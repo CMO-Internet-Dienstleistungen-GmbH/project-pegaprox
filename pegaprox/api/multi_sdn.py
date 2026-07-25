@@ -213,6 +213,8 @@ def _validate_definition(body):
     for s in (body.get('subnets') or []):
         if isinstance(s, str):
             s = {'cidr': s}
+        if not isinstance(s, dict):
+            return None, "each subnet must be a CIDR string or an object with a 'cidr' field"
         cidr = str(s.get('cidr', '')).strip()
         try:
             ipaddress.ip_network(cidr, strict=False)
@@ -797,12 +799,14 @@ def create_multi_vnet():
     # --- atomic: on any non-'applied' member, tear the successful ones back down
     #     and do NOT persist a record (no half-built span left behind).
     if atomic and rollup != 'applied':
-        # Roll back EVERY member, not just the fully-'applied' ones: a member that failed
-        # mid-build (e.g. controller + zone created, then the vnet POST failed) is the one
-        # MOST likely to hold orphaned objects, yet its status is 'failed'. _rollback_on_cluster
-        # is best-effort and ignores "does not exist", so over-rolling a member that created
-        # nothing is a harmless no-op — this is what actually honors "no half-built span".
-        rollbacks = {c: _rollback_on_cluster(c, defn) for c in members}
+        # Roll back what THIS create freshly built on each member — including a member that
+        # failed mid-build (e.g. controller + zone created, then the vnet POST failed), which
+        # is the one most likely to hold orphans. Use `_apply_on_cluster`'s reported `created`
+        # set so we tear down ONLY objects this call made and never a pre-existing controller/
+        # zone that a co-tenant span on that cluster reused idempotently. Best-effort, ignores
+        # "does not exist" — a member that created nothing is a harmless no-op.
+        rollbacks = {c: _teardown_created_on_cluster(c, defn, (per_cluster.get(c) or {}).get('created', []))
+                     for c in members}
         log_audit(user, 'multi_sdn.vnet_create_failed',
                   f"Cross-cluster EVPN vnet '{defn['name']}' failed ({rollup}); "
                   f"rolled back all {len(members)} member(s)")
