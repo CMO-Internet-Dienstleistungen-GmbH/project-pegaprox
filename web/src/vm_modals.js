@@ -3803,6 +3803,36 @@
             );
         }
 
+        // #621 (ccesario) — shared comparator for the "Top Resources" guest tables, used by
+        // both GroupOverview and AllClustersOverview. CPU/RAM sort numerically, name/cluster/
+        // node/status collate as strings. Returns a new array (does not mutate the input).
+        function sortTopGuests(list, by, dir) {
+            const gv = (g) => {
+                switch (by) {
+                    case 'name': return (g.name || `VM ${g.vmid}`).toLowerCase();
+                    case 'cluster': return (g.cluster_name || '').toLowerCase();
+                    case 'node': return (g.node || '').toLowerCase();
+                    case 'ram': return g.maxmem > 0 ? g.mem / g.maxmem : 0;
+                    case 'status': return g.status || '';
+                    case 'cpu':
+                    default: return g.cpu || 0;
+                }
+            };
+            return [...list].sort((a, b) => {
+                const av = gv(a), bv = gv(b);
+                const c = (typeof av === 'number' && typeof bv === 'number')
+                    ? av - bv
+                    : String(av).localeCompare(String(bv));
+                return dir === 'asc' ? c : -c;
+            });
+        }
+        // #621 — clickable-header state machine: re-clicking the active column flips the
+        // direction; switching column defaults numeric cols to desc (highest first), text asc.
+        function nextGuestSort(curBy, curDir, field) {
+            if (curBy === field) return { by: field, dir: curDir === 'asc' ? 'desc' : 'asc' };
+            return { by: field, dir: (field === 'cpu' || field === 'ram') ? 'desc' : 'asc' };
+        }
+
         // MK: Group Overview - drills into a single cluster group
         // basically a scoped-down version of AllClustersOverview w/ LB stuff
         function GroupOverview({ group, clusters, allMetrics, clusterGroups = [], topGuests = [], onSelectCluster, onSelectVm, onOpenSettings, authFetch, API_URL }) {
@@ -3810,6 +3840,8 @@
             const { isCorporate } = useLayout();
             const [sortBy, setSortBy] = useState('name');
             const [sortDir, setSortDir] = useState('asc');
+            const [guestSortBy, setGuestSortBy] = useState('cpu');    // #621 — Top Resources table sort (its own state, kept separate from the cluster table's sortBy)
+            const [guestSortDir, setGuestSortDir] = useState('desc'); // default: highest CPU first, so it stays "top" until the user re-sorts
             const [cpuHistory, setCpuHistory] = useState({});
             const [ramHistory, setRamHistory] = useState({});
             const [lbHistory, setLbHistory] = useState([]);
@@ -4236,9 +4268,17 @@
                                     <span className="text-[13px] font-semibold" style={{color: '#adbbc4'}}>{t('topResources') || 'Top Resources'}</span>
                                 </div>
                                 <table className="corp-datagrid">
-                                    <thead><tr><th style={{width: '24px'}}></th><th>{t('name')}</th><th>{t('cluster')}</th><th>{t('node')}</th><th>CPU</th><th>RAM</th><th>{t('status')}</th></tr></thead>
+                                    <thead><tr>
+                                        <th style={{width: '24px'}}></th>
+                                        {[{field: 'name', label: t('name')}, {field: 'cluster', label: t('cluster')}, {field: 'node', label: t('node')}, {field: 'cpu', label: 'CPU', align: 'right'}, {field: 'ram', label: 'RAM', align: 'right'}, {field: 'status', label: t('status')}].map(col => (
+                                            <th key={col.field} className="cursor-pointer" style={{textAlign: col.align || 'left'}}
+                                                onClick={() => { const n = nextGuestSort(guestSortBy, guestSortDir, col.field); setGuestSortBy(n.by); setGuestSortDir(n.dir); }}>
+                                                {col.label} {guestSortBy === col.field && <span className="sort-indicator">{guestSortDir === 'asc' ? '▲' : '▼'}</span>}
+                                            </th>
+                                        ))}
+                                    </tr></thead>
                                     <tbody>
-                                        {groupTopGuests.slice(0, 10).map(guest => {
+                                        {sortTopGuests(groupTopGuests, guestSortBy, guestSortDir).slice(0, 10).map(guest => {
                                             const cpuP = ((guest.cpu || 0) * 100).toFixed(1);
                                             const memP = guest.maxmem > 0 ? ((guest.mem / guest.maxmem) * 100).toFixed(1) : 0;
                                             const gc = clusters.find(c => c.id === guest.cluster_id);
@@ -4249,8 +4289,8 @@
                                                     <td><span style={{fontWeight: 500}}>{guest.name || `VM ${guest.vmid}`}</span> <span style={{color: '#728b9a', fontSize: '11px'}}>#{guest.vmid}</span></td>
                                                     <td>{guest.cluster_name}</td>
                                                     <td style={{color: '#adbbc4'}}>{guest.node}</td>
-                                                    <td><span style={{color: corpBarColor(cpuP)}}>{cpuP}%</span></td>
-                                                    <td><span style={{color: corpBarColor(memP)}}>{memP}%</span></td>
+                                                    <td style={{textAlign: 'right'}}><span style={{color: corpBarColor(cpuP)}}>{cpuP}%</span></td>
+                                                    <td style={{textAlign: 'right'}}><span style={{color: corpBarColor(memP)}}>{memP}%</span></td>
                                                     <td>
                                                         <span className="inline-flex items-center gap-1">
                                                             <span className="w-1.5 h-1.5 rounded-full inline-block" style={{background: guest.status === 'running' ? '#60b515' : '#728b9a'}} />
@@ -4446,17 +4486,17 @@
                                         <thead className="bg-proxmox-dark/50">
                                             <tr className="text-left text-xs text-gray-400">
                                                 <th className="px-4 py-3 font-medium">{t('type')}</th>
-                                                <th className="px-4 py-3 font-medium">{t('name')}</th>
-                                                <th className="px-4 py-3 font-medium">{t('cluster')}</th>
-                                                <th className="px-4 py-3 font-medium">{t('node')}</th>
-                                                <th className="px-4 py-3 font-medium">CPU</th>
-                                                <th className="px-4 py-3 font-medium">RAM</th>
-                                                <th className="px-4 py-3 font-medium">{t('status')}</th>
+                                                {[{field: 'name', label: t('name')}, {field: 'cluster', label: t('cluster')}, {field: 'node', label: t('node')}, {field: 'cpu', label: 'CPU'}, {field: 'ram', label: 'RAM'}, {field: 'status', label: t('status')}].map(col => (
+                                                    <th key={col.field} className="px-4 py-3 font-medium cursor-pointer hover:text-white select-none"
+                                                        onClick={() => { const n = nextGuestSort(guestSortBy, guestSortDir, col.field); setGuestSortBy(n.by); setGuestSortDir(n.dir); }}>
+                                                        {col.label}{guestSortBy === col.field && <span className="ml-1">{guestSortDir === 'asc' ? '▲' : '▼'}</span>}
+                                                    </th>
+                                                ))}
                                                 <th className="px-4 py-3 w-10"></th>
                                             </tr>
                                         </thead>
                                         <tbody className="divide-y divide-proxmox-border/50">
-                                            {groupTopGuests2.slice(0, 10).map((guest, idx) => {
+                                            {sortTopGuests(groupTopGuests2, guestSortBy, guestSortDir).slice(0, 10).map((guest, idx) => {
                                                 const cpuPercent = ((guest.cpu || 0) * 100).toFixed(1);
                                                 const memPercent = guest.maxmem > 0 ? ((guest.mem / guest.maxmem) * 100).toFixed(1) : 0;
                                                 const isVM = guest.type === 'qemu';
@@ -4587,6 +4627,8 @@
             const { isCorporate } = useLayout();
             const [sortBy, setSortBy] = useState('name');
             const [sortDir, setSortDir] = useState('asc');
+            const [guestSortBy, setGuestSortBy] = useState('cpu');    // #621 — Top Resources table sort (separate from the cluster table)
+            const [guestSortDir, setGuestSortDir] = useState('desc');
             const [cpuHistory, setCpuHistory] = useState({});
             const [ramHistory, setRamHistory] = useState({});
             
@@ -5023,16 +5065,16 @@
                                     <thead>
                                         <tr>
                                             <th style={{width: '24px'}}></th>
-                                            <th>{t('name')}</th>
-                                            <th>{t('cluster')}</th>
-                                            <th>{t('node')}</th>
-                                            <th>CPU</th>
-                                            <th>RAM</th>
-                                            <th>{t('status')}</th>
+                                            {[{field: 'name', label: t('name')}, {field: 'cluster', label: t('cluster')}, {field: 'node', label: t('node')}, {field: 'cpu', label: 'CPU'}, {field: 'ram', label: 'RAM'}, {field: 'status', label: t('status')}].map(col => (
+                                                <th key={col.field} className="cursor-pointer" style={{textAlign: 'left'}}
+                                                    onClick={() => { const n = nextGuestSort(guestSortBy, guestSortDir, col.field); setGuestSortBy(n.by); setGuestSortDir(n.dir); }}>
+                                                    {col.label} {guestSortBy === col.field && <span className="sort-indicator">{guestSortDir === 'asc' ? '▲' : '▼'}</span>}
+                                                </th>
+                                            ))}
                                         </tr>
                                     </thead>
                                     <tbody>
-                                        {topGuests.map((guest) => {
+                                        {sortTopGuests(topGuests, guestSortBy, guestSortDir).map((guest) => {
                                             const cpuP = ((guest.cpu || 0) * 100).toFixed(1);
                                             const memP = guest.maxmem > 0 ? ((guest.mem / guest.maxmem) * 100).toFixed(1) : 0;
                                             const gc = clusters.find(c => c.id === guest.cluster_id);
@@ -5414,17 +5456,17 @@
                                     <thead className="bg-proxmox-dark/50">
                                         <tr className="text-left text-xs text-gray-400">
                                             <th className="px-4 py-3 font-medium">{t('type')}</th>
-                                            <th className="px-4 py-3 font-medium">{t('name')}</th>
-                                            <th className="px-4 py-3 font-medium">{t('cluster')}</th>
-                                            <th className="px-4 py-3 font-medium">{t('node')}</th>
-                                            <th className="px-4 py-3 font-medium">CPU</th>
-                                            <th className="px-4 py-3 font-medium">RAM</th>
-                                            <th className="px-4 py-3 font-medium">{t('status')}</th>
+                                            {[{field: 'name', label: t('name')}, {field: 'cluster', label: t('cluster')}, {field: 'node', label: t('node')}, {field: 'cpu', label: 'CPU'}, {field: 'ram', label: 'RAM'}, {field: 'status', label: t('status')}].map(col => (
+                                                <th key={col.field} className="px-4 py-3 font-medium cursor-pointer hover:text-white select-none"
+                                                    onClick={() => { const n = nextGuestSort(guestSortBy, guestSortDir, col.field); setGuestSortBy(n.by); setGuestSortDir(n.dir); }}>
+                                                    {col.label}{guestSortBy === col.field && <span className="ml-1">{guestSortDir === 'asc' ? '▲' : '▼'}</span>}
+                                                </th>
+                                            ))}
                                             <th className="px-4 py-3 w-10"></th>
                                         </tr>
                                     </thead>
                                     <tbody className="divide-y divide-proxmox-border/50">
-                                        {topGuests.map((guest, idx) => {
+                                        {sortTopGuests(topGuests, guestSortBy, guestSortDir).map((guest, idx) => {
                                             const cpuPercent = ((guest.cpu || 0) * 100).toFixed(1);
                                             const memPercent = guest.maxmem > 0 ? ((guest.mem / guest.maxmem) * 100).toFixed(1) : 0;
                                             const isVM = guest.type === 'qemu';
