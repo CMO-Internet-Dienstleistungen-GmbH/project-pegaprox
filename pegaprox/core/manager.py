@@ -12295,13 +12295,26 @@ echo "AGENT_INSTALLED_OK"
                 # it uses that node's own ~/.ssh/known_hosts, not the hub's. Just harden
                 # accept-new (reject a changed target key) rather than pinning the hub file.
                 _hkc, _ = cli_hostkey_opts()
+                import shlex
+                # MK Jul 2026 — never put the password on the remote argv. `sshpass -p <pw>`
+                # (and any pw baked into the command string) is visible in `ps` on the SOURCE
+                # node to any local user for the duration of the sync — same leak class as the
+                # fencing fix (4c2487e). Feed the password over stdin into an SSHPASS env var and
+                # use `sshpass -e`, so neither the shell's nor sshpass's argv carries the secret.
+                scp_tail = (f"scp -o StrictHostKeyChecking={_hkc} -o ConnectTimeout=10 "
+                            f"{shlex.quote(src_file)} {ssh_user}@{tgt_ip}:{shlex.quote(tgt_path + '/')}")
                 if ssh_pass:
-                    import shlex
-                    escaped_pass = shlex.quote(ssh_pass)
-                    scp_cmd = f"sshpass -p {escaped_pass} scp -o StrictHostKeyChecking={_hkc} -o ConnectTimeout=10 '{src_file}' {ssh_user}@{tgt_ip}:'{tgt_path}/'"
+                    scp_cmd = f"IFS= read -r SSHPASS; export SSHPASS; sshpass -e {scp_tail}"
                 else:
-                    scp_cmd = f"scp -o StrictHostKeyChecking={_hkc} -o ConnectTimeout=10 '{src_file}' {ssh_user}@{tgt_ip}:'{tgt_path}/'"
-                _, scp_out, scp_err = ssh_src.exec_command(scp_cmd, timeout=3600)
+                    scp_cmd = scp_tail
+                scp_in, scp_out, scp_err = ssh_src.exec_command(scp_cmd, timeout=3600)
+                if ssh_pass:
+                    try:
+                        scp_in.write(ssh_pass + "\n")   # consumed by `read -r SSHPASS`, never on argv
+                        scp_in.flush()
+                        scp_in.channel.shutdown_write()
+                    except Exception:
+                        pass
                 rc = scp_out.channel.recv_exit_status()
                 ssh_src.close()
                 if rc == 0:
