@@ -2599,10 +2599,14 @@ def _ssh_esxi_exec(esxi_host, esxi_user, esxi_pass, cmd, timeout=30):
     call opens the master, all follow-ups (within 300 s) skip TCP+SSH-handshake.
     Major contributor to the AccountLockFailures we previously hit on ESXi.
     """
-    import subprocess, shlex as _sh
+    import os, subprocess, shlex as _sh
     from pegaprox.utils.ssh_security import cli_hostkey_opts
     _hkc, _kh = cli_hostkey_opts()
-    full = ['sshpass', '-p', esxi_pass, 'ssh',
+    # MK Jul 2026 — feed the ESXi password via SSHPASS env (`sshpass -e`), never
+    # `-p <pw>` on argv: the argv of a running process is world-readable in
+    # /proc/<pid>/cmdline, so any local user could scrape the ESXi root password
+    # mid-migration. Same fix as the HA-fencing/smbios sinks.
+    full = ['sshpass', '-e', 'ssh',
             '-o', f'StrictHostKeyChecking={_hkc}', '-o', f'UserKnownHostsFile={_kh}', '-o', 'HashKnownHosts=no',
             '-o', 'BatchMode=no', '-o', 'ConnectTimeout=10']
     try:
@@ -2612,7 +2616,8 @@ def _ssh_esxi_exec(esxi_host, esxi_user, esxi_pass, cmd, timeout=30):
         pass  # graceful fallback
     full.extend([f'{esxi_user}@{esxi_host}', cmd])
     try:
-        r = subprocess.run(full, capture_output=True, timeout=timeout, text=True)
+        r = subprocess.run(full, capture_output=True, timeout=timeout, text=True,
+                           env={**os.environ, 'SSHPASS': esxi_pass or ''})
         return r.returncode, r.stdout, r.stderr
     except Exception as e:
         return 1, '', str(e)

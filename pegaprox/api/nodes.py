@@ -534,8 +534,17 @@ def test_bmc_endpoint_api(cluster_id, node):
         return jsonify({'available': False, 'reason': 'no BMC host configured'}), 400
     user = (data.get('user') or stored.get('user') or '').strip()
     pw = data.get('password')
+    # SECURITY (pentest 2026-07-25): never pair the stored BMC secret with a caller-CHOSEN host.
+    # A masked/empty password falls back to the stored plaintext, but if the caller also overrode
+    # `host`, that credential would be sent (preemptive Basic-auth) to an arbitrary off-box host of
+    # their choosing = credential exfiltration. Only reuse the stored password when the host being
+    # tested IS the stored host; testing any other host must carry its own full password.
     if pw in (None, '', '********'):
-        pw = stored.get('password', '')
+        if host == (stored.get('host') or '').strip():
+            pw = stored.get('password', '')
+        else:
+            return jsonify({'available': False,
+                            'reason': 'a full password is required to test a host other than the stored one'}), 400
     verify_ssl = bool(data.get('verify_ssl', stored.get('verify_ssl', False)))
     res = redfish.read_node_bmc_redfish(host, user, str(pw or ''), verify_ssl=verify_ssl, timeout=8)
     return jsonify({'available': res.get('available', False),

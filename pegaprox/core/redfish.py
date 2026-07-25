@@ -15,9 +15,12 @@ SAFETY:
   * READ-ONLY — only HTTP GET on /Systems, /Chassis/*/Thermal, /Chassis/*/Power,
     and the SEL/event log. No power, virtual-media, BIOS or firmware actions.
   * SSRF-guarded — the admin-supplied BMC host is validated with the same
-    is_safe_outbound_url guard used elsewhere (allow_private=True: BMCs live on
-    private management LANs; cloud-metadata / loopback stay blocked). Redirects
-    are refused so a hostile BMC can't bounce us onto an internal target.
+    is_safe_outbound_url guard used elsewhere. allow_private=True because BMCs
+    live on private management LANs, but _validate_host then re-rejects loopback,
+    the unspecified/hub address, link-local and metadata explicitly so the
+    stored credential can't be aimed back at the PegaProx host. Rejections carry
+    a generic reason (no resolved-IP oracle). Redirects are refused so a hostile
+    BMC can't bounce us onto an internal target.
   * Never raises into the caller — any failure returns {'available': False,
     'reason': ...} so it degrades exactly like the in-band reader.
 
@@ -28,7 +31,9 @@ tell which source produced it.
 """
 
 import json as _json
+import ipaddress
 import logging
+import socket
 from urllib.parse import urljoin, urlparse
 
 try:
@@ -188,21 +193,65 @@ def parse_redfish(system_doc, thermal_doc, power_doc, sel_members):
 
 # --- HTTP orchestration -------------------------------------------------------
 
+def _host_is_forbidden_target(hostname):
+    """True if hostname resolves onto a target we must never carry BMC creds to,
+    EVEN on a private management LAN. allow_private=True (below) deliberately
+    permits RFC1918 because BMCs live there, but that must not re-open loopback,
+    the unspecified/hub address, or link-local — those let an admin.settings
+    holder point the stored-credential GET back at the PegaProx host itself or
+    at a metadata endpoint. Returns True (forbidden) on any resolution failure —
+    better to reject than to send a credential blind."""
+    literal = hostname
+    if literal.startswith('[') and literal.endswith(']'):
+        literal = literal[1:-1]
+    candidates = []
+    try:
+        candidates.append(ipaddress.ip_address(literal))
+    except ValueError:
+        try:
+            for info in socket.getaddrinfo(hostname, None):
+                ip_str = info[4][0]
+                if '%' in ip_str:
+                    ip_str = ip_str.split('%', 1)[0]
+                try:
+                    candidates.append(ipaddress.ip_address(ip_str))
+                except ValueError:
+                    continue
+        except socket.gaierror:
+            return True
+    if not candidates:
+        return True
+    for ip in candidates:
+        if ip.is_loopback or ip.is_unspecified or ip.is_link_local \
+                or ip.is_multicast or ip.is_reserved:
+            return True
+    return False
+
+
 def _validate_host(host):
-    """SSRF-validate a BMC host; returns (base_url, None) or (None, reason)."""
+    """SSRF-validate a BMC host; returns (base_url, None) or (None, reason).
+
+    The reason on rejection is deliberately generic (no resolved IP / range /
+    guard internals) so this endpoint can't be used as an internal-network
+    port/host oracle by an admin.settings holder."""
     host = (host or '').strip().rstrip('/')
     if not host or len(host) > 253:
-        return None, 'missing or over-long BMC host'
+        return None, 'invalid BMC host'
     # allow the admin to pass a bare host or a full https URL
     base = host if host.startswith(('http://', 'https://')) else f'https://{host}'
     base = base.rstrip('/')
     try:
         from pegaprox.utils.url_security import is_safe_outbound_url
-        ok, why = is_safe_outbound_url(base + '/redfish/v1/', allowed_schemes=('https', 'http'), allow_private=True)
-    except Exception as e:  # guard module missing -> fail closed for a network cred call
-        return None, f'SSRF guard unavailable: {e}'
+        ok, _why = is_safe_outbound_url(base + '/redfish/v1/', allowed_schemes=('https', 'http'), allow_private=True)
+    except Exception:  # guard module missing -> fail closed for a network cred call
+        return None, 'BMC host not permitted'
     if not ok:
-        return None, f'BMC host rejected by SSRF guard: {why}'
+        return None, 'BMC host not permitted'
+    # allow_private=True re-opens loopback/link-local for the private-LAN case;
+    # slam those shut again so the credential can't be aimed at ourselves.
+    parsed_host = (urlparse(base).hostname or '').strip()
+    if not parsed_host or _host_is_forbidden_target(parsed_host):
+        return None, 'BMC host not permitted'
     return base, None
 
 

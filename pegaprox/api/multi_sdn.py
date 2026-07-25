@@ -427,27 +427,52 @@ def _apply_on_cluster(cid, defn):
     return result
 
 
-def _rollback_on_cluster(cid, defn):
-    """Best-effort teardown of what a create staged on ONE cluster: delete vnet →
-    zone → controller (reverse dependency order), then apply. Used for atomic-
-    create rollback and for purge-delete. Never raises."""
-    out = {'cluster_id': cid, 'deleted': [], 'errors': []}
-    mgr, reason = _resolve_member(cid)
-    if reason:
-        out['errors'].append(reason)
-        return out
-    # reverse order; ignore "does not exist" errors
-    for suffix, label in (
-        (f"vnets/{defn['name']}", 'vnet'),
-        (f"zones/{defn['zone']}", 'zone'),
-        (f"controllers/{defn['controller']}", 'controller'),
-    ):
-        ok, e = _sdn_delete(mgr, suffix)
-        if ok:
-            out['deleted'].append(label)
-        elif e and 'does not exist' not in str(e).lower():
-            out['errors'].append(f"{label}: {e}")
-    _sdn_apply(mgr)
+def _shared_infra_on_cluster(vid, cid, defn):
+    """(zone_shared, controller_shared) — does ANY OTHER aggregate span that also spans
+    cluster `cid` reuse this span's zone / controller name? EVPN zones (and their
+    controllers) routinely host many vnets, so a purge-delete must NOT blindly tear the
+    zone/controller down on a cluster where a co-tenant span still depends on it. Fails
+    SAFE: on any DB/parse error it reports both as shared so we only remove the vnet."""
+    zone, ctrl = defn.get('zone'), defn.get('controller')
+    if not zone and not ctrl:
+        return (False, False)
+    try:
+        rows = get_db().query('SELECT * FROM multi_cluster_vnets WHERE id != ?', (vid,)) or []
+    except Exception:
+        return (True, True)   # can't tell → keep the shared infra
+    zone_shared = ctrl_shared = False
+    for row in rows:
+        try:
+            other = _row_to_dict(row)
+        except Exception:
+            return (True, True)
+        if cid not in (other.get('member_clusters') or []):
+            continue
+        od = other.get('desired_state') or {}
+        if zone and od.get('zone') == zone:
+            zone_shared = True
+        if ctrl and od.get('controller') == ctrl:
+            ctrl_shared = True
+        if zone_shared and ctrl_shared:
+            break
+    return (zone_shared, ctrl_shared)
+
+
+def _purge_span_on_cluster(vid, cid, defn):
+    """Purge a WHOLE span from ONE cluster on a full delete: always remove the vnet, and
+    remove the zone/controller ONLY when no other span on that cluster still uses them
+    (see _shared_infra_on_cluster). Reverse dependency order, single apply. Never raises."""
+    zone_shared, ctrl_shared = _shared_infra_on_cluster(vid, cid, defn)
+    created = ['vnet']
+    if not zone_shared:
+        created.append('zone')
+    if not ctrl_shared:
+        created.append('controller')
+    out = _teardown_created_on_cluster(cid, defn, created)
+    if zone_shared:
+        out.setdefault('kept', []).append('zone (shared)')
+    if ctrl_shared:
+        out.setdefault('kept', []).append('controller (shared)')
     return out
 
 
@@ -900,7 +925,11 @@ def delete_multi_vnet(vid):
     if purge:
         defn = rec.get('desired_state') or {}
         if defn:
-            purged = {c: _rollback_on_cluster(c, defn) for c in members}
+            # SECURITY (pentest 2026-07-25): purge the vnet on every member, but only
+            # tear down that member's zone/controller when no OTHER span on the same
+            # cluster still shares them — otherwise a full-delete purge would collapse
+            # a co-tenant cross-cluster span that reuses the EVPN zone/controller.
+            purged = {c: _purge_span_on_cluster(vid, c, defn) for c in members}
     db.execute('DELETE FROM multi_cluster_vnets WHERE id = ?', (vid,))
     log_audit(getattr(request, 'session', {}).get('user', 'system'),
               'multi_sdn.vnet_deleted',

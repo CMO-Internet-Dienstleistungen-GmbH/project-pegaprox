@@ -153,6 +153,66 @@ def _rbd_cmd(manager, node_ip, args, timeout=30, expect_json=True):
                 pass
 
 
+def _rbd_batch(manager, node_ip, arg_list, timeout=30, expect_json=True):
+    """MK Jul 2026 — run several rbd commands over ONE SSH connection.
+
+    _rbd_cmd opens+auths+tears-down a fresh SSH session per call, so the mirror
+    views (one `rbd mirror image status` per image) fanned into N connections to
+    the same node on a single view load — a self-inflicted SSH storm a low-priv
+    cluster.view user could trigger repeatedly. This reuses a single connection
+    (one TCP + auth handshake, one channel per command) and returns a list of
+    (data, err) tuples in the same order as arg_list.
+    """
+    ssh = None
+    try:
+        ssh = manager._ssh_connect(node_ip)
+        if not ssh:
+            err = (jsonify({'error': 'SSH connection failed - check SSH credentials in cluster settings'}), 503)
+            return [(None, err) for _ in arg_list]
+
+        fmt = ' --format json' if expect_json else ''
+        results = []
+        for args in arg_list:
+            try:
+                cmd = f"rbd {args}{fmt}"
+                logging.debug(f"rbd cmd on {node_ip}: {cmd}")
+                stdin, stdout, stderr = ssh.exec_command(cmd, timeout=timeout)
+                exit_code = stdout.channel.recv_exit_status()
+                out = stdout.read().decode('utf-8', errors='replace').strip()
+                err = stderr.read().decode('utf-8', errors='replace').strip()
+                if exit_code == 22:  # EINVAL — mirroring not enabled on pool
+                    results.append(({} if expect_json else '', None))
+                    continue
+                if exit_code != 0:
+                    if 'command not found' in err or 'No such file' in err:
+                        results.append((None, (jsonify({'error': 'rbd command not found - is ceph-common installed?'}), 501)))
+                        continue
+                    msg = err or out or f'rbd exited with code {exit_code}'
+                    results.append((None, (jsonify({'error': msg}), 500)))
+                    continue
+                if not expect_json or not out:
+                    results.append((out, None))
+                    continue
+                try:
+                    results.append((json.loads(out), None))
+                except json.JSONDecodeError:
+                    results.append(({'raw': out}, None))
+            except Exception as e:
+                logging.error(f"rbd SSH error on {node_ip}: {e}")
+                results.append((None, (jsonify({'error': safe_error(e, 'SSH error')}), 503)))
+        return results
+    except Exception as e:
+        logging.error(f"rbd SSH batch error on {node_ip}: {e}")
+        err = (jsonify({'error': safe_error(e, 'SSH error')}), 503)
+        return [(None, err) for _ in arg_list]
+    finally:
+        if ssh:
+            try:
+                ssh.close()
+            except:
+                pass
+
+
 # ============================================
 # Datacenter-Level Ceph Overview
 # ============================================
@@ -911,34 +971,33 @@ def get_mirror_overview(cluster_id):
     if not pools:
         return jsonify({'pools': [], 'node': node})
 
-    result = []
-    for pool_info in pools:
-        pname = pool_info.get('pool_name') or pool_info.get('name', '')
-        if not pname or not _valid_pool(pname):
-            continue
+    pnames = [pi.get('pool_name') or pi.get('name', '') for pi in pools]
+    pnames = [p for p in pnames if p and _valid_pool(p)]
 
+    # MK Jul 2026 — was 1-2 fresh SSH connects PER pool; now one connection for
+    # all `mirror pool info` calls, then one more for the enabled pools' status.
+    entries = {}
+    infos = _rbd_batch(manager, node_ip, [f'mirror pool info {p}' for p in pnames])
+    for pname, (info, info_err) in zip(pnames, infos):
         entry = {'name': pname, 'mode': 'disabled', 'peers': [], 'health': None, 'image_count': 0}
-
-        # NS: get mirror info for this pool
-        info, info_err = _rbd_cmd(manager, node_ip, f'mirror pool info {pname}')
         if not info_err and isinstance(info, dict):
             mode = info.get('mode', 'disabled')
             entry['mode'] = mode if mode != 'disabled' else 'disabled'
             entry['peers'] = info.get('peers', [])
             entry['site_name'] = info.get('site_name', '')
+        entries[pname] = entry
 
-        # only fetch status if mirroring is actually on
-        if entry['mode'] != 'disabled':
-            status, st_err = _rbd_cmd(manager, node_ip, f'mirror pool status {pname}')
+    enabled = [p for p in pnames if entries[p]['mode'] != 'disabled']
+    if enabled:
+        statuses = _rbd_batch(manager, node_ip, [f'mirror pool status {p}' for p in enabled])
+        for pname, (status, st_err) in zip(enabled, statuses):
             if not st_err and isinstance(status, dict):
                 summary = status.get('summary', {})
-                health = status.get('health', 'UNKNOWN')
-                entry['health'] = health
-                entry['image_count'] = summary.get('states', {}).get('total', 0) if isinstance(summary, dict) else 0
-                entry['summary'] = summary
+                entries[pname]['health'] = status.get('health', 'UNKNOWN')
+                entries[pname]['image_count'] = summary.get('states', {}).get('total', 0) if isinstance(summary, dict) else 0
+                entries[pname]['summary'] = summary
 
-        result.append(entry)
-
+    result = [entries[p] for p in pnames]
     return jsonify({'pools': result, 'node': node})
 
 
@@ -1104,9 +1163,16 @@ def list_mirror_images(cluster_id, pool):
     if node_err: return node_err
     node_ip = _resolve_node_ip(manager, node)
 
-    # first get the image list
-    images_data, img_err = _rbd_cmd(manager, node_ip, f'ls {pool}')
+    # MK Jul 2026 — was: `rbd ls` + one `rbd mirror image status` PER image, each
+    # its own SSH connect (N+1 sessions to the node on a single view load — SSH
+    # amplification a low-priv cluster.view user could spam). Now two commands over
+    # ONE connection: `ls` for the full image list (so non-mirrored images still
+    # show) + a single `mirror pool status --verbose` that carries every image's
+    # mirror state. Two SSH round-trips regardless of image count.
+    both = _rbd_batch(manager, node_ip, [f'ls {pool}', f'mirror pool status {pool} --verbose'])
+    images_data, img_err = both[0]
     if img_err: return img_err
+    status_data, _st_err = both[1]
 
     # rbd ls --format json returns a list of image names
     if isinstance(images_data, list):
@@ -1116,17 +1182,18 @@ def list_mirror_images(cluster_id, pool):
     else:
         image_names = []
 
-    # NS: now get mirror status for each image (batched via separate commands)
-    # could use a single SSH session but _rbd_cmd handles cleanup
+    # index the verbose pool status by image name (only mirror-enabled images appear)
+    by_name = {}
+    if isinstance(status_data, dict):
+        for im in (status_data.get('images') or []):
+            if isinstance(im, dict) and im.get('name'):
+                by_name[im['name']] = im
+
     result = []
-    for img in image_names[:100]:  # cap at 100 to avoid timeout
+    for img in image_names:
         if not _valid_image(str(img)):
             continue
-        entry = {'name': img, 'mirroring': None}
-        status, st_err = _rbd_cmd(manager, node_ip, f'mirror image status {pool}/{img}', timeout=10)
-        if not st_err and isinstance(status, dict):
-            entry['mirroring'] = status
-        result.append(entry)
+        result.append({'name': img, 'mirroring': by_name.get(img)})
 
     return jsonify({'images': result, 'pool': pool})
 

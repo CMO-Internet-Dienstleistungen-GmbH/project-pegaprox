@@ -1921,12 +1921,22 @@ def _run_esxi_to_pve(task):
                     # quoting because scp invokes a remote shell.
                     tmp_path = f"/tmp/xhm-{task.id}-disk{idx}.vmdk"
                     remote_src = f"{esxi_user}@{esxi_host}:" + _q_remote('/vmfs/volumes/' + datastore_name + '/' + flat_path)
+                    # MK Jul 2026 — this scp runs on the PVE node, so `sshpass -p <pw>`
+                    # would leak the ESXi password in that node's `ps`/proc for up to
+                    # 2h. Feed it over stdin into SSHPASS and use `sshpass -e` instead
+                    # (same idiom as the HA-sync/smbios fixes).
                     scp_cmd = (
-                        f"sshpass -p {_q_local(esxi_pass)} "
+                        f"IFS= read -r SSHPASS; export SSHPASS; sshpass -e "
                         f"scp -o StrictHostKeyChecking=accept-new "
                         f"{_q_local(remote_src)} {_q_local(tmp_path)}"
                     )
-                    _, scp_out, scp_err = ssh_pve.exec_command(scp_cmd, timeout=7200)
+                    scp_in, scp_out, scp_err = ssh_pve.exec_command(scp_cmd, timeout=7200)
+                    try:
+                        scp_in.write((esxi_pass or '') + "\n")   # consumed by `read -r SSHPASS`, never on argv
+                        scp_in.flush()
+                        scp_in.channel.shutdown_write()
+                    except Exception:
+                        pass
                     scp_exit = scp_out.channel.recv_exit_status()
                     if scp_exit != 0:
                         err_msg = scp_err.read().decode()[:200]
@@ -2239,13 +2249,17 @@ def _run_esxi_to_xcpng(task):
                 _q_remote_path = "'" + _remote_path.replace("'", "'\"'\"'") + "'"
                 from pegaprox.utils.ssh_security import cli_hostkey_opts
                 _hkc, _kh = cli_hostkey_opts()
+                # MK Jul 2026 — SSHPASS env (`-e`), not `-p <pw>` on argv: the
+                # ESXi password would otherwise sit in /proc/<pid>/cmdline for
+                # any local user to read during the (up to 2h) transfer.
                 scp_cmd = [
-                    'sshpass', '-p', esxi_pass,
+                    'sshpass', '-e',
                     'scp', '-o', f'StrictHostKeyChecking={_hkc}', '-o', f'UserKnownHostsFile={_kh}', '-o', 'HashKnownHosts=no',
                     f'{esxi_user}@{esxi_host}:{_q_remote_path}',
                     tmp_vmdk
                 ]
-                proc = subprocess.run(scp_cmd, capture_output=True, timeout=7200)
+                proc = subprocess.run(scp_cmd, capture_output=True, timeout=7200,
+                                      env={**os.environ, 'SSHPASS': esxi_pass or ''})
                 if proc.returncode != 0:
                     task.set_phase('failed', f'SCP failed: {proc.stderr.decode()[:200]}')
                     return
