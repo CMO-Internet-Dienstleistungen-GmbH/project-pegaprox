@@ -8095,6 +8095,7 @@
             const [vmwareMigrateForm, setVmwareMigrateForm] = useState({
                 target_cluster:'',target_node:'',target_storage:'',esxi_user:'root',esxi_password:'',network_bridge:'vmbr0',net_vlan_tag:'',
                 start_after:true,remove_source:false,transfer_mode:'vmkfstools_clone',bios:'auto',preserve_mac:true,
+                wait_for_confirmation:false, // #562 — hold before the final switchover until the operator confirms
                 // hardware overrides (#222)
                 ostype:'auto',scsihw:'auto',disk_bus:'auto',vga:'vmware',net_driver:'auto',
                 sockets:0,cores_per_socket:0,memory:0,cpu_type:'host',
@@ -11925,7 +11926,33 @@
                 } catch(e) { addToast('Error', e.message, 'error'); }
                 finally { setVmwareMigrateLoading(false); }
             };
-            
+
+            // #562 — commit / abort the switchover when a migration is holding at the cutover gate
+            const confirmVmwareCutover = async (mid) => {
+                try {
+                    const resp = await authFetch(`${API_URL}/vmware/migrations/${mid}/confirm-cutover`, { method: 'POST' });
+                    if (resp?.ok) {
+                        addToast(t('cutoverConfirmed') || 'Switchover confirmed', t('cutoverProceeding') || 'Proceeding with the cutover now', 'success');
+                        fetchVmwareMigrations();
+                    } else {
+                        const err = await resp?.json().catch(() => ({}));
+                        addToast('Error', err.error || 'Failed to confirm switchover', 'error');
+                    }
+                } catch(e) { addToast('Error', e.message, 'error'); }
+            };
+            const cancelVmwareCutover = async (mid) => {
+                try {
+                    const resp = await authFetch(`${API_URL}/vmware/migrations/${mid}/cancel-cutover`, { method: 'POST' });
+                    if (resp?.ok) {
+                        addToast(t('cutoverCancelled') || 'Migration cancelled', t('sourceLeftRunning') || 'The source VM was left running', 'info');
+                        fetchVmwareMigrations();
+                    } else {
+                        const err = await resp?.json().catch(() => ({}));
+                        addToast('Error', err.error || 'Failed to cancel', 'error');
+                    }
+                } catch(e) { addToast('Error', e.message, 'error'); }
+            };
+
             // List VMware Migrations
             const fetchVmwareMigrations = async () => {
                 try {
@@ -20587,6 +20614,13 @@
                                                                                             </div>
                                                                                         )}
                                                                                         {m.current_step && <div className="text-xs text-gray-500 mt-1">{m.current_step}</div>}
+                                                                                        {m.phase === 'awaiting_confirmation' && (
+                                                                                            <div className="mt-2 flex items-center gap-2">
+                                                                                                <span className="text-xs text-amber-300 flex-1">{t('awaitingCutoverShort') || 'Ready to switch over — source still running.'}</span>
+                                                                                                <button onClick={() => confirmVmwareCutover(m.id)} className="px-2 py-1 rounded text-xs font-semibold bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30 border border-emerald-500/40">{t('commitSwitchover') || 'Commit switchover now'}</button>
+                                                                                                <button onClick={() => cancelVmwareCutover(m.id)} className="px-2 py-1 rounded text-xs font-semibold bg-red-500/10 text-red-300 hover:bg-red-500/20 border border-red-500/30">{t('cancel') || 'Cancel'}</button>
+                                                                                            </div>
+                                                                                        )}
                                                                                     </div>
                                                                                 ))}
                                                                             </div>
@@ -20794,7 +20828,16 @@
                                                                         Remove source VM
                                                                     </label>
                                                                 </div>
-                                                                
+
+                                                                {/* #562 — hold before the final switchover until the operator confirms */}
+                                                                <label className="flex items-start gap-2 text-sm text-gray-400 bg-proxmox-dark/40 border border-proxmox-border rounded-lg p-3 cursor-pointer">
+                                                                    <input type="checkbox" checked={vmwareMigrateForm.wait_for_confirmation} onChange={e => setVmwareMigrateForm({...vmwareMigrateForm, wait_for_confirmation: e.target.checked})} className="rounded mt-0.5" />
+                                                                    <span>
+                                                                        <span className="text-gray-200">{t('waitForConfirmation') || 'Wait for my confirmation before switchover'}</span>
+                                                                        <span className="block text-xs text-gray-500 mt-0.5">{t('waitForConfirmationDesc') || 'The migration pauses right before the final cutover — with the source VM still running — and waits for you to commit the switchover, so you schedule the seconds of downtime yourself (drain monitoring, flip DNS, then commit). Most effective on the near-zero-downtime modes (vmkfstools-clone / auto / snapshot-zero).'}</span>
+                                                                    </span>
+                                                                </label>
+
                                                                 {/* Requirements */}
                                                                 {vmwareMigrationPlan.requirements && (
                                                                     <div className="bg-yellow-500/5 border border-yellow-500/20 rounded-lg p-3">
@@ -21487,19 +21530,20 @@
                                                         <div className="divide-y divide-proxmox-border/50">
                                                             {vmwareMigrations.map(m => {
                                                                 const isActive = m.status === 'running';
-                                                                const phaseLabel = { planning:'Planning', pre_sync:'Pre-Sync', delta_sync:'Delta Sync', cutover:'Cutover', verify:'Verify', cleanup:'Cleanup', completed:'Done', failed:'Failed' };
+                                                                const isAwaiting = m.phase === 'awaiting_confirmation'; // #562
+                                                                const phaseLabel = { planning:'Planning', pre_sync:'Pre-Sync', delta_sync:'Delta Sync', awaiting_confirmation: (t('phaseAwaitingConfirmation') || 'Awaiting Confirmation'), cutover:'Cutover', verify:'Verify', cleanup:'Cleanup', completed:'Done', failed:'Failed', cancelled: (t('phaseCancelled') || 'Cancelled') };
                                                                 return (
                                                                     <div key={m.id} className={`p-4 hover:bg-proxmox-hover/30 cursor-pointer ${vmwareSelectedMigration === m.id ? 'bg-emerald-500/5 border-l-2 border-l-emerald-400' : ''}`}
                                                                          onClick={() => setVmwareSelectedMigration(vmwareSelectedMigration === m.id ? null : m.id)}>
                                                                         <div className="flex items-center justify-between mb-2">
                                                                             <div className="flex items-center gap-3">
-                                                                                <div className={`w-2.5 h-2.5 rounded-full ${isActive ? 'bg-blue-400 animate-pulse' : m.status === 'completed' ? 'bg-green-400' : m.status === 'failed' ? 'bg-red-400' : 'bg-gray-500'}`} />
+                                                                                <div className={`w-2.5 h-2.5 rounded-full ${isAwaiting ? 'bg-amber-400 animate-pulse' : isActive ? 'bg-blue-400 animate-pulse' : m.status === 'completed' ? 'bg-green-400' : m.status === 'failed' ? 'bg-red-400' : 'bg-gray-500'}`} />
                                                                                 <span className="text-sm font-medium text-white">{m.vm_name || m.vm_id}</span>
-                                                                                <span className="text-xs px-1.5 py-0.5 rounded bg-proxmox-dark text-gray-400">{phaseLabel[m.phase] || m.phase}</span>
+                                                                                <span className={`text-xs px-1.5 py-0.5 rounded ${isAwaiting ? 'bg-amber-500/20 text-amber-300' : 'bg-proxmox-dark text-gray-400'}`}>{phaseLabel[m.phase] || m.phase}</span>
                                                                             </div>
                                                                             <div className="flex items-center gap-3">
                                                                                 {m.total_downtime_seconds != null && <span className="text-xs text-gray-500">Downtime: {m.total_downtime_seconds}s</span>}
-                                                                                <span className={`px-2 py-0.5 rounded text-xs font-semibold ${m.status === 'completed' ? 'bg-green-500/20 text-green-400' : m.status === 'failed' ? 'bg-red-500/20 text-red-400' : 'bg-blue-500/20 text-blue-400'}`}>{m.status}</span>
+                                                                                <span className={`px-2 py-0.5 rounded text-xs font-semibold ${m.status === 'completed' ? 'bg-green-500/20 text-green-400' : m.status === 'failed' ? 'bg-red-500/20 text-red-400' : m.status === 'cancelled' ? 'bg-gray-500/20 text-gray-400' : 'bg-blue-500/20 text-blue-400'}`}>{m.status}</span>
                                                                             </div>
                                                                         </div>
                                                                         <div className="flex items-center gap-3 mb-1">
@@ -21524,6 +21568,23 @@
                                                                                         </div>
                                                                                     </React.Fragment>);
                                                                                 })}
+                                                                            </div>
+                                                                        )}
+                                                                        {/* #562 — cutover gate: commit / cancel the switchover */}
+                                                                        {isAwaiting && (
+                                                                            <div className="mt-3 p-3 rounded-lg bg-amber-500/10 border border-amber-500/30" onClick={e => e.stopPropagation()}>
+                                                                                <div className="flex items-start gap-2 text-xs text-amber-300 mb-2">
+                                                                                    <Icons.AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                                                                                    <span>{t('awaitingCutoverBanner') || 'Disks are staged and the source VM is still running. Commit the switchover when you are ready to take the brief downtime.'}</span>
+                                                                                </div>
+                                                                                <div className="flex items-center gap-2">
+                                                                                    <button onClick={() => confirmVmwareCutover(m.id)} className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30 border border-emerald-500/40">
+                                                                                        {t('commitSwitchover') || 'Commit switchover now'}
+                                                                                    </button>
+                                                                                    <button onClick={() => cancelVmwareCutover(m.id)} className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-red-500/10 text-red-300 hover:bg-red-500/20 border border-red-500/30">
+                                                                                        {t('cancelMigration') || 'Cancel migration'}
+                                                                                    </button>
+                                                                                </div>
                                                                             </div>
                                                                         )}
                                                                     </div>

@@ -1041,6 +1041,9 @@ def start_vmware_migration(vmware_id, vm_id):
     - esxi_datastore: Datastore name (auto-detected if not set)
     - esxi_vm_dir: VM directory name on datastore (default: VM name)
     - network_bridge, start_after, remove_source
+    - wait_for_confirmation (#562): hold before the final switchover and wait for an
+      explicit POST .../confirm-cutover (or .../cancel-cutover). Default false.
+    - confirmation_timeout: seconds to wait at that gate before auto-aborting (default 86400).
     """
     if vmware_id not in vmware_managers:
         return jsonify({'error': 'VMware server not found'}), 404
@@ -1147,6 +1150,47 @@ def get_vmware_migration_status(mid):
     if not _migration_reachable(_vmware_migrations[mid]):
         return jsonify({'error': 'Migration not found'}), 404
     return jsonify(_vmware_migrations[mid].to_dict())
+
+
+@bp.route('/api/vmware/migrations/<mid>/confirm-cutover', methods=['POST'])
+@require_auth(perms=['vmware.vm.migrate'])
+def confirm_vmware_cutover(mid):
+    """#562 — commit the final switchover for a migration that is holding at the
+    optional pre-cutover confirmation gate. Only valid while the task is parked in
+    'awaiting_confirmation'; the migration thread picks the flag up within ~2s."""
+    if mid not in _vmware_migrations:
+        return jsonify({'error': 'Migration not found'}), 404
+    task = _vmware_migrations[mid]
+    if not _migration_reachable(task):
+        return jsonify({'error': 'Migration not found'}), 404
+    if getattr(task, 'phase', None) != 'awaiting_confirmation':
+        return jsonify({'error': 'Migration is not waiting for cutover confirmation',
+                        'phase': getattr(task, 'phase', None)}), 409
+    task._cutover_confirmed = True
+    log_audit(request.session.get('user', 'admin'), 'vmware.migration.cutover_confirmed',
+              f"V2P cutover confirmed for {getattr(task, 'vm_name', mid)} (migration {mid})")
+    return jsonify({'message': 'Cutover confirmed — switchover proceeding', 'task': task.to_dict()})
+
+
+@bp.route('/api/vmware/migrations/<mid>/cancel-cutover', methods=['POST'])
+@require_auth(perms=['vmware.vm.migrate'])
+def cancel_vmware_cutover(mid):
+    """#562 — abort a migration that is holding at the confirmation gate. The source
+    VM is left running (it was never suspended); the migration thread tears down the
+    staging mount + migration snapshot and marks the run 'cancelled'. Only valid while
+    the task is parked in 'awaiting_confirmation'."""
+    if mid not in _vmware_migrations:
+        return jsonify({'error': 'Migration not found'}), 404
+    task = _vmware_migrations[mid]
+    if not _migration_reachable(task):
+        return jsonify({'error': 'Migration not found'}), 404
+    if getattr(task, 'phase', None) != 'awaiting_confirmation':
+        return jsonify({'error': 'Migration is not waiting for cutover confirmation',
+                        'phase': getattr(task, 'phase', None)}), 409
+    task._cutover_cancelled = True
+    log_audit(request.session.get('user', 'admin'), 'vmware.migration.cutover_cancelled',
+              f"V2P cutover cancelled for {getattr(task, 'vm_name', mid)} (migration {mid}) — source left running")
+    return jsonify({'message': 'Cutover cancelled — source VM left running', 'task': task.to_dict()})
 
 
 # End VMware API endpoints

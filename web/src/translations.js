@@ -4,6 +4,19 @@
         // ═══════════════════════════════════════════════
         const translations = {
             de: {
+                // #562 — V2P cutover confirmation gate (ajoergensen)
+                waitForConfirmation: 'Vor dem Umschalten auf meine Bestätigung warten',
+                waitForConfirmationDesc: 'Die Migration pausiert unmittelbar vor dem finalen Cutover — die Quell-VM läuft dabei weiter — und wartet auf deine Bestätigung zum Umschalten. So planst du die wenigen Sekunden Ausfallzeit selbst (Monitoring stummschalten, DNS umstellen, dann bestätigen). Am wirkungsvollsten bei den Near-Zero-Downtime-Modi (vmkfstools-clone / auto / snapshot-zero).',
+                cutoverConfirmed: 'Umschaltung bestätigt',
+                cutoverProceeding: 'Cutover wird jetzt durchgeführt',
+                cutoverCancelled: 'Migration abgebrochen',
+                sourceLeftRunning: 'Die Quell-VM läuft weiter',
+                phaseAwaitingConfirmation: 'Warte auf Bestätigung',
+                phaseCancelled: 'Abgebrochen',
+                awaitingCutoverBanner: 'Die Datenträger sind bereitgestellt und die Quell-VM läuft noch. Bestätige die Umschaltung, sobald du die kurze Ausfallzeit in Kauf nehmen möchtest.',
+                awaitingCutoverShort: 'Bereit zum Umschalten — Quelle läuft noch.',
+                commitSwitchover: 'Jetzt umschalten',
+                cancelMigration: 'Migration abbrechen',
                 // #611 — Maintenance-Kapazitäts-Vorwarnung
                 maintPreviewProceed: 'Du kannst trotzdem fortfahren — das ist nur eine Kapazitätsprüfung, keine harte Sperre.',
                 maintPreviewNoTargets: 'Warnung: Kein anderer Online-Knoten, um die Gäste dieses Knotens zu evakuieren — sie laufen weiter (ein Reboot nimmt sie herunter).',
@@ -4175,6 +4188,19 @@
                 clusterHealthSshMissing: 'Cluster Health benötigt SSH-Zugriff von PegaProx auf den Node (corosync-cfgtool, pvecm, systemctl). Bitte die Node-Shell-SSH-Credentials des Clusters konfigurieren und neu laden.',
             },
             en: {
+                // #562 — V2P cutover confirmation gate (ajoergensen)
+                waitForConfirmation: 'Wait for my confirmation before switchover',
+                waitForConfirmationDesc: 'The migration pauses right before the final cutover — with the source VM still running — and waits for you to commit the switchover, so you schedule the seconds of downtime yourself (drain monitoring, flip DNS, then commit). Most effective on the near-zero-downtime modes (vmkfstools-clone / auto / snapshot-zero).',
+                cutoverConfirmed: 'Switchover confirmed',
+                cutoverProceeding: 'Proceeding with the cutover now',
+                cutoverCancelled: 'Migration cancelled',
+                sourceLeftRunning: 'The source VM was left running',
+                phaseAwaitingConfirmation: 'Awaiting Confirmation',
+                phaseCancelled: 'Cancelled',
+                awaitingCutoverBanner: 'Disks are staged and the source VM is still running. Commit the switchover when you are ready to take the brief downtime.',
+                awaitingCutoverShort: 'Ready to switch over — source still running.',
+                commitSwitchover: 'Commit switchover now',
+                cancelMigration: 'Cancel migration',
                 // #611 — maintenance capacity pre-warning
                 maintPreviewProceed: 'You can still proceed — this is only a capacity pre-check, not a hard block.',
                 maintPreviewNoTargets: 'Warning: no other online node to evacuate this node\'s guests to — they will keep running (a reboot takes them down).',
@@ -8438,6 +8464,19 @@
             // French translations by @IMNotMax (PR #186)
             // Falls back to EN for missing keys
             fr: {
+                // #562 — V2P cutover confirmation gate (ajoergensen)
+                waitForConfirmation: 'Attendre ma confirmation avant la bascule',
+                waitForConfirmationDesc: 'La migration se met en pause juste avant la bascule finale — la VM source continue de tourner — et attend votre confirmation pour basculer. Vous planifiez ainsi vous-même les quelques secondes d\'indisponibilité (couper la supervision, changer le DNS, puis confirmer). Plus efficace avec les modes à temps d\'arrêt quasi nul (vmkfstools-clone / auto / snapshot-zero).',
+                cutoverConfirmed: 'Bascule confirmée',
+                cutoverProceeding: 'Bascule en cours',
+                cutoverCancelled: 'Migration annulée',
+                sourceLeftRunning: 'La VM source a été laissée en marche',
+                phaseAwaitingConfirmation: 'En attente de confirmation',
+                phaseCancelled: 'Annulée',
+                awaitingCutoverBanner: 'Les disques sont prêts et la VM source tourne encore. Confirmez la bascule quand vous êtes prêt à assumer la brève indisponibilité.',
+                awaitingCutoverShort: 'Prêt à basculer — source toujours active.',
+                commitSwitchover: 'Basculer maintenant',
+                cancelMigration: 'Annuler la migration',
                 // #611 — pré-avertissement de capacité maintenance
                 maintPreviewProceed: 'Vous pouvez tout de même continuer — ce n\'est qu\'une pré-vérification de capacité, pas un blocage.',
                 maintPreviewNoTargets: 'Avertissement : aucun autre nœud en ligne pour évacuer les invités de ce nœud — ils continueront de tourner (un redémarrage les arrêtera).',
@@ -12287,6 +12326,19 @@
                 clusterHealthSshMissing: 'Cluster Health a besoin d\'un accès SSH au nœud depuis PegaProx (corosync-cfgtool, pvecm, systemctl). Configurez les identifiants SSH Node-Shell du cluster et actualisez.',
             },
             es: {
+                // #562 — V2P cutover confirmation gate (ajoergensen)
+                waitForConfirmation: 'Esperar mi confirmación antes del cambio',
+                waitForConfirmationDesc: 'La migración se pausa justo antes del cambio final — con la VM de origen todavía en marcha — y espera a que confirmes el cambio, para que programes tú mismo los segundos de inactividad (silenciar la monitorización, cambiar el DNS y luego confirmar). Más eficaz en los modos de inactividad casi nula (vmkfstools-clone / auto / snapshot-zero).',
+                cutoverConfirmed: 'Cambio confirmado',
+                cutoverProceeding: 'Realizando el cambio ahora',
+                cutoverCancelled: 'Migración cancelada',
+                sourceLeftRunning: 'La VM de origen se dejó en marcha',
+                phaseAwaitingConfirmation: 'Esperando confirmación',
+                phaseCancelled: 'Cancelada',
+                awaitingCutoverBanner: 'Los discos están preparados y la VM de origen sigue en marcha. Confirma el cambio cuando estés listo para asumir la breve inactividad.',
+                awaitingCutoverShort: 'Listo para cambiar — origen todavía en marcha.',
+                commitSwitchover: 'Cambiar ahora',
+                cancelMigration: 'Cancelar migración',
                 // #611 — pre-aviso de capacidad de mantenimiento
                 maintPreviewProceed: 'Aún puedes continuar — esto es solo una comprobación previa de capacidad, no un bloqueo.',
                 maintPreviewNoTargets: 'Advertencia: no hay otro nodo en línea para evacuar los invitados de este nodo — seguirán ejecutándose (un reinicio los apagará).',
@@ -16279,6 +16331,19 @@
                 clusterHealthSshMissing: 'Cluster Health requiere acceso SSH al nodo desde PegaProx (corosync-cfgtool, pvecm, systemctl). Configure las credenciales SSH de Node-Shell del clúster y actualice.',
             },
             pt: {
+                // #562 — V2P cutover confirmation gate (ajoergensen)
+                waitForConfirmation: 'Aguardar a minha confirmação antes da comutação',
+                waitForConfirmationDesc: 'A migração pausa mesmo antes da comutação final — com a VM de origem ainda em execução — e aguarda a sua confirmação para comutar, para que agende você mesmo os segundos de indisponibilidade (silenciar a monitorização, alterar o DNS e depois confirmar). Mais eficaz nos modos de indisponibilidade quase nula (vmkfstools-clone / auto / snapshot-zero).',
+                cutoverConfirmed: 'Comutação confirmada',
+                cutoverProceeding: 'A efetuar a comutação agora',
+                cutoverCancelled: 'Migração cancelada',
+                sourceLeftRunning: 'A VM de origem foi deixada em execução',
+                phaseAwaitingConfirmation: 'A aguardar confirmação',
+                phaseCancelled: 'Cancelada',
+                awaitingCutoverBanner: 'Os discos estão preparados e a VM de origem ainda está em execução. Confirme a comutação quando estiver pronto para assumir a breve indisponibilidade.',
+                awaitingCutoverShort: 'Pronto para comutar — origem ainda em execução.',
+                commitSwitchover: 'Comutar agora',
+                cancelMigration: 'Cancelar migração',
                 // #611 — pré-aviso de capacidade de manutenção
                 maintPreviewProceed: 'Você ainda pode continuar — isto é apenas uma verificação prévia de capacidade, não um bloqueio.',
                 maintPreviewNoTargets: 'Aviso: nenhum outro nó online para evacuar os convidados deste nó — eles continuarão em execução (uma reinicialização irá desligá-los).',
@@ -20071,6 +20136,19 @@
                 clusterHealthSshMissing: 'Cluster Health requer acesso SSH ao nó a partir do PegaProx (corosync-cfgtool, pvecm, systemctl). Configure as credenciais SSH de Node-Shell do cluster e atualize.',
             },
             ko: {
+                // #562 — V2P cutover confirmation gate (ajoergensen)
+                waitForConfirmation: '전환 전 확인 대기',
+                waitForConfirmationDesc: '마이그레이션이 최종 전환 직전에 일시 중지되며(원본 VM은 계속 실행 중) 사용자가 전환을 확정할 때까지 기다립니다. 이렇게 하면 짧은 다운타임을 직접 계획할 수 있습니다(모니터링 음소거, DNS 변경 후 확정). 거의 무중단 모드(vmkfstools-clone / auto / snapshot-zero)에서 가장 효과적입니다.',
+                cutoverConfirmed: '전환 확인됨',
+                cutoverProceeding: '지금 전환을 진행합니다',
+                cutoverCancelled: '마이그레이션 취소됨',
+                sourceLeftRunning: '원본 VM은 계속 실행 중입니다',
+                phaseAwaitingConfirmation: '확인 대기 중',
+                phaseCancelled: '취소됨',
+                awaitingCutoverBanner: '디스크가 준비되었고 원본 VM이 여전히 실행 중입니다. 짧은 다운타임을 감수할 준비가 되면 전환을 확정하세요.',
+                awaitingCutoverShort: '전환 준비 완료 — 원본이 여전히 실행 중입니다.',
+                commitSwitchover: '지금 전환',
+                cancelMigration: '마이그레이션 취소',
                 // #611 — 유지보수 용량 사전 경고
                 maintPreviewProceed: '그래도 계속 진행할 수 있습니다 — 이것은 용량 사전 점검일 뿐이며 강제 차단이 아닙니다.',
                 maintPreviewNoTargets: '경고: 이 노드의 게스트를 옮길 다른 온라인 노드가 없습니다 — 게스트는 계속 실행됩니다(재부팅 시 종료됨).',
@@ -23990,6 +24068,19 @@
                 clusterHealthSshMissing: 'Cluster Health richiede l\'accesso SSH al nodo da PegaProx (corosync-cfgtool, pvecm, systemctl). Configura le credenziali SSH Node-Shell del cluster e aggiorna.',
             },
             it: {
+                // #562 — V2P cutover confirmation gate (ajoergensen)
+                waitForConfirmation: 'Attendere la mia conferma prima del passaggio',
+                waitForConfirmationDesc: 'La migrazione si mette in pausa subito prima del passaggio finale — con la VM di origine ancora in esecuzione — e attende la tua conferma per il passaggio, così pianifichi tu stesso i pochi secondi di inattività (silenzia il monitoraggio, cambia il DNS, poi conferma). Più efficace nelle modalità a inattività quasi nulla (vmkfstools-clone / auto / snapshot-zero).',
+                cutoverConfirmed: 'Passaggio confermato',
+                cutoverProceeding: 'Esecuzione del passaggio in corso',
+                cutoverCancelled: 'Migrazione annullata',
+                sourceLeftRunning: 'La VM di origine è stata lasciata in esecuzione',
+                phaseAwaitingConfirmation: 'In attesa di conferma',
+                phaseCancelled: 'Annullata',
+                awaitingCutoverBanner: 'I dischi sono pronti e la VM di origine è ancora in esecuzione. Conferma il passaggio quando sei pronto ad accettare la breve inattività.',
+                awaitingCutoverShort: 'Pronto al passaggio — origine ancora in esecuzione.',
+                commitSwitchover: 'Passa ora',
+                cancelMigration: 'Annulla migrazione',
                 // MK May 2026 — PVE 9.2 CRS + token rotate + OIDC audiences strings
                 installStarwindPlugin: 'Installa plugin su tutti i nodi',
                 installStarwindPluginHint: 'Installa starwind-proxmox-plugin dal repository apt firmato di StarWind su ogni nodo.',
@@ -27636,6 +27727,19 @@
                 datastoreFound: 'Datastore trovato',
             },
             it: {
+                // #562 — V2P cutover confirmation gate (ajoergensen)
+                waitForConfirmation: 'Attendere la mia conferma prima del passaggio',
+                waitForConfirmationDesc: 'La migrazione si mette in pausa subito prima del passaggio finale — con la VM di origine ancora in esecuzione — e attende la tua conferma per il passaggio, così pianifichi tu stesso i pochi secondi di inattività (silenzia il monitoraggio, cambia il DNS, poi conferma). Più efficace nelle modalità a inattività quasi nulla (vmkfstools-clone / auto / snapshot-zero).',
+                cutoverConfirmed: 'Passaggio confermato',
+                cutoverProceeding: 'Esecuzione del passaggio in corso',
+                cutoverCancelled: 'Migrazione annullata',
+                sourceLeftRunning: 'La VM di origine è stata lasciata in esecuzione',
+                phaseAwaitingConfirmation: 'In attesa di conferma',
+                phaseCancelled: 'Annullata',
+                awaitingCutoverBanner: 'I dischi sono pronti e la VM di origine è ancora in esecuzione. Conferma il passaggio quando sei pronto ad accettare la breve inattività.',
+                awaitingCutoverShort: 'Pronto al passaggio — origine ancora in esecuzione.',
+                commitSwitchover: 'Passa ora',
+                cancelMigration: 'Annulla migrazione',
                 // #611 — pre-avviso capacità manutenzione
                 maintPreviewProceed: 'Puoi comunque procedere — questo è solo un controllo preventivo della capacità, non un blocco.',
                 maintPreviewNoTargets: 'Avviso: nessun altro nodo online su cui evacuare gli ospiti di questo nodo — continueranno a funzionare (un riavvio li spegnerà).',

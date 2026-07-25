@@ -20,6 +20,15 @@ from pegaprox.utils.ssh import _ssh_exec, _pve_node_exec
 from pegaprox.utils.realtime import broadcast_sse
 from pegaprox.utils.audit import log_audit
 
+
+class V2PCutoverCancelled(Exception):
+    """#562 — raised when an operator cancels a migration at the (optional)
+    pre-cutover confirmation gate, or the gate times out waiting. Signals a
+    controlled abort: the source VM is still running and was never touched, so
+    the outer handler just cleans up the half-built target."""
+    pass
+
+
 class V2PMigrationTask:
     """Tracks VMware -> Proxmox migration through all phases.
     
@@ -56,6 +65,23 @@ class V2PMigrationTask:
         self.network_bridge = self.config.get('network_bridge', 'vmbr0')
         self.start_after = self.config.get('start_after', True)
         self.remove_source = self.config.get('remove_source', False)
+        # #562 (ajoergensen) — optional manual hold before the final switchover. When on,
+        # the migration parks in 'awaiting_confirmation' right before it would suspend the
+        # source and pivot to Proxmox, and blocks until the operator commits (or cancels)
+        # via the API — so the seconds of cutover downtime land when THEY schedule it (drain
+        # monitoring, flip DNS, etc.), not whenever the copy happens to finish. Only holds
+        # while the source VM is still running (a hold on an already-stopped source would
+        # just extend downtime). Off by default → byte-identical to every existing run.
+        self.wait_for_confirmation = bool(self.config.get('wait_for_confirmation', False))
+        self._cutover_confirmed = False
+        self._cutover_cancelled = False
+        # Generous safety cap so an abandoned migration doesn't pin a running source (and a
+        # greenlet) forever; hitting it aborts cleanly with the source untouched. Operators
+        # who genuinely need a longer window can raise it per-job. 0/negative => wait forever.
+        try:
+            self._confirmation_timeout = int(self.config.get('confirmation_timeout', 86400))
+        except (ValueError, TypeError):
+            self._confirmation_timeout = 86400
         # ESXi SSH credentials (required for SSHFS).
         # MK May 2026 (audit fix M-10) — password gets popped out of self.config
         # immediately so it doesn't sit in the serializable config dict for the
@@ -234,6 +260,63 @@ class V2PMigrationTask:
                 })
         except: pass
     
+    def await_cutover_confirmation(self, source_running=True):
+        """#562 — optional hold immediately before the final cutover. When the job was
+        created with wait_for_confirmation, park in 'awaiting_confirmation' and block
+        until the operator commits (or cancels) the switchover via the API. No-op when
+        the flag is off, so existing migrations are byte-identical.
+
+        The hold only makes sense while the source VM is still serving — on transfer
+        modes that already stopped the source (offline / sshfs-boot / VM-was-off), a
+        hold here would just extend downtime, so callers pass source_running=False and
+        we commit immediately (with a log line explaining why).
+
+        Raises V2PCutoverCancelled on operator-cancel, external abort, or timeout — the
+        source is still running in every one of those cases, so the outer handler tears
+        down only the half-built target."""
+        if not getattr(self, 'wait_for_confirmation', False):
+            return
+        if not source_running:
+            self.log("Cutover-confirmation was requested, but the source VM is already "
+                     "stopped on this transfer mode — committing the switchover now "
+                     "(holding here would only add downtime).")
+            return
+        self._cutover_confirmed = False
+        self._cutover_cancelled = False
+        self.set_phase('awaiting_confirmation')
+        self.log("=== HOLD FOR CONFIRMATION: disks are staged and the source VM is STILL "
+                 "RUNNING on VMware. The switchover (suspend source → start target) will "
+                 "happen only when you confirm. Drain traffic / flip DNS now, then commit. ===")
+        try:
+            broadcast_sse('vmware_migration', {
+                'id': self.id, 'phase': self.phase, 'status': self.status,
+                'progress': self.progress, 'vm_name': self.vm_name,
+                'awaiting_confirmation': True, 'error': self.error,
+                'disk_progress': self.disk_progress
+            })
+        except Exception:
+            pass
+        POLL = 2
+        cap = getattr(self, '_confirmation_timeout', 86400)
+        waited = 0
+        while not self._cutover_confirmed:
+            if self._cutover_cancelled:
+                raise V2PCutoverCancelled(
+                    "Cancelled by operator at the cutover gate — source VM left running.")
+            if self.status in ('failed', 'cancelled'):
+                raise V2PCutoverCancelled(
+                    "Migration aborted while awaiting cutover confirmation.")
+            time.sleep(POLL)
+            waited += POLL
+            if cap and cap > 0 and waited >= cap:
+                raise V2PCutoverCancelled(
+                    f"No cutover confirmation within {cap}s — aborting to avoid an "
+                    f"unattended switchover. Source VM is untouched (still running).")
+        # The source ran throughout the hold, so real downtime only begins now — reset the
+        # clock so the (possibly long) confirmation wait isn't billed as downtime.
+        self.downtime_start = datetime.now()
+        self.log("=== Operator confirmed — proceeding with the switchover now. ===")
+
     def to_dict(self):
         return {
             'id': self.id, 'vmware_id': self.vmware_id, 'vm_id': self.vm_id,
@@ -241,6 +324,10 @@ class V2PMigrationTask:
             'target_node': self.target_node, 'target_storage': self.target_storage,
             'proxmox_vmid': self.proxmox_vmid, 'phase': self.phase, 'status': self.status,
             'progress': self.progress, 'error': self.error,
+            # #562 — surface the confirmation gate so the UI can show a "commit switchover"
+            # button exactly when the migration is parked waiting on the operator.
+            'wait_for_confirmation': getattr(self, 'wait_for_confirmation', False),
+            'awaiting_confirmation': self.phase == 'awaiting_confirmation',
             'started_at': self.started_at.isoformat(),
             'completed_at': self.completed_at.isoformat() if self.completed_at else None,
             'disk_progress': self.disk_progress, 'phase_times': self.phase_times,
@@ -916,6 +1003,8 @@ def _run_v2p_migration(task):
                     raise Exception("delta loop returned failure")
                 task.log(f"=== DELTA LOOP CONVERGED after {n_iters} iterations ===")
 
+                # #562 — optional operator-scheduled cutover (source still running here)
+                task.await_cutover_confirmation()
                 # Cutover — minimal downtime
                 task.set_phase('cutover')
                 cut_t0 = time.time()
@@ -1269,6 +1358,9 @@ def _run_v2p_migration(task):
                 try: _maybe_convert_disks_to_qcow2(pve_mgr, task)
                 except Exception as _qe: task.log(f"  qcow2 convert skipped: {_qe}")
 
+                # #562 — optional operator-scheduled cutover. The clone finished and the
+                # source VM is still running on ESXi, so this is the clean seam to hold.
+                task.await_cutover_confirmation()
                 # --- cutover (short downtime: stop source, start target) ---
                 # v1 has no delta replay; the delta_sync→cutover transitions just bracket the
                 # cutover so the downtime metric (downtime_start/end) is recorded.
@@ -1551,6 +1643,8 @@ def _run_v2p_migration(task):
                     raise Exception("snapshot_zero failed")
                 task.log(f"=== SNAPSHOT-ZERO converged after {n_iters} iterations ===")
 
+                # #562 — optional operator-scheduled cutover (source still running here)
+                task.await_cutover_confirmation()
                 # ===== CUTOVER: ESXi-suspend → final delta → start Proxmox VM =====
                 task.set_phase('cutover')
                 cut_t0 = time.time()
@@ -1740,6 +1834,10 @@ def _run_v2p_migration(task):
             # ================================================================
         # PHASE: CUTOVER
         # ================================================================
+        # #562 — optional operator-scheduled cutover. Only hold if the source VM was
+        # still running (i.e. we actually did a live delta sync); if it was stopped for
+        # the pre-sync copy, holding here would only extend downtime, so skip.
+        task.await_cutover_confirmation(source_running=not stopped_for_presync)
         task.set_phase('cutover')
         _pve_node_exec(pve_mgr, task.target_node,
             f"qm set {task.proxmox_vmid} --boot order={disk_bus}0 2>&1", timeout=15)
@@ -1799,6 +1897,42 @@ def _run_v2p_migration(task):
         dt_msg = f" (downtime: {task.total_downtime_seconds:.1f}s)" if task.total_downtime_seconds else ""
         task.log(f"COMPLETED{dt_msg}: {task.vm_name} -> VMID {task.proxmox_vmid}")
         
+    except V2PCutoverCancelled as _cc:
+        # #562 — operator cancelled (or the confirmation gate timed out) BEFORE the
+        # switchover. The source VM was never suspended, so it's still running and
+        # serving — mark the run 'cancelled' (not the red 'failed'), tear down only the
+        # staging mount + migration snapshot, and scrub credentials. The half-built
+        # target VM is left in place exactly as a mid-run failure would (same behaviour).
+        task.error = str(_cc)
+        task.phase = 'cancelled'
+        task.status = 'cancelled'
+        task.completed_at = datetime.now()
+        task.log(f"CANCELLED: {_cc}")
+        try: task._scrub_credentials()
+        except Exception: pass
+        try: _cleanup_sshfs(pve_mgr, task.target_node, mnt_path)
+        except Exception: pass
+        try:
+            vmware_mgr = vmware_managers.get(task.vmware_id)
+            if vmware_mgr:
+                try: vmware_mgr.delete_migration_snapshot(task.vm_id)
+                except Exception: pass
+                for sn in list(getattr(task, '_extra_snapshots', []) or []):
+                    try:
+                        snap_list = vmware_mgr.get_snapshots(task.vm_id).get('data', []) or []
+                        tgt = next((s for s in snap_list if s.get('name') == sn), None)
+                        if tgt:
+                            vmware_mgr.delete_snapshot(task.vm_id, str(tgt.get('snapshot') or tgt.get('id') or ''))
+                    except Exception: pass
+        except Exception: pass
+        try:
+            broadcast_sse('vmware_migration', {
+                'id': task.id, 'phase': task.phase, 'status': task.status,
+                'progress': task.progress, 'vm_name': task.vm_name,
+                'error': task.error, 'disk_progress': task.disk_progress
+            })
+        except Exception: pass
+        return
     except Exception as e:
         task.set_phase('failed', str(e))
         try: _cleanup_sshfs(pve_mgr, task.target_node, mnt_path)
@@ -4048,6 +4182,9 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
     # post-stop-and-restart fallback path. Live pivot returns before that.
     bios = getattr(task, 'bios_override', None) or getattr(task, '_detected_bios', 'seabios')
 
+    # #562 — sshfs-boot requires the source already stopped (see docstring), so a
+    # confirmation hold here would only add downtime: log-and-commit, never block.
+    task.await_cutover_confirmation(source_running=False)
     task.set_phase('cutover')
     
     # ================================================================
