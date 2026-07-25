@@ -22137,6 +22137,7 @@
                                             authFetch={authFetch}
                                             API_URL={API_URL}
                                             addToast={addToast}
+                                            canAdminSettings={isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes('admin.settings'))}
                                         />
                                     </div>
                                 ) : (

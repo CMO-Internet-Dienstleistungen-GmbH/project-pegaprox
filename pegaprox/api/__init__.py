@@ -42,7 +42,7 @@ def register_blueprints(app):
     from pegaprox.api.topology import bp as topology_bp
     from pegaprox.api.power import bp as power_bp
     from pegaprox.api.dr_drill import bp as dr_drill_bp
-    from pegaprox.api.multi_sdn import bp as multi_sdn_bp
+    from pegaprox.api.multi_sdn import bp as multi_sdn_bp, start_scanner as start_multi_sdn_scanner
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(users_bp)
@@ -96,6 +96,13 @@ def register_blueprints(app):
         start_drift_scanner()
     except Exception as e:
         logging.warning(f"drift scanner start failed: {e}")
+
+    # MK Jul 2026 — #612 Phase 2: cross-cluster EVPN drift scanner (6h cadence,
+    # detect-only unless multi_sdn_drift_reconcile is opted in)
+    try:
+        start_multi_sdn_scanner()
+    except Exception as e:
+        logging.warning(f"multi_sdn scanner start failed: {e}")
 
     # MK May 2026 — SIEM forwarder worker
     try:

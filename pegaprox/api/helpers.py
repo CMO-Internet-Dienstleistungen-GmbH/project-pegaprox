@@ -39,6 +39,10 @@ def load_server_settings():
         'domain': '',
         'port': 5000,  # Web server port
         'ssl_enabled': False,
+        # MK Jul 2026 — #612 Phase 2: auto-reconcile cross-cluster EVPN drift. OFF by
+        # default → the drift scanner is detect-only (never writes to a production SDN
+        # uninvited); opt in to let it re-push the desired definition to drifted members.
+        'multi_sdn_drift_reconcile': False,
         # MK: Mar 2026 - ACME / Let's Encrypt auto-certs (#96)
         'acme_enabled': False,
         'acme_email': '',

@@ -29,8 +29,11 @@ import ipaddress
 import json
 import logging
 import re
+import threading
+import time
 import uuid
 from datetime import datetime
+from urllib.parse import quote
 
 from flask import Blueprint, jsonify, request
 
@@ -39,7 +42,7 @@ from pegaprox.core.db import get_db
 from pegaprox.utils.auth import require_auth
 from pegaprox.utils.audit import log_audit
 from pegaprox.utils.concurrent import run_per_node
-from pegaprox.api.helpers import check_cluster_access, parse_pve_error
+from pegaprox.api.helpers import check_cluster_access, parse_pve_error, load_server_settings
 
 bp = Blueprint('multi_sdn', __name__)
 
@@ -119,6 +122,21 @@ def _sdn_delete(mgr, suffix):
         resp = mgr._api_delete(f"{_sdn_base(mgr)}/{suffix}", timeout=15)
     except Exception as e:
         return False, f"request failed: {e}"
+    if resp.status_code in (200, 201):
+        return True, None
+    return False, parse_pve_error(resp.text)
+
+
+def _sdn_put(mgr, suffix, body):
+    """PUT an update on a /cluster/sdn/<suffix> object; (ok, err). 200 => ok.
+    PVE partial-updates: only the keys in `body` change. Last-write-wins (no digest,
+    matching the existing single-cluster SDN routes)."""
+    try:
+        resp = mgr._api_put(f"{_sdn_base(mgr)}/{suffix}", data=body, timeout=15)
+    except Exception as e:
+        return False, f"request failed: {e}"
+    if resp.status_code == 501:
+        return False, 'sdn_not_installed'
     if resp.status_code in (200, 201):
         return True, None
     return False, parse_pve_error(resp.text)
@@ -327,6 +345,11 @@ def _apply_on_cluster(cid, defn):
     have_zone = any(z.get('zone') == defn['zone'] for z in zones)
     have_vnet = any(v.get('vnet') == defn['name'] for v in vnets)
 
+    # track whether we ACTUALLY created anything this pass — only then do we run the
+    # (disruptive, cluster-wide) apply. A pure re-assert where everything already exists
+    # must NOT trigger a needless SDN reload — that's the over-broad-blast-radius fix.
+    changed = False
+
     def _step(label, ok, e=None):
         result['steps'].append({'step': label, 'ok': ok, 'error': e})
         return ok
@@ -339,6 +362,7 @@ def _apply_on_cluster(cid, defn):
         if not _step('controller', ok, e):
             result['error'] = f"controller: {e}"
             return result
+        changed = True
     # 2) zone (depends on controller)
     if have_zone:
         _step('zone (exists)', True)
@@ -347,6 +371,7 @@ def _apply_on_cluster(cid, defn):
         if not _step('zone', ok, e):
             result['error'] = f"zone: {e}"
             return result
+        changed = True
     # 3) vnet (depends on zone)
     if have_vnet:
         _step('vnet (exists)', True)
@@ -355,6 +380,7 @@ def _apply_on_cluster(cid, defn):
         if not _step('vnet', ok, e):
             result['error'] = f"vnet: {e}"
             return result
+        changed = True
     # 4) subnets (nested under vnet) — best-effort idempotent
     if defn['subnets']:
         existing_subs, _serr = _sdn_list(mgr, f"vnets/{defn['name']}/subnets")
@@ -382,11 +408,15 @@ def _apply_on_cluster(cid, defn):
             if not _step(f"subnet {sub['cidr']}", ok, e):
                 result['error'] = f"subnet {sub['cidr']}: {e}"
                 return result
-    # 5) apply (cluster-wide reload)
-    ok, e = _sdn_apply(mgr)
-    if not _step('apply', ok, e):
-        result['error'] = f"apply: {e}"
-        return result
+            changed = True
+    # 5) apply (cluster-wide reload) — ONLY if we actually created something this pass
+    if changed:
+        ok, e = _sdn_apply(mgr)
+        if not _step('apply', ok, e):
+            result['error'] = f"apply: {e}"
+            return result
+    else:
+        _step('apply (skipped — nothing to change)', True)
 
     result['status'] = 'applied'
     return result
@@ -416,33 +446,124 @@ def _rollback_on_cluster(cid, defn):
     return out
 
 
+def _canon_net(cidr):
+    """Canonical network string for equality compares; passthrough on unparseable."""
+    try:
+        return str(ipaddress.ip_network(str(cidr), strict=False))
+    except (ValueError, TypeError):
+        return str(cidr)
+
+
 def _live_status_on_cluster(cid, defn):
-    """Read live SDN state on ONE cluster and classify vs the desired definition:
-    in_sync / drift / missing / offline / sdn_not_installed / error."""
-    st = {'cluster_id': cid, 'state': 'error', 'detail': ''}
+    """Read live SDN state on ONE cluster and classify vs the desired definition. The
+    result uses the same 'status' key as _apply_on_cluster so both feed per_cluster_status
+    and the same UI badge: in_sync / drift / missing / offline / not_found /
+    sdn_not_installed / error. 'detail' explains a drift."""
+    st = {'cluster_id': cid, 'status': 'error', 'detail': '', 'error': None}
     mgr, reason = _resolve_member(cid)
     if reason:
-        st['state'] = 'offline' if reason == 'offline' else 'not_found'
+        st['status'] = 'offline' if reason == 'offline' else 'not_found'
         return st
     vnets, err = _sdn_list(mgr, 'vnets')
     if err == 'sdn_not_installed':
-        st['state'] = 'sdn_not_installed'
+        st['status'] = 'sdn_not_installed'
         return st
     if err:
-        st['detail'] = err
+        st['error'] = err
         return st
     v = next((x for x in vnets if x.get('vnet') == defn['name']), None)
     if not v:
-        st['state'] = 'missing'
+        st['status'] = 'missing'
         return st
     diffs = []
     if str(v.get('zone') or '') not in ('', defn['zone']):
         diffs.append(f"zone={v.get('zone')}≠{defn['zone']}")
-    if str(v.get('tag') or '') not in ('', str(defn['vni'])):
-        diffs.append(f"tag={v.get('tag')}≠{defn['vni']}")
-    st['state'] = 'drift' if diffs else 'in_sync'
+    if str(v.get('tag') or '') not in ('', str(defn.get('vni'))):
+        diffs.append(f"tag={v.get('tag')}≠{defn.get('vni')}")
+    if str(v.get('alias') or '') != str(defn.get('alias') or ''):
+        diffs.append(f"alias='{v.get('alias')}'≠'{defn.get('alias')}'")
+    st['status'] = 'drift' if diffs else 'in_sync'
     st['detail'] = '; '.join(diffs)
     return st
+
+
+def _edit_on_cluster(cid, defn, changes):
+    """Apply an EDIT (alias change + subnet add/remove) to ONE member's EVPN vnet, then
+    apply. `changes` = {'alias': <str|None=unchanged>, 'add_subnets': [{cidr,gateway,snat}],
+    'del_cidrs': [cidr,...]}. Best-effort per step; one apply at the end if anything changed."""
+    result = {'cluster_id': cid, 'status': 'failed', 'steps': [], 'error': None}
+    mgr, reason = _resolve_member(cid)
+    if reason:
+        result['status'] = 'offline' if reason == 'offline' else 'not_found'
+        result['error'] = reason
+        return result
+
+    def _step(label, ok, e=None):
+        result['steps'].append({'step': label, 'ok': ok, 'error': e})
+        return ok
+
+    changed = False
+    if changes.get('alias') is not None:
+        body = {'alias': changes['alias']} if changes['alias'] else {'delete': 'alias'}
+        ok, e = _sdn_put(mgr, f"vnets/{defn['name']}", body)
+        if not _step('alias', ok, e):
+            result['error'] = f"alias: {e}"
+            return result
+        changed = True
+    for sub in changes.get('add_subnets', []):
+        body = {'subnet': sub['cidr'], 'type': 'subnet'}
+        if sub.get('gateway'):
+            body['gateway'] = sub['gateway']
+        if sub.get('snat'):
+            body['snat'] = 1
+        ok, e = _sdn_post(mgr, f"vnets/{defn['name']}/subnets", body)
+        if not ok and e and 'already exist' in str(e).lower():
+            ok = True   # idempotent add
+        if not _step(f"add subnet {sub['cidr']}", ok, e):
+            result['error'] = f"add subnet {sub['cidr']}: {e}"
+            return result
+        changed = True
+    if changes.get('del_cidrs'):
+        existing, _e = _sdn_list(mgr, f"vnets/{defn['name']}/subnets")
+        want = {_canon_net(c) for c in changes['del_cidrs']}
+        for es in (existing or []):
+            sid = str(es.get('subnet') or '')
+            if _canon_net(es.get('cidr') or '') in want and sid:
+                # subnet id is "<zone>-<cidr>" and carries a '/', so URL-encode it fully
+                ok, e = _sdn_delete(mgr, f"vnets/{defn['name']}/subnets/{quote(sid, safe='')}")
+                _step(f"del subnet {es.get('cidr')}", ok, e)
+                changed = True
+    if changed:
+        ok, e = _sdn_apply(mgr)
+        if not _step('apply', ok, e):
+            result['error'] = f"apply: {e}"
+            return result
+    result['status'] = 'applied'
+    return result
+
+
+def _reconcile_on_cluster(cid, defn):
+    """Re-assert the desired definition on ONE member: create anything missing (idempotent,
+    via _apply_on_cluster) and fix a drifted alias with a PUT. Structural drift (tag/zone
+    mismatch) is reported by the scanner but NOT auto-changed here — that would be a
+    disruptive rebuild, out of Phase-2 scope."""
+    base = _apply_on_cluster(cid, defn)
+    if base['status'] != 'applied':
+        return base
+    mgr, reason = _resolve_member(cid)
+    if reason:
+        return base
+    vnets, err = _sdn_list(mgr, 'vnets')
+    if err:
+        return base
+    v = next((x for x in vnets if x.get('vnet') == defn['name']), None)
+    if v is not None and str(v.get('alias') or '') != str(defn.get('alias') or ''):
+        body = {'alias': defn['alias']} if defn.get('alias') else {'delete': 'alias'}
+        ok, e = _sdn_put(mgr, f"vnets/{defn['name']}", body)
+        base['steps'].append({'step': 'reassert-alias', 'ok': ok, 'error': e})
+        if ok:
+            _sdn_apply(mgr)
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -469,13 +590,16 @@ def _caller_can_access_all(member_ids):
 
 
 def _rollup_status(per_cluster):
-    """applied / partial / failed from the per-cluster result map."""
+    """Roll up per-cluster status. Accepts both apply-results ('applied') and drift-scan
+    results ('in_sync'), which both count as good; any 'drift' → partial (amber)."""
     states = [v.get('status') for v in per_cluster.values()]
     if not states:
         return 'pending'
-    good = [s for s in states if s == 'applied']
+    good = [s for s in states if s in ('applied', 'in_sync')]
     if len(good) == len(states):
         return 'applied'
+    if any(s == 'drift' for s in states):
+        return 'partial'
     if not good:
         return 'failed'
     return 'partial'
@@ -667,7 +791,9 @@ def reapply_multi_vnet(vid):
         return jsonify({'error': 'record has no stored definition'}), 500
 
     prev = rec.get('per_cluster_status', {})
-    todo = [c for c in members if (prev.get(c) or {}).get('status') != 'applied']
+    # 'in_sync' (from a drift scan) is as healthy as 'applied' — don't re-apply it and
+    # trigger a needless cluster-wide reload. Only members that are actually off get redone.
+    todo = [c for c in members if (prev.get(c) or {}).get('status') not in ('applied', 'in_sync')]
     if not todo:
         todo = members  # allow a full re-apply if everything already applied
     results = run_per_node(
@@ -715,3 +841,240 @@ def delete_multi_vnet(vid):
               f"Deleted cross-cluster vnet record '{rec.get('name')}'"
               + (f" + purged from {len(members)} clusters" if purge else " (record only)"))
     return jsonify({'ok': True, 'purged': purged})
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — edit (alias/subnets), reconcile, drift scan
+# ---------------------------------------------------------------------------
+@bp.route('/api/multi-sdn/vnets/<vid>', methods=['PUT'])
+@require_auth(perms=['sdn.manage', 'admin.settings'])
+def edit_multi_vnet(vid):
+    """Edit a cross-cluster EVPN vnet: alias + subnet add/remove, fanned out to every
+    member. Structural fields (name/zone/vni/asn/controller) are IMMUTABLE here — changing
+    them would rebuild the whole span, so delete + recreate instead."""
+    db = get_db()
+    row = db.query_one('SELECT * FROM multi_cluster_vnets WHERE id = ?', (vid,))
+    if not row:
+        return jsonify({'error': 'not found'}), 404
+    rec = _row_to_dict(row)
+    members = rec.get('member_clusters', [])
+    denied = _require_members_access(members)
+    if denied:
+        return denied
+    defn = rec.get('desired_state') or {}
+    if not defn:
+        return jsonify({'error': 'record has no stored definition'}), 500
+
+    body = request.get_json(force=True, silent=True) or {}
+    for f in ('name', 'zone', 'vni', 'asn', 'controller'):
+        if f in body and str(body[f]).strip() not in ('', str(defn.get(f, ''))):
+            return jsonify({'error': f"'{f}' is structural and cannot be edited — "
+                            f"delete and recreate the vNet to change it"}), 400
+
+    changes = {'alias': None, 'add_subnets': [], 'del_cidrs': []}
+    if 'alias' in body:
+        changes['alias'] = str(body.get('alias') or '').strip()
+    for s in (body.get('add_subnets') or []):
+        cidr = str((s.get('cidr') if isinstance(s, dict) else s) or '').strip()
+        try:
+            ipaddress.ip_network(cidr, strict=False)
+        except (ValueError, TypeError):
+            return jsonify({'error': f'invalid subnet CIDR: {cidr!r}'}), 400
+        entry = {'cidr': cidr}
+        if isinstance(s, dict):
+            gw = str(s.get('gateway', '') or '').strip()
+            if gw:
+                try:
+                    ipaddress.ip_address(gw)
+                except ValueError:
+                    return jsonify({'error': f'invalid gateway: {gw}'}), 400
+                entry['gateway'] = gw
+            if s.get('snat'):
+                entry['snat'] = True
+        changes['add_subnets'].append(entry)
+    for c in (body.get('del_subnets') or []):
+        cc = str((c.get('cidr') if isinstance(c, dict) else c) or '').strip()
+        try:
+            ipaddress.ip_network(cc, strict=False)
+        except (ValueError, TypeError):
+            return jsonify({'error': f'invalid subnet CIDR: {cc!r}'}), 400
+        changes['del_cidrs'].append(cc)
+    if changes['alias'] is None and not changes['add_subnets'] and not changes['del_cidrs']:
+        return jsonify({'error': 'nothing to change (alias / add_subnets / del_subnets)'}), 400
+
+    results = run_per_node(
+        {cid: (lambda c=cid: _edit_on_cluster(c, defn, changes)) for cid in members},
+        max_concurrent=8, timeout=120) or {}
+    per_cluster = {cid: (results.get(cid) if isinstance(results.get(cid), dict) else {
+        'cluster_id': cid, 'status': 'failed', 'error': 'no result', 'steps': []}) for cid in members}
+    rollup = _rollup_status(per_cluster)
+
+    # fold the edit back into the stored desired_state (alias + subnet set)
+    new_defn = dict(defn)
+    if changes['alias'] is not None:
+        new_defn['alias'] = changes['alias']
+    subs = [dict(x) for x in (defn.get('subnets') or [])]
+    del_nets = {_canon_net(c) for c in changes['del_cidrs']}
+    subs = [x for x in subs if _canon_net(x.get('cidr')) not in del_nets]
+    have = {_canon_net(x.get('cidr')) for x in subs}
+    for a in changes['add_subnets']:
+        cn = _canon_net(a['cidr'])
+        if cn not in have:
+            subs.append(a)
+            have.add(cn)   # update as we go so duplicates within add_subnets don't double-insert
+    new_defn['subnets'] = subs
+    now = datetime.now().isoformat()
+    db.execute('UPDATE multi_cluster_vnets SET alias = ?, subnets = ?, desired_state = ?, '
+               'per_cluster_status = ?, status = ?, updated_at = ? WHERE id = ?',
+               (new_defn.get('alias', ''), json.dumps(subs), json.dumps(new_defn),
+                json.dumps(per_cluster), rollup, now, vid))
+    log_audit(getattr(request, 'session', {}).get('user', 'system'),
+              'multi_sdn.vnet_edited', f"Edited cross-cluster vnet '{rec.get('name')}' → {rollup}")
+    row = db.query_one('SELECT * FROM multi_cluster_vnets WHERE id = ?', (vid,))
+    return jsonify(_row_to_dict(row))
+
+
+@bp.route('/api/multi-sdn/vnets/<vid>/reconcile', methods=['POST'])
+@require_auth(perms=['sdn.manage', 'admin.settings'])
+def reconcile_multi_vnet(vid):
+    """Re-assert the stored desired definition on every member (create anything missing +
+    fix alias drift) + apply. Manual, always available — independent of the auto-reconcile
+    setting. Structural drift (tag/zone) is reported but not auto-changed."""
+    db = get_db()
+    row = db.query_one('SELECT * FROM multi_cluster_vnets WHERE id = ?', (vid,))
+    if not row:
+        return jsonify({'error': 'not found'}), 404
+    rec = _row_to_dict(row)
+    members = rec.get('member_clusters', [])
+    denied = _require_members_access(members)
+    if denied:
+        return denied
+    defn = rec.get('desired_state') or {}
+    if not defn:
+        return jsonify({'error': 'record has no stored definition'}), 500
+    results = run_per_node(
+        {cid: (lambda c=cid: _reconcile_on_cluster(c, defn)) for cid in members},
+        max_concurrent=8, timeout=180) or {}
+    per_cluster = {cid: (results.get(cid) if isinstance(results.get(cid), dict) else {
+        'cluster_id': cid, 'status': 'failed', 'error': 'no result', 'steps': []}) for cid in members}
+    rollup = _rollup_status(per_cluster)
+    now = datetime.now().isoformat()
+    db.execute('UPDATE multi_cluster_vnets SET per_cluster_status = ?, status = ?, updated_at = ? WHERE id = ?',
+               (json.dumps(per_cluster), rollup, now, vid))
+    log_audit(getattr(request, 'session', {}).get('user', 'system'),
+              'multi_sdn.vnet_reconciled', f"Reconciled cross-cluster vnet '{rec.get('name')}' → {rollup}")
+    row = db.query_one('SELECT * FROM multi_cluster_vnets WHERE id = ?', (vid,))
+    return jsonify(_row_to_dict(row))
+
+
+@bp.route('/api/multi-sdn/vnets/<vid>/scan', methods=['POST'])
+@require_auth(perms=['node.view'])
+def scan_multi_vnet(vid):
+    """Read live per-member SDN state and persist the drift status. Detect-only — no writes
+    to any cluster. This is the manual 'scan now' behind the UI (read perm suffices)."""
+    db = get_db()
+    row = db.query_one('SELECT * FROM multi_cluster_vnets WHERE id = ?', (vid,))
+    if not row:
+        return jsonify({'error': 'not found'}), 404
+    rec = _row_to_dict(row)
+    members = rec.get('member_clusters', [])
+    if not _caller_can_access_all(members):
+        return jsonify({'error': 'not found'}), 404
+    defn = rec.get('desired_state') or {}
+    live = {cid: _live_status_on_cluster(cid, defn) for cid in members}
+    rollup = _rollup_status(live)
+    now = datetime.now().isoformat()
+    db.execute('UPDATE multi_cluster_vnets SET per_cluster_status = ?, status = ?, updated_at = ? WHERE id = ?',
+               (json.dumps(live), rollup, now, vid))
+    row = db.query_one('SELECT * FROM multi_cluster_vnets WHERE id = ?', (vid,))
+    return jsonify(_row_to_dict(row))
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — background drift scanner (detect-only by default)
+# ---------------------------------------------------------------------------
+# Mirrors api/drift.py: module-level running flag + lock, chunked sleep, plain daemon
+# Thread. Started once from api/__init__.register_blueprints(). Every tick it reads live
+# per-member SDN state for each aggregate vnet and persists the drift status. It only
+# WRITES to clusters (auto-reconcile) when the global opt-in setting
+# `multi_sdn_drift_reconcile` is on — off by default, so the scanner is detect-only and
+# never touches a production SDN uninvited.
+_msdn_scanner_running = False
+_msdn_scanner_lock = threading.Lock()
+MSDN_SCAN_INTERVAL = 6 * 3600  # 6h, same cadence as the config-drift scanner
+
+
+def _msdn_scan_once():
+    """One scan pass over all aggregate vnets. Extracted so tests can call it directly."""
+    try:
+        reconcile_on = bool(load_server_settings().get('multi_sdn_drift_reconcile', False))
+    except Exception:
+        reconcile_on = False
+    db = get_db()
+    rows = db.query('SELECT * FROM multi_cluster_vnets') or []
+    for row in rows:
+        try:
+            rec = _row_to_dict(row)
+            if not rec.get('enabled', True):
+                continue
+            defn = rec.get('desired_state') or {}
+            members = rec.get('member_clusters', [])
+            if not defn or not members:
+                continue
+            prior = rec.get('per_cluster_status', {}) or {}   # last pass, for the debounce
+            live = {cid: _live_status_on_cluster(cid, defn) for cid in members}
+            if reconcile_on:
+                # Reconcile ONLY the members that are actually off — never touch an in-sync
+                # member (each _reconcile is a cluster-wide SDN reload, so fanning it across
+                # the whole span for one drifted member is over-broad blast radius).
+                # A 'drift' (alias mismatch) is a cheap safe PUT → fix on first sight.
+                # A 'missing' member means a full recreate, so DEBOUNCE it: only recreate if
+                # the previous pass ALSO saw it non-healthy — a transient partial SDN read (or
+                # a deliberate out-of-band teardown between two 6h scans) then won't trigger an
+                # unattended resurrection of infrastructure.
+                to_fix = [cid for cid in members
+                          if live[cid].get('status') == 'drift'
+                          or (live[cid].get('status') == 'missing'
+                              and (prior.get(cid) or {}).get('status') in ('missing', 'drift'))]
+                if to_fix:
+                    recreated = [cid for cid in to_fix if live[cid].get('status') == 'missing']
+                    for cid in to_fix:
+                        try:
+                            _reconcile_on_cluster(cid, defn)
+                        except Exception as e:
+                            logging.debug(f"[multi_sdn] auto-reconcile {cid} failed: {e}")
+                    live = {cid: _live_status_on_cluster(cid, defn) for cid in members}
+                    # unattended cluster mutation → leave an audit-DB trail, not just a log line
+                    log_audit('system', 'multi_sdn.vnet_auto_reconciled',
+                              f"Auto-reconciled cross-cluster vnet '{rec.get('name')}' on {to_fix}"
+                              + (f" (re-created on {recreated})" if recreated else "")
+                              + f" → {_rollup_status(live)}")
+            rollup = _rollup_status(live)
+            db.execute('UPDATE multi_cluster_vnets SET per_cluster_status = ?, status = ?, updated_at = ? WHERE id = ?',
+                       (json.dumps(live), rollup, datetime.now().isoformat(), rec['id']))
+        except Exception as e:
+            logging.debug(f"[multi_sdn] scan vnet failed: {e}")
+
+
+def _msdn_scanner_loop():
+    while _msdn_scanner_running:
+        try:
+            _msdn_scan_once()
+        except Exception as e:
+            logging.warning(f"[multi_sdn] scanner iteration failed: {e}")
+        # break the sleep into 1-sec chunks so shutdown is responsive (drift.py pattern)
+        for _ in range(MSDN_SCAN_INTERVAL):
+            if not _msdn_scanner_running:
+                return
+            time.sleep(1)
+
+
+def start_scanner():
+    global _msdn_scanner_running
+    with _msdn_scanner_lock:
+        if _msdn_scanner_running:
+            return
+        _msdn_scanner_running = True
+    t = threading.Thread(target=_msdn_scanner_loop, daemon=True, name='multi-sdn-drift-scanner')
+    t.start()
+    logging.info("[multi_sdn] drift scanner thread started (6h cadence, detect-only unless opted in)")

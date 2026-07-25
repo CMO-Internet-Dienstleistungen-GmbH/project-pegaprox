@@ -1333,7 +1333,15 @@ def update_server_settings():
                 if old_val != settings['air_gap_mode']:
                     log_audit(request.session.get('user', 'admin'), 'settings.air_gap',
                               f"Air-gap mode {'enabled' if settings['air_gap_mode'] else 'disabled'}")
-            
+
+            # MK Jul 2026 — #612 Phase 2: auto-reconcile cross-cluster EVPN drift (off = detect-only)
+            if 'multi_sdn_drift_reconcile' in data:
+                old_val = settings.get('multi_sdn_drift_reconcile', False)
+                settings['multi_sdn_drift_reconcile'] = bool(data['multi_sdn_drift_reconcile'])
+                if old_val != settings['multi_sdn_drift_reconcile']:
+                    log_audit(request.session.get('user', 'admin'), 'settings.multi_sdn_drift_reconcile',
+                              f"Multi-SDN drift auto-reconcile {'enabled' if settings['multi_sdn_drift_reconcile'] else 'disabled'}")
+
             # NS Mar 2026 - reverse proxy / nginx settings
             if 'reverse_proxy_enabled' in data:
                 new_rp = bool(data['reverse_proxy_enabled'])

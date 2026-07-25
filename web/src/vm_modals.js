@@ -3836,7 +3836,7 @@
         // #612 Phase 1 (MK Jul 2026) — Multi-Cluster EVPN: create + read one logical
         // EVPN vNet that spans several same-ASN clusters. PVE has no cross-cluster SDN
         // primitive, so this drives the new /api/multi-sdn/* orchestration layer.
-        function MultiClusterEvpnView({ clusters = [], authFetch, API_URL, addToast }) {
+        function MultiClusterEvpnView({ clusters = [], authFetch, API_URL, addToast, canAdminSettings = false }) {
             const { t } = useTranslation();
             const [vnets, setVnets] = useState([]);
             const [loading, setLoading] = useState(false);
@@ -3846,6 +3846,9 @@
             const [plan, setPlan] = useState(null);           // validate/preview result
             const blankForm = { name: '', alias: '', zone: '', controller: '', vni: '', asn: '', vrf_vxlan: '', peers: '', subnet: '', cluster_ids: [] };
             const [form, setForm] = useState(blankForm);
+            const [showEdit, setShowEdit] = useState(null);   // #612 P2 — the vnet being edited
+            const [editForm, setEditForm] = useState({ alias: '', addSubnet: '', delSubnet: '' });
+            const [autoReconcile, setAutoReconcile] = useState(false); // #612 P2 — global drift auto-reconcile gate
 
             const statusChip = (s) => {
                 const map = {
@@ -3854,6 +3857,7 @@
                     pending: 'bg-yellow-500/20 text-yellow-400',
                     failed: 'bg-red-500/20 text-red-400', offline: 'bg-red-500/20 text-red-400',
                     missing: 'bg-red-500/20 text-red-400', not_found: 'bg-red-500/20 text-red-400',
+                    sdn_not_installed: 'bg-gray-500/20 text-gray-400', error: 'bg-red-500/20 text-red-400',
                 };
                 return map[s] || 'bg-gray-500/20 text-gray-400';
             };
@@ -3867,7 +3871,14 @@
                 } catch (e) { /* silent */ }
                 finally { setLoading(false); }
             };
-            useEffect(() => { load(); }, []);
+            const loadSetting = async () => {
+                if (!canAdminSettings) return; // /settings/server is admin.settings-gated
+                try {
+                    const r = await authFetch(`${API_URL}/settings/server`);
+                    if (r?.ok) { const s = await r.json(); setAutoReconcile(!!(s.multi_sdn_drift_reconcile ?? s?.settings?.multi_sdn_drift_reconcile)); }
+                } catch (e) { /* silent */ }
+            };
+            useEffect(() => { load(); loadSetting(); }, []);
 
             const toggleMember = (cid) => setForm(f => ({ ...f, cluster_ids: f.cluster_ids.includes(cid) ? f.cluster_ids.filter(x => x !== cid) : [...f.cluster_ids, cid] }));
 
@@ -3932,6 +3943,58 @@
                 finally { setBusy(false); }
             };
 
+            // #612 P2 — read-only drift scan (persists per-cluster drift, no writes)
+            const scan = async (vid) => {
+                setBusy(true);
+                try {
+                    const r = await authFetch(`${API_URL}/multi-sdn/vnets/${vid}/scan`, { method: 'POST' });
+                    const data = await r.json().catch(() => ({}));
+                    if (r?.ok) { addToast(t('mcevpnScanned') || 'Drift scan done', `${data.name} → ${data.status}`, 'info'); load(); }
+                    else addToast('Error', data.error || 'Scan failed', 'error');
+                } catch (e) { addToast('Error', e.message, 'error'); }
+                finally { setBusy(false); }
+            };
+
+            // #612 P2 — re-assert the desired definition on drifted/missing members
+            const reconcile = async (vid) => {
+                if (!window.confirm(t('mcevpnReconcileConfirm') || 'Re-push the desired EVPN definition to every member (fixes drift, runs a cluster-wide SDN apply)?')) return;
+                setBusy(true);
+                try {
+                    const r = await authFetch(`${API_URL}/multi-sdn/vnets/${vid}/reconcile`, { method: 'POST' });
+                    const data = await r.json().catch(() => ({}));
+                    if (r?.ok) { addToast(t('mcevpnReconciled') || 'Reconciled', `${data.name} → ${data.status}`, 'success'); load(); }
+                    else addToast('Error', data.error || 'Reconcile failed', 'error');
+                } catch (e) { addToast('Error', e.message, 'error'); }
+                finally { setBusy(false); }
+            };
+
+            const openEdit = (v) => { setEditForm({ alias: v.alias || '', addSubnet: '', delSubnet: '' }); setShowEdit(v); };
+            const submitEdit = async () => {
+                if (!showEdit) return;
+                const body = {};
+                if ((editForm.alias || '') !== (showEdit.alias || '')) body.alias = editForm.alias.trim();
+                if (editForm.addSubnet.trim()) body.add_subnets = [{ cidr: editForm.addSubnet.trim() }];
+                if (editForm.delSubnet.trim()) body.del_subnets = [editForm.delSubnet.trim()];
+                if (!('alias' in body) && !body.add_subnets && !body.del_subnets) { addToast('Error', t('mcevpnNothingToChange') || 'Nothing to change', 'error'); return; }
+                setBusy(true);
+                try {
+                    const r = await authFetch(`${API_URL}/multi-sdn/vnets/${showEdit.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+                    const data = await r.json().catch(() => ({}));
+                    if (r?.ok) { addToast(t('mcevpnEdited') || 'vNet updated', `${data.name} → ${data.status}`, 'success'); setShowEdit(null); load(); }
+                    else addToast('Error', data.error || 'Edit failed', 'error');
+                } catch (e) { addToast('Error', e.message, 'error'); }
+                finally { setBusy(false); }
+            };
+
+            // #612 P2 — global auto-reconcile toggle (off = detect-only)
+            const saveAutoReconcile = async (val) => {
+                setAutoReconcile(val); // optimistic
+                try {
+                    const r = await authFetch(`${API_URL}/settings/server`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ multi_sdn_drift_reconcile: val }) });
+                    if (!r?.ok) { setAutoReconcile(!val); addToast('Error', t('mcevpnSettingFailed') || 'Failed to save setting', 'error'); }
+                } catch (e) { setAutoReconcile(!val); addToast('Error', e.message, 'error'); }
+            };
+
             const evpnClusters = clusters; // any cluster could host an EVPN SDN; membership is user-chosen
             const canCreate = form.name && form.zone && form.controller && form.vni && form.asn && form.cluster_ids.length >= 1;
 
@@ -3943,6 +4006,9 @@
                             <p className="text-xs text-gray-500 mt-0.5">{t('mcevpnSubtitle') || 'One logical EVPN vNet spanning several clusters that share a BGP ASN. The physical BGP-EVPN underlay must already peer.'}</p>
                         </div>
                         <div className="flex items-center gap-2">
+                            {canAdminSettings && (
+                                <button onClick={() => saveAutoReconcile(!autoReconcile)} title={t('mcevpnAutoReconcileHint') || 'When on, the drift scanner re-pushes the desired config to drifted members automatically (cluster-wide SDN apply). Off = detect-only.'} className={`px-2.5 py-1.5 rounded-lg text-xs border flex items-center gap-1.5 ${autoReconcile ? 'bg-amber-500/20 text-amber-300 border-amber-500/40' : 'bg-proxmox-dark text-gray-400 border-proxmox-border hover:text-white'}`}><Icons.RefreshCw className="w-3.5 h-3.5" />{t('mcevpnAutoReconcile') || 'Auto-reconcile'}: {autoReconcile ? (t('on') || 'on') : (t('off') || 'off')}</button>
+                            )}
                             <button onClick={load} className="px-2.5 py-1.5 rounded-lg text-xs bg-proxmox-dark border border-proxmox-border text-gray-300 hover:text-white flex items-center gap-1.5"><Icons.RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />{t('refresh') || 'Refresh'}</button>
                             <button onClick={() => { setShowCreate(true); setPlan(null); }} className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-cyan-500/20 text-cyan-300 hover:bg-cyan-500/30 border border-cyan-500/40 flex items-center gap-1.5"><Icons.Plus className="w-3.5 h-3.5" />{t('mcevpnCreate') || 'Create EVPN vNet'}</button>
                         </div>
@@ -3988,7 +4054,8 @@
                                                         <div key={cid} className="flex items-center justify-between p-2 rounded-lg bg-proxmox-dark/40 border border-proxmox-border">
                                                             <span className="text-sm text-gray-300">{clusterName(cid)}</span>
                                                             <div className="flex items-center gap-2">
-                                                                {st.error && <span className="text-[11px] text-red-400/80 max-w-[220px] truncate" title={st.error}>{st.error}</span>}
+                                                                {st.error ? <span className="text-[11px] text-red-400/80 max-w-[200px] truncate" title={st.error}>{st.error}</span>
+                                                                    : st.detail ? <span className="text-[11px] text-amber-400/80 max-w-[200px] truncate" title={st.detail}>{st.detail}</span> : null}
                                                                 <span className={`px-2 py-0.5 rounded text-xs font-semibold ${statusChip(st.status || 'unknown')}`}>{st.status || 'unknown'}</span>
                                                             </div>
                                                         </div>
@@ -3996,7 +4063,10 @@
                                                 })}
                                             </div>
                                             <div className="flex items-center gap-2 flex-wrap">
+                                                <button disabled={busy} onClick={() => scan(v.id)} className="px-2.5 py-1.5 rounded-lg text-xs bg-proxmox-dark text-gray-300 hover:text-white border border-proxmox-border disabled:opacity-50">{t('mcevpnScan') || 'Scan for drift'}</button>
+                                                <button disabled={busy} onClick={() => openEdit(v)} className="px-2.5 py-1.5 rounded-lg text-xs bg-proxmox-dark text-gray-300 hover:text-white border border-proxmox-border disabled:opacity-50">{t('mcevpnEdit') || 'Edit'}</button>
                                                 <button disabled={busy} onClick={() => reapply(v.id)} className="px-2.5 py-1.5 rounded-lg text-xs bg-cyan-500/15 text-cyan-300 hover:bg-cyan-500/25 border border-cyan-500/30 disabled:opacity-50">{t('mcevpnReapply') || 'Re-apply / retry'}</button>
+                                                <button disabled={busy} onClick={() => reconcile(v.id)} className="px-2.5 py-1.5 rounded-lg text-xs bg-amber-500/15 text-amber-300 hover:bg-amber-500/25 border border-amber-500/30 disabled:opacity-50">{t('mcevpnReconcile') || 'Reconcile drift'}</button>
                                                 <button disabled={busy} onClick={() => remove(v.id, false)} className="px-2.5 py-1.5 rounded-lg text-xs bg-proxmox-dark text-gray-300 hover:text-white border border-proxmox-border disabled:opacity-50">{t('mcevpnForget') || 'Forget record'}</button>
                                                 <button disabled={busy} onClick={() => remove(v.id, true)} className="px-2.5 py-1.5 rounded-lg text-xs bg-red-500/10 text-red-300 hover:bg-red-500/20 border border-red-500/30 disabled:opacity-50">{t('mcevpnPurge') || 'Delete + purge from clusters'}</button>
                                             </div>
@@ -4071,6 +4141,33 @@
                                         <button onClick={() => setShowCreate(false)} className="px-3 py-2 rounded-lg text-sm text-gray-400 hover:text-white">{t('cancel') || 'Cancel'}</button>
                                         <button disabled={busy || !canCreate} onClick={create} className="px-4 py-2 rounded-lg text-sm font-semibold bg-cyan-500/20 text-cyan-300 hover:bg-cyan-500/30 border border-cyan-500/40 disabled:opacity-50">{busy ? '…' : (t('mcevpnCreate') || 'Create EVPN vNet')}</button>
                                     </div>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {showEdit && (
+                        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4" onClick={() => setShowEdit(null)}>
+                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl w-full max-w-lg" onClick={e => e.stopPropagation()}>
+                                <div className="p-4 border-b border-proxmox-border flex items-center justify-between">
+                                    <h3 className="font-semibold text-white flex items-center gap-2"><Icons.Network className="w-4 h-4 text-cyan-400" />{t('mcevpnEditTitle') || 'Edit EVPN vNet'} <span className="text-gray-500 font-normal">{showEdit.name}</span></h3>
+                                    <button onClick={() => setShowEdit(null)} className="text-gray-500 hover:text-white"><Icons.X className="w-5 h-5" /></button>
+                                </div>
+                                <div className="p-4 space-y-3">
+                                    <div className="text-[11px] text-gray-500">{t('mcevpnEditNote') || 'Structural fields (name / zone / VNI / ASN / controller) are immutable — delete and recreate to change them. Changes fan out to every member cluster and run a cluster-wide SDN apply.'}</div>
+                                    <label className="text-xs text-gray-400 block">{t('alias') || 'Alias'}
+                                        <input value={editForm.alias} onChange={e => setEditForm({ ...editForm, alias: e.target.value })} className="mt-1 w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm" placeholder="prod-span" /></label>
+                                    <label className="text-xs text-gray-400 block">{t('mcevpnAddSubnet') || 'Add subnet (CIDR)'}
+                                        <input value={editForm.addSubnet} onChange={e => setEditForm({ ...editForm, addSubnet: e.target.value })} className="mt-1 w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm" placeholder="10.8.0.0/24" /></label>
+                                    <label className="text-xs text-gray-400 block">{t('mcevpnDelSubnet') || 'Remove subnet (CIDR)'}
+                                        <input value={editForm.delSubnet} onChange={e => setEditForm({ ...editForm, delSubnet: e.target.value })} className="mt-1 w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm" placeholder="10.9.0.0/24" /></label>
+                                    {(showEdit.subnets && showEdit.subnets.length > 0) && (
+                                        <div className="text-[11px] text-gray-500">{t('mcevpnCurrentSubnets') || 'Current subnets'}: {showEdit.subnets.map(s => s.cidr).join(', ')}</div>
+                                    )}
+                                </div>
+                                <div className="p-4 border-t border-proxmox-border flex items-center justify-end gap-2">
+                                    <button onClick={() => setShowEdit(null)} className="px-3 py-2 rounded-lg text-sm text-gray-400 hover:text-white">{t('cancel') || 'Cancel'}</button>
+                                    <button disabled={busy} onClick={submitEdit} className="px-4 py-2 rounded-lg text-sm font-semibold bg-cyan-500/20 text-cyan-300 hover:bg-cyan-500/30 border border-cyan-500/40 disabled:opacity-50">{busy ? '…' : (t('save') || 'Save')}</button>
                                 </div>
                             </div>
                         </div>
