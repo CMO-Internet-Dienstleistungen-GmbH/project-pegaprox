@@ -8135,6 +8135,7 @@
 
             // LW: Mar 2026 - Cross-Hypervisor Migration (XHM) state
             const [sidebarXHM, setSidebarXHM] = useState(false);
+            const [sidebarMultiSdn, setSidebarMultiSdn] = useState(false); // #612 — Multi-Cluster EVPN view
             const [xhmMigrations, setXhmMigrations] = useState([]);
             const [xhmSelectedMigration, setXhmSelectedMigration] = useState(null);
             const [xhmMigrationDetail, setXhmMigrationDetail] = useState(null);
@@ -8201,7 +8202,7 @@
             };
 
             // NS: auto-clear topology/xhm sidebar when navigating to something else
-            useEffect(() => { if (selectedCluster || selectedPBS || selectedVMware || selectedGroup) { setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); } }, [selectedCluster, selectedPBS, selectedVMware, selectedGroup]);
+            useEffect(() => { if (selectedCluster || selectedPBS || selectedVMware || selectedGroup) { setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); } }, [selectedCluster, selectedPBS, selectedVMware, selectedGroup]);
 
             // track selected XHM migration in ref for SSE updates
             useEffect(() => { xhmSelectedMigrationRef.current = xhmSelectedMigration; }, [xhmSelectedMigration]);
@@ -14298,7 +14299,7 @@
                                         <div className="space-y-3">
                                             {/* MK: overview button, LW: compact for corporate */}
                                             <button
-                                                onClick={() => { setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); }}
+                                                onClick={() => { setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); }}
                                                 className={`w-full flex items-center ${
                                                     isCorporate
                                                         ? 'gap-1.5 pl-1 pr-2 py-0.5 text-[13px] leading-5'
@@ -14337,7 +14338,7 @@
                                             {/* NS: Mar 2026 - Topology sidebar entry (#142) */}
                                             {isCorporate && (
                                                 <button
-                                                    onClick={() => { setSidebarTopology(true); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); setSidebarWorldmap(false); }}
+                                                    onClick={() => { setSidebarTopology(true); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); setSidebarWorldmap(false); setSidebarXHM(false); setSidebarMultiSdn(false); }}
                                                     className="w-full flex items-center gap-1.5 pl-5 pr-2 py-0.5 text-[13px] leading-5"
                                                     style={sidebarTopology ? {background: 'rgba(73,175,217,0.10)', borderLeft: '2px solid var(--corp-accent)', color: 'var(--color-text)'} : {color: 'var(--corp-text-secondary)'}}
                                                     onMouseEnter={(e) => { if (!sidebarTopology) { e.currentTarget.style.background = 'var(--color-hover)'; e.currentTarget.style.color = 'var(--color-text)'; }}}
@@ -14350,7 +14351,7 @@
 
                                             {/* MK May 2026 — Worldmap sidebar entry (offline cluster geo-view) */}
                                             <button
-                                                onClick={() => { setSidebarWorldmap(true); setSidebarTopology(false); setSidebarXHM(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); }}
+                                                onClick={() => { setSidebarWorldmap(true); setSidebarTopology(false); setSidebarXHM(false); setSidebarMultiSdn(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); }}
                                                 className={isCorporate
                                                     ? 'w-full flex items-center gap-1.5 pl-5 pr-2 py-0.5 text-[13px] leading-5'
                                                     : `w-full flex items-center gap-3 px-3 py-2 rounded-xl transition-all mt-1 ${
@@ -14383,7 +14384,7 @@
                                             {/* LW: Mar 2026 - XHM sidebar (only when both PVE + XCP-ng clusters exist) */}
                                             {clusters.some(c => c.type === 'xcpng' || c.cluster_type === 'xcpng') && clusters.some(c => c.type !== 'xcpng' && c.cluster_type !== 'xcpng') && (
                                                 <button
-                                                    onClick={() => { setSidebarXHM(true); setSidebarTopology(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); }}
+                                                    onClick={() => { setSidebarXHM(true); setSidebarTopology(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); }}
                                                     className={isCorporate
                                                         ? 'w-full flex items-center gap-1.5 pl-5 pr-2 py-0.5 text-[13px] leading-5'
                                                         : `w-full flex items-center gap-3 px-3 py-2 rounded-xl transition-all mt-1 ${
@@ -14404,6 +14405,33 @@
                                                         </div>
                                                     )}
                                                     <span className={isCorporate ? 'flex-1 text-left truncate' : 'flex-1 text-left text-sm font-medium'}>{t('xhmTitle') || 'Hypervisor Migration'}</span>
+                                                </button>
+                                            )}
+
+                                            {/* #612: Multi-Cluster EVPN sidebar (only when ≥2 clusters exist) */}
+                                            {clusters.length >= 2 && (
+                                                <button
+                                                    onClick={() => { setSidebarMultiSdn(true); setSidebarXHM(false); setSidebarTopology(false); setSidebarWorldmap(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); }}
+                                                    className={isCorporate
+                                                        ? 'w-full flex items-center gap-1.5 pl-5 pr-2 py-0.5 text-[13px] leading-5'
+                                                        : `w-full flex items-center gap-3 px-3 py-2 rounded-xl transition-all mt-1 ${
+                                                            sidebarMultiSdn
+                                                                ? 'bg-gradient-to-r from-cyan-500/20 to-sky-600/10 border border-cyan-500/30 text-white'
+                                                                : 'bg-proxmox-card border border-proxmox-border hover:border-cyan-500/30 text-gray-300 hover:text-white'
+                                                          }`
+                                                    }
+                                                    style={isCorporate ? (sidebarMultiSdn ? {background: 'rgba(73,175,217,0.10)', borderLeft: '2px solid var(--corp-accent)', color: 'var(--color-text)'} : {color: 'var(--corp-text-secondary)'}) : undefined}
+                                                    onMouseEnter={isCorporate ? (e) => { if (!sidebarMultiSdn) { e.currentTarget.style.background = 'var(--color-hover)'; e.currentTarget.style.color = 'var(--color-text)'; }} : undefined}
+                                                    onMouseLeave={isCorporate ? (e) => { if (!sidebarMultiSdn) { e.currentTarget.style.background = ''; e.currentTarget.style.color = 'var(--corp-text-secondary)'; }} : undefined}
+                                                >
+                                                    {isCorporate ? (
+                                                        <Icons.Network className="w-4 h-4 flex-shrink-0" style={{color: sidebarMultiSdn ? 'var(--corp-accent)' : 'var(--corp-text-muted)'}} />
+                                                    ) : (
+                                                        <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${sidebarMultiSdn ? 'bg-cyan-500/20' : 'bg-proxmox-dark'}`}>
+                                                            <Icons.Network className="w-4 h-4 text-cyan-400" />
+                                                        </div>
+                                                    )}
+                                                    <span className={isCorporate ? 'flex-1 text-left truncate' : 'flex-1 text-left text-sm font-medium'}>{t('mcevpnTitle') || 'Multi-Cluster EVPN'}</span>
                                                 </button>
                                             )}
 
@@ -22092,6 +22120,24 @@
                                                 </div>
                                             )}
                                         </div>
+                                    </div>
+                                ) : sidebarMultiSdn ? (
+                                    /* #612 — Multi-Cluster EVPN fullscreen route */
+                                    <div className={isCorporate ? '' : 'space-y-4'}>
+                                        {isCorporate && (
+                                            <div className="corp-content-header">
+                                                <div className="flex items-center gap-2">
+                                                    <Icons.Network className="w-4 h-4" style={{color: 'var(--corp-accent)'}} />
+                                                    <span className="corp-header-title">{t('mcevpnTitle') || 'Multi-Cluster EVPN'}</span>
+                                                </div>
+                                            </div>
+                                        )}
+                                        <MultiClusterEvpnView
+                                            clusters={clusters}
+                                            authFetch={authFetch}
+                                            API_URL={API_URL}
+                                            addToast={addToast}
+                                        />
                                     </div>
                                 ) : (
                                     <AllClustersOverview

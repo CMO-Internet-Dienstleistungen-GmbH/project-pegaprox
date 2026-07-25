@@ -42,6 +42,7 @@ def register_blueprints(app):
     from pegaprox.api.topology import bp as topology_bp
     from pegaprox.api.power import bp as power_bp
     from pegaprox.api.dr_drill import bp as dr_drill_bp
+    from pegaprox.api.multi_sdn import bp as multi_sdn_bp
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(users_bp)
@@ -78,6 +79,7 @@ def register_blueprints(app):
     app.register_blueprint(topology_bp)
     app.register_blueprint(power_bp)
     app.register_blueprint(dr_drill_bp)
+    app.register_blueprint(multi_sdn_bp)
 
     # Initialize WebSocket support for realtime blueprint
     from pegaprox.api.realtime import sock

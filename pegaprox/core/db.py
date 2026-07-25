@@ -1845,6 +1845,39 @@ class PegaProxDB:
         except Exception as e:
             logging.error(f"Error creating push_subscriptions table: {e}")
 
+        # MK Jul 2026 — #612 Phase 1: cross-cluster EVPN vNets (multi-cluster SDN
+        # orchestration). PVE has no cross-cluster SDN primitive — each cluster's
+        # /etc/pve/sdn is local — so this is the authoritative record (PDM lacks one)
+        # that composes the per-cluster SDN CRUD across N member clusters. JSON columns
+        # follow the site_recovery_plans convention (TEXT + json.dumps/json.loads);
+        # member_clusters/subnets are JSON lists, desired_state/per_cluster_status JSON dicts.
+        try:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS multi_cluster_vnets (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    alias TEXT DEFAULT '',
+                    zone TEXT NOT NULL,
+                    vni INTEGER,
+                    asn INTEGER,
+                    vrf_vxlan INTEGER,
+                    controller TEXT DEFAULT '',
+                    peers TEXT DEFAULT '',
+                    member_clusters TEXT DEFAULT '[]',
+                    subnets TEXT DEFAULT '[]',
+                    desired_state TEXT DEFAULT '{}',
+                    per_cluster_status TEXT DEFAULT '{}',
+                    status TEXT DEFAULT 'pending',
+                    enabled INTEGER DEFAULT 1,
+                    created_by TEXT DEFAULT '',
+                    created_at TEXT,
+                    updated_at TEXT
+                )
+            ''')
+            logging.info("Ensured multi_cluster_vnets table exists")
+        except Exception as e:
+            logging.error(f"Error creating multi_cluster_vnets table: {e}")
+
         conn.commit()
         logging.info("DB schema initialized")
     

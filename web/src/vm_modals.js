@@ -3833,6 +3833,252 @@
             return { by: field, dir: (field === 'cpu' || field === 'ram') ? 'desc' : 'asc' };
         }
 
+        // #612 Phase 1 (MK Jul 2026) — Multi-Cluster EVPN: create + read one logical
+        // EVPN vNet that spans several same-ASN clusters. PVE has no cross-cluster SDN
+        // primitive, so this drives the new /api/multi-sdn/* orchestration layer.
+        function MultiClusterEvpnView({ clusters = [], authFetch, API_URL, addToast }) {
+            const { t } = useTranslation();
+            const [vnets, setVnets] = useState([]);
+            const [loading, setLoading] = useState(false);
+            const [expanded, setExpanded] = useState(null);
+            const [showCreate, setShowCreate] = useState(false);
+            const [busy, setBusy] = useState(false);
+            const [plan, setPlan] = useState(null);           // validate/preview result
+            const blankForm = { name: '', alias: '', zone: '', controller: '', vni: '', asn: '', vrf_vxlan: '', peers: '', subnet: '', cluster_ids: [] };
+            const [form, setForm] = useState(blankForm);
+
+            const statusChip = (s) => {
+                const map = {
+                    applied: 'bg-green-500/20 text-green-400', in_sync: 'bg-green-500/20 text-green-400',
+                    partial: 'bg-yellow-500/20 text-yellow-400', drift: 'bg-yellow-500/20 text-yellow-400',
+                    pending: 'bg-yellow-500/20 text-yellow-400',
+                    failed: 'bg-red-500/20 text-red-400', offline: 'bg-red-500/20 text-red-400',
+                    missing: 'bg-red-500/20 text-red-400', not_found: 'bg-red-500/20 text-red-400',
+                };
+                return map[s] || 'bg-gray-500/20 text-gray-400';
+            };
+            const clusterName = (cid) => (clusters.find(c => c.id === cid) || {}).name || (clusters.find(c => c.id === cid) || {}).display_name || cid;
+
+            const load = async () => {
+                setLoading(true);
+                try {
+                    const r = await authFetch(`${API_URL}/multi-sdn/vnets`);
+                    if (r?.ok) setVnets(await r.json());
+                } catch (e) { /* silent */ }
+                finally { setLoading(false); }
+            };
+            useEffect(() => { load(); }, []);
+
+            const toggleMember = (cid) => setForm(f => ({ ...f, cluster_ids: f.cluster_ids.includes(cid) ? f.cluster_ids.filter(x => x !== cid) : [...f.cluster_ids, cid] }));
+
+            const buildBody = () => {
+                const body = {
+                    name: form.name.trim(), alias: form.alias.trim(), zone: form.zone.trim(),
+                    controller: form.controller.trim(), vni: parseInt(form.vni) || undefined,
+                    asn: parseInt(form.asn) || undefined,
+                    vrf_vxlan: form.vrf_vxlan ? parseInt(form.vrf_vxlan) : undefined,
+                    peers: form.peers.trim(), cluster_ids: form.cluster_ids,
+                };
+                if (form.subnet.trim()) body.subnets = [{ cidr: form.subnet.trim() }];
+                return body;
+            };
+
+            const validate = async () => {
+                setBusy(true); setPlan(null);
+                try {
+                    const r = await authFetch(`${API_URL}/multi-sdn/vnets/validate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(buildBody()) });
+                    const data = await r.json().catch(() => ({}));
+                    if (r?.ok) setPlan(data);
+                    else addToast('Error', data.error || 'Validation failed', 'error');
+                } catch (e) { addToast('Error', e.message, 'error'); }
+                finally { setBusy(false); }
+            };
+
+            const create = async () => {
+                setBusy(true);
+                try {
+                    const r = await authFetch(`${API_URL}/multi-sdn/vnets`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(buildBody()) });
+                    const data = await r.json().catch(() => ({}));
+                    if (r?.ok) {
+                        addToast(t('mcevpnCreated') || 'Cross-cluster EVPN vNet created', `${data.name} → ${data.status}`, 'success');
+                        setShowCreate(false); setForm(blankForm); setPlan(null); load();
+                    } else {
+                        const extra = data.conflicts ? ` (${data.conflicts.join('; ')})` : (data.status ? ` [${data.status}]` : '');
+                        addToast('Error', (data.error || 'Create failed') + extra, 'error');
+                    }
+                } catch (e) { addToast('Error', e.message, 'error'); }
+                finally { setBusy(false); }
+            };
+
+            const reapply = async (vid) => {
+                setBusy(true);
+                try {
+                    const r = await authFetch(`${API_URL}/multi-sdn/vnets/${vid}/apply`, { method: 'POST' });
+                    const data = await r.json().catch(() => ({}));
+                    if (r?.ok) { addToast(t('mcevpnReapplied') || 'Re-applied', `${data.name} → ${data.status}`, 'success'); load(); }
+                    else addToast('Error', data.error || 'Re-apply failed', 'error');
+                } catch (e) { addToast('Error', e.message, 'error'); }
+                finally { setBusy(false); }
+            };
+
+            const remove = async (vid, purge) => {
+                if (!window.confirm(purge ? (t('mcevpnPurgeConfirm') || 'Delete this vNet AND remove it from every member cluster?') : (t('mcevpnForgetConfirm') || 'Forget this record? (SDN objects stay on the clusters)'))) return;
+                setBusy(true);
+                try {
+                    const r = await authFetch(`${API_URL}/multi-sdn/vnets/${vid}${purge ? '?purge=1' : ''}`, { method: 'DELETE' });
+                    if (r?.ok) { addToast(t('mcevpnDeleted') || 'Deleted', '', 'success'); load(); }
+                    else { const d = await r.json().catch(() => ({})); addToast('Error', d.error || 'Delete failed', 'error'); }
+                } catch (e) { addToast('Error', e.message, 'error'); }
+                finally { setBusy(false); }
+            };
+
+            const evpnClusters = clusters; // any cluster could host an EVPN SDN; membership is user-chosen
+            const canCreate = form.name && form.zone && form.controller && form.vni && form.asn && form.cluster_ids.length >= 1;
+
+            return (
+                <div className="space-y-4">
+                    <div className="flex items-center justify-between">
+                        <div>
+                            <h2 className="text-lg font-semibold text-white flex items-center gap-2"><Icons.Network className="w-5 h-5 text-cyan-400" />{t('mcevpnTitle') || 'Multi-Cluster EVPN'}</h2>
+                            <p className="text-xs text-gray-500 mt-0.5">{t('mcevpnSubtitle') || 'One logical EVPN vNet spanning several clusters that share a BGP ASN. The physical BGP-EVPN underlay must already peer.'}</p>
+                        </div>
+                        <div className="flex items-center gap-2">
+                            <button onClick={load} className="px-2.5 py-1.5 rounded-lg text-xs bg-proxmox-dark border border-proxmox-border text-gray-300 hover:text-white flex items-center gap-1.5"><Icons.RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />{t('refresh') || 'Refresh'}</button>
+                            <button onClick={() => { setShowCreate(true); setPlan(null); }} className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-cyan-500/20 text-cyan-300 hover:bg-cyan-500/30 border border-cyan-500/40 flex items-center gap-1.5"><Icons.Plus className="w-3.5 h-3.5" />{t('mcevpnCreate') || 'Create EVPN vNet'}</button>
+                        </div>
+                    </div>
+
+                    {clusters.length < 2 && (
+                        <div className="p-3 rounded-lg bg-yellow-500/10 border border-yellow-500/30 text-xs text-yellow-300 flex items-start gap-2">
+                            <Icons.AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                            <span>{t('mcevpnNeedTwo') || 'A cross-cluster EVPN vNet spans multiple clusters — add at least two connected clusters to make this useful. You can still define one, but it only makes sense across ≥2 members.'}</span>
+                        </div>
+                    )}
+
+                    {vnets.length === 0 && !loading ? (
+                        <div className="p-10 text-center text-gray-600 text-sm bg-proxmox-card border border-proxmox-border rounded-xl">
+                            {t('mcevpnEmpty') || 'No cross-cluster EVPN vNets yet. Create one to span an EVPN L2 domain across same-ASN clusters.'}
+                        </div>
+                    ) : (
+                        <div className="space-y-2">
+                            {vnets.map(v => (
+                                <div key={v.id} className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
+                                    <div className="p-4 flex items-center justify-between cursor-pointer hover:bg-proxmox-hover/30" onClick={() => setExpanded(expanded === v.id ? null : v.id)}>
+                                        <div className="flex items-center gap-3 min-w-0">
+                                            <Icons.Network className="w-4 h-4 text-cyan-400 flex-shrink-0" />
+                                            <div className="min-w-0">
+                                                <div className="text-sm font-medium text-white truncate">{v.name} {v.alias && <span className="text-gray-500 font-normal">— {v.alias}</span>}</div>
+                                                <div className="text-xs text-gray-500">zone {v.zone} · VNI {v.vni} · ASN {v.asn}{v.controller ? ` · ctl ${v.controller}` : ''}</div>
+                                            </div>
+                                        </div>
+                                        <div className="flex items-center gap-2 flex-shrink-0">
+                                            {(v.member_clusters || []).slice(0, 4).map(cid => (
+                                                <span key={cid} className="hidden sm:inline text-[11px] px-1.5 py-0.5 rounded bg-proxmox-dark text-gray-400 border border-proxmox-border">{clusterName(cid)}</span>
+                                            ))}
+                                            <span className={`px-2 py-0.5 rounded text-xs font-semibold ${statusChip(v.status)}`}>{v.status}</span>
+                                            <Icons.ChevronDown className={`w-4 h-4 text-gray-500 transition-transform ${expanded === v.id ? 'rotate-180' : ''}`} />
+                                        </div>
+                                    </div>
+                                    {expanded === v.id && (
+                                        <div className="border-t border-proxmox-border p-4 space-y-3">
+                                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                                                {(v.member_clusters || []).map(cid => {
+                                                    const st = (v.per_cluster_status || {})[cid] || {};
+                                                    return (
+                                                        <div key={cid} className="flex items-center justify-between p-2 rounded-lg bg-proxmox-dark/40 border border-proxmox-border">
+                                                            <span className="text-sm text-gray-300">{clusterName(cid)}</span>
+                                                            <div className="flex items-center gap-2">
+                                                                {st.error && <span className="text-[11px] text-red-400/80 max-w-[220px] truncate" title={st.error}>{st.error}</span>}
+                                                                <span className={`px-2 py-0.5 rounded text-xs font-semibold ${statusChip(st.status || 'unknown')}`}>{st.status || 'unknown'}</span>
+                                                            </div>
+                                                        </div>
+                                                    );
+                                                })}
+                                            </div>
+                                            <div className="flex items-center gap-2 flex-wrap">
+                                                <button disabled={busy} onClick={() => reapply(v.id)} className="px-2.5 py-1.5 rounded-lg text-xs bg-cyan-500/15 text-cyan-300 hover:bg-cyan-500/25 border border-cyan-500/30 disabled:opacity-50">{t('mcevpnReapply') || 'Re-apply / retry'}</button>
+                                                <button disabled={busy} onClick={() => remove(v.id, false)} className="px-2.5 py-1.5 rounded-lg text-xs bg-proxmox-dark text-gray-300 hover:text-white border border-proxmox-border disabled:opacity-50">{t('mcevpnForget') || 'Forget record'}</button>
+                                                <button disabled={busy} onClick={() => remove(v.id, true)} className="px-2.5 py-1.5 rounded-lg text-xs bg-red-500/10 text-red-300 hover:bg-red-500/20 border border-red-500/30 disabled:opacity-50">{t('mcevpnPurge') || 'Delete + purge from clusters'}</button>
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+                    )}
+
+                    {showCreate && (
+                        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4" onClick={() => setShowCreate(false)}>
+                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl w-full max-w-2xl max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+                                <div className="p-4 border-b border-proxmox-border flex items-center justify-between sticky top-0 bg-proxmox-card">
+                                    <h3 className="font-semibold text-white flex items-center gap-2"><Icons.Network className="w-4 h-4 text-cyan-400" />{t('mcevpnCreate') || 'Create EVPN vNet'}</h3>
+                                    <button onClick={() => setShowCreate(false)} className="text-gray-500 hover:text-white"><Icons.X className="w-5 h-5" /></button>
+                                </div>
+                                <div className="p-4 space-y-3">
+                                    <div className="grid grid-cols-2 gap-3">
+                                        <label className="text-xs text-gray-400">{t('mcevpnVnetName') || 'vNet name'} <span className="text-gray-600">(≤8)</span>
+                                            <input value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} className="mt-1 w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm" placeholder="evpn1" /></label>
+                                        <label className="text-xs text-gray-400">{t('alias') || 'Alias'}
+                                            <input value={form.alias} onChange={e => setForm({ ...form, alias: e.target.value })} className="mt-1 w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm" placeholder="prod-span" /></label>
+                                        <label className="text-xs text-gray-400">{t('mcevpnZone') || 'EVPN zone id'} <span className="text-gray-600">(≤8)</span>
+                                            <input value={form.zone} onChange={e => setForm({ ...form, zone: e.target.value })} className="mt-1 w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm" placeholder="z1" /></label>
+                                        <label className="text-xs text-gray-400">{t('mcevpnController') || 'EVPN controller id'}
+                                            <input value={form.controller} onChange={e => setForm({ ...form, controller: e.target.value })} className="mt-1 w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm" placeholder="evpnctl" /></label>
+                                        <label className="text-xs text-gray-400">{t('mcevpnVni') || 'VNI (vnet tag)'}
+                                            <input type="number" value={form.vni} onChange={e => setForm({ ...form, vni: e.target.value })} className="mt-1 w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm" placeholder="10010" /></label>
+                                        <label className="text-xs text-gray-400">{t('mcevpnAsn') || 'BGP ASN (shared)'}
+                                            <input type="number" value={form.asn} onChange={e => setForm({ ...form, asn: e.target.value })} className="mt-1 w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm" placeholder="65000" /></label>
+                                        <label className="text-xs text-gray-400">{t('mcevpnVrf') || 'VRF-VXLAN / L3 VNI'} <span className="text-gray-600">({t('optional') || 'optional'})</span>
+                                            <input type="number" value={form.vrf_vxlan} onChange={e => setForm({ ...form, vrf_vxlan: e.target.value })} className="mt-1 w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm" placeholder={t('mcevpnVrfDefault') || 'defaults to VNI'} /></label>
+                                        <label className="text-xs text-gray-400">{t('mcevpnSubnet') || 'Subnet CIDR'} <span className="text-gray-600">({t('optional') || 'optional'})</span>
+                                            <input value={form.subnet} onChange={e => setForm({ ...form, subnet: e.target.value })} className="mt-1 w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm" placeholder="10.9.0.0/24" /></label>
+                                    </div>
+                                    <label className="text-xs text-gray-400 block">{t('mcevpnPeers') || 'EVPN controller peers (IPs, comma-separated)'} <span className="text-gray-600">({t('optional') || 'optional'})</span>
+                                        <input value={form.peers} onChange={e => setForm({ ...form, peers: e.target.value })} className="mt-1 w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm" placeholder="10.0.0.1, 10.0.0.2" /></label>
+
+                                    <div>
+                                        <div className="text-xs text-gray-400 mb-1.5">{t('mcevpnMembers') || 'Member clusters (same ASN fabric)'}</div>
+                                        <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 max-h-40 overflow-y-auto">
+                                            {evpnClusters.map(c => (
+                                                <label key={c.id} className={`flex items-center gap-2 text-sm px-2 py-1.5 rounded-lg border cursor-pointer ${form.cluster_ids.includes(c.id) ? 'bg-cyan-500/10 border-cyan-500/40 text-cyan-200' : 'bg-proxmox-dark border-proxmox-border text-gray-300'}`}>
+                                                    <input type="checkbox" checked={form.cluster_ids.includes(c.id)} onChange={() => toggleMember(c.id)} className="rounded" />
+                                                    <span className="truncate">{c.name || c.display_name || c.id}</span>
+                                                </label>
+                                            ))}
+                                        </div>
+                                    </div>
+
+                                    {plan && (
+                                        <div className={`p-3 rounded-lg border text-xs ${plan.ok ? 'bg-green-500/10 border-green-500/30' : 'bg-yellow-500/10 border-yellow-500/30'}`}>
+                                            <div className={`font-semibold mb-1.5 ${plan.ok ? 'text-green-400' : 'text-yellow-400'}`}>{plan.ok ? (t('mcevpnPreviewOk') || 'Pre-flight OK — every member is reachable and conflict-free.') : (t('mcevpnPreviewIssues') || 'Pre-flight found issues:')}</div>
+                                            {Object.entries(plan.plan || {}).map(([cid, p]) => (
+                                                <div key={cid} className="flex items-start justify-between gap-2 py-0.5">
+                                                    <span className="text-gray-300">{clusterName(cid)}</span>
+                                                    <span className="text-right">
+                                                        {!p.reachable ? <span className="text-red-400">{p.reason || 'unreachable'}</span>
+                                                            : p.sdn_installed === false ? <span className="text-red-400">SDN not installed</span>
+                                                            : (p.conflicts && p.conflicts.length) ? <span className="text-yellow-400">{p.conflicts.join('; ')}</span>
+                                                            : <span className="text-green-400">ok</span>}
+                                                    </span>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                                <div className="p-4 border-t border-proxmox-border flex items-center justify-between sticky bottom-0 bg-proxmox-card">
+                                    <button disabled={busy || !canCreate} onClick={validate} className="px-3 py-2 rounded-lg text-sm bg-proxmox-dark border border-proxmox-border text-gray-300 hover:text-white disabled:opacity-50">{t('mcevpnPreview') || 'Validate / preview'}</button>
+                                    <div className="flex items-center gap-2">
+                                        <button onClick={() => setShowCreate(false)} className="px-3 py-2 rounded-lg text-sm text-gray-400 hover:text-white">{t('cancel') || 'Cancel'}</button>
+                                        <button disabled={busy || !canCreate} onClick={create} className="px-4 py-2 rounded-lg text-sm font-semibold bg-cyan-500/20 text-cyan-300 hover:bg-cyan-500/30 border border-cyan-500/40 disabled:opacity-50">{busy ? '…' : (t('mcevpnCreate') || 'Create EVPN vNet')}</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
         // MK: Group Overview - drills into a single cluster group
         // basically a scoped-down version of AllClustersOverview w/ LB stuff
         function GroupOverview({ group, clusters, allMetrics, clusterGroups = [], topGuests = [], onSelectCluster, onSelectVm, onOpenSettings, authFetch, API_URL }) {
