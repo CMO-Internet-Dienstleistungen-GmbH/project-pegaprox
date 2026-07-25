@@ -120,6 +120,7 @@ def get_clusters():
                 'auto_migrate': mgr.config.auto_migrate,
                 'balance_containers': getattr(mgr.config, 'balance_containers', False),
                 'balance_local_disks': getattr(mgr.config, 'balance_local_disks', False),
+                'proxlb_tags_enabled': getattr(mgr.config, 'proxlb_tags_enabled', False),  # #628 — was missing from GET, made the UI toggle revert on refresh
                 'dry_run': mgr.config.dry_run,
                 'predictive_balancing': getattr(mgr.config, 'predictive_balancing', False),
                 'predictive_threshold': getattr(mgr.config, 'predictive_threshold', 75),
@@ -228,6 +229,7 @@ def export_cluster_config(cluster_id):
         'auto_migrate': c.auto_migrate,
         'balance_containers': getattr(c, 'balance_containers', False),
         'balance_local_disks': getattr(c, 'balance_local_disks', False),
+        'proxlb_tags_enabled': getattr(c, 'proxlb_tags_enabled', False),  # #628
         'dry_run': c.dry_run,
         'cluster_type': getattr(mgr, 'cluster_type', 'proxmox'),
         'vnc_tunnel': bool(getattr(c, 'vnc_tunnel', False)),  # MK Apr 2026
