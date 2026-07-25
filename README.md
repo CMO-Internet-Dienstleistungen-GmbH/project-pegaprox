@@ -17,7 +17,8 @@
   <a href="https://docs.pegaprox.com">Documentation</a> •
   <a href="https://github.com/PegaProx/project-pegaprox/releases">Releases</a> •
   <a href="https://plugins.pegaprox.com/">Plugins</a> •
-  <a href="https://opencollective.com/pegaprox">Sponsoring</a>
+  <a href="https://opencollective.com/pegaprox">Sponsoring</a> •
+  <a href="https://pegaprox.com/sponsors.html">Commercial Support</a>
 </p>
 
 <p align="center">
@@ -110,7 +111,8 @@ The name **PegaProx** is inspired by *Pegasus*, the winged horse of Greek mythol
 
 <p align="center">
   <a href="mailto:sponsor@pegaprox.com">Become a Sponsor</a> •
-  <a href="https://opencollective.com/pegaprox">Open Collective</a>
+  <a href="https://opencollective.com/pegaprox">Open Collective</a> •
+  <a href="https://pegaprox.com/sponsors.html">Commercial Support</a>
 </p>
 
 ## ✨ Features
