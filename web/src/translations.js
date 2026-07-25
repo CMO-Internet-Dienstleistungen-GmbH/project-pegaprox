@@ -4,6 +4,15 @@
         // ═══════════════════════════════════════════════
         const translations = {
             de: {
+                // #612 Phase 3 — Multi-Cluster EVPN member add/remove
+                mcevpnMemberAdded: 'Cluster zum Span hinzugefügt',
+                mcevpnMemberRemoved: 'Cluster aus dem Span entfernt',
+                mcevpnRemoveConfirm: 'Dieses Cluster aus dem Span entfernen? (das vNet bleibt auf dem Cluster)',
+                mcevpnRemovePurgeConfirm: 'Dieses Cluster aus dem Span entfernen UND das vNet darauf löschen?',
+                mcevpnRemoveMember: 'Aus dem Span entfernen (vNet auf dem Cluster belassen)',
+                mcevpnRemovePurge: 'Aus dem Span entfernen + vNet auf diesem Cluster löschen',
+                mcevpnAddMember: 'Cluster zum Span hinzufügen',
+                mcevpnPickCluster: '— Cluster wählen —',
                 // #612 Phase 2 — Multi-Cluster EVPN edit/drift
                 mcevpnScanned: 'Drift-Scan fertig',
                 mcevpnReconcileConfirm: 'Die gewünschte EVPN-Definition erneut auf jedes Mitglied ausrollen (behebt Drift, löst einen cluster-weiten SDN-Apply aus)?',
@@ -4232,6 +4241,15 @@
                 clusterHealthSshMissing: 'Cluster Health benötigt SSH-Zugriff von PegaProx auf den Node (corosync-cfgtool, pvecm, systemctl). Bitte die Node-Shell-SSH-Credentials des Clusters konfigurieren und neu laden.',
             },
             en: {
+                // #612 Phase 3 — Multi-Cluster EVPN member add/remove
+                mcevpnMemberAdded: 'Cluster added to the span',
+                mcevpnMemberRemoved: 'Cluster removed from the span',
+                mcevpnRemoveConfirm: 'Remove this cluster from the span? (the vNet stays on the cluster)',
+                mcevpnRemovePurgeConfirm: 'Remove this cluster from the span AND delete the vNet from it?',
+                mcevpnRemoveMember: 'Remove from span (leave the vNet on the cluster)',
+                mcevpnRemovePurge: 'Remove from span + delete the vNet from this cluster',
+                mcevpnAddMember: 'Add cluster to span',
+                mcevpnPickCluster: '— pick a cluster —',
                 // #612 Phase 2 — Multi-Cluster EVPN edit/drift
                 mcevpnScanned: 'Drift scan done',
                 mcevpnReconcileConfirm: 'Re-push the desired EVPN definition to every member (fixes drift, runs a cluster-wide SDN apply)?',
@@ -8552,6 +8570,15 @@
             // French translations by @IMNotMax (PR #186)
             // Falls back to EN for missing keys
             fr: {
+                // #612 Phase 3 — Multi-Cluster EVPN member add/remove
+                mcevpnMemberAdded: 'Cluster ajouté au span',
+                mcevpnMemberRemoved: 'Cluster retiré du span',
+                mcevpnRemoveConfirm: 'Retirer ce cluster du span ? (le vNet reste sur le cluster)',
+                mcevpnRemovePurgeConfirm: 'Retirer ce cluster du span ET supprimer le vNet dessus ?',
+                mcevpnRemoveMember: 'Retirer du span (laisser le vNet sur le cluster)',
+                mcevpnRemovePurge: 'Retirer du span + supprimer le vNet de ce cluster',
+                mcevpnAddMember: 'Ajouter un cluster au span',
+                mcevpnPickCluster: '— choisir un cluster —',
                 // #612 Phase 2 — Multi-Cluster EVPN edit/drift
                 mcevpnScanned: 'Analyse de dérive terminée',
                 mcevpnReconcileConfirm: 'Repousser la définition EVPN souhaitée vers chaque membre (corrige la dérive, lance un apply SDN à l\'échelle du cluster) ?',
@@ -12458,6 +12485,15 @@
                 clusterHealthSshMissing: 'Cluster Health a besoin d\'un accès SSH au nœud depuis PegaProx (corosync-cfgtool, pvecm, systemctl). Configurez les identifiants SSH Node-Shell du cluster et actualisez.',
             },
             es: {
+                // #612 Phase 3 — Multi-Cluster EVPN member add/remove
+                mcevpnMemberAdded: 'Clúster añadido al span',
+                mcevpnMemberRemoved: 'Clúster eliminado del span',
+                mcevpnRemoveConfirm: '¿Quitar este clúster del span? (el vNet permanece en el clúster)',
+                mcevpnRemovePurgeConfirm: '¿Quitar este clúster del span Y eliminar el vNet de él?',
+                mcevpnRemoveMember: 'Quitar del span (dejar el vNet en el clúster)',
+                mcevpnRemovePurge: 'Quitar del span + eliminar el vNet de este clúster',
+                mcevpnAddMember: 'Añadir clúster al span',
+                mcevpnPickCluster: '— elegir un clúster —',
                 // #612 Phase 2 — Multi-Cluster EVPN edit/drift
                 mcevpnScanned: 'Análisis de deriva completado',
                 mcevpnReconcileConfirm: '¿Volver a enviar la definición EVPN deseada a cada miembro (corrige la deriva, ejecuta un apply de SDN en todo el clúster)?',
@@ -16507,6 +16543,15 @@
                 clusterHealthSshMissing: 'Cluster Health requiere acceso SSH al nodo desde PegaProx (corosync-cfgtool, pvecm, systemctl). Configure las credenciales SSH de Node-Shell del clúster y actualice.',
             },
             pt: {
+                // #612 Phase 3 — Multi-Cluster EVPN member add/remove
+                mcevpnMemberAdded: 'Cluster adicionado ao span',
+                mcevpnMemberRemoved: 'Cluster removido do span',
+                mcevpnRemoveConfirm: 'Remover este cluster do span? (o vNet permanece no cluster)',
+                mcevpnRemovePurgeConfirm: 'Remover este cluster do span E eliminar o vNet dele?',
+                mcevpnRemoveMember: 'Remover do span (deixar o vNet no cluster)',
+                mcevpnRemovePurge: 'Remover do span + eliminar o vNet deste cluster',
+                mcevpnAddMember: 'Adicionar cluster ao span',
+                mcevpnPickCluster: '— escolher um cluster —',
                 // #612 Phase 2 — Multi-Cluster EVPN edit/drift
                 mcevpnScanned: 'Análise de desvio concluída',
                 mcevpnReconcileConfirm: 'Reenviar a definição EVPN pretendida para cada membro (corrige o desvio, executa um apply de SDN em todo o cluster)?',
@@ -20356,6 +20401,15 @@
                 clusterHealthSshMissing: 'Cluster Health requer acesso SSH ao nó a partir do PegaProx (corosync-cfgtool, pvecm, systemctl). Configure as credenciais SSH de Node-Shell do cluster e atualize.',
             },
             ko: {
+                // #612 Phase 3 — Multi-Cluster EVPN member add/remove
+                mcevpnMemberAdded: '클러스터가 스팬에 추가됨',
+                mcevpnMemberRemoved: '클러스터가 스팬에서 제거됨',
+                mcevpnRemoveConfirm: '이 클러스터를 스팬에서 제거할까요? (vNet은 클러스터에 유지됩니다)',
+                mcevpnRemovePurgeConfirm: '이 클러스터를 스팬에서 제거하고 vNet도 삭제할까요?',
+                mcevpnRemoveMember: '스팬에서 제거 (vNet은 클러스터에 유지)',
+                mcevpnRemovePurge: '스팬에서 제거 + 이 클러스터에서 vNet 삭제',
+                mcevpnAddMember: '스팬에 클러스터 추가',
+                mcevpnPickCluster: '— 클러스터 선택 —',
                 // #612 Phase 2 — Multi-Cluster EVPN edit/drift
                 mcevpnScanned: '드리프트 스캔 완료',
                 mcevpnReconcileConfirm: '원하는 EVPN 정의를 모든 멤버에 다시 푸시할까요? (드리프트를 수정하고 클러스터 전체 SDN 적용을 실행합니다)',
@@ -24332,6 +24386,15 @@
                 clusterHealthSshMissing: 'Cluster Health richiede l\'accesso SSH al nodo da PegaProx (corosync-cfgtool, pvecm, systemctl). Configura le credenziali SSH Node-Shell del cluster e aggiorna.',
             },
             it: {
+                // #612 Phase 3 — Multi-Cluster EVPN member add/remove
+                mcevpnMemberAdded: 'Cluster aggiunto allo span',
+                mcevpnMemberRemoved: 'Cluster rimosso dallo span',
+                mcevpnRemoveConfirm: 'Rimuovere questo cluster dallo span? (la vNet resta sul cluster)',
+                mcevpnRemovePurgeConfirm: 'Rimuovere questo cluster dallo span ED eliminare la vNet da esso?',
+                mcevpnRemoveMember: 'Rimuovi dallo span (lascia la vNet sul cluster)',
+                mcevpnRemovePurge: 'Rimuovi dallo span + elimina la vNet da questo cluster',
+                mcevpnAddMember: 'Aggiungi cluster allo span',
+                mcevpnPickCluster: '— scegli un cluster —',
                 // #612 Phase 2 — Multi-Cluster EVPN edit/drift
                 mcevpnScanned: 'Scansione drift completata',
                 mcevpnReconcileConfirm: 'Ripubblicare la definizione EVPN desiderata su ogni membro (corregge il drift, esegue un apply SDN a livello di cluster)?',

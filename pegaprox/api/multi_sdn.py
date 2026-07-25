@@ -321,7 +321,7 @@ def _apply_on_cluster(cid, defn):
     """Idempotently build the EVPN controller → zone → vnet → subnet(s) on ONE
     cluster, then apply. Returns a per-cluster status dict. Runs inside a greenlet
     (run_per_node) — no Flask context, PVE calls only."""
-    result = {'cluster_id': cid, 'status': 'failed', 'steps': [], 'error': None}
+    result = {'cluster_id': cid, 'status': 'failed', 'steps': [], 'error': None, 'created': []}
     mgr, reason = _resolve_member(cid)
     if reason:
         result['status'] = 'offline' if reason == 'offline' else 'not_found'
@@ -363,6 +363,7 @@ def _apply_on_cluster(cid, defn):
             result['error'] = f"controller: {e}"
             return result
         changed = True
+        result['created'].append('controller')
     # 2) zone (depends on controller)
     if have_zone:
         _step('zone (exists)', True)
@@ -372,6 +373,7 @@ def _apply_on_cluster(cid, defn):
             result['error'] = f"zone: {e}"
             return result
         changed = True
+        result['created'].append('zone')
     # 3) vnet (depends on zone)
     if have_vnet:
         _step('vnet (exists)', True)
@@ -381,6 +383,7 @@ def _apply_on_cluster(cid, defn):
             result['error'] = f"vnet: {e}"
             return result
         changed = True
+        result['created'].append('vnet')
     # 4) subnets (nested under vnet) — best-effort idempotent
     if defn['subnets']:
         existing_subs, _serr = _sdn_list(mgr, f"vnets/{defn['name']}/subnets")
@@ -442,6 +445,65 @@ def _rollback_on_cluster(cid, defn):
             out['deleted'].append(label)
         elif e and 'does not exist' not in str(e).lower():
             out['errors'].append(f"{label}: {e}")
+    _sdn_apply(mgr)
+    return out
+
+
+def _teardown_created_on_cluster(cid, defn, created):
+    """Delete EXACTLY the objects a just-failed _apply_on_cluster reported it freshly
+    created (`created` list of 'controller'/'zone'/'vnet'), in reverse dependency order,
+    then apply. Used to unwind a mid-build add failure WITHOUT touching a pre-existing
+    zone/controller a co-tenant span on that cluster may share. Never raises."""
+    out = {'cluster_id': cid, 'deleted': [], 'errors': []}
+    mgr, reason = _resolve_member(cid)
+    if reason:
+        out['errors'].append(reason)
+        return out
+    suffix_by = {'vnet': f"vnets/{defn['name']}", 'zone': f"zones/{defn['zone']}",
+                 'controller': f"controllers/{defn['controller']}"}
+    for label in ('vnet', 'zone', 'controller'):   # reverse dependency order
+        if label not in (created or []):
+            continue
+        ok, e = _sdn_delete(mgr, suffix_by[label])
+        if ok:
+            out['deleted'].append(label)
+        elif e and 'does not exist' not in str(e).lower():
+            out['errors'].append(f"{label}: {e}")
+    _sdn_apply(mgr)
+    return out
+
+
+# Per-record mutation lock — serialize the read-modify-write of one aggregate vnet's
+# authoritative fields (member_clusters / desired_state / subnets) so two concurrent
+# admins (gevent greenlets) can't lose an update. Different vids run in parallel.
+_vnet_locks = {}
+_vnet_locks_guard = threading.Lock()
+
+
+def _get_vnet_lock(vid):
+    with _vnet_locks_guard:
+        lk = _vnet_locks.get(vid)
+        if lk is None:
+            lk = threading.Lock()
+            _vnet_locks[vid] = lk
+        return lk
+
+
+def _purge_vnet_only_on_cluster(cid, defn):
+    """Remove ONLY this vnet (and its subnets, which cascade) from ONE cluster, then
+    apply — deliberately NOT the zone/controller, which another cross-cluster span on
+    the same cluster may share. Used when a cluster is dropped from a span (#612 P3).
+    Never raises."""
+    out = {'cluster_id': cid, 'deleted': [], 'errors': []}
+    mgr, reason = _resolve_member(cid)
+    if reason:
+        out['errors'].append(reason)
+        return out
+    ok, e = _sdn_delete(mgr, f"vnets/{defn['name']}")
+    if ok:
+        out['deleted'].append('vnet')
+    elif e and 'does not exist' not in str(e).lower():
+        out['errors'].append(f"vnet: {e}")
     _sdn_apply(mgr)
     return out
 
@@ -991,6 +1053,135 @@ def scan_multi_vnet(vid):
 
 
 # ---------------------------------------------------------------------------
+# Phase 3 — expand / shrink the span (add / remove a member cluster)
+# ---------------------------------------------------------------------------
+def _persist_members(db, vid, defn, new_members, per_cluster, user):
+    """Write a member-list change consistently across all three copies: the
+    member_clusters column (what every route reads), desired_state['member_clusters']
+    (kept honest), and per_cluster_status; refresh the rollup + updated_at."""
+    new_defn = dict(defn)
+    new_defn['member_clusters'] = new_members
+    now = datetime.now().isoformat()
+    db.execute('UPDATE multi_cluster_vnets SET member_clusters = ?, desired_state = ?, '
+               'per_cluster_status = ?, status = ?, updated_at = ? WHERE id = ?',
+               (json.dumps(new_members), json.dumps(new_defn), json.dumps(per_cluster),
+                _rollup_status(per_cluster), now, vid))
+
+
+@bp.route('/api/multi-sdn/vnets/<vid>/members', methods=['POST'])
+@require_auth(perms=['sdn.manage', 'admin.settings'])
+def add_multi_vnet_member(vid):
+    """Add a cluster to an existing span: collision + reachability pre-flight on the NEW
+    cluster, then build the same EVPN controller/zone/vnet on it and append it. Body:
+    {cluster_id}. The new cluster must share the span's ASN/VNI (collision pre-flight
+    enforces it) and the caller must have access to it too."""
+    db = get_db()
+    row = db.query_one('SELECT * FROM multi_cluster_vnets WHERE id = ?', (vid,))
+    if not row:
+        return jsonify({'error': 'not found'}), 404
+    rec = _row_to_dict(row)
+    members = rec.get('member_clusters', [])
+    new_cid = str((request.get_json(force=True, silent=True) or {}).get('cluster_id', '')).strip()
+    if not new_cid:
+        return jsonify({'error': 'cluster_id is required'}), 400
+    if new_cid in members:
+        return jsonify({'error': f"cluster '{new_cid}' is already a member"}), 409
+    # gate on ALL members INCLUDING the new one — a caller who can't reach it can't add it
+    denied = _require_members_access(members + [new_cid])
+    if denied:
+        return denied
+    defn = rec.get('desired_state') or {}
+    if not defn:
+        return jsonify({'error': 'record has no stored definition'}), 500
+
+    # pre-flight the new cluster exactly like create does per-member
+    mgr, reason = _resolve_member(new_cid)
+    if reason:
+        return jsonify({'error': f"cluster '{new_cid}' is {reason}", 'cluster_id': new_cid}), 409
+    conflicts, cerr = _collisions_on_cluster(mgr, defn)
+    if cerr == 'sdn_not_installed':
+        return jsonify({'error': f"SDN is not installed on '{new_cid}'", 'cluster_id': new_cid}), 409
+    if cerr:
+        return jsonify({'error': f"pre-flight read failed on '{new_cid}': {cerr}", 'cluster_id': new_cid}), 502
+    if conflicts:
+        return jsonify({'error': f"conflicting SDN objects on '{new_cid}'",
+                        'cluster_id': new_cid, 'conflicts': conflicts}), 409
+
+    result = _apply_on_cluster(new_cid, defn)
+    if result.get('status') != 'applied':
+        # don't half-add: tear down EXACTLY what this build freshly created (not a
+        # pre-existing zone/controller a co-tenant span may share), leave membership as-is
+        _teardown_created_on_cluster(new_cid, defn, result.get('created'))
+        return jsonify({'error': f"failed to build the vnet on '{new_cid}'",
+                        'cluster_id': new_cid, 'result': result}), 502
+
+    # serialize the authoritative-record write + re-read under the lock so a concurrent
+    # add/remove on the same span can't lose this update
+    user = getattr(request, 'session', {}).get('user', 'system')
+    with _get_vnet_lock(vid):
+        row = db.query_one('SELECT * FROM multi_cluster_vnets WHERE id = ?', (vid,))
+        if not row:
+            return jsonify({'error': 'not found'}), 404
+        rec = _row_to_dict(row)
+        cur_members = rec.get('member_clusters', [])
+        if new_cid not in cur_members:   # skip if a concurrent add already appended it
+            per_cluster = dict(rec.get('per_cluster_status', {}))
+            per_cluster[new_cid] = result
+            _persist_members(db, vid, rec.get('desired_state') or defn, cur_members + [new_cid], per_cluster, user)
+        row = db.query_one('SELECT * FROM multi_cluster_vnets WHERE id = ?', (vid,))
+    log_audit(user, 'multi_sdn.member_added',
+              f"Added cluster '{new_cid}' to cross-cluster vnet '{rec.get('name')}'")
+    return jsonify(_row_to_dict(row)), 201
+
+
+@bp.route('/api/multi-sdn/vnets/<vid>/members/<cid>', methods=['DELETE'])
+@require_auth(perms=['sdn.manage', 'admin.settings'])
+def remove_multi_vnet_member(vid, cid):
+    """Drop a cluster from a span. Keeps >=1 member. ?purge=1 also removes the vNet from
+    that cluster (vnet-only — the zone/controller are left, since another span on that
+    cluster may share them)."""
+    db = get_db()
+    row = db.query_one('SELECT * FROM multi_cluster_vnets WHERE id = ?', (vid,))
+    if not row:
+        return jsonify({'error': 'not found'}), 404
+    rec = _row_to_dict(row)
+    members = rec.get('member_clusters', [])
+    denied = _require_members_access(members)
+    if denied:
+        return denied
+    if cid not in members:
+        return jsonify({'error': f"cluster '{cid}' is not a member"}), 404
+    if len(members) <= 1:
+        return jsonify({'error': 'cannot remove the last member — delete the vNet instead'}), 409
+
+    defn = rec.get('desired_state') or {}
+    purge = request.args.get('purge') in ('1', 'true', 'yes')
+    purged = None
+    if purge and defn:
+        purged = _purge_vnet_only_on_cluster(cid, defn)
+
+    user = getattr(request, 'session', {}).get('user', 'system')
+    with _get_vnet_lock(vid):
+        row = db.query_one('SELECT * FROM multi_cluster_vnets WHERE id = ?', (vid,))
+        if not row:
+            return jsonify({'error': 'not found'}), 404
+        rec = _row_to_dict(row)
+        cur_members = rec.get('member_clusters', [])
+        new_members = [m for m in cur_members if m != cid]
+        if not new_members:   # a concurrent remove already got the others — never orphan-empty
+            return jsonify({'error': 'cannot remove the last member — delete the vNet instead'}), 409
+        per_cluster = {k: v for k, v in rec.get('per_cluster_status', {}).items() if k != cid}
+        _persist_members(db, vid, rec.get('desired_state') or defn, new_members, per_cluster, user)
+        row = db.query_one('SELECT * FROM multi_cluster_vnets WHERE id = ?', (vid,))
+    log_audit(user, 'multi_sdn.member_removed',
+              f"Removed cluster '{cid}' from cross-cluster vnet '{rec.get('name')}'"
+              + (" (purged the vnet from it)" if purge else " (left the vnet in place)"))
+    out = _row_to_dict(row)
+    out['purged'] = purged
+    return jsonify(out)
+
+
+# ---------------------------------------------------------------------------
 # Phase 2 — background drift scanner (detect-only by default)
 # ---------------------------------------------------------------------------
 # Mirrors api/drift.py: module-level running flag + lock, chunked sleep, plain daemon
@@ -1049,6 +1240,39 @@ def _msdn_scan_once():
                               f"Auto-reconciled cross-cluster vnet '{rec.get('name')}' on {to_fix}"
                               + (f" (re-created on {recreated})" if recreated else "")
                               + f" → {_rollup_status(live)}")
+            # #612 P3 — operator alert on a healthy→drift transition. Edge-triggered off
+            # `prior` (already loaded), computed from the FINAL live status (after any
+            # auto-reconcile above), so a fixed member never false-alerts and a member that
+            # stays drifted across 6h ticks alerts ONCE, not every tick.
+            newly_off = [cid for cid in members
+                         if live[cid].get('status') in ('drift', 'missing')
+                         and (prior.get(cid) or {}).get('status') not in ('drift', 'missing')]
+            if newly_off:
+                try:
+                    from pegaprox.background import alerts as alerts_mod
+                    handlers = list(getattr(alerts_mod, '_notification_handlers', []) or [])
+                    # One alert PER drifted member, each anchored to its OWN cluster_id, so
+                    # push fan-out reaches every affected tenant (a single anchor would only
+                    # wake the tenant that owns the first drifted member on a cross-tenant span).
+                    for off_cid in newly_off:
+                        payload = {
+                            'alert_name': 'Cross-cluster SDN Drift',
+                            'severity': 'warning',
+                            'cluster_id': off_cid,
+                            'message': f"EVPN vNet '{rec.get('name')}' drifted on cluster '{off_cid}'",
+                            'metric': 'multi_sdn_drift',
+                            'target_type': 'cluster',
+                            'target_name': rec.get('name'),
+                            'timestamp': datetime.now().isoformat(),
+                        }
+                        for h in handlers:
+                            try:
+                                h(payload)
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logging.debug(f"[multi_sdn] drift alert emit failed: {e}")
+
             rollup = _rollup_status(live)
             db.execute('UPDATE multi_cluster_vnets SET per_cluster_status = ?, status = ?, updated_at = ? WHERE id = ?',
                        (json.dumps(live), rollup, datetime.now().isoformat(), rec['id']))

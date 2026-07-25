@@ -3995,6 +3995,28 @@
                 } catch (e) { setAutoReconcile(!val); addToast('Error', e.message, 'error'); }
             };
 
+            // #612 P3 — expand / shrink the span
+            const addMember = async (vid, cid) => {
+                setBusy(true);
+                try {
+                    const r = await authFetch(`${API_URL}/multi-sdn/vnets/${vid}/members`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cluster_id: cid }) });
+                    const data = await r.json().catch(() => ({}));
+                    if (r?.ok) { addToast(t('mcevpnMemberAdded') || 'Cluster added to the span', `${clusterName(cid)} → ${data.status}`, 'success'); load(); }
+                    else { const extra = data.conflicts ? ` (${data.conflicts.join('; ')})` : ''; addToast('Error', (data.error || 'Add failed') + extra, 'error'); }
+                } catch (e) { addToast('Error', e.message, 'error'); }
+                finally { setBusy(false); }
+            };
+            const removeMember = async (vid, cid, purge) => {
+                if (!window.confirm(purge ? (t('mcevpnRemovePurgeConfirm') || 'Remove this cluster from the span AND delete the vNet from it?') : (t('mcevpnRemoveConfirm') || 'Remove this cluster from the span? (the vNet stays on the cluster)'))) return;
+                setBusy(true);
+                try {
+                    const r = await authFetch(`${API_URL}/multi-sdn/vnets/${vid}/members/${cid}${purge ? '?purge=1' : ''}`, { method: 'DELETE' });
+                    if (r?.ok) { addToast(t('mcevpnMemberRemoved') || 'Cluster removed from the span', '', 'success'); load(); }
+                    else { const d = await r.json().catch(() => ({})); addToast('Error', d.error || 'Remove failed', 'error'); }
+                } catch (e) { addToast('Error', e.message, 'error'); }
+                finally { setBusy(false); }
+            };
+
             const evpnClusters = clusters; // any cluster could host an EVPN SDN; membership is user-chosen
             const canCreate = form.name && form.zone && form.controller && form.vni && form.asn && form.cluster_ids.length >= 1;
 
@@ -4054,14 +4076,32 @@
                                                         <div key={cid} className="flex items-center justify-between p-2 rounded-lg bg-proxmox-dark/40 border border-proxmox-border">
                                                             <span className="text-sm text-gray-300">{clusterName(cid)}</span>
                                                             <div className="flex items-center gap-2">
-                                                                {st.error ? <span className="text-[11px] text-red-400/80 max-w-[200px] truncate" title={st.error}>{st.error}</span>
-                                                                    : st.detail ? <span className="text-[11px] text-amber-400/80 max-w-[200px] truncate" title={st.detail}>{st.detail}</span> : null}
+                                                                {st.error ? <span className="text-[11px] text-red-400/80 max-w-[180px] truncate" title={st.error}>{st.error}</span>
+                                                                    : st.detail ? <span className="text-[11px] text-amber-400/80 max-w-[180px] truncate" title={st.detail}>{st.detail}</span> : null}
                                                                 <span className={`px-2 py-0.5 rounded text-xs font-semibold ${statusChip(st.status || 'unknown')}`}>{st.status || 'unknown'}</span>
+                                                                {(v.member_clusters || []).length > 1 && (
+                                                                    <>
+                                                                        <button disabled={busy} onClick={() => removeMember(v.id, cid, false)} title={t('mcevpnRemoveMember') || 'Remove from span (leave the vNet on the cluster)'} className="text-gray-500 hover:text-white px-1 text-sm leading-none disabled:opacity-50">−</button>
+                                                                        <button disabled={busy} onClick={() => removeMember(v.id, cid, true)} title={t('mcevpnRemovePurge') || 'Remove from span + delete the vNet from this cluster'} className="text-red-400/70 hover:text-red-300 disabled:opacity-50"><Icons.Trash2 className="w-3.5 h-3.5" /></button>
+                                                                    </>
+                                                                )}
                                                             </div>
                                                         </div>
                                                     );
                                                 })}
                                             </div>
+                                            {(() => {
+                                                const nonMembers = clusters.filter(c => !(v.member_clusters || []).includes(c.id));
+                                                return nonMembers.length > 0 ? (
+                                                    <div className="flex items-center gap-2">
+                                                        <span className="text-[11px] text-gray-500">{t('mcevpnAddMember') || 'Add cluster to span'}:</span>
+                                                        <select disabled={busy} value="" onChange={e => { if (e.target.value) addMember(v.id, e.target.value); }} className="px-2 py-1 bg-proxmox-dark border border-proxmox-border rounded text-white text-xs">
+                                                            <option value="">{t('mcevpnPickCluster') || '— pick a cluster —'}</option>
+                                                            {nonMembers.map(c => <option key={c.id} value={c.id}>{c.name || c.display_name || c.id}</option>)}
+                                                        </select>
+                                                    </div>
+                                                ) : null;
+                                            })()}
                                             <div className="flex items-center gap-2 flex-wrap">
                                                 <button disabled={busy} onClick={() => scan(v.id)} className="px-2.5 py-1.5 rounded-lg text-xs bg-proxmox-dark text-gray-300 hover:text-white border border-proxmox-border disabled:opacity-50">{t('mcevpnScan') || 'Scan for drift'}</button>
                                                 <button disabled={busy} onClick={() => openEdit(v)} className="px-2.5 py-1.5 rounded-lg text-xs bg-proxmox-dark text-gray-300 hover:text-white border border-proxmox-border disabled:opacity-50">{t('mcevpnEdit') || 'Edit'}</button>
