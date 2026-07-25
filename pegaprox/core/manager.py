@@ -2348,6 +2348,17 @@ class PegaProxManager:
                     vm_type = 'CT' if vm_res.get('type') == 'lxc' else 'VM'
                     self.logger.info(f"[AFFINITY] Enforcing anti-affinity rule '{rule.get('name')}': migrating {vm_type} {vid} ({vm_res.get('name', '')}) from {nd} → {target}")
 
+                    # #629 — mirror the balancer's local-disk handling here: without
+                    # this, migrate_vm() doesn't pass --with-local-disks and Proxmox
+                    # aborts local-disk VMs ("can't live migrate attached local disks").
+                    # Only when the user has 'Balance VMs with Local Disks' enabled.
+                    if getattr(self.config, 'balance_local_disks', False):
+                        try:
+                            if self.check_vm_storage_type(nd, vid, vm_res.get('type')) == 'local':
+                                vm_res['_has_local_disks'] = True
+                        except Exception:
+                            pass
+
                     ok = self.migrate_vm(vm_res, target)
                     if ok:
                         migrations += 1
