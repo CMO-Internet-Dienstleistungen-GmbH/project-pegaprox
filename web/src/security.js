@@ -2108,6 +2108,7 @@
             const [scheduleReboot, setScheduleReboot] = useState(true);
             const [scheduleSkipEvacuation, setScheduleSkipEvacuation] = useState(false);
             const [scheduleEvacTimeout, setScheduleEvacTimeout] = useState(1800);
+            const [scheduleRebootTimeout, setScheduleRebootTimeout] = useState(600);  // MK #630
             const [scheduleWaitForReboot, setScheduleWaitForReboot] = useState(true);
             const [scheduleShowAdvanced, setScheduleShowAdvanced] = useState(false);
             const [scheduleSaving, setScheduleSaving] = useState(false);
@@ -2277,6 +2278,7 @@
                         setScheduleReboot(data.include_reboot !== false);
                         setScheduleSkipEvacuation(data.skip_evacuation || false);
                         setScheduleEvacTimeout(data.evacuation_timeout || 1800);
+                        setScheduleRebootTimeout(data.reboot_timeout || 600);  // MK #630
                         setScheduleWaitForReboot(data.wait_for_reboot !== false);
                     }
                 } catch (e) {
@@ -2301,7 +2303,8 @@
                             skip_evacuation: scheduleSkipEvacuation,
                             wait_for_reboot: scheduleWaitForReboot,
                             skip_up_to_date: true,
-                            evacuation_timeout: scheduleEvacTimeout
+                            evacuation_timeout: scheduleEvacTimeout,
+                            reboot_timeout: scheduleRebootTimeout  // MK #630
                         })
                     });
                     if (res.ok) {
@@ -3664,7 +3667,28 @@
                                                                 <option value={7200}>2 {t('hours') || 'hours'}</option>
                                                             </select>
                                                         </div>
-                                                        
+
+                                                        {/* MK #630 — reboot timeout is now carried by the schedule too (was fixed at 10 min) */}
+                                                        <div>
+                                                            <label className="text-xs text-gray-400 block mb-1">
+                                                                {t('rebootTimeout') || 'Reboot / Online Timeout'}
+                                                            </label>
+                                                            <select
+                                                                value={scheduleRebootTimeout}
+                                                                onChange={(e) => setScheduleRebootTimeout(parseInt(e.target.value))}
+                                                                className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-1.5 text-sm text-white"
+                                                                disabled={!scheduleReboot}
+                                                            >
+                                                                <option value={300}>5 {t('minutes') || 'min'}</option>
+                                                                <option value={600}>10 {t('minutes') || 'min'} ({t('default') || 'default'})</option>
+                                                                <option value={1200}>20 {t('minutes') || 'min'}</option>
+                                                                <option value={1800}>30 {t('minutes') || 'min'}</option>
+                                                                <option value={3600}>1 {t('hour') || 'hour'}</option>
+                                                                <option value={7200}>2 {t('hours') || 'hours'}</option>
+                                                            </select>
+                                                            <p className="text-xs text-gray-500 mt-1">{t('rebootTimeoutHint') || 'How long to wait for a node to come back online after reboot. Extend this if you run Ceph OSDs or have many disks.'}</p>
+                                                        </div>
+
                                                         <div className="text-xs text-gray-500 flex items-start gap-1.5">
                                                             <Icons.Info className="w-3 h-3 mt-0.5 flex-shrink-0" />
                                                             <span>Scheduled updates cannot pause for user input. If VMs fail to migrate, the node will be skipped and the update continues with the next node.</span>

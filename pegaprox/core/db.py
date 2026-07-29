@@ -584,6 +584,7 @@ class PegaProxDB:
                 skip_evacuation INTEGER DEFAULT 0,
                 skip_up_to_date INTEGER DEFAULT 1,
                 evacuation_timeout INTEGER DEFAULT 1800,
+                reboot_timeout INTEGER DEFAULT 600,
                 last_run TEXT,
                 next_run TEXT,
                 created_by TEXT,
@@ -591,7 +592,15 @@ class PegaProxDB:
                 updated_at TEXT
             )
         ''')
-        
+        # MK #630 — backfill reboot_timeout on schedule tables created before the column existed.
+        try:
+            cursor.execute("PRAGMA table_info(update_schedules)")
+            _us_cols = {r[1] for r in cursor.fetchall()}
+            if 'reboot_timeout' not in _us_cols:
+                cursor.execute("ALTER TABLE update_schedules ADD COLUMN reboot_timeout INTEGER DEFAULT 600")
+        except Exception as _e:
+            logging.warning(f"update_schedules reboot_timeout migration skipped: {_e}")
+
         # Metrics history table - NS Jan 2026
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS metrics_history (
@@ -1193,6 +1202,7 @@ class PegaProxDB:
                     skip_evacuation INTEGER DEFAULT 0,
                     skip_up_to_date INTEGER DEFAULT 1,
                     evacuation_timeout INTEGER DEFAULT 1800,
+                    reboot_timeout INTEGER DEFAULT 600,
                     last_run TEXT,
                     next_run TEXT,
                     created_by TEXT,
@@ -1200,6 +1210,13 @@ class PegaProxDB:
                     updated_at TEXT
                 )
             ''')
+            try:
+                cursor.execute("PRAGMA table_info(update_schedules)")
+                _us_cols2 = {r[1] for r in cursor.fetchall()}
+                if 'reboot_timeout' not in _us_cols2:
+                    cursor.execute("ALTER TABLE update_schedules ADD COLUMN reboot_timeout INTEGER DEFAULT 600")
+            except Exception as _e2:
+                logging.warning(f"update_schedules reboot_timeout migration skipped: {_e2}")
             logging.info("Ensured update_schedules table exists")
         except Exception as e:
             logging.error(f"Error creating update_schedules table: {e}")

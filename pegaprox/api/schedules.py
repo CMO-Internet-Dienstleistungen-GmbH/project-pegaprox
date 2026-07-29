@@ -313,6 +313,12 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
         skip_evacuation = config.get('skip_evacuation', False)
         skip_up_to_date = config.get('skip_up_to_date', True)
         evacuation_timeout = config.get('evacuation_timeout', 1800)
+        # MK #630: reboot timeout was hardcoded 600 here — now carried per-schedule. Clamp it the
+        # same way the manual rolling-update path does (60s..2h) so a bad stored value can't wedge.
+        try:
+            reboot_timeout = max(60, min(7200, int(config.get('reboot_timeout', 600) or 600)))
+        except (TypeError, ValueError):
+            reboot_timeout = 600
         wait_for_reboot = config.get('wait_for_reboot', True)
         
         logging.info(f"[SCHEDULER] Starting scheduled rolling update for cluster {cluster_id}")
@@ -337,7 +343,7 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
             'include_reboot': include_reboot, 'skip_up_to_date': skip_up_to_date,
             'skip_evacuation': skip_evacuation, 'wait_for_reboot': wait_for_reboot,
             'pause_on_evacuation_error': False, 'force_all': False,
-            'evacuation_timeout': evacuation_timeout, 'update_timeout': 900, 'reboot_timeout': 600,
+            'evacuation_timeout': evacuation_timeout, 'update_timeout': 900, 'reboot_timeout': reboot_timeout,
             'nodes': nodes_to_update, 'current_index': 0, 'current_node': nodes_to_update[0],
             'current_step': 'starting', 'completed_nodes': [], 'skipped_nodes': [],
             'failed_nodes': [], 'rebooting_nodes': [], 'paused_reason': None, 'paused_details': None,
@@ -748,6 +754,7 @@ def load_update_schedule(cluster_id: str) -> dict:
                 skip_evacuation INTEGER DEFAULT 0,
                 skip_up_to_date INTEGER DEFAULT 1,
                 evacuation_timeout INTEGER DEFAULT 1800,
+                reboot_timeout INTEGER DEFAULT 600,
                 last_run TEXT,
                 next_run TEXT,
                 created_by TEXT,
@@ -755,7 +762,16 @@ def load_update_schedule(cluster_id: str) -> dict:
                 updated_at TEXT
             )
         ''')
-        
+        # MK #630 — older schedule tables predate the reboot_timeout column; add it in place
+        # so a scheduled run can carry a per-cluster reboot timeout instead of a fixed 600s.
+        try:
+            cursor.execute("PRAGMA table_info(update_schedules)")
+            _cols = {r[1] for r in cursor.fetchall()}
+            if 'reboot_timeout' not in _cols:
+                cursor.execute("ALTER TABLE update_schedules ADD COLUMN reboot_timeout INTEGER DEFAULT 600")
+        except Exception as _mig_e:
+            logging.warning(f"update_schedules reboot_timeout migration skipped: {_mig_e}")
+
         cursor.execute('SELECT * FROM update_schedules WHERE cluster_id = ?', (cluster_id,))
         row = cursor.fetchone()
         if row:
@@ -768,6 +784,7 @@ def load_update_schedule(cluster_id: str) -> dict:
                 'skip_evacuation': bool(row['skip_evacuation']),
                 'skip_up_to_date': bool(row['skip_up_to_date']),
                 'evacuation_timeout': row['evacuation_timeout'] or 1800,
+                'reboot_timeout': (row['reboot_timeout'] if 'reboot_timeout' in row.keys() else 600) or 600,
                 'last_run': row['last_run'],
                 'next_run': row['next_run']
             }
@@ -786,9 +803,9 @@ def save_update_schedule(cluster_id: str, schedule: dict, user: str = 'system'):
         # MK: Use INSERT OR REPLACE for older SQLite compatibility
         cursor.execute('''
             INSERT OR REPLACE INTO update_schedules 
-            (cluster_id, enabled, schedule_type, day, time, include_reboot, skip_evacuation, 
-             skip_up_to_date, evacuation_timeout, last_run, next_run, created_by, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (cluster_id, enabled, schedule_type, day, time, include_reboot, skip_evacuation,
+             skip_up_to_date, evacuation_timeout, reboot_timeout, last_run, next_run, created_by, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             cluster_id,
             1 if schedule.get('enabled') else 0,
@@ -799,6 +816,7 @@ def save_update_schedule(cluster_id: str, schedule: dict, user: str = 'system'):
             1 if schedule.get('skip_evacuation', False) else 0,
             1 if schedule.get('skip_up_to_date', True) else 0,
             schedule.get('evacuation_timeout', 1800),
+            schedule.get('reboot_timeout', 600),
             schedule.get('last_run'),
             schedule.get('next_run'),
             user,
@@ -841,6 +859,7 @@ def load_all_update_schedules() -> dict:
                 'skip_evacuation': bool(row['skip_evacuation']),
                 'skip_up_to_date': bool(row['skip_up_to_date']),
                 'evacuation_timeout': row['evacuation_timeout'] or 1800,
+                'reboot_timeout': (row['reboot_timeout'] if 'reboot_timeout' in row.keys() else 600) or 600,
                 'last_run': row['last_run'],
                 'next_run': row['next_run']
             }
@@ -882,6 +901,7 @@ def set_update_schedule(cluster_id):
         'skip_evacuation': data.get('skip_evacuation', False),
         'skip_up_to_date': data.get('skip_up_to_date', True),
         'evacuation_timeout': data.get('evacuation_timeout', 1800),
+        'reboot_timeout': data.get('reboot_timeout', 600),
         'wait_for_reboot': data.get('wait_for_reboot', True),
         'last_run': None,
         'next_run': None
@@ -1023,7 +1043,10 @@ def check_scheduled_updates():
                         'include_reboot': schedule.get('include_reboot', True),
                         'skip_evacuation': schedule.get('skip_evacuation', False),
                         'skip_up_to_date': schedule.get('skip_up_to_date', True),
-                        'evacuation_timeout': schedule.get('evacuation_timeout', 1800)
+                        'evacuation_timeout': schedule.get('evacuation_timeout', 1800),
+                        # MK #630 — forward the per-schedule reboot timeout to the runner; without this
+                        # the runner falls back to 600s and the saved value never takes effect.
+                        'reboot_timeout': schedule.get('reboot_timeout', 600)
                     }
                 }
                 
