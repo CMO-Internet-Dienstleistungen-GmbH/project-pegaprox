@@ -3404,15 +3404,33 @@ def _pvesm_alloc_disk(pve_mgr, node, storage, vmid, disk_index, size_bytes, errb
         real_err = ('400' in out_str or 'error' in out_low or 'failed' in out_low
                     or 'not supported' in out_low or 'no space' in out_low
                     or 'insufficient' in out_low)
-        if not real_err:
+        # MK #636 — PVE reports an already-present volume as
+        # `... error: Logical Volume "vm-N-disk-M" already exists`, which trips the
+        # 'error' keyword above. On a multi-disk migration an earlier attempt in THIS
+        # loop can create the LV, so the next attempt hits "already exists" and we used
+        # to treat it as a hard failure and give up on the whole disk. It's not a
+        # failure — the volume is there — so fall through to the authoritative
+        # `pvesm path` confirmation below and reuse it.
+        already_exists = ('already exist' in out_low or 'already in use' in out_low
+                          or 'volume already' in out_low)
+        if not real_err or already_exists:
             # extract vol_id
             vol_id = None
-            m = re.search(r"(\S+:vm-\d+-disk-\d+(?:\.\w+)?)", out_str)
-            if m:
-                vol_id = m.group(1).strip("'\"")
-            elif out_str and ':' in out_str and 'vm-' in out_str:
-                # output is just the vol_id on its own line
-                vol_id = out_str.split('\n')[-1].strip().strip("'\"")
+            # MK #636 — on an already-exists result the output is the ERROR text
+            # (e.g. `lvcreate 'pve/vm-112-disk-1' error: Logical Volume "vm-112-disk-1"
+            # already exists`), NOT a `storage:vm-N-disk-M` token. Parsing it yields
+            # garbage (the elif below would grab the error line), so `pvesm path` fails
+            # and the disk aborts anyway. The target volume is fully determined by
+            # storage+vmid+disk_index, so name it directly and let `pvesm path` confirm.
+            if already_exists:
+                vol_id = f"{storage}:{fn_raw}"
+            else:
+                m = re.search(r"(\S+:vm-\d+-disk-\d+(?:\.\w+)?)", out_str)
+                if m:
+                    vol_id = m.group(1).strip("'\"")
+                elif out_str and ':' in out_str and 'vm-' in out_str:
+                    # output is just the vol_id on its own line
+                    vol_id = out_str.split('\n')[-1].strip().strip("'\"")
             if not vol_id:
                 vol_id = f"{storage}:{fn_raw}"
 
