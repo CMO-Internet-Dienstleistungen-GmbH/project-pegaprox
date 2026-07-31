@@ -2,6 +2,12 @@
 Description=PegaProx - Proxmox Datacenter Manager for Proxmox VE
 After=network-online.target
 Wants=network-online.target
+# MK #633: TLS bootstrap now fails closed (won't serve plaintext on the TLS port).
+# Bound the restarts so a permanently-broken cert lands in a clear `failed` state
+# an operator notices, instead of an endless 5s crash-loop. Transient failures
+# still get 5 quick retries within the window.
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
