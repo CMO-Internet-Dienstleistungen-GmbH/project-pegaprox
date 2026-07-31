@@ -12413,19 +12413,35 @@ echo "AGENT_INSTALLED_OK"
             return []
     
     def get_pool_members(self, pool_id: str) -> Dict:
-        """Get pool details including members"""
+        """Get pool details including members.
+
+        MK #634 — nested/hierarchical pools (poolid like 'teamA/servers/db', PVE 8.2+)
+        carry slashes that can't sit on the URL path, so `GET /pools/teamA/servers/db`
+        never resolved and those pools came back with 0 members. For a nested id we use
+        the index filter `GET /pools?poolid=<id>` (added alongside nested pools in 8.2);
+        flat pools keep the classic path form so their behaviour is unchanged.
+        (Owes a live nested-pool retest.)"""
         if not self.is_connected:
             if not self.connect_to_proxmox():
                 return {}
-        
+
+        from urllib.parse import quote, urlencode
+        host = self.host
+        base = f"https://{host}:{self.api_port}/api2/json/pools"
+        if '/' in pool_id:
+            url = f"{base}?{urlencode({'poolid': pool_id})}"
+        else:
+            url = f"{base}/{quote(pool_id, safe='')}"
         try:
-            host = self.host
-            url = f"https://{host}:{self.api_port}/api2/json/pools/{pool_id}"
             response = self._api_get(url)
-            
-            if response.status_code == 200:
-                return response.json().get('data', {})
-            return {}
+            if response.status_code != 200:
+                return {}
+            data = response.json().get('data', {})
+            # the ?poolid= filter can hand back a single-item list instead of a dict
+            if isinstance(data, list):
+                data = next((p for p in data if isinstance(p, dict) and p.get('poolid') == pool_id),
+                            (data[0] if data and isinstance(data[0], dict) else {}))
+            return data if isinstance(data, dict) else {}
         except Exception as e:
             self.logger.error(f"Error getting pool members: {e}")
             return {}
