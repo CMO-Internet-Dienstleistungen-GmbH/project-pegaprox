@@ -44,7 +44,13 @@ dnspython>=2.7.0
 # is Linux-only so the dropped macOS/32-bit-Windows wheels don't apply. <52 matches
 # fido2's ceiling. (The CVE was never reachable here anyway — zero raw ChaCha20.)
 cryptography>=49.0.0,<52
-pyopenssl>=26.0.0
+# MK Aug 2026 — floor at 26.3.0, NOT >=26.0.0: cryptography 49 removed its legacy
+# _openssl bindings, and pyopenssl 26.0-26.2's deprecated X509Extension still
+# referenced _lib.GEN_EMAIL there, so `from OpenSSL import crypto` AttributeError'd
+# on cryptography 49 — a fresh no-cert install would fail to self-generate a cert and
+# refuse to start. 26.3.0 dropped that dead code. (26.3.0 itself caps cryptography
+# <50, so with the pin above the resolver lands on 49.x + 26.3.0.)
+pyopenssl>=26.3.0
 argon2-cffi>=23.0.0
 # pyasn1 transitive via pyopenssl. Explicit pin so scanners stop seeing the old
 # 0.5.x floor. MK 2026-07-11 — bumped 0.6.3 -> 0.6.4: clears 3 new Aikido findings
