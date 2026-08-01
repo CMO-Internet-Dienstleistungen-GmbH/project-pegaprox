@@ -3836,7 +3836,7 @@
         // #612 Phase 1 (MK Jul 2026) — Multi-Cluster EVPN: create + read one logical
         // EVPN vNet that spans several same-ASN clusters. PVE has no cross-cluster SDN
         // primitive, so this drives the new /api/multi-sdn/* orchestration layer.
-        function MultiClusterEvpnView({ clusters = [], authFetch, API_URL, addToast, canAdminSettings = false }) {
+        function MultiClusterEvpnView({ clusters = [], authFetch, API_URL, addToast, canAdminSettings = false, canManage = false }) {
             const { t } = useTranslation();
             const [vnets, setVnets] = useState([]);
             const [loading, setLoading] = useState(false);
@@ -4029,10 +4029,12 @@
                         </div>
                         <div className="flex items-center gap-2">
                             {canAdminSettings && (
-                                <button onClick={() => saveAutoReconcile(!autoReconcile)} title={t('mcevpnAutoReconcileHint') || 'When on, the drift scanner re-pushes the desired config to drifted members automatically (cluster-wide SDN apply). Off = detect-only.'} className={`px-2.5 py-1.5 rounded-lg text-xs border flex items-center gap-1.5 ${autoReconcile ? 'bg-amber-500/20 text-amber-300 border-amber-500/40' : 'bg-proxmox-dark text-gray-400 border-proxmox-border hover:text-white'}`}><Icons.RefreshCw className="w-3.5 h-3.5" />{t('mcevpnAutoReconcile') || 'Auto-reconcile'}: {autoReconcile ? (t('on') || 'on') : (t('off') || 'off')}</button>
+                                <button onClick={() => saveAutoReconcile(!autoReconcile)} title={t('mcevpnAutoReconcileHint') || 'When on, the drift scanner re-pushes the desired config to drifted members automatically (cluster-wide SDN apply). Off = detect-only.'} className={`px-2.5 py-1.5 rounded-lg text-xs border flex items-center gap-1.5 ${autoReconcile ? 'bg-amber-500/20 text-amber-300 border-amber-500/40' : 'bg-proxmox-dark text-gray-400 border-proxmox-border hover:text-white'}`}><Icons.RefreshCw className="w-3.5 h-3.5" />{t('mcevpnAutoReconcile') || 'Auto-reconcile'}: {autoReconcile ? (t('enabled') || 'on') : (t('disabled') || 'off')}</button>
                             )}
                             <button onClick={load} className="px-2.5 py-1.5 rounded-lg text-xs bg-proxmox-dark border border-proxmox-border text-gray-300 hover:text-white flex items-center gap-1.5"><Icons.RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />{t('refresh') || 'Refresh'}</button>
-                            <button onClick={() => { setShowCreate(true); setPlan(null); }} className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-cyan-500/20 text-cyan-300 hover:bg-cyan-500/30 border border-cyan-500/40 flex items-center gap-1.5"><Icons.Plus className="w-3.5 h-3.5" />{t('mcevpnCreate') || 'Create EVPN vNet'}</button>
+                            {canManage && (
+                                <button onClick={() => { setShowCreate(true); setPlan(null); }} className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-cyan-500/20 text-cyan-300 hover:bg-cyan-500/30 border border-cyan-500/40 flex items-center gap-1.5"><Icons.Plus className="w-3.5 h-3.5" />{t('mcevpnCreate') || 'Create EVPN vNet'}</button>
+                            )}
                         </div>
                     </div>
 
@@ -4079,7 +4081,7 @@
                                                                 {st.error ? <span className="text-[11px] text-red-400/80 max-w-[180px] truncate" title={st.error}>{st.error}</span>
                                                                     : st.detail ? <span className="text-[11px] text-amber-400/80 max-w-[180px] truncate" title={st.detail}>{st.detail}</span> : null}
                                                                 <span className={`px-2 py-0.5 rounded text-xs font-semibold ${statusChip(st.status || 'unknown')}`}>{st.status || 'unknown'}</span>
-                                                                {(v.member_clusters || []).length > 1 && (
+                                                                {canManage && (v.member_clusters || []).length > 1 && (
                                                                     <>
                                                                         <button disabled={busy} onClick={() => removeMember(v.id, cid, false)} title={t('mcevpnRemoveMember') || 'Remove from span (leave the vNet on the cluster)'} className="text-gray-500 hover:text-white px-1 text-sm leading-none disabled:opacity-50">−</button>
                                                                         <button disabled={busy} onClick={() => removeMember(v.id, cid, true)} title={t('mcevpnRemovePurge') || 'Remove from span + delete the vNet from this cluster'} className="text-red-400/70 hover:text-red-300 disabled:opacity-50"><Icons.Trash2 className="w-3.5 h-3.5" /></button>
@@ -4090,7 +4092,7 @@
                                                     );
                                                 })}
                                             </div>
-                                            {(() => {
+                                            {canManage && (() => {
                                                 const nonMembers = clusters.filter(c => !(v.member_clusters || []).includes(c.id));
                                                 return nonMembers.length > 0 ? (
                                                     <div className="flex items-center gap-2">
@@ -4102,6 +4104,7 @@
                                                     </div>
                                                 ) : null;
                                             })()}
+                                            {canManage ? (
                                             <div className="flex items-center gap-2 flex-wrap">
                                                 <button disabled={busy} onClick={() => scan(v.id)} className="px-2.5 py-1.5 rounded-lg text-xs bg-proxmox-dark text-gray-300 hover:text-white border border-proxmox-border disabled:opacity-50">{t('mcevpnScan') || 'Scan for drift'}</button>
                                                 <button disabled={busy} onClick={() => openEdit(v)} className="px-2.5 py-1.5 rounded-lg text-xs bg-proxmox-dark text-gray-300 hover:text-white border border-proxmox-border disabled:opacity-50">{t('mcevpnEdit') || 'Edit'}</button>
@@ -4110,6 +4113,9 @@
                                                 <button disabled={busy} onClick={() => remove(v.id, false)} className="px-2.5 py-1.5 rounded-lg text-xs bg-proxmox-dark text-gray-300 hover:text-white border border-proxmox-border disabled:opacity-50">{t('mcevpnForget') || 'Forget record'}</button>
                                                 <button disabled={busy} onClick={() => remove(v.id, true)} className="px-2.5 py-1.5 rounded-lg text-xs bg-red-500/10 text-red-300 hover:bg-red-500/20 border border-red-500/30 disabled:opacity-50">{t('mcevpnPurge') || 'Delete + purge from clusters'}</button>
                                             </div>
+                                            ) : (
+                                                <div className="text-[11px] text-gray-600">{t('mcevpnReadOnly') || 'Read-only view — managing cross-cluster EVPN needs the SDN + settings permissions.'}</div>
+                                            )}
                                         </div>
                                     )}
                                 </div>
@@ -4167,6 +4173,7 @@
                                                     <span className="text-right">
                                                         {!p.reachable ? <span className="text-red-400">{p.reason || 'unreachable'}</span>
                                                             : p.sdn_installed === false ? <span className="text-red-400">SDN not installed</span>
+                                                            : p.error ? <span className="text-red-400 max-w-[220px] truncate inline-block align-bottom" title={p.error}>{p.error}</span>
                                                             : (p.conflicts && p.conflicts.length) ? <span className="text-yellow-400">{p.conflicts.join('; ')}</span>
                                                             : <span className="text-green-400">ok</span>}
                                                     </span>

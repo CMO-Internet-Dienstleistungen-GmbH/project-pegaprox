@@ -32,6 +32,7 @@
                 mcevpnCurrentSubnets: 'Aktuelle Subnetze',
                 // #612 Phase 1 — Multi-Cluster EVPN
                 mcevpnTitle: 'Multi-Cluster-EVPN',
+                mcevpnReadOnly: 'Nur-Lese-Ansicht — die Verwaltung von Cross-Cluster-EVPN erfordert die SDN- + Einstellungs-Rechte.',
                 mcevpnSubtitle: 'Ein logisches EVPN-vNet über mehrere Cluster, die sich eine BGP-ASN teilen. Das physische BGP-EVPN-Underlay muss bereits peeren.',
                 mcevpnCreate: 'EVPN-vNet erstellen',
                 mcevpnCreated: 'Cluster-übergreifendes EVPN-vNet erstellt',
@@ -4269,6 +4270,7 @@
                 mcevpnCurrentSubnets: 'Current subnets',
                 // #612 Phase 1 — Multi-Cluster EVPN
                 mcevpnTitle: 'Multi-Cluster EVPN',
+                mcevpnReadOnly: 'Read-only view — managing cross-cluster EVPN needs the SDN + settings permissions.',
                 mcevpnSubtitle: 'One logical EVPN vNet spanning several clusters that share a BGP ASN. The physical BGP-EVPN underlay must already peer.',
                 mcevpnCreate: 'Create EVPN vNet',
                 mcevpnCreated: 'Cross-cluster EVPN vNet created',
@@ -8598,6 +8600,7 @@
                 mcevpnCurrentSubnets: 'Sous-réseaux actuels',
                 // #612 Phase 1 — Multi-Cluster EVPN
                 mcevpnTitle: 'EVPN multi-cluster',
+                mcevpnReadOnly: 'Vue en lecture seule — gérer l\'EVPN multi-cluster nécessite les autorisations SDN + paramètres.',
                 mcevpnSubtitle: 'Un vNet EVPN logique s\'étendant sur plusieurs clusters qui partagent un ASN BGP. Le sous-réseau physique BGP-EVPN doit déjà être appairé.',
                 mcevpnCreate: 'Créer un vNet EVPN',
                 mcevpnCreated: 'vNet EVPN inter-cluster créé',
@@ -12513,6 +12516,7 @@
                 mcevpnCurrentSubnets: 'Subredes actuales',
                 // #612 Phase 1 — Multi-Cluster EVPN
                 mcevpnTitle: 'EVPN multiclúster',
+                mcevpnReadOnly: 'Vista de solo lectura — gestionar EVPN multiclúster requiere los permisos de SDN + ajustes.',
                 mcevpnSubtitle: 'Un vNet EVPN lógico que abarca varios clústeres que comparten un ASN de BGP. El underlay físico BGP-EVPN ya debe estar emparejado.',
                 mcevpnCreate: 'Crear vNet EVPN',
                 mcevpnCreated: 'vNet EVPN entre clústeres creado',
@@ -16571,6 +16575,7 @@
                 mcevpnCurrentSubnets: 'Sub-redes atuais',
                 // #612 Phase 1 — Multi-Cluster EVPN
                 mcevpnTitle: 'EVPN multicluster',
+                mcevpnReadOnly: 'Vista di sola lettura — gestire l\'EVPN multi-cluster richiede i permessi SDN + impostazioni.',
                 mcevpnSubtitle: 'Um vNet EVPN lógico que abrange vários clusters que partilham um ASN BGP. O underlay físico BGP-EVPN já deve estar emparelhado.',
                 mcevpnCreate: 'Criar vNet EVPN',
                 mcevpnCreated: 'vNet EVPN entre clusters criado',
@@ -20429,6 +20434,7 @@
                 mcevpnCurrentSubnets: '현재 서브넷',
                 // #612 Phase 1 — Multi-Cluster EVPN
                 mcevpnTitle: '멀티 클러스터 EVPN',
+                mcevpnReadOnly: '읽기 전용 보기 — 클러스터 간 EVPN 관리에는 SDN + 설정 권한이 필요합니다.',
                 mcevpnSubtitle: 'BGP ASN을 공유하는 여러 클러스터에 걸친 하나의 논리적 EVPN vNet입니다. 물리적 BGP-EVPN 언더레이는 이미 피어링되어 있어야 합니다.',
                 mcevpnCreate: 'EVPN vNet 생성',
                 mcevpnCreated: '클러스터 간 EVPN vNet이 생성되었습니다',
@@ -24414,6 +24420,7 @@
                 mcevpnCurrentSubnets: 'Subnet attuali',
                 // #612 Phase 1 — Multi-Cluster EVPN
                 mcevpnTitle: 'EVPN multi-cluster',
+                mcevpnReadOnly: 'Visualização somente leitura — gerir o EVPN multi-cluster requer as permissões de SDN + definições.',
                 mcevpnSubtitle: 'Una vNet EVPN logica che si estende su più cluster che condividono un ASN BGP. Il underlay fisico BGP-EVPN deve già essere in peering.',
                 mcevpnCreate: 'Crea vNet EVPN',
                 mcevpnCreated: 'vNet EVPN tra cluster creata',

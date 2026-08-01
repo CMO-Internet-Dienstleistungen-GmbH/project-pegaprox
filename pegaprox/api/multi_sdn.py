@@ -839,22 +839,30 @@ def create_multi_vnet():
                         'status': rollup, 'per_cluster': per_cluster,
                         'rolled_back': rollbacks}), 502
 
-    # --- persist the authoritative record
+    # --- persist the authoritative record. Take a name-scoped lock + re-check for an
+    # existing record with the same name so two admins racing the same name don't end up
+    # with two aggregate records pointing at one EVPN span (#612 review). The vnet name IS
+    # the SDN vnet id, so it's meant to be unique here; the fan-out above is idempotent.
     vid = str(uuid.uuid4())[:8]
     now = datetime.now().isoformat()
     db = get_db()
-    db.execute('''
-        INSERT INTO multi_cluster_vnets
-        (id, name, alias, zone, vni, asn, vrf_vxlan, controller, peers,
-         member_clusters, subnets, desired_state, per_cluster_status, status,
-         enabled, created_by, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
-    ''', (
-        vid, defn['name'], defn['alias'], defn['zone'], defn['vni'], defn['asn'],
-        defn['vrf_vxlan'], defn['controller'], ','.join(defn['peers']),
-        json.dumps(members), json.dumps(defn['subnets']), json.dumps(defn),
-        json.dumps(per_cluster), rollup, user, now, now,
-    ))
+    with _get_vnet_lock('name:' + defn['name']):
+        dup = db.query_one('SELECT id FROM multi_cluster_vnets WHERE name = ?', (defn['name'],))
+        if dup:
+            return jsonify({'error': f"a cross-cluster vnet named '{defn['name']}' already exists",
+                            'existing_id': dict(dup).get('id')}), 409
+        db.execute('''
+            INSERT INTO multi_cluster_vnets
+            (id, name, alias, zone, vni, asn, vrf_vxlan, controller, peers,
+             member_clusters, subnets, desired_state, per_cluster_status, status,
+             enabled, created_by, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+        ''', (
+            vid, defn['name'], defn['alias'], defn['zone'], defn['vni'], defn['asn'],
+            defn['vrf_vxlan'], defn['controller'], ','.join(defn['peers']),
+            json.dumps(members), json.dumps(defn['subnets']), json.dumps(defn),
+            json.dumps(per_cluster), rollup, user, now, now,
+        ))
     log_audit(user, 'multi_sdn.vnet_created',
               f"Cross-cluster EVPN vnet '{defn['name']}' (VNI {defn['vni']}, ASN "
               f"{defn['asn']}) across {len(members)} clusters → {rollup}")
@@ -941,6 +949,41 @@ def delete_multi_vnet(vid):
 # ---------------------------------------------------------------------------
 # Phase 2 — edit (alias/subnets), reconcile, drift scan
 # ---------------------------------------------------------------------------
+def _merge_status_write(vid, fresh_per_cluster, defn_updates=None):
+    """Persist per-cluster results under the per-vid lock (#612 review): re-read the
+    CURRENT row, MERGE the fresh results into the stored per_cluster_status instead of
+    replacing it from a pre-fan-out snapshot, drop statuses for members no longer in
+    the span, recompute the rollup, and write. defn_updates (edit only) folds alias/
+    subnets into the stored desired_state while PRESERVING its current member_clusters,
+    so a concurrent add/remove-member can't be clobbered. Returns the fresh row dict,
+    or None if the record was deleted meanwhile."""
+    db = get_db()
+    with _get_vnet_lock(vid):
+        cur = db.query_one('SELECT * FROM multi_cluster_vnets WHERE id = ?', (vid,))
+        if not cur:
+            return None
+        rec = _row_to_dict(cur)
+        cur_members = rec.get('member_clusters', []) or []
+        merged = dict(rec.get('per_cluster_status') or {})
+        merged.update(fresh_per_cluster)
+        merged = {c: merged[c] for c in cur_members if c in merged}
+        rollup = _rollup_status(merged)
+        now = datetime.now().isoformat()
+        if defn_updates is not None:
+            new_defn = dict(rec.get('desired_state') or {})
+            new_defn.update(defn_updates)
+            new_defn['member_clusters'] = cur_members   # never let an edit revert a concurrent member change
+            db.execute('UPDATE multi_cluster_vnets SET alias = ?, subnets = ?, desired_state = ?, '
+                       'per_cluster_status = ?, status = ?, updated_at = ? WHERE id = ?',
+                       (new_defn.get('alias', ''), json.dumps(new_defn.get('subnets') or []),
+                        json.dumps(new_defn), json.dumps(merged), rollup, now, vid))
+        else:
+            db.execute('UPDATE multi_cluster_vnets SET per_cluster_status = ?, status = ?, '
+                       'updated_at = ? WHERE id = ?', (json.dumps(merged), rollup, now, vid))
+        row = db.query_one('SELECT * FROM multi_cluster_vnets WHERE id = ?', (vid,))
+        return _row_to_dict(row)
+
+
 @bp.route('/api/multi-sdn/vnets/<vid>', methods=['PUT'])
 @require_auth(perms=['sdn.manage', 'admin.settings'])
 def edit_multi_vnet(vid):
@@ -1002,12 +1045,8 @@ def edit_multi_vnet(vid):
         max_concurrent=8, timeout=120) or {}
     per_cluster = {cid: (results.get(cid) if isinstance(results.get(cid), dict) else {
         'cluster_id': cid, 'status': 'failed', 'error': 'no result', 'steps': []}) for cid in members}
-    rollup = _rollup_status(per_cluster)
 
-    # fold the edit back into the stored desired_state (alias + subnet set)
-    new_defn = dict(defn)
-    if changes['alias'] is not None:
-        new_defn['alias'] = changes['alias']
+    # recompute the subnet set (add - del, deduped) to fold into desired_state
     subs = [dict(x) for x in (defn.get('subnets') or [])]
     del_nets = {_canon_net(c) for c in changes['del_cidrs']}
     subs = [x for x in subs if _canon_net(x.get('cidr')) not in del_nets]
@@ -1017,16 +1056,15 @@ def edit_multi_vnet(vid):
         if cn not in have:
             subs.append(a)
             have.add(cn)   # update as we go so duplicates within add_subnets don't double-insert
-    new_defn['subnets'] = subs
-    now = datetime.now().isoformat()
-    db.execute('UPDATE multi_cluster_vnets SET alias = ?, subnets = ?, desired_state = ?, '
-               'per_cluster_status = ?, status = ?, updated_at = ? WHERE id = ?',
-               (new_defn.get('alias', ''), json.dumps(subs), json.dumps(new_defn),
-                json.dumps(per_cluster), rollup, now, vid))
+    defn_updates = {'subnets': subs}
+    if changes['alias'] is not None:
+        defn_updates['alias'] = changes['alias']
+    out = _merge_status_write(vid, per_cluster, defn_updates=defn_updates)
+    if out is None:
+        return jsonify({'error': 'not found'}), 404
     log_audit(getattr(request, 'session', {}).get('user', 'system'),
-              'multi_sdn.vnet_edited', f"Edited cross-cluster vnet '{rec.get('name')}' → {rollup}")
-    row = db.query_one('SELECT * FROM multi_cluster_vnets WHERE id = ?', (vid,))
-    return jsonify(_row_to_dict(row))
+              'multi_sdn.vnet_edited', f"Edited cross-cluster vnet '{rec.get('name')}' → {out.get('status')}")
+    return jsonify(out)
 
 
 @bp.route('/api/multi-sdn/vnets/<vid>/reconcile', methods=['POST'])
@@ -1052,37 +1090,35 @@ def reconcile_multi_vnet(vid):
         max_concurrent=8, timeout=180) or {}
     per_cluster = {cid: (results.get(cid) if isinstance(results.get(cid), dict) else {
         'cluster_id': cid, 'status': 'failed', 'error': 'no result', 'steps': []}) for cid in members}
-    rollup = _rollup_status(per_cluster)
-    now = datetime.now().isoformat()
-    db.execute('UPDATE multi_cluster_vnets SET per_cluster_status = ?, status = ?, updated_at = ? WHERE id = ?',
-               (json.dumps(per_cluster), rollup, now, vid))
+    out = _merge_status_write(vid, per_cluster)
+    if out is None:
+        return jsonify({'error': 'not found'}), 404
     log_audit(getattr(request, 'session', {}).get('user', 'system'),
-              'multi_sdn.vnet_reconciled', f"Reconciled cross-cluster vnet '{rec.get('name')}' → {rollup}")
-    row = db.query_one('SELECT * FROM multi_cluster_vnets WHERE id = ?', (vid,))
-    return jsonify(_row_to_dict(row))
+              'multi_sdn.vnet_reconciled', f"Reconciled cross-cluster vnet '{rec.get('name')}' → {out.get('status')}")
+    return jsonify(out)
 
 
 @bp.route('/api/multi-sdn/vnets/<vid>/scan', methods=['POST'])
-@require_auth(perms=['node.view'])
+@require_auth(perms=['sdn.manage', 'admin.settings'])
 def scan_multi_vnet(vid):
     """Read live per-member SDN state and persist the drift status. Detect-only — no writes
-    to any cluster. This is the manual 'scan now' behind the UI (read perm suffices)."""
+    to any cluster, but it DOES overwrite the shared aggregate drift snapshot other users see,
+    so it's gated like the rest of the span writers (#612 review: was node.view)."""
     db = get_db()
     row = db.query_one('SELECT * FROM multi_cluster_vnets WHERE id = ?', (vid,))
     if not row:
         return jsonify({'error': 'not found'}), 404
     rec = _row_to_dict(row)
     members = rec.get('member_clusters', [])
-    if not _caller_can_access_all(members):
-        return jsonify({'error': 'not found'}), 404
+    denied = _require_members_access(members)
+    if denied:
+        return denied
     defn = rec.get('desired_state') or {}
     live = {cid: _live_status_on_cluster(cid, defn) for cid in members}
-    rollup = _rollup_status(live)
-    now = datetime.now().isoformat()
-    db.execute('UPDATE multi_cluster_vnets SET per_cluster_status = ?, status = ?, updated_at = ? WHERE id = ?',
-               (json.dumps(live), rollup, now, vid))
-    row = db.query_one('SELECT * FROM multi_cluster_vnets WHERE id = ?', (vid,))
-    return jsonify(_row_to_dict(row))
+    out = _merge_status_write(vid, live)
+    if out is None:
+        return jsonify({'error': 'not found'}), 404
+    return jsonify(out)
 
 
 # ---------------------------------------------------------------------------

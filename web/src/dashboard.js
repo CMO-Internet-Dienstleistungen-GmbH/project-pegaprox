@@ -22138,6 +22138,7 @@
                                             API_URL={API_URL}
                                             addToast={addToast}
                                             canAdminSettings={isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes('admin.settings'))}
+                                            canManage={isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes('sdn.manage') && user.permissions.includes('admin.settings'))}
                                         />
                                     </div>
                                 ) : (
