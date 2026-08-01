@@ -77,8 +77,8 @@ STATIC_DIR = 'static'
 IMAGES_DIR = 'images'
 PLUGINS_DIR = 'plugins'
 
-# SP Jul 2026 (#633): everything below runs at IMPORT time, so any script that
-# merely imports pegaprox.* as another user does it as that user. A root-run
+# MK Aug 2026 (#633): the block below runs at IMPORT time, so any process that
+# just imports pegaprox.* under a different user runs it as that user. A root-run
 # helper (a test runner, in the reported case) created config/ssl and copied the
 # certs there as root, the service started as its own user, could not read them,
 # and the old startup path answered that by serving cleartext on the TLS port.

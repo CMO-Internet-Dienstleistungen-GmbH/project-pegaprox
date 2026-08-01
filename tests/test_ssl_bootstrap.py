@@ -1,10 +1,10 @@
 # TLS bootstrap posture - app.py::_resolve_ssl_context().
 #
-# SP Jul 2026 (#633): if TLS was the intended posture and the cert could not be
-# read or generated, PegaProx printed a WARNING and then bound PLAINTEXT HTTP on
-# the port that was meant to be TLS. Every TLS client in front of it spoke TLS
-# into a cleartext socket ("Invalid http version: '\x16\x03\x01...'") while the
-# service reported itself healthy. That is a fail-open downgrade.
+# MK Aug 2026 (#633): with TLS as the intended posture, a cert that could not be
+# read or generated used to get a WARNING and then a PLAINTEXT HTTP bind on the
+# TLS port - so anything speaking TLS to it hit a cleartext socket (the telltale
+# "Invalid http version: '\x16\x03\x01...'") while systemd still saw the unit as
+# healthy. Classic fail-open downgrade; these tests pin it shut.
 #
 # Posture now: TLS unless behind a reverse proxy. If TLS cannot be established we
 # refuse to start, unless plaintext is asked for explicitly with
@@ -24,8 +24,12 @@ import pytest
 
 from pegaprox import app as app_module
 
-pytestmark = pytest.mark.skipif(os.geteuid() == 0,
-                                reason='root ignores file permissions, so no case here can fail closed')
+# Only the cases that chmod a cert/dir to 0 need a non-root euid - root ignores the
+# permission bits and they'd false-fail instead of proving anything. Marking just
+# those (not the whole module) keeps the content/ENOENT/monkeypatched fail-closed
+# cases running under a root CI container or `sudo pytest`, where they still hold.
+needs_dac = pytest.mark.skipif(os.geteuid() == 0,
+                               reason='root ignores file permissions, so a chmod-0 case cannot fail closed')
 
 
 # A real (throwaway) self-signed pair, so the "readable pair is used" path actually
@@ -138,6 +142,7 @@ def test_half_present_pair_refuses_to_start(certs):
     assert str(key) in str(e.value)
 
 
+@needs_dac
 def test_unreadable_cert_refuses_to_start(certs, capsys):
     cert, key = certs
     os.chmod(cert, 0o000)
@@ -156,6 +161,7 @@ def test_unreadable_cert_refuses_to_start(certs, capsys):
     assert os.stat(cert).st_size == len(_TEST_CERT_PEM)
 
 
+@needs_dac
 def test_unreadable_key_refuses_to_start(certs):
     # cert readable, key not - still fail closed, not "missing"
     cert, key = certs
@@ -165,6 +171,7 @@ def test_unreadable_key_refuses_to_start(certs):
     assert str(key) in str(e.value)
 
 
+@needs_dac
 def test_unsearchable_directory_refuses_to_start(certs, capsys):
     # the reported case: config/ssl is 0700 root:root, service user is not root.
     # os.path.exists() returns False here, which is what made the old code print
@@ -177,6 +184,7 @@ def test_unsearchable_directory_refuses_to_start(certs, capsys):
     assert 'No SSL certificates found' not in capsys.readouterr().out
 
 
+@needs_dac
 def test_error_names_the_directory_owner_and_mode(certs):
     cert, key = certs
     os.chmod(cert, 0o000)
@@ -195,6 +203,7 @@ def test_missing_pair_is_generated(certs):
     assert stat.S_IMODE(os.stat(key).st_mode) == 0o600
 
 
+@needs_dac
 def test_generation_failure_refuses_to_start(certs):
     cert, key = certs
     cert.unlink()
@@ -215,6 +224,7 @@ def test_missing_pyopenssl_refuses_to_start(certs, monkeypatch):
     assert 'pyOpenSSL' in str(e.value)
 
 
+@needs_dac
 def test_plaintext_needs_an_explicit_opt_in(certs, monkeypatch, caplog):
     # the escape hatch for anyone who really does want cleartext on that port
     cert, key = certs
@@ -270,6 +280,7 @@ def test_migration_only_runs_when_we_own_config(tmp_path, monkeypatch):
     assert dst.read_bytes() == b'the real cert'      # and it still migrates normally
 
 
+@needs_dac
 @pytest.mark.parametrize('value', ['0', 'false', 'no', '', ' '])
 def test_falsy_opt_in_still_fails_closed(certs, monkeypatch, value):
     cert, key = certs

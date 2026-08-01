@@ -1130,20 +1130,21 @@ def main(debug_mode=False):
 
     # MK: when behind proxy, SSL is handled by nginx/haproxy - we run plain HTTP
     #
-    # SP Jul 2026: the `ssl_enabled` setting is deliberately NOT read here. The old
-    # code only used it as a fast path, and its else-branch generated a cert and
-    # served HTTPS anyway, so with the setting off (the default, api/helpers.py)
-    # every install still ran TLS. Reading it now would drop those installs to
-    # cleartext on upgrade. Posture stays "TLS unless a reverse proxy terminates
-    # it"; making the toggle mean something is a separate change.
+    # MK Aug 2026: we deliberately do NOT gate on the `ssl_enabled` setting here.
+    # The pre-#633 code only ever used it as a fast path - its else-branch generated
+    # a cert and served HTTPS regardless - so with the toggle off (which is the
+    # api/helpers.py default) every existing install is in fact running TLS. Honouring
+    # it now would silently downgrade all of them to cleartext on upgrade. Posture
+    # stays "TLS unless a reverse proxy terminates it"; wiring the toggle up properly
+    # is its own change (#638).
     domain = server_settings.get('domain', '')
     app_name = server_settings.get('app_name', 'PegaProx')
     if reverse_proxy:
         print("SSL disabled (handled by reverse proxy)")
 
-    # Check for SSL certificates (skip entirely behind reverse proxy).
-    # SP Jul 2026 (#633): fail closed - see _resolve_ssl_context(). This used to warn
-    # and fall through to plain HTTP on the port that was meant to be TLS.
+    # Check for SSL certificates (skipped entirely behind a reverse proxy).
+    # MK Aug 2026 (#633): this fails closed now - see _resolve_ssl_context(). It used
+    # to warn and fall through to plain HTTP on the port that was supposed to be TLS.
     ssl_context = _resolve_ssl_context(reverse_proxy, domain, app_name)
 
     # Start HTTP redirect server if SSL is enabled (not needed behind reverse proxy)

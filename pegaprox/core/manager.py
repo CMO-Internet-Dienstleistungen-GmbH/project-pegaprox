@@ -493,7 +493,7 @@ class PegaProxManager:
         self._last_reconnect_attempt = 0  # NS: Feb 2026 - throttle reconnection attempts in broadcast loop
         self._consecutive_empty_responses = 0  # NS: Feb 2026 - detect stale tickets (connected but empty data)
 
-        # SP Jul 2026 (#419 follow-up) - live node network rate state, see
+        # MK Aug 2026 (#632, #419 follow-up) - live node network rate state, see
         # _get_live_node_net_rates(). counters: node -> {ts, netin, netout, rate}
         self._node_net_counters = {}
         self._node_net_rates = {}   # node -> (netin_bps, netout_bps), last computed
@@ -1347,7 +1347,7 @@ class PegaProxManager:
     def _get_live_node_net_rates(self) -> Dict[str, Any]:
         """Live per-node network rate (bytes/sec), differentiated from counters.
 
-        SP Jul 2026 (#419 follow-up): /nodes/{name}/rrddata gives a rate, but the
+        MK Aug 2026 (#632, #419 follow-up): /nodes/{name}/rrddata gives a rate, but the
         'hour' timeframe has a 60s RRD step and PVE leaves the last 1-2 averaging
         windows null, so the dashboard value is 60s-coarse AND 60-120s behind.
 
@@ -1547,7 +1547,7 @@ class PegaProxManager:
                 # _get_live_node_net_rates() for the live 10s source.
                 api_nodes = set()
 
-                # SP Jul 2026 (#419 follow-up): one cluster-wide call for live
+                # MK Aug 2026 (#632, #419 follow-up): one cluster-wide call for live
                 # ~10s rates. Nodes it cannot answer for fall through to the
                 # per-node rrddata pull below, so nothing regresses.
                 live_net = self._get_live_node_net_rates()
