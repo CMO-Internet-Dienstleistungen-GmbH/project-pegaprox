@@ -1048,7 +1048,7 @@ class VMwareManager:
                             'port': port,
                             'type': ticket_type,
                             'url': f"wss://{host}:{port}/ticket/{ticket_str}",
-                            'web_url': f"https://{self.host}/ui/webconsole.html?vmId={vm_id}&vmName=&serverGuid=&host={host}&sessionTicket={ticket_str}&thumbprint=",
+                            'web_url': f"https://{self.host}:{self.port}/ui/webconsole.html?vmId={vm_id}&vmName=&serverGuid=&host={host}&sessionTicket={ticket_str}&thumbprint=",
                         }}
         
         # Method 2: SOAP AcquireTicket (works on all versions incl. ESXi)
@@ -1068,7 +1068,7 @@ class VMwareManager:
                                 # Build URLs
                                 wmks_url = f"wss://{host}:{port}/ticket/{ticket.ticket}"
                                 # ESXi has built-in HTML console
-                                web_url = f"https://{self.host}/ui/#/console/{vm_id}"
+                                web_url = f"https://{self.host}:{self.port}/ui/#/console/{vm_id}"
                                 # VMRC protocol link
                                 vmrc_url = f"vmrc://clone:{ticket.ticket}@{host}:{port}/?moid={vm_id}"
                                 return {'data': {
@@ -1095,7 +1095,7 @@ class VMwareManager:
                                 'port': ticket.port or 902,
                                 'type': 'mks_legacy',
                                 'url': f"wss://{ticket.host or self.host}:{ticket.port or 902}/ticket/{ticket.ticket}",
-                                'web_url': f"https://{self.host}/ui/#/console/{vm_id}",
+                                'web_url': f"https://{self.host}:{self.port}/ui/#/console/{vm_id}",
                                 'vmrc_url': f"vmrc://clone:{ticket.ticket}@{ticket.host or self.host}:{ticket.port or 902}/?moid={vm_id}",
                             }}
                     except Exception:
@@ -1104,7 +1104,7 @@ class VMwareManager:
                 logging.warning(f"[VMware:{self.id}] SOAP console ticket failed: {e}")
         
         # Method 3: Direct URL fallback (no ticket needed for ESXi web UI)
-        web_url = f"https://{self.host}/ui/#/host/vms/{vm_id}/console" if self.server_type == 'esxi' else f"https://{self.host}/ui/app/vm;nav=v/urn:vmomi:VirtualMachine:{vm_id}/console"
+        web_url = f"https://{self.host}:{self.port}/ui/#/host/vms/{vm_id}/console" if self.server_type == 'esxi' else f"https://{self.host}:{self.port}/ui/app/vm;nav=v/urn:vmomi:VirtualMachine:{vm_id}/console"
         return {'data': {
             'ticket': '',
             'type': 'direct_url',
