@@ -5,7 +5,11 @@
         // Datastore Tab Component - with Storage Clusters for balancing
         function DatastoreTab({ clusterId, addToast, initialStorage, initialNode, sharedDatastoreData }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, isAdmin } = useAuth();
+            const { getAuthHeaders, isAdmin, user } = useAuth();
+            // #644: gate the storage action bar on the same fine-grained perms the API
+            // enforces (storage.download / upload / config) rather than a blanket admin
+            // check — a non-admin who holds e.g. storage.upload should get the button.
+            const hasPerm = (p) => isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes(p));
             const { isCorporate } = useLayout();
             const [loading, setLoading] = useState(true);
             const [datastores, setDatastores] = useState({ shared: [], local: {}, nodes: [] });
@@ -1536,13 +1540,13 @@
                                                     );
                                                 })()}
                                             </h3>
-                                            {selectedStorage && isAdmin && (
+                                            {selectedStorage && (
                                                 <div className="flex gap-2">
                                                     {/* NS: Download Templates button - only for vztmpl storage */}
                                                     {(() => {
                                                         const storage = datastores.shared.find(s => s.storage === selectedStorage.name) || 
                                                                        datastores.local[selectedStorage.node]?.find(s => s.storage === selectedStorage.name);
-                                                        return storage?.content?.includes('vztmpl');
+                                                        return storage?.content?.includes('vztmpl') && hasPerm('storage.download');
                                                     })() && (
                                                         <button
                                                             onClick={() => { setShowTemplateModal(true); loadAvailableTemplates(); }}
@@ -1555,7 +1559,7 @@
                                                     {(() => {
                                                         const storage = datastores.shared.find(s => s.storage === selectedStorage.name) || 
                                                                        datastores.local[selectedStorage.node]?.find(s => s.storage === selectedStorage.name);
-                                                        return storage?.content?.includes('iso');
+                                                        return storage?.content?.includes('iso') && hasPerm('storage.download');
                                                     })() && (
                                                         <button
                                                             onClick={() => setDownloadUrlModalOpen(true)}
@@ -1565,7 +1569,7 @@
                                                             <Icons.Link /> {t('fromUrl') || 'From URL'}
                                                         </button>
                                                     )}
-                                                    {canUploadTo(datastores.shared.find(s => s.storage === selectedStorage.name) || 
+                                                    {hasPerm('storage.upload') && canUploadTo(datastores.shared.find(s => s.storage === selectedStorage.name) ||
                                                                  datastores.local[selectedStorage.node]?.find(s => s.storage === selectedStorage.name)) && (
                                                         <button
                                                             onClick={() => setUploadModalOpen(true)}
@@ -1578,7 +1582,7 @@
                                                     {(() => {
                                                         const storage = datastores.shared.find(s => s.storage === selectedStorage.name) || 
                                                                        datastores.local[selectedStorage.node]?.find(s => s.storage === selectedStorage.name);
-                                                        return ['iscsi', 'iscsidirect', 'lvm', 'lvmthin', 'zfspool', 'zfs', 'starlvm'].includes(storage?.type);
+                                                        return ['iscsi', 'iscsidirect', 'lvm', 'lvmthin', 'zfspool', 'zfs', 'starlvm'].includes(storage?.type) && hasPerm('storage.config');
                                                     })() && (
                                                         <button
                                                             onClick={() => setShowRescanModal(true)}
