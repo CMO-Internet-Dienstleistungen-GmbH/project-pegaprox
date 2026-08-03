@@ -8515,6 +8515,12 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
         ws_logging.getLogger('websockets').setLevel(ws_logging.CRITICAL)
         
         # NS: added ping keepalive like ssh server has, was causing random disconnects (#92)
+        # MK Aug 2026: loosened 20/10 -> 30/60. This ws server runs as a monkey-patched
+        # greenlet on the shared gevent hub, so during a brief hub stall its asyncio loop
+        # can't answer a pong in time — and that same stall is what makes the client's SSE
+        # watchdog reconnect. A 10s ping_timeout was killing healthy consoles exactly when
+        # SSE renewed ("VNC drops on SSE refresh"). 60s rides out the jitter; TCP + the
+        # client's own reconnect still catch a genuinely dead peer.
         # LW Feb 2026: host='' means all interfaces (asyncio creates IPv4+IPv6 listeners)
         # MK Apr 2026 (#352): lenient Connection-header recovery for PVE 9.1.8-9 hosts
         # and middlebox-stripped Upgrade tokens. See pegaprox/utils/ws_lenient.py.
@@ -8522,7 +8528,7 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
         ws_host = host if host else None
         display_host = host or '0.0.0.0'
         try:
-            async with websockets.serve(vnc_handler, ws_host, port, ssl=ssl_context, ping_interval=20, ping_timeout=10, process_request=_lpr_vnc):
+            async with websockets.serve(vnc_handler, ws_host, port, ssl=ssl_context, ping_interval=30, ping_timeout=60, process_request=_lpr_vnc):
                 print(f"VNC WebSocket Server ready on {proto}://{display_host}:{port}", flush=True)
                 server_ready.set()
                 await asyncio.Future()  # Run forever
@@ -8530,7 +8536,7 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
             # Issue #71: IPv6 bind failed, fall back to 0.0.0.0
             if ':' in str(host):
                 print(f"VNC WebSocket: IPv6 bind failed ({bind_err}), falling back to 0.0.0.0", flush=True)
-                async with websockets.serve(vnc_handler, '0.0.0.0', port, ssl=ssl_context, ping_interval=20, ping_timeout=10, process_request=_lpr_vnc):
+                async with websockets.serve(vnc_handler, '0.0.0.0', port, ssl=ssl_context, ping_interval=30, ping_timeout=60, process_request=_lpr_vnc):
                     print(f"VNC WebSocket Server ready on {proto}://0.0.0.0:{port}", flush=True)
                     server_ready.set()
                     await asyncio.Future()
