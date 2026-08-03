@@ -6207,7 +6207,13 @@ def _execute_local_replication(job):
             clone_data['name'] = clone_label
         if use_snap_clone:
             clone_data['snapname'] = snap_name
-        if target_storage:
+        # #641 (@ripperrd): only pin the clone onto target_storage when this clone
+        # IS the final replica — a same-node run. On a cross-node job the clone is
+        # just an intermediate on the SOURCE node, and target_storage names a storage
+        # on the destination (or the 'local-lvm' fallback) that may not exist here;
+        # leave it on the source volume's own storage and let the migrate step below
+        # re-home it (it already passes targetstorage=target_storage).
+        if target_storage and source_node == target_node:
             clone_data['storage'] = target_storage
 
         clone_resp = mgr._api_post(clone_url, data=clone_data)
