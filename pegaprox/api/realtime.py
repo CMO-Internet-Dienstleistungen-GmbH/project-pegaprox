@@ -168,8 +168,20 @@ def validate_ws_token_api():
         try:
             from pegaprox.utils.auth import load_users
             from pegaprox.utils.rbac import get_user_clusters, load_vm_acls
-            users = load_users()
-            user = users.get(data['user'], {})
+            from pegaprox.core.db import get_db
+            # MK Aug 2026 — resolve the token's user by its indexed row, not a whole-table
+            # load_users() reload. That read decrypts every user's TOTP; on a transient
+            # failure (SQLite/WAL contention under gevent, a bad TOTP row) it degrades to {},
+            # which get_user_clusters() then reads as a default-tenant viewer — silently
+            # dropping admin/all-access and 403-ing a valid node console ("No access to
+            # cluster", intermittent). An unresolvable identity is a retryable auth failure
+            # (401), not a cluster denial; a genuinely unauthorized user still resolves + 403s.
+            try:
+                user = get_db().get_user(data['user'])
+            except Exception:
+                user = load_users().get(data['user'])
+            if not user:
+                return jsonify({'error': 'Invalid or expired token'}), 401
             allowed = get_user_clusters(user)
             access_ok = allowed is None or requested_cluster in allowed
             if not access_ok:
