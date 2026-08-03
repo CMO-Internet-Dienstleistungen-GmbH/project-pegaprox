@@ -95,7 +95,7 @@
             const auth = useContext(AuthContext);
             const switchLang = (auth && auth.isAuthenticated) ? changeLanguage : applyLanguage;
             const langs = [
-                { code: 'de', flag: '🇩🇪', label: 'DE', title: 'Deutsch' },
+                { code: 'de', flag: '🇦🇹', label: 'DE', title: 'Deutsch' },  // NS: AT flag is intentional (German is spoken in Austria too) — do NOT swap it for the German flag
                 { code: 'en', flag: '🇬🇧', label: 'EN', title: 'English' },
                 { code: 'it', flag: '🇮🇹', label: 'IT', title: 'Italiano' },
                 { code: 'fr', flag: '🇫🇷', label: 'FR', title: 'Français' },
