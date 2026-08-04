@@ -14086,14 +14086,29 @@ echo "AGENT_INSTALLED_OK"
         user = getattr(self.config, 'ssh_user', None) or 'root'
 
         raw = self._ssh_run_command_output(ip, user, 'sensors -j 2>/dev/null', timeout=8)
-        if not raw or not raw.strip():
-            return {'error': 'sensors command unavailable or empty (lm-sensors not installed?)'}
+        data = None
+        if raw and raw.strip():
+            import json as _json
+            try:
+                data = _json.loads(raw)
+            except Exception:
+                # #601 (@jostrasser): lm-sensors < 3.6 has a `sensors -j` bug that emits
+                # malformed JSON (missing commas between chips). Don't error out — fall
+                # through to the plain-text parser below.
+                data = None
 
-        import json as _json
-        try:
-            data = _json.loads(raw)
-        except Exception as e:
-            return {'error': f'sensors JSON parse failed: {e}'}
+        if data is None:
+            # `sensors -j` (JSON) needs lm-sensors >= 3.5.0; older builds don't know -j at
+            # all (empty output) or emit broken JSON, even when the plain `sensors` command
+            # is perfectly fine. Parse the human-readable output instead — it works wherever
+            # `sensors` itself does.
+            text = self._ssh_run_command_output(ip, user, 'sensors 2>/dev/null', timeout=8)
+            if not text or not text.strip():
+                return {'error': 'sensors command unavailable or empty (lm-sensors not installed?)'}
+            out = self._parse_sensors_text(text)
+            if not out:
+                return {'error': 'sensors ran but no readings could be parsed'}
+            return {'sensors': out, 'count': len(out), 'source': 'text'}
 
         # Flatten the {chip: {sensor: {temp1_input: X, ...}}} structure.
         # lm-sensors keys follow `tempN_input`, `tempN_max`, `tempN_crit`, `tempN_alarm`
@@ -14129,6 +14144,48 @@ echo "AGENT_INSTALLED_OK"
                 }
                 out.append(row)
         return {'sensors': out, 'count': len(out)}
+
+    def _parse_sensors_text(self, text: str) -> list:
+        """Fallback parser for the human-readable `sensors` output — used when
+        `sensors -j` (JSON) is missing (lm-sensors < 3.5) or emits broken JSON.
+        Returns the same row shape the -j path produces. #601 (@jostrasser)."""
+        import re
+        rows = []
+        chip = None
+        for line in text.splitlines():
+            if not line.strip():
+                chip = None                      # blank line separates chips
+                continue
+            if chip is None and ':' not in line:
+                chip = line.strip()              # chip header, e.g. "coretemp-isa-0000"
+                continue
+            if ':' not in line or line.startswith('Adapter:'):
+                continue
+            label, _, rest = line.partition(':')
+            rest = rest.strip()
+            num = re.search(r'[+-]?\d+(?:\.\d+)?', rest)
+            if not num:
+                continue
+            if '°C' in rest or re.search(r'\d\s*C\b', rest):
+                kind = 'temp'
+            elif 'RPM' in rest:
+                kind = 'fan'
+            elif re.search(r'\d\s*V\b', rest):
+                kind = 'volt'
+            else:
+                continue                         # skip units we don't chart (%, W, dBm…)
+            hi = re.search(r'(?:high|max)\s*=\s*([+-]?\d+(?:\.\d+)?)', rest)
+            cr = re.search(r'crit\s*=\s*([+-]?\d+(?:\.\d+)?)', rest)
+            rows.append({
+                'chip': chip or 'sensors',
+                'label': label.strip(),
+                'kind': kind,
+                'value': float(num.group(0)),
+                'max': float(hi.group(1)) if hi else None,
+                'crit': float(cr.group(1)) if cr else None,
+                'alarm': 'ALARM' in rest,
+            })
+        return rows
 
     def get_cached_node_temp(self, node: str, max_age: float = 900):
         """#601 — last cached hottest-sensor temperature (°C) for a node, or None if
