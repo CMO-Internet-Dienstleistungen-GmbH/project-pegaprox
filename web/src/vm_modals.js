@@ -762,7 +762,7 @@
 
         // VM Detail Panel Component (inline, not modal)
         // LW: this shows when you click a VM in detail view mode
-        function VmDetailPanel({ vm, clusterId, onAction, onOpenConsole, onOpenLxcShell, onOpenConfig, onMigrate, onClone, onForceStop, onDelete, onCrossClusterMigrate, showCrossCluster, actionLoading, onShowMetrics, addToast }) {
+        function VmDetailPanel({ vm, clusterId, onAction, onOpenConsole, onOpenSpice, onOpenLxcShell, onOpenConfig, onMigrate, onClone, onForceStop, onDelete, onCrossClusterMigrate, showCrossCluster, actionLoading, onShowMetrics, addToast }) {
             const { t } = useTranslation();
             const { getAuthHeaders } = useAuth();
             
@@ -1325,6 +1325,17 @@
                                 {t('console')}
                             </button>
                             {/* NS May 2026 — VNC↔Term toggle moved inside Console modal. */}
+                            {/* MK Aug 2026 — SPICE (virt-viewer .vv) sits next to the web console; QEMU only */}
+                            {isQemu && onOpenSpice && (
+                                <button
+                                    onClick={() => onOpenSpice(vm)}
+                                    title={t('spiceConsoleHint') || 'Download a virt-viewer file (audio / USB / multi-monitor)'}
+                                    className="flex items-center justify-center gap-2 p-3 bg-blue-500/10 hover:bg-blue-500/20 border border-blue-500/30 rounded-lg text-blue-400 transition-all"
+                                >
+                                    <Icons.ExternalLink />
+                                    {t('spiceConsole') || 'SPICE'}
+                                </button>
+                            )}
                             <button
                                 onClick={() => onOpenConfig(vm)}
                                 className="flex items-center justify-center gap-2 p-3 bg-proxmox-dark hover:bg-proxmox-border border border-proxmox-border rounded-lg text-gray-300 transition-all"
@@ -1472,7 +1483,7 @@
         }
 
         // LW: Feb 2026 - Corporate VM Detail View (experimental)
-        function CorporateVmDetailView({ vm, clusterId, onAction, onOpenConsole, onOpenConfig, onBack, onMigrate, onClone, onForceStop, onDelete, onCrossClusterMigrate, showCrossCluster, actionLoading, onShowMetrics, addToast }) {
+        function CorporateVmDetailView({ vm, clusterId, onAction, onOpenConsole, onOpenSpice, onOpenConfig, onBack, onMigrate, onClone, onForceStop, onDelete, onCrossClusterMigrate, showCrossCluster, actionLoading, onShowMetrics, addToast }) {
             const { t } = useTranslation();
             const { getAuthHeaders } = useAuth();
             const [activeDetailTab, setActiveDetailTab] = useState('summary');
@@ -1855,6 +1866,11 @@
                                     <Icons.Terminal className="w-3 h-3" /> {t('console')}
                                 </button>
                             )}
+                            {isQemu && isRunning && onOpenSpice && (
+                                <button onClick={() => onOpenSpice(vm)} title={t('spiceConsoleHint') || 'Download a virt-viewer file (audio / USB / multi-monitor)'}>
+                                    <Icons.ExternalLink className="w-3 h-3" /> {t('spiceConsole') || 'SPICE'}
+                                </button>
+                            )}
                             <button onClick={() => onOpenConfig(vm)}>
                                 <Icons.Settings className="w-3 h-3" /> {t('configure')}
                             </button>
@@ -1973,6 +1989,12 @@
                                         <button onClick={() => onOpenConsole(vm)} className="w-full mt-1.5 py-1.5 text-[12px] font-medium uppercase tracking-wider flex items-center justify-center gap-1.5" style={{background: 'var(--corp-header-bg)', border: '1px solid var(--corp-border-medium)', color: 'var(--corp-accent)'}}>
                                             <Icons.Terminal className="w-3.5 h-3.5" />
                                             {t('launchWebConsole') || 'Launch Web Console'}
+                                        </button>
+                                    )}
+                                    {isRunning && isQemu && onOpenSpice && (
+                                        <button onClick={() => onOpenSpice(vm)} title={t('spiceConsoleHint') || 'Download a virt-viewer file (audio / USB / multi-monitor)'} className="w-full mt-1.5 py-1.5 text-[12px] font-medium uppercase tracking-wider flex items-center justify-center gap-1.5" style={{background: 'var(--corp-surface-1)', border: '1px solid var(--corp-border-medium)', color: 'var(--corp-text-secondary)'}}>
+                                            <Icons.ExternalLink className="w-3.5 h-3.5" />
+                                            {t('spiceConsole') || 'SPICE'}
                                         </button>
                                     )}
                                 </div>

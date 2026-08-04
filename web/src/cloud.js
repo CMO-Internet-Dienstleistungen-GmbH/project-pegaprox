@@ -355,6 +355,7 @@
                 running && { label: t('forceStop') || 'Force stop', icon: 'StopCircle', danger: true, onClick: () => act.forceStop(r) },
                 { divider: true },
                 { label: t('console') || 'Console', icon: 'Monitor', onClick: () => act.openConsole(r) },
+                (running && !isCt) && { label: t('spiceConsole') || 'SPICE', icon: 'ExternalLink', onClick: () => act.openSpice(r) },
                 isCt && { label: t('shell') || 'Shell', icon: 'Terminal', onClick: () => act.openLxcShell(r) },
                 { label: t('snapshots') || 'Snapshot', icon: 'Camera', onClick: () => act.snapshot(r) },
                 { label: t('metrics') || 'Metrics', icon: 'BarChart', onClick: () => act.openMetrics(r) },
@@ -880,6 +881,9 @@
                                 </button>
                             ))}
                             <button type="button" className="cloud-btn" onClick={() => act.openConsole(r)}><Icons.Monitor /> {t('console') || 'Console'}</button>
+                            {r.status === 'running' && r.type === 'qemu' && (
+                                <button type="button" className="cloud-btn" onClick={() => act.openSpice(r)} title={t('spiceConsoleHint') || 'Download a virt-viewer file (audio / USB / multi-monitor)'}><Icons.ExternalLink /> {t('spiceConsole') || 'SPICE'}</button>
+                            )}
                             <CloudActionMenu items={cloudVmActionItems(r, act, t)} triggerLabel={t('cloud.actions') || 'Actions'} label="Actions" />
                         </div>
                     </div>
@@ -2212,6 +2216,7 @@
                 vmAction: (r, a) => actions?.vmAction?.(stamp(r), a),
                 forceStop: (r) => actions?.forceStop?.(stamp(r)),
                 openConsole: (r) => actions?.openConsole?.(stamp(r)),
+                openSpice: (r) => actions?.openSpice?.(stamp(r)),
                 openLxcShell: (r) => actions?.openLxcShell?.(stamp(r)),
                 openConfig: (r) => actions?.openConfig?.(stamp(r)),
                 openMetrics: (r) => actions?.openMetrics?.(stamp(r)),

@@ -13470,7 +13470,7 @@
                         { label: t('power') || 'Power', icon: <Icons.Power className="w-3.5 h-3.5" />, submenu: powerItems },
                         { separator: true },
                         { label: t('console') || 'Console', icon: <Icons.Terminal className="w-3.5 h-3.5" />, onClick: () => handleOpenConsole(vm), disabled: !isRunning },
-                        ...(vm.type === 'qemu' ? [{ label: t('spiceConsole') || 'SPICE', icon: <Icons.Monitor className="w-3.5 h-3.5" />, onClick: () => handleOpenSpice(vm), disabled: !isRunning }] : []),
+                        ...(vm.type === 'qemu' ? [{ label: t('spiceConsole') || 'SPICE', icon: <Icons.ExternalLink className="w-3.5 h-3.5" />, onClick: () => handleOpenSpice(vm), disabled: !isRunning }] : []),
                         // NS May 2026 — VNC ↔ Term toggle now lives inside the Console modal,
                         // so the separate Terminal entry was removed (one entry point = clearer UX).
                         { label: t('editSettings') || 'Settings', icon: <Icons.Settings className="w-3.5 h-3.5" />, onClick: () => handleOpenConfig(vm) },
@@ -13597,6 +13597,7 @@
                     vmAction: handleVmAction,                         // (resource, action)
                     forceStop: handleForceStop,                       // (resource)
                     openConsole: handleOpenConsole,                   // (resource)
+                    openSpice: handleOpenSpice,                       // (resource) -> downloads virt-viewer .vv
                     openLxcShell: (vm) => setLxcShellVm(vm),
                     openConfig: handleOpenConfig,                     // (resource) -> ConfigModal
                     openMetrics: (vm) => setCorpMetricsVm(vm),
@@ -15407,6 +15408,7 @@
                                                         clusterId={selectedSidebarVm._clusterId || selectedCluster.id}
                                                         onAction={handleVmAction}
                                                         onOpenConsole={handleOpenConsole}
+                                                        onOpenSpice={handleOpenSpice}
                                                         onOpenLxcShell={(v) => setLxcShellVm(v)}
                                                         onOpenConfig={handleOpenConfig}
                                                         onBack={() => setSelectedSidebarVm(null)}
@@ -15485,6 +15487,7 @@
                                                             sourceCluster={selectedCluster}
                                                             onVmAction={handleVmAction}
                                                             onOpenConsole={handleOpenConsole}
+                                                            onOpenSpice={handleOpenSpice}
                                                         onOpenLxcShell={(v) => setLxcShellVm(v)}
                                                             onOpenConfig={handleOpenConfig}
                                                             onMigrate={handleMigrate}

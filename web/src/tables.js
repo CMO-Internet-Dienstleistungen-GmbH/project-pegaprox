@@ -1285,7 +1285,7 @@
         // NS: Added bulk select for mass operations (migration, etc.)
         // This component does a lot... might need to split it up eventually
         // NS: filtering + sorting uses useMemo below (lines 1320+)
-        function ResourceTable({ resources, clusterId, clusters, sourceCluster, onVmAction, onOpenConsole, onOpenConfig, onMigrate, onBulkMigrate, onDelete, onClone, onForceStop, onCrossClusterMigrate, nodes, onOpenTags, highlightedVm, addToast, pendingVmAction, onPendingActionConsumed, onVmNavigate, backupStatus }) {
+        function ResourceTable({ resources, clusterId, clusters, sourceCluster, onVmAction, onOpenConsole, onOpenSpice, onOpenConfig, onMigrate, onBulkMigrate, onDelete, onClone, onForceStop, onCrossClusterMigrate, nodes, onOpenTags, highlightedVm, addToast, pendingVmAction, onPendingActionConsumed, onVmNavigate, backupStatus }) {
             const { t } = useTranslation();
             const { getAuthHeaders, user } = useAuth();
             const { isCorporate } = useLayout(); // LW: Feb 2026 - corporate defaults to table view
@@ -1948,6 +1948,15 @@
                                                         <Icons.Monitor />
                                                     </button>
                                                 )}
+                                                {resource.status === 'running' && resource.type === 'qemu' && onOpenSpice && (
+                                                    <button
+                                                        onClick={() => onOpenSpice(resource)}
+                                                        className="p-1.5 rounded-lg hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
+                                                        title={t('spiceConsole') || 'SPICE'}
+                                                    >
+                                                        <Icons.ExternalLink />
+                                                    </button>
+                                                )}
                                                 <button
                                                     onClick={() => onOpenConfig(resource)}
                                                     className="p-1.5 rounded-lg hover:bg-purple-500/20 text-gray-400 hover:text-purple-400 transition-all"
@@ -2296,6 +2305,9 @@
                                                             {resource.status === 'running' && (
                                                                 <button onClick={() => onOpenConsole(resource)} className="corp-action-btn" title={t('openConsole')}><Icons.Monitor className="w-3.5 h-3.5" /></button>
                                                             )}
+                                                            {resource.status === 'running' && resource.type === 'qemu' && onOpenSpice && (
+                                                                <button onClick={() => onOpenSpice(resource)} className="corp-action-btn" title={t('spiceConsole') || 'SPICE'}><Icons.ExternalLink className="w-3.5 h-3.5" /></button>
+                                                            )}
                                                             <button onClick={() => onOpenConfig(resource)} className="corp-action-btn" title={t('configuration')}><Icons.Cog className="w-3.5 h-3.5" /></button>
                                                             <button onClick={() => setShowMigrateModal(resource)} className="corp-action-btn" title={t('migrate')}><Icons.ArrowRight className="w-3.5 h-3.5" /></button>
                                                             <button onClick={() => setShowCloneModal(resource)} className="corp-action-btn" title={t('clone')}><Icons.Copy className="w-3.5 h-3.5" /></button>
@@ -2358,6 +2370,15 @@
                                                                 title={t('openConsole')}
                                                             >
                                                                 <Icons.Monitor />
+                                                            </button>
+                                                        )}
+                                                        {resource.status === 'running' && resource.type === 'qemu' && onOpenSpice && (
+                                                            <button
+                                                                onClick={() => onOpenSpice(resource)}
+                                                                className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
+                                                                title={t('spiceConsole') || 'SPICE'}
+                                                            >
+                                                                <Icons.ExternalLink />
                                                             </button>
                                                         )}
                                                         {resource.status === 'stopped' ? (
@@ -2514,6 +2535,7 @@
                                         clusterId={clusterId}
                                         onAction={handleAction}
                                         onOpenConsole={onOpenConsole}
+                                        onOpenSpice={onOpenSpice}
                                         onOpenConfig={onOpenConfig}
                                         onMigrate={() => setShowMigrateModal(selectedDetailVm)}
                                         onClone={() => setShowCloneModal(selectedDetailVm)}
