@@ -2071,7 +2071,10 @@
         // update Manager Section Component (for Settings tab)
         function UpdateManagerSection({ clusterId, addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, isAdmin } = useAuth();
+            const { getAuthHeaders, isAdmin, user } = useAuth();
+            // #644-class: gate the update-manager controls on the backend perms they
+            // actually call (backup.schedule / node.update), not a blanket isAdmin.
+            const hasPerm = (p) => isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes(p));
             const { isCorporate } = useLayout();
             const [loading, setLoading] = useState(false);
             const [checking, setChecking] = useState(false);
@@ -2580,7 +2583,7 @@
                                 </button>
                                 
                                 {/* MK: Schedule button */}
-                                {isAdmin && (
+                                {hasPerm('backup.schedule') && (
                                     <button
                                         onClick={(e) => { e.stopPropagation(); setShowScheduleModal(true); }}
                                         className={`px-4 py-2 rounded-lg text-sm transition-colors flex items-center gap-2 ${
@@ -2599,7 +2602,7 @@
                                     </button>
                                 )}
                                 
-                                {isAdmin && totalUpdates > 0 && !rollingUpdate && (
+                                {hasPerm('node.update') && totalUpdates > 0 && !rollingUpdate && (
                                     <button
                                         onClick={(e) => { e.stopPropagation(); setShowConfirm(true); }}
                                         className="px-4 py-2 bg-proxmox-orange rounded-lg text-white text-sm hover:bg-orange-600 transition-colors flex items-center gap-2"
@@ -2693,11 +2696,11 @@
                                                         {nodeData.count > 0 ? (
                                                             <>
                                                                 {/* Update Actions */}
-                                                                {isAdmin && (
+                                                                {hasPerm('node.update') && (
                                                                     <div className="p-3 bg-proxmox-darker border-b border-proxmox-border flex items-center gap-2">
                                                                         <button
-                                                                            onClick={(e) => { 
-                                                                                e.stopPropagation(); 
+                                                                            onClick={(e) => {
+                                                                                e.stopPropagation();
                                                                                 setNodeReboot(hasKernel);
                                                                                 setShowNodeUpdateConfirm(nodeName); 
                                                                             }}

@@ -2936,7 +2936,7 @@
         // NS May 2026 — Snapshot Scheduling. Tag-based or VMID-based policies
         // with cron-like schedules + retention. The scheduler thread server-
         // side wakes every minute.
-        function SnapshotPoliciesTab({ clusterId, authFetch, addToast, t, isAdmin }) {
+        function SnapshotPoliciesTab({ clusterId, authFetch, addToast, t, isAdmin, canSnapshot }) {
             const [policies, setPolicies] = React.useState([]);
             const [loading, setLoading] = React.useState(false);
             const [editing, setEditing] = React.useState(null);
@@ -3047,7 +3047,7 @@
                                 {loading ? <Icons.RotateCw className="w-3.5 h-3.5 animate-spin" /> : <Icons.RefreshCw className="w-3.5 h-3.5" />}
                                 {t('refresh') || 'Refresh'}
                             </button>
-                            {isAdmin && (
+                            {canSnapshot && (
                                 <button onClick={newPolicy}
                                     className="px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm text-white flex items-center gap-1.5">
                                     <Icons.Plus className="w-3.5 h-3.5" />
@@ -3088,7 +3088,7 @@
                                                     {p.last_run_status} · {(p.last_run_at || '').replace('T', ' ').slice(11, 16)}
                                                 </span>
                                             )}
-                                            {isAdmin && (
+                                            {canSnapshot && (
                                                 <>
                                                     <button onClick={() => runNow(p.id)}
                                                         className="px-2 py-1 bg-proxmox-darker border border-proxmox-border rounded text-xs text-gray-300 hover:text-white">
@@ -16436,6 +16436,7 @@
                                                         addToast={addToast}
                                                         t={t}
                                                         isAdmin={isAdmin}
+                                                        canSnapshot={can('vm.snapshot')}
                                                     />
                                                 )}
 
@@ -19068,7 +19069,7 @@
                                                                                                     <Icons.FileText className="w-3.5 h-3.5" />
                                                                                                 </button>
                                                                                                 {/* NS May 2026 — Restore Wizard trigger */}
-                                                                                                {isAdmin && (
+                                                                                                {can('vm.backup') && (
                                                                                                     <button onClick={() => {
                                                                                                         const isoTime = new Date(snap['backup-time'] * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
                                                                                                         setShowRestoreWizard({

@@ -1239,7 +1239,7 @@
                                 />
                                 <span className="text-xs text-gray-500">{t('zeroDisables') || '0 = disabled'}</span>
                                 <div className="flex-1" />
-                                <button onClick={saveSlaConfig} disabled={slaSaving || !isAdmin}
+                                <button onClick={saveSlaConfig} disabled={slaSaving || !hasPerm('cluster.config')}
                                     className="px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 rounded text-sm font-medium disabled:opacity-50 flex items-center gap-1.5">
                                     {slaSaving && <Icons.RotateCw className="w-3.5 h-3.5 animate-spin" />}
                                     {t('save') || 'Save'}
@@ -1625,7 +1625,7 @@
                                                                 <th className="p-2">{t('type') || 'Type'}</th>
                                                                 <th className="p-2">{t('format') || 'Format'}</th>
                                                         <th className="p-2 text-right">{t('size') || 'Size'}</th>
-                                                        {isAdmin && <th className="p-2 w-10"></th>}
+                                                        {hasPerm('storage.delete') && <th className="p-2 w-10"></th>}
                                                     </tr>
                                                 </thead>
                                                 <tbody>
@@ -1654,7 +1654,7 @@
                                                                 {item.size_human || formatSize(item.size)}
                                                                 {item.size_is_approx && <span className="text-[10px] text-gray-500 ml-1" title="Approximate — PVE 9.2 reported approximate-size, not exact size">≈</span>}
                                                             </td>
-                                                            {isAdmin && (
+                                                            {hasPerm('storage.delete') && (
                                                                 <td className="p-2">
                                                                     {/* LW: allow deleting backups even with vmid - vzdumps always have vmid attached */}
                                                                     {(item.content === 'backup' || (!item.vmid && (item.content === 'iso' || item.content === 'vztmpl'))) && (
@@ -1698,7 +1698,7 @@
                                         <Icons.Zap className="text-yellow-400" />
                                         Storage Clusters
                                     </h3>
-                                    {isAdmin && (
+                                    {hasPerm('storage.config') && (
                                         <button
                                             onClick={() => setShowCreateCluster(true)}
                                             className="p-1.5 bg-proxmox-orange hover:bg-orange-600 rounded-lg"
@@ -1731,7 +1731,7 @@
                                                         <span className={`w-2 h-2 rounded-full ${sc.enabled ? 'bg-green-500' : 'bg-gray-500'}`} />
                                                         <span className="font-medium">{sc.name}</span>
                                                     </div>
-                                                    {isAdmin && (
+                                                    {hasPerm('storage.config') && (
                                                         <button
                                                             onClick={(e) => { e.stopPropagation(); deleteStorageCluster(sc.id); }}
                                                             className="p-1 hover:bg-red-500/20 rounded text-gray-500 hover:text-red-400"
@@ -1848,7 +1848,7 @@
                                             <div>
                                                 <div className="flex items-center justify-between mb-3">
                                                     <h4 className="text-sm font-medium text-gray-400">{t('storagesInCluster') || 'Storages in Cluster'}</h4>
-                                                    {isAdmin && datastores.shared?.length > (clusterStatus.storages?.length || 0) && (
+                                                    {hasPerm('storage.config') && datastores.shared?.length > (clusterStatus.storages?.length || 0) && (
                                                         <select
                                                             className="px-2 py-1 bg-proxmox-dark border border-proxmox-border rounded text-sm"
                                                             onChange={(e) => { if (e.target.value) { addStorageToCluster(clusterStatus.id, e.target.value); e.target.value = ''; }}}
@@ -1870,7 +1870,7 @@
                                                                     <span className={`text-sm ${storage.usage_percent > 90 ? 'text-red-400' : storage.usage_percent > 70 ? 'text-yellow-400' : 'text-green-400'}`}>
                                                                         {storage.usage_percent}%
                                                                     </span>
-                                                                    {isAdmin && clusterStatus.storages.length > 2 && (
+                                                                    {hasPerm('storage.config') && clusterStatus.storages.length > 2 && (
                                                                         <button
                                                                             onClick={() => removeStorageFromCluster(clusterStatus.id, storage.storage)}
                                                                             className="p-1 hover:bg-red-500/20 rounded text-gray-500 hover:text-red-400"
@@ -1911,7 +1911,7 @@
                                                                         <div className="text-xs text-gray-500">{rec.reason}</div>
                                                                     </div>
                                                                 </div>
-                                                                {isAdmin && (
+                                                                {hasPerm('storage.config') && (
                                                                     <button
                                                                         onClick={() => executeMigration(rec)}
                                                                         className="px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm"
