@@ -14055,8 +14055,8 @@
                                         </div>
                                     )}
                                     
-                                    {/* Task Bar Toggle - disabled for debugging */}
-                                    {false && !showTaskBar && tasks.length > 0 && (
+                                    {/* Task Bar Toggle — brings the bar back after it's been closed (#648: debug guard slipped into 1.0) */}
+                                    {!showTaskBar && tasks.length > 0 && (
                                         <button
                                             onClick={() => setShowTaskBar(true)}
                                             className="relative flex items-center gap-2 px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg hover:border-proxmox-orange/50 transition-colors"
