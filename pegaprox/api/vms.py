@@ -16,7 +16,7 @@ import shlex
 import ssl
 import socket
 from datetime import datetime, timedelta, timezone
-from flask import Blueprint, jsonify, request, g, current_app
+from flask import Blueprint, jsonify, request, g, current_app, Response
 
 from pegaprox.constants import *
 from pegaprox.globals import *
@@ -3682,6 +3682,60 @@ def get_console_ticket(cluster_id, node, vm_type, vmid):
 
         return jsonify(result)
     return jsonify({'error': result.get('error', 'Failed')}), 500
+
+
+@bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/spice', methods=['GET'])
+@require_auth()
+def get_spice_console(cluster_id, node, vm_type, vmid):
+    """MK Aug 2026 — SPICE console as a downloadable virt-viewer .vv file (like PVE's
+    own web UI): opens in remote-viewer, full SPICE (audio / USB / multi-monitor).
+    Same authz as the VNC console (vm.console + per-VM ACL). remote-viewer tunnels the
+    SPICE stream through the PVE host's pveproxy, so it works behind a single public IP."""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    if vm_type != 'qemu':
+        return jsonify({'error': 'SPICE is only available for QEMU VMs'}), 400
+
+    users = load_users()
+    user = users.get(request.session['user'], {})
+    user['username'] = request.session['user']
+    mgr = cluster_managers[cluster_id]
+    if not user_can_access_vm(user, cluster_id, vmid, 'vm.console', vm_type):
+        return jsonify({'error': 'Permission denied: vm.console'}), 403
+
+    result = mgr.get_spice_ticket(node, vmid, vm_type)
+    if not result.get('success'):
+        e = str(result.get('error', 'Failed'))
+        # PVE returns 'no spice port' when the VM's display isn't SPICE (vga != qxl/virtio-gl)
+        if 'no spice port' in e.lower():
+            return jsonify({'error': 'This VM has no SPICE display — set its Display to SPICE (qxl) first.'}), 409
+        return jsonify({'error': e}), 500
+
+    data = result.get('data') or {}
+    # Assemble the [virt-viewer] .vv. PVE's spiceproxy keys already map 1:1 to the
+    # virt-viewer connection fields; the multi-line 'ca' PEM has to be single-line with
+    # escaped newlines so the INI parser keeps it intact.
+    lines = ['[virt-viewer]']
+    if 'type' not in data:
+        lines.append('type=spice')
+    for k, v in data.items():
+        if v is None:
+            continue
+        val = str(v)
+        if k == 'ca':
+            val = val.replace('\r\n', '\n').replace('\n', '\\n')
+        lines.append(f'{k}={val}')
+    vv = '\n'.join(lines) + '\n'
+
+    log_audit(request.session.get('user', 'unknown'), 'vm.console',
+              f'SPICE console opened: {vm_type}/{vmid} on {node}', cluster=mgr.config.name)
+    resp = Response(vv, mimetype='application/x-virt-viewer')
+    resp.headers['Content-Disposition'] = f'attachment; filename="spice-{cluster_id}-{vmid}.vv"'
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
 
 
 # NS Jun 2026 — framebuffer grab for the "Console Available" tile preview.

@@ -11291,8 +11291,11 @@ echo "AGENT_INSTALLED_OK"
             self.logger.exception(f"[ERROR] Shell ticket error: {e}")
             return {'success': False, 'error': str(e)}
     
-    def get_spice_ticket(self, node: str, vmid: int, vm_type: str) -> Dict[str, Any]:
-        
+    def get_spice_ticket(self, node: str, vmid: int, vm_type: str, proxy: str = None) -> Dict[str, Any]:
+        # MK Aug 2026 — SPICE .vv console. `proxy` = the host the browser reached us on,
+        # so remote-viewer tunnels SPICE through pveproxy (:3128) instead of trying to
+        # reach the node directly; matters for single-public-IP clusters. Defaults to
+        # this cluster's API host.
         if vm_type != 'qemu':
             return {'success': False, 'error': 'SPICE only available for QEMU VMs'}
         
@@ -11302,7 +11305,7 @@ echo "AGENT_INSTALLED_OK"
         
         try:
             url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/spiceproxy"
-            response = self._create_session().post(url, timeout=15)
+            response = self._create_session().post(url, data={'proxy': proxy or self.host}, timeout=15)
             
             if response.status_code == 200:
                 data = response.json()['data']

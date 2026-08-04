@@ -13248,6 +13248,30 @@
             const [showMoveNodeDash, setShowMoveNodeDash] = useState(false);
             const [nodeToMoveDash, setNodeToMoveDash] = useState(null);
 
+            // MK Aug 2026 — SPICE console: downloads a virt-viewer .vv that opens in
+            // remote-viewer (full SPICE: audio / USB / multi-monitor), like PVE's own UI.
+            const handleOpenSpice = async (resource) => {
+                const cId = resource._clusterId || selectedCluster?.id;
+                if (!cId) return;
+                try {
+                    const r = await authFetch(`${API_URL}/clusters/${cId}/vms/${resource.node}/${resource.type}/${resource.vmid}/spice`);
+                    if (!r.ok) {
+                        let msg = t('spiceUnavailable') || 'SPICE is not available for this VM';
+                        try { msg = (await r.json()).error || msg; } catch (e) {}
+                        addToast(msg, 'error');
+                        return;
+                    }
+                    const blob = await r.blob();
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url; a.download = `spice-${resource.vmid}.vv`;
+                    document.body.appendChild(a); a.click(); a.remove();
+                    URL.revokeObjectURL(url);
+                    addToast(t('spiceDownloaded') || 'SPICE file downloaded — open it with Virt-Viewer', 'success');
+                } catch (e) {
+                    addToast('SPICE: ' + e.message, 'error');
+                }
+            };
             const handleOpenConsole = async (resource) => {
                 const cId = resource._clusterId || selectedCluster?.id;
                 if (!cId) return;
@@ -13446,6 +13470,7 @@
                         { label: t('power') || 'Power', icon: <Icons.Power className="w-3.5 h-3.5" />, submenu: powerItems },
                         { separator: true },
                         { label: t('console') || 'Console', icon: <Icons.Terminal className="w-3.5 h-3.5" />, onClick: () => handleOpenConsole(vm), disabled: !isRunning },
+                        ...(vm.type === 'qemu' ? [{ label: t('spiceConsole') || 'SPICE', icon: <Icons.Monitor className="w-3.5 h-3.5" />, onClick: () => handleOpenSpice(vm), disabled: !isRunning }] : []),
                         // NS May 2026 — VNC ↔ Term toggle now lives inside the Console modal,
                         // so the separate Terminal entry was removed (one entry point = clearer UX).
                         { label: t('editSettings') || 'Settings', icon: <Icons.Settings className="w-3.5 h-3.5" />, onClick: () => handleOpenConfig(vm) },
