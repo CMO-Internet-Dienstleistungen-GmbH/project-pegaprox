@@ -214,8 +214,8 @@ def oidc_callback():
         # Check if user already exists
         # MK: this has to match the logic in oidc_provision_user or we get mismatches
         # (had a bug where "john.doe" here vs "johndoe" in provision caused 403s)
-        check_username = oidc_derive_username(user_info)
         users = load_users()
+        check_username = oidc_derive_username(user_info, users)
         if check_username not in users:
             return jsonify({'error': 'User account does not exist. Contact an administrator.'}), 403
     
