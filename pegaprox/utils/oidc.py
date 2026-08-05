@@ -621,6 +621,33 @@ def oidc_map_groups_to_role(config: dict, groups: list, id_token_claims: dict = 
     return result
 
 
+def oidc_derive_username(user_info: dict) -> str:
+    """Derive the local username key from OIDC claims.
+
+    LW: keep the full preferred_username including the domain. Truncating at
+    '@' collapsed bob@corp.com and bob@partner.com onto one account, so the
+    second one to log in inherited the first one's role and tenant.
+    """
+    from pegaprox.utils.auth import load_users
+
+    raw_username = (user_info.get('preferred_username')
+                    or user_info.get('email', ''))
+
+    username = ''.join(c for c in raw_username.lower()
+                       if c.isalnum() or c in '._-@')
+    if not username:
+        return f"oidc_{user_info.get('sub', 'unknown')[:12]}"
+
+    # Back-compat: installs before this change stored the part before '@'.
+    # An existing account keeps its old key so it isn't orphaned.
+    if '@' in username:
+        legacy = username.split('@')[0]
+        if legacy and legacy in load_users():
+            return legacy
+
+    return username
+
+
 def oidc_provision_user(user_info: dict, role_mapping: dict, auth_source: str = 'oidc') -> dict:
     from pegaprox.utils.auth import load_users, save_users
     """Create or update local user from OIDC authentication
@@ -630,19 +657,8 @@ def oidc_provision_user(user_info: dict, role_mapping: dict, auth_source: str = 
     """
     # Derive username from OIDC claims
     email = user_info.get('email') or user_info.get('preferred_username', '')
-    raw_username = user_info.get('preferred_username') or email
-    
-    # LW: Sanitize username - use part before @ for email-style usernames
-    if '@' in raw_username:
-        username = raw_username.split('@')[0].lower()
-    else:
-        username = raw_username.lower()
-    
-    # NS: Ensure we have a valid username
-    username = ''.join(c for c in username if c.isalnum() or c in '._-')
-    if not username:
-        username = f"oidc_{user_info.get('sub', 'unknown')[:12]}"
-    
+    username = oidc_derive_username(user_info)
+
     display_name = user_info.get('name') or user_info.get('given_name', '') 
     if not display_name:
         display_name = username
