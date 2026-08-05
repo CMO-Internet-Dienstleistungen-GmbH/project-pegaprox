@@ -367,7 +367,8 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
                         except Exception as e:
                             logging.warning(f"[SCHEDULER] Check failed for {node_name}: {e}")
                     mgr._rolling_update['current_step'] = 'maintenance'
-                    mgr.enter_maintenance_mode(node_name, skip_evacuation=skip_evacuation)
+                    mgr.enter_maintenance_mode(node_name, skip_evacuation=skip_evacuation,
+                                               allow_local_disks=getattr(mgr.config, 'balance_local_disks', False))  # MK #629
                     if not skip_evacuation:
                         mgr._rolling_update['current_step'] = 'evacuating'
                         waited = 0; evacuation_ok = False

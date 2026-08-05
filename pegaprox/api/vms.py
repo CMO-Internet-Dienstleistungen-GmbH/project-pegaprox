@@ -2409,7 +2409,12 @@ def set_maintenance_mode(cluster_id, node_name):
     usr = getattr(request, 'session', {}).get('user', 'system')
     
     if enable:
-        task = mgr.enter_maintenance_mode(node_name, skip_evacuation=skip_evacuation)
+        # MK Aug 2026 (#629): thread the cluster's local-disk-balance flag through so a
+        # maintenance evacuation migrates local-disk VMs with --with-local-disks too,
+        # like the balancer/anti-affinity path does (same config flag). Off by default,
+        # so behaviour is unchanged unless "Balance VMs with Local Disks" is enabled.
+        task = mgr.enter_maintenance_mode(node_name, skip_evacuation=skip_evacuation,
+                                          allow_local_disks=getattr(mgr.config, 'balance_local_disks', False))
         
         if skip_evacuation:
             log_audit(usr, 'node.maintenance_entered', f"Node {node_name} entered maintenance mode (skip_evacuation=True)", cluster=mgr.config.name)
