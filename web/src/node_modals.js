@@ -3959,6 +3959,16 @@
 
             // NS: type text into VM as keypresses - clipboardPasteFrom only sets VNC clipboard
             // buffer which needs guest agent, this actually works everywhere
+            // MK #653 (dcodner24) — shifted symbols pasted unshifted (!->1, @->2, _->-, {->[ ...).
+            // qemu's VNC keysym path doesn't assert Shift for the symbol row, so sending keysym
+            // 0x21 lands on the '1' key unshifted. Manual typing works because the browser holds
+            // Shift for us, so paste has to do the same: hold Shift_L, tap the *base* key on that
+            // physical key, release Shift_L — exactly what pressing it by hand does. Uppercase
+            // already works (qemu shifts A-Z itself), so leave those on the plain path.
+            const SHIFTED_US = {
+                '!':0x31,'@':0x32,'#':0x33,'$':0x34,'%':0x35,'^':0x36,'&':0x37,'*':0x38,'(':0x39,')':0x30,
+                '_':0x2D,'+':0x3D,'{':0x5B,'}':0x5D,'|':0x5C,':':0x3B,'"':0x27,'<':0x2C,'>':0x2E,'?':0x2F,'~':0x60,
+            };
             const typeTextToVM = (conn, text) => {
                 for (const ch of text) {
                     const code = ch.charCodeAt(0);
@@ -3966,6 +3976,10 @@
                         conn.sendKey(0xFF0D); // Return
                     } else if (code === 9) {
                         conn.sendKey(0xFF09); // Tab
+                    } else if (SHIFTED_US[ch] !== undefined) {
+                        conn.sendKey(0xFFE1, 'ShiftLeft', true);   // Shift_L down
+                        conn.sendKey(SHIFTED_US[ch]);              // tap the unshifted base key
+                        conn.sendKey(0xFFE1, 'ShiftLeft', false);  // Shift_L up
                     } else if (code >= 0x20 && code <= 0x7E) {
                         conn.sendKey(code); // ASCII printable = X11 keysym
                     } else if (code > 0x00A0) {

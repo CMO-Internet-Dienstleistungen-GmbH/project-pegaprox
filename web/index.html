@@ -5903,8 +5903,17 @@ rfbInstance.addEventListener('credentialsrequired',()=>{console.log('VNC: Creden
 rfbInstance.addEventListener('clipboard',e=>{if(e.detail?.text){navigator.clipboard.writeText(e.detail.text).catch(()=>{});}});setRfb(rfbInstance);rfbRef.current=rfbInstance;}catch(e){console.error('VNC: Error:',e);if(!cancelled){setConnectionStatus('load_error');}}};startVNC();return()=>{cancelled=true;if(rfbRef.current){try{rfbRef.current.disconnect();}catch(e){}rfbRef.current=null;}};},[consoleInfo,clusterId,vm,viewMode]);// resize handling - observer for container changes, window event for monitor switches
 useEffect(()=>{if(!rfb||!canvasRef.current)return;const triggerResize=()=>{if(rfbRef.current){rfbRef.current.scaleViewport=true;}};const observer=new ResizeObserver(triggerResize);observer.observe(canvasRef.current);window.addEventListener('resize',triggerResize);return()=>{observer.disconnect();window.removeEventListener('resize',triggerResize);};},[rfb]);const handleFullscreen=()=>{if(!document.fullscreenElement){containerRef.current?.requestFullscreen();setIsFullscreen(true);}else{document.exitFullscreen();setIsFullscreen(false);}};const handleCtrlAltDel=()=>{if(rfb){rfb.sendCtrlAltDel();}};// NS: type text into VM as keypresses - clipboardPasteFrom only sets VNC clipboard
 // buffer which needs guest agent, this actually works everywhere
-const typeTextToVM=(conn,text)=>{for(const ch of text){const code=ch.charCodeAt(0);if(code===10||code===13){conn.sendKey(0xFF0D);// Return
+// MK #653 (dcodner24) — shifted symbols pasted unshifted (!->1, @->2, _->-, {->[ ...).
+// qemu's VNC keysym path doesn't assert Shift for the symbol row, so sending keysym
+// 0x21 lands on the '1' key unshifted. Manual typing works because the browser holds
+// Shift for us, so paste has to do the same: hold Shift_L, tap the *base* key on that
+// physical key, release Shift_L — exactly what pressing it by hand does. Uppercase
+// already works (qemu shifts A-Z itself), so leave those on the plain path.
+const SHIFTED_US={'!':0x31,'@':0x32,'#':0x33,'$':0x34,'%':0x35,'^':0x36,'&':0x37,'*':0x38,'(':0x39,')':0x30,'_':0x2D,'+':0x3D,'{':0x5B,'}':0x5D,'|':0x5C,':':0x3B,'"':0x27,'<':0x2C,'>':0x2E,'?':0x2F,'~':0x60};const typeTextToVM=(conn,text)=>{for(const ch of text){const code=ch.charCodeAt(0);if(code===10||code===13){conn.sendKey(0xFF0D);// Return
 }else if(code===9){conn.sendKey(0xFF09);// Tab
+}else if(SHIFTED_US[ch]!==undefined){conn.sendKey(0xFFE1,'ShiftLeft',true);// Shift_L down
+conn.sendKey(SHIFTED_US[ch]);// tap the unshifted base key
+conn.sendKey(0xFFE1,'ShiftLeft',false);// Shift_L up
 }else if(code>=0x20&&code<=0x7E){conn.sendKey(code);// ASCII printable = X11 keysym
 }else if(code>0x00A0){conn.sendKey(0x01000000+code);// Unicode
 }}};const openInProxmox=()=>{// NS: IPv6 needs brackets in URLs
