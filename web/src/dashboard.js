@@ -23012,10 +23012,12 @@
                                     </div>
                                     
                                     {/* Advanced Settings - Collapsed */}
-                                    <details className="bg-proxmox-dark border border-proxmox-border rounded-xl overflow-hidden">
+                                    {/* MK #652: native <details> needs the `group` class + group-open:rotate on the
+                                        chevron, otherwise the arrow stays put and never signals the open state */}
+                                    <details className="group bg-proxmox-dark border border-proxmox-border rounded-xl overflow-hidden">
                                         <summary className="p-3 cursor-pointer hover:bg-proxmox-hover flex items-center justify-between text-sm">
                                             <span className="text-gray-400">{t('advancedSettings')}</span>
-                                            <Icons.ChevronDown className="w-4 h-4 text-gray-400" />
+                                            <Icons.ChevronDown className="w-4 h-4 text-gray-400 transition-transform group-open:rotate-180" />
                                         </summary>
                                         <div className="p-3 pt-0 space-y-3 border-t border-proxmox-border">
                                             <div className="grid grid-cols-2 gap-3">
