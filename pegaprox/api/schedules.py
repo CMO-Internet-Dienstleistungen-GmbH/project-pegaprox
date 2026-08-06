@@ -367,8 +367,13 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
                         except Exception as e:
                             logging.warning(f"[SCHEDULER] Check failed for {node_name}: {e}")
                     mgr._rolling_update['current_step'] = 'maintenance'
+                    # NS #630 — scheduled updates run unattended, so default local-disk
+                    # evacuation ON: a run that pauses at 3am waiting for a human because one
+                    # local-disk VM couldn't live-migrate is the worst possible outcome for an
+                    # automatic update. On shared-storage clusters it's a no-op anyway. Honour a
+                    # per-schedule override if one is ever stored, else evacuate everything.
                     mgr.enter_maintenance_mode(node_name, skip_evacuation=skip_evacuation,
-                                               allow_local_disks=getattr(mgr.config, 'balance_local_disks', False))  # MK #629
+                                               allow_local_disks=action.get('allow_local_disks', True))
                     if not skip_evacuation:
                         mgr._rolling_update['current_step'] = 'evacuating'
                         waited = 0; evacuation_ok = False

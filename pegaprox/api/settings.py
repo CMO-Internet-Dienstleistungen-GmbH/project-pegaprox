@@ -4071,7 +4071,7 @@ def start_rolling_update(cluster_id):
         try:
             logging.info(f"[RollingUpdate] Starting rolling update for cluster, nodes: {nodes_to_update}")
             _log("Rolling update started")
-            _log(f"Settings: skip_up_to_date={skip_up_to_date}, skip_evacuation={skip_evacuation}, evacuation_timeout={evacuation_timeout}s, ceph_health_gate={ceph_health_gate}")
+            _log(f"Settings: skip_up_to_date={skip_up_to_date}, skip_evacuation={skip_evacuation}, evacuation_timeout={evacuation_timeout}s, reboot_timeout={reboot_timeout}s, allow_local_disks={allow_local_disks}, ceph_health_gate={ceph_health_gate}")
 
             if skip_evacuation:
                 _log("⚠️ WARNING: VM evacuation disabled - VMs may be affected if update fails!")
