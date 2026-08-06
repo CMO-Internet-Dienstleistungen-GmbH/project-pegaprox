@@ -43,7 +43,11 @@ dnspython>=2.7.0
 # TripleDES-decrepit/rsa/ec/serialization) + create_app import clean on 49; PegaProx
 # is Linux-only so the dropped macOS/32-bit-Windows wheels don't apply. <52 matches
 # fido2's ceiling. (The CVE was never reachable here anyway — zero raw ChaCha20.)
-cryptography>=49.0.0,<52
+# NS Aug 2026 — floor raised 49 -> 50 now that pyopenssl 26.4.0 (below) permits it: pin the
+# CVE-2026-69247 cryptography 49 out entirely instead of merely resolving past it, so no
+# lockfile/older resolution can land back on it (unreachable here, but no reason to allow).
+# Effective range with pyopenssl's <51 cap = 50.x; verified installed + crypto surface clean.
+cryptography>=50.0.0,<52
 # MK Aug 2026 — floor at 26.3.0, NOT >=26.0.0: cryptography 49 removed its legacy
 # _openssl bindings, and pyopenssl 26.0-26.2's deprecated X509Extension still
 # referenced _lib.GEN_EMAIL there, so `from OpenSSL import crypto` AttributeError'd
