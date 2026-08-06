@@ -48,9 +48,14 @@ cryptography>=49.0.0,<52
 # _openssl bindings, and pyopenssl 26.0-26.2's deprecated X509Extension still
 # referenced _lib.GEN_EMAIL there, so `from OpenSSL import crypto` AttributeError'd
 # on cryptography 49 — a fresh no-cert install would fail to self-generate a cert and
-# refuse to start. 26.3.0 dropped that dead code. (26.3.0 itself caps cryptography
-# <50, so with the pin above the resolver lands on 49.x + 26.3.0.)
-pyopenssl>=26.3.0
+# refuse to start. 26.3.0 dropped that dead code (it capped cryptography <50).
+# NS Aug 2026 — floor bumped to 26.4.0: it lifts that cap to <51, so the resolver now
+# lands on cryptography 50.x (already inside our <52 pin above), which clears the Aikido
+# cryptography-50 finding the #650 autofix PR kept raising. Verified `from OpenSSL import
+# crypto` + _generate_self_signed + create_app import clean on 26.4.0 + cryptography 50,
+# pip check OK. (Note: that CVE — PKCS#7 EnvelopedData decrypt — is unreachable here; we
+# use zero PKCS#7 and no RSA decryption, only Fernet/AESGCM + RSA *signing* for ACME.)
+pyopenssl>=26.4.0
 argon2-cffi>=23.0.0
 # pyasn1 transitive via pyopenssl. Explicit pin so scanners stop seeing the old
 # 0.5.x floor. MK 2026-07-11 — bumped 0.6.3 -> 0.6.4: clears 3 new Aikido findings
