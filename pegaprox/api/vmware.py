@@ -1127,8 +1127,6 @@ def start_vmware_migration(vmware_id, vm_id):
     }), 202
 
 
-@bp.route('/api/vmware/migrations', methods=['GET'])
-@require_auth(perms=['vmware.vm.migrate'])
 def _migration_reachable(t):
     # NS Jul 2026 (CodeAnt IDOR) — a caller may see a migration only if they can reach one of the
     # clusters it touches (source or target). Tasks with no determinable cluster are shown.
@@ -1136,6 +1134,12 @@ def _migration_reachable(t):
     return (not cids) or any(check_cluster_access(c)[0] for c in cids)
 
 
+# NS Aug 2026 (#654) — the route + auth decorators were stuck on the _migration_reachable helper
+# above (a copy-paste slip when the IDOR helper was inserted between them and this handler), so
+# GET /api/vmware/migrations called the helper with no args -> TypeError 500 and ESXi migration
+# blew up immediately, while the real handler below was never routed. Put the decorators back here.
+@bp.route('/api/vmware/migrations', methods=['GET'])
+@require_auth(perms=['vmware.vm.migrate'])
 def list_vmware_migrations():
     """List all active and recent migrations"""
     return jsonify([t.to_dict() for t in _vmware_migrations.values() if _migration_reachable(t)])

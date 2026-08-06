@@ -191,8 +191,6 @@ def xhm_start():
     }), 202
 
 
-@bp.route('/api/xhm/migrations', methods=['GET'])
-@require_auth(perms=['vm.migrate'])
 def _xhm_reachable(t):
     # NS Jul 2026 (CodeAnt IDOR) — show a migration only if the caller reaches one of its clusters.
     from pegaprox.api.helpers import check_cluster_access
@@ -200,6 +198,10 @@ def _xhm_reachable(t):
     return (not cids) or any(check_cluster_access(c)[0] for c in cids)
 
 
+# NS Aug 2026 (#654) — same slip as the vmware list route: decorators were on _xhm_reachable
+# instead of this handler, so GET /api/xhm/migrations 500'd with a missing-arg TypeError.
+@bp.route('/api/xhm/migrations', methods=['GET'])
+@require_auth(perms=['vm.migrate'])
 def xhm_list():
     return jsonify([t.to_dict() for t in _xhm_migrations.values() if _xhm_reachable(t)])
 
