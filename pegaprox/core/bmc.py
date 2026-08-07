@@ -438,9 +438,29 @@ def read_node_bmc_inband(mgr, node, timeout=15):
         if not ip:
             return {'available': False, 'reason': f'no SSH-reachable IP for node {node}'}
         user = getattr(mgr.config, 'ssh_user', None) or 'root'
-        raw = mgr._ssh_run_command_output(ip, user, INBAND_PROBE_CMD, timeout=timeout)
-        if raw is None or not raw.strip():
-            return {'available': False, 'reason': 'no response from node (SSH unavailable?)'}
+
+        # NS Aug 2026 (#609) — "credential-free" here means no BMC creds, but it still needs a
+        # node shell. The read originally tried ONLY _ssh_run_command_output (agent/known-key
+        # auth), so a node reachable purely by password (root@pam, no key deployed) got nothing
+        # back -> "SSH unavailable", even though the stored cluster password would have worked.
+        # Mirror the key -> agent -> password fallback the HA/maintenance node-SSH paths already
+        # use (manager.py). INBAND_PROBE_CMD always echoes a marker on a live shell, so an
+        # empty/None result reliably means "this auth didn't connect" -> safe to fall through.
+        def _has_output(x):
+            return x is not None and str(x).strip() != ''
+
+        raw = None
+        ssh_key = getattr(mgr.config, 'ssh_key', '') or ''
+        if ssh_key:
+            raw = mgr._ssh_run_command_with_key_output(ip, user, INBAND_PROBE_CMD, ssh_key, timeout=timeout)
+        if not _has_output(raw):
+            raw = mgr._ssh_run_command_output(ip, user, INBAND_PROBE_CMD, timeout=timeout)
+        if not _has_output(raw):
+            ssh_pass = getattr(mgr.config, 'pass_', '') or ''
+            if ssh_pass:
+                raw = mgr._ssh_run_command_with_password_output(ip, user, INBAND_PROBE_CMD, ssh_pass, timeout=timeout)
+        if not _has_output(raw):
+            return {'available': False, 'reason': 'no response from node (SSH unavailable or auth failed?)'}
         return parse_inband(raw)
     except Exception as e:  # noqa: BLE001 — surface as unavailable, never raise into the route
         return {'available': False, 'reason': f'in-band BMC read failed: {e}'}
