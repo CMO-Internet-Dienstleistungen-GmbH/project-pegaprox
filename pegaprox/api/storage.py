@@ -2294,9 +2294,14 @@ def download_from_url(cluster_id, node, storage):
         # fetches it FROM the PVE management network (SSRF: internal services, cloud
         # metadata 169.254.169.254, etc.). Validate before delegating. http+https only
         # (ISO mirrors use both); require_resolution fails CLOSED on unresolvable hosts.
-        from pegaprox.utils.url_security import sanitize_outbound_url, SsrfError
+        # NS Aug 2026 (Aikido pentest) — sanitize_* validated the host's CURRENT resolution but
+        # handed PVE the hostname, which the node re-resolves independently (TOCTOU / DNS-rebind:
+        # public IP during our check, 169.254.169.254 during PVE's fetch). resolve_and_pin_url
+        # pins http URLs to the validated IP; https is left as the hostname (PVE's TLS cert
+        # validation defeats a rebind on its own — an internal IP won't present the mirror's cert).
+        from pegaprox.utils.url_security import resolve_and_pin_url, SsrfError
         try:
-            url = sanitize_outbound_url(url, allowed_schemes=('https', 'http'))
+            url = resolve_and_pin_url(url, allowed_schemes=('https', 'http'))
         except SsrfError as _ssrf:
             return jsonify({'error': f'URL rejected by SSRF guard: {_ssrf}'}), 400
 

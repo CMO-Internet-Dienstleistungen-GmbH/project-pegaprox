@@ -206,6 +206,17 @@ def validate_ws_token_api():
                 logging.warning(f"[WS-TOKEN] user '{_sl(data['user'])}' has no access to cluster '{_sl(requested_cluster)}'")
                 return jsonify({'error': 'Access denied to this cluster'}), 403
 
+            # NS Aug 2026 (Aikido pentest) — the standalone SSH shell server (mainPort+2) calls
+            # this with &shell=node. Unlike the in-process node_shell_websocket_proxy (vms.py),
+            # this validate path never checked node.shell, so a user with mere cluster access
+            # could open a root node shell. Enforce node.shell here. The VM termproxy path does
+            # NOT send shell=node (it's a guest console gated separately), so it's unaffected.
+            if (request.args.get('shell') or '') == 'node':
+                from pegaprox.utils.rbac import has_permission
+                if not has_permission(user, 'node.shell'):
+                    logging.warning(f"[WS-TOKEN] user '{_sl(data['user'])}' lacks node.shell for a node shell on '{_sl(requested_cluster)}'")
+                    return jsonify({'error': 'node.shell permission required'}), 403
+
             # MK May 2026 - lightweight cluster context for the SSH/VNC proxy.
             # We intentionally do NOT call mgr._get_node_ip() here: that has a
             # network-probing first-call path (up to ~15s) which would hang the
@@ -429,6 +440,11 @@ def test_smtp():
         # But if password is masked (********), use the saved password
         provided_password = data.get('smtp_password', '')
         if provided_password == '********' or not provided_password:
+            # NS Aug 2026 (Aikido pentest) — only reuse the saved SMTP password when the test host
+            # matches the saved host; otherwise a settings admin could point the stored credential
+            # at an attacker-controlled MX = credential exfil. A different host needs its own password.
+            if smtp_host != (saved_settings.get('smtp_host') or ''):
+                return jsonify({'error': 'A password is required to test a host other than the saved one'}), 400
             # Use saved password - NS: Feb 2026: now encrypted in DB, must decrypt
             raw_password = saved_settings.get('smtp_password', '')
             try:

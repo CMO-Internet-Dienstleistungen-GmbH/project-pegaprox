@@ -329,6 +329,11 @@ def setup_multipath(cluster_id):
     target_nodes = data.get('nodes', [])  # Empty = all nodes
     vendor = data.get('vendor', 'default')  # default, netapp, emc, hpe, pure, dell
     policy = data.get('policy', 'service-time')  # round-robin, service-time, queue-length
+    # NS Aug 2026 (Aikido pentest) — policy is interpolated raw into `path_selector "{policy} 0"`
+    # in the multipath.conf pushed to every node; a `"`-breakout would inject arbitrary stanzas.
+    # Allowlist the three real path selectors (vendor is already allowlisted via vendor_configs).
+    if policy not in ('round-robin', 'service-time', 'queue-length'):
+        return jsonify({'error': 'Invalid multipath policy'}), 400
     skip_existing_config = data.get('skipExistingConfig', False)  # Don't overwrite existing config
 
     try:
@@ -340,6 +345,14 @@ def setup_multipath(cluster_id):
             nodes_resp = manager._create_session().get(nodes_url, timeout=10)
             if nodes_resp.status_code == 200:
                 target_nodes = [n['node'] for n in nodes_resp.json().get('data', []) if n.get('status') == 'online']
+        else:
+            # NS Aug 2026 (Aikido pentest) — validate caller-supplied nodes against real cluster
+            # membership; a non-member name falls through `_get_node_ip() or node` to the raw
+            # string below and would leak the cluster SSH password to an attacker host (TOFU).
+            _members = set(_list_cluster_node_names(manager))
+            _bad = [n for n in target_nodes if n not in _members]
+            if _bad:
+                return jsonify({'error': f'Unknown cluster node(s): {", ".join(map(str, _bad))}'}), 400
 
         # Generate multipath.conf based on vendor
         multipath_conf = generate_multipath_conf(vendor, policy)
@@ -630,6 +643,11 @@ def reconfigure_multipath(cluster_id, node):
     
     ssh = None
     try:
+        # NS Aug 2026 (Aikido pentest) — reject non-member nodes before SSH: `_get_node_ip(node)
+        # or node` otherwise falls back to the raw URL segment and would leak the cluster SSH
+        # password to an attacker host on TOFU first-connect.
+        if node not in set(_list_cluster_node_names(manager)):
+            return jsonify({'error': f'Unknown cluster node: {node}'}), 400
         # Resolve node IP
         node_ip = manager._get_node_ip(node) or node
 
@@ -778,6 +796,11 @@ def login_iscsi_target(cluster_id, node):
 
     ssh = None
     try:
+        # NS Aug 2026 (Aikido pentest) — reject non-member nodes before SSH: `_get_node_ip(node)
+        # or node` otherwise falls back to the raw URL segment and would leak the cluster SSH
+        # password to an attacker host on TOFU first-connect.
+        if node not in set(_list_cluster_node_names(manager)):
+            return jsonify({'error': f'Unknown cluster node: {node}'}), 400
         # Resolve node IP
         node_ip = manager._get_node_ip(node) or node
 

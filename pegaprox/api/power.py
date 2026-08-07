@@ -222,6 +222,11 @@ def upsert(cluster_id):
         ok, err = check_cluster_access(cluster_id)
         if not ok:
             return err
+    # NS Aug 2026 (Aikido pentest) — __default__ is the shared fallback row for every cluster;
+    # only a global admin may overwrite it (a cluster.config holder edits only its own cluster).
+    # effective_role, not the raw role, so an admin-owned scoped token can't do it either.
+    elif request.session.get('effective_role', request.session.get('role')) != ROLE_ADMIN:
+        return jsonify({'error': 'Only a global admin can edit the default power rates'}), 403
     body = request.get_json(silent=True) or {}
     try:
         f = {k: float(body.get(k, _DEFAULT[k])) for k in

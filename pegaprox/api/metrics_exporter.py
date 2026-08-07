@@ -23,6 +23,7 @@ from pegaprox.globals import (
 )
 from pegaprox.api.helpers import load_server_settings
 from pegaprox.utils.auth import validate_api_token, load_users
+from pegaprox.models.permissions import ROLE_ADMIN
 from pegaprox.utils import auth as auth_state
 
 
@@ -118,7 +119,13 @@ def _node_apt_updates_available(cid, mgr, node):
 
 
 def _auth_ok():
-    """Allow scrape if: (a) bearer token is valid API token, or (b) metrics_public=true."""
+    """Allow scrape if: (a) bearer token is a valid ADMIN-role API token, or (b) metrics_public=true.
+
+    NS Aug 2026 (Aikido pentest): /api/metrics emits cluster-wide, cross-tenant infra gauges
+    (node status, quorum, CPU, VM counts across every cluster). Mere token validity is not
+    enough — a viewer/tenant-scoped token would otherwise scrape all tenants' operational data.
+    Require the token's role to be admin (matches the 'admin-view role is enough' docstring intent).
+    """
     settings = load_server_settings()
     if settings.get('metrics_public', False):
         return True
@@ -127,7 +134,7 @@ def _auth_ok():
         token = auth[7:].strip()
         try:
             info = validate_api_token(token)
-            if info:
+            if info and info.get('role') == ROLE_ADMIN:
                 return True
         except Exception as e:
             logging.debug(f"[metrics] token validate failed: {e}")

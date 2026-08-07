@@ -427,6 +427,50 @@ def _apply_on_cluster(cid, defn):
     return result
 
 
+# NS Aug 2026 (Aikido pentest, TOCTOU) — create builds the physical zone/controller/vnet on
+# every member BEFORE its aggregate DB row exists, so a concurrent purge-delete's
+# _shared_infra_on_cluster (which only reads the DB) can miss the in-flight span and rip out a
+# zone/controller the create is actively building on. Creates advertise their (zone, controller,
+# clusters) here for the duration of the fan-out; the shared-infra check folds these in so it
+# treats in-flight infra as shared. Entries carry a TTL so a create that dies mid-flight (skipping
+# its explicit unregister) self-heals, and the fail direction is SAFE (over-keep, never over-tear).
+_provisioning_lock = threading.Lock()
+_provisioning_spans = {}          # token -> {'clusters': set, 'zone': str, 'controller': str, 'expires': float}
+_PROVISIONING_TTL = 240           # seconds; the create fan-out itself times out at 180s
+
+
+def _register_provisioning(members, defn):
+    tok = uuid.uuid4().hex
+    with _provisioning_lock:
+        _provisioning_spans[tok] = {
+            'clusters': set(members), 'zone': defn.get('zone'),
+            'controller': defn.get('controller'), 'expires': time.time() + _PROVISIONING_TTL,
+        }
+    return tok
+
+
+def _unregister_provisioning(tok):
+    if not tok:
+        return
+    with _provisioning_lock:
+        _provisioning_spans.pop(tok, None)
+
+
+def _provisioning_shares(cid, zone, ctrl):
+    """(zone_shared, ctrl_shared) contributed by not-yet-persisted in-flight creates on `cid`."""
+    zs = cs = False
+    now = time.time()
+    with _provisioning_lock:
+        for rec in list(_provisioning_spans.values()):
+            if rec['expires'] < now or cid not in rec['clusters']:
+                continue
+            if zone and rec.get('zone') == zone:
+                zs = True
+            if ctrl and rec.get('controller') == ctrl:
+                cs = True
+    return zs, cs
+
+
 def _shared_infra_on_cluster(vid, cid, defn):
     """(zone_shared, controller_shared) — does ANY OTHER aggregate span that also spans
     cluster `cid` reuse this span's zone / controller name? EVPN zones (and their
@@ -455,7 +499,9 @@ def _shared_infra_on_cluster(vid, cid, defn):
             ctrl_shared = True
         if zone_shared and ctrl_shared:
             break
-    return (zone_shared, ctrl_shared)
+    # fold in any in-flight create advertising the same zone/controller on this cluster
+    pzs, pcs = _provisioning_shares(cid, zone, ctrl)
+    return (zone_shared or pzs, ctrl_shared or pcs)
 
 
 def _purge_span_on_cluster(vid, cid, defn):
@@ -808,6 +854,10 @@ def create_multi_vnet():
                             'cluster_id': cid, 'conflicts': conflicts}), 409
         preflight[cid] = 'ok'
 
+    # NS Aug 2026 (Aikido pentest) — advertise this span's zone/controller as in-flight so a
+    # concurrent purge-delete's shared-infra check keeps them up while we build (TOCTOU). The
+    # matching _unregister runs after the DB row lands; failure paths rely on the entry's TTL.
+    _prov_tok = _register_provisioning(members, defn)
     # --- fan out (bounded concurrency); each member builds sequentially internally
     results = run_per_node(
         {cid: (lambda c=cid: _apply_on_cluster(c, defn)) for cid in members},
@@ -863,6 +913,7 @@ def create_multi_vnet():
             json.dumps(members), json.dumps(defn['subnets']), json.dumps(defn),
             json.dumps(per_cluster), rollup, user, now, now,
         ))
+    _unregister_provisioning(_prov_tok)   # DB row now authoritative; drop the in-flight advert
     log_audit(user, 'multi_sdn.vnet_created',
               f"Cross-cluster EVPN vnet '{defn['name']}' (VNI {defn['vni']}, ASN "
               f"{defn['asn']}) across {len(members)} clusters → {rollup}")

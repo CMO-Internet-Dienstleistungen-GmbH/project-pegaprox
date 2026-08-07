@@ -341,17 +341,28 @@ def ldap_provision_user(ldap_result: dict) -> dict:
         if ldap_result.get('tenant'):
             user['tenant_id'] = ldap_result['tenant']  # NS: Must be tenant_id (not tenant) for code compatibility
         
-        # LW: Merge extra permissions from LDAP group mappings
-        if ldap_result.get('permissions'):
-            existing_perms = user.get('permissions', [])
-            merged = list(set(existing_perms + ldap_result['permissions']))
-            user['permissions'] = merged
+        # NS Aug 2026 (Aikido pentest) — LDAP is authoritative on each sync. The old code only
+        # ever UNIONED group perms in, so dropping a user from a mapped group never revoked the
+        # grant. Track what LDAP last granted (ldap_permissions) separately from any manually
+        # added perms, and rebuild only OUR own grants: strip the previous LDAP set, re-add the
+        # current one. Runs unconditionally so an empty result (all groups removed) revokes.
+        new_ldap_perms = list(ldap_result.get('permissions') or [])
+        prev_ldap_perms = set(user.get('ldap_permissions', []) or [])
+        base_perms = [p for p in (user.get('permissions', []) or []) if p not in prev_ldap_perms]
+        user['permissions'] = list(dict.fromkeys(base_perms + new_ldap_perms))  # ordered, deduped
+        user['ldap_permissions'] = new_ldap_perms
         
-        # NS: Sync tenant-specific roles/permissions
-        if ldap_result.get('tenant_permissions'):
-            if 'tenant_permissions' not in user:
-                user['tenant_permissions'] = {}
-            user['tenant_permissions'].update(ldap_result['tenant_permissions'])
+        # NS Aug 2026 (Aikido pentest) — same authoritative rebuild for tenant-scoped grants:
+        # revoke the LDAP-owned tenant entries that are no longer in the current mapping, then
+        # (re)apply the fresh ones. Manually-set tenants LDAP never touched are left intact.
+        new_ldap_tp = dict(ldap_result.get('tenant_permissions') or {})
+        prev_ldap_tp_keys = set(user.get('ldap_tenant_permissions', {}) or {})
+        tp = dict(user.get('tenant_permissions', {}) or {})
+        for _t in prev_ldap_tp_keys - set(new_ldap_tp):
+            tp.pop(_t, None)
+        tp.update(new_ldap_tp)
+        user['tenant_permissions'] = tp
+        user['ldap_tenant_permissions'] = new_ldap_tp
         
         logging.info(f"[LDAP] Updated existing user '{username}' from LDAP (role={user['role']}, tenant={user.get('tenant')})")
     else:
@@ -364,6 +375,10 @@ def ldap_provision_user(ldap_result: dict) -> dict:
             'password_hash': '',  # NS: No local password for LDAP users
             'password_salt': '',
             'permissions': ldap_result.get('permissions', []),
+            # NS Aug 2026 (Aikido pentest) — record what LDAP granted so the first re-sync can
+            # authoritatively revoke it if the group mapping later changes (see the update path).
+            'ldap_permissions': list(ldap_result.get('permissions', []) or []),
+            'ldap_tenant_permissions': dict(ldap_result.get('tenant_permissions', {}) or {}),
             'tenant_id': ldap_result.get('tenant', ''),  # NS: Must be tenant_id
             'tenant_permissions': ldap_result.get('tenant_permissions', {}),
             'theme': '',

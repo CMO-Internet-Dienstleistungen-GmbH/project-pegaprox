@@ -207,7 +207,10 @@ def delete_cluster_group(group_id):
     # Check tenant access
     if user.get('role') != ROLE_ADMIN:
         user_tenant = _user_tenant(user)
-        if group['tenant_id'] and group['tenant_id'] != user_tenant:
+        # NS Aug 2026 (Aikido pentest) — a global (tenant_id NULL) group is admin-only for
+        # writes; the old `group['tenant_id'] and ...` let any admin.groups holder delete a
+        # global group (which the background balancer acts on across ALL tenants' clusters).
+        if group['tenant_id'] is None or group['tenant_id'] != user_tenant:
             log_audit(usr, 'cluster_group.delete_denied', f"Access denied to delete group '{group['name']}' (ID: {group_id}) - tenant mismatch", ip_address=ip)
             return jsonify({'error': 'Access denied - group belongs to different tenant'}), 403
     
@@ -520,7 +523,9 @@ def trigger_xclb_balance_now(group_id):
     # rebalancing on another tenant's group. Admins/default tenant unscoped.
     usr = getattr(request, 'session', {}).get('user', 'system')
     _ut = _user_tenant(load_users().get(usr, {}))
-    if _ut and group.get('tenant_id') and group.get('tenant_id') != _ut:
+    # NS Aug 2026 (Aikido pentest) — a tenant-scoped user (_ut set) must not trigger balancing
+    # on a global (tenant_id NULL) group either; treat NULL-tenant as admin-only for this write.
+    if _ut and (group.get('tenant_id') is None or group.get('tenant_id') != _ut):
         log_audit(usr, 'xclb.manual_denied',
                   f"Denied cross-cluster balance on group {_sl(str(group.get('name', group_id)))} (tenant mismatch)")
         return jsonify({'error': 'Access denied'}), 403

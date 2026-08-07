@@ -226,12 +226,19 @@ def validate_ws_token(token: str) -> dict:
         return token_data
 
 
-def broadcast_sse(update_type: str, data: dict, cluster_id: str = None):
+def broadcast_sse(update_type: str, data: dict, cluster_id: str = None, target_clusters=None):
     """Broadcast update to SSE clients
 
     For cluster-specific events (node_status, vm_update, etc.), only sends to clients
     subscribed to that cluster. Global events (update_type starting with 'global_')
     are sent to all clients.
+
+    NS Aug 2026 (Aikido pentest) — target_clusters scopes an event that maps to a SET of
+    clusters (e.g. a VMware/ESXi server's linked_clusters) rather than a single cluster_id.
+    When provided (not None) it takes precedence: deliver to all-access clients (subscribed
+    is None) and to any client whose subscription intersects target_clusters. An empty list
+    means "not linked to any cluster" → global, mirroring check_vmware_access's backward-compat
+    rule. Without it (default None) the classic cluster_id / global logic below is unchanged.
     """
     try:
         # MK 2026-05-31 — `default=str` so a datetime / set / bytes / custom
@@ -274,7 +281,16 @@ def broadcast_sse(update_type: str, data: dict, cluster_id: str = None):
                     subscribed = client_info.get('clusters')
 
                     should_send = False
-                    if not is_cluster_specific:
+                    if target_clusters is not None:
+                        # NS Aug 2026 (Aikido pentest) — multi-cluster-scoped event (VMware
+                        # linked_clusters). Empty → unlinked server → global (matches REST).
+                        if not target_clusters:
+                            should_send = True
+                        elif subscribed is None:
+                            should_send = True   # admin / all-access
+                        elif subscribed and any(c in subscribed for c in target_clusters):
+                            should_send = True
+                    elif not is_cluster_specific:
                         # Global event - send to everyone
                         should_send = True
                     elif cluster_id and subscribed is None:

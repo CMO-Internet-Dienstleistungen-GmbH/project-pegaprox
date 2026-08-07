@@ -53,12 +53,18 @@ def _get_recent_audit_tasks(cluster_id, cluster_name):
         cursor = db.conn.cursor()
         # only last 2 minutes of portal + console events
         cutoff = (datetime.now() - __import__('datetime').timedelta(minutes=2)).isoformat()
+        # NS Aug 2026 (Aikido pentest) — scope portal events to the cluster they happened on.
+        # Without this, EVERY cluster's task feed showed EVERY tenant's portal actions (the row
+        # got tagged with whichever cluster was broadcasting). The portal writers now populate
+        # `cluster` (= cluster name) so this filter attributes each event correctly; non-cluster
+        # portal actions (e.g. password change) carry no cluster and simply don't surface here.
         cursor.execute('''
             SELECT id, timestamp, user, action, details FROM audit_log
             WHERE action LIKE 'portal.%'
+            AND cluster = ?
             AND timestamp > ?
             ORDER BY timestamp DESC LIMIT 10
-        ''', (cutoff,))
+        ''', (cluster_name, cutoff,))
         rows = cursor.fetchall()
         if not rows:
             return []
@@ -383,7 +389,7 @@ def broadcast_resources_loop():
                                     broadcast_sse('vmware_vms', {
                                         'vmware_id': vmw_id,
                                         'vms': result.get('data', [])
-                                    })
+                                    }, target_clusters=(getattr(vmw_mgr, 'linked_clusters', None) or []))
                             except Exception as e:
                                 logging.debug(f"[SSE] VMware VMs broadcast failed for {vmw_id}: {e}")
                     except Exception as e:
@@ -417,7 +423,7 @@ def broadcast_resources_loop():
                                         'vmware_id': vmw_id,
                                         'vm_id': vm_id,
                                         'data': data
-                                    })
+                                    }, target_clusters=(getattr(vmw_mgr, 'linked_clusters', None) or []))
                             except:
                                 pass
                         broadcast_resources_loop._vmw_watched = watched

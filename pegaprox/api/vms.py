@@ -9134,9 +9134,11 @@ async def ssh_handler(websocket):
     node_ips = {}
     try:
         if ws_token:
+            # NS Aug 2026 (Aikido pentest) — shell=node makes /validate enforce the node.shell
+            # permission for this node SSH shell (the VM termproxy path deliberately omits it).
             validate_url = (
                 f"{PEGAPROX_URL}/api/ws/token/validate"
-                f"?token={ws_token}&cluster_id={quote_plus(cluster_id)}&node={quote_plus(node)}"
+                f"?token={ws_token}&cluster_id={quote_plus(cluster_id)}&node={quote_plus(node)}&shell=node"
             )
             print(f"Validating WS token (cluster={cluster_id}, node={node})...")
         else:

@@ -572,6 +572,13 @@ def save_vm_tags(tags):
         db.conn.commit()
     except Exception as e:
         logging.error(f"Error saving VM tags: {e}")
+        # NS Aug 2026 (Aikido pentest) — defence in depth: the global DELETE above runs before
+        # the re-inserts, so a mid-loop failure must NOT be left pending on the shared
+        # thread-local connection (a later log_audit commit would persist the partial wipe).
+        try:
+            db.conn.rollback()
+        except Exception:
+            pass
 
 # LW: Global tag colors - keeps things consistent
 TAG_COLORS = [
@@ -669,6 +676,14 @@ def update_vm_tags(cluster_id, vmid):
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
+    # NS Aug 2026 (Aikido pentest) — vmid is a bare <string> route converter. save_vm_tags
+    # does a global `DELETE FROM vm_tags` + full rewrite that int()s every stored key; a
+    # non-numeric vmid would ValueError mid-rewrite and (via the next log_audit commit on the
+    # shared connection) persist a partial cross-tenant tag wipe. Reject non-numeric here.
+    try:
+        vmid = int(vmid)
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Invalid VM ID'}), 400
     data = request.json or {}
     tags_db = load_vm_tags()
     

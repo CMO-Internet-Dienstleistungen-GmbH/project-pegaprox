@@ -163,9 +163,12 @@ def _get_my_vms():
 def _vm_power():
     """Handle VM power action (start/stop/shutdown/reboot)"""
     username = request.session.get('user', '')
-    users = load_users()
-    user = users.get(username, {})
-    user['username'] = username
+    # NS Aug 2026 (Aikido pentest) — portal routes are reachable by API token; build the
+    # authz user via build_authz_user so user_can_access_vm sees the token-floored
+    # effective_role. A plain load_users() lookup carries no effective_role, letting an
+    # admin-owned viewer-scoped token short-circuit the admin VM bypass and run power actions.
+    from pegaprox.utils.auth import build_authz_user
+    user = build_authz_user(username, request.session)
     cfg = _load_config()
 
     data = request.get_json() or {}
@@ -220,7 +223,7 @@ def _vm_power():
         resp = mgr._api_post(url)
         if resp.status_code == 200:
             from pegaprox.utils.audit import log_audit
-            log_audit(username, f'portal.vm.{action}', f'Client portal: {action} VM {vmid}')
+            log_audit(username, f'portal.vm.{action}', f'Client portal: {action} VM {vmid}', cluster=mgr.config.name)
             return {'success': True, 'action': action, 'vmid': vmid}
         else:
             return {'error': f'Action failed: {resp.text[:100]}'}
@@ -345,7 +348,7 @@ def _vm_snapshots():
             )
             if snap_resp.status_code == 200:
                 from pegaprox.utils.audit import log_audit
-                log_audit(username, 'portal.snapshot_created', f'Snapshot "{snap_name}" on VM {vmid}')
+                log_audit(username, 'portal.snapshot_created', f'Snapshot "{snap_name}" on VM {vmid}', cluster=mgr.config.name)
                 return {'success': True, 'name': snap_name}
             return {'error': f'Snapshot failed: {snap_resp.text[:100]}'}
         except Exception as e:
@@ -393,7 +396,7 @@ def _vm_snapshot_rollback():
         result = mgr.rollback_snapshot(node, int(vmid), vm_type, snapname)
         if result.get('success'):
             from pegaprox.utils.audit import log_audit
-            log_audit(username, 'portal.snapshot_rollback', f'Rollback to "{snapname}" on VM {vmid}')
+            log_audit(username, 'portal.snapshot_rollback', f'Rollback to "{snapname}" on VM {vmid}', cluster=mgr.config.name)
             return {'success': True, 'snapname': snapname}
         return {'error': result.get('error', 'Rollback failed')}
     except Exception as e:
@@ -442,7 +445,7 @@ def _vm_snapshot_delete():
         )
         if resp.status_code == 200:
             from pegaprox.utils.audit import log_audit
-            log_audit(username, 'portal.snapshot_deleted', f'Deleted snapshot "{snapname}" on VM {vmid}')
+            log_audit(username, 'portal.snapshot_deleted', f'Deleted snapshot "{snapname}" on VM {vmid}', cluster=mgr.config.name)
             return {'success': True, 'snapname': snapname}
         return {'error': f'Delete failed: {resp.text[:100]}'}
     except Exception as e:
@@ -480,6 +483,13 @@ def _change_password():
     from datetime import datetime
     user['password_changed_at'] = datetime.now().isoformat()
     save_users(users)
+
+    # NS Aug 2026 (Aikido pentest) — a password change must revoke the user's other live
+    # sessions (matches the main dashboard's behaviour, users.py). Keep the current portal
+    # session alive so the customer isn't logged straight back out.
+    from pegaprox.utils.auth import invalidate_all_user_sessions
+    _cur_sid = request.headers.get('X-Session-ID') or request.cookies.get('session_id')
+    invalidate_all_user_sessions(username, except_session=_cur_sid)
 
     from pegaprox.utils.audit import log_audit
     log_audit(username, 'portal.password_changed', 'Password changed via client portal')
@@ -572,7 +582,7 @@ def _mount_iso():
         resp = mgr._api_post(url, data={drive: f'{iso_volid},media=cdrom'})
         if resp.status_code == 200:
             from pegaprox.utils.audit import log_audit
-            log_audit(username, 'portal.iso_mount', f'Mounted {iso_volid} on VM {vmid}')
+            log_audit(username, 'portal.iso_mount', f'Mounted {iso_volid} on VM {vmid}', cluster=mgr.config.name)
             return {'success': True, 'message': f'ISO mounted on {drive}'}
         return {'error': f'Mount failed: {resp.text[:200]}'}, 500
     except Exception as e:
@@ -608,7 +618,7 @@ def _unmount_iso():
         resp = mgr._api_post(url, data={drive: 'none,media=cdrom'})
         if resp.status_code == 200:
             from pegaprox.utils.audit import log_audit
-            log_audit(username, 'portal.iso_unmount', f'Unmounted ISO from VM {vmid}')
+            log_audit(username, 'portal.iso_unmount', f'Unmounted ISO from VM {vmid}', cluster=mgr.config.name)
             return {'success': True}
         return {'error': f'Unmount failed: {resp.text[:200]}'}, 500
     except Exception as e:

@@ -31,7 +31,7 @@ import ipaddress
 import logging
 import socket
 from typing import Iterable, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 
 class SsrfError(ValueError):
@@ -179,3 +179,76 @@ def sanitize_outbound_url(url: str, **kwargs) -> str:
         )
         raise SsrfError(reason)
     return url
+
+
+def resolve_and_pin_url(
+    url: str,
+    *,
+    allowed_schemes: Iterable[str] = ('https',),
+    allow_private: bool = False,
+) -> str:
+    """Close the validate-then-refetch DNS-rebinding window for a URL we delegate to a
+    *different* fetcher (e.g. a Proxmox node's download-url API, which re-resolves the host
+    on its own machine). NS Aug 2026 (Aikido pentest).
+
+    Validates via :func:`is_safe_outbound_url` (raise on reject), then:
+
+      * host already an IP literal  -> returned unchanged (nothing to rebind).
+      * http scheme                 -> host rewritten to a freshly-validated safe IP literal,
+                                       so the delegated fetcher connects to the exact address
+                                       we vetted. Plaintext http has no TLS to catch a later
+                                       rebind, so pinning is the only guard.
+      * https (or other allowed)    -> returned unchanged. The fetcher validates the TLS cert
+                                       against the hostname, so a rebind to an internal IP
+                                       fails the handshake anyway; rewriting to an IP literal
+                                       would instead break that legitimate cert check.
+
+    Raises :class:`SsrfError` if the URL is unsafe, or (for http) resolves to no safe address.
+    """
+    ok, reason = is_safe_outbound_url(
+        url, allowed_schemes=allowed_schemes, allow_private=allow_private, require_resolution=True
+    )
+    if not ok:
+        logging.warning(
+            "[ssrf-guard] rejected outbound URL: %s (len=%d)",
+            reason, len(url) if isinstance(url, str) else -1,
+        )
+        raise SsrfError(reason)
+
+    parsed = urlparse(url)
+    host = (parsed.hostname or '').strip()
+
+    # Already an IP literal (strip IPv6 brackets to test) → nothing to pin.
+    _lit = host[1:-1] if host.startswith('[') and host.endswith(']') else host
+    try:
+        ipaddress.ip_address(_lit)
+        return url
+    except ValueError:
+        pass
+
+    if (parsed.scheme or '').lower() != 'http':
+        return url  # https: TLS cert binding defeats a rebind; keep the hostname intact.
+
+    # http: pick the first freshly-resolved safe address and rewrite the host to it.
+    try:
+        resolved = list(_resolve_all(host))
+    except socket.gaierror:
+        raise SsrfError(f'host {host!r} could not be resolved')
+    pinned = None
+    for ip in resolved:
+        if str(ip) in _METADATA_HOSTS:
+            continue
+        if not allow_private and _is_private_or_special(ip):
+            continue
+        pinned = ip
+        break
+    if pinned is None:
+        raise SsrfError(f'host {host!r} resolved to no safe address')
+
+    hostpart = f'[{pinned}]' if pinned.version == 6 else str(pinned)
+    netloc = parsed.netloc
+    userinfo = ''
+    if '@' in netloc:
+        userinfo = netloc.rsplit('@', 1)[0] + '@'
+    portpart = f':{parsed.port}' if parsed.port else ''
+    return urlunparse(parsed._replace(netloc=f'{userinfo}{hostpart}{portpart}'))
