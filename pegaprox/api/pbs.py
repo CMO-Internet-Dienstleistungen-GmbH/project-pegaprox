@@ -2889,6 +2889,17 @@ def restore_backup(cluster_id):
     if mode not in ('new', 'overwrite', 'test'):
         return jsonify({'error': "mode must be 'new', 'overwrite', or 'test'"}), 400
 
+    # NS Aug 2026 (Aikido pentest) — overwrite (destructive qmrestore --force) and test (boots into
+    # the VMID) both act on an EXISTING target VM, so require the same per-VM ACL as a direct VM op;
+    # cluster reachability alone let a vm.backup holder clobber/boot any VM in a reachable cluster.
+    if mode in ('overwrite', 'test'):
+        from pegaprox.utils.auth import build_authz_user
+        from pegaprox.utils.rbac import user_can_access_vm
+        _is_lxc = '/ct/' in volid or volid.endswith('.lxc.tar') or 'vzdump-lxc' in volid
+        if not user_can_access_vm(build_authz_user(request.session.get('user', ''), request.session),
+                                  cluster_id, target_vmid, 'vm.backup', 'lxc' if _is_lxc else 'qemu'):
+            return jsonify({'error': 'Permission denied for target VM'}), 403
+
     # Test-mode = verify pipeline without cleanup
     if mode == 'test':
         from pegaprox.core.backup_verify import start_verification
@@ -2939,7 +2950,7 @@ def restore_backup(cluster_id):
 
 
 @bp.route('/api/pbs/<pbs_id>/backup-diff', methods=['GET'])
-@require_auth(perms=['pbs.view'])
+@require_auth(perms=['pbs.datastore.view'])  # NS Aug 2026 (Aikido pentest): snapshot metadata is datastore-view, not plain pbs.view
 def diff_pbs_backups(pbs_id):
     """Compare two PBS backups (same backup-id, same datastore).
 

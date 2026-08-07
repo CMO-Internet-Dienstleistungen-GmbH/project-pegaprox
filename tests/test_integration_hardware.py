@@ -318,11 +318,16 @@ def test_bmc_endpoint_save_get_masked_delete(api, seed):
     got = api.as_user(admin).get(BMC_ROUTE).get_json()
     assert got['configured'] is True and got['host'] == '10.20.30.40' and got['user'] == 'ro-monitor'
     assert got['password'] == '********'
-    # re-save with the mask keeps the stored password (no overwrite)
-    r2 = api.as_user(admin).post(BMC_ROUTE, json={'host': '10.20.30.50', 'user': 'ro-monitor', 'password': '********'})
+    # re-save with the mask + the SAME host keeps the stored password (no overwrite)
+    r2 = api.as_user(admin).post(BMC_ROUTE, json={'host': '10.20.30.40', 'user': 'ro-monitor', 'password': '********'})
     assert r2.status_code == 200
     from pegaprox.core.db import get_db
     assert get_db().get_bmc_endpoint(CID, NODE)['password'] == 'S3cret!'  # unchanged
+    # NS Aug 2026 (Aikido pentest) — a masked password paired with a CHANGED host must be rejected;
+    # otherwise the stored secret would be shipped (Basic auth) to a caller-chosen host = exfil.
+    r3 = api.as_user(admin).post(BMC_ROUTE, json={'host': '10.20.30.50', 'password': '********'})
+    assert r3.status_code == 400, r3.get_data(as_text=True)
+    assert get_db().get_bmc_endpoint(CID, NODE)['host'] == '10.20.30.40'  # host unchanged
     # delete
     d = api.as_user(admin).delete(BMC_ROUTE)
     assert d.status_code == 200 and d.get_json()['removed'] is True

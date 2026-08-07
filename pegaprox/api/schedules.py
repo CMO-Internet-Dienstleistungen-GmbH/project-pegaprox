@@ -583,6 +583,19 @@ def create_schedule():
     if perm_err:
         return perm_err
 
+    # NS Aug 2026 (Aikido pentest) — clear the SAME per-VM ACL the live action enforces (vms.py),
+    # not just cluster reachability, else a pool-restricted user could schedule actions on any VMID.
+    try:
+        _sv = int(data['vmid'])
+    except (TypeError, ValueError):
+        return jsonify({'error': 'vmid must be a number'}), 400
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import user_can_access_vm
+    if not user_can_access_vm(build_authz_user(request.session.get('user', ''), request.session),
+                              data['cluster_id'], _sv, _perm_for_action(data['action']),
+                              data.get('vm_type', 'qemu')):
+        return jsonify({'error': 'Permission denied for this VM'}), 403
+
     # Validate schedule type
     valid_types = ['once', 'daily', 'weekly', 'weekdays', 'weekends']
     if data['schedule_type'] not in valid_types:
@@ -659,6 +672,20 @@ def update_schedule(schedule_id):
     perm_err = _require_action_perm(data.get('action', schedule.get('action', 'start')))
     if perm_err:
         return perm_err
+
+    # NS Aug 2026 (Aikido pentest) — re-check the per-VM ACL for the effective target/action (same
+    # as create) so an edit cannot retarget a schedule onto an unauthorized VMID.
+    try:
+        _uv = int(data.get('vmid', schedule.get('vmid')))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'vmid must be a number'}), 400
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import user_can_access_vm
+    if not user_can_access_vm(build_authz_user(request.session.get('user', ''), request.session),
+                              schedule.get('cluster_id', ''), _uv,
+                              _perm_for_action(data.get('action', schedule.get('action', 'start'))),
+                              data.get('vm_type', schedule.get('vm_type', 'qemu'))):
+        return jsonify({'error': 'Permission denied for this VM'}), 403
 
     # Validate time format if being updated
     if 'time' in data:

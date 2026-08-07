@@ -134,7 +134,10 @@ def update_cluster_group(group_id):
     # Check tenant access - non-admins can only edit their tenant's groups
     if user.get('role') != ROLE_ADMIN:
         user_tenant = _user_tenant(user)
-        if group['tenant_id'] and group['tenant_id'] != user_tenant:
+        # NS Aug 2026 (Aikido pentest) — a global (tenant_id NULL) group is admin-only for writes;
+        # the old `group['tenant_id'] and ...` let any admin.groups holder edit a global group
+        # (and flip its cross-cluster live-migration settings). NULL now denies non-admins too.
+        if group['tenant_id'] is None or group['tenant_id'] != user_tenant:
             log_audit(usr, 'cluster_group.update_denied', f"Access denied to group '{group['name']}' (ID: {group_id}) - tenant mismatch", ip_address=ip)
             return jsonify({'error': 'Access denied - group belongs to different tenant'}), 403
     

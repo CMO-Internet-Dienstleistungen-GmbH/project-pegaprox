@@ -67,6 +67,31 @@ def _role_at_or_below_caller(target_role):
     return _ROLE_LEVEL.get(target_role, 2) <= caller_lvl
 
 
+def _role_permissions(role):
+    """All permissions a role grants — builtin (ROLE_PERMISSIONS) or custom (load_custom_roles)."""
+    if role in ROLE_PERMISSIONS:
+        return list(ROLE_PERMISSIONS.get(role, []))
+    cr = load_custom_roles()
+    if role in cr.get('global', {}):
+        return list((cr['global'].get(role) or {}).get('permissions', []))
+    for _tid, _roles in cr.get('tenants', {}).items():
+        if role in _roles:
+            return list((_roles.get(role) or {}).get('permissions', []))
+    return []
+
+
+def _caller_can_grant_role(target_role):
+    # NS Aug 2026 (Aikido pentest) — the tier map above collapses every custom role to the 'user'
+    # level, so a custom role carrying admin.* perms would pass _role_at_or_below_caller for a
+    # user-tier delegate. Require a non-global-admin caller to actually hold every permission the
+    # role grants before assigning it. Global admins keep full delegation.
+    if request.session.get('role') == ROLE_ADMIN:
+        return True
+    from pegaprox.utils.auth import build_authz_user
+    caller = build_authz_user(request.session.get('user', ''), request.session)
+    return all(has_permission(caller, p) for p in _role_permissions(target_role))
+
+
 def _parse_avatar_data_url(value: str):
     """Validate avatar data URL and return (mime, base64-data)."""
     if not isinstance(value, str) or not value.startswith('data:'):
@@ -768,12 +793,22 @@ def create_user():
         return jsonify({'error': 'Access denied: cannot create users in other tenants'}), 403
     if not _role_at_or_below_caller(role):
         return jsonify({'error': 'Cannot create a user with a role higher than your own'}), 403
+    if not _caller_can_grant_role(role):
+        return jsonify({'error': 'Cannot assign a role that grants permissions beyond your own'}), 403
 
     # validate permissions are valid
     for p in permissions + denied_permissions:
         if p not in PERMISSIONS:
             return jsonify({'error': f'Invalid permission: {p}'}), 400
-    
+    # NS Aug 2026 (Aikido pentest) — a non-global-admin may only grant permissions it holds itself,
+    # else admin.users lets a tenant delegate mint accounts with admin.roles/tenants/settings/etc.
+    if _ct is not None:
+        from pegaprox.utils.auth import build_authz_user
+        _caller = build_authz_user(request.session.get('user', ''), request.session)
+        _over = [p for p in permissions if not has_permission(_caller, p)]
+        if _over:
+            return jsonify({'error': 'Cannot grant permissions you do not hold: ' + ', '.join(_over)}), 403
+
     users_db = load_users()
     
     if username in users_db:
@@ -849,6 +884,8 @@ def update_user(username):
             return jsonify({'error': 'Cannot modify your own role'}), 403
         if not _role_at_or_below_caller(data['role']):
             return jsonify({'error': 'Cannot assign a role with higher privileges than your own'}), 403
+        if not _caller_can_grant_role(data['role']):
+            return jsonify({'error': 'Cannot assign a role that grants permissions beyond your own'}), 403
         # Prevent last admin from losing admin role
         if user['role'] == ROLE_ADMIN and data['role'] != ROLE_ADMIN:
             admin_count = sum(1 for u in users_db.values() if u['role'] == ROLE_ADMIN and u.get('enabled', True))
@@ -867,6 +904,10 @@ def update_user(username):
             found_tenant = False
             for tid, roles in custom_roles.get('tenants', {}).items():
                 if data['role'] in roles:
+                    # NS Aug 2026 (Aikido pentest) — a tenant-scoped admin must not assign a role
+                    # owned by another tenant; it would silently move the account into that tenant.
+                    if _ct is not None and tid != _ct:
+                        return jsonify({'error': 'Cannot assign a role from another tenant'}), 403
                     user['tenant_id'] = tid
                     found_tenant = True
                     logging.info(f"Auto-set tenant_id={tid} for user with role {data['role']}")
@@ -1126,9 +1167,16 @@ def update_tenant(tenant_id):
     
     if tenant_id not in tenants_db:
         return jsonify({'error': 'Tenant not found'}), 404
-    
+
+    # NS Aug 2026 (Aikido pentest) — mirror get_tenant_quota: a tenant-scoped admin.tenants holder
+    # may only edit its OWN tenant, else one tenant rewrites another's name/clusters/quota.
+    if request.session.get('role') != ROLE_ADMIN:
+        _caller = get_db().get_user(request.session.get('user', '')) or {}
+        if tenant_id != _caller.get('tenant_id', DEFAULT_TENANT_ID):
+            return jsonify({'error': 'Access denied to this tenant'}), 403
+
     data = request.json
-    
+
     if 'name' in data:
         tenants_db[tenant_id]['name'] = data['name']
     if 'clusters' in data:

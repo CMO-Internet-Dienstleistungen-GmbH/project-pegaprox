@@ -482,10 +482,16 @@ def set_bmc_endpoint_api(cluster_id, node):
     verify_ssl = bool(data.get('verify_ssl'))
     enabled = data.get('enabled', True)
     pw = data.get('password')
-    # keep the existing password when the UI submits the mask (never overwrite with ****)
+    # keep the existing password when the UI submits the mask (never overwrite with ****).
+    # NS Aug 2026 (Aikido pentest) — only when the host is unchanged: the 5-min collector
+    # auto-connects (Basic auth) to whatever host is stored, so a masked password paired with a
+    # changed host would exfil the saved secret to a caller-chosen box. Same guard the /test route has.
     if pw in (None, '', '********'):
         existing = get_db().get_bmc_endpoint(cluster_id, node)
-        pw = (existing or {}).get('password', '')
+        if host == ((existing or {}).get('host') or '').strip():
+            pw = (existing or {}).get('password', '')
+        else:
+            return jsonify({'error': 'A full password is required when changing the BMC host.'}), 400
         if not pw:
             return jsonify({'error': 'BMC password required'}), 400
     if len(str(pw)) > 512:

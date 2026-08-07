@@ -114,6 +114,12 @@ def update_vmware_server(vmware_id):
            (data.get('port') and int(data.get('port', 443)) != old_mgr.port):
             host_changed = True
         if data.get('password') == '********':
+            # NS Aug 2026 (Aikido pentest) — never persist the preserved password against a CHANGED
+            # host: the saved row is reused verbatim by diagnose / Test Connection / the boot-time
+            # auto-connect, any of which would ship the secret to the new (possibly attacker-chosen)
+            # host. Require a full password whenever the host changes.
+            if host_changed:
+                return jsonify({'error': 'Re-enter the password when changing the VMware host.'}), 400
             data['password'] = old_mgr.password
             credentials_preserved = True
 

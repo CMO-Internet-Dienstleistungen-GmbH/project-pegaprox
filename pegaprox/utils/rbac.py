@@ -912,12 +912,15 @@ def user_can_access_vmware_vm(user: dict, vmware_id: str, vm_id: str, permission
     Returns:
         bool: True if user has access, False otherwise
     """
-    if user.get('role') == ROLE_ADMIN:
+    # NS Aug 2026 (Aikido pentest) — effective_role (token-scoped) wins over the stored role,
+    # exactly like the Proxmox twin user_can_access_vm above; otherwise an admin-owned but
+    # viewer-scoped API token gets the full-admin VMware VM bypass here.
+    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
         return True
-    
+
     username = user.get('username', '')
     acls = get_vm_acls()
-    
+
     # VMware ACLs are stored under vmware_id as the cluster key
     vmware_acls = acls.get(f'vmware:{vmware_id}', {})
     vm_acl = vmware_acls.get(str(vm_id), {})
