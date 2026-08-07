@@ -989,6 +989,11 @@ def get_vmware_migration_plan(vmware_id, vm_id):
         return jsonify({'error': 'Permission denied: You do not have access to this VM'}), 403
     
     mgr = vmware_managers[vmware_id]
+    # NS Aug 2026 — refresh a stale ESXi REST/CIS session before the read, exactly like the
+    # VM-list/detail routes do (get_vmware_vms:270, single-VM GET:295). Without it, a server
+    # that's been up long enough for the ESXi session to expire returns "VM not found" here and
+    # the migration wizard dies at the planning step even though the VM plainly exists.
+    mgr.ensure_connected()
     result = mgr.get_vm_disks_for_export(vm_id)
     if 'error' in result:
         return jsonify(result), 400
@@ -1103,6 +1108,10 @@ def start_vmware_migration(vmware_id, vm_id):
         return err_response
 
     mgr = vmware_managers[vmware_id]
+    # NS Aug 2026 — same stale-session guard as the migration-plan + VM-list routes: a long-lived
+    # server whose ESXi session has expired would otherwise read "VM not found" here and the
+    # migration would abort before it even started.
+    mgr.ensure_connected()
     vm_detail = mgr.get_vm(vm_id)
     vm_name = vm_detail.get('data', {}).get('name', vm_id) if 'data' in vm_detail else vm_id
 
