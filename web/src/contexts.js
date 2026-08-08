@@ -9,7 +9,7 @@
         // NS May 2026 (#389): supported language allowlist — reused for input validation
         // both at init (localStorage) and at switch time. Keep in sync with the
         // backend allowlist in pegaprox/api/users.py and the LanguageSwitcher list.
-        const SUPPORTED_LANGS = ['de', 'en', 'it', 'fr', 'es', 'pt', 'ko'];
+        const SUPPORTED_LANGS = ['de', 'en', 'it', 'fr', 'es', 'pt', 'ko', 'zh'];
 
         // map navigator.language ("en-US", "de-AT", ...) onto a supported code, or null
         function _detectBrowserLang() {
@@ -19,7 +19,17 @@
                 if (navigator.language) langs.push(navigator.language);
                 for (const raw of langs) {
                     if (typeof raw !== 'string' || !raw) continue;
-                    const base = raw.toLowerCase().split(/[-_]/)[0];
+                    const parts = raw.toLowerCase().split(/[-_]/);
+                    const base = parts[0];
+                    // This project currently ships Simplified Chinese only. Skip
+                    // explicitly Traditional Chinese preferences so zh-TW/zh-Hant
+                    // can fall through to the user's next preferred language.
+                    if (base === 'zh' && (
+                        parts.includes('hant') ||
+                        parts.includes('tw') ||
+                        parts.includes('hk') ||
+                        parts.includes('mo')
+                    )) continue;
                     if (SUPPORTED_LANGS.includes(base)) return base;
                 }
             } catch (_) { /* navigator unavailable / locked down */ }
@@ -102,6 +112,7 @@
                 { code: 'es', flag: '🇪🇸', label: 'ES', title: 'Español (LATAM)' },
                 { code: 'pt', flag: '🇧🇷', label: 'PT', title: 'Português' },
                 { code: 'ko', flag: '🇰🇷', label: 'KO', title: '한국어' },
+                { code: 'zh', flag: '🇨🇳', label: 'ZH', title: t('languageSimplifiedChinese') },
             ];
             const activeLanguage = langs.find(l => l.code === language) || langs[0];
 
