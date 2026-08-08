@@ -369,7 +369,7 @@
                         
                         {/* Footer */}
                         <p className="text-center text-gray-500 text-sm mt-6">
-                            PegaProx Cluster Management {PEGAPROX_VERSION}
+                            {t('clusterManagement')} {PEGAPROX_VERSION}
                         </p>
                     </div>
                 </div>
@@ -383,6 +383,7 @@
         // Renders instead of LoginScreen when /auth/check returns initialized=false.
         // ═══════════════════════════════════════════════
         function SetupWizard() {
+            const { t } = useTranslation();
             const [username, setUsername] = useState('');
             const [password, setPassword] = useState('');
             const [passwordConfirm, setPasswordConfirm] = useState('');
@@ -396,10 +397,10 @@
             const submit = async (e) => {
                 e.preventDefault();
                 setErr('');
-                if (!username || username.length < 2) { setErr('Username must be at least 2 characters'); return; }
-                if (username.toLowerCase() === 'pegaprox') { setErr("'pegaprox' is reserved — pick a different username"); return; }
-                if (!password) { setErr('Password is required'); return; }
-                if (password !== passwordConfirm) { setErr('Passwords do not match'); return; }
+                if (!username || username.length < 2) { setErr(t('setupUsernameMin')); return; }
+                if (username.toLowerCase() === 'pegaprox') { setErr(t('setupUsernameReserved')); return; }
+                if (!password) { setErr(t('passwordRequired')); return; }
+                if (password !== passwordConfirm) { setErr(t('passwordMismatch')); return; }
                 setSubmitting(true);
                 try {
                     const r = await fetch(`${API_URL}/auth/setup`, {
@@ -415,7 +416,7 @@
                     });
                     const data = await r.json().catch(() => ({}));
                     if (!r.ok) {
-                        setErr(data.error || `Setup failed (HTTP ${r.status})`);
+                        setErr(data.error || t('setupFailedHttp').replace('{status}', r.status));
                         setSubmitting(false);
                         return;
                     }
@@ -423,7 +424,7 @@
                     // reload after a short delay so AuthProvider re-checks and shows the login form
                     setTimeout(() => window.location.reload(), 1500);
                 } catch (e2) {
-                    setErr('Network error — could not reach server');
+                    setErr(t('setupNetworkError'));
                     setSubmitting(false);
                 }
             };
@@ -437,8 +438,8 @@
                                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
                                 </svg>
                             </div>
-                            <h2 className="text-xl font-semibold text-white mb-2">Setup complete</h2>
-                            <p className="text-gray-400">Redirecting to login…</p>
+                            <h2 className="text-xl font-semibold text-white mb-2">{t('setupComplete')}</h2>
+                            <p className="text-gray-400">{t('setupRedirecting')}</p>
                         </div>
                     </div>
                 );
@@ -454,11 +455,11 @@
                                 className="w-28 h-28 mx-auto mb-4 object-contain drop-shadow-[0_8px_20px_rgba(229,112,0,0.35)]"
                                 onError={(e) => { e.target.style.display = 'none'; }}
                             />
-                            <h1 className="text-3xl font-bold text-white mb-2">Welcome to PegaProx</h1>
-                            <p className="text-gray-400">Create the first administrator account to get started</p>
+                            <h1 className="text-3xl font-bold text-white mb-2">{t('setupWelcome')}</h1>
+                            <p className="text-gray-400">{t('setupCreateFirstAdmin')}</p>
                         </div>
                         <div className="bg-proxmox-card border border-proxmox-border rounded-2xl p-8 shadow-xl">
-                            <h2 className="text-xl font-semibold text-white mb-6">First-Time Setup</h2>
+                            <h2 className="text-xl font-semibold text-white mb-6">{t('setupFirstTime')}</h2>
 
                             {err && (
                                 <div className="mb-4 p-3 bg-red-500/10 border border-red-500/30 rounded-lg text-red-400 text-sm">
@@ -468,7 +469,7 @@
 
                             <form onSubmit={submit} className="space-y-5">
                                 <div>
-                                    <label className="block text-sm font-medium text-gray-300 mb-2">Username</label>
+                                    <label className="block text-sm font-medium text-gray-300 mb-2">{t('username')}</label>
                                     <input
                                         type="text"
                                         value={username}
@@ -480,7 +481,7 @@
                                     />
                                 </div>
                                 <div>
-                                    <label className="block text-sm font-medium text-gray-300 mb-2">Password</label>
+                                    <label className="block text-sm font-medium text-gray-300 mb-2">{t('password')}</label>
                                     <div className="relative">
                                         <input
                                             type={showPassword ? 'text' : 'password'}
@@ -501,7 +502,7 @@
                                     </div>
                                 </div>
                                 <div>
-                                    <label className="block text-sm font-medium text-gray-300 mb-2">Confirm password</label>
+                                    <label className="block text-sm font-medium text-gray-300 mb-2">{t('confirmPassword')}</label>
                                     <input
                                         type={showPassword ? 'text' : 'password'}
                                         value={passwordConfirm}
@@ -513,7 +514,7 @@
                                 </div>
                                 <div>
                                     <label className="block text-sm font-medium text-gray-300 mb-2">
-                                        Display name <span className="text-gray-500 font-normal">(optional)</span>
+                                        {t('displayName')} <span className="text-gray-500 font-normal">({t('optional')})</span>
                                     </label>
                                     <input
                                         type="text"
@@ -525,7 +526,7 @@
                                 </div>
                                 <div>
                                     <label className="block text-sm font-medium text-gray-300 mb-2">
-                                        Email <span className="text-gray-500 font-normal">(optional)</span>
+                                        {t('email')} <span className="text-gray-500 font-normal">({t('optional')})</span>
                                     </label>
                                     <input
                                         type="email"
@@ -540,19 +541,19 @@
                                     disabled={submitting}
                                     className="w-full px-4 py-3 bg-proxmox-orange hover:bg-orange-600 disabled:opacity-50 rounded-xl text-white font-semibold transition-colors"
                                 >
-                                    {submitting ? 'Creating administrator…' : 'Create administrator'}
+                                    {submitting ? t('setupCreatingAdmin') : t('setupCreateAdmin')}
                                 </button>
                             </form>
 
                             <p className="text-xs text-gray-500 mt-6 leading-relaxed">
-                                This account becomes the first PegaProx administrator. Treat the
-                                password like any other root credential — store it in your password
-                                manager. You can create additional users (admin or scoped roles)
-                                once you are logged in.
+                                {t('setupSecurityNote')}
                             </p>
                         </div>
+                        <div className="flex justify-center mt-6">
+                            <LanguageSwitcher />
+                        </div>
                         <p className="text-center text-gray-500 text-sm mt-6">
-                            PegaProx Cluster Management {PEGAPROX_VERSION}
+                            {t('clusterManagement')} {PEGAPROX_VERSION}
                         </p>
                     </div>
                 </div>
