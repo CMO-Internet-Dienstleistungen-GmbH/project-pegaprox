@@ -37,6 +37,10 @@ SAMPLE = (
 def _mgr(api, **methods):
     m = api.make_fake_manager(cluster_id=CID, **methods)
     m.config.name = CID
+    # NS Aug 2026 — real PegaProxConfig.ssh_key is a string ('' when unset); a bare MagicMock
+    # attribute is truthy, which would send read_node_bmc_inband down the key-auth branch instead
+    # of the agent path (_ssh_run_command_output) these tests stub + assert. Model "no key set".
+    m.config.ssh_key = ''
     return m
 
 
