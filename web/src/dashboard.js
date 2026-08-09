@@ -2419,9 +2419,6 @@
                                     </g>
                                     );
                                 }))}
-                                )))}
-
-
                                 {/* PBS icons */}
                                 {diagramPbs.map(pbs => (
                                     <g key={`pbs-${pbs.id}`} transform={`translate(${pbs.x}, ${pbs.y})`}
@@ -7914,6 +7911,7 @@
         function PegaProxDashboard() {
             const { t } = useTranslation();
             const { user, sessionId, logout, getAuthHeaders, isAdmin, passwordExpiry, updatePreferences } = useAuth();
+            const can = (permission) => isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes(permission));
             const { isCorporate, isCloud } = useLayout(); // LW: Feb 2026 - corporate layout / NS 2026-06: + cloud (Preview)
             const [clusters, setClusters] = useState([]);
             const [clusterGroups, setClusterGroups] = useState([]); // NS Jan 2026 - for grouping
@@ -14004,9 +14002,9 @@
 
                                     {/* Live Status Indicator (corporate: status in bottom panel) */}
                                     {!isCorporate && (
-                                        <div className="flex items-center gap-2 px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg" title={wsConnected ? 'Live-Updates aktiv' : 'Polling-Modus'}>
+                                        <div className="flex items-center gap-2 px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg" title={wsConnected ? t('liveUpdatesActive') : t('pollingMode')}>
                                             <div className={`w-2 h-2 rounded-full ${wsConnected ? 'bg-green-500 animate-pulse' : 'bg-yellow-500'}`}></div>
-                                            <span className="text-xs text-gray-400 hidden sm:inline">{wsConnected ? 'Live' : 'Polling'}</span>
+                                            <span className="text-xs text-gray-400 hidden sm:inline">{wsConnected ? t('live') : t('polling')}</span>
                                         </div>
                                     )}
 
@@ -14629,7 +14627,7 @@
                                     <div className="mt-4 pt-4 border-t border-proxmox-border">
                                         <button onClick={() => setShowAddPBS(true)} className="w-full flex items-center gap-2 px-3 py-2 rounded-xl bg-proxmox-card border border-dashed border-proxmox-border text-gray-500 hover:text-blue-400 hover:border-blue-500/30 transition-all text-sm">
                                             <Icons.Shield className="w-4 h-4" />
-                                            <span>Add Backup Server</span>
+                                            <span>{t('addPbsServer')}</span>
                                         </button>
                                     </div>
                                 )}
@@ -14640,7 +14638,7 @@
                                         <div className="flex items-center justify-between px-1 mb-2">
                                             <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">ESXi</h2>
                                             {isAdmin && (
-                                                <button onClick={() => { setEditingVMware(null); setVmwareForm({ name: '', host: '', port: 443, username: 'root', password: '', ssl_verify: false, notes: '' }); setShowAddVMware(true); }} className="p-1 text-gray-500 hover:text-proxmox-orange rounded transition-colors" title="Add ESXi Server">
+                                                <button onClick={() => { setEditingVMware(null); setVmwareForm({ name: '', host: '', port: 443, username: 'root', password: '', ssl_verify: false, notes: '' }); setShowAddVMware(true); }} className="p-1 text-gray-500 hover:text-proxmox-orange rounded transition-colors" title={t('addEsxiServer')}>
                                                     <Icons.Plus className="w-4 h-4" />
                                                 </button>
                                             )}
@@ -14806,7 +14804,7 @@
                                     <div className="mt-4 pt-4 border-t border-proxmox-border">
                                         <button onClick={() => { setEditingVMware(null); setVmwareForm({ name: '', host: '', port: 443, username: 'root', password: '', ssl_verify: false, notes: '' }); setShowAddVMware(true); }} className="w-full flex items-center gap-2 px-3 py-2 rounded-xl bg-proxmox-card border border-dashed border-proxmox-border text-gray-500 hover:text-emerald-400 hover:border-emerald-500/30 transition-all text-sm">
                                             <Icons.Cloud className="w-4 h-4" />
-                                            <span>Add ESXi Server</span>
+                                            <span>{t('addEsxiServer')}</span>
                                         </button>
                                     </div>
                                 )}
@@ -14924,7 +14922,6 @@
                                                 ];
                                             })().filter(tab => {
                                                 // #390 — admin role always passes (matches backend has_permission shortcut).
-                                                const can = (p) => user?.role === 'admin' || (Array.isArray(user?.permissions) && user.permissions.includes(p));
                                                 if (tab.id === 'site-recovery') return can('site_recovery.view');
                                                 if (tab.id === 'plugins') return can('plugins.view');
                                                 if (tab.id === 'compliance') return can('admin.audit') || can('node.maintenance');
@@ -17212,8 +17209,6 @@
                                                                         </div>
                                                                     </div>);
                                                                 })()}
-                                                                )}
-
                                                                 {/* data points info */}
                                                                 {reportData?.data_points > 0 && (
                                                                     <div className="text-xs text-gray-600 text-center">

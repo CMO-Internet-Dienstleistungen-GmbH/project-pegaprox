@@ -533,7 +533,7 @@
                                         metrics.status === 'online' ? 'bg-green-500 status-online' : 'bg-gray-500'
                                     }`} />
                                     <span className="text-xs text-gray-400">
-                                        {isUpdating ? t('updating') : isInMaintenance ? t('maintenance') : metrics.status}
+                                        {isUpdating ? t('updating') : isInMaintenance ? t('maintenance') : metrics.status === 'online' ? t('online') : metrics.status === 'offline' ? t('offline') : metrics.status}
                                     </span>
                                 </div>
                             </div>
@@ -556,7 +556,7 @@
                                 <Icons.Cog />
                             </button>
                             <div className="text-right">
-                                <div className="text-xs text-gray-500">Score</div>
+                                <div className="text-xs text-gray-500">{t('score')}</div>
                                 <div className={`font-mono font-bold text-lg ${
                                     metrics.score < 100 ? 'text-green-400' : metrics.score < 150 ? 'text-yellow-400' : 'text-red-400'
                                 }`}>
@@ -638,7 +638,7 @@
                                 {/* Network */}
                                 <div className="flex items-center justify-between text-xs">
                                     <span className="text-gray-500 flex items-center gap-2">
-                                        <Icons.Network /> Network In
+                                        <Icons.Network /> {t('networkIn')}
                                     </span>
                                     <div className="flex items-center gap-2">
                                         <Sparkline data={history.netin} width={50} height={16} color="#22c55e" />
@@ -649,7 +649,7 @@
                                 </div>
                                 <div className="flex items-center justify-between text-xs">
                                     <span className="text-gray-500 flex items-center gap-2">
-                                        <Icons.Network /> Network Out
+                                        <Icons.Network /> {t('networkOut')}
                                     </span>
                                     <div className="flex items-center gap-2">
                                         <Sparkline data={history.netout} width={50} height={16} color="#f97316" />
@@ -663,7 +663,7 @@
                                 {metrics.loadavg && (
                                     <div className="flex items-center justify-between text-xs">
                                         <span className="text-gray-500 flex items-center gap-2">
-                                            <Icons.Activity /> Load Avg
+                                            <Icons.Activity /> {t('loadAverage')}
                                         </span>
                                         <span className="text-gray-300 font-mono">
                                             {Array.isArray(metrics.loadavg) ? 
@@ -679,7 +679,7 @@
                                     <div className="flex items-center justify-between text-xs">
                                         <span className="text-gray-500">{t('cores')}</span>
                                         <span className="text-gray-300">
-                                            {metrics.cpuinfo.cores || metrics.cpuinfo.cpus || '-'} × {metrics.cpuinfo.sockets || 1} Socket
+                                            {metrics.cpuinfo.cores || metrics.cpuinfo.cpus || '-'} × {metrics.cpuinfo.sockets || 1} {t('socket')}
                                         </span>
                                     </div>
                                 )}
@@ -687,7 +687,7 @@
                                 {/* Kernel Version */}
                                 {metrics.kversion && (
                                     <div className="flex items-center justify-between text-xs">
-                                        <span className="text-gray-500">Kernel</span>
+                                        <span className="text-gray-500">{t('kernel')}</span>
                                         <span className="text-gray-400 font-mono text-[10px] truncate max-w-32">
                                             {metrics.kversion.split(' ')[0] || metrics.kversion}
                                         </span>
