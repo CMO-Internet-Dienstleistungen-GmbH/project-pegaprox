@@ -40,6 +40,7 @@ def _mgr():
     m.add_disk = types.MethodType(PegaProxManager.add_disk, m)
     m.unlock_vm = types.MethodType(PegaProxManager.unlock_vm, m)
     m._next_lxc_mp = types.MethodType(PegaProxManager._next_lxc_mp, m)
+    m._used_lxc_mp_slots = types.MethodType(PegaProxManager._used_lxc_mp_slots, m)
     return m
 
 
@@ -98,6 +99,45 @@ def test_qemu_add_disk_keeps_scsi_key():
     data = m._api_put.call_args.kwargs['data']
     assert 'scsi1' in data
     assert data['scsi1'].startswith('local-lvm:32')
+
+
+def test_lxc_add_disk_coerces_occupied_mp_slot():
+    # a caller-supplied but ALREADY-USED mpN must be redirected to a free slot, never overwrite.
+    m = _mgr()
+    m._api_get.return_value = _Resp(200, data={'rootfs': 'x:8', 'mp0': 'x:8,mp=/a'})
+    m._api_put.return_value = _Resp(200, text='')
+
+    res = m.add_disk('pve1', 105, 'lxc',
+                     {'disk_id': 'mp0', 'storage': 'local-lvm', 'size': 8, 'mountpoint': '/data'})
+
+    assert res['success'] is True, res
+    # mp0 is occupied -> the add lands on mp1, leaving mp0 untouched
+    assert m._api_put.call_args.kwargs['data'] == {'mp1': 'local-lvm:8,mp=/data'}
+
+
+def test_lxc_add_disk_never_targets_rootfs():
+    m = _mgr()
+    m._api_get.return_value = _Resp(200, data={'rootfs': 'x:8'})
+    m._api_put.return_value = _Resp(200, text='')
+
+    res = m.add_disk('pve1', 105, 'lxc',
+                     {'disk_id': 'rootfs', 'storage': 'local-lvm', 'size': 8, 'mountpoint': '/data'})
+
+    assert res['success'] is True, res
+    assert m._api_put.call_args.kwargs['data'] == {'mp0': 'local-lvm:8,mp=/data'}  # not rootfs
+
+
+def test_lxc_add_disk_rejects_mount_path_injection():
+    # a mount path carrying ',' / '=' would inject extra mountpoint options into the config string.
+    m = _mgr()
+    m._api_get.return_value = _Resp(200, data={'rootfs': 'x:8'})
+    m._api_put.return_value = _Resp(200, text='')
+
+    res = m.add_disk('pve1', 105, 'lxc',
+                     {'disk_id': 'mp0', 'storage': 'x', 'size': 8, 'mountpoint': '/data,ro=1'})
+
+    assert res['success'] is False and 'mount path' in res['error'], res
+    m._api_put.assert_not_called()  # rejected before any config write
 
 
 # ---------------------------------------------------------------------------

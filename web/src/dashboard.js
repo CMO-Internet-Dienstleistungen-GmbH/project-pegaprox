@@ -16975,7 +16975,7 @@
                                                                     <div className="flex gap-3 text-xs">
                                                                         <button onClick={() => {
                                                                             const sel = {};
-                                                                            Object.entries(controls).forEach(([id, ok]) => { if (!ok) sel[id] = true; });
+                                                                            Object.entries(controls).forEach(([id, v]) => { const applied = typeof v === 'object' ? v.status : v; if (!applied) sel[id] = true; });
                                                                             setHardenSelected(sel);
                                                                         }} className="text-blue-400 hover:text-blue-300">{t('selectAll') || 'Select all'}</button>
                                                                         <button onClick={() => setHardenSelected({})} className="text-gray-500 hover:text-gray-400">{t('deselectAll') || 'Deselect all'}</button>

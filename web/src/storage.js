@@ -1546,7 +1546,7 @@
                                                     {(() => {
                                                         const storage = datastores.shared.find(s => s.storage === selectedStorage.name) || 
                                                                        datastores.local[selectedStorage.node]?.find(s => s.storage === selectedStorage.name);
-                                                        return storage?.content?.includes('vztmpl') && hasPerm('storage.download');
+                                                        return storage?.content?.includes('vztmpl') && hasPerm('storage.upload');
                                                     })() && (
                                                         <button
                                                             onClick={() => { setShowTemplateModal(true); loadAvailableTemplates(); }}
@@ -1559,7 +1559,7 @@
                                                     {(() => {
                                                         const storage = datastores.shared.find(s => s.storage === selectedStorage.name) || 
                                                                        datastores.local[selectedStorage.node]?.find(s => s.storage === selectedStorage.name);
-                                                        return storage?.content?.includes('iso') && hasPerm('storage.download');
+                                                        return storage?.content?.includes('iso') && hasPerm('storage.upload');
                                                     })() && (
                                                         <button
                                                             onClick={() => setDownloadUrlModalOpen(true)}

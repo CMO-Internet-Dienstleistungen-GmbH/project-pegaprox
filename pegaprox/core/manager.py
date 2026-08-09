@@ -12770,8 +12770,8 @@ echo "AGENT_INSTALLED_OK"
             self.logger.error(f"delete_pool({poolid}): {e}")
             return {'success': False, 'error': str(e)}
 
-    def _next_lxc_mp(self, node: str, vmid: int) -> str:
-        """Next free mountpoint slot (mp0, mp1, …) for an LXC container."""
+    def _used_lxc_mp_slots(self, node: str, vmid: int) -> set:
+        """Set of mountpoint slot indices already used by an LXC container ({0,1,…} for mp0/mp1/…)."""
         used = set()
         try:
             url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
@@ -12782,7 +12782,12 @@ echo "AGENT_INSTALLED_OK"
                     if m:
                         used.add(int(m.group(1)))
         except Exception as e:
-            self.logger.debug(f"[LXC] could not read config for next mp slot: {e}")
+            self.logger.debug(f"[LXC] could not read config for mp slots: {e}")
+        return used
+
+    def _next_lxc_mp(self, node: str, vmid: int) -> str:
+        """Next free mountpoint slot (mp0, mp1, …) for an LXC container."""
+        used = self._used_lxc_mp_slots(node, vmid)
         i = 0
         while i in used:
             i += 1
@@ -12845,15 +12850,24 @@ echo "AGENT_INSTALLED_OK"
             else:  # LXC
                 url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
                 
-                # NS Aug 2026 — LXC volumes are mountpoints (mpN), never scsi/virtio/
-                # etc. An older UI (or a QEMU-shaped disk_id like "scsi1") makes PVE
-                # reject the whole request with "property is not defined in schema", so
-                # coerce anything that isn't already a mountpoint slot to the next free
-                # mpN. PVE also requires a container-side mount path for every mpN, so
-                # default one from the slot name when the caller didn't supply it.
-                if not re.match(r'^(mp\d+|rootfs)$', str(disk_id)):
-                    disk_id = self._next_lxc_mp(node, vmid)
+                # NS Aug 2026 — LXC volumes are mountpoints (mpN), never scsi/virtio/etc.,
+                # and an "add" must land on a FREE slot. Coerce a QEMU-shaped disk_id, a
+                # 'rootfs' (the container root), OR an already-occupied mpN to the next free
+                # mpN — otherwise the PUT silently REPLACES an existing mountpoint and orphans
+                # its volume. A QEMU-shaped id would also make PVE reject the whole request
+                # ("property is not defined in schema").
+                used = self._used_lxc_mp_slots(node, vmid)
+                slot = re.match(r'^mp(\d+)$', str(disk_id))
+                if not slot or int(slot.group(1)) in used:
+                    i = 0
+                    while i in used:
+                        i += 1
+                    disk_id = f"mp{i}"
+                # PVE requires a container-side mount path for every mpN; default one from the
+                # slot name. Reject metacharacters that would inject extra mountpoint options.
                 mp_path = (disk_config.get('mountpoint') or '').strip() or f"/mnt/{disk_id}"
+                if ',' in mp_path or '=' in mp_path:
+                    return {'success': False, 'error': 'invalid mount path (no comma or "=" allowed)'}
                 mp_str = f"{storage}:{size},mp={mp_path}"
                 if disk_config.get('backup') == False:
                     mp_str += ",backup=0"
