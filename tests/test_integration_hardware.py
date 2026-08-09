@@ -545,3 +545,45 @@ def test_corrupt_stored_ack_version_fails_closed(api, seed):
     resp = api.as_user(admin).get(HW_ROUTE)
     assert resp.status_code == 403, resp.get_data(as_text=True)
     assert resp.get_json()['code'] == 'CONSENT_REQUIRED'
+
+
+# ===========================================================================
+# #609 in-band read — SSH credential fallback order (key -> agent -> password)
+# ===========================================================================
+
+def test_inband_read_uses_key_branch_when_ssh_key_set(api):
+    # a deployed cluster SSH key must be tried first; the agent/password paths are not touched.
+    m = _mgr(api, _get_node_ip='10.0.0.1', _ssh_run_command_with_key_output=SAMPLE)
+    m.config.ssh_key = 'PRIVATE-KEY-DATA'
+    m.config.ssh_user = 'root'
+    res = bmc.read_node_bmc_inband(m, NODE)
+    assert res.get('available') is True, res
+    m._ssh_run_command_with_key_output.assert_called_once()
+    m._ssh_run_command_output.assert_not_called()
+    m._ssh_run_command_with_password_output.assert_not_called()
+
+
+def test_inband_read_falls_back_to_password(api):
+    # no key + the agent/known-host path yields nothing -> the stored cluster password is used.
+    m = _mgr(api, _get_node_ip='10.0.0.1',
+             _ssh_run_command_output='',
+             _ssh_run_command_with_password_output=SAMPLE)
+    m.config.ssh_key = ''            # no key -> key branch skipped
+    m.config.ssh_user = 'root'
+    m.config.pass_ = 'cluster-secret'
+    res = bmc.read_node_bmc_inband(m, NODE)
+    assert res.get('available') is True, res
+    m._ssh_run_command_with_key_output.assert_not_called()
+    m._ssh_run_command_output.assert_called_once()
+    m._ssh_run_command_with_password_output.assert_called_once()
+
+
+def test_inband_read_unavailable_when_all_auth_fail(api):
+    # key absent, agent empty, no password -> honest unavailable, never raises.
+    m = _mgr(api, _get_node_ip='10.0.0.1', _ssh_run_command_output='')
+    m.config.ssh_key = ''
+    m.config.ssh_user = 'root'
+    m.config.pass_ = ''
+    res = bmc.read_node_bmc_inband(m, NODE)
+    assert res.get('available') is False, res
+    m._ssh_run_command_with_password_output.assert_not_called()

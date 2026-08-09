@@ -115,6 +115,10 @@ jobs:
   build-lxc:
     needs: prepare
     runs-on: ubuntu-latest
+    # NS Aug 2026 — arm64 builds under qemu emulation and is flaky; a failed arm64 leg must NOT
+    # block the amd64 release. publish attaches whatever artifacts exist (glob), so a missing
+    # arm64 asset is fine; amd64 has no continue-on-error, so a real amd64 failure still blocks.
+    continue-on-error: ${{ matrix.arch == 'arm64' }}
     strategy:
       fail-fast: false
       matrix:
@@ -299,6 +303,8 @@ jobs:
   build-vm:
     needs: prepare
     runs-on: ubuntu-latest
+    # NS Aug 2026 — see build-lxc: keep the emulated arm64 leg from blocking the amd64 release.
+    continue-on-error: ${{ matrix.arch == 'arm64' }}
     strategy:
       fail-fast: false
       matrix:

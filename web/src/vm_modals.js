@@ -4437,8 +4437,8 @@
                 const now = new Date();
                 const diff = Math.floor((now - new Date(date)) / 1000);
                 if (diff < 10) return t('justNow') || 'just now';
-                if (diff < 60) return `${diff}s ${t('timeAgo') || 'ago'}`;
-                if (diff < 3600) return `${Math.floor(diff / 60)}m ${t('timeAgo') || 'ago'}`;
+                if (diff < 60) return (t('timeAgoSec') || '{n}s ago').replace('{n}', diff);
+                if (diff < 3600) return (t('timeAgoMin') || '{n}m ago').replace('{n}', Math.floor(diff / 60));
                 return new Date(date).toLocaleTimeString();
             };
 
@@ -5203,8 +5203,8 @@
                 const now = new Date();
                 const diff = Math.floor((now - new Date(date)) / 1000);
                 if (diff < 10) return t('justNow') || 'just now';
-                if (diff < 60) return `${diff}s ${t('timeAgo') || 'ago'}`;
-                if (diff < 3600) return `${Math.floor(diff / 60)}m ${t('timeAgo') || 'ago'}`;
+                if (diff < 60) return (t('timeAgoSec') || '{n}s ago').replace('{n}', diff);
+                if (diff < 3600) return (t('timeAgoMin') || '{n}m ago').replace('{n}', Math.floor(diff / 60));
                 return new Date(date).toLocaleTimeString();
             };
             
