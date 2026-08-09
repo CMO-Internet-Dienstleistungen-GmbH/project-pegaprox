@@ -96,7 +96,7 @@
 
         // Language Switcher Component
         function LanguageSwitcher() {
-            const { language, changeLanguage, applyLanguage } = useTranslation();
+            const { language, t, changeLanguage, applyLanguage } = useTranslation();
             const { isCorporate } = useLayout();
             // NS May 2026 (#389): On the login page (unauthenticated) we must NOT
             // hit /api/user/preferences — it would always 401 and spam the console.
