@@ -15388,7 +15388,10 @@ X11Forwarding no
 ClientAliveInterval 300
 ClientAliveCountMax 3
 LoginGraceTime 60
-AllowTcpForwarding no
+# AllowTcpForwarding is left at the sshd default on purpose — PegaProx's VNC console
+# tunnels to the node through an SSH direct-tcpip channel (utils/vnc_tunnel.py), which
+# 'AllowTcpForwarding no' would block. The sed above still strips any stale directive so
+# a node hardened by an older build heals back to the default (forwarding on) on re-apply.
 PermitEmptyPasswords no
 SSHDHEOF
 if sshd -t 2>/dev/null; then

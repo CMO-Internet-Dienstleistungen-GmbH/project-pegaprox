@@ -16677,16 +16677,16 @@
                                                                                 <div className="w-5 h-5 rounded bg-gray-700/40 flex items-center justify-center" title={t('queued') || 'Queued'}>
                                                                                     <span className="text-[10px] text-gray-400">…</span>
                                                                                 </div>
-                                                                            ) : applied ? (
-                                                                                <div className="w-5 h-5 rounded bg-green-500/20 flex items-center justify-center" title={t('alreadyApplied') || 'Already applied'}>
-                                                                                    <Icons.Check className="w-3.5 h-3.5 text-green-400" />
-                                                                                </div>
                                                                             ) : (
+                                                                                // NS Aug 2026 — applied controls stay selectable so they can be rolled
+                                                                                // back (was a static check → couldn't tick them). The green "Applied"
+                                                                                // badge on the title still marks their state.
                                                                                 <input
                                                                                     type="checkbox"
                                                                                     checked={!!hardenSelected[id]}
                                                                                     onChange={e => setHardenSelected(prev => ({...prev, [id]: e.target.checked}))}
-                                                                                    className="w-4 h-4 rounded border-gray-600 bg-proxmox-dark accent-proxmox-orange"
+                                                                                    title={applied ? (t('appliedTickToRollback') || 'Applied — tick to roll back') : undefined}
+                                                                                    className={`w-4 h-4 rounded border-gray-600 bg-proxmox-dark accent-proxmox-orange ${applied ? 'ring-1 ring-green-500/50' : ''}`}
                                                                                 />
                                                                             )}
                                                                         </div>
