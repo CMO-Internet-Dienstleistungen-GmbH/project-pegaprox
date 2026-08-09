@@ -26,6 +26,10 @@ concurrency:
 
 jobs:
   build-and-push:
+    # MK 2026-08-09 (Aikido/CodeAnt daily scan) — a workflow_dispatch can be fired from ANY
+    # branch; without this guard that would publish an arbitrary branch as pegaprox-testing:latest.
+    # Pin the job to the Testing ref so a dispatch from elsewhere is a harmless no-op.
+    if: github.ref == 'refs/heads/Testing'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -33,6 +37,10 @@ jobs:
     steps:
       # third-party actions pinned to the same commit SHAs as docker.yml
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        # MK 2026-08-09 — don't persist GITHUB_TOKEN into .git/config; this job never pushes
+        # git, so a compromised downstream action can't lift the token from the checkout.
+        with:
+          persist-credentials: false
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
