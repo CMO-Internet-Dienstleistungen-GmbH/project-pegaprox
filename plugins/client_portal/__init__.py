@@ -180,7 +180,10 @@ def _vm_power():
         return {'error': 'Missing cluster_id, vmid, or action'}
 
     # map action to permission
-    perm_map = {'start': 'vm.start', 'stop': 'vm.stop', 'shutdown': 'vm.stop', 'reboot': 'vm.start'}
+    # NS Aug 2026 (Aikido) — reboot stops+starts the guest, so it must gate on vm.restart
+    # (the dedicated perm the main API + scheduler use), not vm.start. A vm.start-only portal
+    # user must not be able to reboot a guest through the portal.
+    perm_map = {'start': 'vm.start', 'stop': 'vm.stop', 'shutdown': 'vm.stop', 'reboot': 'vm.restart'}
     required_perm = perm_map.get(action, 'vm.start')
 
     # check allowed actions
