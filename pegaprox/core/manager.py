@@ -11400,8 +11400,15 @@ echo "AGENT_INSTALLED_OK"
             
             self.logger.info(f"Unlocking {vm_type}/{vmid} on {node} (lock reason: {lock_reason})")
             
-            # Remove the lock by setting delete=lock
-            response = self._api_put(config_url, data={'delete': 'lock'})
+            # NS Aug 2026 — removing a lock is a root@pam-only op in PVE. Send skiplock
+            # when we actually are root@pam, but PVE still refuses it under an API token
+            # (even root's) or a role-based admin — the same trap we hit on force-stop
+            # (#391). So try the API, then fall back to `qm/pct unlock` over SSH, which
+            # runs as real root on the node and always clears it.
+            data = {'delete': 'lock'}
+            if str(self.config.user or '').lower().startswith('root@'):
+                data['skiplock'] = 1
+            response = self._api_put(config_url, data=data)
             
             if response.status_code == 200:
                 self.logger.info(f"[OK] Unlocked {vm_type}/{vmid} (was: {lock_reason})")
@@ -11411,10 +11418,26 @@ echo "AGENT_INSTALLED_OK"
                     'was_locked': True,
                     'lock_reason': lock_reason
                 }
-            else:
-                error = response.text
-                self.logger.error(f"[ERROR] Failed to unlock {vm_type}/{vmid}: {error}")
-                return {'success': False, 'error': error}
+            # API path couldn't clear the lock (token / role / custom-realm auth, or PVE
+            # refused skiplock) → do it on the node over SSH as root.
+            api_err = (response.text or '').strip()
+            self.logger.warning(
+                f"[VM] API unlock of {vm_type}/{vmid} failed ({api_err[:120]!r}); "
+                f"falling back to SSH {'qm' if vm_type == 'qemu' else 'pct'} unlock on {node}")
+            unlock_cmd = f"qm unlock {vmid}" if vm_type == 'qemu' else f"pct unlock {vmid}"
+            rc, out, ssh_err = self._node_ssh_exec(node, unlock_cmd, timeout=30)
+            if rc == 0:
+                self.logger.info(f"[OK] Unlocked {vm_type}/{vmid} via node SSH (was: {lock_reason})")
+                return {
+                    'success': True,
+                    'message': 'VM unlocked successfully (via node SSH)',
+                    'was_locked': True,
+                    'lock_reason': lock_reason
+                }
+            detail = (ssh_err or out or '').strip()
+            self.logger.error(f"[ERROR] Failed to unlock {vm_type}/{vmid}: api={api_err!r} ssh={detail!r}")
+            return {'success': False,
+                    'error': (api_err or 'unlock refused') + (f" — SSH fallback: {detail}" if detail else "")}
                 
         except Exception as e:
             self.logger.error(f"[ERROR] Unlock VM error: {e}")
@@ -12747,6 +12770,24 @@ echo "AGENT_INSTALLED_OK"
             self.logger.error(f"delete_pool({poolid}): {e}")
             return {'success': False, 'error': str(e)}
 
+    def _next_lxc_mp(self, node: str, vmid: int) -> str:
+        """Next free mountpoint slot (mp0, mp1, …) for an LXC container."""
+        used = set()
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
+            resp = self._api_get(url)
+            if resp.status_code == 200:
+                for k in (resp.json().get('data', {}) or {}):
+                    m = re.match(r'^mp(\d+)$', k)
+                    if m:
+                        used.add(int(m.group(1)))
+        except Exception as e:
+            self.logger.debug(f"[LXC] could not read config for next mp slot: {e}")
+        i = 0
+        while i in used:
+            i += 1
+        return f"mp{i}"
+
     def add_disk(self, node: str, vmid: int, vm_type: str, disk_config: Dict) -> Dict[str, Any]:
         """Add a new disk to VM or container
         
@@ -12804,10 +12845,16 @@ echo "AGENT_INSTALLED_OK"
             else:  # LXC
                 url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
                 
-                # For LXC mountpoints
-                mp_str = f"{storage}:{size}"
-                if disk_config.get('mountpoint'):
-                    mp_str += f",mp={disk_config['mountpoint']}"
+                # NS Aug 2026 — LXC volumes are mountpoints (mpN), never scsi/virtio/
+                # etc. An older UI (or a QEMU-shaped disk_id like "scsi1") makes PVE
+                # reject the whole request with "property is not defined in schema", so
+                # coerce anything that isn't already a mountpoint slot to the next free
+                # mpN. PVE also requires a container-side mount path for every mpN, so
+                # default one from the slot name when the caller didn't supply it.
+                if not re.match(r'^(mp\d+|rootfs)$', str(disk_id)):
+                    disk_id = self._next_lxc_mp(node, vmid)
+                mp_path = (disk_config.get('mountpoint') or '').strip() or f"/mnt/{disk_id}"
+                mp_str = f"{storage}:{size},mp={mp_path}"
                 if disk_config.get('backup') == False:
                     mp_str += ",backup=0"
                 

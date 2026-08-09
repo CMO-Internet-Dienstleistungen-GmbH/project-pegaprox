@@ -5855,10 +5855,11 @@
             const initialFmt = formatsForStorageType(storageList[0]?.type)[0] || 'raw';
 
             const [diskConfig, setDiskConfig] = useState({
-                disk_id: 'scsi1',
+                disk_id: isQemu ? 'scsi1' : 'mp0',
                 storage: initialStorage,
                 format: initialFmt,
                 size: 32,
+                mountpoint: '',   // NS: LXC only — container-side mount path for the mpN volume
                 cache: '',
                 iothread: true,
                 ssd: false,
@@ -5887,7 +5888,8 @@
 
             useEffect(() => {
                 if (getNextDiskId) {
-                    setDiskConfig(prev => ({...prev, disk_id: getNextDiskId('scsi')}));
+                    // LXC volumes are mountpoints (mpN); QEMU disks default to the next scsi slot.
+                    setDiskConfig(prev => ({...prev, disk_id: getNextDiskId(isQemu ? 'scsi' : 'mp')}));
                 }
             }, []);
             
@@ -5906,6 +5908,22 @@
             
             // NS: Filter out unsupported options before sending to API
             const handleAdd = () => {
+                // NS Aug 2026 — a container gets an LXC mountpoint (mpN + a container-side
+                // mount path), not a QEMU bus disk, so no format/iothread/ssd/cache here.
+                if (!isQemu) {
+                    const mp = (diskConfig.mountpoint || '').trim();
+                    if (!mp || !mp.startsWith('/')) {
+                        alert(t('mountPathRequired') || 'Enter an absolute mount path inside the container (e.g. /data)');
+                        return;
+                    }
+                    onAdd({
+                        disk_id: diskConfig.disk_id,
+                        storage: diskConfig.storage,
+                        size: diskConfig.size,
+                        mountpoint: mp,
+                    });
+                    return;
+                }
                 const configToSend = {
                     disk_id: diskConfig.disk_id,
                     storage: diskConfig.storage,
@@ -6021,6 +6039,26 @@
                                     />
                                 </div>
                             </div>
+                            {/* NS Aug 2026 — LXC mountpoints need a container-side path; the
+                                slot (mpN) is picked automatically from the free slots. */}
+                            {!isQemu && (
+                                <div>
+                                    <label className="block text-xs text-gray-400 mb-1">
+                                        {t('mountPath') || 'Mount Path'}
+                                        <span className="ml-2 text-gray-500">({diskConfig.disk_id})</span>
+                                    </label>
+                                    <input
+                                        type="text"
+                                        value={diskConfig.mountpoint}
+                                        onChange={(e) => setDiskConfig({...diskConfig, mountpoint: e.target.value})}
+                                        placeholder="/data"
+                                        className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm"
+                                    />
+                                    <p className="text-xs text-gray-500 mt-1">
+                                        {t('mountPathHint') || 'Absolute path inside the container where this volume is mounted (e.g. /data).'}
+                                    </p>
+                                </div>
+                            )}
                             {/* MK Apr 2026 — explicit format selector. Defaults follow the
                                 storage type (raw for ZFS/RBD, qcow2 for files / LVM since 9.1). */}
                             {isQemu && (
