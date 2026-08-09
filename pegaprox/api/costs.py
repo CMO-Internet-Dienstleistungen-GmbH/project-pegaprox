@@ -197,7 +197,16 @@ def list_rates():
     try:
         c = get_db().conn.cursor()
         c.execute('SELECT * FROM cost_rates ORDER BY cluster_id')
-        return jsonify({'rates': [_row_to_rates(r) for r in c.fetchall()]})
+        rows = [_row_to_rates(r) for r in c.fetchall()]
+        # NS Aug 2026 (Aikido IDOR) — scope rows to the caller's reachable clusters; was
+        # leaking every cluster's cost rates to any authed user. Always keep the shared
+        # '__default__' fallback row (every cluster reads it when it has no own row).
+        from pegaprox.utils.rbac import get_user_clusters
+        from flask import g as _g
+        allowed = get_user_clusters(getattr(_g, 'current_user', None) or {})
+        if allowed is not None:
+            rows = [r for r in rows if r['cluster_id'] == '__default__' or r['cluster_id'] in allowed]
+        return jsonify({'rates': rows})
     except Exception as e:
         logging.exception('handler error in costs.py'); return jsonify({'error': 'internal error'}), 500
 
@@ -205,6 +214,12 @@ def list_rates():
 @bp.route('/api/cost/rates/<cluster_id>', methods=['GET'])
 @require_auth()
 def get_one_rate(cluster_id):
+    # NS Aug 2026 (Aikido IDOR) — tenant gate; the __default__ pseudo-cluster is shared (no owner).
+    if cluster_id != '__default__':
+        from pegaprox.api.helpers import check_cluster_access
+        ok, err = check_cluster_access(cluster_id)
+        if not ok:
+            return err
     return jsonify(_get_rates(cluster_id))
 
 

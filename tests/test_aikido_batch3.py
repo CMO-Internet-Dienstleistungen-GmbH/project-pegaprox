@@ -46,6 +46,46 @@ def test_list_power_rates_admin_sees_all(api, seed):
 
 
 # ---------------------------------------------------------------------------
+# cost rates — same IDOR class as power rates (GET /api/cost/rates + /<id>)
+# ---------------------------------------------------------------------------
+
+def _seed_cost_rate(seed, cluster_id):
+    seed.db.execute(
+        "INSERT OR REPLACE INTO cost_rates (cluster_id, cpu_per_core_h, updated_at) VALUES (?, ?, ?)",
+        (cluster_id, 0.02, '2026-01-01T00:00:00'))
+
+
+def test_list_cost_rates_scoped_to_caller_clusters(api, seed):
+    _seed_cost_rate(seed, 'cluster_a')
+    _seed_cost_rate(seed, 'cluster_b')
+    seed.tenant('tenant_a', clusters=['cluster_a'])
+    alice = seed.user('alice', role='user', tenant_id='tenant_a')
+
+    r = api.as_user(alice).get('/api/cost/rates')
+    assert r.status_code == 200, r.get_data(as_text=True)
+    ids = {row['cluster_id'] for row in r.get_json()['rates']}
+    assert 'cluster_a' in ids
+    assert '__default__' in ids
+    assert 'cluster_b' not in ids
+
+
+def test_get_one_cost_rate_denies_foreign_cluster(api, seed):
+    _seed_cost_rate(seed, 'cluster_b')
+    seed.tenant('tenant_a', clusters=['cluster_a'])
+    alice = seed.user('alice', role='user', tenant_id='tenant_a')
+    r = api.as_user(alice).get('/api/cost/rates/cluster_b')
+    assert r.status_code == 403, r.get_data(as_text=True)
+
+
+def test_get_default_cost_rate_allowed_for_any_user(api, seed):
+    # the shared __default__ pseudo-cluster is readable by anyone (no owner).
+    seed.tenant('tenant_a', clusters=['cluster_a'])
+    alice = seed.user('alice', role='user', tenant_id='tenant_a')
+    r = api.as_user(alice).get('/api/cost/rates/__default__')
+    assert r.status_code == 200, r.get_data(as_text=True)
+
+
+# ---------------------------------------------------------------------------
 # #469089251 — portal reboot gates on vm.restart, not vm.start
 # ---------------------------------------------------------------------------
 
