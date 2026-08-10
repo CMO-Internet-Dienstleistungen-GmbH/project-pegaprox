@@ -70,3 +70,25 @@ def test_backup_job_allowed_for_own_vm(api, seed):
         '/api/clusters/cluster_1/datacenter/backup', json={'vmid': '100'})
     # not a 403 from our gate (may be 200 or a PVE-shaped error from the fake, but authz passed)
     assert r.status_code != 403, r.get_data(as_text=True)
+
+
+def test_backup_job_empty_selection_denied_for_non_admin(api, seed):
+    # #469089226 (CodeAnt follow-up) — PVE treats an empty / exclude-mode selection as "every VM";
+    # a non-admin must not slip past the gate by omitting vmid or using exclude/selMode.
+    alice = _reacher(seed, 'backup.schedule')
+    api.set_manager('cluster_1', api.make_fake_manager())
+    acc = api.as_user({'username': alice, 'role': 'user'})
+    for payload in ({}, {'exclude': '999'}, {'selMode': 'all'}, {'selMode': 'exclude', 'vmid': '100'}):
+        r = acc.post('/api/clusters/cluster_1/datacenter/backup', json=payload)
+        assert r.status_code == 403, f'{payload} -> {r.status_code}: {r.get_data(as_text=True)}'
+
+
+def test_backup_job_update_all_denied_for_non_admin(api, seed):
+    # #469089226 (CodeAnt follow-up) — the load→edit→save round-trip of an admin all=1 job must
+    # be re-checked on PUT, so a non-admin can't retune a cluster-wide job they don't own.
+    alice = _reacher(seed, 'backup.schedule')
+    api.set_manager('cluster_1', api.make_fake_manager())
+    r = api.as_user({'username': alice, 'role': 'user'}).put(
+        '/api/clusters/cluster_1/datacenter/backup/backup-abc',
+        json={'all': '1', 'starttime': '03:00'})
+    assert r.status_code == 403, r.get_data(as_text=True)

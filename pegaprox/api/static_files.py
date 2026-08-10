@@ -334,7 +334,12 @@ def get_vms_without_pool(cluster_id):
             vm_type = vm.get('type', 'qemu')
             key = f"{vmid}:{vm_type}"
 
-            if key not in membership and vmid is not None and user_can_access_vm(_user, cluster_id, int(vmid), 'vm.view'):
+            try:
+                vmid_int = int(vmid)
+            except (TypeError, ValueError):
+                continue  # a single malformed vmid must skip this row, not 500 the whole endpoint
+
+            if key not in membership and user_can_access_vm(_user, cluster_id, vmid_int, 'vm.view'):
                 vms_without_pool.append({
                     'vmid': vmid,
                     'name': vm.get('name', f'VM {vmid}'),

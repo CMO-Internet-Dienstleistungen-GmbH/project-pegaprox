@@ -2375,10 +2375,20 @@ def _authz_backup_targets(cluster_id, data):
     from pegaprox.models.permissions import ROLE_ADMIN
     if request.session.get('effective_role', request.session.get('role')) == ROLE_ADMIN:
         return None
-    if str(data.get('all', '')).strip() in ('1', 'true', 'True', 'yes') or (data.get('pool') or '').strip():
-        return jsonify({'error': 'Access denied: cluster-wide or pool backup jobs require admin'}), 403
+    # non-admin: only an explicit include-list of VMs they own is allowed. PVE treats a
+    # cluster-wide (all=1), pool, exclude-mode, or *empty* selection as "every VM", so each of
+    # those is admin-only — this also covers the load→edit→save round-trip of an admin-made job,
+    # whose all=1/pool/exclude/foreign-vmid fields survive into `data` on PUT and get re-checked.
+    _sel = str(data.get('selMode') or data.get('selmode') or '').strip().lower()
+    _vmids = [x.strip() for x in str(data.get('vmid') or '').split(',') if x.strip()]
+    if (str(data.get('all', '')).strip() in ('1', 'true', 'True', 'yes')
+            or (data.get('pool') or '').strip()
+            or (data.get('exclude') or '').strip()
+            or _sel in ('all', 'exclude', 'pool')
+            or not _vmids):
+        return jsonify({'error': 'Access denied: cluster-wide, pool, or exclusion backup jobs require admin'}), 403
     user = build_authz_user(request.session.get('user', ''), request.session)
-    for v in [x.strip() for x in str(data.get('vmid') or '').split(',') if x.strip()]:
+    for v in _vmids:
         if not v.isdigit() or not user_can_access_vm(user, cluster_id, int(v), 'vm.backup'):
             return jsonify({'error': f'Access denied: no permission for VM {v}'}), 403
     return None
