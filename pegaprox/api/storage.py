@@ -2367,6 +2367,23 @@ def get_backup_jobs(cluster_id):
         return jsonify([])
 
 
+def _authz_backup_targets(cluster_id, data):
+    """NS Aug 2026 (Aikido #469089226) — a backup.schedule holder must own every VM a backup
+    job targets. Explicit vmids are authorized per-VM; a cluster-wide (all=1) or pool selection
+    is admin-only (a scoped user must not schedule backups for VMs they don't control)."""
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.models.permissions import ROLE_ADMIN
+    if request.session.get('effective_role', request.session.get('role')) == ROLE_ADMIN:
+        return None
+    if str(data.get('all', '')).strip() in ('1', 'true', 'True', 'yes') or (data.get('pool') or '').strip():
+        return jsonify({'error': 'Access denied: cluster-wide or pool backup jobs require admin'}), 403
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    for v in [x.strip() for x in str(data.get('vmid') or '').split(',') if x.strip()]:
+        if not v.isdigit() or not user_can_access_vm(user, cluster_id, int(v), 'vm.backup'):
+            return jsonify({'error': f'Access denied: no permission for VM {v}'}), 403
+    return None
+
+
 @bp.route('/api/clusters/<cluster_id>/datacenter/backup', methods=['POST'])
 @require_auth(perms=['backup.schedule'])
 def create_backup_job(cluster_id):
@@ -2381,6 +2398,9 @@ def create_backup_job(cluster_id):
         host, port = manager.host, manager.api_port
         url = f"https://{host}:{port}/api2/json/cluster/backup"
         data = request.json or {}
+        _aerr = _authz_backup_targets(cluster_id, data)
+        if _aerr:
+            return _aerr
         # NS May 2026 — PVE backup-job create can take >10s when it has to
         # validate the destination (PBS in particular). Bumped to 60s.
         r = manager._create_session().post(url, data=data, timeout=60)
@@ -2416,6 +2436,9 @@ def update_backup_job(cluster_id, job_id):
         host, port = manager.host, manager.api_port
         url = f"https://{host}:{port}/api2/json/cluster/backup/{job_id}"
         data = dict(request.json or {})
+        _aerr = _authz_backup_targets(cluster_id, data)
+        if _aerr:
+            return _aerr
 
         # MK Apr 2026 (#338) — sanitise the payload before bouncing back to PVE.
         # When a job was created in PVE itself, GETing it returns fields that
