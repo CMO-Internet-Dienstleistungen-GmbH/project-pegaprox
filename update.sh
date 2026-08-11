@@ -70,6 +70,43 @@ else
     echo ""
 fi
 
+# NS 2026-08-11 — install-method guard. This script does a git-tree download + pip and only
+# fits a source/deploy.sh layout. On an apt/dpkg-managed install the right update is
+# `apt upgrade` (a git+pip run diverges from dpkg and can't lift the dpkg-owned crypto libs, so
+# the service fail-closes on TLS at restart). Inside a container a file update is discarded on
+# the next image pull. Detect + refuse unless --force is passed.
+_pgx_install_method() {
+    if [ -f /.dockerenv ] || grep -qE 'docker|containerd|kubepods' /proc/1/cgroup 2>/dev/null; then
+        echo docker; return
+    fi
+    if command -v dpkg >/dev/null 2>&1 \
+        && dpkg -S "$SCRIPT_DIR/pegaprox_multi_cluster.py" 2>/dev/null | grep -q '^pegaprox:'; then
+        echo apt; return
+    fi
+    echo source
+}
+
+_PGX_FORCE=0
+for _a in "$@"; do
+    case "$_a" in --force|--allow-managed) _PGX_FORCE=1 ;; esac
+done
+_PGX_METHOD="$(_pgx_install_method)"
+if [ "$_PGX_METHOD" != "source" ] && [ "$_PGX_FORCE" -eq 0 ]; then
+    echo -e "${YELLOW}This PegaProx instance was installed via: ${_PGX_METHOD}.${NC}"
+    if [ "$_PGX_METHOD" = "apt" ]; then
+        echo -e "${YELLOW}Update it through the package manager, not this script:${NC}"
+        echo    "    sudo apt update && sudo apt upgrade pegaprox"
+        echo -e "${YELLOW}(A git+pip update would diverge from dpkg and can break dependency handling.)${NC}"
+    else
+        echo -e "${YELLOW}Update it by pulling a fresh image and recreating the container:${NC}"
+        echo    "    docker pull ghcr.io/pegaprox/pegaprox:latest   # then recreate: compose up -d / docker run"
+        echo -e "${YELLOW}(An in-place update here is discarded on the next image pull.)${NC}"
+    fi
+    echo ""
+    echo -e "  Override at your own risk with: ${BLUE}./update.sh --force${NC}"
+    exit 0
+fi
+
 # Check current version
 CURRENT_VERSION="unknown"
 if [ -f "version.json" ]; then

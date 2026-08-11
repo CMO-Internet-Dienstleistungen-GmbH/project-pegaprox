@@ -230,6 +230,57 @@ def migrate_all_encryption():
     })
 
 
+def _detect_install_method(install_dir):
+    """How was THIS running instance installed? Governs how it may self-update.
+
+    NS 2026-08-11 — the built-in updater is a git-tree download + pip run and only fits the
+    deploy.sh / source layout. It must NOT run on:
+      - 'apt'   : files are owned by the pegaprox .deb and deps are system python3-* packages;
+                  the correct update is `apt upgrade`. A git+pip run diverges from dpkg and
+                  can't lift the dpkg-owned crypto libs → fail-closed TLS on restart.
+      - 'docker': the image is immutable; a file-level update is discarded on the next image
+                  pull / container recreate, so it's pointless (and misleading).
+    Anything else → 'source' (deploy.sh / git checkout, optionally a venv) = the updater's turf.
+    Docker wins over apt: our images are built by apt-installing pegaprox, but a container is
+    still updated by pulling a new image, never by apt inside it.
+    """
+    try:
+        if os.path.exists('/.dockerenv'):
+            return 'docker'
+        with open('/proc/1/cgroup', 'r') as _cg:
+            if any(k in _cg.read() for k in ('docker', 'containerd', 'kubepods')):
+                return 'docker'
+    except Exception:
+        pass
+    try:
+        probe = os.path.join(install_dir, 'pegaprox_multi_cluster.py')
+        r = subprocess.run(['dpkg', '-S', probe], capture_output=True, text=True, timeout=5)
+        # dpkg -S prints "pegaprox: /usr/lib/pegaprox/pegaprox_multi_cluster.py" when tracked
+        if r.returncode == 0 and 'pegaprox' in (r.stdout.split(':', 1)[0] if ':' in r.stdout else ''):
+            return 'apt'
+    except Exception:
+        pass
+    return 'source'
+
+
+def _managed_update_guidance(method):
+    """Operator-facing 'update it the right way' message for a non-source install."""
+    return {
+        'apt': 'This instance is managed by APT/dpkg. Update it with the command below. '
+               'For hands-off updates, enable unattended-upgrades on the PegaProx repo.',
+        'docker': 'This instance runs in a container. Pull a fresh image and recreate the '
+                  'container — an in-place update would be discarded on the next pull.',
+    }.get(method, '')
+
+
+def _managed_update_command(method):
+    """The bare, copy-pasteable command for a non-source install (rendered as a code block)."""
+    return {
+        'apt': 'sudo apt update && sudo apt upgrade pegaprox',
+        'docker': 'docker compose pull && docker compose up -d',
+    }.get(method, '')
+
+
 @bp.route('/api/pegaprox/check-update', methods=['GET'])
 @require_auth(perms=['update.manage'])
 def check_pegaprox_update():
@@ -293,7 +344,13 @@ def check_pegaprox_update():
         latest_tuple = parse_version(latest_version)
         
         update_available = latest_tuple > current_tuple
-        
+
+        # NS 2026-08-11 — tell the UI how this instance was installed so it can render the
+        # right update path (apt upgrade / docker pull) instead of the in-app file updater,
+        # which only fits the source/deploy.sh layout.
+        _install_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        _method = _detect_install_method(_install_dir)
+
         return jsonify({
             'current_version': PEGAPROX_VERSION,
             'current_build': PEGAPROX_BUILD,
@@ -303,6 +360,10 @@ def check_pegaprox_update():
             'changelog': remote_version.get('changelog', []),
             'download_url': remote_version.get('download_url', GITHUB_REPO_URL),
             'update_available': update_available,
+            'install_method': _method,
+            'in_app_update_supported': _method == 'source',
+            'managed_update_hint': _managed_update_guidance(_method),
+            'managed_update_command': _managed_update_command(_method),
             'min_python': remote_version.get('min_python', '3.8'),
             'breaking_changes': remote_version.get('breaking_changes', []),
         })
@@ -359,6 +420,22 @@ def perform_pegaprox_update():
     try:
         data = request.json or {}
         force = data.get('force', False)
+        allow_managed = bool(data.get('allow_managed', False))  # power-user escape hatch
+
+        # NS 2026-08-11 — refuse the git+pip file updater on installs it doesn't fit. On an
+        # apt/dpkg instance the correct path is `apt upgrade` (deps are system python3-*
+        # packages; a pip run can't lift the dpkg-owned crypto libs → fail-closed TLS brick on
+        # restart, and the file copy diverges from dpkg). On Docker the update is discarded at
+        # the next image pull. Route the operator instead of bricking them; allow_managed lets a
+        # power-user force it anyway.
+        _install_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        _method = _detect_install_method(_install_dir)
+        if _method in ('apt', 'docker') and not allow_managed:
+            return jsonify({
+                'error': 'in_app_update_not_supported',
+                'install_method': _method,
+                'message': _managed_update_guidance(_method),
+            }), 409
 
         # Protected paths - NEVER overwrite
         PROTECTED = [

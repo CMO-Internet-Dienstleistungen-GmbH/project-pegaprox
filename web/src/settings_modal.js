@@ -967,6 +967,10 @@
                     } else if (data.message === 'Already up to date') {
                         addToast(t('alreadyUpToDate') || 'Already up to date!', 'info');
                         setUpdateProgress(null);
+                    } else if (data.error === 'in_app_update_not_supported') {
+                        // NS: apt/docker install — the in-app updater must not run here.
+                        addToast(data.message || t('updateManagedExternally') || 'This install is updated outside the app (apt / docker).', 'info');
+                        setUpdateProgress(null);
                     } else {
                         addToast(data.error || t('updateFailed') || 'Update failed', 'error');
                         setUpdateProgress(null);
@@ -6953,18 +6957,45 @@
                                                         {t('released') || 'Released'}: {updateInfo.release_date || 'Unknown'}
                                                     </p>
                                                 </div>
-                                                <button
-                                                    onClick={performUpdate}
-                                                    disabled={updateLoading || updateProgress}
-                                                    className="flex items-center gap-2 px-6 py-3 bg-green-500 hover:bg-green-600 disabled:bg-gray-600 rounded-lg font-medium transition-colors"
-                                                >
-                                                    {updateLoading ? (
-                                                        <Icons.Loader className="animate-spin" />
-                                                    ) : (
-                                                        <Icons.Download />
-                                                    )}
-                                                    {t('installUpdate') || 'Install Update'}
-                                                </button>
+                                                {/* NS 2026-08-11 — apt/docker installs must not use the in-app file updater;
+                                                    show the correct path instead of the Install button. */}
+                                                {updateInfo.in_app_update_supported === false ? (
+                                                    <div className="max-w-xs text-right">
+                                                        <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-yellow-500/10 border border-yellow-500/30 text-yellow-300 text-xs font-medium">
+                                                            <Icons.AlertTriangle />
+                                                            {updateInfo.install_method === 'docker' ? (t('dockerInstall') || 'Docker install') : (t('aptInstall') || 'APT / package install')}
+                                                        </div>
+                                                        <p className="text-xs text-gray-400 mt-2 whitespace-pre-line">
+                                                            {updateInfo.managed_update_hint || (t('updateManagedExternally') || 'Update this instance through its package manager or image, not the in-app updater.')}
+                                                        </p>
+                                                        {updateInfo.managed_update_command && (
+                                                            <div className="mt-2 flex items-center gap-2 justify-end">
+                                                                <code className="px-2 py-1 rounded bg-black/40 border border-proxmox-border text-[11px] text-green-300 font-mono select-all">
+                                                                    {updateInfo.managed_update_command}
+                                                                </code>
+                                                                <button
+                                                                    onClick={() => { try { navigator.clipboard.writeText(updateInfo.managed_update_command); addToast(t('copied') || 'Copied', 'success'); } catch (e) {} }}
+                                                                    className="px-2 py-1 rounded bg-proxmox-dark border border-proxmox-border hover:border-gray-500 text-gray-400 text-[11px] shrink-0"
+                                                                >
+                                                                    {t('copy') || 'Copy'}
+                                                                </button>
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                ) : (
+                                                    <button
+                                                        onClick={performUpdate}
+                                                        disabled={updateLoading || updateProgress}
+                                                        className="flex items-center gap-2 px-6 py-3 bg-green-500 hover:bg-green-600 disabled:bg-gray-600 rounded-lg font-medium transition-colors"
+                                                    >
+                                                        {updateLoading ? (
+                                                            <Icons.Loader className="animate-spin" />
+                                                        ) : (
+                                                            <Icons.Download />
+                                                        )}
+                                                        {t('installUpdate') || 'Install Update'}
+                                                    </button>
+                                                )}
                                             </div>
                                             
                                             {/* Changelog */}
