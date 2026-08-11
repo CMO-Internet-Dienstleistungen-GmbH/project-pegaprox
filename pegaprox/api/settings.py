@@ -744,6 +744,30 @@ def perform_pegaprox_update():
                 audit_detail += f" (+{len(failed_files) - 5} more)"
         log_audit(user, 'pegaprox.update_completed', audit_detail)
 
+        # MK 2026-08-11 — preflight the crypto/TLS stack in the interpreter the restarted
+        # service will actually use (the venv), NOT this already-running one that still has the
+        # old deps in memory. Our TLS startup is fail-closed (#633): if the just-synced
+        # requirements didn't land a loadable cryptography/pyOpenSSL pair, restarting now takes
+        # the service down and it won't come back. Verify a self-signed cert can be generated
+        # first; if it can't, keep the current process up and let the operator fix deps.
+        deps_ok, deps_reason = True, ''
+        try:
+            _venv_py = os.path.join(install_dir, 'venv', 'bin', 'python')
+            _pf_py = _venv_py if os.path.exists(_venv_py) else sys.executable
+            _pf = subprocess.run(
+                [_pf_py, '-c',
+                 "from OpenSSL import crypto; k=crypto.PKey(); "
+                 "k.generate_key(crypto.TYPE_RSA, 2048); c=crypto.X509(); "
+                 "c.set_pubkey(k); c.sign(k, 'sha256')"],
+                capture_output=True, text=True, timeout=30)
+            if _pf.returncode != 0:
+                deps_ok = False
+                _err = (_pf.stderr or _pf.stdout or 'crypto preflight failed').strip().splitlines()
+                deps_reason = (_err[-1] if _err else 'crypto preflight failed')[:200]
+        except Exception as _pfe:
+            deps_ok = False
+            deps_reason = str(_pfe)[:200]
+
         # Schedule restart
         restart_delay = 3
 
@@ -780,7 +804,12 @@ def perform_pegaprox_update():
             except:
                 os._exit(0)
 
-        threading.Thread(target=restart_server, daemon=True).start()
+        if deps_ok:
+            threading.Thread(target=restart_server, daemon=True).start()
+        else:
+            logging.error(f"[update] restart SKIPPED — dependency/crypto preflight failed: {deps_reason}")
+            log_audit(user, 'pegaprox.update_restart_skipped',
+                      f"Restart withheld after update to {new_version}: crypto/deps preflight failed")
 
         # MK 2026-06-02: surface partial-success in the response so the UI can
         # show a warning instead of a green check when N files failed to write.
@@ -802,20 +831,29 @@ def perform_pegaprox_update():
         if version_mismatch:
             logging.warning(f"[update] post-copy version mismatch: on-disk {on_disk_version}, expected {new_version}")
 
-        partial = len(failed_files) > 0 or version_mismatch
+        partial = len(failed_files) > 0 or version_mismatch or not deps_ok
         _verb = 'Re-synced all files for' if resync else 'Update to'
+        if not deps_ok:
+            _msg = (f'{_verb} {new_version} was written to disk, but the Python dependency '
+                    f'upgrade did not complete — the service was NOT restarted and is still '
+                    f'running the previous version (this avoids a failed start). Update the '
+                    f'dependencies on the host (pip install -r requirements.txt) and restart '
+                    f'the service manually. Detail: {deps_reason}')
+        elif partial:
+            _msg = (f'{_verb} {new_version} partially applied — '
+                    f'{len(failed_files)} file(s) failed to write'
+                    f'{", on-disk version mismatch" if version_mismatch else ""}. '
+                    f'Restarting in {restart_delay}s...')
+        else:
+            _msg = f'{_verb} {new_version} complete! Restarting in {restart_delay}s...'
         return jsonify({
             'success': True,
             'partial': partial,
             'resync': resync,
+            'deps_ok': deps_ok,
             'on_disk_version': on_disk_version,
             'version_mismatch': version_mismatch,
-            'message': (f'{_verb} {new_version} complete! Restarting in {restart_delay}s...'
-                        if not partial else
-                        f'{_verb} {new_version} partially applied — '
-                        f'{len(failed_files)} file(s) failed to write'
-                        f'{", on-disk version mismatch" if version_mismatch else ""}. '
-                        f'Restarting in {restart_delay}s...'),
+            'message': _msg,
             'updated_version': new_version,
             'update_method': update_method,
             'backup_path': backup_path,
@@ -823,7 +861,7 @@ def perform_pegaprox_update():
             'files_failed': failed_files,
             'files_protected': skipped_protected,
             'pip_install': pip_result,
-            'restarting': True,
+            'restarting': deps_ok,
             'restart_delay': restart_delay
         })
 

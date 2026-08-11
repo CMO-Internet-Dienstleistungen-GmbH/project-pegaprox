@@ -419,6 +419,32 @@ else
     echo -e "${YELLOW}Couldn't install - run: pip install -r requirements.txt${NC}"
 fi
 
+# MK 2026-08-11 — preflight the crypto/TLS stack BEFORE bouncing the service. Startup is
+# fail-closed (#633): if the dependency step above didn't land a loadable cryptography/
+# pyOpenSSL pair (offline host, a source build that timed out, or a venv that kept the old
+# version), a restart takes the service down and it won't come back. Verify a self-signed
+# cert can actually be generated first; if not, leave the running service untouched.
+PY_BIN="python3"
+[ -x "venv/bin/python" ] && PY_BIN="venv/bin/python"
+CRYPTO_OK=true
+"$PY_BIN" - <<'PYEOF' >/dev/null 2>&1 || CRYPTO_OK=false
+from OpenSSL import crypto
+k = crypto.PKey(); k.generate_key(crypto.TYPE_RSA, 2048)
+c = crypto.X509(); c.set_pubkey(k); c.sign(k, 'sha256')
+PYEOF
+
+if [ "$CRYPTO_OK" = false ]; then
+    echo ""
+    echo -e "${YELLOW}⚠ Dependency/crypto preflight FAILED — NOT restarting the service.${NC}"
+    echo -e "${YELLOW}  The new version needs an updated cryptography/pyOpenSSL that isn't installed yet.${NC}"
+    echo -e "${YELLOW}  The service is still running the previous version. To finish the upgrade:${NC}"
+    echo    "    1) $PY_BIN -m pip install -r requirements.txt   (needs PyPI access; watch for build errors)"
+    echo    "    2) sudo systemctl restart pegaprox"
+    echo ""
+    echo -e "  Files are on disk at version ${GREEN}$LATEST_VERSION${NC}; it goes live once deps install and the service restarts."
+    exit 0
+fi
+
 # Restart service
 echo ""
 echo -n "Restarting PegaProx service... "
