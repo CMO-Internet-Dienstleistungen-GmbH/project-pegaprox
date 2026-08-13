@@ -1373,6 +1373,8 @@ def update_server_settings():
                 settings['acme_email'] = str(data['acme_email']).strip()
             if 'acme_staging' in data:
                 settings['acme_staging'] = bool(data['acme_staging'])
+            if 'acme_allow_private_ca' in data:
+                settings['acme_allow_private_ca'] = bool(data['acme_allow_private_ca'])
             if 'acme_challenge_type' in data:
                 challenge_type = str(data['acme_challenge_type'] or 'http-01').strip()
                 settings['acme_challenge_type'] = challenge_type if challenge_type in ('http-01', 'dns-01') else 'http-01'
@@ -1754,6 +1756,8 @@ def update_server_settings():
             settings['acme_enabled'] = request.form.get('acme_enabled', str(settings.get('acme_enabled', 'false'))).lower() == 'true'
             settings['acme_email'] = request.form.get('acme_email', settings.get('acme_email', '')).strip()
             settings['acme_staging'] = request.form.get('acme_staging', str(settings.get('acme_staging', 'false'))).lower() == 'true'
+            # NS Aug 2026 (#685) — opt-in to reach a private/internal ACME CA (StepCA on RFC1918)
+            settings['acme_allow_private_ca'] = request.form.get('acme_allow_private_ca', str(settings.get('acme_allow_private_ca', 'false'))).lower() == 'true'
             acme_challenge_type = request.form.get('acme_challenge_type', settings.get('acme_challenge_type', 'http-01')).strip()
             settings['acme_challenge_type'] = acme_challenge_type if acme_challenge_type in ('http-01', 'dns-01') else 'http-01'
             settings = _sanitize_acme_dns_settings(settings, request.form)

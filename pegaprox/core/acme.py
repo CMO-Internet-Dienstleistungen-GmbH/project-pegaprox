@@ -110,14 +110,27 @@ def _signed_request(url, payload, account_key, nonce, kid=None):
     return resp
 
 
+def _acme_allow_private():
+    """NS Aug 2026 (#685) — opt-in to allow an ACME directory on a private/internal address
+    (e.g. an in-house StepCA on RFC1918). Off by default, so the SSRF guard still blocks
+    private/loopback targets; when on, ONLY private-range blocking is relaxed — cloud-metadata
+    endpoints stay blocked regardless. Mirrors alert_webhook_allow_private / oidc_allow_private_ip."""
+    try:
+        from pegaprox.api.helpers import load_server_settings
+        return bool((load_server_settings() or {}).get('acme_allow_private_ca', False))
+    except Exception:
+        return False
+
+
 def _guard_acme_url(url):
     """M-8/M-9 (security audit): every ACME follow-on URL pulled out of the
     directory doc (newNonce/newAccount/newOrder/finalize/certificate/authz/
     challenge) must pass the SAME SSRF guard as the directory itself — a
     hostile/MITM'd directory response could point them at 169.254.169.254 /
-    RFC1918. Public CAs (Let's Encrypt) are unaffected. Raises SsrfError."""
+    RFC1918. Public CAs (Let's Encrypt) are unaffected. An internal CA (#685)
+    is allowed only when the operator opted in. Raises SsrfError."""
     from pegaprox.utils.url_security import sanitize_outbound_url
-    return sanitize_outbound_url(url)  # https-only + block-private (matches directory guard)
+    return sanitize_outbound_url(url, allow_private=_acme_allow_private())  # https-only
 
 
 def _get_nonce(directory):
@@ -311,9 +324,10 @@ def _create_order(domain, email, ssl_dir, staging=False, directory_url=None):
     logging.info(f"[ACME] Starting certificate request for {domain} ({env}) via {acme_url}")
     try:
         from pegaprox.utils.url_security import sanitize_outbound_url, SsrfError
-        sanitize_outbound_url(acme_url)
+        sanitize_outbound_url(acme_url, allow_private=_acme_allow_private())
     except SsrfError as guard_err:
-        return {'success': False, 'message': f'ACME directory URL rejected: {guard_err}'}
+        return {'success': False, 'message': f'ACME directory URL rejected: {guard_err} '
+                '(set "Allow private/internal ACME CA" in SSL settings if this is an internal CA)'}
 
     dir_resp = requests.get(acme_url, timeout=15, allow_redirects=False)  # M-8: no redirect to internal
     dir_resp.raise_for_status()

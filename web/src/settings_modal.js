@@ -718,6 +718,7 @@
                 acme_dns_rfc2136_ttl: 60,
                 acme_dns_propagation_seconds: 30,
                 acme_directory_url: '',
+                acme_allow_private_ca: false,
                 cert_info: null,
                 reverse_proxy_enabled: false,
                 // NS Apr 2026 — compliance / hardened-environment settings
@@ -1525,6 +1526,7 @@
                             acme_provider: acmeCertificate.provider || data.acme_provider || 'letsencrypt',
                             acme_email: acmeCertificate.email || data.acme_email || '',
                             acme_directory_url: acmeCertificate.directory_url || data.acme_directory_url || '',
+                            acme_allow_private_ca: data.acme_allow_private_ca ?? false,
                             acme_staging: acmeCertificate.staging ?? data.acme_staging ?? false,
                             acme_challenge_type: acmeCertificate.challenge_type || data.acme_challenge_type || 'http-01',
                             acme_dns_provider: acmeCertificate.dns_provider || data.acme_dns_provider || 'manual',
@@ -1771,6 +1773,7 @@
                     formData.append('acme_dns_rfc2136_ttl', serverSettings.acme_dns_rfc2136_ttl || 60);
                     formData.append('acme_dns_propagation_seconds', serverSettings.acme_dns_propagation_seconds || 30);
                     formData.append('acme_directory_url', serverSettings.acme_provider === 'custom' ? (serverSettings.acme_directory_url || '') : '');
+                    formData.append('acme_allow_private_ca', serverSettings.acme_allow_private_ca ? 'true' : 'false');
                     formData.append('reverse_proxy_enabled', serverSettings.reverse_proxy_enabled);
                     formData.append('audit_retention_days', String(serverSettings.audit_retention_days || 90));
                     formData.append('air_gap_mode', serverSettings.air_gap_mode ? 'true' : 'false');
@@ -6007,6 +6010,16 @@
                                                             className="w-full px-3 py-2 bg-proxmox-darker border border-proxmox-border rounded-lg text-white text-sm"
                                                         />
                                                         <p className="text-xs text-gray-500 mt-1">{t('acmeDirectoryUrlHint') || 'ACME directory endpoint of your CA (must be HTTPS)'}</p>
+                                                        <label className="flex items-center gap-2 cursor-pointer mt-2">
+                                                            <input
+                                                                type="checkbox"
+                                                                checked={!!serverSettings.acme_allow_private_ca}
+                                                                onChange={e => setServerSettings({...serverSettings, acme_allow_private_ca: e.target.checked})}
+                                                                className="rounded border-proxmox-border bg-proxmox-darker"
+                                                            />
+                                                            <span className="text-sm text-gray-300">{t('acmeAllowPrivateCa') || 'Allow private/internal ACME CA'}</span>
+                                                            <span className="text-xs text-gray-500">({t('acmeAllowPrivateCaHint') || 'permit an RFC1918/loopback directory, e.g. an internal StepCA'})</span>
+                                                        </label>
                                                     </div>
                                                 )}
 
