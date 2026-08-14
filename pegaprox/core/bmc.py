@@ -382,7 +382,11 @@ def _active_sel_events(sel):
     parse_sel). A 'Deasserted' entry clears its sensor, so an older 'Asserted' for the same
     sensor no longer counts — this is what stops a months-old 'AC lost' / 'PSU fail' log line
     from pinning the whole node to Critical after the fault cleared. Events with no
-    assert/deassert marker are treated as history, not current state."""
+    assert/deassert marker are treated as history, not current state.
+
+    Truncation-safe: parse_sel keeps the NEWEST events, and a deassert is always newer than the
+    assert it clears — so if an assert survives the cut, its deassert did too. The 25-event cap
+    can never strand a resolved assert as permanently active."""
     cleared, active = set(), []
     for e in sel:  # newest -> oldest
         key = (e.get('sensor') or '').lower()

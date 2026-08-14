@@ -57,6 +57,7 @@ def load_server_settings():
         'acme_dns_rfc2136_algorithm': 'hmac-sha512',
         'acme_dns_rfc2136_ttl': 60,
         'acme_dns_propagation_seconds': 30,
+        'acme_allow_private_ca': False,  # #685 — opt-in to reach a private/internal ACME CA (mirrors oidc_allow_private_ip)
         'logo_url': '',
         'app_name': 'PegaProx',
         # HTTP redirect port - NS Jan 2026
