@@ -288,6 +288,12 @@ def _cloudflare_api(token, method, path, params=None, json_body=None):
     except Exception:
         return {'success': False, 'message': f'Cloudflare API returned HTTP {resp.status_code}', 'status_code': resp.status_code}
 
+    # MK Aug 2026 (#691 follow-up) — a non-object JSON body (list/null/string from a proxy or a
+    # weird error) would make payload.get() below throw; that AttributeError could propagate out
+    # of the cleanup finally and leave the TXT record behind. Treat anything non-dict as failure.
+    if not isinstance(payload, dict):
+        return {'success': False, 'message': f'Cloudflare API returned an unexpected body (HTTP {resp.status_code})', 'status_code': resp.status_code}
+
     if not payload.get('success'):
         errors = payload.get('errors') or []
         detail = '; '.join(
