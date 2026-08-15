@@ -446,9 +446,16 @@ def _run_automated_dns01(provider_name, updater, dns_config, dns_name, dns_value
             context['kid'],
         )
     finally:
-        cleanup = updater(dns_config, dns_name, dns_value, action='delete')
-        if not cleanup.get('success'):
-            logging.warning(f"[ACME] {provider_name} TXT cleanup failed: {cleanup.get('message')}")
+        # MK Aug 2026 — the cleanup runs in a finally, so a *raised* updater (not just a
+        # failure dict) would propagate out and mask the validation result / abort finalization,
+        # leaving the challenge TXT behind. The non-dict guard in _cloudflare_api covers the one
+        # known CF trigger; wrap the whole call so no updater can ever swallow the real outcome.
+        try:
+            cleanup = updater(dns_config, dns_name, dns_value, action='delete')
+            if not cleanup.get('success'):
+                logging.warning(f"[ACME] {provider_name} TXT cleanup failed: {cleanup.get('message')}")
+        except Exception as cleanup_err:
+            logging.warning(f"[ACME] {provider_name} TXT cleanup raised, ignoring: {cleanup_err}")
 
     if not result or not result.get('success'):
         return result or {'success': False, 'message': f'{provider_name} DNS-01 validation failed'}
