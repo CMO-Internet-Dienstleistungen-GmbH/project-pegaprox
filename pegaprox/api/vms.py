@@ -1242,9 +1242,13 @@ def download_iso_from_url(cluster_id, storage_name):
         # metadata-by-hostname. Delegate to the central guard, which fails CLOSED
         # (require_resolution) and blocks private/loopback/link-local/metadata. The URL is
         # fetched by the Proxmox node, so this SSRF would fire from the PVE management LAN.
-        from pegaprox.utils.url_security import sanitize_outbound_url, SsrfError
+        from pegaprox.utils.url_security import resolve_and_pin_url, SsrfError
         try:
-            url = sanitize_outbound_url(url, allowed_schemes=('https', 'http'))
+            # GHSA-hmcf-9q7f-vx35 — the download is delegated to the PVE node, which re-resolves the
+            # host on its own box AND (below) fetches with verify-certificates=0, so a low-TTL rebind
+            # could dodge the guard. Pin the vetted IP into the URL (both http and https, since PVE
+            # won't verify the cert) so there is no second resolution to rebind.
+            url = resolve_and_pin_url(url, allowed_schemes=('https', 'http'), tls_verified=False)
         except SsrfError as _ssrf:
             return jsonify({'error': f'URL rejected by SSRF guard: {_ssrf}'}), 400
 
