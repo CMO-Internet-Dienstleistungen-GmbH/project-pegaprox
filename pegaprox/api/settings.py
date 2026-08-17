@@ -4448,6 +4448,7 @@ def start_rolling_update(cluster_id):
                     # Step 4: If reboot was included, wait for node to come back
                     if include_reboot:
                         mgr._rolling_update['current_step'] = 'rebooting'
+                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Evaluating if node {node_name} requires a reboot. Analyzing...")
                         mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Node {node_name} rebooting (timeout: {reboot_timeout}s)...")
                         if 'rebooting_nodes' not in mgr._rolling_update:
                             mgr._rolling_update['rebooting_nodes'] = []
