@@ -8935,35 +8935,63 @@ echo "AGENT_INSTALLED_OK"
                         stdin, stdout, stderr = ssh.exec_command('id -u')
                         uid = stdout.read().decode().strip()
                         is_root = (uid == '0')
-                        
-                        self.logger.info(f"Sending reboot command to {node_name} (root={is_root})")
-                        task.add_output(f"Running as {'root' if is_root else 'non-root user'}")
-                        
-                        # Get transport and open channel with PTY for sudo support
-                        transport = ssh.get_transport()
-                        channel = transport.open_session()
-                        channel.get_pty()
-                        channel.settimeout(10)
-                        
-                        # Execute reboot command
-                        if is_root:
-                            channel.exec_command('shutdown -r now')
+
+                        # Check if related node requires a reboot
+                        needrestart_utility = False
+                        needrestart_validated = False
+                        self.logger.info(f"Validate if package needrestart is installed on node: {node_name}")
+                        exit_code, output, stderr = self._ssh_execute(ssh, f'{sudo_prefix}dpkg -s needrestart', task)
+
+                        if exit_code == 0:
+                            needrestart_utility = True
+                            self.logger.info(f"Package needrestart is installed on node: {node_name}")
                         else:
-                            channel.exec_command('sudo shutdown -r now')
-                        
-                        # Wait briefly for command to be sent
-                        time.sleep(3)
-                        
-                        # Try to read any output (will fail when connection drops, that's ok)
-                        try:
-                            output = channel.recv(1024).decode()
-                            if output:
-                                task.add_output(f"Reboot output: {output.strip()}")
-                        except:
-                            pass
-                        
-                        channel.close()
-                        task.add_output("Reboot command sent / Reboot-Befehl gesendet")
+                            self.logger.info(f"Package needrestart is not installed on node: {node_name} - forcing to reboot!")
+                            needrestart_validated = True
+
+                        if needrestart_utility:
+                            self.logger.info(f"Validate if node {node_name} requires a restart (needrestart utility mode)")
+                            exit_code, output, stderr = self._ssh_execute(ssh, f'{sudo_prefix}needrestart -p', task)
+                            
+                            if exit_code != 0:
+                                self.logger.info(f"Node {node_name} requires a restart (needrestart utility mode)")
+                                needrestart_validated = True
+                            else:
+                                self.logger.info(f"Node {node_name} does NOT require a restart (needrestart utility mode)")
+
+                        # Run reboot only if this got validated for the related node
+                        if needrestart_validated:
+                            self.logger.info(f"Sending reboot command to {node_name} (root={is_root})")
+                            task.add_output(f"Running as {'root' if is_root else 'non-root user'}")
+                            
+                            # Get transport and open channel with PTY for sudo support
+                            transport = ssh.get_transport()
+                            channel = transport.open_session()
+                            channel.get_pty()
+                            channel.settimeout(10)
+                            
+                            # Execute reboot command
+                            if is_root:
+                                channel.exec_command('shutdown -r now')
+                            else:
+                                channel.exec_command('sudo shutdown -r now')
+                            
+                            # Wait briefly for command to be sent
+                            time.sleep(3)
+                            
+                            # Try to read any output (will fail when connection drops, that's ok)
+                            try:
+                                output = channel.recv(1024).decode()
+                                if output:
+                                    task.add_output(f"Reboot output: {output.strip()}")
+                            except:
+                                pass
+                            
+                            channel.close()
+                            task.add_output("Reboot command sent / Reboot-Befehl gesendet")
+                        else:
+                            self.logger.info(f"Skipping reboot for node: {node_name}")
+                            task.add_output(f"Skipping reboot for node: {node_name}")
                         
                     except Exception as e:
                         self.logger.info(f"Reboot command sent (connection closed as expected): {e}")
@@ -8974,25 +9002,7 @@ echo "AGENT_INSTALLED_OK"
                         except:
                             pass
                         ssh = None
-                else:
-                    task.add_output("[WARN] Could not reconnect for reboot / Konnte nicht für Reboot verbinden")
-                    task.add_output("Trying alternative reboot method / Versuche alternative Methode...")
-                    
-                    # Try via Proxmox API as fallback
-                    try:
-                        # MK May 2026 — was `self.session.post(..., verify=False)` which
-                        # hardcoded the SSL bypass even when the operator configured
-                        # `_ssl_verify=True` on this cluster. Use _create_session()
-                        # so the per-cluster TLS preference is honoured (proper CA
-                        # verification when the user pinned a custom CA bundle).
-                        url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node_name}/status"
-                        response = self._create_session().post(url, data={'command': 'reboot'})
-                        if response.status_code == 200:
-                            task.add_output("Reboot initiated via Proxmox API")
-                        else:
-                            task.add_output(f"API reboot failed: {response.status_code}")
-                    except Exception as api_e:
-                        task.add_output(f"API reboot also failed: {api_e}")
+
                 
                 task.add_output("Waiting for node to reboot / Warte auf Neustart...")
                 
