@@ -1169,6 +1169,29 @@ class PegaProxManager:
 
                         if resp.status_code == 200:
                             data = resp.json()['data']
+                            # NS Aug 2026 (#683) — PVE returns HTTP 200 with NeedTFA:1 and a PARTIAL
+                            # ticket when the account has TFA/2FA enabled. A partial ticket can't make
+                            # API calls (and can't even auto-create a token), so blindly accepting it
+                            # marked the cluster "connected" and then every request failed — the
+                            # reported "connected for ~2 min then offline" with no guidance. Fail fast
+                            # with an actionable message; this is an account-level issue, so don't
+                            # retry the other hosts with the same credentials.
+                            if data.get('NeedTFA'):
+                                # English fallback for logs / non-UI callers; the frontend renders a
+                                # translated message off `error_code` (see add_cluster / translations).
+                                msg = ("This Proxmox account has two-factor authentication enabled. "
+                                       "Password login only returns a partial ticket that cannot be used "
+                                       "for API access. Either add the cluster with an API token "
+                                       "(Datacenter → Permissions → API Tokens), or temporarily disable "
+                                       "two-factor authentication on the account to add it (PegaProx "
+                                       "creates an API token automatically), then re-enable it.")
+                                self.logger.warning(f"{host}: account requires 2FA (NeedTFA) — password auth cannot proceed")
+                                self._ticket = None
+                                self._csrf_token = None
+                                self.is_connected = False
+                                self.connection_error = msg
+                                self.connection_error_code = 'NEEDS_2FA'   # #683 — frontend maps this to a localized message
+                                return False
                             self._ticket = data['ticket']
                             self._csrf_token = data['CSRFPreventionToken']
                             self._api_token = None
@@ -9791,10 +9814,16 @@ echo "AGENT_INSTALLED_OK"
                 # parse volume ID ':1'". `or storage` handles both missing + empty.
                 efi_storage = vm_config.get('efi_storage') or storage
                 efi_type = "4m"
+                _efi = f"{efi_storage}:1,efitype={efi_type}"
                 if vm_config.get('efi_pre_enroll'):
-                    data['efidisk0'] = f"{efi_storage}:1,efitype={efi_type},pre-enrolled-keys=1"
-                else:
-                    data['efidisk0'] = f"{efi_storage}:1,efitype={efi_type}"
+                    _efi += ",pre-enrolled-keys=1"
+                # #678 — expose the disk format (raw/qcow2) like Proxmox does; omitting it keeps the
+                # storage's implicit default (previous behaviour). The UI only offers formats the
+                # target storage actually supports.
+                efi_fmt = vm_config.get('efi_format')
+                if efi_fmt:
+                    _efi += f",format={efi_fmt}"
+                data['efidisk0'] = _efi
                 # UEFI requires q35 machine type
                 if not vm_config.get('machine') or vm_config.get('machine') in ['i440fx', 'pc']:
                     data['machine'] = 'q35'
@@ -9802,7 +9831,11 @@ echo "AGENT_INSTALLED_OK"
             # TPM
             if vm_config.get('tpm_storage'):
                 tpm_version = vm_config.get('tpm_version', 'v2.0')
-                data['tpmstate0'] = f"{vm_config['tpm_storage']}:1,version={tpm_version}"
+                _tpm = f"{vm_config['tpm_storage']}:1,version={tpm_version}"
+                tpm_fmt = vm_config.get('tpm_format')   # #678 — same optional format= as efidisk0
+                if tpm_fmt:
+                    _tpm += f",format={tpm_fmt}"
+                data['tpmstate0'] = _tpm
             
             # Network
             net_model = vm_config.get('net_model', 'virtio')
