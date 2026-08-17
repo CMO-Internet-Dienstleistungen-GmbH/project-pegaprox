@@ -289,7 +289,10 @@
                         setClusterTags(Array.from(tagSet).sort().map(name => ({ name })));
                     })
                     .catch(() => {});
-            }, [vm, clusterId]);
+                // depend on stable VM identity, not the whole vm object — a parent re-render
+                // that rebuilds `vm` would otherwise re-fire every fetch and bounce the modal
+                // back to the loading spinner (#698). vmid+node+type is enough to key a refetch.
+            }, [vm.vmid, vm.node, vm.type, clusterId]);
 
             // NS: SSE vm_config live-update listener — split from the fetch effect so
             // re-subscribing when the user's edit state changes never re-fires the
@@ -346,7 +349,7 @@
                 if (isQemu && (activeTab === 'hardware' || activeTab === 'resources')) {
                     fetchPassthrough();
                 }
-            }, [activeTab, vm, clusterId]);
+            }, [activeTab, vm.vmid, vm.node, vm.type, clusterId]);
 
             const fetchPassthrough = async () => {
                 if (vm.type !== 'qemu') return;
