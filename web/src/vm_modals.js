@@ -140,7 +140,7 @@
         // Clone VM Modal
         // LW: Supports both linked clones and full clones
         // Full clone takes longer but is independent from source
-        function CloneVmModal({ vm, nodes, clusterId, onClone, onClose }) {
+        function CloneVmModal({ vm, nodes, clusterId, storages, onClone, onClose }) {
             const { t } = useTranslation();
             const { getAuthHeaders } = useAuth();
             
@@ -155,6 +155,7 @@
                 newid: '',
                 full: true,
                 target_node: vm.node,
+                target_storage: '',
                 description: '',
                 // #194: Cloud-Init fields
                 ciuser: '', cipassword: '', sshkeys: '', ipconfig0: '', nameserver: '', searchdomain: ''
@@ -181,6 +182,47 @@
             }, []);  // intentionally empty deps — snapshot once on mount
 
             const isQemu = vm.type === 'qemu';
+
+            // Build storage list filtered to the selected target node (shared + local on that node)
+            const storageList = useMemo(() => {
+                if (!storages) return [];
+                const target = cloneConfig.target_node;
+                const items = [];
+                // shared datastores are available everywhere
+                (storages.shared || []).forEach(s => {
+                    items.push({ name: s.storage, type: s.type, content: s.content, avail: s.avail });
+                });
+                // local datastores only on the selected target node
+                if (target) {
+                    const nodeLocal = storages.local?.[target] || [];
+                    nodeLocal.forEach(s => {
+                        // skip if already added as shared
+                        if (!items.find(i => i.name === s.storage)) {
+                            items.push({ name: s.storage, type: s.type, content: s.content, avail: s.avail });
+                        }
+                    });
+                }
+                // filter by content type compatible with the VM being cloned
+                const neededContent = isQemu ? 'images' : 'rootdir';
+                return items.length > 0 && !vm._sourceStorage ? items.filter(s => s.content.includes(neededContent)) : items;
+            }, [storages, cloneConfig.target_node, isQemu, vm._sourceStorage]);
+
+            // default target_storage: prefer source VM's storage, then first shared, then first available
+            useEffect(() => {
+                if (!cloneConfig.target_storage && storageList.length > 0) {
+                    // detect source VM storage from disk field (e.g. "scsi0:local-zfs:64")
+                    let src = vm._sourceStorage;
+                    if (!src && vm.disk) {
+                        try {
+                            const match = vm.disk.match(/(\w+):([a-zA-Z0-9_-]+)/);
+                            if (match) src = match[2];
+                        } catch(_) {}
+                    }
+                    src = src || (storageList.find(s => s.shared) || storageList[0])?.name;
+                    if (src) setCloneConfig(prev => ({ ...prev, target_storage: src }));
+                }
+                // eslint-disable-next-line react-hooks/exhaustive-deps
+            }, [storageList]);
 
             // Get next available VMID on mount
             useEffect(() => {
@@ -303,6 +345,27 @@
                                     </button>
                                 </div>
                             </div>
+
+                            {/* Target storage selector */}
+                            {storageList.length > 0 && (
+                                <div>
+                                    <label className="block text-xs text-gray-400 mb-1">{t('targetStorage')}</label>
+                                    <select
+                                        value={cloneConfig.target_storage}
+                                        onChange={(e) => setCloneConfig({...cloneConfig, target_storage: e.target.value})}
+                                        className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm"
+                                    >
+                                        {storageList.map(s => {
+                                            const availGb = s.avail ? Math.round(s.avail / 1073741824) : '?';
+                                            return(
+                                                <option key={s.name} value={s.name}>
+                                                    {s.name} ({s.type}) - {availGb} GB {t('free')}
+                                                </option>
+                                            );
+                                        })}
+                                    </select>
+                                </div>
+                            )}
 
                             {/* #194: Cloud-Init config (QEMU only) */}
                             {isQemu && (

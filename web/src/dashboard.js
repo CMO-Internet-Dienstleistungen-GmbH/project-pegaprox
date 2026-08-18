@@ -13140,6 +13140,7 @@
                                 name: cloneConfig.name,
                                 full: cloneConfig.full,
                                 target_node: cloneConfig.target_node,
+                                target_storage: cloneConfig.target_storage,
                                 description: cloneConfig.description
                             })
                         }
@@ -13148,7 +13149,7 @@
                     if (response && response.ok) {
                         const result = await response.json();
                         addToast(result.message || `${t('cloneStarted') || 'Clone started'}: ${vm.vmid} ↑ ${cloneConfig.newid}`);
-                        setShowCloneModal(null);
+                        setDashCloneVm(null);
                         setTimeout(() => fetchClusterResources(selectedCluster.id), 3000);
                     } else if (response) {
                         const err = await response.json();
@@ -13694,7 +13695,7 @@
                             <MigrateModal vm={dashMigrateVm} nodes={Object.keys(clusterMetrics)} clusterId={dashMigrateVm._clusterId || selectedCluster?.id} onMigrate={handleMigrate} onClose={() => setDashMigrateVm(null)} />
                         )}
                         {dashCloneVm && (
-                            <CloneVmModal vm={dashCloneVm} nodes={Object.keys(clusterMetrics)} clusterId={dashCloneVm._clusterId || selectedCluster?.id} onClone={handleCloneVm} onClose={() => setDashCloneVm(null)} />
+                            <CloneVmModal vm={dashCloneVm} nodes={Object.keys(clusterMetrics)} clusterId={dashCloneVm._clusterId || selectedCluster?.id} storages={clusterDatastores} onClone={handleCloneVm} onClose={() => setDashCloneVm(null)} />
                         )}
                         {dashDeleteVm && (
                             <DeleteVmModal vm={dashDeleteVm} clusterId={dashDeleteVm._clusterId || selectedCluster?.id} onDelete={handleDeleteVm} onClose={() => setDashDeleteVm(null)} />
@@ -15526,6 +15527,7 @@
                                                             onForceStop={handleForceStop}
                                                             onCrossClusterMigrate={handleCrossClusterMigrate}
                                                             nodes={Object.keys(clusterMetrics)}
+                                                            datastores={clusterDatastores}
                                                             onOpenTags={(resource) => {
                                                                 loadVmTags(selectedCluster.id, resource.vmid);
                                                                 loadClusterTags(selectedCluster.id);
@@ -22664,6 +22666,7 @@
                             vm={dashCloneVm}
                             nodes={Object.keys(clusterMetrics)}
                             clusterId={dashCloneVm._clusterId || selectedCluster?.id}
+                            storages={clusterDatastores}
                             onClone={handleCloneVm}
                             onClose={() => setDashCloneVm(null)}
                         />
