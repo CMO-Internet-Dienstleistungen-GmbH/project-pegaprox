@@ -1448,18 +1448,23 @@
                 return parts.join(':');
             };
 
+            const diskBusSlotLimits = { ide: 4, scsi: 30, sata: 30, virtio: 30, mp: 30 };
+            const getDiskBusSlots = (bus) => Array.from(
+                { length: diskBusSlotLimits[bus] || 30 },
+                (_, index) => String(index)
+            );
+
             const getNextDiskId = (busType = 'scsi') => {
                 const existing = config?.disks?.filter(d => d.id.startsWith(busType)).map(d => parseInt(d.id.replace(busType, ''))) || [];
-                for (let i = 0; i < 30; i++) {
-                    if (!existing.includes(i)) return `${busType}${i}`;
+                for (const slot of getDiskBusSlots(busType)) {
+                    if (!existing.includes(Number(slot))) return `${busType}${slot}`;
                 }
                 return `${busType}0`;
             };
 
             const getFirstFreeCloudInitDevice = (bus) => {
-                const slots = bus === 'ide' ? ['0', '1', '2', '3'] : ['0', '1', '2', '3', '4', '5'];
                 const used = new Set(Object.keys(config?.raw || {}));
-                return slots.find(slot => !used.has(`${bus}${slot}`)) || '';
+                return getDiskBusSlots(bus).find(slot => !used.has(`${bus}${slot}`)) || '';
             };
 
             const getCloudInitFormatsForStorage = (storageName) => {
@@ -5908,7 +5913,7 @@
                                                 onChange={(e) => setCloudInitDevice(e.target.value)}
                                                 className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white"
                                             >
-                                                {(cloudInitBus === 'ide' ? ['0', '1', '2', '3'] : ['0', '1', '2', '3', '4', '5']).map(slot => {
+                                                {getDiskBusSlots(cloudInitBus).map(slot => {
                                                     const driveId = `${cloudInitBus}${slot}`;
                                                     const occupied = Boolean(config?.raw?.[driveId]);
                                                     return <option key={slot} value={slot} disabled={occupied}>{driveId}{occupied ? ` (${t('inUse')})` : ''}</option>;
