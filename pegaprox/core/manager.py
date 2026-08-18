@@ -9186,9 +9186,9 @@ echo "AGENT_INSTALLED_OK"
             self.logger.error(f"[ERROR] vm_action: {e}")
             return {'success': False, 'error': str(e)}
     
-    def clone_vm(self, node: str, vmid: int, vm_type: str, newid: int, name: str = None, 
+    def clone_vm(self, node: str, vmid: int, vm_type: str, newid: int, name: str = None,
                  full: bool = True, target_node: str = None, target_storage: str = None,
-                 description: str = None) -> Dict[str, Any]:
+                 description: str = None, snapname: str = None) -> Dict[str, Any]:
         """clone a vm"""
         # MK: full clone = independent copy, linked clone = shares base with original
         # linked clones only work for qemu
@@ -9229,7 +9229,11 @@ echo "AGENT_INSTALLED_OK"
                 data['storage'] = target_storage
             if description:
                 data['description'] = description
-            
+            # #709 — PVE only allows a FULL clone of a running container from a snapshot; the caller
+            # passes the snapshot name to clone from (also valid for a stopped source).
+            if snapname:
+                data['snapname'] = snapname
+
             self._no_agent_vms.discard(newid)  # #237
             self.logger.info(f"Cloning {vm_type}/{vmid} to {newid} (full={full})")
             response = self._api_post(url, data=data)

@@ -719,6 +719,14 @@ def get_datastores(cluster_id):
                     'nodes': config.get('nodes', ''),
                 }
 
+                # NS Aug 2026 (#708) — honor the storage's node restriction (config `nodes`). A
+                # storage enabled only on OTHER nodes must not be shown for this node: PVE still lists
+                # it per-node with active=0, which the UI then renders as "unreachable". The offline
+                # fallback below already applies this filter; the online path didn't.
+                _node_filter = config.get('nodes', '')
+                if _node_filter and node not in [x.strip() for x in _node_filter.split(',') if x.strip()]:
+                    continue
+
                 if is_shared:
                     if storage_name not in shared_storages:
                         shared_storages[storage_name] = dict(storage_info)
