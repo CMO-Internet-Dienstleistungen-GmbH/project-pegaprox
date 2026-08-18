@@ -2480,6 +2480,17 @@ def trigger_balance_now(cluster_id):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
 
+    # NS Aug 2026 (Aikido 469089250) — balance-now spawns cluster-wide node-to-node VM migrations, so
+    # confine it to clusters the caller's TENANT owns; a user who reached this cluster only via a
+    # single VM-ACL / pool grant (the #248/#555 fallbacks in check_cluster_access) must not rebalance
+    # VMs outside their scope. Admins / default-tenant (get_user_clusters None) unaffected. Mirrors
+    # the cluster-group balance guard in groups.py.
+    _usr = getattr(request, 'session', {}).get('user', 'system')
+    _allowed = get_user_clusters(load_users().get(_usr, {}))
+    if _allowed is not None and cluster_id not in _allowed:
+        log_audit(_usr, 'balance.manual_denied', f"Denied balance-now on {cluster_id} (not tenant-owned)")
+        return jsonify({'error': 'Access denied'}), 403
+
     mgr = cluster_managers.get(cluster_id)
     if not mgr:
         return jsonify({'error': 'Cluster not found'}), 404
