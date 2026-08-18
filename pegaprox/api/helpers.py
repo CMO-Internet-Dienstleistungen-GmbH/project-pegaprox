@@ -381,6 +381,15 @@ def check_cluster_access(cluster_id):
         except Exception:
             from pegaprox.utils.auth import load_users
             user = load_users().get(request.session['user'], {})
+    # #491 — for an API token, floor the acting role to the token's grant (like build_authz_user)
+    # so an admin-owned scoped token can't reach clusters outside its scope. Done inline (a copy,
+    # not mutating g.current_user) to avoid the whole-table load_users() this hot path deliberately
+    # skips; get_user_clusters now honors effective_role.
+    if request.session.get('api_token') and isinstance(user, dict) and 'effective_role' not in user:
+        from pegaprox.models.permissions import ROLE_ADMIN, ROLE_USER, ROLE_VIEWER
+        _h = {ROLE_ADMIN: 3, ROLE_USER: 2, ROLE_VIEWER: 1}
+        _eff = min(_h.get(request.session.get('role'), 1), _h.get(user.get('role'), 1))
+        user = {**user, 'effective_role': next((r for r, lvl in _h.items() if lvl == _eff), ROLE_VIEWER)}
     allowed = get_user_clusters(user)
     if allowed is not None and cluster_id not in allowed:
         # #248: check VM ACLs as fallback — users with VM-level access can reach the cluster
