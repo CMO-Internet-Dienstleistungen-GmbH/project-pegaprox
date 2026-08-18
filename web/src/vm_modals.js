@@ -204,22 +204,18 @@
                 }
                 // filter by content type compatible with the VM being cloned
                 const neededContent = isQemu ? 'images' : 'rootdir';
-                return items.length > 0 && !vm._sourceStorage ? items.filter(s => s.content.includes(neededContent)) : items;
-            }, [storages, cloneConfig.target_node, isQemu, vm._sourceStorage]);
+                return items.length > 0 ? items.filter(s => s.content.includes(neededContent)) : items;
+            }, [storages, cloneConfig.target_node, isQemu]);
 
-            // default target_storage: prefer source VM's storage, then first shared, then first available
+            // NS Aug 2026 — leave target_storage EMPTY by default: an empty value isn't sent to the
+            // clone API, so Proxmox keeps the source VM's storage (the pre-picker behaviour). The
+            // old "default to source storage" code was dead (vm._sourceStorage never set, vm.disk is
+            // a byte count) and silently retargeted every clone to the first shared storage. The user
+            // opts into a different target via the picker. Only reset the selection if a target-node
+            // change made the currently-picked storage unavailable on the new node.
             useEffect(() => {
-                if (!cloneConfig.target_storage && storageList.length > 0) {
-                    // detect source VM storage from disk field (e.g. "scsi0:local-zfs:64")
-                    let src = vm._sourceStorage;
-                    if (!src && vm.disk) {
-                        try {
-                            const match = vm.disk.match(/(\w+):([a-zA-Z0-9_-]+)/);
-                            if (match) src = match[2];
-                        } catch(_) {}
-                    }
-                    src = src || (storageList.find(s => s.shared) || storageList[0])?.name;
-                    if (src) setCloneConfig(prev => ({ ...prev, target_storage: src }));
+                if (cloneConfig.target_storage && !storageList.some(s => s.name === cloneConfig.target_storage)) {
+                    setCloneConfig(prev => ({ ...prev, target_storage: '' }));
                 }
                 // eslint-disable-next-line react-hooks/exhaustive-deps
             }, [storageList]);
@@ -243,8 +239,12 @@
             const handleClone = async () => {
                 if (!cloneConfig.newid) return;
                 setLoading(true);
-                await onClone(vm, cloneConfig);
+                const ok = await onClone(vm, cloneConfig);
                 setLoading(false);
+                // #702 — close on success. Covers the table view too (its modal is ResourceTable's
+                // own state, which the parent's onClone can't reach); onClose maps to the right
+                // setter in both card and table callers.
+                if (ok) onClose();
             };
 
             return(
@@ -355,6 +355,7 @@
                                         onChange={(e) => setCloneConfig({...cloneConfig, target_storage: e.target.value})}
                                         className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm"
                                     >
+                                        <option value="">{t('sourceStorageDefault') || 'Source storage (default)'}</option>
                                         {storageList.map(s => {
                                             const availGb = s.avail ? Math.round(s.avail / 1073741824) : '?';
                                             return(

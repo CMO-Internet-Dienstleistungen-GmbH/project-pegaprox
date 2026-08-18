@@ -1468,15 +1468,17 @@
             };
 
             const getCloudInitFormatsForStorage = (storageName) => {
+                // NS Aug 2026 — a cloud-init drive is a tiny config disk; keep the format valid for
+                // the target: raw-first everywhere (Proxmox's own default, cf. templates_lib.py which
+                // attaches plain `storage:cloudinit`), block storages are raw-only, and vmdk is not a
+                // valid cloud-init format so it's dropped. Prevents PVE rejecting qcow2-on-LVM /
+                // vmdk-cloud-init combos the original PR offered.
                 const storageType = storageList.find(s => s.storage === storageName)?.type;
                 if (!storageType) return ['raw', 'qcow2'];
                 switch (storageType) {
-                    case 'dir': case 'nfs': case 'cifs': case 'glusterfs':
-                        return ['qcow2', 'raw', 'vmdk'];
-                    case 'btrfs':
+                    case 'dir': case 'nfs': case 'cifs': case 'glusterfs': case 'btrfs':
                         return ['raw', 'qcow2'];
                     case 'lvm': case 'lvmthin':
-                        return ['qcow2', 'raw'];
                     case 'zfspool': case 'zfs': case 'rbd': case 'iscsi': case 'iscsidirect':
                         return ['raw'];
                     default:
@@ -1484,7 +1486,11 @@
                 }
             };
 
-            const cloudInitStorageFormats = cloudInitStorage ? getCloudInitFormatsForStorage(cloudInitStorage) : ['raw', 'qcow2'];
+            // memoized so the reset-effect below doesn't fire on every render (stable array identity)
+            const cloudInitStorageFormats = useMemo(
+                () => cloudInitStorage ? getCloudInitFormatsForStorage(cloudInitStorage) : ['raw', 'qcow2'],
+                [cloudInitStorage, storageList]
+            );
 
             useEffect(() => {
                 if (!showAddCloudInit) return;

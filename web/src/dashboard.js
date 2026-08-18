@@ -13151,6 +13151,7 @@
                         addToast(result.message || `${t('cloneStarted') || 'Clone started'}: ${vm.vmid} ↑ ${cloneConfig.newid}`);
                         setDashCloneVm(null);
                         setTimeout(() => fetchClusterResources(selectedCluster.id), 3000);
+                        return true;   // #702 — signal success so the table-view modal can self-close
                     } else if (response) {
                         const err = await response.json();
                         addToast(err.error || t('cloneFailed'), 'error');
