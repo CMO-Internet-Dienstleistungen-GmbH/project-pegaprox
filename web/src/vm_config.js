@@ -2346,7 +2346,7 @@
                                                     <div className="mt-6 pt-6 border-t border-proxmox-border">
                                                         <h3 className="text-white font-medium mb-4 flex items-center gap-2">
                                                             <Icons.Cloud className="w-4 h-4 text-cyan-400" />
-                                                            {t('cloudInitDrive') || 'Cloud-Init drive'}
+                                                            {t('cloudInitDrive')}
                                                         </h3>
                                                         {(() => {
                                                             const cloudInitDrive = Object.entries(config?.raw || {}).find(([key, value]) =>
@@ -2362,7 +2362,7 @@
                                                                         </div>
                                                                         <button
                                                                             onClick={async () => {
-                                                                                if (!confirm(t('confirmDeleteCloudInitDrive') || 'Remove this Cloud-Init drive?')) return;
+                                                                                if (!confirm(t('confirmDeleteCloudInitDrive'))) return;
                                                                                 try {
                                                                                     const res = await authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}/config`, {
                                                                                         method: 'PUT',
@@ -2370,11 +2370,11 @@
                                                                                         body: JSON.stringify({ delete: cloudInitDrive[0] })
                                                                                     });
                                                                                     if (res?.ok) {
-                                                                                        addToast(t('cloudInitDriveRemoved') || 'Cloud-Init drive removed', 'success');
+                                                                                        addToast(t('cloudInitDriveRemoved'), 'success');
                                                                                         fetchConfig();
                                                                                     } else {
                                                                                         const err = await res.json();
-                                                                                        addToast(err.error || 'Error removing Cloud-Init drive', 'error');
+                                                                                        addToast(err.error || t('cloudInitDriveRemoveFailed'), 'error');
                                                                                     }
                                                                                 } catch (e) {
                                                                                     addToast(t('connectionError'), 'error');
@@ -2390,13 +2390,13 @@
                                                             ) : (
                                                                 <div className="p-3 bg-proxmox-dark rounded-lg border border-dashed border-proxmox-border">
                                                                     <div className="flex items-center justify-between gap-4">
-                                                                        <span className="text-sm text-gray-500">{t('noCloudInitDrive') || 'No Cloud-Init drive configured'}</span>
+                                                                        <span className="text-sm text-gray-500">{t('noCloudInitDrive')}</span>
                                                                         <button
                                                                             onClick={() => setShowAddCloudInit(true)}
                                                                             className="shrink-0 text-xs px-3 py-1.5 bg-cyan-500/20 text-cyan-400 rounded hover:bg-cyan-500/30 flex items-center gap-1"
                                                                         >
                                                                             <Icons.Plus className="w-3 h-3" />
-                                                                            {t('addCloudInitDrive') || 'Add Cloud-Init drive'}
+                                                                            {t('addCloudInitDrive')}
                                                                         </button>
                                                                     </div>
                                                                 </div>
@@ -5864,11 +5864,11 @@
                             <div className="w-full max-w-md bg-proxmox-card border border-proxmox-border rounded-xl p-6">
                                 <h3 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
                                     <Icons.Cloud className="text-cyan-400" />
-                                    {t('addCloudInitDrive') || 'Add Cloud-Init drive'}
+                                    {t('addCloudInitDrive')}
                                 </h3>
                                 <div className="space-y-4">
                                     <div>
-                                        <label className="block text-xs text-gray-400 mb-1">{t('storage') || 'Storage'}</label>
+                                        <label className="block text-xs text-gray-400 mb-1">{t('storage')}</label>
                                         <select
                                             value={cloudInitStorage}
                                             onChange={(e) => {
@@ -5878,7 +5878,7 @@
                                             }}
                                             className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white"
                                         >
-                                            <option value="">{t('selectStorage') || 'Select storage...'}</option>
+                                                <option value="">{t('selectStorage')}</option>
                                             {storageList.filter(s => s.content?.includes('images')).map(s => (
                                                 <option key={s.storage} value={s.storage}>{s.storage}</option>
                                             ))}
@@ -5886,7 +5886,7 @@
                                     </div>
                                     <div className="grid grid-cols-2 gap-4">
                                         <div>
-                                            <label className="block text-xs text-gray-400 mb-1">{t('busType') || 'Bus Type'}</label>
+                                            <label className="block text-xs text-gray-400 mb-1">{t('busType')}</label>
                                             <select
                                                 value={cloudInitBus}
                                                 onChange={(e) => {
@@ -5902,7 +5902,7 @@
                                             </select>
                                         </div>
                                         <div>
-                                            <label className="block text-xs text-gray-400 mb-1">{t('device') || 'Device'}</label>
+                                            <label className="block text-xs text-gray-400 mb-1">{t('device')}</label>
                                             <select
                                                 value={cloudInitDevice}
                                                 onChange={(e) => setCloudInitDevice(e.target.value)}
@@ -5911,13 +5911,13 @@
                                                 {(cloudInitBus === 'ide' ? ['0', '1', '2', '3'] : ['0', '1', '2', '3', '4', '5']).map(slot => {
                                                     const driveId = `${cloudInitBus}${slot}`;
                                                     const occupied = Boolean(config?.raw?.[driveId]);
-                                                    return <option key={slot} value={slot} disabled={occupied}>{driveId}{occupied ? ` (${t('inUse') || 'in use'})` : ''}</option>;
+                                                    return <option key={slot} value={slot} disabled={occupied}>{driveId}{occupied ? ` (${t('inUse')})` : ''}</option>;
                                                 })}
                                             </select>
                                         </div>
                                     </div>
                                     <div>
-                                        <label className="block text-xs text-gray-400 mb-1">{t('diskFormat') || 'Format'}</label>
+                                        <label className="block text-xs text-gray-400 mb-1">{t('cloudInitDiskFormat')}</label>
                                         <select
                                             value={cloudInitFormat}
                                             onChange={(e) => setCloudInitFormat(e.target.value)}
@@ -5929,7 +5929,7 @@
                                             ))}
                                         </select>
                                         {cloudInitStorageFormats.length === 1 && (
-                                            <p className="text-xs text-gray-500 mt-1">{t('diskFormatLockedHint') || 'This storage type only supports one format.'}</p>
+                                            <p className="text-xs text-gray-500 mt-1">{t('cloudInitDiskFormatLockedHint')}</p>
                                         )}
                                     </div>
                                     <div className="flex gap-2 justify-end pt-4">
@@ -5946,14 +5946,14 @@
                                                         body: JSON.stringify({ [driveId]: `${cloudInitStorage}:cloudinit,format=${cloudInitFormat}` })
                                                     });
                                                     if (res?.ok) {
-                                                        addToast(t('cloudInitDriveAdded') || 'Cloud-Init drive added', 'success');
+                                                        addToast(t('cloudInitDriveAdded'), 'success');
                                                         setShowAddCloudInit(false);
                                                         setCloudInitStorage('');
                                                         setCloudInitFormat('raw');
                                                         fetchConfig();
                                                     } else {
                                                         const err = await res.json();
-                                                        addToast(err.error || 'Error adding Cloud-Init drive', 'error');
+                                                        addToast(err.error || t('cloudInitDriveAddFailed'), 'error');
                                                     }
                                                 } catch (e) {
                                                     addToast(t('connectionError'), 'error');
