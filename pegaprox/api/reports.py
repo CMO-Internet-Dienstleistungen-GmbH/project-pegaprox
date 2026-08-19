@@ -338,6 +338,26 @@ def get_integrated_syslog_events():
         else:
             where.append("1 = 0")
 
+    # NS Aug 2026 (AI-pentest) — always confine a non-all-cluster caller to the hostnames of the
+    # clusters they can actually reach, independent of the syslog_filter_by_selected_cluster flag and
+    # of whether a cluster_id filter was supplied. Omitting cluster_id previously returned EVERY
+    # cluster's syslog to a tenant-scoped admin.audit holder.
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import get_user_clusters
+    _acc = get_user_clusters(build_authz_user(request.session.get('user', ''), request.session))
+    if _acc is not None:  # None = global-admin / all-cluster; a list = confine to it
+        _allowed_hosts = set()
+        for _cid in _acc:
+            _allowed_hosts.update(_syslog_cluster_hostnames(_cid))
+        if _allowed_hosts:
+            _hw = []
+            for _h in sorted(_allowed_hosts):
+                _hw.append("LOWER(logs.hostname) = ?"); params.append(_h)
+                _hw.append("LOWER(logs.hostname) LIKE ?"); params.append(f"{_h}.%")
+            where.append(f"({' OR '.join(_hw)})")
+        else:
+            where.append("1 = 0")
+
     where_sql = f"WHERE {' AND '.join(where)}" if where else ''
     joins_sql = f"{' '.join(joins)}" if joins else ''
     offset = (page - 1) * per_page

@@ -157,20 +157,44 @@ def update_pbs_server(pbs_id):
     host_changed = (data.get('host') and data.get('host') != old_host) or \
                    (_new_port is not None and _old_port_i is not None and _new_port != _old_port_i)
 
-    # NS Aug 2026 (Aikido 469089267) — FAIL CLOSED like the BMC/vmware/SMTP masked-password guards.
-    # A masked ('********') or blank credential submitted together with a host/port change would ship
-    # the stored PBS secret to a caller-chosen host — on save+auto-connect, on the next daemon reload
-    # (load_pbs_servers auto-connects to whatever host is stored), or via a follow-up /test. The old
-    # in-line guard only skipped the immediate auto-connect but still PERSISTED attacker-host + real
-    # creds. Require full re-entry and refuse to save.
-    def _masked(v):
-        return v in (None, '', '********')
-    cred_submitted_masked = (('password' in data and _masked(data.get('password')))
-                             or ('api_token_secret' in data and _masked(data.get('api_token_secret')))
-                             or ('ssh_key' in data and data.get('ssh_key') == '********'))
-    if host_changed and cred_submitted_masked:
-        logging.warning(f"[PBS:{pbs_id}] Rejected host change with preserved/masked credentials (cred-exfil guard)")
-        return jsonify({'error': 'Re-enter the PBS credentials when changing the host or port.'}), 400
+    # NS Aug 2026 (Aikido 469089267 + AI-pentest re-check) — FAIL CLOSED on a host/port change: every
+    # credential the STORED config holds must be freshly re-entered, otherwise it would be shipped to
+    # the caller-chosen new host (on save+auto-connect, the next daemon reload, or a follow-up /test).
+    # The first guard only checked the '********' sentinel and gated each clause on the key being
+    # PRESENT — so simply OMITTING password/api_token_secret/ssh_key bypassed it and the stored secret
+    # was still preserved against the attacker host. An omitted OR blank OR masked value is NOT a
+    # re-entry.
+    def _fresh(key):
+        return data.get(key) not in (None, '', '********')
+    if host_changed:
+        if old_mgr is not None:
+            _stored = {'password': bool(getattr(old_mgr, 'password', '')),
+                       'api_token_secret': bool(getattr(old_mgr, 'api_token_secret', '')),
+                       'ssh_key': bool(getattr(old_mgr, 'ssh_key', ''))}
+        else:
+            # disabled/not-loaded server (old_mgr None): introspect the encrypted DB columns — the
+            # earlier "require one connect cred" shortcut still let an attacker re-point a disabled
+            # server by supplying a dummy password and OMITTING api_token_secret/ssh_key, which
+            # save_pbs_server then preserved and shipped to the new host.
+            def _rowhas(col):
+                try:
+                    return bool(row[col])
+                except Exception:
+                    return False
+            _stored = {'password': _rowhas('pass_encrypted'),
+                       'api_token_secret': _rowhas('api_token_secret_encrypted'),
+                       'ssh_key': _rowhas('ssh_key_encrypted')}
+        _stale = [k for k, present in _stored.items() if present and not _fresh(k)]
+        if _stale:
+            logging.warning(f"[PBS:{pbs_id}] Rejected host/port change without re-entering {_stale} (cred-exfil guard)")
+            return jsonify({'error': 'Re-enter the PBS credentials when changing the host or port.'}), 400
+
+    # NS Aug 2026 — normalise the port so an empty/invalid value can't hit int('') in save_pbs_server
+    # (500). We already parsed/validated it above; drop an empty one so the stored default is used.
+    if data.get('port') in ('', None):
+        data.pop('port', None)
+    elif _new_port is not None:
+        data['port'] = _new_port
 
     # Host unchanged (or full creds supplied): preserve masked creds from the stored config so the
     # rebuilt manager keeps working. (save_pbs_server also preserves at the DB layer.)

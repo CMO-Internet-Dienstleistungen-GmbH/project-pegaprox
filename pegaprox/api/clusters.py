@@ -1808,7 +1808,17 @@ def cancel_task(cluster_id, node, upid):
     # pool-scoped user can't cancel another pool/tenant's VM task on a shared cluster.
     _p = str(upid).split(':')
     _tvmid = _p[6] if len(_p) > 6 and _p[6].isdigit() else None
-    if _tvmid is not None:
+    if _tvmid is None:
+        # NS Aug 2026 (AI-pentest) — XCP-ng UPIDs aren't the PVE colon format, so the split yields no
+        # vmid and the gate was skipped, letting a pool-scoped user cancel another VM's XAPI task.
+        # Resolve the VM from the manager's tracked tasks.
+        try:
+            _tv = (getattr(mgr, '_active_tasks', {}) or {}).get(upid, {}).get('vmid')
+            if _tv is not None:
+                _tvmid = str(_tv)
+        except Exception:
+            pass
+    if _tvmid is not None and str(_tvmid).isdigit():
         from pegaprox.utils.auth import build_authz_user
         _u = build_authz_user(request.session.get('user', ''), request.session)
         if not user_can_access_vm(_u, cluster_id, int(_tvmid), 'vm.stop'):

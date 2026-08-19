@@ -127,9 +127,21 @@ def right_sizing(cluster_id):
         pass
 
     recommendations = []
+    # NS Aug 2026 (AI-pentest) — the metrics history is cluster-wide; filter the per-VM sizing output
+    # to VMs the caller can actually read, so a pool-/ACL-scoped user doesn't get every cluster VM's
+    # name/node/CPU/mem stats. Admin & cluster-wide are scope-wins (user_can_access_vm returns True).
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import user_can_access_vm
+    _authz_u = build_authz_user(request.session.get('user', ''), request.session)
     counts = {'oversized_cpu': 0, 'oversized_mem': 0, 'undersized_cpu': 0,
               'undersized_mem': 0, 'idle': 0, 'no_data': 0, 'ok': 0}
     for vmid, e in by_vm.items():
+        try:
+            _vmid_i = int(vmid)
+        except (TypeError, ValueError):
+            _vmid_i = None
+        if _vmid_i is None or not user_can_access_vm(_authz_u, cluster_id, _vmid_i, 'vm.view'):
+            continue
         cpus = e['cpu']; mems = e['mem']
         if e['running'] < min_samples or len(cpus) < min_samples:
             counts['no_data'] += 1
@@ -484,8 +496,19 @@ def top_talkers(cluster_id):
     top = vms[:limit]
 
     # trim payload to what the UI cares about
+    # NS Aug 2026 (AI-pentest) — filter to VMs the caller can read (pool-/ACL-scoped users must not
+    # see the whole cluster's top talkers). Admin & cluster-wide are scope-wins.
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import user_can_access_vm
+    _authz_u = build_authz_user(request.session.get('user', ''), request.session)
     out = []
     for v in top:
+        try:
+            _vid = int(v.get('vmid'))
+        except (TypeError, ValueError):
+            _vid = None
+        if _vid is None or not user_can_access_vm(_authz_u, cluster_id, _vid, 'vm.view'):
+            continue
         out.append({
             'vmid': v.get('vmid'),
             'name': v.get('name') or f"VM {v.get('vmid')}",
