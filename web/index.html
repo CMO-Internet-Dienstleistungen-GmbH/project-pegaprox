@@ -5207,7 +5207,9 @@ const storageList=useMemo(()=>{if(!storages)return[];const target=cloneConfig.ta
 (storages.shared||[]).forEach(s=>{items.push({name:s.storage,type:s.type,content:s.content,avail:s.avail});});// local datastores only on the selected target node
 if(target){const nodeLocal=storages.local?.[target]||[];nodeLocal.forEach(s=>{// skip if already added as shared
 if(!items.find(i=>i.name===s.storage)){items.push({name:s.storage,type:s.type,content:s.content,avail:s.avail});}});}// filter by content type compatible with the VM being cloned
-const neededContent=isQemu?'images':'rootdir';return items.length>0?items.filter(s=>s.content.includes(neededContent)):items;},[storages,cloneConfig.target_node,isQemu]);// NS Aug 2026 — leave target_storage EMPTY by default: an empty value isn't sent to the
+// NS Aug 2026 (CodeAnt) — guard s.content: a datastore with no content field would
+// crash the whole modal (undefined.includes). Matches the s.content && ... guards elsewhere.
+const neededContent=isQemu?'images':'rootdir';return items.length>0?items.filter(s=>(s.content||'').includes(neededContent)):items;},[storages,cloneConfig.target_node,isQemu]);// NS Aug 2026 — leave target_storage EMPTY by default: an empty value isn't sent to the
 // clone API, so Proxmox keeps the source VM's storage (the pre-picker behaviour). The
 // old "default to source storage" code was dead (vm._sourceStorage never set, vm.disk is
 // a byte count) and silently retargeted every clone to the first shared storage. The user

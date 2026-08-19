@@ -72,6 +72,22 @@ def test_pbs_update_masked_password_without_host_change_is_not_rejected(api, see
         ppglobals.pbs_managers.clear()
 
 
+def test_pbs_update_malformed_port_is_rejected_not_500(api, seed):
+    # CodeAnt (2026-08-19 daily scan) — a non-numeric port used to raise an unhandled ValueError
+    # inside host/port change-detection (500). It must be rejected as a clean 400 instead.
+    ppglobals.pbs_managers.clear()
+    root = seed.user('root', role='admin', tenant_id='default')
+    _inject_pbs_mgr('p1', 'good-pbs.example', ['cluster_1'])
+    try:
+        r = api.as_user(root).put('/api/pbs/p1', json={'port': 'not-a-number'})
+        assert r.status_code == 400, r.get_data(as_text=True)
+        assert 'port' in r.get_data(as_text=True).lower()
+        # nothing was persisted on the bad-input path
+        assert ppglobals.pbs_managers['p1'].host == 'good-pbs.example'
+    finally:
+        ppglobals.pbs_managers.clear()
+
+
 # ---------------------------------------------------------------------------
 # 469089250 — /balance-now confined to tenant-owned clusters
 # ---------------------------------------------------------------------------

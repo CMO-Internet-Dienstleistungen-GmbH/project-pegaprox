@@ -140,8 +140,22 @@ def update_pbs_server(pbs_id):
         except Exception:
             old_host, old_port = None, None
 
+    # NS Aug 2026 (CodeAnt) — a non-numeric submitted port must not blow up change-detection with an
+    # unhandled ValueError (500). Reject it up front; everything below assumes a parseable port.
+    _new_port = data.get('port')
+    if _new_port not in (None, ''):
+        try:
+            _new_port = int(_new_port)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'Invalid port'}), 400
+    else:
+        _new_port = None
+    try:
+        _old_port_i = int(old_port) if old_port is not None else None
+    except (TypeError, ValueError):
+        _old_port_i = None
     host_changed = (data.get('host') and data.get('host') != old_host) or \
-                   (data.get('port') and old_port is not None and int(data.get('port', 8007)) != int(old_port))
+                   (_new_port is not None and _old_port_i is not None and _new_port != _old_port_i)
 
     # NS Aug 2026 (Aikido 469089267) — FAIL CLOSED like the BMC/vmware/SMTP masked-password guards.
     # A masked ('********') or blank credential submitted together with a host/port change would ship

@@ -2485,8 +2485,13 @@ def trigger_balance_now(cluster_id):
     # single VM-ACL / pool grant (the #248/#555 fallbacks in check_cluster_access) must not rebalance
     # VMs outside their scope. Admins / default-tenant (get_user_clusters None) unaffected. Mirrors
     # the cluster-group balance guard in groups.py.
-    _usr = getattr(request, 'session', {}).get('user', 'system')
-    _allowed = get_user_clusters(load_users().get(_usr, {}))
+    _sess = getattr(request, 'session', {})
+    _usr = _sess.get('user', 'system')
+    # #491 — resolve the token-scoped identity (build_authz_user floors an admin-owned scoped
+    # token to its effective_role) so a scoped token that only reached this cluster via the
+    # #248/#555 ACL/pool fallbacks in check_cluster_access can't slip past the raw admin role.
+    from pegaprox.utils.auth import build_authz_user
+    _allowed = get_user_clusters(build_authz_user(_usr, _sess))
     if _allowed is not None and cluster_id not in _allowed:
         log_audit(_usr, 'balance.manual_denied', f"Denied balance-now on {cluster_id} (not tenant-owned)")
         return jsonify({'error': 'Access denied'}), 403

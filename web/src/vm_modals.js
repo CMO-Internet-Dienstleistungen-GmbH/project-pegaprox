@@ -203,8 +203,10 @@
                     });
                 }
                 // filter by content type compatible with the VM being cloned
+                // NS Aug 2026 (CodeAnt) — guard s.content: a datastore with no content field would
+                // crash the whole modal (undefined.includes). Matches the s.content && ... guards elsewhere.
                 const neededContent = isQemu ? 'images' : 'rootdir';
-                return items.length > 0 ? items.filter(s => s.content.includes(neededContent)) : items;
+                return items.length > 0 ? items.filter(s => (s.content || '').includes(neededContent)) : items;
             }, [storages, cloneConfig.target_node, isQemu]);
 
             // NS Aug 2026 — leave target_storage EMPTY by default: an empty value isn't sent to the
