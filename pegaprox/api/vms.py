@@ -8401,11 +8401,46 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
             _ttfb_ms = None
             _session_started = _t_connect.monotonic()
 
-            # NS Apr 2026 (#312/#92): the old loop used settimeout(0.001) + asyncio.sleep(0.005)
-            # to fake non-blocking recv. That's a busy-wait that blocks the event loop on every
-            # recv() call — under load or network jitter it drops bytes and the session dies after
-            # a few minutes. Switch to blocking recv in a worker thread via asyncio.to_thread.
-            pve_ws.settimeout(None)  # blocking mode — to_thread handles the blocking call
+            # NS Aug 2026 (#713) — the ONE pve_ws SSL object is read by proxmox_to_client and
+            # written by client_to_proxmox + pve_keepalive. websocket-client serialises
+            # writer-vs-writer (self.lock) but read-vs-write share no common lock (recv uses a
+            # separate self.readlock), so a concurrent SSL_read + SSL_write hit the same OpenSSL
+            # object at once and can splice an outbound TLS record — pveproxy then answers
+            # "tlsv1 alert decode error" and tears the console (intermittent, native noVNC fine,
+            # reconnect works). Serialise EVERY SSL op on pve_ws through one lock so the read and
+            # the writes never touch the object at the same time (correct for any TLS version;
+            # no transport/handshake change).
+            import threading as _threading
+            _pve_io_lock = _threading.Lock()
+
+            # NS Apr 2026 (#312/#92): recv must NOT busy-wait on the event loop (the old
+            # settimeout(0.001)+asyncio.sleep starved the loop, dropped pongs → disconnect). We
+            # keep recv in a worker thread (asyncio.to_thread), but with a bounded SLICE instead of
+            # blocking forever so it releases _pve_io_lock for the writers between reads.
+            # websocket-client's frame_buffer is resumable across a timed-out recv (partial
+            # header/length/payload persist in recv_buffer), so a slice expiring mid-frame loses NO
+            # bytes; the worker thread keeps the event loop free. 50ms slice = ≤50ms worst-case
+            # keystroke latency on a fully idle screen, negligible while the framebuffer streams.
+            _PVE_RECV_SLICE = 0.05
+            pve_ws.settimeout(_PVE_RECV_SLICE)
+
+            # The only three call sites that touch the pve_ws SSL object — all funnelled through
+            # the one lock. Blocking calls run in a worker thread via asyncio.to_thread.
+            def _pve_recv():
+                with _pve_io_lock:
+                    return pve_ws.recv()
+
+            def _pve_send(msg):
+                with _pve_io_lock:
+                    pve_ws.send(msg)
+
+            def _pve_send_binary(msg):
+                with _pve_io_lock:
+                    pve_ws.send_binary(msg)
+
+            def _pve_ping():
+                with _pve_io_lock:
+                    pve_ws.ping()
 
             async def proxmox_to_client():
                 """Forward data from Proxmox to browser (blocking recv handled in thread).
@@ -8419,7 +8454,7 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                 nonlocal bytes_received, running, _ttfb_ms
                 while running:
                     try:
-                        data = await asyncio.to_thread(pve_ws.recv)
+                        data = await asyncio.to_thread(_pve_recv)
                         if not data:
                             running = False
                             break
@@ -8431,6 +8466,9 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                         if crypto_session is not None:
                             data = crypto_session.encrypt(data)
                         await websocket.send(data)
+                    except ws_client.WebSocketTimeoutException:
+                        # idle slice — no frame this tick; loop so the writers get the lock (#713)
+                        continue
                     except ws_client.WebSocketConnectionClosedException:
                         running = False
                         break
@@ -8474,7 +8512,7 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                                 except Exception:
                                     pass
                                 break
-                        await asyncio.to_thread(pve_ws.send, message)
+                        await asyncio.to_thread(_pve_send, message)
                 except Exception as e:
                     if running and 'close' not in str(e).lower():
                         logging.debug(f"[VNC] Client->PVE: {e}")
@@ -8518,14 +8556,14 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                         break
                     # WS-layer ping (cheap, keeps any websocket-aware intermediary happy)
                     try:
-                        await asyncio.to_thread(pve_ws.ping)
+                        await asyncio.to_thread(_pve_ping)
                     except Exception:
                         break
                     # RFB-layer keepalive (keeps pveproxy/qemu from declaring the session idle)
                     now = _time.monotonic()
                     if now >= next_rfb_at:
                         try:
-                            await asyncio.to_thread(pve_ws.send_binary, RFB_FB_UPDATE_REQUEST)
+                            await asyncio.to_thread(_pve_send_binary, RFB_FB_UPDATE_REQUEST)
                             next_rfb_at = now + rfb_interval
                         except Exception as e:
                             logging.debug(f"[VNC] RFB keepalive send failed: {e}")
