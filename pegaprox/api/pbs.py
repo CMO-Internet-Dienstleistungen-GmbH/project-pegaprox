@@ -150,12 +150,14 @@ def update_pbs_server(pbs_id):
             return jsonify({'error': 'Invalid port'}), 400
     else:
         _new_port = None
+    # NS Aug 2026 (CodeAnt) — treat an unstored port as the PBS default (8007) so a port change from
+    # "none stored" to a new value still counts as an endpoint change and trips the cred-exfil guard.
     try:
-        _old_port_i = int(old_port) if old_port is not None else None
+        _old_port_i = int(old_port) if old_port not in (None, '') else 8007
     except (TypeError, ValueError):
-        _old_port_i = None
+        _old_port_i = 8007
     host_changed = (data.get('host') and data.get('host') != old_host) or \
-                   (_new_port is not None and _old_port_i is not None and _new_port != _old_port_i)
+                   (_new_port is not None and _new_port != _old_port_i)
 
     # NS Aug 2026 (Aikido 469089267 + AI-pentest re-check) — FAIL CLOSED on a host/port change: every
     # credential the STORED config holds must be freshly re-entered, otherwise it would be shipped to

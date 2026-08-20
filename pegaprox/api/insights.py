@@ -491,24 +491,26 @@ def top_talkers(cluster_id):
         v['_disk_io'] = (v.get('diskread') or 0) + (v.get('diskwrite') or 0)
         v['_net_io'] = (v.get('netin') or 0) + (v.get('netout') or 0)
 
+    # NS Aug 2026 (AI-pentest + CodeAnt) — filter to VMs the caller can read BEFORE ranking + limit,
+    # so a pool-/ACL-scoped user gets THEIR top-N, not (cluster top-N minus what they can't see).
+    # Admin & cluster-wide are scope-wins.
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import user_can_access_vm
+    _authz_u = build_authz_user(request.session.get('user', ''), request.session)
+    def _vm_ok(v):
+        try:
+            return user_can_access_vm(_authz_u, cluster_id, int(v.get('vmid')), 'vm.view')
+        except (TypeError, ValueError):
+            return False
+    vms = [v for v in vms if _vm_ok(v)]
+
     sort_key, unit = _TOP_METRICS[metric]
     vms.sort(key=lambda x: x.get(sort_key) or 0, reverse=True)
     top = vms[:limit]
 
-    # trim payload to what the UI cares about
-    # NS Aug 2026 (AI-pentest) — filter to VMs the caller can read (pool-/ACL-scoped users must not
-    # see the whole cluster's top talkers). Admin & cluster-wide are scope-wins.
-    from pegaprox.utils.auth import build_authz_user
-    from pegaprox.utils.rbac import user_can_access_vm
-    _authz_u = build_authz_user(request.session.get('user', ''), request.session)
+    # trim payload to what the UI cares about (already authz-filtered above)
     out = []
     for v in top:
-        try:
-            _vid = int(v.get('vmid'))
-        except (TypeError, ValueError):
-            _vid = None
-        if _vid is None or not user_can_access_vm(_authz_u, cluster_id, _vid, 'vm.view'):
-            continue
         out.append({
             'vmid': v.get('vmid'),
             'name': v.get('name') or f"VM {v.get('vmid')}",

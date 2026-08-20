@@ -45,7 +45,10 @@ bp = Blueprint('webauthn', __name__)
 
 # MK: challenges live in memory, keyed by (username, ceremony).
 # 5 min TTL. Sweeping on every touch keeps the map small without a cron.
-_challenges = {}  # {(user, 'register'|'auth'): (state, expiry)}
+_challenges = {}  # {(user, 'register'|'auth'|'proof'[, nonce]): (state, expiry)}
+import threading as _threading
+_challenge_lock = _threading.Lock()  # NS Aug 2026 (CodeAnt) — serialize concurrent match/pop of the
+#                                      same auth ceremony so two finishes can't reuse one challenge
 
 
 def _sweep_challenges():
@@ -340,13 +343,17 @@ def auth_finish():
     if err: return err
     matched_cred = None
     _last_err = None
-    for _k in sorted(_keys, key=lambda k: _challenges[k][1], reverse=True):
-        try:
-            matched_cred = srv.authenticate_complete(_challenges[_k][0], credentials=creds, response=data)
-            _challenges.pop(_k, None)  # consume only the ceremony that actually matched
-            break
-        except Exception as e:
-            _last_err = e
+    with _challenge_lock:  # one ceremony is matched+consumed atomically per user
+        for _k in sorted(_keys, key=lambda k: (_challenges.get(k) or (None, 0))[1], reverse=True):
+            _st = _challenges.get(_k)
+            if _st is None:
+                continue  # already consumed by a racing finish
+            try:
+                matched_cred = srv.authenticate_complete(_st[0], credentials=creds, response=data)
+                _challenges.pop(_k, None)  # consume only the ceremony that actually matched
+                break
+            except Exception as e:
+                _last_err = e
     if matched_cred is None:
         logging.warning(f"[WebAuthn] auth_complete failed for {_sl(username)}: {_sl(str(_last_err))}")
         return jsonify({'error': f'Verification failed: {_last_err}'}), 400
