@@ -4445,11 +4445,18 @@ def start_rolling_update(cluster_id):
                     
                     mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✓ Updates installed")
                     
-                    # Step 4: If reboot was included, wait for node to come back
-                    if include_reboot:
+                    # Step 4: only wait for a reboot if one was ACTUALLY issued for THIS node.
+                    # #715 (robertdahlem) — include_reboot is the global toggle; the per-node needrestart
+                    # check inside start_node_update decides whether the node actually rebooted and
+                    # records it on the task. A node that needs no reboot must NOT enter the offline-wait,
+                    # or it logs a phantom "rebooting", sits 120s waiting for an offline that never comes,
+                    # then "back online (0s)".
+                    _node_rebooted = include_reboot and getattr(update_task, 'reboot_issued', True)
+                    if include_reboot and not _node_rebooted:
+                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Node {node_name} did not require a reboot — skipping reboot wait")
+                    if _node_rebooted:
                         mgr._rolling_update['current_step'] = 'rebooting'
-                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Evaluating if node {node_name} requires a reboot. Analyzing...")
-                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Node {node_name} rebooting (timeout: {reboot_timeout}s)...")
+                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Node {node_name} requires a reboot — rebooting (timeout: {reboot_timeout}s)...")
                         if 'rebooting_nodes' not in mgr._rolling_update:
                             mgr._rolling_update['rebooting_nodes'] = []
                         mgr._rolling_update['rebooting_nodes'].append(node_name)
@@ -4528,7 +4535,9 @@ def start_rolling_update(cluster_id):
                     # NS May 2026 — give HA services 30s to come back after reboot
                     # before we try to disable maintenance. Otherwise ha-manager
                     # rejects the call and the node stays stuck.
-                    if include_reboot:
+                    # #715 — only sleep when the node actually rebooted; a no-reboot node's HA services
+                    # never went down, so the 30s wait is pointless and delays the maintenance exit.
+                    if _node_rebooted:
                         time.sleep(30)
                     if not mgr.exit_maintenance_mode(node_name):
                         _log(f"⚠ {node_name} maintenance exit failed (will retry at end of run)")
