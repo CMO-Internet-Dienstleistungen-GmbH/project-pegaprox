@@ -1304,10 +1304,10 @@ def get_server_settings():
     try:
         from pegaprox.core.acme import get_cert_info
         from pathlib import Path
-        if Path("/usr/lib/pegaprox").exists():
-            _ssl_dir = str(Path("/var/lib/pegaprox/ssl"))
-        else:
-            _ssl_dir = str(Path(__file__).resolve().parent.parent.parent / 'ssl')
+        # #725 — read cert info from the dir the TLS listener actually serves
+        # from (config/ssl / SSL_DIR), not the retired <root>/ssl heuristic —
+        # otherwise the UI shows a cert that isn't the one being served.
+        _ssl_dir = SSL_DIR
         settings['cert_info'] = get_cert_info(_ssl_dir)
     except Exception:
         settings['cert_info'] = None
@@ -1993,10 +1993,10 @@ def get_acme_status():
         from pegaprox.core.acme import get_cert_info
         from pathlib import Path
 
-        if Path("/usr/lib/pegaprox").exists():
-            ssl_dir = str(Path("/var/lib/pegaprox/ssl"))
-        else:
-            ssl_dir = str(Path(__file__).resolve().parent.parent.parent / 'ssl')
+        # #725 (nvaert1986) — SSL_DIR (config/ssl) is the dir the TLS listener
+        # loads from; the old <root>/ssl heuristic diverged from it on 2026-06-01,
+        # so ACME wrote issued certs where nothing served them.
+        ssl_dir = SSL_DIR
 
         settings = load_server_settings()
         cert_info = get_cert_info(ssl_dir)
@@ -2036,10 +2036,10 @@ def request_acme_certificate():
         from pegaprox.core.acme import request_certificate
         from pathlib import Path
 
-        if Path("/usr/lib/pegaprox").exists():
-            ssl_dir = str(Path("/var/lib/pegaprox/ssl"))
-        else:
-            ssl_dir = str(Path(__file__).resolve().parent.parent.parent / 'ssl')
+        # #725 (nvaert1986) — SSL_DIR (config/ssl) is the dir the TLS listener
+        # loads from; the old <root>/ssl heuristic diverged from it on 2026-06-01,
+        # so ACME wrote issued certs where nothing served them.
+        ssl_dir = SSL_DIR
 
         settings = load_server_settings()
         data = request.get_json() or {}
@@ -2112,6 +2112,10 @@ def request_acme_certificate():
             settings['ssl_enabled'] = True
             save_server_settings(settings)
             log_audit(usr, 'settings.acme_issued', f"Certificate issued for {domain}, expires {result.get('expires', '?')}")
+            # #725 — the new cert is on disk now, but the running TLS context still
+            # holds the old one until the service restarts. Tell the UI, same as the
+            # manual-upload path does, so the operator knows to restart to serve it.
+            result['restart_required'] = True
 
         return jsonify(result)
 
@@ -2128,10 +2132,10 @@ def complete_acme_dns_challenge():
         from pegaprox.core.acme import complete_dns01_challenge
         from pathlib import Path
 
-        if Path("/usr/lib/pegaprox").exists():
-            ssl_dir = str(Path("/var/lib/pegaprox/ssl"))
-        else:
-            ssl_dir = str(Path(__file__).resolve().parent.parent.parent / 'ssl')
+        # #725 (nvaert1986) — SSL_DIR (config/ssl) is the dir the TLS listener
+        # loads from; the old <root>/ssl heuristic diverged from it on 2026-06-01,
+        # so ACME wrote issued certs where nothing served them.
+        ssl_dir = SSL_DIR
 
         data = request.get_json() or {}
         challenge_id = str(data.get('challenge_id') or '').strip()
@@ -2146,6 +2150,7 @@ def complete_acme_dns_challenge():
             save_server_settings(settings)
             usr = getattr(request, 'session', {}).get('user', 'admin')
             log_audit(usr, 'settings.acme_issued', f"Certificate issued via DNS-01, expires {result.get('expires', '?')}")
+            result['restart_required'] = True   # #725 — restart to serve the new cert
 
         return jsonify(result)
     except Exception as e:
