@@ -2095,6 +2095,11 @@ def request_acme_certificate():
         settings['acme_dns_provider'] = dns_provider
         settings['acme_provider'] = acme_provider
         settings['acme_directory_url'] = directory_url
+        # #730 (Flachdachs) — honour the "allow private/internal CA" checkbox sent WITH the
+        # request. #685 only read it from saved settings, so ticking the box and hitting
+        # "Request Certificate" without a separate settings-save left the SSRF guard blocking
+        # the private directory URL. Fall back to the stored value when the body omits it.
+        settings['acme_allow_private_ca'] = bool(data.get('acme_allow_private_ca', settings.get('acme_allow_private_ca', False)))
         settings['domain'] = domain
         save_server_settings(settings)
 
