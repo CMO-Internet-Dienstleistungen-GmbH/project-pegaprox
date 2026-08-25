@@ -114,6 +114,10 @@ def get_clusters():
                 'status': 'running' if mgr.running else 'stopped',
                 'connected': mgr.is_connected,
                 'connection_error': mgr.connection_error,
+                # #16745 — presence only (never the key). Lets the Harden PVE Node UI warn before
+                # the sshd_hardening control (PermitRootLogin prohibit-password) cuts off PegaProx's
+                # own access on a cluster we reach by root password with no key deployed.
+                'has_ssh_key': bool(getattr(mgr.config, 'ssh_key', '')),
                 'migration_threshold': mgr.config.migration_threshold,
                 'migration_tolerance': getattr(mgr.config, 'migration_tolerance', 10),
                 'check_interval': mgr.config.check_interval,

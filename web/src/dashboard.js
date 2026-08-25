@@ -16773,6 +16773,10 @@
                                                                             {id === 'default_umask' && (
                                                                                 <p className="text-[11px] text-yellow-400/80 mt-1 leading-tight">⚠ {t('cmUmaskToolingNote')}</p>
                                                                             )}
+                                                                            {/* MK #16745: this cluster is reached by password with no key -> sshd_hardening (prohibit-password) would cut off PegaProx's OWN root SSH, and the rollback needs SSH too. Warn before apply. */}
+                                                                            {id === 'sshd_hardening' && selectedCluster && selectedCluster.has_ssh_key === false && !applied && (
+                                                                                <p className="text-[11px] text-red-400/90 mt-1 leading-tight">⚠ {t('cmSshdRootLockoutNote')}</p>
+                                                                            )}
                                                                             {/* LW: configurable DNS for backup_dns control */}
                                                                             {id === 'backup_dns' && !applied && (
                                                                                 <div className="flex items-center gap-2 mt-2">
