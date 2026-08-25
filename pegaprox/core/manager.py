@@ -15739,6 +15739,12 @@ echo DONE""",
             'defaults': {'service_user': ''},
         },
         'default_umask': {
+            # MK 2026-08-25 (community-scripts #16745) — reversible now. umask 027 in a login
+            # shell propagates to `pct create` (it extracts the template under the caller's umask),
+            # so community LXC scripts land /etc at 750 and DNS breaks in the CT. Declaring
+            # backup_files lets the operator roll this control back (restores login.defs + profile)
+            # without hand-editing; the GUI create-CT path (pvedaemon, umask 022) is unaffected.
+            'backup_files': ['/etc/login.defs', '/etc/profile'],
             'check': """(grep -q 'UMASK.*027' /etc/login.defs 2>/dev/null || grep -q 'umask 027' /etc/profile 2>/dev/null) && echo OK || echo FAIL""",
             'apply': """if grep -q '^UMASK' /etc/login.defs 2>/dev/null; then
   sed -i 's/^UMASK.*/UMASK           027/' /etc/login.defs

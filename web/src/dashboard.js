@@ -16769,6 +16769,10 @@
                                                                             </div>
                                                                             <p className="text-xs text-gray-400 mt-1">{info.desc}</p>
                                                                             <p className="text-xs text-gray-600 mt-0.5">{t('pveImpact') || 'PVE Impact'}: {info.impact}</p>
+                                                                            {/* MK #16745: umask 027 leaks into login-shell tooling (community LXC scripts -> /etc 750 -> no DNS); flag it + point at the rollback. */}
+                                                                            {id === 'default_umask' && (
+                                                                                <p className="text-[11px] text-yellow-400/80 mt-1 leading-tight">⚠ {t('cmUmaskToolingNote')}</p>
+                                                                            )}
                                                                             {/* LW: configurable DNS for backup_dns control */}
                                                                             {id === 'backup_dns' && !applied && (
                                                                                 <div className="flex items-center gap-2 mt-2">
