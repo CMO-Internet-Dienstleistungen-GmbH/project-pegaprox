@@ -1162,8 +1162,11 @@
                 if (nameValue !== undefined && nameValue !== '') {
                     const dnsLabel = '[a-zA-Z0-9](?:[a-zA-Z0-9\\-]{0,61}[a-zA-Z0-9])?';
                     const dnsRegex = new RegExp(`^${dnsLabel}(?:\\.${dnsLabel})*$`);
-                    if (!dnsRegex.test(nameValue)) {
-                        addToast(t('invalidDnsName') || 'Invalid name: only letters, digits, hyphens and dots allowed; each part must start and end with a letter or digit (max 63 characters per part)', 'error');
+                    // The per-label rule above does not bound the total length, and PVE declares
+                    // the LXC hostname with maxLength 255 — check it here instead of letting the
+                    // API reject the request.
+                    if (!dnsRegex.test(nameValue) || nameValue.length > 255) {
+                        addToast(t('invalidDnsName'), 'error');
                         return;
                     }
                 }
