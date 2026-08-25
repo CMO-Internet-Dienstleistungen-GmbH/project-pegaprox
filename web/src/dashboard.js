@@ -8472,6 +8472,11 @@
             // so user sees "Applying X (3/15)…" instead of a frozen "Applying…" spinner.
             const [hardenApplyProgress, setHardenApplyProgress] = useState(null);
             const [hardenExpanded, setHardenExpanded] = useState({});  // {ctrl_id: bool}
+            // #16745 — checkbox-gated apply confirmation (A/C) so click-happy users can't
+            // silently footgun their remote access. hardenConfirm holds the pending apply.
+            const [hardenConfirm, setHardenConfirm] = useState(null); // {toApply, needsAccessAck, needsLockoutAck}
+            const [hardenAccessAck, setHardenAccessAck] = useState(false);
+            const [hardenLockoutAck, setHardenLockoutAck] = useState(false);
 
             // Custom Scripts state - MK Jan 2026
             const [customScripts, setCustomScripts] = useState([]);
@@ -10193,12 +10198,27 @@
                 setHardenLoading(false);
             };
 
-            const applyHardening = async () => {
+            // #16745 (C) — controls that change SSH / login access; selecting any of them makes the
+            // apply confirmation require an explicit "I understand this can lock out access" checkbox.
+            const HARDEN_ACCESS_CONTROLS = ['sshd_hardening', 'ssh_perms', 'ssh_crypto', 'pam_faillock'];
+
+            // Opens the gated confirmation modal instead of a bare confirm(), so a click-happy user
+            // has to read + tick before anything touches the node (#16745 A/C).
+            const applyHardening = () => {
                 if (!selectedCluster?.id || !hardenNode) return;
                 const toApply = Object.keys(hardenSelected).filter(k => hardenSelected[k]);
                 if (!toApply.length) { addToast(t('noControlsSelected') || 'No controls selected', 'warning'); return; }
-                // NS: warn before modifying system config
-                if (!confirm(`${t('hardenConfirm') || `⚠️ This will apply ${toApply.length} hardening control(s) to "${hardenNode}".\n\nSystem configuration files will be modified. Some changes may require a reboot.\n\nProceed?`}`)) return;
+                const needsAccessAck = toApply.some(c => HARDEN_ACCESS_CONTROLS.includes(c));
+                // (A) the reliable self-lockout combo: sshd_hardening on a cluster we reach by
+                // password with no key deployed — needs a second, explicit red acknowledgement.
+                const needsLockoutAck = toApply.includes('sshd_hardening') && selectedCluster?.has_ssh_key === false;
+                setHardenAccessAck(false);
+                setHardenLockoutAck(false);
+                setHardenConfirm({ toApply, needsAccessAck, needsLockoutAck });
+            };
+
+            const doApplyHardening = async (toApply, force) => {
+                setHardenConfirm(null);
                 setHardenApplying(true);
                 setHardenResults({});
                 // NS Apr 2026 — apply controls one at a time so the user gets live feedback
@@ -10218,6 +10238,8 @@
                                 body: JSON.stringify({
                                     controls: [ctrlId],
                                     params: hardenParams && hardenParams[ctrlId] ? { [ctrlId]: hardenParams[ctrlId] } : {},
+                                    // #16745 (A) — only sshd_hardening, only after the explicit red ack, carries force
+                                    ...(ctrlId === 'sshd_hardening' && force ? { force: true } : {}),
                                 })
                             });
                             if (resp && resp.ok) {
@@ -16974,6 +16996,40 @@
                                                                         <Icons.RotateCcw className="w-4 h-4" /> {t('rollbackSelected') || 'Rollback Selected'} ({selectedCount})
                                                                     </button>
                                                                 </div>
+
+                                                                {/* #16745 (A/C) — gated apply confirmation: click-happy users must read + tick before anything touches the node */}
+                                                                {hardenConfirm && (
+                                                                    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 p-4" onClick={() => setHardenConfirm(null)}>
+                                                                        <div className="bg-proxmox-card border border-proxmox-border rounded-xl max-w-lg w-full p-5" onClick={e => e.stopPropagation()}>
+                                                                            <h3 className="text-base font-semibold text-white mb-2 flex items-center gap-2"><Icons.Shield className="w-4 h-4 text-green-400" /> {t('hardenApplyTitle') || 'Apply hardening controls'}</h3>
+                                                                            <p className="text-sm text-gray-400 mb-3">{(t('hardenApplyBody') || 'This applies {n} control(s) to "{node}". System configuration files will be modified; some changes may require a reboot.').replace('{n}', hardenConfirm.toApply.length).replace('{node}', hardenNode)}</p>
+                                                                            {hardenConfirm.needsLockoutAck && (
+                                                                                <div className="rounded-lg bg-red-500/10 border border-red-500/40 p-3 mb-3">
+                                                                                    <p className="text-xs text-red-300 mb-2 leading-snug">⚠ {t('cmSshdRootLockoutNote')}</p>
+                                                                                    <label className="flex items-start gap-2 text-xs text-red-200 cursor-pointer">
+                                                                                        <input type="checkbox" checked={hardenLockoutAck} onChange={e => setHardenLockoutAck(e.target.checked)} className="mt-0.5 accent-red-500" />
+                                                                                        <span>{t('hardenLockoutAck') || "I understand this cuts off PegaProx's own password access to this cluster, and I have console / manual access to recover."}</span>
+                                                                                    </label>
+                                                                                </div>
+                                                                            )}
+                                                                            {hardenConfirm.needsAccessAck && (
+                                                                                <label className="flex items-start gap-2 text-xs text-yellow-200/90 cursor-pointer mb-4">
+                                                                                    <input type="checkbox" checked={hardenAccessAck} onChange={e => setHardenAccessAck(e.target.checked)} className="mt-0.5 accent-yellow-500" />
+                                                                                    <span>{t('hardenAccessAck') || 'I understand these controls change SSH / login access and can lock out remote access if misconfigured.'}</span>
+                                                                                </label>
+                                                                            )}
+                                                                            <div className="flex justify-end gap-2">
+                                                                                <button onClick={() => setHardenConfirm(null)} className="px-4 py-2 rounded-lg bg-proxmox-dark text-gray-400 hover:text-white text-sm">{t('cancel') || 'Cancel'}</button>
+                                                                                <button
+                                                                                    disabled={(hardenConfirm.needsAccessAck && !hardenAccessAck) || (hardenConfirm.needsLockoutAck && !hardenLockoutAck)}
+                                                                                    onClick={() => doApplyHardening(hardenConfirm.toApply, hardenConfirm.needsLockoutAck && hardenLockoutAck)}
+                                                                                    className="px-4 py-2 rounded-lg text-sm font-medium text-white disabled:bg-gray-600 disabled:cursor-not-allowed bg-green-600 hover:bg-green-500">
+                                                                                    {t('hardenApplyBtn') || 'Apply'}
+                                                                                </button>
+                                                                            </div>
+                                                                        </div>
+                                                                    </div>
+                                                                )}
 
                                                                 {/* MK Apr 2026: id wrapper so PNG export can target the whole thing */}
                                                                 <div id="harden-report-content" className="space-y-4">

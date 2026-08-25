@@ -730,20 +730,38 @@ def apply_hardening(cluster_id, node):
     controls = data.get('controls', [])
     if not controls:
         return jsonify({'error': 'No controls specified'}), 400
+    force = bool(data.get('force', False))
+    requested_count = len(controls)
+
+    # #16745 — self-lockout guard (belt-and-suspenders behind the UI ack). sshd_hardening sets
+    # PermitRootLogin=prohibit-password; on a cluster we reach as root by password with no SSH
+    # key, that severs PegaProx's own access to the node — and rollback needs SSH too. Refuse it
+    # unless the caller explicitly forces (the UI does, after a checked acknowledgement).
+    mgr_has_key = bool(getattr(mgr.config, 'ssh_key', ''))
+    blocked = {}
+    if 'sshd_hardening' in controls and not mgr_has_key and not force:
+        controls = [c for c in controls if c != 'sshd_hardening']
+        blocked['sshd_hardening'] = {
+            'success': False, 'blocked': True,
+            'error': 'Blocked: SSH Access Hardening disables root password login and would cut off '
+                     'PegaProx access to this cluster (no SSH key is configured). Add an SSH key to '
+                     'the cluster first, or re-apply with force to override.'
+        }
 
     ctrl_params = data.get('params', {})
-    results = mgr.apply_node_hardening(node, controls, params=ctrl_params)
+    results = mgr.apply_node_hardening(node, controls, params=ctrl_params) if controls else {}
+    results.update(blocked)
     ok_count = sum(1 for v in results.values() if v.get('success'))
 
     from pegaprox.utils.audit import log_audit
     log_audit('node.hardening_applied', {
-        'node': node, 'controls': controls,
-        'success': ok_count, 'total': len(controls)
+        'node': node, 'controls': list(results.keys()), 'forced': force,
+        'success': ok_count, 'total': requested_count
     })
 
     return jsonify({
         'node': node, 'results': results,
-        'applied': ok_count, 'total': len(controls)
+        'applied': ok_count, 'total': requested_count
     })
 
 
