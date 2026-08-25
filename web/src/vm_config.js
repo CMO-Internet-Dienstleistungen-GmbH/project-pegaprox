@@ -1152,11 +1152,18 @@
                 if (Object.keys(changes).length === 0) return;
 
                 // Validate VM name format (DNS-compatible)
+                // KG Aug 2026 — this demanded a SINGLE label starting with a LETTER, which is
+                // stricter than both PVE and our own create wizard (which doesn't check the name
+                // at all). PVE's `name`/`hostname` are format=dns-name: dot-separated labels,
+                // each up to 63 chars, and a label may start with a digit. So a guest created
+                // here as "10.158.163.101-app01" could never be renamed afterwards — the request
+                // was rejected client-side and never reached the API. Mirror dns-name instead.
                 const nameValue = 'name' in changes ? changes.name : ('hostname' in changes ? changes.hostname : undefined);
                 if (nameValue !== undefined && nameValue !== '') {
-                    const dnsRegex = /^[a-zA-Z]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?$/;
+                    const dnsLabel = '[a-zA-Z0-9](?:[a-zA-Z0-9\\-]{0,61}[a-zA-Z0-9])?';
+                    const dnsRegex = new RegExp(`^${dnsLabel}(?:\\.${dnsLabel})*$`);
                     if (!dnsRegex.test(nameValue)) {
-                        addToast(t('invalidDnsName') || 'Invalid name: must start with a letter, only alphanumeric and hyphens allowed, max 63 characters', 'error');
+                        addToast(t('invalidDnsName') || 'Invalid name: only letters, digits, hyphens and dots allowed; each part must start and end with a letter or digit (max 63 characters per part)', 'error');
                         return;
                     }
                 }

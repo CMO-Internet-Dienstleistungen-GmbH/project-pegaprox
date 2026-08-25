@@ -2605,7 +2605,7 @@
                 // Common notifications
                 connectionError: 'Verbindungsfehler',
                 saveFailed: 'Speichern fehlgeschlagen',
-                invalidDnsName: 'Ungültiger Name: muss mit einem Buchstaben beginnen, nur Buchstaben, Zahlen und Bindestriche erlaubt, max. 63 Zeichen',
+                invalidDnsName: 'Ungültiger Name: nur Buchstaben, Zahlen, Bindestriche und Punkte erlaubt; jeder Teil muss mit einem Buchstaben oder einer Zahl beginnen und enden (max. 63 Zeichen pro Teil)',
                 addTag: 'Tag hinzufügen...',
                 invalidTagFormat: 'Ungültiges Format. Tags müssen klein geschrieben und alphanumerisch sein (Bindestriche, Punkte, Unterstriche erlaubt).',
                 deleteError: 'Fehler beim Löschen',
@@ -7185,7 +7185,7 @@
                 // Common notifications
                 connectionError: 'Connection error',
                 saveFailed: 'Save failed',
-                invalidDnsName: 'Invalid name: must start with a letter, only alphanumeric and hyphens allowed, max 63 characters',
+                invalidDnsName: 'Invalid name: only letters, digits, hyphens and dots allowed; each part must start and end with a letter or digit (max 63 characters per part)',
                 addTag: 'Add tag...',
                 invalidTagFormat: 'Invalid format. Tags must be lowercase alphanumeric (hyphens, dots, underscores allowed).',
                 deleteError: 'Delete error',
@@ -11330,7 +11330,7 @@
                 threshold: '阈值',
                 interval: '间隔',
                 saveFailed: '保存失败',
-                invalidDnsName: '名称无效：必须以字母开头，仅允许使用字母数字和连字符，最多 63 个字符',
+                invalidDnsName: '名称无效：仅允许字母、数字、连字符和点；每个部分必须以字母或数字开头和结尾（每部分最多 63 个字符）',
                 addTag: '添加标签...',
                 invalidTagFormat: '格式无效。标签必须是小写字母数字（允许使用连字符、点、下划线）。',
                 deleteError: '删除错误',
@@ -15229,7 +15229,7 @@
                 // Common notifications
                 connectionError: 'Erreur de connexion',
                 saveFailed: 'Échec de sauvegarde',
-                invalidDnsName: 'Nom invalide : doit commencer par une lettre, uniquement alphanumériques et tirets, max 63 caractères',
+                invalidDnsName: 'Nom invalide : seuls les lettres, chiffres, tirets et points sont autorisés ; chaque partie doit commencer et se terminer par une lettre ou un chiffre (max 63 caractères par partie)',
                 addTag: 'Ajouter un tag...',
                 invalidTagFormat: 'Format invalide. Les tags doivent être en minuscules alphanumériques (tirets, points, underscores autorisés).',
                 deleteError: 'Erreur de suppression',
@@ -19577,7 +19577,7 @@
                 // Common notifications / Notificaciones comunes
                 connectionError: 'Error de conexión',
                 saveFailed: 'Falló guardar',
-                invalidDnsName: 'Nombre inválido: debe comenzar con una letra, solo alfanuméricos y guiones, máx. 63 caracteres',
+                invalidDnsName: 'Nombre inválido: solo se permiten letras, números, guiones y puntos; cada parte debe comenzar y terminar con una letra o un número (máx. 63 caracteres por parte)',
                 addTag: 'Agregar etiqueta...',
                 invalidTagFormat: 'Formato inválido. Las etiquetas deben ser alfanuméricas en minúsculas (guiones, puntos, guiones bajos permitidos).',
                 deleteError: 'Error de remoción',
@@ -23909,7 +23909,7 @@
 
                 // Common notifications
                 saveFailed: 'Falha ao salvar',
-                invalidDnsName: 'Nome inválido: deve começar com uma letra, apenas alfanuméricos e hifens, máx. 63 caracteres',
+                invalidDnsName: 'Nome inválido: apenas letras, números, hífens e pontos são permitidos; cada parte deve começar e terminar com uma letra ou número (máx. 63 caracteres por parte)',
                 addTag: 'Adicionar tag...',
                 invalidTagFormat: 'Formato inválido. Tags devem ser alfanuméricos em minúsculas (hifens, pontos, underscores permitidos).',
                 deleteError: 'Erro ao excluir',
@@ -29919,7 +29919,7 @@
                 interfaceUpdated: '인터페이스가 업데이트되었습니다',
                 internalCheck: '내부 검사',
                 intraClusterReplOnlyHint: '이 대화 상자는 현재 클러스터 내에서 복제를 생성합니다. 클러스터 간 복제는 VM → 구성 → 복제 → 클러스터 간 탭을 여십시오.',
-                invalidDnsName: '잘못된 이름: 문자로 시작해야 하며 영숫자와 하이픈만 허용되고 최대 63자입니다',
+                invalidDnsName: '잘못된 이름: 문자, 숫자, 하이픈, 점만 사용할 수 있으며 각 부분은 문자 또는 숫자로 시작하고 끝나야 합니다(부분당 최대 63자)',
                 invalidPassword: '잘못된 비밀번호',
                 invalidStorageId: '스토리지 ID는 문자로 시작해야 하며 문자, 숫자, -, _, .만 포함할 수 있습니다',
                 invalidTagFormat: '잘못된 형식입니다. 태그는 소문자 영숫자여야 합니다(하이픈, 점, 밑줄 허용).',
@@ -32595,7 +32595,7 @@
                 // Notifiche comuni
                 connectionError: 'Errore di connessione',
                 saveFailed: 'Salvataggio non riuscito',
-                invalidDnsName: 'Nome non valido: deve iniziare con una lettera, solo alfanumerico e trattini consentiti, max 63 caratteri',
+                invalidDnsName: 'Nome non valido: sono consentiti solo lettere, numeri, trattini e punti; ogni parte deve iniziare e terminare con una lettera o un numero (max 63 caratteri per parte)',
                 addTag: 'Aggiungi tag...',
                 invalidTagFormat: 'Formato non valido. I tag devono essere alfanumerici minuscoli (trattini, punti, underscore consentiti).',
                 deleteError: 'Errore durante l\'eliminazione',
