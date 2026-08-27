@@ -1538,8 +1538,13 @@
             const mons = Array.isArray(c.mon) ? c.mon : [];
             const osds = Array.isArray(c.osd) ? c.osd : [];
             const pools = Array.isArray(c.pools) ? c.pools : [];
-            const osdUp = osds.filter(o => o.up === 1 || o.up === true).length;
-            const health = (c.status && (c.status.health || c.status.health_status)) || c.health || 'unknown';
+            // #735 (mdobprv-lab) — flattened CRUSH-tree OSD entries carry status:"up", not a boolean
+            // up; the node/datacenter Ceph UIs already key on o.status. Count that, keep o.up fallback.
+            const osdUp = osds.filter(o => String(o.status || '').toLowerCase() === 'up' || o.up === 1 || o.up === true).length;
+            // #735 — Proxmox /ceph/status returns health as an OBJECT ({status:"HEALTH_OK",...}); pull the
+            // scalar out first, or String(health) renders as "[object Object]".
+            const _healthRaw = (c.status && (c.status.health || c.status.health_status)) || c.health || 'unknown';
+            const health = (_healthRaw && typeof _healthRaw === 'object') ? (_healthRaw.status || _healthRaw.health_status || 'unknown') : _healthRaw;
             const kpis = [
                 { icon: 'Heart', value: String(health).toUpperCase(), label: t('cloud.cephHealth') || 'Health', accent: /ok|healthy/i.test(String(health)) ? '#22c55e' : '#f59e0b' },
                 { icon: 'Database', value: mons.length, label: t('cloud.cephMons') || 'Monitors', accent: '#6366f1' },
