@@ -10548,7 +10548,12 @@ def cross_cluster_migrate_api():
         )
         
         logging.info(f"Starting remote migration of {vm_type}/{vmid} from {source_cluster_id} to {target_cluster_id}...")
-        logging.info(f"Target host: {fp_result['host']}, Token user: {target_token['token_id'].split('!')[0]}, Online: {online}")
+        # MK Aug 2026 (#733) — log the host + fingerprint we hand to PVE. remote_migrate on a
+        # target added without SSL trust rejects with a bare {"data":null}/500 and swallows the
+        # real reason, so this is often the only way to tell whether the fp we computed matches
+        # the one the source node actually sees. The fingerprint is public cert data — the token
+        # secret is NOT logged (the full target-endpoint stays redacted in remote_migrate_vm).
+        logging.info(f"Target host: {fp_result['host']}, fingerprint: {fp_result['fingerprint']}, Token user: {target_token['token_id'].split('!')[0]}, Online: {online}")
         
         # Step 4: Perform the migration
         result = source_manager.remote_migrate_vm(
