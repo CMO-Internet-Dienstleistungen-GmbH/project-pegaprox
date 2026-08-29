@@ -98,7 +98,7 @@ git -C "$REPO_ROOT" remote get-url upstream >/dev/null 2>&1 \
 git -C "$REPO_ROOT" fetch --quiet --tags "$FORK_REMOTE"
 git -C "$REPO_ROOT" fetch --quiet --tags upstream
 
-RELEASE_TAG="$(latest_release_tag "$UPSTREAM_REPO")"
+RELEASE_TAG="$(latest_release_tag "$UPSTREAM_URL")"
 [ -n "$RELEASE_TAG" ] || die "could not determine the latest upstream release"
 git -C "$REPO_ROOT" rev-parse --verify --quiet "refs/tags/$RELEASE_TAG^{commit}" >/dev/null \
     || die "upstream release tag $RELEASE_TAG is not in this clone after fetch"
@@ -191,16 +191,6 @@ while IFS=$'\x1f' read -r name branch base pr summary; do
     [ -n "$name" ] || continue
     info "patch: $name — $summary"
 
-    if [ -n "$pr" ]; then
-        merged="$(pr_merged "$UPSTREAM_REPO" "$pr")"
-        if [ "$merged" = "true" ]; then
-            ok "  upstream PR #$pr is merged — dropping this patch from the set"
-            SKIPPED_LIST="${SKIPPED_LIST}${name} (PR #${pr} merged upstream)"$'\n'
-            N_SKIPPED=$((N_SKIPPED + 1))
-            continue
-        fi
-    fi
-
     if ! git -C "$REPO_ROOT" rev-parse --verify --quiet "$FORK_REMOTE/$branch" >/dev/null; then
         die "$name: branch $FORK_REMOTE/$branch not found"
     fi
@@ -213,6 +203,30 @@ while IFS=$'\x1f' read -r name branch base pr summary; do
         SKIPPED_LIST="${SKIPPED_LIST}${name} (no commits beyond upstream/${base})"$'\n'
         N_SKIPPED=$((N_SKIPPED + 1))
         continue
+    fi
+
+    # Has the release already got this work? `git cherry` compares patch-ids,
+    # so it recognises our commits even when the maintainer rebased them. This
+    # is the reliable signal and needs no network; the PR lookup below only
+    # adds the squash-merge case, which patch-ids cannot see.
+    if [ -z "$(git -C "$REPO_ROOT" cherry "$RELEASE_SHA" "$FORK_REMOTE/$branch" "$merge_base" | grep '^+' || true)" ]; then
+        ok "  every commit is already in $RELEASE_TAG — dropping this patch"
+        SKIPPED_LIST="${SKIPPED_LIST}${name} (already contained in ${RELEASE_TAG})"$'\n'
+        N_SKIPPED=$((N_SKIPPED + 1))
+        continue
+    fi
+
+    if [ -n "$pr" ]; then
+        merged="$(pr_merged "$UPSTREAM_REPO" "$pr")"
+        case "$merged" in
+            true)
+                ok "  upstream PR #$pr is merged — dropping this patch from the set"
+                SKIPPED_LIST="${SKIPPED_LIST}${name} (PR #${pr} merged upstream)"$'\n'
+                N_SKIPPED=$((N_SKIPPED + 1))
+                continue ;;
+            unknown)
+                warn "  PR #$pr status unavailable (API unreachable) — relying on patch-ids" ;;
+        esac
     fi
 
     n=0
