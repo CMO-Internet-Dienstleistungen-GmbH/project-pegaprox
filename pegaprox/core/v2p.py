@@ -1966,6 +1966,15 @@ def _run_v2p_migration(task):
                     pass
         except Exception:
             pass
+    finally:
+        # #722 follow-up (mluenzer) — release any kernel rbd maps we created for a non-krbd RBD
+        # target. The migrated guest runs through librbd, so these maps are pure leftovers; a krbd
+        # storage is untouched (we only unmap the devices _pvesm_alloc_disk mapped itself). Runs on
+        # both success and failure, after the guest has started.
+        try:
+            _unmap_v2p_rbd_devices(pve_mgr, task.target_node, task)
+        except Exception:
+            pass
 
 
 # NS Apr 2026 — 4K-sector iSCSI LUN fix. Lots of SAN targets (TrueNAS LIO, some
@@ -1992,6 +2001,16 @@ def _register_uefi_fallback_loader(pve_mgr, task):
         if not vol_path:
             task.log("EFI fallback: could not resolve volume path, skipping")
             return
+        # #722 follow-up — a non-krbd RBD storage resolves to a librbd URI, not a block device, so the
+        # loopback below would bail with 'volume not a block device'. Map it to /dev/rbdN (tracked so
+        # the migration teardown unmaps it) and use that.
+        if vol_path.startswith('rbd:'):
+            _mapped_efi = _map_rbd_uri_to_device(pve_mgr, task.target_node, vol_id, vol_path)
+            if not _mapped_efi:
+                task.log("EFI fallback: non-krbd RBD volume could not be mapped, skipping (non-fatal)")
+                return
+            _rbd_map_sink(task).append(_mapped_efi)
+            vol_path = _mapped_efi
         task.log(f"EFI fallback: registering BOOTX64.EFI on {vol_path}")
         # Combined script — losetup with 512b sector override, partprobe, identify ESP,
         # mount RW, copy loader, cleanup. Idempotent: if BOOTX64.EFI already exists with
@@ -3396,7 +3415,33 @@ def _map_rbd_uri_to_device(pve_mgr, node, vol_id, rbd_uri):
     return None
 
 
-def _pvesm_alloc_disk(pve_mgr, node, storage, vmid, disk_index, size_bytes, errbuf=None):
+def _rbd_map_sink(task):
+    """List on the task that collects the /dev/rbdN devices _pvesm_alloc_disk kernel-maps for a
+    non-krbd RBD target, so the migration teardown can rbd-unmap exactly those (#722 follow-up)."""
+    devs = getattr(task, '_mapped_rbd_devs', None)
+    if devs is None:
+        devs = task._mapped_rbd_devs = []
+    return devs
+
+
+def _unmap_v2p_rbd_devices(pve_mgr, node, task):
+    """Release the kernel rbd maps we created for a non-krbd RBD target once the copy is done.
+    Safe: the migrated guest runs through librbd, not this kernel map — and we only touch devices
+    _pvesm_alloc_disk mapped itself, so a krbd storage (whose running guest DOES use the kernel map)
+    is never disturbed. Best-effort and idempotent."""
+    devs = getattr(task, '_mapped_rbd_devs', None)
+    if not devs:
+        return
+    for dev in list(devs):
+        try:
+            _pve_node_exec(pve_mgr, node, f"rbd unmap {shlex.quote(dev)} 2>/dev/null || true", timeout=30)
+            task.log(f"  released kernel rbd map {dev}")
+        except Exception as _e:
+            logging.debug(f"[V2P] rbd unmap {dev} failed: {_e}")
+    task._mapped_rbd_devs = []
+
+
+def _pvesm_alloc_disk(pve_mgr, node, storage, vmid, disk_index, size_bytes, errbuf=None, mapped_rbd=None):
     """Robustly allocate a disk via pvesm alloc.
 
     Handles all storage types (LVM-thin, ZFS, Dir, Ceph, NFS) and
@@ -3569,6 +3614,8 @@ def _pvesm_alloc_disk(pve_mgr, node, storage, vmid, disk_index, size_bytes, errb
                 mapped = _map_rbd_uri_to_device(pve_mgr, node, vol_id, dev_path)
                 if mapped and _ensure_block_device(pve_mgr, node, vol_id, mapped, 'rbd'):
                     logging.info(f"[V2P] Disk allocated (non-krbd RBD mapped): {vol_id} → {mapped}")
+                    if mapped_rbd is not None:
+                        mapped_rbd.append(mapped)
                     return vol_id, mapped
                 logging.error(f"[V2P] {vol_id}: non-krbd RBD URI could not be mapped to a "
                               f"block device — failing alloc to avoid a phantom-file write")
@@ -3632,6 +3679,8 @@ def _pvesm_alloc_disk(pve_mgr, node, storage, vmid, disk_index, size_bytes, errb
                     mapped = _map_rbd_uri_to_device(pve_mgr, node, vol_id, dev_path)
                     if mapped and _ensure_block_device(pve_mgr, node, vol_id, mapped, 'rbd'):
                         logging.info(f"[V2P] Disk allocated via API (non-krbd RBD mapped): {vol_id} → {mapped}")
+                        if mapped_rbd is not None:
+                            mapped_rbd.append(mapped)
                         return vol_id, mapped
                 logging.warning(f"[V2P] API alloc OK but path invalid: {vol_id} → {dev_path[:100]}")
     except Exception as e:
@@ -4072,7 +4121,7 @@ def _qemu_img_ssh_copy(pve_mgr, task, esxi_host, esxi_user, key_path,
         # Allocate volume using robust helper
         _alloc_err = []
         vol_id, dev_path = _pvesm_alloc_disk(pve_mgr, task.target_node,
-            task.target_storage, task.proxmox_vmid, di, disk_total, errbuf=_alloc_err)
+            task.target_storage, task.proxmox_vmid, di, disk_total, errbuf=_alloc_err, mapped_rbd=_rbd_map_sink(task))
 
         task.log(f"  Target: {vol_id} → {dev_path}")
         if not vol_id or not dev_path:
@@ -4373,7 +4422,7 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
         task.log(f"Disk {di}: allocating {disk_total / (1024**3):.1f} GB on {task.target_storage}")
         
         vol_id, dev_path = _pvesm_alloc_disk(pve_mgr, task.target_node,
-            task.target_storage, task.proxmox_vmid, di, disk_total)
+            task.target_storage, task.proxmox_vmid, di, disk_total, mapped_rbd=_rbd_map_sink(task))
         
         if vol_id and dev_path:
             task.log(f"  Disk {di}: {vol_id} → {dev_path}")
@@ -5080,7 +5129,7 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             vol_id, dev_path = local_volumes[di]
             if not vol_id or not dev_path:
                 vol_id, dev_path = _pvesm_alloc_disk(pve_mgr, task.target_node,
-                    task.target_storage, task.proxmox_vmid, di, disk_total)
+                    task.target_storage, task.proxmox_vmid, di, disk_total, mapped_rbd=_rbd_map_sink(task))
                 if vol_id and dev_path:
                     local_volumes[di] = (vol_id, dev_path)
                 else:
@@ -5171,7 +5220,7 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             vol_id, dev_path = local_volumes[di]
             if not vol_id or not dev_path:
                 vol_id, dev_path = _pvesm_alloc_disk(pve_mgr, task.target_node,
-                    task.target_storage, task.proxmox_vmid, di, disk_total)
+                    task.target_storage, task.proxmox_vmid, di, disk_total, mapped_rbd=_rbd_map_sink(task))
                 if vol_id and dev_path:
                     local_volumes[di] = (vol_id, dev_path)
                 else:
@@ -5550,7 +5599,7 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
         
         if not vol_id or not dev_path:
             vol_id, dev_path = _pvesm_alloc_disk(pve_mgr, task.target_node,
-                task.target_storage, task.proxmox_vmid, di, disk_total)
+                task.target_storage, task.proxmox_vmid, di, disk_total, mapped_rbd=_rbd_map_sink(task))
             if vol_id and dev_path:
                 local_volumes[di] = (vol_id, dev_path)
             else:
@@ -6337,7 +6386,7 @@ def _ssh_pipe_transfer(pve_mgr, task, esxi_host, esxi_user, esxi_pass, datastore
     # 3. Allocate raw volume on Proxmox using robust helper
     _alloc_err = []
     vol_id, vol_path = _pvesm_alloc_disk(pve_mgr, task.target_node,
-        task.target_storage, task.proxmox_vmid, disk_index, flat_size, errbuf=_alloc_err)
+        task.target_storage, task.proxmox_vmid, disk_index, flat_size, errbuf=_alloc_err, mapped_rbd=_rbd_map_sink(task))
     if not vol_id or not vol_path:
         # surface pvesm error for debugging (#132, #529)
         rc_dbg, out_dbg, _ = _pve_node_exec(pve_mgr, task.target_node,

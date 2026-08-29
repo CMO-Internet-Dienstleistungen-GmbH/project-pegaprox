@@ -140,3 +140,45 @@ def test_map_returns_none_when_unmappable(monkeypatch):
 def test_map_returns_none_on_unparseable_uri(monkeypatch):
     _stub_exec(monkeypatch, lambda cmd: (0, '', ''))
     assert v2p._map_rbd_uri_to_device(None, 'pve1', 'x', 'rbd:garbage') is None
+
+
+# --------------------------------------------------------------------------- #
+# #722 follow-up — teardown of the kernel rbd maps we created (non-krbd RBD)
+# --------------------------------------------------------------------------- #
+
+class _FakeTask:
+    def __init__(self, devs=None):
+        if devs is not None:
+            self._mapped_rbd_devs = devs
+        self.logs = []
+
+    def log(self, m):
+        self.logs.append(m)
+
+
+def test_rbd_map_sink_creates_and_reuses_one_list():
+    t = _FakeTask()
+    a = v2p._rbd_map_sink(t)
+    a.append('/dev/rbd5')
+    b = v2p._rbd_map_sink(t)
+    assert a is b
+    assert b == ['/dev/rbd5']
+
+
+def test_unmap_issues_rbd_unmap_per_device_and_clears(monkeypatch):
+    calls = []
+    _stub_exec(monkeypatch, lambda cmd: (calls.append(cmd), (0, '', ''))[1])
+    t = _FakeTask(['/dev/rbd0', '/dev/rbd1'])
+    v2p._unmap_v2p_rbd_devices(None, 'pve1', t)
+    assert any('rbd unmap' in c and '/dev/rbd0' in c for c in calls)
+    assert any('rbd unmap' in c and '/dev/rbd1' in c for c in calls)
+    # cleared so a retry / the orchestrator finally can't double-unmap
+    assert t._mapped_rbd_devs == []
+
+
+def test_unmap_is_noop_when_nothing_tracked(monkeypatch):
+    calls = []
+    _stub_exec(monkeypatch, lambda cmd: (calls.append(cmd), (0, '', ''))[1])
+    t = _FakeTask([])
+    v2p._unmap_v2p_rbd_devices(None, 'pve1', t)
+    assert calls == []
