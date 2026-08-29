@@ -3801,7 +3801,7 @@ def _screenshot_via_rfb(mgr, node, vm_type, vmid, max_width=480, timeout=10):
 
     # login → vncproxy ticket/port (same flow as vnc_poll)
     login_data = urllib.parse.urlencode({'username': mgr.config.user, 'password': mgr.config.pass_}).encode('utf-8')
-    login_req = urllib.request.Request(f"https://{host}:{port}/api2/json/access/ticket", data=login_data, method='POST')
+    login_req = urllib.request.Request(f"https://{mgr.auth_host}:{port}/api2/json/access/ticket", data=login_data, method='POST')
     with urllib.request.urlopen(login_req, context=ssl_ctx, timeout=10) as r:
         login_result = _json.loads(r.read().decode('utf-8'))
     pve_ticket = login_result['data']['ticket']
@@ -3987,7 +3987,7 @@ def vnc_poll(cluster_id, node, vm_type, vmid):
                 'password': mgr.config.pass_,
             }).encode('utf-8')
             login_req = urllib.request.Request(
-                f"https://{host}:{port}/api2/json/access/ticket", data=login_data, method='POST'
+                f"https://{mgr.auth_host}:{port}/api2/json/access/ticket", data=login_data, method='POST'
             )
             with urllib.request.urlopen(login_req, context=ssl_ctx, timeout=10) as r:
                 login_result = _json.loads(r.read().decode('utf-8'))
@@ -7897,7 +7897,7 @@ def handle_vnc_websocket(ws, cluster_id, node, vm_type, vmid):
         }).encode('utf-8')
         
         login_req = urllib.request.Request(
-            f"https://{host}:{port}/api2/json/access/ticket",
+            f"https://{manager.auth_host}:{port}/api2/json/access/ticket",
             data=login_data, method='POST'
         )
         
@@ -8256,7 +8256,7 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
             }).encode('utf-8')
 
             login_req = urllib.request.Request(
-                f"https://{host}:{port}/api2/json/access/ticket",
+                f"https://{manager.auth_host}:{port}/api2/json/access/ticket",
                 data=login_data, method='POST'
             )
 
@@ -8879,7 +8879,7 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
         }).encode('utf-8')
         
         login_req = urllib.request.Request(
-            f"https://{host}:{port}/api2/json/access/ticket",
+            f"https://{manager.auth_host}:{port}/api2/json/access/ticket",
             data=login_data, method='POST'
         )
         
@@ -9075,7 +9075,7 @@ def get_termproxy_ticket_api(cluster_id, node, vm_type, vmid):
     # Step 1: real PVE session login
     try:
         login_req = _urlreq.Request(
-            f"https://{host}:{port}/api2/json/access/ticket",
+            f"https://{mgr.auth_host}:{port}/api2/json/access/ticket",
             data=_urlencode({'username': pve_usr, 'password': pve_pwd}).encode('utf-8'),
             method='POST'
         )

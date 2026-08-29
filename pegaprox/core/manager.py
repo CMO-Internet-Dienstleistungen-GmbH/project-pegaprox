@@ -667,6 +667,15 @@ class PegaProxManager:
         return self._bracket_ipv6(h)
 
     @property
+    def auth_host(self) -> str:
+        """The registered node (config.host), bracketed for URLs. Password/@pam ticket mints
+        MUST target this, not `host`: `host` follows the HA fallback to current_host, and @pam
+        is a node-local account, so minting the stored cluster password against a fallback node
+        answers 401 (#740.2 — console dead on every node but the registered one). The PVE ticket
+        we get back is cluster-wide, so the vncproxy/termproxy leg can still run on `host`."""
+        return self._bracket_ipv6(self.config.host)
+
+    @property
     def raw_host(self) -> str:
         """Raw host/IP without brackets — for SSH, DNS lookups etc."""
         return self.current_host or self.config.host
@@ -11141,7 +11150,7 @@ echo "AGENT_INSTALLED_OK"
                 ctx.check_hostname = False
                 ctx.verify_mode = _ssl.CERT_NONE
             req = _ur.Request(
-                f"https://{self.host}:{self.api_port}/api2/json/access/ticket",
+                f"https://{self.auth_host}:{self.api_port}/api2/json/access/ticket",
                 data=_ue({'username': usr, 'password': pwd}).encode('utf-8'),
                 method='POST',
             )
