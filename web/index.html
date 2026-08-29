@@ -4399,12 +4399,13 @@ if(d.session_id){setSessionId(d.session_id);}// LW: Store password expiry info i
 if(d.password_expiry){setPasswordExpiry(d.password_expiry);}// NS: Check if server requires 2FA setup
 if(d.requires_2fa_setup){setRequires2FASetup(true);}else{setRequires2FASetup(false);}// NS: Mar 2026 - apply user's saved language (server overrides local)
 if(d.user?.language&&translations[d.user.language]){applyLanguage(d.user.language);}// NS: Apply user's theme or default
-// MK May 2026 — when user is in corporate layout, the local
-// corp-theme toggle is the source of truth for that session.
-// Without this, a stale server.user.theme=corporateLight would
-// override an active corporateDark toggle on F5 → taskbar
-// bg-proxmox-dark/50 etc. would render with light CSS vars.
-let userTheme=d.user?.theme||d.default_theme||'proxmoxDark';try{if(d.user?.ui_layout==='corporate'){const isLight=localStorage.getItem('corp-theme')==='light';userTheme=isLight?'corporateLight':'corporateDark';}}catch(_){}console.log('[Theme] checkSession - Server theme:',d.user?.theme,'Default:',d.default_theme,'Using:',userTheme);if(userTheme&&PEGAPROX_THEMES[userTheme]){applyTheme(userTheme);}// NS: Store reverse proxy status
+// #742 (was MK May 2026) — the SERVER user.theme is the single source of
+// truth for corporate light/dark; both the Settings selector and the header
+// toggle persist it. Honour it and keep the local corp-theme cache in sync,
+// falling back to the cache only when the server has no corporate variant yet.
+// (The old code let the local cache override the server, so a 'Corporate
+// Light' picked in Settings was ignored on reload.)
+let userTheme=d.user?.theme||d.default_theme||'proxmoxDark';try{if(d.user?.ui_layout==='corporate'){const serverCorp=d.user?.theme==='corporateLight'||d.user?.theme==='corporateDark'?d.user.theme:null;const isLight=serverCorp?serverCorp==='corporateLight':localStorage.getItem('corp-theme')==='light';localStorage.setItem('corp-theme',isLight?'light':'');userTheme=isLight?'corporateLight':'corporateDark';}}catch(_){}console.log('[Theme] checkSession - Server theme:',d.user?.theme,'Default:',d.default_theme,'Using:',userTheme);if(userTheme&&PEGAPROX_THEMES[userTheme]){applyTheme(userTheme);}// NS: Store reverse proxy status
 if(d.reverse_proxy_enabled!==undefined){setReverseProxyEnabled(d.reverse_proxy_enabled);}}else{logout();}}else{// NS: Feb 2026 - Capture ldap_enabled from 401 response
 try{const errData=await r.json();if(errData.ldap_enabled!==undefined)setLdapEnabled(errData.ldap_enabled);if(errData.oidc_enabled!==undefined){setOidcEnabled(errData.oidc_enabled);setOidcButtonText(errData.oidc_button_text||'Sign in with SSO');}if(errData.login_background)setLoginBackground(errData.login_background);if(errData.reverse_proxy_enabled!==undefined)setReverseProxyEnabled(errData.reverse_proxy_enabled);// MK May 2026 — first-run signal from backend
 if(errData.initialized===false)setNeedsSetup(true);else setNeedsSetup(false);}catch(e){}logout();}}catch(err){console.error('Session check failed');logout();}setLoading(false);};// -lw: Main login handler - supports 2FA flow + remember me
@@ -4423,7 +4424,8 @@ if(data.portal_only&&!window.location.pathname.startsWith('/portal')){setError(t
 if(data.session_id){setSessionId(data.session_id);}// NS: Feb 2026 - Check if force 2FA setup is required
 if(data.requires_2fa_setup){setRequires2FASetup(true);}// NS: Mar 2026 - apply user's saved language on login
 if(data.user?.language&&translations[data.user.language]){applyLanguage(data.user.language);}// NS: Apply user's theme (with fallback to default)
-let userTheme=data.user?.theme||data.default_theme||'proxmoxDark';try{if(data.user?.ui_layout==='corporate'){const isLight=localStorage.getItem('corp-theme')==='light';userTheme=isLight?'corporateLight':'corporateDark';}}catch(_){}console.log('[Theme] Login - Server theme:',data.user?.theme,'Default:',data.default_theme,'Using:',userTheme);if(userTheme&&PEGAPROX_THEMES[userTheme]){applyTheme(userTheme);}// NS: Store reverse proxy status
+// #742: server user.theme is the single source of truth for corporate light/dark.
+let userTheme=data.user?.theme||data.default_theme||'proxmoxDark';try{if(data.user?.ui_layout==='corporate'){const serverCorp=data.user?.theme==='corporateLight'||data.user?.theme==='corporateDark'?data.user.theme:null;const isLight=serverCorp?serverCorp==='corporateLight':localStorage.getItem('corp-theme')==='light';localStorage.setItem('corp-theme',isLight?'light':'');userTheme=isLight?'corporateLight':'corporateDark';}}catch(_){}console.log('[Theme] Login - Server theme:',data.user?.theme,'Default:',data.default_theme,'Using:',userTheme);if(userTheme&&PEGAPROX_THEMES[userTheme]){applyTheme(userTheme);}// NS: Store reverse proxy status
 if(data.reverse_proxy_enabled!==undefined){setReverseProxyEnabled(data.reverse_proxy_enabled);}// NS: Security warning for default password
 if(data.security_warning==='DEFAULT_PASSWORD'){setTimeout(()=>{alert('⚠️ SECURITY WARNING!\n\nYou are using the default admin password.\nPlease change it immediately in Settings ↑ Users!');},500);}return{success:true};}else{setError(data.error||'Login failed');return{success:false,error:data.error};}}catch(err){console.error('login err',err);setError('Connection error');return{success:false,error:'Connection error'};}};// LW: Update user preferences (theme, language, ui_layout)
 const updatePreferences=async prefs=>{try{if(DEBUG)console.log('updatePreferences:',Object.keys(prefs));const r=await fetch(`${API_URL}/user/preferences`,{method:'PUT',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify(prefs)});if(DEBUG)console.log('updatePreferences status:',r.status);if(r.ok){const data=await r.json();if(DEBUG)console.log('updatePreferences: ok');// Update user in state
@@ -4438,10 +4440,10 @@ const getAuthHeaders=()=>{return{};// Empty - credentials: 'include' handles aut
 function useLayout(){const{user}=useAuth();const layout=user?.ui_layout||'modern';const isCorporate=layout==='corporate';// NS 2026-06-05 — Cloud skin (Preview). Third layout alongside modern/corporate.
 const isCloud=layout==='cloud';// Set data-layout on body whenever layout changes
 // also force matching theme so modern themes dont bleed into corporate
-useEffect(()=>{document.body.setAttribute('data-layout',layout);if(isCorporate){const isLight=localStorage.getItem('corp-theme')==='light';// MK May 2026 (#296): the data-corp-theme attribute gates ALL light-mode
-// CSS overrides. The header toggle sets this on click, but on a fresh
-// page load only applyTheme() ran — so light variables got applied but
-// body still had no data-corp-theme, leaving every component in dark.
+useEffect(()=>{document.body.setAttribute('data-layout',layout);if(isCorporate){// #742: prefer the server's user.theme (single source of truth); fall back to the
+// local corp-theme cache only when the server has no corporate variant yet.
+const serverCorp=user?.theme==='corporateLight'||user?.theme==='corporateDark'?user.theme:null;const isLight=serverCorp?serverCorp==='corporateLight':localStorage.getItem('corp-theme')==='light';try{localStorage.setItem('corp-theme',isLight?'light':'');}catch(_){}// MK May 2026 (#296): data-corp-theme gates ALL light-mode CSS overrides — on a
+// fresh load only applyTheme() ran, leaving the body without it (everything dark).
 document.body.dataset.corpTheme=isLight?'light':'';applyTheme(isLight?'corporateLight':'corporateDark');}else if(isCloud){// NS: force the cloud theme on layout change + F5-restore so the
 // teal/navy variables apply even if a stale theme was stored.
 delete document.body.dataset.corpTheme;applyTheme('cloud');}else{// leaving corporate -> clear so no stale attribute lingers
