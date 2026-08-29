@@ -1,0 +1,57 @@
+# Which upstream release we track, and which of our fixes ride on top of it.
+#
+# This file is the only thing that changes when a fix lands upstream or a new
+# one is added — the scripts read it, nothing is hardcoded there.
+
+upstream:
+  # GitHub repo we track. Releases (not arbitrary tags) drive the sync.
+  repo: PegaProx/project-pegaprox
+  url: https://github.com/PegaProx/project-pegaprox.git
+
+fork:
+  # Remote name inside the clone the scripts run in.
+  remote: origin
+  # Rebuilt from the upstream release tag on every sync — never merged into,
+  # so it is force-pushed by design. The tags below are the stable references.
+  integration_branch: cmo/main
+  # Tag scheme: <upstream tag>-<suffix>.<n>, e.g. v1.0.2-cmo.1
+  tag_suffix: cmo
+
+# Our patches, applied in this order on top of the upstream release tag.
+#
+#   branch       a branch in the fork holding the commits
+#   base         the upstream branch that branch was built on; the commits taken
+#                are `merge-base(base, branch)..branch`
+#   upstream_pr  the pull request upstream; when it is merged, the patch is
+#                dropped from the set instead of applied (the fix is in the
+#                release by then). Leave empty if there is no PR yet.
+patches:
+  - name: vnc-console-under-gevent
+    branch: fix/vnc-console-under-gevent
+    base: Testing
+    upstream_pr: 741
+    summary: web console works under gevent (to_thread delivery, listen socket, session mint)
+
+  - name: taskbar-remount-expand
+    branch: fix/taskbar-remount-expand
+    base: Testing
+    upstream_pr: 739
+    summary: TaskBar auto-expands only for tasks the user just started
+
+  - name: corporate-theme-source-of-truth
+    branch: fix/corporate-theme-source-of-truth
+    base: Testing
+    upstream_pr:
+    summary: user.theme is the single source of truth for Corporate light/dark
+
+# Files whose conflicts are resolved by regenerating them instead of merging.
+# web/index.html is a build artefact (web/Dev/build.sh compiles it from
+# web/index.html.original + web/src/*.js) and conflicts on every backport
+# because upstream ships a bundle built from a different tree.
+generated_files:
+  - path: web/index.html
+    rebuild: web/Dev/build.sh
+
+# Gate for publishing: all of these must pass before a tag is pushed.
+verify:
+  pytest: true

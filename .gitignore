@@ -1,0 +1,7 @@
+# Local experiments with an alternative patch set (see --config / SYNC_CONFIG).
+patches.*.yml
+!patches.yml
+
+# Anything a local run leaves behind.
+.venv/
+__pycache__/
