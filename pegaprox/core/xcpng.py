@@ -1728,12 +1728,20 @@ class XcpngManager:
         with self._task_lock:
             tasks = []
             for task_id, info in list(self._active_tasks.items())[-limit:]:
+                # 'started' is stored as an ISO string internally, but the outward 'starttime'
+                # has to be Unix seconds like every other provider — the TaskBar sorts on it and
+                # its "did this just start?" auto-expand check compares starttime against
+                # Date.now()/1000, where a naive ISO string is NaN (#738).
+                try:
+                    started_s = int(datetime.fromisoformat(info['started']).timestamp())
+                except (ValueError, TypeError):
+                    started_s = None
                 tasks.append({
                     'upid': task_id,
                     'type': info['action'],
                     'status': info['status'],
                     'vmid': info['vmid'],
-                    'starttime': info['started'],
+                    'starttime': started_s,
                     'node': self.current_host or '',
                     'user': 'xapi@xcpng',
                 })

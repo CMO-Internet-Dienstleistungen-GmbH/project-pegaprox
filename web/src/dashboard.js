@@ -17,7 +17,7 @@
             const [taskLogLoading, setTaskLogLoading] = useState(false);
             const [filter, setFilter] = useState('all'); // all, running, error, today
             const { getAuthHeaders } = useAuth();
-            const prevRunningCount = React.useRef(0);
+            const seenRunningIds = React.useRef(null);  // #738: UPIDs already seen running (null = not yet seeded)
             
             // LW: Resizable height - Feb 2026
             const [height, setHeight] = useState(() => {
@@ -32,13 +32,31 @@
             const runningCount = safeTasks.filter(task => task && task.status === 'running').length;
             const failedCount = safeTasks.filter(task => task && (task.status === 'failed' || task.status === 'error')).length;
             
-            // NS: Auto-expand when new task starts (if enabled in user preferences)
+            // #738 — auto-expand only for a task the user actually just started: an unseen UPID
+            // whose starttime is within the last 2 min. The old check compared running COUNTS, but
+            // the parent wipes tasks with setTasks([]) on every cluster switch / reload, so the count
+            // ran 0→N and popped the bar open for tasks that were already running. starttime is Unix
+            // seconds across providers (XCP-ng normalised in get_tasks).
             React.useEffect(() => {
-                if (autoExpandEnabled && runningCount > prevRunningCount.current && runningCount > 0) {
-                    setExpanded(true);
+                const running = safeTasks.filter(t => t && t.status === 'running');
+                const ids = new Set(running.map(t => t.upid || t.id).filter(Boolean));
+                if (seenRunningIds.current === null) {
+                    // first snapshot — whatever is already running is existing, not new
+                    seenRunningIds.current = ids;
+                    return;
                 }
-                prevRunningCount.current = runningCount;
-            }, [runningCount, autoExpandEnabled]);
+                if (autoExpandEnabled) {
+                    const now = Date.now() / 1000;
+                    const justStarted = running.some(t => {
+                        const id = t.upid || t.id;
+                        if (!id || seenRunningIds.current.has(id)) return false;
+                        const st = Number(t.starttime);
+                        return Number.isFinite(st) && (now - st) <= 120;
+                    });
+                    if (justStarted) setExpanded(true);
+                }
+                seenRunningIds.current = ids;
+            }, [tasks, autoExpandEnabled]);
             
             // NS: Handle resize drag
             React.useEffect(() => {

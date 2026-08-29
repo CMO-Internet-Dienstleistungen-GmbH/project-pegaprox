@@ -6461,11 +6461,17 @@ case'topology':body=/*#__PURE__*/React.createElement("div",{className:"cloud-mou
 // backups) deliberately don't pass a timeout and are therefore unaffected.
 const POLL_TIMEOUT_MS=12000;// Task Bar Component with Task Viewer
 function TaskBar({tasks,onClear,onClose,onCancel,onRefresh,clusterId,autoExpandEnabled=true}){const{t}=useTranslation();const[expanded,setExpanded]=useState(false);const[selectedTask,setSelectedTask]=useState(null);const[taskLog,setTaskLog]=useState('');const[taskLogLoading,setTaskLogLoading]=useState(false);const[filter,setFilter]=useState('all');// all, running, error, today
-const{getAuthHeaders}=useAuth();const prevRunningCount=React.useRef(0);// LW: Resizable height - Feb 2026
+const{getAuthHeaders}=useAuth();const seenRunningIds=React.useRef(null);// #738: UPIDs already seen running (null = not yet seeded)
+// LW: Resizable height - Feb 2026
 const[height,setHeight]=useState(()=>{const saved=localStorage.getItem('pegaprox-taskbar-height');return saved?parseInt(saved):384;// default h-96 = 384px
 });const[isResizing,setIsResizing]=useState(false);const resizeRef=React.useRef(null);// Ensure tasks is an array
-const safeTasks=Array.isArray(tasks)?tasks:[];const runningCount=safeTasks.filter(task=>task&&task.status==='running').length;const failedCount=safeTasks.filter(task=>task&&(task.status==='failed'||task.status==='error')).length;// NS: Auto-expand when new task starts (if enabled in user preferences)
-React.useEffect(()=>{if(autoExpandEnabled&&runningCount>prevRunningCount.current&&runningCount>0){setExpanded(true);}prevRunningCount.current=runningCount;},[runningCount,autoExpandEnabled]);// NS: Handle resize drag
+const safeTasks=Array.isArray(tasks)?tasks:[];const runningCount=safeTasks.filter(task=>task&&task.status==='running').length;const failedCount=safeTasks.filter(task=>task&&(task.status==='failed'||task.status==='error')).length;// #738 — auto-expand only for a task the user actually just started: an unseen UPID
+// whose starttime is within the last 2 min. The old check compared running COUNTS, but
+// the parent wipes tasks with setTasks([]) on every cluster switch / reload, so the count
+// ran 0→N and popped the bar open for tasks that were already running. starttime is Unix
+// seconds across providers (XCP-ng normalised in get_tasks).
+React.useEffect(()=>{const running=safeTasks.filter(t=>t&&t.status==='running');const ids=new Set(running.map(t=>t.upid||t.id).filter(Boolean));if(seenRunningIds.current===null){// first snapshot — whatever is already running is existing, not new
+seenRunningIds.current=ids;return;}if(autoExpandEnabled){const now=Date.now()/1000;const justStarted=running.some(t=>{const id=t.upid||t.id;if(!id||seenRunningIds.current.has(id))return false;const st=Number(t.starttime);return Number.isFinite(st)&&now-st<=120;});if(justStarted)setExpanded(true);}seenRunningIds.current=ids;},[tasks,autoExpandEnabled]);// NS: Handle resize drag
 React.useEffect(()=>{if(!isResizing)return;// Set cursor on body during resize
 document.body.style.cursor='ns-resize';document.body.style.userSelect='none';const handleMouseMove=e=>{const newHeight=window.innerHeight-e.clientY;// Limit between 150px and 80% of viewport
 const clampedHeight=Math.max(150,Math.min(newHeight,window.innerHeight*0.8));setHeight(clampedHeight);};const handleMouseUp=()=>{setIsResizing(false);document.body.style.cursor='';document.body.style.userSelect='';// Save to localStorage
