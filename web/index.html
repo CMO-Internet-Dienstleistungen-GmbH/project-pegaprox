@@ -4415,7 +4415,10 @@ if(data.locked){// user-friendly error message derived from retry_after, since
 // the server response stays generic ("Invalid credentials") to avoid
 // leaking which users exist
 const sec=data.retry_after||0;const mins=Math.ceil(sec/60);setError(t('accountLocked')?t('accountLocked').replace('{mins}',mins):`Too many failed attempts. Try again in ~${mins} min.`);return{success:false,locked:true,retry_after:sec};}if(resp.status===429){setError(data.error||'Too many requests, slow down.');return{success:false,locked:false};}// 2fa required?
-if(resp.ok&&data.requires_2fa){return{requires_2fa:true};}if(resp.ok&&data.success){// portal_only users can't use main dashboard
+if(resp.ok&&data.requires_2fa){// -lw #746: pass the server's `methods` through — the login screen branches
+// on it to show the security-key prompt. Without it twoFAMethods stayed []
+// and a WebAuthn-only account only ever saw the TOTP box (i.e. locked out).
+return{requires_2fa:true,methods:data.methods};}if(resp.ok&&data.success){// portal_only users can't use main dashboard
 if(data.portal_only&&!window.location.pathname.startsWith('/portal')){setError(t('portalOnlyAccount')||'This account can only log in via the Client Portal (/portal)');return{success:false,portal_only:true};}setUser(data.user);setIsAuthenticated(true);// NS: Keep session_id in memory for WebSocket auth
 if(data.session_id){setSessionId(data.session_id);}// NS: Feb 2026 - Check if force 2FA setup is required
 if(data.requires_2fa_setup){setRequires2FASetup(true);}// NS: Mar 2026 - apply user's saved language on login

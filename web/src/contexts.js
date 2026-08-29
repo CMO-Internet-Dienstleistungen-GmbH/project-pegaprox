@@ -333,7 +333,10 @@
                     
                     // 2fa required?
                     if (resp.ok && data.requires_2fa) {
-                        return { requires_2fa: true };
+                        // -lw #746: pass the server's `methods` through — the login screen branches
+                        // on it to show the security-key prompt. Without it twoFAMethods stayed []
+                        // and a WebAuthn-only account only ever saw the TOTP box (i.e. locked out).
+                        return { requires_2fa: true, methods: data.methods };
                     }
                     
                     if (resp.ok && data.success) {
