@@ -197,6 +197,34 @@ def _ssh_stderr_excerpt(stderr, max_chars=240):
     return lines[-1][:max_chars]
 
 
+def _ssh_auth_hint(stderr):
+    """Translate an opaque SSH failure into an actionable one-liner, or None.
+
+    #717: nodes running `PermitRootLogin without-password` refuse root PASSWORD
+    auth, so OpenSSH answers every attempt with a bare 'Permission denied
+    (publickey).' — no mention of the password it just rejected. Without a hint
+    the DEBUG logs (and the compliance 502 that follows) read like a mystery.
+    A host key that changed after CIS/reprovision surfaces as 'Host key
+    verification failed'. Both have a concrete fix the operator can act on.
+    """
+    if not stderr:
+        return None
+    low = stderr.lower()
+    if 'host key verification failed' in low:
+        return ("the node's SSH host key changed — clear the pinned entry to re-pin it "
+                "(cluster edit reconnects and re-learns it)")
+    if 'permission denied' in low:
+        # '(publickey)' alone => the server offered ONLY key auth (password refused,
+        # e.g. without-password). '(publickey,password)' => a password was accepted
+        # as a method but the credential was wrong.
+        if '(publickey)' in low or 'password' not in low:
+            return ("node accepts SSH key auth only (e.g. PermitRootLogin without-password) "
+                    "— add an authorized SSH key for this cluster; the password/token only "
+                    "covers the PVE API, not SSH")
+        return "SSH password rejected — check the node credentials or add an SSH key"
+    return None
+
+
 # /cluster/metrics/export carries EVERY node, guest and storage metric for the
 # whole cluster (pve-manager >= 8.2.5), so on a big estate (10k guests) it is many
 # MB / ~100k rows. json.loads()-ing that whole blob holds the GIL for ~150ms per
@@ -6557,6 +6585,20 @@ echo "AGENT_INSTALLED_OK"
         
         return result
     
+    def _note_ssh_auth_hint(self, host, stderr):
+        """#717: surface an actionable SSH-auth hint ONCE per host, at INFO level so it
+        shows without DEBUG. The per-command sites only DEBUG the raw stderr; this lifts
+        the conclusion ('add an SSH key' / 'host key changed') into normal logs where a
+        user staring at a compliance 502 will actually see it."""
+        hint = _ssh_auth_hint(stderr)
+        if not hint:
+            return
+        seen = self.__dict__.setdefault('_ssh_auth_hint_seen', set())
+        if (host, hint) in seen:
+            return
+        seen.add((host, hint))
+        self.logger.info(f"[SSH] {host}: {hint}")
+
     def _ssh_run_command_output(self, host: str, user: str, command: str, timeout: int = 30) -> str:
         """Run SSH command and return output - HA PRIORITY (no rate limiting)
 
@@ -6582,6 +6624,7 @@ echo "AGENT_INSTALLED_OK"
             if result.returncode == 0:
                 return result.stdout
             self.logger.debug(f"[SSH] Command failed on {host}: {_ssh_stderr_excerpt(result.stderr)}")
+            self._note_ssh_auth_hint(host, result.stderr)
             return None
         except subprocess.TimeoutExpired:
             self.logger.debug(f"[SSH] Command timed out on {host}")
@@ -6625,6 +6668,7 @@ echo "AGENT_INSTALLED_OK"
                 if result.returncode == 0:
                     return result.stdout
                 self.logger.debug(f"[SSH] Key auth failed on {host}: {_ssh_stderr_excerpt(result.stderr)}")
+                self._note_ssh_auth_hint(host, result.stderr)
                 return None
             finally:
                 os.unlink(key_file)
@@ -6665,6 +6709,7 @@ echo "AGENT_INSTALLED_OK"
             if result.returncode == 0:
                 return result.stdout
             self.logger.debug(f"[SSH] Password auth failed on {host}: {_ssh_stderr_excerpt(result.stderr)}")
+            self._note_ssh_auth_hint(host, result.stderr)
             return None
         except FileNotFoundError:
             self.logger.debug(f"[SSH] sshpass not installed - cannot use password auth")
