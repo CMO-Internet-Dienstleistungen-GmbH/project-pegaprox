@@ -493,7 +493,10 @@ def create_storage_cluster(cluster_id):
     _usr = request.session.get('user', 'system')
     # #491 — floor an admin-owned scoped token to its effective_role before the tenant-ownership
     # check (matches check_cluster_access / trigger_balance_now), else the raw admin role bypasses it.
-    _allowed = _guc(build_authz_user(_usr, request.session))
+    # include_pools=False: a pool/VM-ACL reach (the #555/#248 fallbacks) must NOT arm the userless
+    # cluster-wide balancing worker — only a caller whose TENANT owns the cluster may (Aikido 469089261
+    # re-verify: the default include_pools=True re-added pool-reached clusters and defeated this guard).
+    _allowed = _guc(build_authz_user(_usr, request.session), include_pools=False)
     if _allowed is not None and cluster_id not in _allowed:
         return jsonify({'error': 'Access denied'}), 403
 
@@ -558,7 +561,10 @@ def update_storage_cluster(cluster_id, sc_id):
     _usr = request.session.get('user', 'system')
     # #491 — floor an admin-owned scoped token to its effective_role before the tenant-ownership
     # check (matches check_cluster_access / trigger_balance_now), else the raw admin role bypasses it.
-    _allowed = _guc(build_authz_user(_usr, request.session))
+    # include_pools=False: a pool/VM-ACL reach (the #555/#248 fallbacks) must NOT arm the userless
+    # cluster-wide balancing worker — only a caller whose TENANT owns the cluster may (Aikido 469089261
+    # re-verify: the default include_pools=True re-added pool-reached clusters and defeated this guard).
+    _allowed = _guc(build_authz_user(_usr, request.session), include_pools=False)
     if _allowed is not None and cluster_id not in _allowed:
         return jsonify({'error': 'Access denied'}), 403
 

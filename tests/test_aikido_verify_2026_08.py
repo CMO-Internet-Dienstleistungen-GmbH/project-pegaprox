@@ -137,3 +137,18 @@ def test_storage_cluster_create_allowed_for_tenant_owned(api, seed):
     r = api.as_user(bob).post('/api/clusters/cluster_1/storage-clusters', json={
         'name': 'sc1', 'storages': ['local', 'ceph'], 'auto_balance': True})
     assert r.status_code in (200, 201), r.get_data(as_text=True)
+
+
+def test_storage_cluster_create_denied_via_pool_fallback(api, seed):
+    # 469089261 re-verify (Aug-31): the arming guard called get_user_clusters() with the DEFAULT
+    # include_pools=True, which re-added #555 pool-reached clusters and defeated the tenant-ownership
+    # check — a storage.config holder with only a pool grant on the cluster could still arm the
+    # userless cluster-wide balance worker. Fixed by include_pools=False; bob reaches cluster_1 ONLY
+    # via a pool grant (his tenant owns cluster_other), so arming must be denied.
+    seed.tenant('tenant_b', clusters=['cluster_other'])
+    bob = seed.user('bob', role='user', tenant_id='tenant_b', permissions=['storage.config'])
+    seed.pool('cluster_1', 'pool_1', 'bob', ['pool.view', 'vm.view'])
+    api.set_manager('cluster_1', api.make_fake_manager('cluster_1'))
+    r = api.as_user(bob).post('/api/clusters/cluster_1/storage-clusters', json={
+        'name': 'sc1', 'storages': ['local', 'ceph'], 'auto_balance': True})
+    assert r.status_code == 403, r.get_data(as_text=True)
