@@ -572,15 +572,15 @@
                                 </div>
                             </div>
                             <div className="bg-proxmox-dark rounded-lg p-4">
-                                <div className="text-xs text-gray-500 mb-1">RAM</div>
-                                <div className="text-lg font-bold text-white">{(vm.mem_percent || 0).toFixed(1)}%</div>
-                                <div className="text-xs text-gray-500">{formatBytes(vm.mem)} / {formatBytes(vm.maxmem)}</div>
+                                <div className="text-xs text-gray-500 mb-1">{t('guestRam')}</div>
+                                <div className="text-lg font-bold text-white">{vm.guest_mem_percent == null ? t('guestMemoryUnavailable') : `${Number(vm.guest_mem_percent).toFixed(1)}%`}</div>
+                                <div className="text-xs text-gray-500">{vm.guest_mem_percent == null ? t('guestMemoryUnavailable') : `${formatBytes(vm.guest_mem)} / ${formatBytes(vm.guest_maxmem)}`}</div>
                                 <div className="mt-2 h-1.5 rounded-full bg-proxmox-border overflow-hidden">
                                     <div 
                                         className="h-full rounded-full transition-all"
                                         style={{
-                                            width: `${vm.mem_percent || 0}%`,
-                                            background: (vm.mem_percent || 0) < 50 ? '#22c55e' : (vm.mem_percent || 0) < 80 ? '#eab308' : '#ef4444'
+                                            width: `${vm.guest_mem_percent || 0}%`,
+                                            background: vm.guest_mem_percent == null ? '#6b7280' : vm.guest_mem_percent < 50 ? '#22c55e' : vm.guest_mem_percent < 80 ? '#eab308' : '#ef4444'
                                         }}
                                     />
                                 </div>
@@ -1175,15 +1175,15 @@
                             </div>
                         </div>
                         <div className="bg-proxmox-dark rounded-lg p-4">
-                            <div className="text-xs text-gray-500 mb-1">RAM</div>
-                            <div className="text-lg font-bold text-white">{(vm.mem_percent || 0).toFixed(1)}%</div>
-                            <div className="text-xs text-gray-500">{formatBytes(vm.mem)} / {formatBytes(vm.maxmem)}</div>
+                            <div className="text-xs text-gray-500 mb-1">{t('guestRam')}</div>
+                            <div className="text-lg font-bold text-white">{vm.guest_mem_percent == null ? t('guestMemoryUnavailable') : `${Number(vm.guest_mem_percent).toFixed(1)}%`}</div>
+                            <div className="text-xs text-gray-500">{vm.guest_mem_percent == null ? t('guestMemoryUnavailable') : `${formatBytes(vm.guest_mem)} / ${formatBytes(vm.guest_maxmem)}`}</div>
                             <div className="mt-2 h-1.5 rounded-full bg-proxmox-border overflow-hidden">
                                 <div 
                                     className="h-full rounded-full transition-all"
                                     style={{
-                                        width: `${vm.mem_percent || 0}%`,
-                                        background: (vm.mem_percent || 0) < 50 ? '#22c55e' : (vm.mem_percent || 0) < 80 ? '#eab308' : '#ef4444'
+                                        width: `${vm.guest_mem_percent || 0}%`,
+                                        background: vm.guest_mem_percent == null ? '#6b7280' : vm.guest_mem_percent < 50 ? '#22c55e' : vm.guest_mem_percent < 80 ? '#eab308' : '#ef4444'
                                     }}
                                 />
                             </div>
@@ -1874,7 +1874,14 @@
             };
 
             const cpuPercent = vm.maxcpu ? ((vm.cpu || 0) * 100).toFixed(1) : 0;
-            const ramPercent = vm.maxmem ? ((vm.mem / vm.maxmem) * 100).toFixed(1) : 0;
+            const guestMemory = guestInfo?.memory || null;
+            const ramPercent = guestMemory?.used_pct != null
+                ? guestMemory.used_pct.toFixed(1)
+                : (vm.guest_mem_percent != null ? Number(vm.guest_mem_percent).toFixed(1) : null);
+            const ramUsed = guestMemory?.used_bytes ?? vm.guest_mem;
+            const ramTotal = guestMemory?.total_bytes ?? vm.guest_maxmem;
+            const ramAvailable = guestMemory?.available_bytes ?? (ramTotal != null && ramUsed != null ? Math.max(0, ramTotal - ramUsed) : null);
+            const ramLabel = ramPercent == null ? t('guestMemoryUnavailable') : t('guestMemory');
 
             return (
                 <div className="space-y-0">
@@ -2093,10 +2100,11 @@
                                         <div className="flex flex-col gap-1 min-w-[90px]">
                                             <div className="flex items-center gap-1.5">
                                                 <div className="w-2 h-2 rounded-full" style={{background: 'var(--corp-metric-ram)'}}></div>
-                                                <span className="text-[12px]" style={{color: '#adbbc4'}}>{t('ramUsage')}</span>
-                                                <span className="text-[12px] font-medium" style={{color: '#e9ecef'}}>{formatBytes(vm.mem)}</span>
+                                                <span className="text-[12px]" style={{color: '#adbbc4'}} title={ramLabel}>{ramLabel}</span>
+                                                <span className="text-[12px] font-medium" style={{color: ramPercent == null ? '#728b9a' : '#e9ecef'}}>{ramPercent == null ? t('guestMemoryUnavailable') : formatBytes(ramUsed)}</span>
                                             </div>
-                                            <div className="corp-capacity-bar"><div style={{width: Math.min(ramPercent, 100) + '%', background: ramPercent >= 90 ? 'var(--corp-thresh-crit)' : ramPercent >= 70 ? 'var(--corp-thresh-warn)' : 'var(--corp-thresh-ok)'}} /></div>
+                                            <div className="corp-capacity-bar"><div style={{width: (ramPercent == null ? 0 : Math.min(ramPercent, 100)) + '%', background: ramPercent == null ? '#728b9a' : ramPercent >= 90 ? 'var(--corp-thresh-crit)' : ramPercent >= 70 ? 'var(--corp-thresh-warn)' : 'var(--corp-thresh-ok)'}} /></div>
+                                            {ramAvailable != null && <span className="text-[10px]" style={{color: '#728b9a'}}>{t('availableMemory').replace('{value}', formatBytes(ramAvailable))}</span>}
                                         </div>
                                         <div className="flex items-center gap-1.5">
                                             <div className="w-2 h-2 rounded-full" style={{background: 'var(--corp-metric-disk)'}}></div>
@@ -2192,15 +2200,15 @@
                                         {/* Memory */}
                                         <div className="flex items-center gap-2 text-[12px]">
                                             <Icons.MemoryStick className="w-3.5 h-3.5 flex-shrink-0" style={{color: '#9b59b6'}} />
-                                            <span style={{color: '#adbbc4', width: '60px'}}>{t('memory') || 'Memory'}</span>
+                                            <span style={{color: '#adbbc4', width: '60px'}} title={ramLabel}>{t('memory') || 'Memory'}</span>
                                             <div className="flex-1">
                                                 <div className="flex items-center gap-2">
                                                     <div className="flex-1 h-1.5 overflow-hidden" style={{background: 'var(--corp-bar-track)'}}>
-                                                        <div className="h-full" style={{width: `${Math.min(ramPercent, 100)}%`, background: '#9b59b6'}}></div>
+                                                        <div className="h-full" style={{width: `${ramPercent == null ? 0 : Math.min(ramPercent, 100)}%`, background: ramPercent == null ? '#728b9a' : '#9b59b6'}}></div>
                                                     </div>
-                                                    <span style={{color: '#e9ecef', minWidth: '35px'}}>{ramPercent}%</span>
+                                                    <span style={{color: ramPercent == null ? '#728b9a' : '#e9ecef', minWidth: '35px'}}>{ramPercent == null ? t('guestMemoryUnavailable') : `${ramPercent}%`}</span>
                                                 </div>
-                                                <div className="text-[11px] mt-0.5" style={{color: '#728b9a'}}>{formatBytes(vm.mem)} / {formatBytes(vm.maxmem)}</div>
+                                                <div className="text-[11px] mt-0.5" style={{color: '#728b9a'}}>{ramPercent == null ? t('guestMemoryUnavailable') : `${formatBytes(ramUsed)} / ${formatBytes(ramTotal)} · ${ramLabel} · ${t('availableMemory').replace('{value}', formatBytes(ramAvailable))}`} · {t('hostResident')} {formatBytes(vm.host_mem ?? vm.mem)} / {formatBytes(vm.host_maxmem ?? vm.maxmem)}</div>
                                             </div>
                                         </div>
                                         {/* Disk */}
@@ -3900,7 +3908,10 @@
                     case 'name': return (g.name || `VM ${g.vmid}`).toLowerCase();
                     case 'cluster': return (g.cluster_name || '').toLowerCase();
                     case 'node': return (g.node || '').toLowerCase();
-                    case 'ram': return g.maxmem > 0 ? g.mem / g.maxmem : 0;
+                    case 'ram': {
+                        const pct = guestRamPercent(g);
+                        return pct == null ? (dir === 'asc' ? Infinity : -Infinity) : pct;
+                    }
                     case 'status': return g.status || '';
                     case 'cpu':
                     default: return g.cpu || 0;
@@ -3913,6 +3924,18 @@
                     : String(av).localeCompare(String(bv));
                 return dir === 'asc' ? c : -c;
             });
+        }
+        /** Return a finite, bounded guest-memory percentage for shared VM views. */
+        function guestRamPercent(guest) {
+            const pct = Number(guest?.guest_mem_percent);
+            return guest?.guest_mem_percent != null && Number.isFinite(pct)
+                ? Math.max(0, Math.min(pct, 100))
+                : null;
+        }
+        /** Format guest pressure while preserving the localized unavailable state. */
+        function guestRamText(guest, t) {
+            const pct = guestRamPercent(guest);
+            return pct == null ? t('guestMemoryUnavailable') : `${pct.toFixed(1)}%`;
         }
         // #621 — clickable-header state machine: re-clicking the active column flips the
         // direction; switching column defaults numeric cols to desc (highest first), text asc.
@@ -4748,8 +4771,9 @@
                                 <table className="corp-datagrid">
                                     <thead><tr>
                                         <th style={{width: '24px'}}></th>
-                                        {[{field: 'name', label: t('name')}, {field: 'cluster', label: t('cluster')}, {field: 'node', label: t('node')}, {field: 'cpu', label: 'CPU', align: 'right'}, {field: 'ram', label: 'RAM', align: 'right'}, {field: 'status', label: t('status')}].map(col => (
+                                        {[{field: 'name', label: t('name')}, {field: 'cluster', label: t('cluster')}, {field: 'node', label: t('node')}, {field: 'cpu', label: 'CPU', align: 'right'}, {field: 'ram', label: t('guestRam'), align: 'right', title: t('guestMemoryPressureTooltip')}, {field: 'status', label: t('status')}].map(col => (
                                             <th key={col.field} className="cursor-pointer" style={{textAlign: col.align || 'left'}}
+                                                title={col.title}
                                                 onClick={() => { const n = nextGuestSort(guestSortBy, guestSortDir, col.field); setGuestSortBy(n.by); setGuestSortDir(n.dir); }}>
                                                 {col.label} {guestSortBy === col.field && <span className="sort-indicator">{guestSortDir === 'asc' ? '▲' : '▼'}</span>}
                                             </th>
@@ -4758,7 +4782,7 @@
                                     <tbody>
                                         {sortTopGuests(groupTopGuests, guestSortBy, guestSortDir).slice(0, 10).map(guest => {
                                             const cpuP = ((guest.cpu || 0) * 100).toFixed(1);
-                                            const memP = guest.maxmem > 0 ? ((guest.mem / guest.maxmem) * 100).toFixed(1) : 0;
+                                            const memP = guestRamPercent(guest);
                                             const gc = clusters.find(c => c.id === guest.cluster_id);
                                             return (
                                                 <tr key={`${guest.cluster_id}-${guest.vmid}`} className="table-row-hover cursor-pointer"
@@ -4768,7 +4792,7 @@
                                                     <td>{guest.cluster_name}</td>
                                                     <td style={{color: '#adbbc4'}}>{guest.node}</td>
                                                     <td style={{textAlign: 'right'}}><span style={{color: corpBarColor(cpuP)}}>{cpuP}%</span></td>
-                                                    <td style={{textAlign: 'right'}}><span style={{color: corpBarColor(memP)}}>{memP}%</span></td>
+                                                    <td style={{textAlign: 'right'}} title={memP == null ? t('guestMemoryUnavailable') : (guest.host_mem_percent == null ? t('hostResidentMemory') + ': —' : `${t('hostResident')}: ${Number(guest.host_mem_percent).toFixed(1)}%`)}><span style={{color: memP == null ? '#728b9a' : corpBarColor(memP)}}>{guestRamText(guest, t)}</span></td>
                                                     <td>
                                                         <span className="inline-flex items-center gap-1">
                                                             <span className="w-1.5 h-1.5 rounded-full inline-block" style={{background: guest.status === 'running' ? '#60b515' : '#728b9a'}} />
@@ -4964,7 +4988,7 @@
                                         <thead className="bg-proxmox-dark/50">
                                             <tr className="text-left text-xs text-gray-400">
                                                 <th className="px-4 py-3 font-medium">{t('type')}</th>
-                                                {[{field: 'name', label: t('name')}, {field: 'cluster', label: t('cluster')}, {field: 'node', label: t('node')}, {field: 'cpu', label: 'CPU'}, {field: 'ram', label: 'RAM'}, {field: 'status', label: t('status')}].map(col => (
+                                                {[{field: 'name', label: t('name')}, {field: 'cluster', label: t('cluster')}, {field: 'node', label: t('node')}, {field: 'cpu', label: 'CPU'}, {field: 'ram', label: t('guestRam')}, {field: 'status', label: t('status')}].map(col => (
                                                     <th key={col.field} className="px-4 py-3 font-medium cursor-pointer hover:text-white select-none"
                                                         onClick={() => { const n = nextGuestSort(guestSortBy, guestSortDir, col.field); setGuestSortBy(n.by); setGuestSortDir(n.dir); }}>
                                                         {col.label}{guestSortBy === col.field && <span className="ml-1">{guestSortDir === 'asc' ? '▲' : '▼'}</span>}
@@ -4976,7 +5000,7 @@
                                         <tbody className="divide-y divide-proxmox-border/50">
                                             {sortTopGuests(groupTopGuests2, guestSortBy, guestSortDir).slice(0, 10).map((guest, idx) => {
                                                 const cpuPercent = ((guest.cpu || 0) * 100).toFixed(1);
-                                                const memPercent = guest.maxmem > 0 ? ((guest.mem / guest.maxmem) * 100).toFixed(1) : 0;
+                                                const memPercent = guestRamPercent(guest);
                                                 const isVM = guest.type === 'qemu';
                                                 const guestCluster = clusters.find(c => c.id === guest.cluster_id);
                                                 return (
@@ -5008,9 +5032,9 @@
                                                         <td className="px-4 py-3">
                                                             <div className="flex items-center gap-2">
                                                                 <div className="w-16 h-2 bg-proxmox-dark rounded-full overflow-hidden">
-                                                                    <div className={`h-full rounded-full ${memPercent > 80 ? 'bg-red-500' : memPercent > 60 ? 'bg-yellow-500' : 'bg-blue-500'}`} style={{ width: `${Math.min(memPercent, 100)}%` }} />
+                                                                    <div className={`h-full rounded-full ${memPercent == null ? 'bg-gray-600' : memPercent > 80 ? 'bg-red-500' : memPercent > 60 ? 'bg-yellow-500' : 'bg-blue-500'}`} style={{ width: `${memPercent == null ? 0 : memPercent}%` }} />
                                                                 </div>
-                                                                <span className="text-xs text-gray-400">{memPercent}%</span>
+                                                                <span className="text-xs text-gray-400" title={memPercent == null ? t('guestMemoryUnavailable') : (guest.host_mem_percent == null ? t('hostResidentMemory') + ': —' : `${t('hostResident')}: ${Number(guest.host_mem_percent).toFixed(1)}%`)}>{guestRamText(guest, t)}</span>
                                                             </div>
                                                         </td>
                                                         <td className="px-4 py-3">
@@ -5543,7 +5567,7 @@
                                     <thead>
                                         <tr>
                                             <th style={{width: '24px'}}></th>
-                                            {[{field: 'name', label: t('name')}, {field: 'cluster', label: t('cluster')}, {field: 'node', label: t('node')}, {field: 'cpu', label: 'CPU'}, {field: 'ram', label: 'RAM'}, {field: 'status', label: t('status')}].map(col => (
+                                            {[{field: 'name', label: t('name')}, {field: 'cluster', label: t('cluster')}, {field: 'node', label: t('node')}, {field: 'cpu', label: 'CPU'}, {field: 'ram', label: t('guestRam')}, {field: 'status', label: t('status')}].map(col => (
                                                 <th key={col.field} className="cursor-pointer" style={{textAlign: 'left'}}
                                                     onClick={() => { const n = nextGuestSort(guestSortBy, guestSortDir, col.field); setGuestSortBy(n.by); setGuestSortDir(n.dir); }}>
                                                     {col.label} {guestSortBy === col.field && <span className="sort-indicator">{guestSortDir === 'asc' ? '▲' : '▼'}</span>}
@@ -5554,7 +5578,7 @@
                                     <tbody>
                                         {sortTopGuests(topGuests, guestSortBy, guestSortDir).map((guest) => {
                                             const cpuP = ((guest.cpu || 0) * 100).toFixed(1);
-                                            const memP = guest.maxmem > 0 ? ((guest.mem / guest.maxmem) * 100).toFixed(1) : 0;
+                                            const memP = guestRamPercent(guest);
                                             const gc = clusters.find(c => c.id === guest.cluster_id);
                                             return (
                                                 <tr key={`${guest.cluster_id}-${guest.vmid}`} className="table-row-hover cursor-pointer"
@@ -5578,9 +5602,9 @@
                                                     </td>
                                                     <td>
                                                         <div className="flex items-center gap-1.5">
-                                                            <span style={{color: corpBarColor(memP), minWidth: '32px'}}>{memP}%</span>
+                                                            <span style={{color: memP == null ? '#728b9a' : corpBarColor(memP), minWidth: '32px'}} title={memP == null ? t('guestMemoryUnavailable') : (guest.host_mem_percent == null ? t('hostResidentMemory') + ': —' : `${t('hostResident')}: ${Number(guest.host_mem_percent).toFixed(1)}%`)}>{guestRamText(guest, t)}</span>
                                                             <span className="inline-block" style={{width: '40px', height: '2px', background: 'var(--corp-divider)', position: 'relative'}}>
-                                                                <span style={{position: 'absolute', left: 0, top: 0, height: '2px', width: `${Math.min(memP, 100)}%`, background: corpBarColor(memP)}} />
+                                                                <span style={{position: 'absolute', left: 0, top: 0, height: '2px', width: `${memP == null ? 0 : memP}%`, background: memP == null ? '#728b9a' : corpBarColor(memP)}} />
                                                             </span>
                                                         </div>
                                                     </td>
@@ -5608,6 +5632,7 @@
                                     <div style={{width: `${Math.min(pct, 100)}%`, height: '3px', background: color, borderRadius: '1.5px', transition: 'width 0.3s'}} />
                                 </div>
                             );
+                            /** Render a small bounded topology utilization donut. */
                             const MiniDonut = ({pct, color, sz}) => {
                                 const r = (sz - 3) / 2, c = r * 2 * Math.PI;
                                 const off = c - (Math.min(pct, 100) / 100) * c;
@@ -5640,9 +5665,10 @@
                                         // LW: cluster-level avg stats for header donuts
                                         const allGuests = Object.values(nodeMap).flatMap(n => n.guests);
                                         const clAvgCpu = allGuests.length > 0 ? allGuests.reduce((s, g) => s + ((g.cpu || 0) * 100), 0) / allGuests.length : 0;
-                                        const clTotalMem = allGuests.reduce((s, g) => s + (g.mem || 0), 0);
-                                        const clTotalMaxMem = allGuests.reduce((s, g) => s + (g.maxmem || 0), 0);
-                                        const clMemPct = clTotalMaxMem > 0 ? (clTotalMem / clTotalMaxMem * 100) : 0;
+                                        const clMeasuredGuests = allGuests.filter(g => g.guest_mem != null && g.guest_maxmem > 0);
+                                        const clTotalMem = clMeasuredGuests.reduce((s, g) => s + g.guest_mem, 0);
+                                        const clTotalMaxMem = clMeasuredGuests.reduce((s, g) => s + g.guest_maxmem, 0);
+                                        const clMemPct = clTotalMaxMem > 0 ? Math.min(100, clTotalMem / clTotalMaxMem * 100) : null;
 
                                         return (
                                             <div key={cluster.id} className="flex-1 min-w-[300px] max-w-[520px]" style={{
@@ -5672,8 +5698,8 @@
                                                                     <span className="text-[9px] font-medium" style={{color: barColor(clAvgCpu)}}>{clAvgCpu.toFixed(0)}%</span>
                                                                 </div>
                                                                 <div className="flex items-center gap-1">
-                                                                    <MiniDonut pct={clMemPct} color={barColor(clMemPct)} sz={24} />
-                                                                    <span className="text-[9px] font-medium" style={{color: barColor(clMemPct)}}>{clMemPct.toFixed(0)}%</span>
+                                                                    <MiniDonut pct={clMemPct || 0} color={clMemPct == null ? 'var(--corp-text-muted)' : barColor(clMemPct)} sz={24} />
+                                                                    <span className="text-[9px] font-medium" title={clMemPct == null ? t('guestMemoryUnavailable') : t('guestMemoryPressureTooltip')} style={{color: clMemPct == null ? 'var(--corp-text-muted)' : barColor(clMemPct)}}>{clMemPct == null ? t('guestMemoryUnavailable') : `${clMemPct.toFixed(0)}%`}</span>
                                                                 </div>
                                                             </div>
                                                         )}
@@ -5689,10 +5715,11 @@
                                                         const isOnline = true; // connected cluster = reachable
                                                         const runG = nd.guests.filter(g => g.status === 'running').length;
                                                         const totalGuestCpu = nd.guests.reduce((s, g) => s + ((g.cpu || 0) * 100), 0);
-                                                        const totalGuestMem = nd.guests.reduce((s, g) => s + (g.mem || 0), 0);
-                                                        const totalGuestMaxMem = nd.guests.reduce((s, g) => s + (g.maxmem || 0), 0);
+                                                        const measuredGuests = nd.guests.filter(g => g.guest_mem != null && g.guest_maxmem > 0);
+                                                        const totalGuestMem = measuredGuests.reduce((s, g) => s + g.guest_mem, 0);
+                                                        const totalGuestMaxMem = measuredGuests.reduce((s, g) => s + g.guest_maxmem, 0);
                                                         const avgCpu = nd.guests.length > 0 ? totalGuestCpu / nd.guests.length : 0;
-                                                        const memPct = totalGuestMaxMem > 0 ? (totalGuestMem / totalGuestMaxMem * 100) : 0;
+                                                        const memPct = totalGuestMaxMem > 0 ? Math.min(100, totalGuestMem / totalGuestMaxMem * 100) : null;
 
                                                         return (
                                                             <div key={nodeName} style={{
@@ -5713,8 +5740,8 @@
                                                                                 <span className="text-[10px] font-medium" style={{color: barColor(avgCpu)}}>{avgCpu.toFixed(0)}%</span>
                                                                             </div>
                                                                             <div className="flex items-center gap-1">
-                                                                                <MiniDonut pct={memPct} color={barColor(memPct)} sz={28} />
-                                                                                <span className="text-[10px] font-medium" style={{color: barColor(memPct)}}>{memPct.toFixed(0)}%</span>
+                                                                                <MiniDonut pct={memPct || 0} color={memPct == null ? 'var(--corp-text-muted)' : barColor(memPct)} sz={28} />
+                                                                                <span className="text-[10px] font-medium" title={memPct == null ? t('guestMemoryUnavailable') : t('guestMemoryPressureTooltip')} style={{color: memPct == null ? 'var(--corp-text-muted)' : barColor(memPct)}}>{memPct == null ? t('guestMemoryUnavailable') : `${memPct.toFixed(0)}%`}</span>
                                                                             </div>
                                                                             <span className="text-[10px]" style={{color: 'var(--corp-text-muted)'}}>{runG}/{nd.guests.length}</span>
                                                                         </div>
@@ -5744,7 +5771,7 @@
                                                                                 }}>{g.type === 'qemu' ? 'VM' : 'LXC'}</span>
                                                                                 {g.status === 'running' && (
                                                                                     <span className="ml-auto text-[10px] flex-shrink-0" style={{color: 'var(--corp-text-muted)'}}>
-                                                                                        {((g.cpu || 0) * 100).toFixed(0)}% &middot; {fmtMem(g.mem)}
+                                                                                        {((g.cpu || 0) * 100).toFixed(0)}% &middot; {g.guest_mem == null ? t('guestMemoryUnavailable') : fmtMem(g.guest_mem)}
                                                                                     </span>
                                                                                 )}
                                                                             </div>
@@ -5934,7 +5961,7 @@
                                     <thead className="bg-proxmox-dark/50">
                                         <tr className="text-left text-xs text-gray-400">
                                             <th className="px-4 py-3 font-medium">{t('type')}</th>
-                                            {[{field: 'name', label: t('name')}, {field: 'cluster', label: t('cluster')}, {field: 'node', label: t('node')}, {field: 'cpu', label: 'CPU'}, {field: 'ram', label: 'RAM'}, {field: 'status', label: t('status')}].map(col => (
+                                            {[{field: 'name', label: t('name')}, {field: 'cluster', label: t('cluster')}, {field: 'node', label: t('node')}, {field: 'cpu', label: 'CPU'}, {field: 'ram', label: t('guestRam')}, {field: 'status', label: t('status')}].map(col => (
                                                 <th key={col.field} className="px-4 py-3 font-medium cursor-pointer hover:text-white select-none"
                                                     onClick={() => { const n = nextGuestSort(guestSortBy, guestSortDir, col.field); setGuestSortBy(n.by); setGuestSortDir(n.dir); }}>
                                                     {col.label}{guestSortBy === col.field && <span className="ml-1">{guestSortDir === 'asc' ? '▲' : '▼'}</span>}
@@ -5946,7 +5973,7 @@
                                     <tbody className="divide-y divide-proxmox-border/50">
                                         {sortTopGuests(topGuests, guestSortBy, guestSortDir).map((guest, idx) => {
                                             const cpuPercent = ((guest.cpu || 0) * 100).toFixed(1);
-                                            const memPercent = guest.maxmem > 0 ? ((guest.mem / guest.maxmem) * 100).toFixed(1) : 0;
+                                            const memPercent = guestRamPercent(guest);
                                             const isVM = guest.type === 'qemu';
                                             const guestCluster = clusters.find(c => c.id === guest.cluster_id);
 
@@ -5997,11 +6024,11 @@
                                                         <div className="flex items-center gap-2">
                                                             <div className="w-16 h-2 bg-proxmox-dark rounded-full overflow-hidden">
                                                                 <div
-                                                                    className={`h-full rounded-full transition-all ${memPercent > 80 ? 'bg-red-500' : memPercent > 60 ? 'bg-yellow-500' : 'bg-blue-500'}`}
-                                                                    style={{ width: `${Math.min(memPercent, 100)}%` }}
+                                                                    className={`h-full rounded-full transition-all ${memPercent == null ? 'bg-gray-600' : memPercent > 80 ? 'bg-red-500' : memPercent > 60 ? 'bg-yellow-500' : 'bg-blue-500'}`}
+                                                                    style={{ width: `${memPercent == null ? 0 : memPercent}%` }}
                                                                 />
                                                             </div>
-                                                            <span className="text-xs text-gray-400">{memPercent}%</span>
+                                                            <span className="text-xs text-gray-400" title={memPercent == null ? t('guestMemoryUnavailable') : (guest.host_mem_percent == null ? t('hostResidentMemory') + ': —' : `${t('hostResident')}: ${Number(guest.host_mem_percent).toFixed(1)}%`)}>{guestRamText(guest, t)}</span>
                                                         </div>
                                                     </td>
                                                     <td className="px-4 py-3">

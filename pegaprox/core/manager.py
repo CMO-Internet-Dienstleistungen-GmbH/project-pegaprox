@@ -341,6 +341,11 @@ class PegaProxManager:
         # disk usage from guest agent: (node, vmid) -> {used, total}
         self._disk_cache = {}
         self._disk_cache_lock = threading.Lock()
+        # Linux guest pressure (MemAvailable), keyed by (node, vmid). It is
+        # refreshed by the existing watched-cluster QGA loop so inventory polls
+        # never fan out into one synchronous guest call per VM.
+        self._memory_cache = {}
+        self._memory_cache_lock = threading.Lock()
         # #237: track VMs where guest agent is disabled to avoid spamming PVE with failed requests
         self._no_agent_vms = set()  # vmids with no agent (cleared on VM start/config change)
 
@@ -1057,6 +1062,8 @@ class PegaProxManager:
                 self._ip_cache.clear()
             with self._disk_cache_lock:
                 self._disk_cache.clear()
+            with self._memory_cache_lock:
+                self._memory_cache.clear()
             # N-1 (regression fix): also drop the short node-status/tasks result
             # caches so the post-reconnect "flip to online" push isn't served a
             # ≤5s-old pre-disconnect snapshot (could show a node still offline).
@@ -1890,6 +1897,7 @@ class PegaProxManager:
         if max_age > 0:
             cached = getattr(self, '_vm_resources_cache', None)
             if cached and (time.time() - cached[0]) < max_age:
+                self._inject_guest_memory(cached[1])
                 return cached[1]
         if not self.is_connected or not self.session: return []
 
@@ -1912,6 +1920,8 @@ class PegaProxManager:
                 r['cpu_percent'] = round(r.get('cpu', 0) * 100, 1)
                 maxdisk = r.get('maxdisk', 0)
                 r['disk_percent'] = round((r.get('disk', 0) / maxdisk) * 100, 1) if maxdisk > 0 else 0
+
+            self._inject_guest_memory(resources)
 
             # inject cached IP addresses + disk usage (only for running VMs)
             if self._ip_cache or self._disk_cache:
@@ -1943,6 +1953,53 @@ class PegaProxManager:
             return []
         except:
             return []
+
+    def _inject_guest_memory(self, resources: list) -> None:
+        """Attach cached guest pressure while preserving PVE host accounting."""
+        with self._memory_cache_lock:
+            memory_cache = dict(self._memory_cache)
+        for resource in resources:
+            if resource.get('type') not in ('qemu', 'lxc'):
+                continue
+            host_percent = resource.get('mem_percent')
+            if host_percent is None:
+                maxmem = resource.get('maxmem', 0)
+                host_percent = round((resource.get('mem', 0) / maxmem) * 100, 1) if maxmem else 0
+            resource['host_mem'] = resource.get('mem', 0)
+            resource['host_maxmem'] = resource.get('maxmem', 0)
+            resource['host_mem_percent'] = host_percent
+
+            if resource.get('type') == 'lxc':
+                # PVE's container value is cgroup usage, not QEMU process residency.
+                resource['guest_mem'] = resource.get('mem', 0)
+                resource['guest_maxmem'] = resource.get('maxmem', 0)
+                resource['guest_mem_percent'] = max(0, min(float(host_percent or 0), 100.0))
+                resource['guest_memory_status'] = 'available'
+                resource['guest_memory_source'] = 'proxmox-lxc-cgroup'
+                continue
+
+            key = (resource.get('node', ''), resource.get('vmid'))
+            guest = memory_cache.get(key)
+            if resource.get('status') == 'running' and guest:
+                resource['guest_mem'] = guest['used_bytes']
+                resource['guest_maxmem'] = guest['total_bytes']
+                resource['guest_mem_available'] = guest['available_bytes']
+                resource['guest_mem_percent'] = max(0, min(float(guest['used_pct']), 100.0))
+                resource['guest_memory_status'] = 'available'
+                resource['guest_memory_source'] = guest['source']
+            else:
+                resource['guest_mem'] = None
+                resource['guest_maxmem'] = None
+                resource['guest_mem_available'] = None
+                resource['guest_mem_percent'] = None
+                resource['guest_memory_status'] = 'unavailable'
+                resource['guest_memory_source'] = None
+
+    def get_cached_guest_memory(self, node: str, vmid: int):
+        """Return a copy of the watched-cluster guest-memory sample, if present."""
+        with self._memory_cache_lock:
+            memory = self._memory_cache.get((node, vmid))
+            return dict(memory) if memory else None
     
     # MK May 2026 (#413) — uniform get_vms(node=None) shim so the site-recovery
     # detection code (and any other caller that loops over manager types) can
@@ -16657,6 +16714,24 @@ echo DONE""",
         except Exception:
             return {}
 
+    def _fetch_qemu_memory(self, node: str, vmid: int, force: bool = False):
+        """Get Linux guest memory pressure through QGA, or None if unavailable."""
+        if vmid in self._no_agent_vms and not force:
+            return None
+        try:
+            from pegaprox.utils.guest_memory import get_guest_linux_memory
+            base = (f"https://{self.host}:{self.api_port}/api2/json/nodes/"
+                    f"{node}/qemu/{vmid}/agent")
+            memory = get_guest_linux_memory(self, base)
+            if memory:
+                # A guest can gain an agent after package installation/reboot.
+                # Recover the shared IP/disk probes immediately instead of
+                # leaving the VM unavailable until the five-minute sweep.
+                self._no_agent_vms.discard(vmid)
+            return memory
+        except Exception:
+            return None
+
     def _fetch_lxc_ips(self, node: str, vmid: int) -> list:
         """Fetch IP addresses for a running LXC container.
         Proxmox returns either inet/inet6 strings or ip-addresses array depending on version."""
@@ -16715,11 +16790,16 @@ echo DONE""",
                 vm_type = r.get('type', 'qemu')
                 if vm_type == 'lxc':
                     ips = self._fetch_lxc_ips(node, vmid)
-                    return (node, vmid, ips, None)
+                    return (node, vmid, ips, None, None)
                 else:
                     ips = self._fetch_qemu_ips(node, vmid)
                     disk = self._fetch_qemu_disk_usage(node, vmid)
-                    return (node, vmid, ips, disk)
+                    # A freshly booted VM may have acquired its agent channel
+                    # since it entered the no-agent skip list. Probe memory once
+                    # during the boot window so inventory recovers immediately.
+                    force_memory = 0 < (r.get('uptime') or 0) < 180
+                    memory = self._fetch_qemu_memory(node, vmid, force=force_memory)
+                    return (node, vmid, ips, disk, memory)
 
             tasks = [lambda r=r: fetch_one(r) for r in running]
             results = run_concurrent(tasks, timeout=15.0)
@@ -16728,15 +16808,24 @@ echo DONE""",
                 for result in results:
                     if result is None:
                         continue
-                    node, vmid, ips, disk = result
+                    node, vmid, ips, disk, memory = result
                     self._ip_cache[(node, vmid)] = ips
             with self._disk_cache_lock:
                 for result in results:
                     if result is None:
                         continue
-                    node, vmid, ips, disk = result
+                    node, vmid, ips, disk, memory = result
                     if disk:
                         self._disk_cache[(node, vmid)] = disk
+            with self._memory_cache_lock:
+                for result in results:
+                    if result is None:
+                        continue
+                    node, vmid, ips, disk, memory = result
+                    if memory:
+                        self._memory_cache[(node, vmid)] = memory
+                    else:
+                        self._memory_cache.pop((node, vmid), None)
         except Exception as e:
             self.logger.debug(f"[IP cache] refresh failed: {e}")
 

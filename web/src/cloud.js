@@ -48,10 +48,10 @@
             if (r && r.cpu_percent != null && isFinite(r.cpu_percent)) return Math.min(100, Math.round(r.cpu_percent));
             return cloudPct(r && r.cpu);  // cpu is a 0..1 fraction
         }
+        /** Return bounded guest pressure or null when the guest cannot report it. */
         function cloudMemPct(r) {
-            if (r && r.mem_percent != null && isFinite(r.mem_percent)) return Math.min(100, Math.round(r.mem_percent));
-            const mx = Number(r && r.maxmem) || 0;
-            return mx > 0 ? Math.round((Number(r.mem) || 0) / mx * 100) : 0;
+            if (r && r.guest_mem_percent != null && isFinite(r.guest_mem_percent)) return Math.min(100, Math.round(r.guest_mem_percent));
+            return null;
         }
 
         function cloudRelTime(epoch) {
@@ -143,7 +143,12 @@
         }
 
         // inline meter used in table cells
+        /** Render a compact guest-memory meter without inventing missing data. */
         function CloudMiniMeter({ pct, color }) {
+            const { t } = useTranslation();
+            if (pct == null) {
+                return <span className="cloud-cell-meter-num" title={t('guestMemoryUnavailable')}>{t('guestMemoryUnavailable')}</span>;
+            }
             const p = Math.min(100, Math.max(0, Number(pct) || 0));
             return (
                 <div className="cloud-cell-meter">
@@ -844,7 +849,7 @@
             const running = r.status === 'running';
             const cpuP = cloudCpuPct(r);
             const memP = cloudMemPct(r);
-            const memMax = Number(r.maxmem) || 0, memUse = Number(r.mem) || 0;
+            const memMax = Number(r.guest_maxmem) || 0, memUse = Number(r.guest_mem) || 0;
             const diskMax = Number(r.maxdisk) || 0, diskUse = Number(r.disk) || 0;
             const tags = cloudTagList(r.tags);
 
@@ -909,8 +914,9 @@
                             <CloudKVPanel title={t('cloud.tabCapacity') || 'Capacity'}>
                                 <CloudKVRow label={t('cloud.vcpu') || 'vCPU'} value={Number(r.maxcpu) || '—'} />
                                 <CloudKVRow label={t('cloud.colCpu') || 'CPU usage'} value={cpuP + '%'} />
-                                <CloudKVRow label={t('cloud.ram') || 'Memory'} value={memMax ? cloudFmtBytes(memMax) : '—'} />
-                                <CloudKVRow label={t('cloud.ramInUse') || 'Memory used'} value={`${cloudFmtBytes(memUse)} (${memP}%)`} />
+                                <CloudKVRow label={t('guestMemory')} value={memMax ? cloudFmtBytes(memMax) : t('guestMemoryUnavailable')} />
+                                <CloudKVRow label={t('cloud.ramInUse') || 'Memory used'} value={memP == null ? t('guestMemoryUnavailable') : `${cloudFmtBytes(memUse)} (${memP}%)`} />
+                                <CloudKVRow label={t('hostResident')} value={r.host_maxmem ? `${cloudFmtBytes(r.host_mem)} / ${cloudFmtBytes(r.host_maxmem)}` : '—'} />
                                 {diskMax > 0 && <CloudKVRow label={t('cloud.disk') || 'Disk'} value={`${cloudFmtBytes(diskUse)} / ${cloudFmtBytes(diskMax)}`} />}
                             </CloudKVPanel>
                             <CloudKVPanel title={t('cloud.tabNetwork') || 'Network'}>
@@ -935,9 +941,9 @@
                                 <div className="cloud-meter-sub">{Number(r.maxcpu) || 0} {t('cloud.cores') || 'vCPU'}</div>
                             </div>
                             <div className="cloud-meter-block">
-                                <div className="cloud-meter-label">{t('cloud.ram') || 'Memory'} · {memP}%</div>
-                                <div className="cloud-meter cloud-meter-lg"><div style={{ width: memP + '%', background: '#a855f7' }} /></div>
-                                <div className="cloud-meter-sub">{cloudFmtBytes(memUse)} / {cloudFmtBytes(memMax)}</div>
+                                <div className="cloud-meter-label">{t('guestMemory')} · {memP == null ? t('guestMemoryUnavailable') : `${memP}%`}</div>
+                                <div className="cloud-meter cloud-meter-lg"><div style={{ width: (memP || 0) + '%', background: memP == null ? 'var(--cloud-text-muted)' : '#a855f7' }} /></div>
+                                <div className="cloud-meter-sub">{memP == null ? t('guestMemoryUnavailable') : `${cloudFmtBytes(memUse)} / ${cloudFmtBytes(memMax)}`}</div>
                             </div>
                             {diskMax > 0 && (
                                 <div className="cloud-meter-block">
