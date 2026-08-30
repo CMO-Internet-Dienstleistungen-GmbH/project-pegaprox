@@ -15241,6 +15241,7 @@
                                                                     name={node}
                                                                     metrics={metrics}
                                                                     clusterId={selectedCluster.id}
+                                                                    nodeUiSuffix={selectedCluster.node_ui_suffix || ''}
                                                                     onOpenNodeConfig={(nodeName) => setConfigNode(nodeName)}
                                                                     onMaintenanceToggle={handleMaintenanceToggle}
                                                                     onStartUpdate={handleStartUpdate}
@@ -15253,12 +15254,12 @@
                                                             {Object.entries(knownNodes)
                                                                 .filter(([nodeName, nodeData]) => nodeData.status === 'offline' && !clusterMetrics[nodeName])
                                                                 .map(([nodeName]) => (
-                                                                <NodeCompactRow key={`offline-${nodeName}`} name={nodeName} metrics={null} clusterId={selectedCluster.id} />
+                                                                <NodeCompactRow key={`offline-${nodeName}`} name={nodeName} metrics={null} clusterId={selectedCluster.id} nodeUiSuffix={selectedCluster.node_ui_suffix || ''} />
                                                             ))}
                                                             {Object.entries(nodeAlerts)
                                                                 .filter(([nodeName, alert]) => alert.cluster_id === selectedCluster.id && !clusterMetrics[nodeName] && !knownNodes[nodeName]?.status)
                                                                 .map(([nodeName]) => (
-                                                                <NodeCompactRow key={`alert-${nodeName}`} name={nodeName} metrics={null} clusterId={selectedCluster.id} />
+                                                                <NodeCompactRow key={`alert-${nodeName}`} name={nodeName} metrics={null} clusterId={selectedCluster.id} nodeUiSuffix={selectedCluster.node_ui_suffix || ''} />
                                                             ))}
                                                         </div>
                                                         ) : (
@@ -15273,6 +15274,7 @@
                                                                     metrics={metrics}
                                                                     index={idx}
                                                                     clusterId={selectedCluster.id}
+                                                                    nodeUiSuffix={selectedCluster.node_ui_suffix || ''}
                                                                     onMaintenanceToggle={handleMaintenanceToggle}
                                                                     onStartUpdate={handleStartUpdate}
                                                                     onOpenNodeConfig={(nodeName) => setConfigNode(nodeName)}

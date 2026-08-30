@@ -144,6 +144,7 @@ def get_clusters():
                 'latitude': getattr(mgr.config, 'latitude', None),
                 'longitude': getattr(mgr.config, 'longitude', None),
                 'location_label': getattr(mgr.config, 'location_label', '') or '',
+                'node_ui_suffix': getattr(mgr.config, 'node_ui_suffix', '') or '',
             })
 
     # MK: Sort clusters by sort_order first, then by name for consistent ordering
@@ -1105,6 +1106,7 @@ ALLOWED_CONFIG_FIELDS = {
     'cpu_baseline',
     'vnc_tunnel',  # MK Apr 2026 — SSH-tunnel-mode for VNC console
     'proxlb_tags_enabled',  # MK Jul 2026 (#426) — derive placement from ProxLB VM tags
+    'node_ui_suffix',  # MK Aug 2026 (#689) — FQDN suffix for "Open in Proxmox" node links
 }
 
 @bp.route('/api/clusters/<cluster_id>', methods=['PUT'])
