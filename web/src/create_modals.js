@@ -2826,6 +2826,10 @@
                                         </div>
                                     </div>
 
+                                    {/* #742: the theme grid is hidden in the Corporate layout — corporate
+                                        light/dark is driven by the toggle in the top bar, so the personal
+                                        themes here don't apply there and would look "ignored". */}
+                                    {(user?.ui_layout !== 'corporate') && (<>
                                     <div>
                                         <h3 className="text-lg font-semibold text-white mb-2 flex items-center gap-2">
                                             <Icons.Palette />
@@ -2892,6 +2896,7 @@
                                             );
                                         })}
                                     </div>
+                                    </>)}
                                     
                                     {/* LW: Feb 2026 - Layout Selector (Modern vs Corporate) */}
                                     <div className="pt-4 border-t border-proxmox-border">

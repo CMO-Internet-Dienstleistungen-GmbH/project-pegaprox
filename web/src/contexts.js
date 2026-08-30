@@ -255,18 +255,14 @@
                                 applyLanguage(d.user.language);
                             }
                             // NS: Apply user's theme or default
-                            // #742 (was MK May 2026) — the SERVER user.theme is the single source of
-                            // truth for corporate light/dark; both the Settings selector and the header
-                            // toggle persist it. Honour it and keep the local corp-theme cache in sync,
-                            // falling back to the cache only when the server has no corporate variant yet.
-                            // (The old code let the local cache override the server, so a 'Corporate
-                            // Light' picked in Settings was ignored on reload.)
+                            // MK May 2026 — when user is in corporate layout, the local corp-theme
+                            // toggle in the top bar is the source of truth. Corporate doesn't use the
+                            // theme grid (it's hidden there), so the toggle and server user.theme stay
+                            // in sync; reading the toggle avoids a stale server value overriding it on F5.
                             let userTheme = d.user?.theme || d.default_theme || 'proxmoxDark';
                             try {
                                 if (d.user?.ui_layout === 'corporate') {
-                                    const serverCorp = (d.user?.theme === 'corporateLight' || d.user?.theme === 'corporateDark') ? d.user.theme : null;
-                                    const isLight = serverCorp ? serverCorp === 'corporateLight' : (localStorage.getItem('corp-theme') === 'light');
-                                    localStorage.setItem('corp-theme', isLight ? 'light' : '');
+                                    const isLight = localStorage.getItem('corp-theme') === 'light';
                                     userTheme = isLight ? 'corporateLight' : 'corporateDark';
                                 }
                             } catch (_) {}
@@ -363,13 +359,10 @@
                             applyLanguage(data.user.language);
                         }
                         // NS: Apply user's theme (with fallback to default)
-                        // #742: server user.theme is the single source of truth for corporate light/dark.
                         let userTheme = data.user?.theme || data.default_theme || 'proxmoxDark';
                         try {
                             if (data.user?.ui_layout === 'corporate') {
-                                const serverCorp = (data.user?.theme === 'corporateLight' || data.user?.theme === 'corporateDark') ? data.user.theme : null;
-                                const isLight = serverCorp ? serverCorp === 'corporateLight' : (localStorage.getItem('corp-theme') === 'light');
-                                localStorage.setItem('corp-theme', isLight ? 'light' : '');
+                                const isLight = localStorage.getItem('corp-theme') === 'light';
                                 userTheme = isLight ? 'corporateLight' : 'corporateDark';
                             }
                         } catch (_) {}
@@ -505,13 +498,11 @@
             useEffect(() => {
                 document.body.setAttribute('data-layout', layout);
                 if (isCorporate) {
-                    // #742: prefer the server's user.theme (single source of truth); fall back to the
-                    // local corp-theme cache only when the server has no corporate variant yet.
-                    const serverCorp = (user?.theme === 'corporateLight' || user?.theme === 'corporateDark') ? user.theme : null;
-                    const isLight = serverCorp ? serverCorp === 'corporateLight' : (localStorage.getItem('corp-theme') === 'light');
-                    try { localStorage.setItem('corp-theme', isLight ? 'light' : ''); } catch (_) {}
-                    // MK May 2026 (#296): data-corp-theme gates ALL light-mode CSS overrides — on a
-                    // fresh load only applyTheme() ran, leaving the body without it (everything dark).
+                    const isLight = localStorage.getItem('corp-theme') === 'light';
+                    // MK May 2026 (#296): the data-corp-theme attribute gates ALL light-mode
+                    // CSS overrides. The header toggle sets this on click, but on a fresh
+                    // page load only applyTheme() ran — so light variables got applied but
+                    // body still had no data-corp-theme, leaving every component in dark.
                     document.body.dataset.corpTheme = isLight ? 'light' : '';
                     applyTheme(isLight ? 'corporateLight' : 'corporateDark');
                 } else if (isCloud) {
