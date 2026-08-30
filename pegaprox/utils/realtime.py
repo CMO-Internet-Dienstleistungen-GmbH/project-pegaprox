@@ -358,10 +358,13 @@ def broadcast_sse(update_type: str, data: dict, cluster_id: str = None, target_c
                     if q and should_send:
                         client_message = message
                         # #736 — a scoped (non-admin) client must not receive VMs it can't view over
-                        # the 'resources' stream. subscribed is None == admin/all-access (send the
-                        # shared frame); a subscription LIST means a possibly pool-/VM-scoped user,
-                        # so hand them a per-VM-authorized frame (cached per distinct user above).
-                        if update_type == 'resources' and cluster_id is not None and subscribed is not None:
+                        # the 'resources' stream. Gate on the REAL admin role, NOT `subscribed is None`:
+                        # get_user_clusters() returns None for a default-tenant scoped user too
+                        # (rbac.py:347), so the old `subscribed is not None` check silently leaked the
+                        # full inventory to them. Every non-admin (list-scoped OR default-tenant) gets a
+                        # per-VM-authorized frame (cached per distinct user above). Fail-closed: a client
+                        # registered without the is_admin flag is treated as non-admin and filtered.
+                        if update_type == 'resources' and cluster_id is not None and not client_info.get('is_admin', False):
                             uname = client_info.get('user')
                             client_message = _res_frame_cache.get(uname, _SSE_FILTER_MISSING)
                             if client_message is _SSE_FILTER_MISSING:

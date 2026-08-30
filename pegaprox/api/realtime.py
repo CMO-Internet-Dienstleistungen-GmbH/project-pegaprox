@@ -364,11 +364,22 @@ def sse_updates():
     else:
         subscribed_clusters = allowed_clusters
 
+    # #736 security fix — the SSE 'resources' per-VM ACL filter must run for every NON-admin, but
+    # `subscribed is None` does NOT mean admin: get_user_clusters() returns None for a default-tenant
+    # scoped user too (rbac.py:347). Capture the real admin role ONCE here so the broadcast loop
+    # filters those users' frames instead of leaking the full inventory. Fail-closed (unknown → filter).
+    try:
+        from pegaprox.core.db import get_db as _gdb_role
+        _is_admin = ((_gdb_role().get_user(user) or {}).get('role') == ROLE_ADMIN)
+    except Exception:
+        _is_admin = False
+
     with sse_clients_lock:
         sse_clients[client_id] = {
             'queue': message_queue,
             'user': user,
             'clusters': subscribed_clusters,
+            'is_admin': _is_admin,
             'connected_at': datetime.now().isoformat(),
             'auth_method': auth_method
         }
