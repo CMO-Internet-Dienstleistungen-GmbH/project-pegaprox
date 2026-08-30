@@ -59,6 +59,12 @@ bp = Blueprint('vms', __name__)
 # inspection middleboxes (TLS DPI, Falcon-style EDR scoring) to finish their work.
 VNC_PVE_CONNECT_TIMEOUT = int(os.environ.get('PEGAPROX_VNC_CONNECT_TIMEOUT', '15'))
 
+# #740 (Frisch12) — under gevent's monkey-patch, asyncio.to_thread never delivers, so the console's
+# offloaded PVE socket calls burn VNC_PVE_CONNECT_TIMEOUT instead of connecting. Route to_thread
+# through gevent once, process-wide; no-op when gevent isn't patched in (e.g. under pytest).
+from pegaprox.utils.concurrent import install_gevent_to_thread, gevent_listen_socket
+install_gevent_to_thread()
+
 
 # NS 2026-05-06: cluster-add / -join nehmen frei eingegebene node-targets
 # entgegen. Semgrep flagt das als tainted-flask-input -> paramiko.connect.
@@ -8683,8 +8689,15 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
         from pegaprox.utils.ws_lenient import lenient_process_request as _lpr_vnc
         ws_host = host if host else None
         display_host = host or '0.0.0.0'
+        # #740 (Frisch12) — from Python 3.13 on, websockets.serve() never binds under gevent's
+        # monkey-patch (the greenlet parks in the selector, no listener appears). Hand it a socket
+        # we bind ourselves from the un-patched socket. py<=3.12 binds natively, so leave it be.
+        def _vnc_serve(bind_host):
+            if sys.version_info >= (3, 13):
+                return websockets.serve(vnc_handler, sock=gevent_listen_socket(bind_host, port), ssl=ssl_context, ping_interval=30, ping_timeout=60, process_request=_lpr_vnc)
+            return websockets.serve(vnc_handler, bind_host, port, ssl=ssl_context, ping_interval=30, ping_timeout=60, process_request=_lpr_vnc)
         try:
-            async with websockets.serve(vnc_handler, ws_host, port, ssl=ssl_context, ping_interval=30, ping_timeout=60, process_request=_lpr_vnc):
+            async with _vnc_serve(ws_host):
                 print(f"VNC WebSocket Server ready on {proto}://{display_host}:{port}", flush=True)
                 server_ready.set()
                 await asyncio.Future()  # Run forever
@@ -8692,7 +8705,7 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
             # Issue #71: IPv6 bind failed, fall back to 0.0.0.0
             if ':' in str(host):
                 print(f"VNC WebSocket: IPv6 bind failed ({bind_err}), falling back to 0.0.0.0", flush=True)
-                async with websockets.serve(vnc_handler, '0.0.0.0', port, ssl=ssl_context, ping_interval=30, ping_timeout=60, process_request=_lpr_vnc):
+                async with _vnc_serve('0.0.0.0'):
                     print(f"VNC WebSocket Server ready on {proto}://0.0.0.0:{port}", flush=True)
                     server_ready.set()
                     await asyncio.Future()
