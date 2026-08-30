@@ -8,7 +8,7 @@
 import time
 
 import pegaprox.utils.rbac as rbac
-from pegaprox.utils.rbac import user_can_access_vm
+from pegaprox.utils.rbac import user_can_access_vm, get_user_pool_vmids
 
 
 def _seed_pool_membership(cluster_id, mapping):
@@ -63,3 +63,34 @@ def test_pool_grant_does_not_leak_across_clusters(seed):
     _seed_pool_membership('cluster_y', {})   # alice has no reach to cluster_y at all
 
     assert user_can_access_vm(alice, 'cluster_y', 100, 'vm.view') is False
+
+
+# --------------------------------------------------------------------------- #
+# #635 pool-subset — a pool grant is exactly "assign once, see all its VMs".
+# The client portal's _get_my_vms() unions the set get_user_pool_vmids() returns.
+# --------------------------------------------------------------------------- #
+
+def test_user_pool_grant_gives_portal_visibility_of_all_pool_vms(seed):
+    """A per-user pool grant makes every VM in that pool reachable via get_user_pool_vmids — the
+    exact set the client portal unions in — so a portal client sees all the pool's VMs without a
+    per-VM ACL each (#635 / #555). A VM in another pool is not included."""
+    alice = seed.user('alice', role='viewer')
+    seed.pool('cluster_x', 'pool_1', 'alice', ['pool.view', 'vm.view'])
+    _seed_pool_membership('cluster_x', {100: ('qemu', 'pool_1'), 101: ('lxc', 'pool_1'),
+                                        200: ('qemu', 'other_pool')})
+    vmids = get_user_pool_vmids(alice, 'cluster_x')
+    assert 100 in vmids and 101 in vmids   # both pool_1 members
+    assert 200 not in vmids                # different pool → not visible
+
+
+def test_group_pool_grant_resolves_when_user_carries_groups(seed):
+    """The group→pool resolution works when the user object carries its groups (subject_type='group').
+    NOTE: portal / load_users user records don't populate 'groups' today, so group-pool grants are
+    dormant there — this locks in the resolution semantics for when a groups-carrying user hits it."""
+    seed.pool('cluster_x', 'pool_1', 'engineering', ['pool.view', 'vm.view'], subject_type='group')
+    _seed_pool_membership('cluster_x', {100: ('qemu', 'pool_1')})
+    bob = seed.user('bob', role='viewer')
+    bob['groups'] = ['engineering']          # as an IdP-authenticated session user would carry
+    assert 100 in get_user_pool_vmids(bob, 'cluster_x')
+    carol = seed.user('carol', role='viewer')   # not in the group
+    assert 100 not in get_user_pool_vmids(carol, 'cluster_x')
