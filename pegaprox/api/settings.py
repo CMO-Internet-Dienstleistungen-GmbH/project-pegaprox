@@ -4102,6 +4102,42 @@ def _ceph_gate_unsafe(summary, gate):
     return None
 
 
+def _ceph_recovery_pending(summary):
+    """True while Ceph is still recovering / rebalancing (or has data at risk) — so waiting for it to
+    settle before pulling the next node is meaningful. False for a cluster that has SETTLED but is
+    sitting on a benign steady-state HEALTH_WARN — e.g. OSD_SLOW_OPS (slow ops in BlueStore), clock
+    skew, a leftover flag — which never clears by waiting (#747, robertdahlem: the old `!= HEALTH_OK`
+    wait burned the full 120s per node in that case).
+
+    Deliberately STRICTER than _ceph_gate_unsafe(): that gate tolerates data-safe backfill/misplaced
+    movement, but the rolling-update WAIT must hold right through it — pulling the next node mid-
+    rebalance is how a rolling update becomes a rolling outage on HCI."""
+    if not summary:
+        return False
+    status = summary.get('status')
+    if status == 'HEALTH_OK':
+        return False
+    if status in ('HEALTH_ERR', 'unknown'):
+        return True  # be conservative — keep waiting
+    # HEALTH_WARN — wait only while data is actually moving or under-replicated.
+    pgs = str(summary.get('pgs', '')).lower()
+    moving = ('degraded', 'undersized', 'backfill', 'recover', 'remap', 'misplaced', 'peering',
+              'activating', 'incomplete', 'stale', 'inactive', 'down', 'unfound', 'inconsistent')
+    if any(tok in pgs for tok in moving):
+        return True
+    checks = ' '.join(str(w) for w in (summary.get('warnings') or [])).upper()
+    if any(rc in checks for rc in ('PG_DEGRADED', 'PG_AVAILABILITY', 'PG_BACKFILL', 'PG_RECOVERY',
+                                   'OSD_DOWN', 'OBJECT_UNFOUND', 'PG_DAMAGED', 'OSD_FULL', 'PG_NOT')):
+        return True
+    try:
+        osd_up, osd_in = int(summary.get('osd_up') or 0), int(summary.get('osd_in') or 0)
+    except (TypeError, ValueError):
+        osd_up = osd_in = 0
+    if osd_in and osd_up < osd_in:
+        return True
+    return False
+
+
 @bp.route('/api/clusters/<cluster_id>/updates/rolling', methods=['POST'])
 @require_auth(perms=['node.update'])
 def start_rolling_update(cluster_id):
@@ -4565,18 +4601,25 @@ def start_rolling_update(cluster_id):
                         badge = '✓' if status == 'HEALTH_OK' else ('⚠' if status == 'HEALTH_WARN' else '✗')
                         _log(f"Ceph after {node_name}: {badge} {status} · {ceph_after.get('osd_up', 0)}/{ceph_after.get('osd_in', 0)} OSDs up")
                         if status != 'HEALTH_OK' and idx < len(nodes_to_update) - 1:
-                            _log(f"Waiting up to 120s for Ceph to return to HEALTH_OK before next node…")
+                            # #747 (robertdahlem) — only spin here while Ceph is actually recovering
+                            # or has data at risk. A settled cluster on a benign HEALTH_WARN (slow ops
+                            # in BlueStore, clock skew, a leftover flag) never returns to HEALTH_OK, so
+                            # the old `!= HEALTH_OK` wait burned the full 120s per node. The opt-in gate
+                            # below still evaluates whatever status remains, either way.
                             ceph_waited = 0
-                            while ceph_waited < 120 and status != 'HEALTH_OK':
-                                time.sleep(10); ceph_waited += 10
-                                try:
-                                    ceph_after = mgr.get_ceph_health_summary() or {}
-                                    status = ceph_after.get('status', 'unknown')
-                                except Exception:
-                                    break
-                            if status == 'HEALTH_OK':
-                                _log(f"Ceph recovered to HEALTH_OK after {ceph_waited}s")
+                            if _ceph_recovery_pending(ceph_after):
+                                _log(f"Ceph is {status} and still settling — waiting up to 120s for recovery to finish before next node…")
+                                while ceph_waited < 120 and _ceph_recovery_pending(ceph_after):
+                                    time.sleep(10); ceph_waited += 10
+                                    try:
+                                        ceph_after = mgr.get_ceph_health_summary() or {}
+                                        status = ceph_after.get('status', 'unknown')
+                                    except Exception:
+                                        break
+                                _log(f"Ceph {'still recovering' if _ceph_recovery_pending(ceph_after) else 'settled'} ({status}) after {ceph_waited}s")
                             else:
+                                _log(f"Ceph is {status} but settled (no recovery in progress) — continuing without the HEALTH_OK wait")
+                            if status != 'HEALTH_OK':
                                 # NS 2026-07-17 (#403 part 2, proxforge): opt-in gate — don't pull
                                 # the next node while a deployed Ceph is still at risk.
                                 gate_reason = _ceph_gate_unsafe(ceph_after, ceph_health_gate) if ceph_health_gate != 'off' else None
