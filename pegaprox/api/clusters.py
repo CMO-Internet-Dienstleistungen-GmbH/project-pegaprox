@@ -482,6 +482,54 @@ def get_cluster_nodes(cluster_id):
     }), 503
 
 
+@bp.route('/api/clusters/<cluster_id>/ssh/repin-host-keys', methods=['POST'])
+@require_auth(perms=['cluster.config'])
+def repin_cluster_host_keys(cluster_id):
+    """Drop the pinned SSH host keys for this cluster's hosts so the next connection
+    re-learns them via TOFU.
+
+    #717: after CIS hardening or a reinstall a node regenerates its SSH host key; the
+    pinned key then trips reject-on-change and every SSH feature fails — and it reads
+    like an auth error, not a host-key one. Deleting + re-adding the cluster already
+    clears the pins on the way out; this exposes that same cleanup on its own so an
+    operator doesn't have to tear the cluster down to recover. The next SSH connect
+    pins the new key.
+    """
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+
+    mgr = cluster_managers[cluster_id]
+    try:
+        from pegaprox.utils.ssh_security import remove_host_keys
+        from pegaprox.utils.ssh import _node_ip_cache
+        # same host set the delete path cleans: configured host + resolved node IPs
+        hosts = set()
+        v = getattr(mgr, 'host', None) or getattr(mgr.config, 'host', None)
+        if v:
+            hosts.add(v)
+        for (cid, _node), val in list(_node_ip_cache.items()):
+            if cid == cluster_id and val and val[0]:
+                hosts.add(val[0])
+        try:
+            for n in (mgr.get_nodes() or []):
+                ip = (n or {}).get('ip') or (n or {}).get('host')
+                if ip:
+                    hosts.add(ip)
+        except Exception:
+            pass
+        removed = remove_host_keys(hosts)
+        logging.info(f"[SSH] host-key re-pin for cluster {cluster_id}: dropped {removed} pin(s) "
+                     f"across {len(hosts)} host(s) — next connect re-learns")
+        return jsonify({'success': True, 'removed': removed, 'hosts': len(hosts)})
+    except Exception as e:
+        logging.exception(f"host-key re-pin failed for {cluster_id}")
+        return jsonify({'error': safe_error(e, 'Re-pin failed')}), 500
+
+
 @bp.route('/api/clusters/<cluster_id>', methods=['DELETE'])
 @require_auth(perms=['cluster.delete'])
 def delete_cluster(cluster_id):

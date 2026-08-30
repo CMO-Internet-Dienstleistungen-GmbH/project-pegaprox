@@ -12703,6 +12703,23 @@
                 }
             };
 
+            // #717 — drop pinned SSH host keys for a cluster whose node host key changed
+            // (CIS hardening / reinstall) so the next connect re-pins, without deleting the cluster.
+            const handleRepinHostKeys = async (clusterId) => {
+                if (!window.confirm(t('repinHostKeysConfirm') || 'Clear the pinned SSH host keys for this cluster? Use this after a node was reinstalled or hardened and its SSH host key changed — the next connection re-learns the new key.')) return;
+                try {
+                    const response = await authFetch(`${API_URL}/clusters/${clusterId}/ssh/repin-host-keys`, { method: 'POST' });
+                    const d = response ? await response.json().catch(() => ({})) : {};
+                    if (response && response.ok) {
+                        addToast((t('repinHostKeysDone') || 'SSH host keys cleared — the next connection re-pins') + (d.removed != null ? ` (${d.removed})` : ''));
+                    } else {
+                        addToast(d.error || (t('repinHostKeysFailed') || 'Re-pin failed'), 'error');
+                    }
+                } catch (error) {
+                    addToast(t('repinHostKeysFailed') || 'Re-pin failed', 'error');
+                }
+            };
+
             // NS: Mar 2026 - rename cluster (display_name)
             const handleRenameCluster = async () => {
                 if (!renamingCluster) return;
@@ -13448,6 +13465,7 @@
                         { label: t('refreshData') || 'Refresh', icon: <Icons.RefreshCw className="w-3.5 h-3.5" />, onClick: () => { fetchSidebarClusterData(cluster.id); if (selectedCluster?.id === cluster.id) { fetchClusterMetrics(cluster.id); fetchClusterResources(cluster.id); } } },
                         { separator: true },
                         { label: t('reconfigureCluster') || 'Re-configure', icon: <Icons.Settings className="w-3.5 h-3.5" />, onClick: () => setReconfigureCluster(cluster) },
+                        { label: t('repinHostKeys') || 'Re-pin SSH host keys', icon: <Icons.Key className="w-3.5 h-3.5" />, onClick: () => handleRepinHostKeys(cluster.id) },
                         { label: t('deleteCluster') || 'Remove Cluster', icon: <Icons.Trash className="w-3.5 h-3.5" />, danger: true, onClick: () => handleDeleteCluster(cluster.id) },
                     ];
                 }
