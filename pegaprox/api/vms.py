@@ -26,10 +26,6 @@ from pegaprox.core.db import get_db
 from pegaprox.utils.auth import require_auth, load_users, validate_session, build_authz_user
 from pegaprox.utils.audit import log_audit
 from pegaprox.utils.rbac import user_can_access_vm, get_user_permissions
-from pegaprox.utils.guest_memory import (
-    get_guest_linux_memory as _get_guest_linux_memory,
-    parse_linux_meminfo as _parse_linux_meminfo,
-)
 
 
 def _require_vm_access(cluster_id, vmid, perm, vm_type=None):
@@ -4393,7 +4389,6 @@ def get_vm_guest_info_api(cluster_id, node, vm_type, vmid):
               'interfaces': [],
               'users': [],
               'filesystems': [],
-              'memory': None,
               'guest_time_ns': None}
 
     try:
@@ -4411,12 +4406,6 @@ def get_vm_guest_info_api(cluster_id, node, vm_type, vmid):
                 return jsonify(result)
         except Exception:
             pass
-
-        # Guest pressure is refreshed asynchronously for watched clusters.
-        # Never turn this request path into a potentially slow guest-exec poll.
-        result['memory'] = mgr.get_cached_guest_memory(node, vmid)
-        if result['memory']:
-            result['agent_running'] = True
 
         try:
             resp = session.get(f"{base}/get-osinfo", timeout=8)
@@ -10899,3 +10888,4 @@ def create_container_api(cluster_id, node):
         return jsonify(result)
     else:
         return jsonify(result), 400
+
