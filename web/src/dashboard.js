@@ -2770,7 +2770,9 @@
                                 {allNodes.map(node => {
                                     const vms = nodeGroups[node.name] || [];
                                     const running = vms.filter(v => v.status === 'running').length;
-                                    const stopped = vms.length - running;
+                                    // #749: stopped is its own status — paused/suspended/templates
+                                    // shouldn't get bucketed as stopped via length-minus-running.
+                                    const stopped = vms.filter(v => v.status === 'stopped').length;
                                     const isOnline = node.status === 'online' || node.cpu !== undefined || node.cpu_percent !== undefined;
                                     // LW: #299 — default collapsed: node is collapsed unless explicitly expanded
                                     const isCollapsed = collapsedNodes._defaultCollapsed
@@ -18908,9 +18910,12 @@
                                                                                     // #690 — PBS /disks/list carries SMART health in `status` (PASSED/FAILED/UNKNOWN),
                                                                                     // not `health`; HDDs have no `wearout`, so the old read showed a bare N/A. Prefer
                                                                                     // status, fall back to health, then wearout for SSDs.
+                                                                                    // #751 — some PBS builds emit it lowercase ("passed"), so match case-insensitively
+                                                                                    // or a healthy disk turns red.
                                                                                     const smart = disk.status || disk.health || (disk.wearout != null ? `${disk.wearout}%` : '');
-                                                                                    const ok = smart === 'PASSED' || smart === 'OK';
-                                                                                    const unk = !smart || smart === 'UNKNOWN';
+                                                                                    const su = String(smart).toUpperCase();
+                                                                                    const ok = su === 'PASSED' || su === 'OK';
+                                                                                    const unk = !smart || su === 'UNKNOWN';
                                                                                     return (
                                                                                         <span className={`px-2 py-0.5 rounded text-xs ${ok ? 'bg-green-500/20 text-green-400' : unk ? 'bg-gray-500/20 text-gray-400' : 'bg-red-500/20 text-red-400'}`}>
                                                                                             {smart || 'N/A'}

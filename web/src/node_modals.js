@@ -5079,7 +5079,7 @@
                                             <tr><td>QEMU VMs</td><td>{nodeVms.filter(v => v.type === 'qemu').length}</td></tr>
                                             <tr><td>LXC CTs</td><td>{nodeVms.filter(v => v.type === 'lxc').length}</td></tr>
                                             <tr><td>{t('running')}</td><td>{runningVms}</td></tr>
-                                            <tr><td>{t('stopped')}</td><td>{nodeVms.length - runningVms}</td></tr>
+                                            <tr><td>{t('stopped')}</td><td>{nodeVms.filter(v => v.status === 'stopped').length}</td></tr>
                                         </tbody>
                                     </table>
                                 </div>
