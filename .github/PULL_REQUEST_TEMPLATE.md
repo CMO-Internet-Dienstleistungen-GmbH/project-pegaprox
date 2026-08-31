@@ -25,5 +25,8 @@ approach before writing a lot of code — large unsolicited PRs are the ones mos
 - [ ] There's a linked issue and the approach was discussed — or this is a small, obvious fix.
 - [ ] The test suite passes locally, and I added/updated tests for this change.
 - [ ] It's scoped to the title and doesn't touch unrelated files.
-- [ ] If I used an AI assistant, **I have read, understood and tested every line myself.** This is
-      not unreviewed generated output.
+- [ ] If I used an AI assistant, **I have read, understood and tested every line myself** (this is
+      not unreviewed generated output), **and I've named the assistant/model below** — we record it
+      for licensing & compliance review.
+      <!-- Which tool/model? e.g. Claude, GitHub Copilot, Gemini, GPT-4o, ... -->
+      AI tool / model used: `none`

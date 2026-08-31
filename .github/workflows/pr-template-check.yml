@@ -91,6 +91,16 @@ jobs:
               problems.push('The checklist was removed — please keep it and tick what applies.');
             }
 
+            // NS Aug 2026 — if they ticked the AI-assist box, the assistant/model has to be named
+            // (we record it for licensing/compliance). The template ships that line defaulting to
+            // `none`; a ticked box that still says none/blank means it wasn't filled in.
+            const aiTicked = /[-*]\s*\[[xX]\][^\n]*AI assistant/i.test(body);
+            const modelMatch = noComments.match(/AI tool\s*\/\s*model used:\s*`?\s*([^`\n]*?)\s*`?\s*$/im);
+            const modelVal = (modelMatch ? modelMatch[1] : '').trim();
+            if (aiTicked && (!modelVal || /^none$/i.test(modelVal))) {
+              problems.push('You ticked the AI-assist box — please also name the assistant/model on the "AI tool / model used:" line (it still says `none`). We record it for licensing/compliance review.');
+            }
+
             // find our previous comment so we update one comment instead of spamming on edits.
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
