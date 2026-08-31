@@ -3343,7 +3343,41 @@ class PegaProxManager:
                 
                 return True
             else:
-                self.logger.error(f"[ERROR] Failed to migrate {vm.get('name', 'unnamed')}: {response.status_code} - {response.text}")
+                resp_text = response.text or ''
+                # MK Aug 2026 (#647 cklabautermann) — a migrate POST can come back 500
+                # "VM is locked (migrate)" when a migration for this guest is ALREADY in
+                # flight: PVE HA relocates HA guests the instant the node enters
+                # maintenance, and a recheck / parallel evacuation pass can re-issue the
+                # migrate before the first finishes. The guest IS moving, so failing here
+                # (and pausing the rolling update) is a false negative. Wait for the
+                # in-flight move to land and confirm the guest actually left the source
+                # node before deciding — same "moved anyway" reasoning as the HA-reroute
+                # branch on the task-failure path above.
+                if 'locked (migrate)' in resp_text:
+                    self.logger.info(
+                        f"[MAINT] {vm.get('name', 'unnamed')} ({vmid}) already holds a "
+                        f"migrate lock — a migration is in flight; waiting for it to finish "
+                        f"instead of failing the evacuation."
+                    )
+                    landed = self._await_inflight_migration(
+                        vmid, source_node, vm_type, vm.get('name', 'unnamed'), wait_timeout)
+                    if landed:
+                        self.logger.info(
+                            f"[OK] {vm.get('name', 'unnamed')} left {source_node} (now on "
+                            f"{landed}) via the in-flight migration — evacuation successful."
+                        )
+                        self.last_migration_log.append({
+                            'timestamp': datetime.now().isoformat(),
+                            'vm': vm.get('name', 'unnamed'),
+                            'vmid': vmid,
+                            'from_node': source_node,
+                            'to_node': landed,
+                            'dry_run': False,
+                            'success': True,
+                            'note': 'already migrating (migrate lock) — confirmed off source',
+                        })
+                        return True
+                self.logger.error(f"[ERROR] Failed to migrate {vm.get('name', 'unnamed')}: {response.status_code} - {resp_text}")
                 self.last_migration_log.append({
                     'timestamp': datetime.now().isoformat(),
                     'vm': vm.get('name', 'unnamed'),
@@ -3352,7 +3386,7 @@ class PegaProxManager:
                     'to_node': target_node,
                     'dry_run': False,
                     'success': False,
-                    'error': response.text
+                    'error': resp_text
                 })
                 return False
                 
@@ -3399,7 +3433,54 @@ class PegaProxManager:
         
         self.logger.error(f"Task {task_id} timed out after {timeout} seconds")
         return False
-    
+
+    def _vm_has_migrate_lock(self, node, vmid, vm_type):
+        """#647: best-effort check whether a guest still holds a 'migrate' lock on
+        `node`. On any error we assume it might still be locked (return True) so the
+        caller keeps waiting rather than declaring a premature failure — the caller's
+        own timeout bounds the wait."""
+        try:
+            kind = 'qemu' if vm_type == 'qemu' else 'lxc'
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/{kind}/{vmid}/status/current"
+            resp = self._api_get(url)
+            if resp is not None and resp.status_code == 200:
+                lock = (resp.json().get('data') or {}).get('lock', '') or ''
+                return 'migrate' in str(lock)
+        except Exception:
+            pass
+        return True
+
+    def _await_inflight_migration(self, vmid, source_node, vm_type, vm_name, timeout=1800):
+        """#647: called when a migrate call reports 'VM is locked (migrate)' because a
+        migration for this guest is already running. Poll until the guest leaves
+        source_node (return the node it landed on), or the migrate lock clears while it
+        is still on source (the in-flight move ended without relocating it → real
+        failure), or we hit `timeout`. Returns the landing node on success, else None."""
+        deadline = time.time() + max(60, int(timeout or 0))
+        while time.time() < deadline:
+            node_now = None
+            try:
+                rec = next((v for v in self.get_vm_resources() if v.get('vmid') == vmid), None)
+                node_now = rec.get('node') if rec else None
+            except Exception:
+                node_now = None
+            if node_now and node_now != source_node:
+                return node_now
+            # still on source with the lock gone → the in-flight move finished without
+            # relocating it; don't sit out the whole timeout on a genuine failure.
+            if node_now == source_node and not self._vm_has_migrate_lock(source_node, vmid, vm_type):
+                self.logger.warning(
+                    f"[MAINT] {vm_name} ({vmid}) migrate lock cleared but it is still on "
+                    f"{source_node}; the in-flight migration did not relocate it."
+                )
+                return None
+            time.sleep(5)
+        self.logger.warning(
+            f"[MAINT] timed out after {int(timeout or 0)}s waiting for {vm_name} ({vmid}) "
+            f"to leave {source_node}."
+        )
+        return None
+
     def enter_maintenance_mode(self, node_name, skip_evacuation=False, allow_local_disks=False):
         # NS: tries native HA first, falls back to our own evacuation logic
         # NS Apr 2026 (#330): allow_local_disks opts the evacuator into
