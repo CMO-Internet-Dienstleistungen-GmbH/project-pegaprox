@@ -68,6 +68,54 @@ upstream release with a changed patch set (a fix added, reworked, or dropped).
 **A tag is only ever created after a green test run.** `--skip-tests` refuses
 to run together with `--push`.
 
+## Where an internal request goes
+
+A request from a colleague is classified before a line of code is written,
+because the category decides what it costs us on *every* future release:
+
+| Category | Route | Cost per upstream release |
+|---|---|---|
+| **A — configuration** | config/ENV/theme, no code | none |
+| **B — bug** | issue upstream, PR against `Testing`, entry here with `upstream_pr` | temporary — drops itself |
+| **C — generic feature** | build it here **and** offer it upstream in parallel | temporary; rework if upstream builds it differently |
+| **D — CMO-specific** | stays in the fork for good, `kind: internal` | permanent |
+
+C is deliberately not "wait for upstream to agree first": being blocked for
+weeks on a discussion costs more than the occasional rework. Keep such a patch
+small and additive so that rework stays cheap.
+
+The chain ends at the tag:
+
+```
+request -> issue in the fork -> triage A/B/C/D
+        -> branch + entry in patches.yml
+        -> sync builds v<upstream>-cmo.<n>, tests green, tag pushed
+        -> notification: a new version is ready to test
+```
+
+What happens after that — testing it, rolling it out, moving
+`pegaprox_install_version` — belongs to the IaC repository, not here.
+
+### Rules for a category D patch
+
+A permanent patch has to survive a rebase onto every future upstream release.
+What makes that cheap:
+
+1. **Additive, not invasive** — a new file or module. What upstream does not
+   know about can never conflict.
+2. **Where touching an upstream file is unavoidable, leave a one-line hook** and
+   put the logic in a file of your own. Minimise the conflict surface, not the
+   line count.
+3. **No refactoring of upstream code** in the same patch. That is what got PR
+   #744 closed, and it multiplies the conflict surface.
+4. **Never edit `web/index.html`** — it is a build artefact; edit `web/src/*.js`
+   and let the sync rebuild the bundle.
+5. **One patch, one concern, one branch** — otherwise the sync cannot drop it
+   individually.
+6. **Leave `.github/workflows/` alone.** A `fix/*` branch goes upstream as a PR,
+   and a diff that touches CI config will not be accepted. Anything the fork
+   needs differently is a repository setting, not a commit.
+
 ## Adding, changing or retiring a patch
 
 Everything lives in [`patches.yml`](patches.yml) — the scripts hardcode nothing:
@@ -77,15 +125,30 @@ patches:
   - name: some-fix
     branch: fix/some-fix        # branch in the fork holding the commits
     base: Testing               # upstream branch it was built on
+    kind: fix                   # fix | feature | internal   (default: fix)
     upstream_pr: 812            # drops the patch automatically once merged
+    requested_by: 12            # issue in the fork; for internal patches
     summary: one line for the tag message
 ```
+
+`kind` is the promise the entry makes. `fix` and `feature` are meant to end up
+upstream and disappear from this file; `internal` is the opposite — it stays in
+the fork, so neither drop heuristic may touch it, and a branch with no commits
+is an error rather than a silent skip. An unknown value stops the run: a typo
+must not quietly turn a permanent patch back into a droppable one.
 
 The commits taken are `merge-base(upstream/<base>, origin/<branch>)..<branch>`,
 so rebasing the fix branch onto a newer upstream is transparent here.
 
 When a fix lands upstream, you do not have to do anything: the next sync sees
 the merged PR and drops it. Deleting the entry afterwards keeps the file tidy.
+
+In practice the `upstream_pr` lookup is the one that fires. The patch-id check
+(`git cherry`) only recognises our commits when they were taken *as they are* —
+and so far the maintainer has reimplemented every one of our fixes in a revised
+form, which gives them a different patch-id. So keep `upstream_pr` filled in:
+without it, a patch that is long since fixed upstream will be replayed until
+someone notices by hand.
 
 ## Triggering it
 
@@ -143,11 +206,12 @@ quietly dies is worse than no watcher.
 
 ## Current patch set
 
-See `patches.yml`. As of the first sync:
+See `patches.yml` — it is the authority; this list is a summary.
 
-- **vnc-console-under-gevent** — the web console never connected under gevent
-  on Python 3.13+ (upstream PR #741)
-- **taskbar-remount-expand** — the task bar popped open on page load and on
-  every cluster switch (upstream PR #739)
 - **corporate-theme-source-of-truth** — "Corporate Light" from the settings was
-  overridden on reload (upstream issue #742)
+  overridden on reload (upstream issue #742). PR #744 was closed rather than
+  merged, so this one currently has no upstream PR to track.
+
+Dropped as of v1.1.0, fixed upstream in revised form:
+**vnc-console-under-gevent** (issue #740) and **taskbar-remount-expand**
+(issue #738).

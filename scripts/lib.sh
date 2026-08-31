@@ -36,15 +36,21 @@ PY
 }
 
 # Emit the patch list, one record per line, fields separated by US (0x1f):
-# name, branch, base, upstream_pr, summary. Not TAB: `read` treats TAB as IFS
-# whitespace and collapses runs of it, which drops empty fields.
+# name, branch, base, upstream_pr, summary, kind, requested_by. Not TAB: `read`
+# treats TAB as IFS whitespace and collapses runs of it, which drops empty fields.
+#
+# `kind` defaults to 'fix' when the entry does not say otherwise, so every
+# pre-existing entry keeps behaving exactly as before.
 cfg_patches() {
     python3 - "$CONFIG_FILE" <<'PY'
 import sys, yaml
 with open(sys.argv[1]) as fh:
     data = yaml.safe_load(fh) or {}
 for p in data.get('patches') or []:
-    print('\x1f'.join(str(p.get(k) or '') for k in ('name', 'branch', 'base', 'upstream_pr', 'summary')))
+    fields = [str(p.get(k) or '') for k in ('name', 'branch', 'base', 'upstream_pr', 'summary')]
+    fields.append(str(p.get('kind') or 'fix'))
+    fields.append(str(p.get('requested_by') or ''))
+    print('\x1f'.join(fields))
 PY
 }
 

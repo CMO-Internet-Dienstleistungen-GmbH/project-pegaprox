@@ -25,10 +25,23 @@ fork:
 #   upstream_pr  the pull request upstream; when it is merged, the patch is
 #                dropped from the set instead of applied (the fix is in the
 #                release by then). Leave empty if there is no PR yet.
+#   kind         fix | feature | internal, default fix.
+#                `fix` and `feature` are meant to end up upstream and disappear
+#                from this file on their own -- the sync drops them once the
+#                release contains the work (patch-id) or the PR is merged.
+#                `internal` is the opposite promise: it stays in the fork for
+#                good, so neither heuristic is allowed to touch it and an empty
+#                commit set is an error rather than a silent skip.
+#                An unknown value stops the run: a typo must not quietly turn a
+#                permanent patch back into a droppable one.
+#   requested_by who asked for it -- an issue number in the fork. Only meaningful
+#                for internal patches; it is what tells the next reader why a
+#                permanent delta to upstream exists at all.
 patches:
   - name: corporate-theme-source-of-truth
     branch: fix/corporate-theme-source-of-truth
     base: Testing
+    kind: fix
     upstream_pr:
     summary: user.theme is the single source of truth for Corporate light/dark
 

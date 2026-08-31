@@ -187,9 +187,17 @@ apply_commit() {   # apply_commit <sha> <patch-name>
     return 0
 }
 
-while IFS=$'\x1f' read -r name branch base pr summary; do
+while IFS=$'\x1f' read -r name branch base pr summary kind requested_by; do
     [ -n "$name" ] || continue
-    info "patch: $name — $summary"
+    case "$kind" in
+        fix|feature|internal) ;;
+        *) die "$name: unknown kind '$kind' (expected fix, feature or internal)" ;;
+    esac
+    if [ "$kind" = internal ]; then
+        info "patch: $name — $summary [internal${requested_by:+, requested by $requested_by}]"
+    else
+        info "patch: $name — $summary"
+    fi
 
     if ! git -C "$REPO_ROOT" rev-parse --verify --quiet "$FORK_REMOTE/$branch" >/dev/null; then
         die "$name: branch $FORK_REMOTE/$branch not found"
@@ -198,6 +206,12 @@ while IFS=$'\x1f' read -r name branch base pr summary; do
         || die "$name: no merge base between upstream/$base and $FORK_REMOTE/$branch"
 
     commits="$(git -C "$REPO_ROOT" rev-list --reverse "$merge_base..$FORK_REMOTE/$branch")"
+    if [ -z "$commits" ] && [ "$kind" = internal ]; then
+        # An internal patch is meant to stay forever. Empty means the branch is
+        # wrong, not that the work is done -- dropping it silently would remove
+        # a feature from the fork and nobody would notice until it was missed.
+        die "$name: internal patch has no commits beyond upstream/$base — check the branch"
+    fi
     if [ -z "$commits" ]; then
         warn "  no commits on $branch beyond upstream/$base — skipped"
         SKIPPED_LIST="${SKIPPED_LIST}${name} (no commits beyond upstream/${base})"$'\n'
@@ -209,14 +223,15 @@ while IFS=$'\x1f' read -r name branch base pr summary; do
     # so it recognises our commits even when the maintainer rebased them. This
     # is the reliable signal and needs no network; the PR lookup below only
     # adds the squash-merge case, which patch-ids cannot see.
-    if [ -z "$(git -C "$REPO_ROOT" cherry "$RELEASE_SHA" "$FORK_REMOTE/$branch" "$merge_base" | grep '^+' || true)" ]; then
+    if [ "$kind" != internal ] \
+        && [ -z "$(git -C "$REPO_ROOT" cherry "$RELEASE_SHA" "$FORK_REMOTE/$branch" "$merge_base" | grep '^+' || true)" ]; then
         ok "  every commit is already in $RELEASE_TAG — dropping this patch"
         SKIPPED_LIST="${SKIPPED_LIST}${name} (already contained in ${RELEASE_TAG})"$'\n'
         N_SKIPPED=$((N_SKIPPED + 1))
         continue
     fi
 
-    if [ -n "$pr" ]; then
+    if [ -n "$pr" ] && [ "$kind" != internal ]; then
         merged="$(pr_merged "$UPSTREAM_REPO" "$pr")"
         case "$merged" in
             true)
@@ -236,7 +251,11 @@ while IFS=$'\x1f' read -r name branch base pr summary; do
         n=$((n + 1))
     done <<< "$commits"
     ok "  applied $n commit(s)"
-    APPLIED_LIST="${APPLIED_LIST}${name}: ${summary}"$'\n'
+    if [ "$kind" = internal ]; then
+        APPLIED_LIST="${APPLIED_LIST}${name}: ${summary} [internal — stays in the fork]"$'\n'
+    else
+        APPLIED_LIST="${APPLIED_LIST}${name}: ${summary}"$'\n'
+    fi
     N_APPLIED=$((N_APPLIED + 1))
 done < <(cfg_patches)
 
