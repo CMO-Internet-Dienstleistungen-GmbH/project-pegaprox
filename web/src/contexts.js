@@ -498,6 +498,9 @@
             // also force matching theme so modern themes dont bleed into corporate
             useEffect(() => {
                 document.body.setAttribute('data-layout', layout);
+                // Remember the layout for the pre-React theme bootstrap: it resolves
+                // a saved 'system' before body carries data-layout (see index.html).
+                try { localStorage.setItem('pegaprox-last-layout', layout); } catch (_) {}
                 if (isCorporate) {
                     const isLight = localStorage.getItem('corp-theme') === 'light';
                     // MK May 2026 (#296): the data-corp-theme attribute gates ALL light-mode
