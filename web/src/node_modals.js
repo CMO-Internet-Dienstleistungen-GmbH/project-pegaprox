@@ -5780,7 +5780,9 @@
 
                         {/* Shell Tab */}
                         {activeDetailTab === 'shell' && (
-                            <div className="bg-black border border-proxmox-border overflow-hidden" style={{height: '500px'}}>
+                            // NS #727 — clip (not hidden) so Firefox's selection-autoscroll can't
+                            // scroll this panel; hidden boxes stay programmatically scrollable, clip doesn't.
+                            <div className="bg-black border border-proxmox-border" style={{height: '500px', overflow: 'clip'}}>
                                 <NodeShellTerminal node={node} clusterId={clusterId} addToast={addToast} />
                             </div>
                         )}

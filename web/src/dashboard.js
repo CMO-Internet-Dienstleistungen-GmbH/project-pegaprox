@@ -13799,8 +13799,12 @@
                 );
             }
 
+            // NS #727 — Firefox drives text-selection autoscroll into overflow:hidden boxes
+            // (Chrome doesn't), which can shove the whole shell off-screen horizontally with no
+            // scrollbar left to recover it. overflow-x:clip pins the shell on the x-axis; y stays
+            // visible so the page still scrolls vertically and fixed-position modals are unaffected.
             return (
-                <div className={`min-h-screen bg-proxmox-darker text-white ${isCorporate ? 'pb-7' : ''}`}>
+                <div className={`min-h-screen bg-proxmox-darker text-white ${isCorporate ? 'pb-7' : ''}`} style={{ overflowX: 'clip' }}>
                     {/* LW: Password Expiry Warning */}
                     <PasswordExpiryBanner onChangePassword={() => setShowProfile(true)} />
                     
