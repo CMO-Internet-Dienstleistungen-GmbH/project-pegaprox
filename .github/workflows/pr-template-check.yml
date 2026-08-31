@@ -100,6 +100,34 @@ jobs:
             });
             const mine = comments.find(c => (c.body || '').includes(MARKER));
 
+            // NS Aug 2026 — companion to the issue validator's auto-close: a PR that DELETES the whole
+            // template (none of its section headings survive) or strikes every section through to fake
+            // it is the AI-slop signal we close outright, not just nudge. A partially-incomplete
+            // template still gets the soft nudge below.
+            const noC = (pr.body || '').replace(/<!--[\s\S]*?-->/g, '');
+            const PR_HEADINGS = ['What\\s*&\\s*why', 'Scope', 'How it was tested', 'Checklist'];
+            const headingsPresent = PR_HEADINGS.filter(h =>
+              new RegExp('^#{1,6}\\s*[^\\n]*(' + h + ')', 'im').test(noC)).length;
+            const struckOut = /~~[^~\n]*(What\s*&\s*why|How it was tested|Scope|Checklist)[^~\n]*~~/i.test(pr.body || '');
+            if (headingsPresent === 0 || struckOut) {
+              const closeMsg = `${MARKER}\n👋 Thanks for opening a PR — but the **PR template was removed** ` +
+                `(or its sections were struck through). We rely on it (what & why, a linked issue, and how ` +
+                `you actually tested) to review at all — a template-less PR is almost always unreviewable.\n\n` +
+                `Please open a fresh PR using the template and fill in the sections, including the AI-assist ` +
+                `checklist line. 🐾\n\n*Automated — closing for now; reopen with the completed template.*`;
+              if (mine) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner, repo: context.repo.repo, comment_id: mine.id, body: closeMsg });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner, repo: context.repo.repo, issue_number: pr.number, body: closeMsg });
+              }
+              await github.rest.pulls.update({
+                owner: context.repo.owner, repo: context.repo.repo, pull_number: pr.number, state: 'closed' });
+              core.setFailed('PR template removed — auto-closed.');
+              return;
+            }
+
             if (problems.length === 0) {
               if (mine) {
                 await github.rest.issues.updateComment({
