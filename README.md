@@ -208,10 +208,19 @@ quietly dies is worse than no watcher.
 
 See `patches.yml` — it is the authority; this list is a summary.
 
-- **corporate-theme-source-of-truth** — "Corporate Light" from the settings was
-  overridden on reload (upstream issue #742). PR #744 was closed rather than
-  merged, so this one currently has no upstream PR to track.
+**As of v1.1.0 the set is empty: the fork carries no delta against upstream.**
+All three patches were solved upstream, each in a different shape than our PR,
+which is why none of them was dropped automatically:
 
-Dropped as of v1.1.0, fixed upstream in revised form:
-**vnc-console-under-gevent** (issue #740) and **taskbar-remount-expand**
-(issue #738).
+| Patch | Upstream |
+|---|---|
+| vnc-console-under-gevent | issue #740, fixed in 1.1.0 |
+| taskbar-remount-expand | issue #738, fixed in 1.1.0 |
+| corporate-theme-source-of-truth | issue #742, fixed in 1.1.0 (702bfa5 + c53a859); our PR #744 was closed, not merged |
+
+The fork stays useful as the vehicle for the next patch — and the tag remains
+what gets deployed, so the deployed revision is still unambiguous.
+
+Still open upstream: the **System theme** that follows the OS light/dark
+setting (issue #743, PR #745 closed pending discussion). The branch
+`feat/system-theme` holds the work; it is not in the patch set.

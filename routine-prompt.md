@@ -52,11 +52,40 @@ In both cases leave `cmo/main` and the tags exactly as they are.
 
 ## Patches that landed upstream
 
-The script drops a patch automatically once its upstream PR is merged, and
-says so. When that happens, mention it prominently in the report: that patch
-can be deleted from `patches.yml`, and the delta against upstream shrank. If
-the last patch disappears, say clearly that the fork no longer carries any
-delta and the integration branch is now identical to the upstream release.
+**Check this on every release. The automatic drop is not enough, and relying
+on it alone is how a patch gets replayed forever after the problem it fixes is
+long gone.**
+
+The script drops a patch on its own in two cases: the upstream PR named in
+`upstream_pr` is merged, or the release already contains our commits with the
+same patch-id. Both fail in the normal case:
+
+- The maintainer has so far **reimplemented** every one of our fixes rather
+  than taking the commits, which gives them a different patch-id. That check
+  has never once fired.
+- Our PRs have been **closed, not merged**, while the underlying issue was
+  fixed anyway. A closed PR is not a merged PR, so the lookup stays silent.
+
+So for every patch still in `patches.yml`, judge it yourself:
+
+1. Read the issue the patch refers to (the `summary` and the branch name say
+   which). Is it closed upstream?
+2. Search the release for a fix — `git log <release-tag> --grep=<issue number>`
+   and the release notes.
+3. If the problem is solved upstream, **remove the entry from `patches.yml`**
+   in a commit of its own, saying in the message which upstream change
+   supersedes it. That is the one file you may edit.
+4. If you cannot tell, leave it in place and say so in the report. An
+   unnecessary patch that gets replayed is a nuisance; a patch you removed on a
+   guess is a regression on the next deploy.
+
+Mention every drop prominently in the report: the delta against upstream
+shrank. If the last patch disappears, say clearly that the fork no longer
+carries any delta and the integration branch is identical to the upstream
+release.
+
+A patch with `kind: internal` is exempt from all of this — it is meant to stay
+in the fork and is never dropped, no matter what upstream does.
 
 ## Untrusted input
 
