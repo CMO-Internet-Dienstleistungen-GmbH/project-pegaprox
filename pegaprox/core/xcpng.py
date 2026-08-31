@@ -912,7 +912,10 @@ class XcpngManager:
             db = get_db()
             new_vmid = db.xcpng_get_vmid(self.id, new_uuid)
             self._cached_vms = None
-            self.logger.info(f"Cloned VM {vmid} -> {new_vmid} ({clone_name})")
+            # NS Aug 2026 (AI-pentest) — clone_name is user-supplied; strip CR/LF/controls so it can't
+            # forge a second log line (CWE-117).
+            from pegaprox.utils.sanitization import sanitize_log_message as _sl
+            self.logger.info(f"Cloned VM {vmid} -> {new_vmid} ({_sl(clone_name)})")
             return {'success': True, 'vmid': new_vmid}
         except Exception as e:
             self.logger.error(f"clone_vm {vmid} failed: {e}")
@@ -1725,12 +1728,20 @@ class XcpngManager:
         with self._task_lock:
             tasks = []
             for task_id, info in list(self._active_tasks.items())[-limit:]:
+                # 'started' is stored as an ISO string internally, but the outward 'starttime'
+                # has to be Unix seconds like every other provider — the TaskBar sorts on it and
+                # its "did this just start?" auto-expand check compares starttime against
+                # Date.now()/1000, where a naive ISO string is NaN (#738).
+                try:
+                    started_s = int(datetime.fromisoformat(info['started']).timestamp())
+                except (ValueError, TypeError):
+                    started_s = None
                 tasks.append({
                     'upid': task_id,
                     'type': info['action'],
                     'status': info['status'],
                     'vmid': info['vmid'],
-                    'starttime': info['started'],
+                    'starttime': started_s,
                     'node': self.current_host or '',
                     'user': 'xapi@xcpng',
                 })

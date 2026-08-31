@@ -114,6 +114,10 @@ def get_clusters():
                 'status': 'running' if mgr.running else 'stopped',
                 'connected': mgr.is_connected,
                 'connection_error': mgr.connection_error,
+                # #16745 — presence only (never the key). Lets the Harden PVE Node UI warn before
+                # the sshd_hardening control (PermitRootLogin prohibit-password) cuts off PegaProx's
+                # own access on a cluster we reach by root password with no key deployed.
+                'has_ssh_key': bool(getattr(mgr.config, 'ssh_key', '')),
                 'migration_threshold': mgr.config.migration_threshold,
                 'migration_tolerance': getattr(mgr.config, 'migration_tolerance', 10),
                 'check_interval': mgr.config.check_interval,
@@ -140,6 +144,7 @@ def get_clusters():
                 'latitude': getattr(mgr.config, 'latitude', None),
                 'longitude': getattr(mgr.config, 'longitude', None),
                 'location_label': getattr(mgr.config, 'location_label', '') or '',
+                'node_ui_suffix': getattr(mgr.config, 'node_ui_suffix', '') or '',
             })
 
     # MK: Sort clusters by sort_order first, then by name for consistent ordering
@@ -475,6 +480,54 @@ def get_cluster_nodes(cluster_id):
         'nodes': [],
         'offline': not manager.is_connected
     }), 503
+
+
+@bp.route('/api/clusters/<cluster_id>/ssh/repin-host-keys', methods=['POST'])
+@require_auth(perms=['cluster.config'])
+def repin_cluster_host_keys(cluster_id):
+    """Drop the pinned SSH host keys for this cluster's hosts so the next connection
+    re-learns them via TOFU.
+
+    #717: after CIS hardening or a reinstall a node regenerates its SSH host key; the
+    pinned key then trips reject-on-change and every SSH feature fails — and it reads
+    like an auth error, not a host-key one. Deleting + re-adding the cluster already
+    clears the pins on the way out; this exposes that same cleanup on its own so an
+    operator doesn't have to tear the cluster down to recover. The next SSH connect
+    pins the new key.
+    """
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+
+    mgr = cluster_managers[cluster_id]
+    try:
+        from pegaprox.utils.ssh_security import remove_host_keys
+        from pegaprox.utils.ssh import _node_ip_cache
+        # same host set the delete path cleans: configured host + resolved node IPs
+        hosts = set()
+        v = getattr(mgr, 'host', None) or getattr(mgr.config, 'host', None)
+        if v:
+            hosts.add(v)
+        for (cid, _node), val in list(_node_ip_cache.items()):
+            if cid == cluster_id and val and val[0]:
+                hosts.add(val[0])
+        try:
+            for n in (mgr.get_nodes() or []):
+                ip = (n or {}).get('ip') or (n or {}).get('host')
+                if ip:
+                    hosts.add(ip)
+        except Exception:
+            pass
+        removed = remove_host_keys(hosts)
+        logging.info(f"[SSH] host-key re-pin for cluster {cluster_id}: dropped {removed} pin(s) "
+                     f"across {len(hosts)} host(s) — next connect re-learns")
+        return jsonify({'success': True, 'removed': removed, 'hosts': len(hosts)})
+    except Exception as e:
+        logging.exception(f"host-key re-pin failed for {cluster_id}")
+        return jsonify({'error': safe_error(e, 'Re-pin failed')}), 500
 
 
 @bp.route('/api/clusters/<cluster_id>', methods=['DELETE'])
@@ -1047,36 +1100,55 @@ def get_cluster_resources(cluster_id):
     # cluster, so the same heavy walk was happening 2-3x per window per cluster.
     all_resources = mgr.get_vm_resources(max_age=6)
 
-    # check if user is admin - admin sees everything
-    users = load_users()
-    user = users.get(request.session['user'], {})
+    # NS Aug 2026 — build the authz user so an admin-owned scoped API token is floored to its
+    # effective_role (the stored-role fast-path let such a token see everything).
+    from pegaprox.utils.rbac import user_can_access_vm as _ucav, get_user_clusters as _guc
+    from pegaprox.utils.auth import build_authz_user
+    user = build_authz_user(request.session['user'], request.session)
     user['username'] = request.session['user']
-
-    # NOTE (RBAC 2026-06-10): intentional admin data-scoping fast-path, NOT a gate to
-    # swap for a permission — vm.view / cluster.view are held by viewer+user too, so a
-    # perm check here would leak ALL VMs past the per-VM ACL filter below. Stays role-scoped.
-    if user.get('role') == ROLE_ADMIN:
+    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
         return jsonify(all_resources)
-    
-    # LW: Filter VMs based on ACLs - only show VMs user can access
+
+    # Aikido 469089182 re-verify — the RESTRICTIVE ACL listing below (an ACL'd VM is hidden from
+    # non-whitelisted TENANT operators; a no-ACL VM stays visible via role-level vm.view) is correct
+    # ONLY for a caller whose tenant actually OWNS this cluster. A caller who reached it via a #555
+    # pool / #248 ACL fallback (tenant does NOT own it) must NOT get that blanket vm.view fallback —
+    # confine them to exactly the VMs their pool/ACL grants, via user_can_access_vm (which enforces
+    # the tenant gate). None => admin/default-tenant (unscoped).
+    _tenant_clusters = _guc(user, include_pools=False)
+    _is_tenant_owner = _tenant_clusters is None or cluster_id in _tenant_clusters
+    if not _is_tenant_owner:
+        filtered = []
+        for vm in all_resources:
+            _vmid = vm.get('vmid')
+            if _vmid is None:
+                continue
+            try:
+                if _ucav(user, cluster_id, int(_vmid), 'vm.view', vm.get('type')):
+                    filtered.append(vm)
+            except Exception:
+                continue
+        return jsonify(filtered)
+
+    # LW: Filter VMs based on ACLs - only show VMs user can access (tenant-owner, restrictive listing)
     acls = get_vm_acls()
     cluster_acls = acls.get(cluster_id, {})
-    
+
     # if no ACLs defined for this cluster, check if user has general vm.view permission
     if not cluster_acls:
         if has_permission(user, 'vm.view'):
             return jsonify(all_resources)
         else:
             return jsonify([])  # no vm.view permission and no ACLs
-    
+
     # filter resources - show VMs user has ACL access to OR general vm.view permission
     filtered = []
     has_general_view = has_permission(user, 'vm.view')
-    
+
     for vm in all_resources:
         vmid = str(vm.get('vmid', ''))
         vm_acl = cluster_acls.get(vmid, {})
-        
+
         if vm_acl:
             # VM has specific ACL - check if user is in whitelist
             allowed_users = vm_acl.get('users', [])
@@ -1085,7 +1157,7 @@ def get_cluster_resources(cluster_id):
         elif has_general_view:
             # No specific ACL but user has general view permission
             filtered.append(vm)
-    
+
     return jsonify(filtered)
 
 # NS: Feb 2026 - SECURITY: explicit allowlist prevents mass assignment attacks
@@ -1101,6 +1173,7 @@ ALLOWED_CONFIG_FIELDS = {
     'cpu_baseline',
     'vnc_tunnel',  # MK Apr 2026 — SSH-tunnel-mode for VNC console
     'proxlb_tags_enabled',  # MK Jul 2026 (#426) — derive placement from ProxLB VM tags
+    'node_ui_suffix',  # MK Aug 2026 (#689) — FQDN suffix for "Open in Proxmox" node links
 }
 
 @bp.route('/api/clusters/<cluster_id>', methods=['PUT'])
@@ -1808,7 +1881,17 @@ def cancel_task(cluster_id, node, upid):
     # pool-scoped user can't cancel another pool/tenant's VM task on a shared cluster.
     _p = str(upid).split(':')
     _tvmid = _p[6] if len(_p) > 6 and _p[6].isdigit() else None
-    if _tvmid is not None:
+    if _tvmid is None:
+        # NS Aug 2026 (AI-pentest) — XCP-ng UPIDs aren't the PVE colon format, so the split yields no
+        # vmid and the gate was skipped, letting a pool-scoped user cancel another VM's XAPI task.
+        # Resolve the VM from the manager's tracked tasks.
+        try:
+            _tv = (getattr(mgr, '_active_tasks', {}) or {}).get(upid, {}).get('vmid')
+            if _tv is not None:
+                _tvmid = str(_tv)
+        except Exception:
+            pass
+    if _tvmid is not None and str(_tvmid).isdigit():
         from pegaprox.utils.auth import build_authz_user
         _u = build_authz_user(request.session.get('user', ''), request.session)
         if not user_can_access_vm(_u, cluster_id, int(_tvmid), 'vm.stop'):
@@ -2479,6 +2562,22 @@ def remove_from_proxmox_ha_by_sid(cluster_id, sid):
 def trigger_balance_now(cluster_id):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+
+    # NS Aug 2026 (Aikido 469089250) — balance-now spawns cluster-wide node-to-node VM migrations, so
+    # confine it to clusters the caller's TENANT owns; a user who reached this cluster only via a
+    # single VM-ACL / pool grant (the #248/#555 fallbacks in check_cluster_access) must not rebalance
+    # VMs outside their scope. Admins / default-tenant (get_user_clusters None) unaffected. Mirrors
+    # the cluster-group balance guard in groups.py.
+    _sess = getattr(request, 'session', {})
+    _usr = _sess.get('user', 'system')
+    # #491 — resolve the token-scoped identity (build_authz_user floors an admin-owned scoped
+    # token to its effective_role) so a scoped token that only reached this cluster via the
+    # #248/#555 ACL/pool fallbacks in check_cluster_access can't slip past the raw admin role.
+    from pegaprox.utils.auth import build_authz_user
+    _allowed = get_user_clusters(build_authz_user(_usr, _sess))
+    if _allowed is not None and cluster_id not in _allowed:
+        log_audit(_usr, 'balance.manual_denied', f"Denied balance-now on {cluster_id} (not tenant-owned)")
+        return jsonify({'error': 'Access denied'}), 403
 
     mgr = cluster_managers.get(cluster_id)
     if not mgr:

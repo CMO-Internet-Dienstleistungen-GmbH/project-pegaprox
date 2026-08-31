@@ -514,7 +514,18 @@ class PegaProxDB:
         cursor.execute('''
             CREATE INDEX IF NOT EXISTS idx_migration_timestamp ON migration_history(timestamp DESC)
         ''')
-        
+
+        # #720 — persist SOFT (non-HA) node maintenance so it survives a PegaProx restart. Native HA
+        # maintenance is re-derived from PVE on each poll (#78) and is NOT stored here.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS node_maintenance (
+                cluster_id TEXT NOT NULL,
+                node TEXT NOT NULL,
+                entered_at TEXT NOT NULL,
+                PRIMARY KEY (cluster_id, node)
+            )
+        ''')
+
         # Server settings table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS server_settings (
@@ -1097,6 +1108,9 @@ class PegaProxDB:
                 ('latitude', "REAL DEFAULT NULL"),
                 ('longitude', "REAL DEFAULT NULL"),
                 ('location_label', "TEXT DEFAULT ''"),
+                # MK Aug 2026 (#689) — optional FQDN suffix for "Open in Proxmox" node links.
+                # e.g. "example.local" turns pve01 → https://pve01.example.local:8006. Empty = off.
+                ('node_ui_suffix', "TEXT DEFAULT ''"),
             ]:
                 if col_name not in cluster_columns:
                     try:
@@ -2902,6 +2916,7 @@ class PegaProxDB:
                 'latitude': float(row['latitude']) if 'latitude' in row.keys() and row['latitude'] is not None else None,
                 'longitude': float(row['longitude']) if 'longitude' in row.keys() and row['longitude'] is not None else None,
                 'location_label': row['location_label'] if 'location_label' in row.keys() and row['location_label'] else '',
+                'node_ui_suffix': row['node_ui_suffix'] if 'node_ui_suffix' in row.keys() and row['node_ui_suffix'] else '',
             }
 
         return clusters
@@ -3005,14 +3020,16 @@ class PegaProxDB:
         # actually opens the location panel; without this preserve, every other
         # edit (rename, password rotation, etc.) would wipe the dot off the map.
         existing_lat = existing_lon = existing_loc_label = None
+        existing_node_ui_suffix = ''
         if existing:
             try:
-                cursor.execute('SELECT latitude, longitude, location_label FROM clusters WHERE id = ?', (cluster_id,))
+                cursor.execute('SELECT latitude, longitude, location_label, node_ui_suffix FROM clusters WHERE id = ?', (cluster_id,))
                 _loc = cursor.fetchone()
                 if _loc:
                     existing_lat = _loc['latitude']
                     existing_lon = _loc['longitude']
                     existing_loc_label = _loc['location_label']
+                    existing_node_ui_suffix = _loc['node_ui_suffix'] if 'node_ui_suffix' in _loc.keys() and _loc['node_ui_suffix'] else ''
             except Exception:
                 pass
 
@@ -3032,10 +3049,11 @@ class PegaProxDB:
              backup_sla_max_age_hours,
              api_port,
              latitude, longitude, location_label,
+             node_ui_suffix,
              proxlb_tags_enabled,
              created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             cluster_id,
             data.get('name', ''),
@@ -3077,6 +3095,7 @@ class PegaProxDB:
             data.get('latitude', existing_lat),
             data.get('longitude', existing_lon),
             data.get('location_label', existing_loc_label) or '',
+            (data.get('node_ui_suffix', existing_node_ui_suffix) or '').strip().lstrip('.'),
             1 if data.get('proxlb_tags_enabled', False) else 0,
             existing['created_at'] if existing else now,
             now
@@ -4176,6 +4195,27 @@ class PegaProxDB:
     # AFFINITY RULES OPERATIONS
     # ========================================
     
+    def save_node_maintenance(self, cluster_id: str, node: str):
+        """#720 — persist a soft (non-HA) node-maintenance entry so it survives a PegaProx restart."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'INSERT OR REPLACE INTO node_maintenance (cluster_id, node, entered_at) VALUES (?, ?, '
+            'COALESCE((SELECT entered_at FROM node_maintenance WHERE cluster_id=? AND node=?), ?))',
+            (cluster_id, node, cluster_id, node, datetime.now().isoformat()))
+        self.conn.commit()
+
+    def remove_node_maintenance(self, cluster_id: str, node: str):
+        """#720 — drop a persisted soft-maintenance entry on exit."""
+        cursor = self.conn.cursor()
+        cursor.execute('DELETE FROM node_maintenance WHERE cluster_id=? AND node=?', (cluster_id, node))
+        self.conn.commit()
+
+    def get_node_maintenance(self, cluster_id: str) -> list:
+        """#720 — [(node, entered_at), ...] of a cluster's persisted soft maintenance, for restore."""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT node, entered_at FROM node_maintenance WHERE cluster_id=?', (cluster_id,))
+        return [(r['node'], r['entered_at']) for r in cursor.fetchall()]
+
     def get_affinity_rules(self, cluster_id: str = None) -> dict:
         """Get affinity rules"""
         cursor = self.conn.cursor()

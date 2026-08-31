@@ -197,6 +197,34 @@ def _ssh_stderr_excerpt(stderr, max_chars=240):
     return lines[-1][:max_chars]
 
 
+def _ssh_auth_hint(stderr):
+    """Translate an opaque SSH failure into an actionable one-liner, or None.
+
+    #717: nodes running `PermitRootLogin without-password` refuse root PASSWORD
+    auth, so OpenSSH answers every attempt with a bare 'Permission denied
+    (publickey).' — no mention of the password it just rejected. Without a hint
+    the DEBUG logs (and the compliance 502 that follows) read like a mystery.
+    A host key that changed after CIS/reprovision surfaces as 'Host key
+    verification failed'. Both have a concrete fix the operator can act on.
+    """
+    if not stderr:
+        return None
+    low = stderr.lower()
+    if 'host key verification failed' in low:
+        return ("the node's SSH host key changed — clear the pinned entry to re-pin it "
+                "(cluster edit reconnects and re-learns it)")
+    if 'permission denied' in low:
+        # '(publickey)' alone => the server offered ONLY key auth (password refused,
+        # e.g. without-password). '(publickey,password)' => a password was accepted
+        # as a method but the credential was wrong.
+        if '(publickey)' in low or 'password' not in low:
+            return ("node accepts SSH key auth only (e.g. PermitRootLogin without-password) "
+                    "— add an authorized SSH key for this cluster; the password/token only "
+                    "covers the PVE API, not SSH")
+        return "SSH password rejected — check the node credentials or add an SSH key"
+    return None
+
+
 # /cluster/metrics/export carries EVERY node, guest and storage metric for the
 # whole cluster (pve-manager >= 8.2.5), so on a big estate (10k guests) it is many
 # MB / ~100k rows. json.loads()-ing that whole blob holds the GIL for ~150ms per
@@ -665,6 +693,15 @@ class PegaProxManager:
         """Host formatted for URL use — IPv6 gets brackets"""
         h = self.current_host or self.config.host
         return self._bracket_ipv6(h)
+
+    @property
+    def auth_host(self) -> str:
+        """The registered node (config.host), bracketed for URLs. Password/@pam ticket mints
+        MUST target this, not `host`: `host` follows the HA fallback to current_host, and @pam
+        is a node-local account, so minting the stored cluster password against a fallback node
+        answers 401 (#740.2 — console dead on every node but the registered one). The PVE ticket
+        we get back is cluster-wide, so the vncproxy/termproxy leg can still run on `host`."""
+        return self._bracket_ipv6(self.config.host)
 
     @property
     def raw_host(self) -> str:
@@ -3306,7 +3343,41 @@ class PegaProxManager:
                 
                 return True
             else:
-                self.logger.error(f"[ERROR] Failed to migrate {vm.get('name', 'unnamed')}: {response.status_code} - {response.text}")
+                resp_text = response.text or ''
+                # MK Aug 2026 (#647 cklabautermann) — a migrate POST can come back 500
+                # "VM is locked (migrate)" when a migration for this guest is ALREADY in
+                # flight: PVE HA relocates HA guests the instant the node enters
+                # maintenance, and a recheck / parallel evacuation pass can re-issue the
+                # migrate before the first finishes. The guest IS moving, so failing here
+                # (and pausing the rolling update) is a false negative. Wait for the
+                # in-flight move to land and confirm the guest actually left the source
+                # node before deciding — same "moved anyway" reasoning as the HA-reroute
+                # branch on the task-failure path above.
+                if 'locked (migrate)' in resp_text:
+                    self.logger.info(
+                        f"[MAINT] {vm.get('name', 'unnamed')} ({vmid}) already holds a "
+                        f"migrate lock — a migration is in flight; waiting for it to finish "
+                        f"instead of failing the evacuation."
+                    )
+                    landed = self._await_inflight_migration(
+                        vmid, source_node, vm_type, vm.get('name', 'unnamed'), wait_timeout)
+                    if landed:
+                        self.logger.info(
+                            f"[OK] {vm.get('name', 'unnamed')} left {source_node} (now on "
+                            f"{landed}) via the in-flight migration — evacuation successful."
+                        )
+                        self.last_migration_log.append({
+                            'timestamp': datetime.now().isoformat(),
+                            'vm': vm.get('name', 'unnamed'),
+                            'vmid': vmid,
+                            'from_node': source_node,
+                            'to_node': landed,
+                            'dry_run': False,
+                            'success': True,
+                            'note': 'already migrating (migrate lock) — confirmed off source',
+                        })
+                        return True
+                self.logger.error(f"[ERROR] Failed to migrate {vm.get('name', 'unnamed')}: {response.status_code} - {resp_text}")
                 self.last_migration_log.append({
                     'timestamp': datetime.now().isoformat(),
                     'vm': vm.get('name', 'unnamed'),
@@ -3315,7 +3386,7 @@ class PegaProxManager:
                     'to_node': target_node,
                     'dry_run': False,
                     'success': False,
-                    'error': response.text
+                    'error': resp_text
                 })
                 return False
                 
@@ -3362,7 +3433,54 @@ class PegaProxManager:
         
         self.logger.error(f"Task {task_id} timed out after {timeout} seconds")
         return False
-    
+
+    def _vm_has_migrate_lock(self, node, vmid, vm_type):
+        """#647: best-effort check whether a guest still holds a 'migrate' lock on
+        `node`. On any error we assume it might still be locked (return True) so the
+        caller keeps waiting rather than declaring a premature failure — the caller's
+        own timeout bounds the wait."""
+        try:
+            kind = 'qemu' if vm_type == 'qemu' else 'lxc'
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/{kind}/{vmid}/status/current"
+            resp = self._api_get(url)
+            if resp is not None and resp.status_code == 200:
+                lock = (resp.json().get('data') or {}).get('lock', '') or ''
+                return 'migrate' in str(lock)
+        except Exception:
+            pass
+        return True
+
+    def _await_inflight_migration(self, vmid, source_node, vm_type, vm_name, timeout=1800):
+        """#647: called when a migrate call reports 'VM is locked (migrate)' because a
+        migration for this guest is already running. Poll until the guest leaves
+        source_node (return the node it landed on), or the migrate lock clears while it
+        is still on source (the in-flight move ended without relocating it → real
+        failure), or we hit `timeout`. Returns the landing node on success, else None."""
+        deadline = time.time() + max(60, int(timeout or 0))
+        while time.time() < deadline:
+            node_now = None
+            try:
+                rec = next((v for v in self.get_vm_resources() if v.get('vmid') == vmid), None)
+                node_now = rec.get('node') if rec else None
+            except Exception:
+                node_now = None
+            if node_now and node_now != source_node:
+                return node_now
+            # still on source with the lock gone → the in-flight move finished without
+            # relocating it; don't sit out the whole timeout on a genuine failure.
+            if node_now == source_node and not self._vm_has_migrate_lock(source_node, vmid, vm_type):
+                self.logger.warning(
+                    f"[MAINT] {vm_name} ({vmid}) migrate lock cleared but it is still on "
+                    f"{source_node}; the in-flight migration did not relocate it."
+                )
+                return None
+            time.sleep(5)
+        self.logger.warning(
+            f"[MAINT] timed out after {int(timeout or 0)}s waiting for {vm_name} ({vmid}) "
+            f"to leave {source_node}."
+        )
+        return None
+
     def enter_maintenance_mode(self, node_name, skip_evacuation=False, allow_local_disks=False):
         # NS: tries native HA first, falls back to our own evacuation logic
         # NS Apr 2026 (#330): allow_local_disks opts the evacuator into
@@ -3401,6 +3519,14 @@ class PegaProxManager:
             t = threading.Thread(target=self._evacuate_node, args=(node_name, task))
             t.daemon = True
             t.start()
+
+        # #720 — persist SOFT (non-HA) maintenance so it survives a PegaProx restart. Native HA
+        # maintenance is re-derived from PVE on each poll (#78), so we don't store that here.
+        if not getattr(task, 'native_ha', False):
+            try:
+                get_db().save_node_maintenance(self.id, node_name)
+            except Exception as _e:
+                self.logger.debug(f"[MAINT] persist failed for {node_name}: {_e}")
 
         return task
 
@@ -3862,6 +3988,10 @@ class PegaProxManager:
         # never had native_ha set in the first place
         with self.maintenance_lock:
             self.nodes_in_maintenance.pop(node_name, None)
+        try:
+            get_db().remove_node_maintenance(self.id, node_name)   # #720 — drop persisted soft state
+        except Exception:
+            pass
         self.logger.info(f"[OK] Exited maintenance mode for {node_name}")
 
         # unset ceph flags after maintenance (#141)
@@ -6536,6 +6666,20 @@ echo "AGENT_INSTALLED_OK"
         
         return result
     
+    def _note_ssh_auth_hint(self, host, stderr):
+        """#717: surface an actionable SSH-auth hint ONCE per host, at INFO level so it
+        shows without DEBUG. The per-command sites only DEBUG the raw stderr; this lifts
+        the conclusion ('add an SSH key' / 'host key changed') into normal logs where a
+        user staring at a compliance 502 will actually see it."""
+        hint = _ssh_auth_hint(stderr)
+        if not hint:
+            return
+        seen = self.__dict__.setdefault('_ssh_auth_hint_seen', set())
+        if (host, hint) in seen:
+            return
+        seen.add((host, hint))
+        self.logger.info(f"[SSH] {host}: {hint}")
+
     def _ssh_run_command_output(self, host: str, user: str, command: str, timeout: int = 30) -> str:
         """Run SSH command and return output - HA PRIORITY (no rate limiting)
 
@@ -6561,6 +6705,7 @@ echo "AGENT_INSTALLED_OK"
             if result.returncode == 0:
                 return result.stdout
             self.logger.debug(f"[SSH] Command failed on {host}: {_ssh_stderr_excerpt(result.stderr)}")
+            self._note_ssh_auth_hint(host, result.stderr)
             return None
         except subprocess.TimeoutExpired:
             self.logger.debug(f"[SSH] Command timed out on {host}")
@@ -6604,6 +6749,7 @@ echo "AGENT_INSTALLED_OK"
                 if result.returncode == 0:
                     return result.stdout
                 self.logger.debug(f"[SSH] Key auth failed on {host}: {_ssh_stderr_excerpt(result.stderr)}")
+                self._note_ssh_auth_hint(host, result.stderr)
                 return None
             finally:
                 os.unlink(key_file)
@@ -6644,6 +6790,7 @@ echo "AGENT_INSTALLED_OK"
             if result.returncode == 0:
                 return result.stdout
             self.logger.debug(f"[SSH] Password auth failed on {host}: {_ssh_stderr_excerpt(result.stderr)}")
+            self._note_ssh_auth_hint(host, result.stderr)
             return None
         except FileNotFoundError:
             self.logger.debug(f"[SSH] sshpass not installed - cannot use password auth")
@@ -9012,13 +9159,16 @@ echo "AGENT_INSTALLED_OK"
                             
                             channel.close()
                             task.add_output("Reboot command sent / Reboot-Befehl gesendet")
+                            task.reboot_issued = True   # #715 — let the RU loop skip the offline-wait
                         else:
                             self.logger.info(f"Skipping reboot for node: {node_name}")
                             task.add_output(f"Skipping reboot for node: {node_name}")
-                        
+                            task.reboot_issued = False   # #715 — no reboot: RU must NOT wait for offline
+
                     except Exception as e:
                         self.logger.info(f"Reboot command sent (connection closed as expected): {e}")
                         task.add_output("Reboot command sent / Reboot-Befehl gesendet")
+                        task.reboot_issued = True   # #715 — assume reboot on a dropped connection (safe: wait)
                     finally:
                         try:
                             ssh.close()
@@ -9186,9 +9336,9 @@ echo "AGENT_INSTALLED_OK"
             self.logger.error(f"[ERROR] vm_action: {e}")
             return {'success': False, 'error': str(e)}
     
-    def clone_vm(self, node: str, vmid: int, vm_type: str, newid: int, name: str = None, 
+    def clone_vm(self, node: str, vmid: int, vm_type: str, newid: int, name: str = None,
                  full: bool = True, target_node: str = None, target_storage: str = None,
-                 description: str = None) -> Dict[str, Any]:
+                 description: str = None, snapname: str = None) -> Dict[str, Any]:
         """clone a vm"""
         # MK: full clone = independent copy, linked clone = shares base with original
         # linked clones only work for qemu
@@ -9229,7 +9379,11 @@ echo "AGENT_INSTALLED_OK"
                 data['storage'] = target_storage
             if description:
                 data['description'] = description
-            
+            # #709 — PVE only allows a FULL clone of a running container from a snapshot; the caller
+            # passes the snapshot name to clone from (also valid for a stopped source).
+            if snapname:
+                data['snapname'] = snapname
+
             self._no_agent_vms.discard(newid)  # #237
             self.logger.info(f"Cloning {vm_type}/{vmid} to {newid} (full={full})")
             response = self._api_post(url, data=data)
@@ -11122,7 +11276,7 @@ echo "AGENT_INSTALLED_OK"
                 ctx.check_hostname = False
                 ctx.verify_mode = _ssl.CERT_NONE
             req = _ur.Request(
-                f"https://{self.host}:{self.api_port}/api2/json/access/ticket",
+                f"https://{self.auth_host}:{self.api_port}/api2/json/access/ticket",
                 data=_ue({'username': usr, 'password': pwd}).encode('utf-8'),
                 method='POST',
             )
@@ -15720,6 +15874,12 @@ echo DONE""",
             'defaults': {'service_user': ''},
         },
         'default_umask': {
+            # MK 2026-08-25 (community-scripts #16745) — reversible now. umask 027 in a login
+            # shell propagates to `pct create` (it extracts the template under the caller's umask),
+            # so community LXC scripts land /etc at 750 and DNS breaks in the CT. Declaring
+            # backup_files lets the operator roll this control back (restores login.defs + profile)
+            # without hand-editing; the GUI create-CT path (pvedaemon, umask 022) is unaffected.
+            'backup_files': ['/etc/login.defs', '/etc/profile'],
             'check': """(grep -q 'UMASK.*027' /etc/login.defs 2>/dev/null || grep -q 'umask 027' /etc/profile 2>/dev/null) && echo OK || echo FAIL""",
             'apply': """if grep -q '^UMASK' /etc/login.defs 2>/dev/null; then
   sed -i 's/^UMASK.*/UMASK           027/' /etc/login.defs
@@ -16740,11 +16900,32 @@ echo DONE""",
             # H4: jitter so 30 managers don't fire on the same wall-clock tick
             self.stop_event.wait(30 + random.uniform(0, 10))
 
+    def _restore_persisted_maintenance(self):
+        """#720 — repopulate SOFT (non-HA) node maintenance from the DB after a restart, so a node
+        left in maintenance still shows as such. Native HA maintenance is re-derived from PVE on the
+        first poll (#78), so only the soft entries we persisted are restored here."""
+        try:
+            from pegaprox.models.tasks import MaintenanceTask
+            for node_name, _entered_at in get_db().get_node_maintenance(self.id):
+                with self.maintenance_lock:
+                    if node_name in self.nodes_in_maintenance:
+                        continue
+                    t = MaintenanceTask(node_name)
+                    t.native_ha = False
+                    t.status = 'completed'
+                    t.total_vms = 0
+                    t._restored = True
+                    self.nodes_in_maintenance[node_name] = t
+                self.logger.info(f"[MAINT] Restored soft maintenance for {node_name} after restart (#720)")
+        except Exception as e:
+            self.logger.debug(f"[MAINT] maintenance restore failed: {e}")
+
     def start(self):
         """Start the PegaProx daemon"""
         if self.running:
             return
-        
+
+        self._restore_persisted_maintenance()   # #720 — before the first poll assumes everything Online
         self.stop_event.clear()
         self.thread = threading.Thread(target=self.daemon_loop)
         self.thread.daemon = True

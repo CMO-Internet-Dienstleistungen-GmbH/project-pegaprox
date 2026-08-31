@@ -1304,10 +1304,10 @@ def get_server_settings():
     try:
         from pegaprox.core.acme import get_cert_info
         from pathlib import Path
-        if Path("/usr/lib/pegaprox").exists():
-            _ssl_dir = str(Path("/var/lib/pegaprox/ssl"))
-        else:
-            _ssl_dir = str(Path(__file__).resolve().parent.parent.parent / 'ssl')
+        # #725 — read cert info from the dir the TLS listener actually serves
+        # from (config/ssl / SSL_DIR), not the retired <root>/ssl heuristic —
+        # otherwise the UI shows a cert that isn't the one being served.
+        _ssl_dir = SSL_DIR
         settings['cert_info'] = get_cert_info(_ssl_dir)
     except Exception:
         settings['cert_info'] = None
@@ -1993,10 +1993,10 @@ def get_acme_status():
         from pegaprox.core.acme import get_cert_info
         from pathlib import Path
 
-        if Path("/usr/lib/pegaprox").exists():
-            ssl_dir = str(Path("/var/lib/pegaprox/ssl"))
-        else:
-            ssl_dir = str(Path(__file__).resolve().parent.parent.parent / 'ssl')
+        # #725 (nvaert1986) — SSL_DIR (config/ssl) is the dir the TLS listener
+        # loads from; the old <root>/ssl heuristic diverged from it on 2026-06-01,
+        # so ACME wrote issued certs where nothing served them.
+        ssl_dir = SSL_DIR
 
         settings = load_server_settings()
         cert_info = get_cert_info(ssl_dir)
@@ -2036,10 +2036,10 @@ def request_acme_certificate():
         from pegaprox.core.acme import request_certificate
         from pathlib import Path
 
-        if Path("/usr/lib/pegaprox").exists():
-            ssl_dir = str(Path("/var/lib/pegaprox/ssl"))
-        else:
-            ssl_dir = str(Path(__file__).resolve().parent.parent.parent / 'ssl')
+        # #725 (nvaert1986) — SSL_DIR (config/ssl) is the dir the TLS listener
+        # loads from; the old <root>/ssl heuristic diverged from it on 2026-06-01,
+        # so ACME wrote issued certs where nothing served them.
+        ssl_dir = SSL_DIR
 
         settings = load_server_settings()
         data = request.get_json() or {}
@@ -2095,6 +2095,11 @@ def request_acme_certificate():
         settings['acme_dns_provider'] = dns_provider
         settings['acme_provider'] = acme_provider
         settings['acme_directory_url'] = directory_url
+        # #730 (Flachdachs) — honour the "allow private/internal CA" checkbox sent WITH the
+        # request. #685 only read it from saved settings, so ticking the box and hitting
+        # "Request Certificate" without a separate settings-save left the SSRF guard blocking
+        # the private directory URL. Fall back to the stored value when the body omits it.
+        settings['acme_allow_private_ca'] = bool(data.get('acme_allow_private_ca', settings.get('acme_allow_private_ca', False)))
         settings['domain'] = domain
         save_server_settings(settings)
 
@@ -2112,6 +2117,10 @@ def request_acme_certificate():
             settings['ssl_enabled'] = True
             save_server_settings(settings)
             log_audit(usr, 'settings.acme_issued', f"Certificate issued for {domain}, expires {result.get('expires', '?')}")
+            # #725 — the new cert is on disk now, but the running TLS context still
+            # holds the old one until the service restarts. Tell the UI, same as the
+            # manual-upload path does, so the operator knows to restart to serve it.
+            result['restart_required'] = True
 
         return jsonify(result)
 
@@ -2128,10 +2137,10 @@ def complete_acme_dns_challenge():
         from pegaprox.core.acme import complete_dns01_challenge
         from pathlib import Path
 
-        if Path("/usr/lib/pegaprox").exists():
-            ssl_dir = str(Path("/var/lib/pegaprox/ssl"))
-        else:
-            ssl_dir = str(Path(__file__).resolve().parent.parent.parent / 'ssl')
+        # #725 (nvaert1986) — SSL_DIR (config/ssl) is the dir the TLS listener
+        # loads from; the old <root>/ssl heuristic diverged from it on 2026-06-01,
+        # so ACME wrote issued certs where nothing served them.
+        ssl_dir = SSL_DIR
 
         data = request.get_json() or {}
         challenge_id = str(data.get('challenge_id') or '').strip()
@@ -2146,6 +2155,7 @@ def complete_acme_dns_challenge():
             save_server_settings(settings)
             usr = getattr(request, 'session', {}).get('user', 'admin')
             log_audit(usr, 'settings.acme_issued', f"Certificate issued via DNS-01, expires {result.get('expires', '?')}")
+            result['restart_required'] = True   # #725 — restart to serve the new cert
 
         return jsonify(result)
     except Exception as e:
@@ -4092,6 +4102,42 @@ def _ceph_gate_unsafe(summary, gate):
     return None
 
 
+def _ceph_recovery_pending(summary):
+    """True while Ceph is still recovering / rebalancing (or has data at risk) — so waiting for it to
+    settle before pulling the next node is meaningful. False for a cluster that has SETTLED but is
+    sitting on a benign steady-state HEALTH_WARN — e.g. OSD_SLOW_OPS (slow ops in BlueStore), clock
+    skew, a leftover flag — which never clears by waiting (#747, robertdahlem: the old `!= HEALTH_OK`
+    wait burned the full 120s per node in that case).
+
+    Deliberately STRICTER than _ceph_gate_unsafe(): that gate tolerates data-safe backfill/misplaced
+    movement, but the rolling-update WAIT must hold right through it — pulling the next node mid-
+    rebalance is how a rolling update becomes a rolling outage on HCI."""
+    if not summary:
+        return False
+    status = summary.get('status')
+    if status == 'HEALTH_OK':
+        return False
+    if status in ('HEALTH_ERR', 'unknown'):
+        return True  # be conservative — keep waiting
+    # HEALTH_WARN — wait only while data is actually moving or under-replicated.
+    pgs = str(summary.get('pgs', '')).lower()
+    moving = ('degraded', 'undersized', 'backfill', 'recover', 'remap', 'misplaced', 'peering',
+              'activating', 'incomplete', 'stale', 'inactive', 'down', 'unfound', 'inconsistent')
+    if any(tok in pgs for tok in moving):
+        return True
+    checks = ' '.join(str(w) for w in (summary.get('warnings') or [])).upper()
+    if any(rc in checks for rc in ('PG_DEGRADED', 'PG_AVAILABILITY', 'PG_BACKFILL', 'PG_RECOVERY',
+                                   'OSD_DOWN', 'OBJECT_UNFOUND', 'PG_DAMAGED', 'OSD_FULL', 'PG_NOT')):
+        return True
+    try:
+        osd_up, osd_in = int(summary.get('osd_up') or 0), int(summary.get('osd_in') or 0)
+    except (TypeError, ValueError):
+        osd_up = osd_in = 0
+    if osd_in and osd_up < osd_in:
+        return True
+    return False
+
+
 @bp.route('/api/clusters/<cluster_id>/updates/rolling', methods=['POST'])
 @require_auth(perms=['node.update'])
 def start_rolling_update(cluster_id):
@@ -4445,11 +4491,18 @@ def start_rolling_update(cluster_id):
                     
                     mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✓ Updates installed")
                     
-                    # Step 4: If reboot was included, wait for node to come back
-                    if include_reboot:
+                    # Step 4: only wait for a reboot if one was ACTUALLY issued for THIS node.
+                    # #715 (robertdahlem) — include_reboot is the global toggle; the per-node needrestart
+                    # check inside start_node_update decides whether the node actually rebooted and
+                    # records it on the task. A node that needs no reboot must NOT enter the offline-wait,
+                    # or it logs a phantom "rebooting", sits 120s waiting for an offline that never comes,
+                    # then "back online (0s)".
+                    _node_rebooted = include_reboot and getattr(update_task, 'reboot_issued', True)
+                    if include_reboot and not _node_rebooted:
+                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Node {node_name} did not require a reboot — skipping reboot wait")
+                    if _node_rebooted:
                         mgr._rolling_update['current_step'] = 'rebooting'
-                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Evaluating if node {node_name} requires a reboot. Analyzing...")
-                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Node {node_name} rebooting (timeout: {reboot_timeout}s)...")
+                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Node {node_name} requires a reboot — rebooting (timeout: {reboot_timeout}s)...")
                         if 'rebooting_nodes' not in mgr._rolling_update:
                             mgr._rolling_update['rebooting_nodes'] = []
                         mgr._rolling_update['rebooting_nodes'].append(node_name)
@@ -4528,7 +4581,9 @@ def start_rolling_update(cluster_id):
                     # NS May 2026 — give HA services 30s to come back after reboot
                     # before we try to disable maintenance. Otherwise ha-manager
                     # rejects the call and the node stays stuck.
-                    if include_reboot:
+                    # #715 — only sleep when the node actually rebooted; a no-reboot node's HA services
+                    # never went down, so the 30s wait is pointless and delays the maintenance exit.
+                    if _node_rebooted:
                         time.sleep(30)
                     if not mgr.exit_maintenance_mode(node_name):
                         _log(f"⚠ {node_name} maintenance exit failed (will retry at end of run)")
@@ -4546,18 +4601,25 @@ def start_rolling_update(cluster_id):
                         badge = '✓' if status == 'HEALTH_OK' else ('⚠' if status == 'HEALTH_WARN' else '✗')
                         _log(f"Ceph after {node_name}: {badge} {status} · {ceph_after.get('osd_up', 0)}/{ceph_after.get('osd_in', 0)} OSDs up")
                         if status != 'HEALTH_OK' and idx < len(nodes_to_update) - 1:
-                            _log(f"Waiting up to 120s for Ceph to return to HEALTH_OK before next node…")
+                            # #747 (robertdahlem) — only spin here while Ceph is actually recovering
+                            # or has data at risk. A settled cluster on a benign HEALTH_WARN (slow ops
+                            # in BlueStore, clock skew, a leftover flag) never returns to HEALTH_OK, so
+                            # the old `!= HEALTH_OK` wait burned the full 120s per node. The opt-in gate
+                            # below still evaluates whatever status remains, either way.
                             ceph_waited = 0
-                            while ceph_waited < 120 and status != 'HEALTH_OK':
-                                time.sleep(10); ceph_waited += 10
-                                try:
-                                    ceph_after = mgr.get_ceph_health_summary() or {}
-                                    status = ceph_after.get('status', 'unknown')
-                                except Exception:
-                                    break
-                            if status == 'HEALTH_OK':
-                                _log(f"Ceph recovered to HEALTH_OK after {ceph_waited}s")
+                            if _ceph_recovery_pending(ceph_after):
+                                _log(f"Ceph is {status} and still settling — waiting up to 120s for recovery to finish before next node…")
+                                while ceph_waited < 120 and _ceph_recovery_pending(ceph_after):
+                                    time.sleep(10); ceph_waited += 10
+                                    try:
+                                        ceph_after = mgr.get_ceph_health_summary() or {}
+                                        status = ceph_after.get('status', 'unknown')
+                                    except Exception:
+                                        break
+                                _log(f"Ceph {'still recovering' if _ceph_recovery_pending(ceph_after) else 'settled'} ({status}) after {ceph_waited}s")
                             else:
+                                _log(f"Ceph is {status} but settled (no recovery in progress) — continuing without the HEALTH_OK wait")
+                            if status != 'HEALTH_OK':
                                 # NS 2026-07-17 (#403 part 2, proxforge): opt-in gate — don't pull
                                 # the next node while a deployed Ceph is still at risk.
                                 gate_reason = _ceph_gate_unsafe(ceph_after, ceph_health_gate) if ceph_health_gate != 'off' else None

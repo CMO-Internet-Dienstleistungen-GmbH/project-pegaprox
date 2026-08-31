@@ -287,6 +287,11 @@ def validate_ws_token_api():
                         'host': cluster_host,
                         'node_ips': node_ips,
                         'ssh_port': getattr(cfg, 'ssh_port', 22) or 22,
+                        # NS Aug 2026 (AI-pentest) — carry the per-cluster TLS-verify flag to the
+                        # termproxy WS subprocess. Without it the consumer defaults verify_pve_tls to
+                        # False and pins CERT_NONE even when the admin enabled ssl_verification, so a
+                        # MitM between PegaProx and PVE could intercept the console + its auth ticket.
+                        'verify_pve_tls': bool(getattr(mgr, '_ssl_verify', False)),
                     }
                     # NS 2026-06-05 (C-1): hand the PVE session cookie to the WS
                     # subprocess server-side (it used to come from the browser).
@@ -359,11 +364,22 @@ def sse_updates():
     else:
         subscribed_clusters = allowed_clusters
 
+    # #736 security fix — the SSE 'resources' per-VM ACL filter must run for every NON-admin, but
+    # `subscribed is None` does NOT mean admin: get_user_clusters() returns None for a default-tenant
+    # scoped user too (rbac.py:347). Capture the real admin role ONCE here so the broadcast loop
+    # filters those users' frames instead of leaking the full inventory. Fail-closed (unknown → filter).
+    try:
+        from pegaprox.core.db import get_db as _gdb_role
+        _is_admin = ((_gdb_role().get_user(user) or {}).get('role') == ROLE_ADMIN)
+    except Exception:
+        _is_admin = False
+
     with sse_clients_lock:
         sse_clients[client_id] = {
             'queue': message_queue,
             'user': user,
             'clusters': subscribed_clusters,
+            'is_admin': _is_admin,
             'connected_at': datetime.now().isoformat(),
             'auth_method': auth_method
         }

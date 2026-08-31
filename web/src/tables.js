@@ -24,11 +24,15 @@
 
         function getProxmoxObjectUrl(target = {}) {
             const kind = target.kind || target.type;
-            const host = getProxmoxNodeHost(target, target.node || target.name);
+            const nodeName = (kind === 'node') ? (target.name || target.node) : target.node;
+            // #689 — when the cluster has a node FQDN suffix configured, link via <node>.<suffix>
+            // (e.g. pve01.example.local) instead of the raw IP/host the API returns.
+            const suffix = (target.node_ui_suffix || '').trim().replace(/^\.+/, '');
+            const host = (suffix && nodeName) ? `${nodeName}.${suffix}`
+                                              : getProxmoxNodeHost(target, target.node || target.name);
             if (!host) return null;
 
             if (kind === 'node') {
-                const nodeName = target.name || target.node;
                 if (!nodeName) return null;
                 return `https://${host}:8006/#v1:0:=${encodeURIComponent(`node/${nodeName}`)}:4:=aptrepositories:=contentIso:::9::`;
             }
@@ -69,7 +73,7 @@
         }
 
         // Node Card Component
-        function NodeCard({ name, metrics, index, clusterId, onMaintenanceToggle, onStartUpdate, onOpenNodeConfig, onNodeAction, onRemoveNode, onMoveNode }) {
+        function NodeCard({ name, metrics, index, clusterId, nodeUiSuffix, onMaintenanceToggle, onStartUpdate, onOpenNodeConfig, onNodeAction, onRemoveNode, onMoveNode }) {
             const { t } = useTranslation();
             const { getAuthHeaders } = useAuth();
             // NS: 20 data points = last ~40s of sparkline at 2s polling interval
@@ -148,7 +152,7 @@
             const isUpdating = metrics.is_updating;
             const updateTask = metrics.update_task;
             const isOffline = metrics.offline || metrics.status === 'offline';
-            const proxmoxTarget = { ...metrics, kind: 'node', name, node: name };
+            const proxmoxTarget = { ...metrics, kind: 'node', name, node: name, node_ui_suffix: nodeUiSuffix || '' };  // #689
             const proxmoxUrl = getProxmoxObjectUrl(proxmoxTarget);
             
             // Can only update if in maintenance and evacuation complete
@@ -961,7 +965,7 @@
 
         // LW: Feb 2026 - compact node row for corporate overview
         // NS: Mar 2026 - added sparkline history + detail cards
-        function NodeCompactRow({ name, metrics, clusterId, onOpenNodeConfig, onMaintenanceToggle, onStartUpdate, onNodeAction, onRemoveNode, onMoveNode }) {
+        function NodeCompactRow({ name, metrics, clusterId, nodeUiSuffix, onOpenNodeConfig, onMaintenanceToggle, onStartUpdate, onNodeAction, onRemoveNode, onMoveNode }) {
             const { t } = useTranslation();
             const { getAuthHeaders } = useAuth();
             const [expanded, setExpanded] = useState(false);
@@ -995,7 +999,7 @@
             const isUpdating = metrics?.is_updating;
             const updateTask = metrics?.update_task;
             const canUpdate = isInMaintenance && maintenanceTask?.status && (['completed', 'completed_with_errors'].includes(maintenanceTask.status) || metrics?.maintenance_acknowledged) && !isUpdating;
-            const proxmoxTarget = { ...metrics, kind: 'node', name, node: name };
+            const proxmoxTarget = { ...metrics, kind: 'node', name, node: name, node_ui_suffix: nodeUiSuffix || '' };  // #689
             const proxmoxUrl = getProxmoxObjectUrl(proxmoxTarget);
 
             const formatBytes = (bytes) => { if(!bytes)return'0 B';const k=1024,s=['B','KB','MB','GB','TB','PB'],i=Math.floor(Math.log(bytes)/Math.log(k));return(bytes/Math.pow(k,i)).toFixed(1)+' '+s[i]; };
@@ -1285,7 +1289,7 @@
         // NS: Added bulk select for mass operations (migration, etc.)
         // This component does a lot... might need to split it up eventually
         // NS: filtering + sorting uses useMemo below (lines 1320+)
-        function ResourceTable({ resources, clusterId, clusters, sourceCluster, onVmAction, onOpenConsole, onOpenSpice, onOpenConfig, onMigrate, onBulkMigrate, onDelete, onClone, onForceStop, onCrossClusterMigrate, nodes, onOpenTags, highlightedVm, addToast, pendingVmAction, onPendingActionConsumed, onVmNavigate, backupStatus }) {
+        function ResourceTable({ resources, clusterId, clusters, sourceCluster, onVmAction, onOpenConsole, onOpenSpice, onOpenConfig, onMigrate, onBulkMigrate, onDelete, onClone, onForceStop, onCrossClusterMigrate, nodes, datastores, onOpenTags, highlightedVm, addToast, pendingVmAction, onPendingActionConsumed, onVmNavigate, backupStatus }) {
             const { t } = useTranslation();
             const { getAuthHeaders, user } = useAuth();
             const { isCorporate } = useLayout(); // LW: Feb 2026 - corporate defaults to table view
@@ -1530,7 +1534,8 @@
                 ...resource,
                 type: resource.type,
                 node: resource.node,
-                node_ip: resource.node_ip || resource.nodeIp || sourceCluster?.current_host || sourceCluster?.host
+                node_ip: resource.node_ip || resource.nodeIp || sourceCluster?.current_host || sourceCluster?.host,
+                node_ui_suffix: sourceCluster?.node_ui_suffix || ''   // #689
             });
             
             // old version for reference
@@ -2663,6 +2668,7 @@
                             vm={showCloneModal}
                             nodes={nodes}
                             clusterId={clusterId}
+                            storages={datastores}
                             onClone={onClone}
                             onClose={() => setShowCloneModal(null)}
                         />

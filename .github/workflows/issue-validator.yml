@@ -24,12 +24,58 @@ jobs:
             const body = issue.body || '';
             const labels = issue.labels.map(l => l.name.toLowerCase());
             const title = issue.title.toLowerCase();
-            
+
             let isInvalid = false;
             let message = '';
-            
+
+            // NS Aug 2026 — maintainers/bots know the drill; only gate external reporters, and
+            // never re-close something a maintainer already touched.
+            const assoc = issue.author_association || '';
+            const login = (issue.user && issue.user.login) || '';
+            const isMaintainer = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assoc) || login.endsWith('[bot]');
+
+            // === TEMPLATE GUTTED / DELETED (any issue, labelled or not) ===
+            // A wave of low-effort / AI-generated issues opens with the whole template deleted (or
+            // opens outside the templates entirely, e.g. #749 had no [Bug] prefix + no template at
+            // all), which slipped past the label-scoped checks below. blank_issues_enabled is false,
+            // so a real reporter always starts FROM a template — an issue with none of the template's
+            // section headings has had it stripped out. Strip HTML comment scaffold first, then count
+            // the template markers actually present as markdown headings.
+            if (!isMaintainer) {
+              const noComments = body.replace(/<!--[\s\S]*?-->/g, '');
+              const TEMPLATE_HEADINGS = [
+                // bug_report.md
+                'Describe the bug', 'Steps to Reproduce', 'Expected behavior',
+                'Environment', 'Logs', 'Screenshots',
+                // feature_request.md
+                'Describe the feature', 'Use Case', 'Alternatives considered',
+                'How important is this for you',
+              ];
+              const headingRe = new RegExp(
+                '^#{1,6}\\s*[^\\n]*(' + TEMPLATE_HEADINGS.map(h => h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')',
+                'im');
+              const presentCount = TEMPLATE_HEADINGS.filter(h =>
+                new RegExp('^#{1,6}\\s*[^\\n]*' + h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'im').test(noComments)
+              ).length;
+              // crossing the headings out with ~~strikethrough~~ doesn't count as using them.
+              const struckOut = /~~[^~\n]*(Describe the bug|Steps to Reproduce|Environment|Describe the feature|Use Case)[^~\n]*~~/i.test(body);
+
+              if (presentCount === 0 || struckOut) {
+                isInvalid = true;
+                message = '👋 Thanks for opening an issue!\n\n' +
+                  'It looks like the **issue template was removed** (or this was opened outside the ' +
+                  'templates). We rely on the Bug / Feature template so we can actually act on reports — ' +
+                  'a description-only issue with the template deleted almost always misses the details ' +
+                  'we need (version, repro, environment).\n\n' +
+                  '**Please open a fresh issue using one of the templates** (New issue → 🐛 Bug Report ' +
+                  'or ✨ Feature Request) and fill in the sections. 🐾\n\n' +
+                  '*This is an automated message — closing for now; reopen with a completed template.*';
+              }
+            }
+
             // === BUG REPORT ===
-            if (labels.includes('bug') || title.includes('[bug]')) {
+            if (!isInvalid && !isMaintainer &&
+                (labels.includes('bug') || title.includes('[bug]'))) {
               
               const requiredFields = [
                 { name: 'Describe the bug', check: /describe the bug\s*\n+\s*\S+/i },
@@ -54,7 +100,8 @@ jobs:
             }
             
             // === FEATURE REQUEST ===
-            if (labels.includes('enhancement') || labels.includes('feature') || title.includes('[feature]')) {
+            if (!isInvalid && !isMaintainer &&
+                (labels.includes('enhancement') || labels.includes('feature') || title.includes('[feature]'))) {
               
               const hasDescription = body.length > 50;
               

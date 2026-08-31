@@ -9,7 +9,7 @@
         // NS May 2026 (#389): supported language allowlist — reused for input validation
         // both at init (localStorage) and at switch time. Keep in sync with the
         // backend allowlist in pegaprox/api/users.py and the LanguageSwitcher list.
-        const SUPPORTED_LANGS = ['de', 'en', 'it', 'fr', 'es', 'pt', 'ko', 'zh'];
+        const SUPPORTED_LANGS = ['de', 'en', 'it', 'fr', 'es', 'pt', 'ko', 'zh', 'pl'];
 
         // map navigator.language ("en-US", "de-AT", ...) onto a supported code, or null
         function _detectBrowserLang() {
@@ -113,6 +113,7 @@
                 { code: 'pt', flag: '🇧🇷', label: 'PT', title: 'Português' },
                 { code: 'ko', flag: '🇰🇷', label: 'KO', title: '한국어' },
                 { code: 'zh', flag: '🇨🇳', label: 'ZH', title: t('languageSimplifiedChinese') },
+                { code: 'pl', flag: '🇵🇱', label: 'PL', title: 'Polski' },
             ];
             const activeLanguage = langs.find(l => l.code === language) || langs[0];
 
@@ -255,11 +256,10 @@
                                 applyLanguage(d.user.language);
                             }
                             // NS: Apply user's theme or default
-                            // MK May 2026 — when user is in corporate layout, the local
-                            // corp-theme toggle is the source of truth for that session.
-                            // Without this, a stale server.user.theme=corporateLight would
-                            // override an active corporateDark toggle on F5 → taskbar
-                            // bg-proxmox-dark/50 etc. would render with light CSS vars.
+                            // MK May 2026 — when user is in corporate layout, the local corp-theme
+                            // toggle in the top bar is the source of truth. Corporate doesn't use the
+                            // theme grid (it's hidden there), so the toggle and server user.theme stay
+                            // in sync; reading the toggle avoids a stale server value overriding it on F5.
                             let userTheme = d.user?.theme || d.default_theme || 'proxmoxDark';
                             try {
                                 if (d.user?.ui_layout === 'corporate') {
@@ -333,7 +333,10 @@
                     
                     // 2fa required?
                     if (resp.ok && data.requires_2fa) {
-                        return { requires_2fa: true };
+                        // -lw #746: pass the server's `methods` through — the login screen branches
+                        // on it to show the security-key prompt. Without it twoFAMethods stayed []
+                        // and a WebAuthn-only account only ever saw the TOTP box (i.e. locked out).
+                        return { requires_2fa: true, methods: data.methods };
                     }
                     
                     if (resp.ok && data.success) {

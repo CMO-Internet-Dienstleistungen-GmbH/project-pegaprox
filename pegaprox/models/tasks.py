@@ -133,6 +133,10 @@ class PegaProxConfig:
         self.latitude = cluster_data.get('latitude')
         self.longitude = cluster_data.get('longitude')
         self.location_label = cluster_data.get('location_label', '') or ''
+        # MK Aug 2026 (#689) — optional FQDN suffix for the node Web-UI links. Short node names
+        # (pve01) get "<suffix>" appended → pve01.example.local:8006. Empty string = links use the
+        # node IP/host as before.
+        self.node_ui_suffix = (cluster_data.get('node_ui_suffix', '') or '').strip().lstrip('.')
         # NS May 2026 (#364) — load-balancer settings finally hydrated from db.
         # Were API-settable but never persisted before, so users saw "saved"
         # toasts that reverted within seconds.

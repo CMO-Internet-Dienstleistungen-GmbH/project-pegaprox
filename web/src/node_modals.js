@@ -46,7 +46,7 @@
                     setStatus('connecting');
                     if (termRef.current) {
                         const method = authData.privateKey ? '(SSH Key)' : '';
-                        termRef.current.write(`\r\nVerbinde als ${authData.username}@${authData.host} ${method}...\r\n`);
+                        termRef.current.write(`\r\n${t('shellConnectingAs')} ${authData.username}@${authData.host} ${method}...\r\n`);
                     }
                     return true;
                 }
@@ -65,7 +65,7 @@
                 if (!_flushAuth(authData)) {
                     pendingCredsRef.current = authData;
                     if (termRef.current) {
-                        termRef.current.write('\r\n\x1b[33mWarte auf WebSocket-Verbindung...\x1b[0m\r\n');
+                        termRef.current.write(`\r\n\x1b[33m${t('waitingForWsConnection')}\x1b[0m\r\n`);
                     }
                     setStatus('connecting');
                     setShowLogin(false);
@@ -170,7 +170,7 @@
                         setTimeout(() => fitAddon && fitAddon.fit(), 50);  // idk why 50ms but it works
 
                         setStatus('connecting');
-                        term.write('Verbinde zum Server...\r\n');
+                        term.write(`${t('connectingToServer')}\r\n`);
                         
                         // First, try to get the node IP via API
                         let nodeIp = '';
@@ -273,7 +273,7 @@
                                             setStatus('login');
                                             return;
                                         } else if (msg.status === 'connecting') {
-                                            term.write('SSH Verbindung wird aufgebaut...\r\n');
+                                            term.write(`${t('sshConnecting')}\r\n`);
                                             return;
                                         } else if (msg.status === 'connected') {
                                             setStatus('connected');
@@ -344,9 +344,9 @@
                             console.log('WebSocket closed:', event.code, event.reason);
                             if (!cleanup) {
                                 // Different messages based on close code
-                                let msg = 'Verbindung beendet';
+                                let msg = t('connectionClosed');
                                 if (event.code === 1006) {
-                                    msg = 'Verbindung unerwartet getrennt';
+                                    msg = t('connectionLostUnexpected');
                                 } else if (event.code === 1011) {
                                     msg = 'Server-Fehler';
                                 } else if (event.reason) {
@@ -5079,7 +5079,7 @@
                                             <tr><td>QEMU VMs</td><td>{nodeVms.filter(v => v.type === 'qemu').length}</td></tr>
                                             <tr><td>LXC CTs</td><td>{nodeVms.filter(v => v.type === 'lxc').length}</td></tr>
                                             <tr><td>{t('running')}</td><td>{runningVms}</td></tr>
-                                            <tr><td>{t('stopped')}</td><td>{nodeVms.length - runningVms}</td></tr>
+                                            <tr><td>{t('stopped')}</td><td>{nodeVms.filter(v => v.status === 'stopped').length}</td></tr>
                                         </tbody>
                                     </table>
                                 </div>
@@ -5780,7 +5780,9 @@
 
                         {/* Shell Tab */}
                         {activeDetailTab === 'shell' && (
-                            <div className="bg-black border border-proxmox-border overflow-hidden" style={{height: '500px'}}>
+                            // NS #727 — clip (not hidden) so Firefox's selection-autoscroll can't
+                            // scroll this panel; hidden boxes stay programmatically scrollable, clip doesn't.
+                            <div className="bg-black border border-proxmox-border" style={{height: '500px', overflow: 'clip'}}>
                                 <NodeShellTerminal node={node} clusterId={clusterId} addToast={addToast} />
                             </div>
                         )}

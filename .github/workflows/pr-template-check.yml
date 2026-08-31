@@ -1,0 +1,175 @@
+name: PR checklist
+
+# Aug 2026 — companion to the PR template + CONTRIBUTING guide. A lot of the low-effort /
+# AI-slop PRs we get either leave the template untouched, delete the bits they don't want to
+# answer, or cross them out to look "done". This nudges the author to actually fill it in:
+# a friendly (single, self-updating) comment + a red check. It does NOT block merge on its own
+# — add it as a required check in branch protection if you want that. Maintainers and bots are
+# skipped; only external contributors see it.
+#
+# Uses pull_request_target for the write token but NEVER checks out the PR head — the PR body is
+# only ever string-matched and we post our own text back, so untrusted PR code never runs. Like
+# pr-target-guard, GitHub reads this from the PR's BASE branch, so it has to live on both Testing
+# and main to fire for PRs against either.
+on:
+  pull_request_target:
+    types: [opened, edited, reopened]
+    branches: [Testing, main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-checklist-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  checklist:
+    runs-on: ubuntu-latest
+    # Only nudge external contributors — maintainers (and bots like dependabot) opening a PR
+    # know the drill and may legitimately skip parts.
+    if: >
+      github.event.pull_request.author_association != 'OWNER'
+      && github.event.pull_request.author_association != 'MEMBER'
+      && github.event.pull_request.author_association != 'COLLABORATOR'
+    steps:
+      - name: Check the PR body
+        # pinned to commit SHA (same as issue-validator) so a moving tag can't smuggle script in
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            const MARKER = '<!-- pegaprox-pr-checklist -->';
+            const pr = context.payload.pull_request;
+            const login = (pr.user && pr.user.login) || '';
+            if (login.endsWith('[bot]')) {
+              console.log('skip: bot author');
+              return;
+            }
+
+            const body = pr.body || '';
+            // strip the template's HTML placeholder comments so "did they actually write
+            // anything" only looks at real content, not the scaffold we shipped.
+            const noComments = body.replace(/<!--[\s\S]*?-->/g, '');
+
+            // prose = body minus headings, checklist lines and markdown punctuation. What's
+            // left is the free text the author actually typed.
+            const prose = noComments
+              .replace(/^#{1,6}\s.*$/gm, '')
+              .replace(/^\s*[-*]\s+\[[ xX]\].*$/gm, '')
+              .replace(/Fixes #/gi, '')
+              .replace(/[\s>*_`~.-]/g, '');
+
+            const problems = [];
+
+            if (prose.length < 20) {
+              problems.push('The template looks empty — please say **what** this PR changes and **why**.');
+            }
+
+            // "How it was tested" section must have more than the placeholder in it.
+            const m = noComments.match(/##\s*How it was tested([\s\S]*?)(?:\n##\s|$)/i);
+            const testText = (m ? m[1] : '').replace(/[\s>*_`~.-]/g, '');
+            if (testText.length < 15) {
+              problems.push('The **How it was tested** section is empty — tell us what you actually ran this against and the result (not "the CI is green").');
+            }
+
+            // a linked issue OR the "small, obvious fix" box ticked — one or the other.
+            const hasIssueRef = /(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)\s+#\d+/i.test(body)
+              || /#\d{1,6}\b/.test(noComments);
+            const smallFixTicked = /[-*]\s*\[[xX]\][^\n]*small,?\s*obvious fix/i.test(body);
+            if (!hasIssueRef && !smallFixTicked) {
+              problems.push('No linked issue and the "small, obvious fix" box isn\'t ticked — link the issue with `Fixes #123`, or tick that box if it really is a small fix.');
+            }
+
+            // crossing the requirements out doesn't satisfy them.
+            if (/~~[^~\n]+~~/.test(body)) {
+              problems.push('Please don\'t strike through the checklist/requirements — fill them in or leave them as-is; crossing them out doesn\'t answer them.');
+            }
+
+            // whole checklist removed.
+            if (!/[-*]\s*\[[ xX]\]/.test(body) && prose.length < 200) {
+              problems.push('The checklist was removed — please keep it and tick what applies.');
+            }
+
+            // NS Aug 2026 — if they ticked the AI-assist box, the assistant/model has to be named
+            // (we record it for licensing/compliance). The template ships that line defaulting to
+            // `none`; a ticked box that still says none/blank means it wasn't filled in.
+            const aiTicked = /[-*]\s*\[[xX]\][^\n]*AI assistant/i.test(body);
+            const modelMatch = noComments.match(/AI tool\s*\/\s*model used:\s*`?\s*([^`\n]*?)\s*`?\s*$/im);
+            const modelVal = (modelMatch ? modelMatch[1] : '').trim();
+            if (aiTicked && (!modelVal || /^none$/i.test(modelVal))) {
+              problems.push('You ticked the AI-assist box — please also name the assistant/model on the "AI tool / model used:" line (it still says `none`). We record it for licensing/compliance review.');
+            }
+
+            // find our previous comment so we update one comment instead of spamming on edits.
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              per_page: 100,
+            });
+            const mine = comments.find(c => (c.body || '').includes(MARKER));
+
+            // NS Aug 2026 — companion to the issue validator's auto-close: a PR that DELETES the whole
+            // template (none of its section headings survive) or strikes every section through to fake
+            // it is the AI-slop signal we close outright, not just nudge. A partially-incomplete
+            // template still gets the soft nudge below.
+            const noC = (pr.body || '').replace(/<!--[\s\S]*?-->/g, '');
+            const PR_HEADINGS = ['What\\s*&\\s*why', 'Scope', 'How it was tested', 'Checklist'];
+            const headingsPresent = PR_HEADINGS.filter(h =>
+              new RegExp('^#{1,6}\\s*[^\\n]*(' + h + ')', 'im').test(noC)).length;
+            const struckOut = /~~[^~\n]*(What\s*&\s*why|How it was tested|Scope|Checklist)[^~\n]*~~/i.test(pr.body || '');
+            if (headingsPresent === 0 || struckOut) {
+              const closeMsg = `${MARKER}\n👋 Thanks for opening a PR — but the **PR template was removed** ` +
+                `(or its sections were struck through). We rely on it (what & why, a linked issue, and how ` +
+                `you actually tested) to review at all — a template-less PR is almost always unreviewable.\n\n` +
+                `Please open a fresh PR using the template and fill in the sections, including the AI-assist ` +
+                `checklist line. 🐾\n\n*Automated — closing for now; reopen with the completed template.*`;
+              if (mine) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner, repo: context.repo.repo, comment_id: mine.id, body: closeMsg });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner, repo: context.repo.repo, issue_number: pr.number, body: closeMsg });
+              }
+              await github.rest.pulls.update({
+                owner: context.repo.owner, repo: context.repo.repo, pull_number: pr.number, state: 'closed' });
+              core.setFailed('PR template removed — auto-closed.');
+              return;
+            }
+
+            if (problems.length === 0) {
+              if (mine) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: mine.id,
+                  body: `${MARKER}\n✅ Thanks — the PR checklist looks filled in. A maintainer will take it from here. 🐾`,
+                });
+              }
+              console.log('checklist ok');
+              return;
+            }
+
+            const repoUrl = (context.payload.repository && context.payload.repository.html_url) || '';
+            const msg = `${MARKER}\n👋 Thanks for the PR! Before a maintainer picks it up, a couple of things from the checklist still need filling in:\n\n`
+              + problems.map(p => `- ${p}`).join('\n')
+              + `\n\nWe're a small volunteer team — a linked issue, a one-line scope and how you tested it are what let us review quickly (see [CONTRIBUTING](${repoUrl}/blob/main/CONTRIBUTING.md)). Edit the PR description and this check goes green. 🐾\n\n*Automated check — not a merge block.*`;
+
+            if (mine) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: mine.id,
+                body: msg,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                body: msg,
+              });
+            }
+
+            core.setFailed(`PR checklist incomplete: ${problems.length} item(s).`);
