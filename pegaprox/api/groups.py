@@ -433,10 +433,13 @@ def get_cluster_group_status(group_id):
             try:
                 vms = mgr.get_vm_resources()
                 for vm in vms:
+                    # #749: only count a guest as stopped when it actually is —
+                    # paused/suspended/templates would otherwise inflate the stopped
+                    # tally via the old catch-all else.
                     if vm.get('status') == 'running':
                         total_vms_running += 1
                         c_info['vms_running'] += 1
-                    else:
+                    elif vm.get('status') == 'stopped':
                         total_vms_stopped += 1
                         c_info['vms_stopped'] += 1
             except Exception:
