@@ -26,12 +26,6 @@ fork:
 #                dropped from the set instead of applied (the fix is in the
 #                release by then). Leave empty if there is no PR yet.
 patches:
-  - name: vnc-console-under-gevent
-    branch: fix/vnc-console-under-gevent
-    base: Testing
-    upstream_pr: 741
-    summary: web console works under gevent (to_thread delivery, listen socket, session mint)
-
   - name: taskbar-remount-expand
     branch: fix/taskbar-remount-expand
     base: Testing
