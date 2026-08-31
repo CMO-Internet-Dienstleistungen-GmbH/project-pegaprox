@@ -48,6 +48,32 @@ def test_cluster_resources_filtered_for_acl_reached_non_owner(api, seed):
     assert got == [100], got   # only his ACL VM, NOT the whole inventory
 
 
+# 469089255 CORE — build_authz_user must keep a token's tenant CUSTOM role NAME (not collapse it to
+# a builtin), so its tenant scope resolves in get_user_clusters instead of falling back to the
+# owner's default tenant and returning None = "all clusters".
+def test_token_custom_role_name_is_preserved(seed):
+    from pegaprox.utils.auth import build_authz_user
+    seed.user('root', role='admin', tenant_id='default')
+    # builtin viewer token still floors (regression guard)
+    assert build_authz_user('root', {'user': 'root', 'role': 'viewer', 'api_token': True})['effective_role'] == 'viewer'
+    # a custom-role token keeps the role NAME
+    assert build_authz_user('root', {'user': 'root', 'role': 'auditor_t1', 'api_token': True})['effective_role'] == 'auditor_t1'
+    # no token -> no effective_role (stored role applies)
+    assert 'effective_role' not in build_authz_user('root', {'user': 'root', 'role': 'admin'})
+
+
+def test_token_custom_role_scoped_to_role_tenant_not_all(seed, monkeypatch):
+    from pegaprox.utils.rbac import get_user_clusters
+    seed.tenant('tenant_t1', clusters=['cluster_a'])
+    monkeypatch.setattr('pegaprox.utils.rbac.load_custom_roles',
+                        lambda: {'global': {}, 'tenants': {'tenant_t1': {'auditor_t1': {'permissions': ['pbs.view']}}}})
+    # admin-owned token floored to the tenant custom role — scoped to that role's tenant, NOT all
+    u = {'role': 'admin', 'tenant_id': 'default', 'effective_role': 'auditor_t1'}
+    assert get_user_clusters(u) == ['cluster_a']
+    # counter: the OLD collapse-to-viewer behaviour returned None (all clusters)
+    assert get_user_clusters({'role': 'admin', 'tenant_id': 'default', 'effective_role': 'viewer'}) is None
+
+
 # 469089213 — POST /api/pbs/<id>/auto-storage injects the PBS's stored creds into a cluster's
 # storage; a pool/ACL reach must NOT let a user target a cluster their tenant doesn't own.
 def test_pbs_auto_attach_denied_target_not_tenant_owned(api, seed):
