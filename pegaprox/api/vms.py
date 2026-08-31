@@ -285,10 +285,24 @@ def get_cluster_vms_list(cluster_id):
     if error:
         return error
 
+    # NS Aug 2026 (Aikido 469089182) — this endpoint reached the cluster via check_cluster_access,
+    # which for a pool-/ACL-scoped user passes on the #555/#248 fallback. It must then still filter
+    # per-VM like the sibling /resources (clusters.py) does, or a pool-scoped user gets the WHOLE
+    # cluster inventory (incl. unpooled + ACL-restricted VMs). Admins short-circuit True.
+    from pegaprox.utils.rbac import user_can_access_vm as _ucav
+    from pegaprox.utils.auth import build_authz_user as _bau
+    _authz_u = _bau(request.session.get('user', ''), request.session)
+    def _visible(_vmid, _vtype):
+        try:
+            return bool(_vmid) and _ucav(_authz_u, cluster_id, int(_vmid), 'vm.view', _vtype)
+        except Exception:
+            return False
+
     # MK: XCP-ng clusters use their own get_vms()
     if getattr(manager, 'cluster_type', 'proxmox') == 'xcpng':
         try:
             vms = manager.get_vms()
+            vms = [v for v in vms if _visible(v.get('vmid'), v.get('type'))]
             vms.sort(key=lambda x: x.get('vmid', 0))
             return jsonify({'vms': vms})
         except Exception as e:
@@ -299,6 +313,8 @@ def get_cluster_vms_list(cluster_id):
     vms = []
     for r in resources:
         if r.get('type') in ['qemu', 'lxc'] and r.get('vmid'):
+            if not _visible(r.get('vmid'), r.get('type')):
+                continue
             vms.append({
                 'vmid': r.get('vmid'),
                 'name': r.get('name', ''),

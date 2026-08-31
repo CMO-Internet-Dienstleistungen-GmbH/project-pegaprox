@@ -24,13 +24,17 @@ def list_pbs_servers():
     # NS Jul 2026 (CodeAnt IDOR) — scope the listing to PBS servers the caller can reach.
     # Unfiltered enumeration here is what made the per-route PBS BOLA trivial to exploit.
     # Mirrors check_pbs_access semantics but also covers disabled (DB-only) servers.
-    from pegaprox.utils.auth import load_users as _load_users
+    # NS Aug 2026 (Aikido 469089255) — build_authz_user (not raw load_users) so an admin-owned but
+    # role-scoped API token is floored to its effective_role here too, matching the fixed siblings
+    # check_pbs_access / check_vmware_access. The raw path let a viewer-scoped admin token read every
+    # PBS server (role==ADMIN short-circuit + _guc None) despite the token's reduced scope.
+    from pegaprox.utils.auth import build_authz_user as _bau
     from pegaprox.utils.rbac import get_user_clusters as _guc
     from pegaprox.models.permissions import ROLE_ADMIN as _RA
-    _lu = _load_users().get(request.session.get('user', ''), {})
+    _lu = _bau(request.session.get('user', ''), request.session)
     _uc = _guc(_lu)  # None => all clusters (admin / default tenant)
     def _pbs_visible(linked):
-        if _lu.get('role') == _RA or _uc is None:
+        if _lu.get('effective_role', _lu.get('role')) == _RA or _uc is None:
             return True
         linked = linked or []
         return (not linked) or any(c in _uc for c in linked)
@@ -2535,10 +2539,19 @@ def auto_attach_pbs_to_clusters(pbs_id):
     cluster_ids = body.get('clusters') or pbs_mgr.linked_clusters or []
     if not cluster_ids:
         return jsonify({'error': 'no clusters specified or linked'}), 400
+    # NS Aug 2026 (Aikido 469089213) — this injects the PBS's stored (often root@pam) credentials
+    # into a PVE storage config, so check_cluster_access (which passes on the #555 pool / #248 ACL
+    # fallback) is not enough: confine to clusters the caller's TENANT owns, like the storage
+    # auto-balance arming guard (469089261). Admin / default-tenant (_owned None) unaffected.
+    from pegaprox.utils.rbac import get_user_clusters as _guc_pbs
+    from pegaprox.utils.auth import build_authz_user as _bau_pbs
+    _owned = _guc_pbs(_bau_pbs(request.session.get('user', ''), request.session), include_pools=False)
     for _cid in cluster_ids:
         _ok, _err = check_cluster_access(_cid)
         if not _ok:
             return _err
+        if _owned is not None and _cid not in _owned:
+            return jsonify({'error': 'Access denied — target cluster not owned by your tenant'}), 403
 
     storage_name = (body.get('storage_name') or f"pbs-{pbs_mgr.name}").lower()
     storage_name = ''.join(c if c.isalnum() or c in ('-', '_', '.') else '-' for c in storage_name)

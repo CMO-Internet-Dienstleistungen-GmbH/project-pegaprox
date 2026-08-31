@@ -1100,36 +1100,55 @@ def get_cluster_resources(cluster_id):
     # cluster, so the same heavy walk was happening 2-3x per window per cluster.
     all_resources = mgr.get_vm_resources(max_age=6)
 
-    # check if user is admin - admin sees everything
-    users = load_users()
-    user = users.get(request.session['user'], {})
+    # NS Aug 2026 — build the authz user so an admin-owned scoped API token is floored to its
+    # effective_role (the stored-role fast-path let such a token see everything).
+    from pegaprox.utils.rbac import user_can_access_vm as _ucav, get_user_clusters as _guc
+    from pegaprox.utils.auth import build_authz_user
+    user = build_authz_user(request.session['user'], request.session)
     user['username'] = request.session['user']
-
-    # NOTE (RBAC 2026-06-10): intentional admin data-scoping fast-path, NOT a gate to
-    # swap for a permission — vm.view / cluster.view are held by viewer+user too, so a
-    # perm check here would leak ALL VMs past the per-VM ACL filter below. Stays role-scoped.
-    if user.get('role') == ROLE_ADMIN:
+    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
         return jsonify(all_resources)
-    
-    # LW: Filter VMs based on ACLs - only show VMs user can access
+
+    # Aikido 469089182 re-verify — the RESTRICTIVE ACL listing below (an ACL'd VM is hidden from
+    # non-whitelisted TENANT operators; a no-ACL VM stays visible via role-level vm.view) is correct
+    # ONLY for a caller whose tenant actually OWNS this cluster. A caller who reached it via a #555
+    # pool / #248 ACL fallback (tenant does NOT own it) must NOT get that blanket vm.view fallback —
+    # confine them to exactly the VMs their pool/ACL grants, via user_can_access_vm (which enforces
+    # the tenant gate). None => admin/default-tenant (unscoped).
+    _tenant_clusters = _guc(user, include_pools=False)
+    _is_tenant_owner = _tenant_clusters is None or cluster_id in _tenant_clusters
+    if not _is_tenant_owner:
+        filtered = []
+        for vm in all_resources:
+            _vmid = vm.get('vmid')
+            if _vmid is None:
+                continue
+            try:
+                if _ucav(user, cluster_id, int(_vmid), 'vm.view', vm.get('type')):
+                    filtered.append(vm)
+            except Exception:
+                continue
+        return jsonify(filtered)
+
+    # LW: Filter VMs based on ACLs - only show VMs user can access (tenant-owner, restrictive listing)
     acls = get_vm_acls()
     cluster_acls = acls.get(cluster_id, {})
-    
+
     # if no ACLs defined for this cluster, check if user has general vm.view permission
     if not cluster_acls:
         if has_permission(user, 'vm.view'):
             return jsonify(all_resources)
         else:
             return jsonify([])  # no vm.view permission and no ACLs
-    
+
     # filter resources - show VMs user has ACL access to OR general vm.view permission
     filtered = []
     has_general_view = has_permission(user, 'vm.view')
-    
+
     for vm in all_resources:
         vmid = str(vm.get('vmid', ''))
         vm_acl = cluster_acls.get(vmid, {})
-        
+
         if vm_acl:
             # VM has specific ACL - check if user is in whitelist
             allowed_users = vm_acl.get('users', [])
@@ -1138,7 +1157,7 @@ def get_cluster_resources(cluster_id):
         elif has_general_view:
             # No specific ACL but user has general view permission
             filtered.append(vm)
-    
+
     return jsonify(filtered)
 
 # NS: Feb 2026 - SECURITY: explicit allowlist prevents mass assignment attacks
