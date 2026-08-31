@@ -37,11 +37,16 @@ fork:
 #   requested_by who asked for it -- an issue number in the fork. Only meaningful
 #                for internal patches; it is what tells the next reader why a
 #                permanent delta to upstream exists at all.
-# Empty: as of v1.1.0 the fork carries no delta against upstream. The corporate
-# theme fix (issue #742) was solved upstream in 702bfa5 + c53a859 -- in a
-# different shape than our PR #744, which was closed rather than merged, so
-# neither drop heuristic could see it.
-patches: []
+patches:
+  # Upstream issue #743 is open; PR #745 was closed pending discussion, so there
+  # is no PR to track and the entry has to be retired by hand once upstream
+  # ships its own System theme.
+  - name: system-theme
+    branch: feat/system-theme
+    base: main
+    kind: feature
+    upstream_pr:
+    summary: '"System" theme follows the OS light/dark setting (upstream issue #743)'
 
 # Files whose conflicts are resolved by regenerating them instead of merging.
 # web/index.html is a build artefact (web/Dev/build.sh compiles it from
