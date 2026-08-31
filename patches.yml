@@ -26,12 +26,6 @@ fork:
 #                dropped from the set instead of applied (the fix is in the
 #                release by then). Leave empty if there is no PR yet.
 patches:
-  - name: taskbar-remount-expand
-    branch: fix/taskbar-remount-expand
-    base: Testing
-    upstream_pr: 739
-    summary: TaskBar auto-expands only for tasks the user just started
-
   - name: corporate-theme-source-of-truth
     branch: fix/corporate-theme-source-of-truth
     base: Testing
