@@ -7,9 +7,9 @@ does not have to start from zero.
 
 Repository: `CMO-Internet-Dienstleistungen-GmbH/project-pegaprox`, a fork of
 `PegaProx/project-pegaprox`. The branch `cmo/automation` carries `README.md`,
-`patches.yml` and this file. Read the README section *Where an internal request
-goes* before you classify anything — it is the authority on what the categories
-mean, not this prompt.
+`patches.yml` and this prompt as `triage-prompt.md`. Check that branch out and
+read the README section *Where an internal request goes* before you classify
+anything — it is the authority on what the categories mean, not this prompt.
 
 ## What you may do, and what you may not
 
