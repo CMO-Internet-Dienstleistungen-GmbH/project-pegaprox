@@ -108,7 +108,7 @@ question and its answer stay in one thread.
 |---|---|
 | `triage/A-config` … `triage/D-internal` | the category; exactly one is ever set |
 | `needs-info` | a question is open, waiting on the requester |
-| `needs-dennis` | the routine stopped and wants a decision |
+| `needs-review` | the routine stopped and wants a decision |
 | `triaged` | classified, plan is in the thread |
 
 **It plans and asks; it does not build.** It writes no code, creates no branch,
@@ -117,7 +117,7 @@ an issue or marks it `duplicate` or `wontfix` — a colleague's request does not
 dismissed by an automation. That limit is also what makes it safe to point a
 language model at text other people wrote.
 
-It stops after three rounds on one issue and hands over with `needs-dennis`.
+It stops after three rounds on one issue and hands over with `needs-review`.
 
 Its prompt is [`triage-prompt.md`](triage-prompt.md) — that file is the source of
 truth for what it is told to do; edit it there and update the routine.
