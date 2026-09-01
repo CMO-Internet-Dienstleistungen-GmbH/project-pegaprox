@@ -119,6 +119,17 @@ language model at text other people wrote.
 
 It stops after three rounds on one issue and hands over with `needs-review`.
 
+Everything about it that follows a rule rather than a judgement lives in
+[`scripts/triage.sh`](scripts/triage.sh): `gate` says whether the routine may
+act at all, `render` appends the sign-off and the round marker with the right
+number, `finish` strips the footer the platform adds to a posted comment and
+keeps the four `triage/*` labels mutually exclusive. The routine writes the text
+and picks the category; it does not count rounds or edit labels by hand.
+
+Posting is the one step the script does not do. The author of a comment is
+decided by the credentials that post it — so the routine posts through the tool
+that puts the maintainer's name on it, then hands the comment id to `finish`.
+
 Its prompt is [`triage-prompt.md`](triage-prompt.md) — that file is the source of
 truth for what it is told to do; edit it there and update the routine.
 
