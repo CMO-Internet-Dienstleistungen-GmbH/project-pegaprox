@@ -127,6 +127,16 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
     exit 0
 fi
 
+# The branch is moved with `git branch --force`, which git refuses while the
+# branch is checked out anywhere. Without this the run does the whole build and
+# the test suite first and only then dies on a bare git message that says
+# nothing about what to do -- so ask now, while it is still cheap.
+if git -C "$REPO_ROOT" worktree list --porcelain \
+   | grep -qx "branch refs/heads/$INTEGRATION_BRANCH"; then
+    die "$INTEGRATION_BRANCH is checked out in a worktree, so it cannot be rebuilt.
+     Switch that worktree away from it first (git checkout --detach)."
+fi
+
 # ------------------------------------------------------------------- build
 
 WORKTREE="$(mktemp -d "${TMPDIR:-/tmp}/pegaprox-sync.XXXXXX")"
@@ -301,7 +311,22 @@ fi
 if [ "$PREV_N" -gt 0 ]; then
     prev_tree="$(git -C "$REPO_ROOT" rev-parse "refs/tags/${PREV_TAG}^{tree}" 2>/dev/null || echo none)"
     if [ "$prev_tree" = "$BUILT_TREE" ]; then
-        ok "result is identical to $PREV_TAG — nothing to publish"
+        ok "result is identical to $PREV_TAG — no new revision needed"
+        # Same tree is not the same thing as a consistent fork. The branch can
+        # still point somewhere else -- someone pressing "Sync fork" in the
+        # GitHub UI puts a merge commit on it -- and nothing else would ever
+        # move it back, because a run that publishes no new tag used to stop
+        # here. Heal it instead of reporting up-to-date over a drifted branch.
+        prev_sha="$(git -C "$REPO_ROOT" rev-parse "refs/tags/${PREV_TAG}^{commit}")"
+        if [ "$(git -C "$REPO_ROOT" rev-parse "$INTEGRATION_BRANCH" 2>/dev/null || echo none)" != "$prev_sha" ]; then
+            warn "$INTEGRATION_BRANCH does not point at $PREV_TAG — moving it back"
+            git -C "$REPO_ROOT" branch --force "$INTEGRATION_BRANCH" "$prev_sha"
+        fi
+        if [ "$DO_PUSH" -eq 1 ] \
+           && [ "$(git -C "$REPO_ROOT" rev-parse "$FORK_REMOTE/$INTEGRATION_BRANCH" 2>/dev/null || echo none)" != "$prev_sha" ]; then
+            warn "$FORK_REMOTE/$INTEGRATION_BRANCH differs — force-pushing it back to $PREV_TAG"
+            git -C "$REPO_ROOT" push --force-with-lease "$FORK_REMOTE" "$INTEGRATION_BRANCH"
+        fi
         log "RESULT: up-to-date release=$RELEASE_TAG tag=$PREV_TAG"
         exit 0
     fi
@@ -327,8 +352,12 @@ tag_body="$tag_body
 
 Built by scripts/sync-upstream-release.sh; the test suite passed on this tree."
 
-git -C "$WORKTREE" tag -a "$NEW_TAG" -m "$tag_body" "$BUILT_SHA"
+# Branch first, tag second. The other way round, anything that stops the branch
+# from moving leaves a tag behind with no branch pointing at it -- and the next
+# run then sees that tag, finds the same tree, and reports "up to date" over a
+# fork that never got the commit.
 git -C "$REPO_ROOT" branch --force "$INTEGRATION_BRANCH" "$BUILT_SHA"
+git -C "$WORKTREE" tag -a "$NEW_TAG" -m "$tag_body" "$BUILT_SHA"
 ok "local branch $INTEGRATION_BRANCH and tag $NEW_TAG created"
 
 if [ "$DO_PUSH" -eq 1 ]; then
