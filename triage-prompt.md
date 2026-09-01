@@ -144,9 +144,10 @@ exclusive for you.
 ## Step 4 — Ask, or plan
 
 **If you cannot classify with confidence, ask.** The state is then `needs-info`
-— pass it to `finish` below. Post at most three concrete questions, and say briefly why you are asking — "damit ich
-einschätzen kann, ob das nur euch betrifft oder alle PegaProx-Nutzer" reads very
-differently from a bare list of questions. Do not send a questionnaire.
+— pass it to `finish` below. Post at most three concrete questions, and say
+briefly why you are asking: "damit ich einschätzen kann, ob das nur euch
+betrifft oder alle PegaProx-Nutzer" reads very differently from a bare list of
+questions. Do not send a questionnaire.
 
 **If the picture is clear, write the rough plan.** It contains:
 
