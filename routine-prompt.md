@@ -118,5 +118,10 @@ Keep it short — a maintainer skims it on a phone.
 - tests: <pass/fail, count>
 ```
 
-Do not open pull requests, do not comment on upstream issues, and do not
-touch the `fix/*` branches — they belong to the upstream contributions.
+Do not open pull requests and do not comment on upstream issues.
+
+Never delete or rewrite a patch branch named in `patches.yml`. `cmo/main` is
+rebuilt and force-pushed on every sync, so those branches are the only place
+the work exists — losing one means the fork cannot be rebuilt from the release
+tag any more. Retiring a patch means removing its entry from `patches.yml`,
+never touching the branch.
