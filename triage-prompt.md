@@ -212,6 +212,11 @@ _Automatische Ersteinschätzung — Dennis schaut noch drauf._
 
 ## Report
 
+**Do not send a push notification, and do not open a task.** GitHub already
+notifies Dennis about the issue and about every comment on it; a second channel
+saying the same thing is noise he has asked not to have. The written report below
+is the only thing you produce besides the label and the comment.
+
 The run report is for Dennis, not for the issue. Keep it to a few lines:
 
 ```
