@@ -96,6 +96,36 @@ request -> issue in the fork -> triage A/B/C/D
 What happens after that — testing it, rolling it out, moving
 `pegaprox_install_version` — belongs to the IaC repository, not here.
 
+### The first step runs by itself
+
+Opening an issue starts a Claude Code routine. It reads the request, looks for
+whether the thing already exists — in the other issues, in the code, in
+`patches.yml` — classifies it A/B/C/D, and leaves either a rough plan or up to
+three questions as a comment, in German. Answering it starts it again, so a
+question and its answer stay in one thread.
+
+| Label | What it means |
+|---|---|
+| `triage/A-config` … `triage/D-internal` | the category; exactly one is ever set |
+| `needs-info` | a question is open, waiting on the requester |
+| `needs-dennis` | the routine stopped and wants a decision |
+| `triaged` | classified, plan is in the thread |
+
+**It plans and asks; it does not build.** It writes no code, creates no branch,
+pushes nothing, edits neither `patches.yml` nor any other file, and never closes
+an issue or marks it `duplicate` or `wontfix` — a colleague's request does not get
+dismissed by an automation. That limit is also what makes it safe to point a
+language model at text other people wrote.
+
+It stops after three rounds on one issue and hands over with `needs-dennis`.
+
+Its prompt is [`triage-prompt.md`](triage-prompt.md) — that file is the source of
+truth for what it is told to do; edit it there and update the routine.
+
+Writing an issue requires being a collaborator on the fork: the repository is
+public and interaction is limited to `collaborators_only`, so a colleague needs
+`pull` access once, and nobody else can file anything.
+
 ### Rules for a category D patch
 
 A permanent patch has to survive a rebase onto every future upstream release.
