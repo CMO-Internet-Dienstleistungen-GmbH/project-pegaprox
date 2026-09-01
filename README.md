@@ -122,6 +122,15 @@ It stops after three rounds on one issue and hands over with `needs-review`.
 Its prompt is [`triage-prompt.md`](triage-prompt.md) — that file is the source of
 truth for what it is told to do; edit it there and update the routine.
 
+A smaller self-hosted model was considered for the first pass and deferred: the
+run does multi-step tool use (grep the code, read `patches.yml`, compare a patch
+against a release tag) and has to recognise a prompt injection in text other
+people wrote. What a small model could take over is the narrow part —
+category plus reasoning as JSON against a schema, with a schema violation
+escalating — but that drops the "does it already exist?" check, which is the
+most useful thing the routine does. Worth revisiting once the volume justifies
+running and watching another service.
+
 Writing an issue requires being a collaborator on the fork: the repository is
 public and interaction is limited to `collaborators_only`, so a colleague needs
 `pull` access once, and nobody else can file anything.
