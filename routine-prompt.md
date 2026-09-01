@@ -36,6 +36,12 @@ git checkout cmo/automation
 
 Then run `./scripts/run.sh verify` and include its output in your report.
 
+The scripts use plain git for everything about the upstream repository. Do not
+"fix" them to call api.github.com for it: this sandbox answers 403 for repos it
+has not attached, and add_repo refuses the upstream one. If a required tool is
+missing (node, npm, python3 with PyYAML), say so plainly in the report instead
+of working around it — that is an environment fix, not a code fix.
+
 ## When the script stops with an error
 
 Do not try to force it through. The two cases that stop it are deliberate:
