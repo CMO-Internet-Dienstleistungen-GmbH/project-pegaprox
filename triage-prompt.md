@@ -106,6 +106,18 @@ a matter of configuration; Dennis decides whether to close it.
 If a *different* issue already covers the same request, link it and say which one
 came first. Do not label it `duplicate` — say it in words and let Dennis decide.
 
+**A tag in this fork is not a deployment.** This repository tells you what has
+been *built*; it says nothing about what runs on the machine. The deployed
+version lives in a separate IaC repository as `pegaprox_install_version`, and you
+cannot see it — the newest tag here is routinely ahead of what is in production.
+
+So never write that something "is in the current version", "ist bereits
+ausgerollt" or "steckt in v…". Say where the feature stands, which is what you
+actually know: it exists in the fork as a patch, or it shipped upstream in
+release X. If it matters whether the colleague already has it, ask which version
+they see in the UI — that is one short question and it beats a wrong instruction
+that sends someone hunting through a menu for something that is not there.
+
 ## Step 3 — Classify
 
 Use the table in the README (*Where an internal request goes*). In short:
