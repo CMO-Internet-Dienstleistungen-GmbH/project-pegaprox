@@ -190,6 +190,14 @@ yours to keep, so remove it:
    Change nothing else — not a word of the text above it.
 3. Read it once more and confirm the marker is now the last line.
 
+This is a **Bash** command. There is no MCP tool for editing a comment, you do
+not need one, and searching the tool list for one is wasted effort — `gh` is
+installed and authenticated in this sandbox. Run it.
+
+If the PATCH comes back 403 or 404, put that status code in the report. "There
+is no tool for it" is not a finding until you have run the command and watched
+it fail; a limit you assumed is not a limit you measured.
+
 If the footer is still there after two attempts, leave the comment alone and say
 so in the report. Never delete the comment to get rid of it.
 
