@@ -87,7 +87,7 @@ small and additive so that rework stays cheap.
 The chain ends at the tag:
 
 ```
-request -> issue in the fork -> triage A/B/C/D
+request -> issue in the fork -> triage A/B/C/D + priority
         -> branch + entry in patches.yml
         -> sync builds v<upstream>-cmo.<n>, tests green, tag pushed
         -> notification: a new version is ready to test
@@ -98,49 +98,52 @@ What happens after that — testing it, rolling it out, moving
 
 ### The first step runs by itself
 
-Opening an issue starts a Claude Code routine. It reads the request, looks for
-whether the thing already exists — in the other issues, in the code, in
-`patches.yml` — classifies it A/B/C/D, and leaves either a rough plan or up to
-three questions as a comment, in German. Answering it starts it again, so a
-question and its answer stay in one thread.
+Opening an issue starts an automation, and so does every comment on one. It
+reads the whole thread, looks for whether the thing already exists — in the
+other issues, in the code, in `patches.yml` — classifies it A/B/C/D, says how
+urgent it is, and leaves either a rough plan or up to three questions as a
+comment, in German.
 
 | Label | What it means |
 |---|---|
 | `triage/A-config` … `triage/D-internal` | the category; exactly one is ever set |
+| `prio/blocker` | someone cannot work |
+| `prio/hoch` | painful daily, or a workaround that costs real time |
+| `prio/mittel` | wanted, has a workaround |
+| `prio/niedrig` | nice to have |
 | `needs-info` | a question is open, waiting on the requester |
-| `needs-review` | the routine stopped and wants a decision |
-| `triaged` | classified, plan is in the thread |
+| `needs-review` | a human has to decide |
+| `triaged` | classified, the plan is in the thread |
 
-**It plans and asks; it does not build.** It writes no code, creates no branch,
-pushes nothing, edits neither `patches.yml` nor any other file, and never closes
-an issue or marks it `duplicate` or `wontfix` — a colleague's request does not get
-dismissed by an automation. That limit is also what makes it safe to point a
-language model at text other people wrote.
+**It classifies; it never builds.** No code, no diff, no branch, no commit, no
+pull request, no estimate in hours — in any round, however often it is asked. A
+sketch of what would have to happen is the answer; a solution is not.
 
-It stops after three rounds on one issue and hands over with `needs-review`.
+**Every comment gets read.** There is no round limit: if a colleague writes,
+that is processed. What keeps it from talking to itself is not a counter but
+the rule that nothing is written unless it differs from what is already there —
+a comment that adds nothing gets no reply, and labels that already fit are not
+rewritten.
 
-Everything about it that follows a rule rather than a judgement lives in
-[`scripts/triage.sh`](scripts/triage.sh): `gate` says whether the routine may
-act at all, `render` appends the sign-off and the round marker with the right
-number, `finish` strips the footer the platform adds to a posted comment and
-keeps the four `triage/*` labels mutually exclusive. The routine writes the text
-and picks the category; it does not count rounds or edit labels by hand.
+**It writes nothing itself.** The classification comes back as data, and the
+workflow around it posts the comment and sets the labels. The run has no
+credentials at all, so there is nothing to authenticate with even if it tried —
+which is what makes it safe to point a language model at text other people
+wrote. It also never closes an issue and never applies `duplicate` or
+`wontfix`: a colleague's request does not get dismissed by an automation.
 
-Posting is the one step the script does not do. The author of a comment is
-decided by the credentials that post it — so the routine posts through the tool
-that puts the maintainer's name on it, then hands the comment id to `finish`.
-
-Its prompt is [`triage-prompt.md`](triage-prompt.md) — that file is the source of
-truth for what it is told to do; edit it there and update the routine.
+The run works on a throwaway checkout of this repository that is deleted when it
+ends. It may read and search and run read-only commands; the file tools are
+confined to that directory by the CLI itself.
 
 A smaller self-hosted model was considered for the first pass and deferred: the
-run does multi-step tool use (grep the code, read `patches.yml`, compare a patch
-against a release tag) and has to recognise a prompt injection in text other
-people wrote. What a small model could take over is the narrow part —
-category plus reasoning as JSON against a schema, with a schema violation
-escalating — but that drops the "does it already exist?" check, which is the
-most useful thing the routine does. Worth revisiting once the volume justifies
-running and watching another service.
+run does multi-step work — grep the code, read `patches.yml`, compare a patch
+against a release tag — and has to recognise a prompt injection in text other
+people wrote. What a small model could take over is the narrow part — category
+plus reasoning as JSON against a schema, with a schema violation escalating —
+but that drops the "does it already exist?" check, which is the most useful
+thing it does. Worth revisiting once the volume justifies running and watching
+another service.
 
 Writing an issue requires being a collaborator on the fork: the repository is
 public and interaction is limited to `collaborators_only`, so a colleague needs
