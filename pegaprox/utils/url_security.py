@@ -47,8 +47,57 @@ _METADATA_HOSTS = frozenset({
 })
 
 
+def _embedded_ipv4(ip: ipaddress._BaseAddress):
+    """The IPv4 address carried inside an IPv6 transition address, or None.
+
+    Several IPv6 transition schemes embed a full IPv4 address in the v6 address.
+    CPython's classification flags (is_private / is_reserved / …) have covered
+    these inconsistently across 3.12.x point releases, so a guard that trusts the
+    outer-address flags alone has a version-dependent hole
+    (GHSA-ffhp-cpm8-4mpv, reported by tonghuaroot): a 6to4 / NAT64 / Teredo
+    address embedding 169.254.169.254 or 127.0.0.1 can classify as 'public' and
+    slip past. Decode the embedded v4 ourselves and classify THAT, so the verdict
+    is correct on every Python version. Only the well-defined prefixes are decoded;
+    anything else returns None and is classified as the plain v6 address it is.
+    """
+    if not isinstance(ip, ipaddress.IPv6Address):
+        return None
+    # ::ffff:a.b.c.d — IPv4-mapped (the common one; stdlib exposes it directly).
+    if ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    packed = ip.packed
+    # 6to4  2002::/16 (RFC 3056) — the embedded IPv4 is bytes 2..5.
+    if packed[0:2] == b'\x20\x02':
+        return ipaddress.IPv4Address(packed[2:6])
+    # NAT64 well-known prefix 64:ff9b::/96 (RFC 6052) — embedded IPv4 in the last 4 bytes.
+    if packed[0:12] == b'\x00\x64\xff\x9b' + b'\x00' * 8:
+        return ipaddress.IPv4Address(packed[12:16])
+    # NAT64 local-use prefix 64:ff9b:1::/48 (RFC 8215) — embedded IPv4 in the last 4 bytes.
+    if packed[0:6] == b'\x00\x64\xff\x9b\x00\x01':
+        return ipaddress.IPv4Address(packed[12:16])
+    # Teredo 2001:0000::/32 (RFC 4380) — client IPv4 is the last 4 bytes, bitwise-inverted.
+    if packed[0:4] == b'\x20\x01\x00\x00':
+        return ipaddress.IPv4Address(bytes(b ^ 0xFF for b in packed[12:16]))
+    # IPv4-compatible ::/96 (deprecated, RFC 4291 §2.5.5.1) — high 96 bits zero, embedded IPv4 in
+    # the low 32. Caught last so :: / ::1 (also in ::/96) decode to 0.0.0.0 / 0.0.0.1, which stay
+    # blocked as unspecified / reserved. Self-review add (not in the original advisory): the whole
+    # ::/96 range was otherwise left to the stdlib flags — the exact version-dependent reliance this
+    # fix removes for the other schemes. ::ffff:* was already handled above via .ipv4_mapped.
+    if packed[0:12] == b'\x00' * 12:
+        return ipaddress.IPv4Address(packed[12:16])
+    return None
+
+
 def _is_private_or_special(ip: ipaddress._BaseAddress) -> bool:
     """True if the IP falls in a range we should never reach over the public path."""
+    # GHSA-ffhp-cpm8-4mpv — if this is an IPv6 transition address wrapping an IPv4
+    # address, the real destination is that inner v4; classify it instead of trusting
+    # the outer v6's stdlib flags (which miss embedded private/metadata targets on
+    # some Python builds). A wrapped *public* v4 stays allowed; a wrapped private /
+    # loopback / link-local (169.254/16 metadata) / reserved one is blocked.
+    embedded = _embedded_ipv4(ip)
+    if embedded is not None:
+        return _is_private_or_special(embedded)
     return (
         ip.is_private
         or ip.is_loopback
