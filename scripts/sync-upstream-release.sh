@@ -254,13 +254,37 @@ while IFS=$'\x1f' read -r name branch base pr summary kind requested_by; do
         esac
     fi
 
+    # Applied one at a time so a conflict is reported against the commit that
+    # caused it, then squashed: the integration branch carries one commit per
+    # patch, never a branch's development history. Rebuilding it is what makes
+    # `git log cmo/main` readable as "upstream, plus these deltas".
+    before="$(git -C "$WORKTREE" rev-parse HEAD)"
     n=0
     while IFS= read -r sha; do
         [ -n "$sha" ] || continue
         apply_commit "$sha" "$name"
         n=$((n + 1))
     done <<< "$commits"
-    ok "  applied $n commit(s)"
+
+    if [ "$(git -C "$WORKTREE" rev-parse HEAD)" = "$before" ]; then
+        # Every commit turned out to be in the release already.
+        ok "  nothing left to apply — all $n commit(s) already in $RELEASE_TAG"
+    else
+        landed="$(git -C "$WORKTREE" rev-list --count "$before..HEAD")"
+        subject="$(git -C "$WORKTREE" log -1 --format=%s "$before..HEAD" --reverse | head -1)"
+        [ -n "$subject" ] || subject="$name: $summary"
+        git -C "$WORKTREE" reset --quiet --soft "$before"
+        if [ "$landed" -gt 1 ]; then
+            git -C "$WORKTREE" commit --quiet \
+                -m "$subject" \
+                -m "Squashed from $branch ($landed commits):" \
+                -m "$(git -C "$REPO_ROOT" log --format='  %s' --reverse "$merge_base..$FORK_REMOTE/$branch")"
+        else
+            git -C "$WORKTREE" commit --quiet -m "$subject" \
+                -m "From $branch."
+        fi
+        ok "  applied $n commit(s) as one ($subject)"
+    fi
     if [ "$kind" = internal ]; then
         APPLIED_LIST="${APPLIED_LIST}${name}: ${summary} [internal — stays in the fork]"$'\n'
     else

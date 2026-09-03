@@ -41,6 +41,12 @@ is the upstream release with those branches applied on top, in that sequence,
 and nothing else. It is never merged into and never edited directly — anything
 committed straight onto it is gone at the next sync.
 
+**One commit per patch, squashed — never a merge.** However many commits a
+branch took to get right, it arrives on `cmo/main` as one, so `git log
+cmo/main` reads as the upstream release plus a short list of our deltas. The
+script does this for you; do not assemble it by hand, and never merge a branch
+in.
+
 Then run `./scripts/run.sh verify` and include its output in your report.
 
 The scripts use plain git for everything about the upstream repository. Do not
