@@ -82,9 +82,15 @@ nobody can see is better than one that arrived by a route nobody chose.
 
 Say in the report which branch was refused: the fix is to add it to this
 routine's allowed push targets, and the list is explicit on purpose — it holds
-exactly the branches `patches.yml` names, so a new patch branch needs adding
-there once. Nothing widens it by itself, and `main` and `cmo/automation` are
-deliberately not on it.
+`cmo/main`, `cmo/automation` and exactly the branches `patches.yml` names, so a
+new patch branch needs adding there once. Nothing widens it by itself, and
+`main` is deliberately not on it: it mirrors upstream and nothing of ours
+belongs there.
+
+`cmo/automation` is on the list for one reason, dropping a patch entry, and
+that is the whole permission: on that branch you change **`patches.yml` and
+nothing else**. Not the scripts, and not this prompt — a routine that can
+rewrite its own instructions has no instructions.
 
 Then start the rebuild again from the top.
 
