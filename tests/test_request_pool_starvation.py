@@ -9,7 +9,9 @@
 # conftest applies gevent.monkey.patch_all() first, so the pool exists and the client
 # sockets below yield to the server running in the same hub.
 
+import datetime
 import socket
+import ssl
 import time
 
 import gevent
@@ -107,6 +109,82 @@ def test_a_fresh_connection_that_never_sends_a_request_is_closed_too():
     cli = socket.create_connection(('127.0.0.1', server.server_port), timeout=5)
     try:
         assert cli.recv(4096) == b''
+    finally:
+        cli.close()
+        server.stop()
+
+
+def test_headers_that_never_arrive_are_bounded_too():
+    server = _serve(_ok)
+    cli = socket.create_connection(('127.0.0.1', server.server_port), timeout=5)
+    try:
+        cli.sendall(b'GET / HTTP/1.1\r\n')  # request line, then silence instead of headers
+        t0 = time.monotonic()
+        data = b''
+        while True:  # pywsgi answers a timed-out header read with a 400 and hangs up
+            chunk = cli.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        assert time.monotonic() - t0 < 3
+        assert data == b'' or data.startswith(b'HTTP/1.1 400'), data
+    finally:
+        cli.close()
+        server.stop()
+
+
+def test_a_second_request_within_the_timeout_is_served_on_the_same_connection():
+    server = _serve(_ok)
+    cli = socket.create_connection(('127.0.0.1', server.server_port), timeout=5)
+    try:
+        for _ in range(2):
+            cli.sendall(b'GET / HTTP/1.1\r\nHost: x\r\n\r\n')
+            _recv_until(cli, b'ok')
+            gevent.sleep(0.2)  # idle, but under the 0.5 s bound
+    finally:
+        cli.close()
+        server.stop()
+
+
+def _self_signed(tmp_path):
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'localhost')])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+            .public_key(key.public_key()).serial_number(1)
+            .not_valid_before(now - datetime.timedelta(minutes=1))
+            .not_valid_after(now + datetime.timedelta(days=1))
+            .sign(key, hashes.SHA256()))
+    cert_path, key_path = tmp_path / 'cert.pem', tmp_path / 'key.pem'
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(key.private_bytes(serialization.Encoding.PEM,
+                                           serialization.PrivateFormat.TraditionalOpenSSL,
+                                           serialization.NoEncryption()))
+    return str(cert_path), str(key_path)
+
+
+class _TlsServer(c.KeepAliveTimeoutServerMixin, WSGIServer):
+    pass
+
+
+def test_a_tls_client_that_never_starts_the_handshake_is_closed(tmp_path, monkeypatch):
+    # The pool slot is taken before the handler exists: a half-open TCP client that
+    # never sends a ClientHello has to be bounded by the server, not the handler.
+    monkeypatch.setattr(c, 'KEEPALIVE_TIMEOUT', 0.5)
+    cert, key = _self_signed(tmp_path)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+    server = _TlsServer(('127.0.0.1', 0), _ok, handler_class=_Handler, ssl_context=ctx, log=None)
+    server.start()
+    cli = socket.create_connection(('127.0.0.1', server.server_port), timeout=5)
+    try:
+        t0 = time.monotonic()
+        assert cli.recv(4096) == b''
+        assert time.monotonic() - t0 < 3
     finally:
         cli.close()
         server.stop()

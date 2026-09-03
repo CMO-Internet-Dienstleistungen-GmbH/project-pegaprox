@@ -330,23 +330,49 @@ def gevent_listen_socket(host, port, backlog=100):
 KEEPALIVE_TIMEOUT = float(os.environ.get('PEGAPROX_KEEPALIVE_TIMEOUT', '60'))
 
 
+def bound_accepted_socket(sock, timeout=None):
+    """Give a freshly accepted socket the idle bound, so the TLS handshake and
+    the wait for the first request line cannot pin a pool slot forever. Called
+    by the server before it hands the socket to the handler; the handler lifts
+    the bound once the request headers are in. 0 or negative disables it."""
+    timeout = KEEPALIVE_TIMEOUT if timeout is None else timeout
+    if sock is not None and timeout and timeout > 0:
+        sock.settimeout(timeout)
+
+
+class KeepAliveTimeoutServerMixin:
+    """Mix into a gevent.pywsgi.WSGIServer subclass, ahead of it in the MRO:
+    bounds everything before the handler sees the connection — the TLS
+    handshake above all. A half-open client that never sends a ClientHello
+    used to hold its slot until TCP gave up."""
+
+    def wrap_socket_and_handle(self, client_socket, address):
+        bound_accepted_socket(client_socket)
+        return super().wrap_socket_and_handle(client_socket, address)
+
+
 class KeepAliveTimeoutMixin:
-    """Close a keep-alive connection that sends no request line within
-    `keepalive_timeout` seconds. Mix into a gevent.pywsgi.WSGIHandler subclass,
-    ahead of it in the MRO. 0 or a negative value disables the timeout."""
+    """Mix into a gevent.pywsgi.WSGIHandler subclass, ahead of it in the MRO.
+    The wait for a request line and its headers is bounded by
+    `keepalive_timeout`; the application phase after them is not — SSE
+    streams, uploads and websocket sessions live there and are allowed to
+    sit quiet for as long as they like. 0 or a negative value disables it."""
 
     keepalive_timeout = KEEPALIVE_TIMEOUT
 
-    def read_requestline(self):
-        timeout = self.keepalive_timeout
+    def _bound_idle(self, timeout):
         sock = self.socket
-        if not timeout or timeout <= 0 or sock is None:
-            return super().read_requestline()
-        previous = sock.gettimeout()
-        sock.settimeout(timeout)
+        if sock is not None:
+            sock.settimeout(timeout if timeout and timeout > 0 else None)
+
+    def read_requestline(self):
+        # socket.timeout is an OSError: handle_one_request treats it like any
+        # other socket error and closes the connection.
+        self._bound_idle(self.keepalive_timeout)
+        return super().read_requestline()
+
+    def read_request(self, raw_requestline):
         try:
-            # socket.timeout is an OSError: handle_one_request treats it like
-            # any other socket error and closes the connection.
-            return super().read_requestline()
+            return super().read_request(raw_requestline)
         finally:
-            sock.settimeout(previous)
+            self._bound_idle(None)
