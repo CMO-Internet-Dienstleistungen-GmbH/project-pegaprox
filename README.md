@@ -257,17 +257,15 @@ net in case the watcher host is down when a release lands.
 organization and simply stop when the allowance is used up — a watcher that
 quietly dies is worse than no watcher.
 
-## Current patch set
+## The patch set
 
-See `patches.yml` — it is the authority; this list is a summary.
+`patches.yml` is the authority: which patches are in the set, in which order
+they are applied, and what each one is for. It is deliberately not repeated
+here — of two lists saying the same thing, the prose is always the one that
+drifts.
 
-One patch: **system-theme** — the "System" theme that follows the OS light/dark
-setting. Upstream issue #743 is open and PR #745 was closed pending discussion,
-so there is no PR to track; the entry has to be retired by hand once upstream
-ships its own. The branch holds exactly one commit against the release tag.
-
-The three original patches are gone, each solved upstream in a different shape
-than our PR — which is why none of them was dropped automatically:
+Three patches have left the set so far, each solved upstream in a different
+shape than our PR, which is why none of them was dropped automatically:
 
 | Patch | Upstream |
 |---|---|
