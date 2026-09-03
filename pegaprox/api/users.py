@@ -246,7 +246,8 @@ def update_user_preferences():
         'highContrast', 'dracula', 'nord', 'monokai', 'matrix', 'sunset',
         'cyberpunk', 'github', 'solarizedDark', 'gruvbox',
         'corporateDark', 'corporateLight', 'enterpriseBlue',  # NS: Corporate themes
-        'cloud'  # NS 2026-06-05: Cloud skin (Preview)
+        'cloud',  # NS 2026-06-05: Cloud skin (Preview)
+        'system'  # follows the OS light/dark setting; resolved client-side
     ]
     
     if 'theme' in data:
