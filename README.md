@@ -149,29 +149,12 @@ Writing an issue requires being a collaborator on the fork: the repository is
 public and interaction is limited to `collaborators_only`, so a colleague needs
 `pull` access once, and nobody else can file anything.
 
-### Rules for a category D patch
-
-A permanent patch has to survive a rebase onto every future upstream release.
-What makes that cheap:
-
-1. **Additive, not invasive** — a new file or module. What upstream does not
-   know about can never conflict.
-2. **Where touching an upstream file is unavoidable, leave a one-line hook** and
-   put the logic in a file of your own. Minimise the conflict surface, not the
-   line count.
-3. **No refactoring of upstream code** in the same patch. That is what got PR
-   #744 closed, and it multiplies the conflict surface.
-4. **Never edit `web/index.html`** — it is a build artefact; edit `web/src/*.js`
-   and let the sync rebuild the bundle.
-5. **One patch, one concern, one branch** — otherwise the sync cannot drop it
-   individually.
-6. **Leave `.github/workflows/` alone.** A `fix/*` branch goes upstream as a PR,
-   and a diff that touches CI config will not be accepted. Anything the fork
-   needs differently is a repository setting, not a commit.
-
 ## Adding, changing or retiring a patch
 
-Everything lives in [`patches.yml`](patches.yml) — the scripts hardcode nothing:
+Everything lives in [`patches.yml`](patches.yml) — the scripts hardcode
+nothing. What a patch has to look like to survive future releases is in
+[`CLAUDE.md`](CLAUDE.md), not here.
+
 
 ```yaml
 patches:
@@ -256,17 +239,3 @@ net in case the watcher host is down when a release lands.
 **GitHub Actions is deliberately not used here.** Minutes are billed per
 organization and simply stop when the allowance is used up — a watcher that
 quietly dies is worse than no watcher.
-
-## Keep the patch branches, and keep them atomic
-
-A patch branch is the source `cmo/main` is rebuilt from — the integration branch
-itself is disposable, the branches are not. Two rules follow:
-
-- **Do not delete a branch that is still in the set.** Deleting it means the
-  next sync cannot rebuild, and `cmo/main` is force-pushed, so there is nothing
-  to recover it from.
-- **One concern per branch, ideally one commit.** `feat/system-theme` used to
-  carry six commits — a theme-registry refactor and the corporate fix riding
-  along with the feature. When upstream fixed the corporate bug, none of it
-  could be retired individually. It was rebuilt as a single commit against the
-  release tag; that is the shape to aim for.

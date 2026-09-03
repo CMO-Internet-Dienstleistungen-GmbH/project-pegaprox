@@ -1,7 +1,7 @@
 # Project: PegaProx fork automation (`cmo/automation`)
 
 The tooling that keeps the CMO fork of PegaProx in sync with upstream
-releases — `patches.yml`, `scripts/`, the triage prompt. No application code
+releases — `patches.yml`, `scripts/`, `routine-prompt.md`. No application code
 lives on this branch; see `README.md` for how a sync builds `v<release>-cmo.<n>`.
 
 ## Rules & Constraints
@@ -32,6 +32,31 @@ internal goes into them:
   `ISSUE-<yyyy-mm-dd>-<topic>.md` / `PR-<yyyy-mm-dd>-<topic>.md`, checked
   against the live upstream templates (GitHub API, not the local clone), and
   opened by Dennis — never posted by the assistant.
+
+### What a patch has to look like
+
+A patch is replayed onto every future upstream release, so its shape decides
+what each release costs. These hold for every entry in `patches.yml`:
+
+- **Additive, not invasive** — a new file or module. What upstream does not
+  know about can never conflict.
+- **Where touching an upstream file is unavoidable, leave a one-line hook**
+  and put the logic in a file of your own. Minimise the conflict surface, not
+  the line count.
+- **No refactoring of upstream code in the same patch.** That is what got
+  PR #744 closed, and it multiplies the conflict surface.
+- **Never edit `web/index.html`** — it is a build artefact. Edit `web/src/*.js`
+  and let the sync rebuild the bundle.
+- **One patch, one concern, one branch.** Otherwise the sync cannot retire it
+  on its own when upstream absorbs half of it.
+- **Leave `.github/workflows/` alone.** A `fix/*` branch goes upstream as a
+  pull request, and a diff touching CI config will not be accepted. What the
+  fork needs differently is a repository setting, not a commit.
+- **Fill in `upstream_pr` whenever a PR exists.** It is the only drop check
+  that has ever fired here: the patch-id comparison recognises our commits
+  only if they were taken as they are, and the maintainer has so far
+  reimplemented every one of them. Without it, a patch fixed upstream long ago
+  is replayed until somebody notices by hand.
 
 ### Upstream's own conditions
 
