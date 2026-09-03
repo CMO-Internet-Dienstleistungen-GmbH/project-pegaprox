@@ -73,6 +73,13 @@ For each patch whose branch no longer applies, in `patches.yml` order:
    step exists to catch.
 6. Only then `git push --force-with-lease` the branch.
 
+If that push is **refused because the branch is not one this routine may write
+to**, stop there and report it, with the resolved commits still on your local
+branch and their shas in the report. Do not push it somewhere else, do not fold
+the resolution into `cmo/main`, and do not try to widen your own permissions:
+which branches a routine may rewrite is Dennis's decision, and a resolution
+nobody can see is better than one that arrived by a route nobody chose.
+
 Then start the rebuild again from the top.
 
 **Stop and report instead of resolving** when any of these holds. A branch left
