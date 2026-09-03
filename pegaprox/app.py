@@ -1599,6 +1599,12 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
                             pass
                     self._handle_http_redirect(client_socket, address)
                     return
+            except socket.timeout:
+                # nothing arrived within the idle bound: a half-open client,
+                # not a protocol we failed to detect — trying the handshake
+                # would only wait the same bound a second time
+                client_socket.close()
+                return
             except Exception as e:
                 if 'ssl' in str(type(e).__name__).lower():
                     return
