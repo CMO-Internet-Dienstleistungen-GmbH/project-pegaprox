@@ -102,6 +102,14 @@ def run_concurrent(tasks: list, timeout: float = 30.0) -> list:
             greenlets = [GEVENT_POOL.spawn(task) for task in tasks]
             from gevent import joinall
             joinall(greenlets, timeout=timeout)
+            # A task that outlives the timeout keeps its pool slot until it
+            # returns on its own, and the pool is shared process-wide: enough
+            # stragglers and every later spawn blocks in Pool.add, taking the
+            # request that issued it down with it. The result is discarded
+            # anyway, so kill them.
+            for g in greenlets:
+                if not g.ready():
+                    g.kill(block=False)
             results = []
             for g in greenlets:
                 try:
