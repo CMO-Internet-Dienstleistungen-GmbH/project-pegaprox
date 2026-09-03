@@ -1,0 +1,85 @@
+name: 🐛 Etwas funktioniert nicht
+description: Ein Fehler, ein falsches Verhalten oder etwas, das nicht mehr geht
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Ein Bot ordnet das hier innerhalb weniger Minuten ein und stellt
+        Rückfragen, wenn etwas fehlt. Danach schaut ein Mensch drauf. Du musst
+        nichts einordnen und keine Priorität vergeben -- beschreib einfach, was
+        du erlebt hast.
+
+  - type: textarea
+    id: was
+    attributes:
+      label: Was ist passiert?
+      description: In deinen Worten. Ein Screenshot hilft oft mehr als eine Beschreibung.
+      placeholder: Ich wollte ... und dann ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: erwartet
+    attributes:
+      label: Was hattest du erwartet?
+      description: >
+        Klingt banal, ist es nicht: oft steckt genau hier der Unterschied
+        zwischen einem Fehler und einer anderen Erwartung an das Programm.
+    validations:
+      required: true
+
+  - type: textarea
+    id: schritte
+    attributes:
+      label: Wie kommt man dahin?
+      description: Falls es sich nachstellen lässt. "Weiß ich nicht" ist auch eine Antwort.
+      placeholder: |
+        1.
+        2.
+        3.
+
+  - type: dropdown
+    id: bereich
+    attributes:
+      label: Wo ungefähr?
+      description: Nur als grober Hinweis -- daneben liegen ist nicht schlimm.
+      options:
+        - Weiß ich nicht
+        - Übersicht / Dashboard
+        - VM- und Container-Liste
+        - Storage und Backups
+        - Netzwerk
+        - Cluster / Datacenter
+        - Login und Berechtigungen
+        - Einstellungen
+        - API oder CLI
+        - Etwas anderes
+
+  - type: dropdown
+    id: dringlichkeit
+    attributes:
+      label: Wie sehr hält es dich auf?
+      description: >
+        Deine Einschätzung. Die Triage entscheidet am Ende selbst, aber sie
+        rechnet damit -- und "blockiert mich" löst sofort eine Meldung aus.
+      options:
+        - Blockiert mich -- ich komme gerade nicht weiter
+        - Täglich schmerzhaft
+        - Nervt, aber ich habe einen Weg drumherum
+        - Fällt kaum auf
+    validations:
+      required: true
+
+  - type: input
+    id: seit_wann
+    attributes:
+      label: Seit wann?
+      description: Falls du es weißt -- besonders "seit dem Update auf ..." hilft sehr.
+      placeholder: z. B. seit heute früh, oder seit dem Update auf 0.6.7
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logausgabe
+      description: Falls du welche hast. Wird automatisch als Code formatiert.
+      render: shell
