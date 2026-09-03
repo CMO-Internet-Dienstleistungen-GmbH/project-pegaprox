@@ -61,6 +61,15 @@ patches:
     # No issue asked for it; it came out of a conversation about the triage.
     requested_by:
 
+  # Idle keep-alive sockets and run_concurrent stragglers filled the request
+  # pool until the server stopped accepting; see the commit for the analysis.
+  - name: request-pool-starvation
+    branch: fix/request-pool-starvation
+    base: main
+    kind: fix
+    upstream_pr:
+    summary: 'Idle keep-alive connections and run_concurrent stragglers no longer starve the request pool'
+
 # Files whose conflicts are resolved by regenerating them instead of merging.
 # web/index.html is a build artefact (web/Dev/build.sh compiles it from
 # web/index.html.original + web/src/*.js) and conflicts on every backport
