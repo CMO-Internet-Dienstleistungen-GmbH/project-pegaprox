@@ -1,0 +1,75 @@
+name: 💡 Wunsch oder Idee
+description: Etwas, das das Programm können sollte
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Ein Bot ordnet das hier innerhalb weniger Minuten ein und skizziert grob,
+        was zu tun wäre. Er baut nichts -- das entscheidet ein Mensch.
+
+  - type: textarea
+    id: was
+    attributes:
+      label: Was soll möglich sein?
+      placeholder: Ich würde gern ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: wofuer
+    attributes:
+      label: Wofür brauchst du das?
+      description: >
+        Das ist der wichtigste Teil. Aus dem Zweck ergibt sich oft eine
+        einfachere Lösung als die, die man sich zuerst ausdenkt.
+    validations:
+      required: true
+
+  - type: textarea
+    id: heute
+    attributes:
+      label: Wie machst du es heute?
+      description: Der Umweg, den du gerade gehst -- oder ob es gar nicht geht.
+
+  - type: dropdown
+    id: bereich
+    attributes:
+      label: Wo ungefähr?
+      options:
+        - Weiß ich nicht
+        - Übersicht / Dashboard
+        - VM- und Container-Liste
+        - Storage und Backups
+        - Netzwerk
+        - Cluster / Datacenter
+        - Login und Berechtigungen
+        - Einstellungen
+        - API oder CLI
+        - Etwas anderes
+
+  - type: dropdown
+    id: allgemein
+    attributes:
+      label: Nur für uns, oder für alle?
+      description: >
+        Das entscheidet, wohin die Änderung geht: was allgemein nützlich ist,
+        bieten wir upstream an und tragen es nicht dauerhaft selbst. Was nur bei
+        uns Sinn ergibt, bleibt im Fork.
+      options:
+        - Weiß ich nicht
+        - Das könnte jeder PegaProx-Nutzer brauchen
+        - Das ergibt nur bei uns Sinn
+    validations:
+      required: true
+
+  - type: dropdown
+    id: dringlichkeit
+    attributes:
+      label: Wie dringend?
+      options:
+        - Ohne das komme ich nicht weiter
+        - Täglich schmerzhaft
+        - Wäre eine spürbare Erleichterung
+        - Nice to have
+    validations:
+      required: true
