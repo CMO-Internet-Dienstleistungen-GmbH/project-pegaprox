@@ -68,9 +68,10 @@ For each patch whose branch no longer applies, in `patches.yml` order:
    the report. It is how the branch is restored if the rebase turns out wrong.
 2. `git rebase --onto upstream/<base> <old merge-base> <branch>`.
 3. Resolve each conflicted file. Read what upstream changed there and what the
-   patch is for; `summary` in `patches.yml` and the commit messages say so. The
-   result has to still do what the patch set out to do — you are carrying an
-   intent across a moved codebase, not making a merge marker disappear.
+   patch is for: `requested_by` in `patches.yml` names an issue in this fork
+   that states the scope and the acceptance criteria, and that issue — not the
+   diff — is what the resolution has to satisfy. You are carrying an intent
+   across a moved codebase, not making a merge marker disappear.
 4. Run the test suite.
 5. **Check the patch survived.** `git rev-list --count upstream/<base>..<branch>`
    must not be zero, and the diff against upstream must still contain the change
@@ -100,6 +101,27 @@ rewrite its own instructions has no instructions.
 
 Then start the rebuild again from the top.
 
+### What resolving does not include
+
+A conflict is an invitation to change more than it should, and the boundary is
+not a matter of taste:
+
+- **No refactoring.** Not the conflicted file, not what you read on the way
+  there, not "while I am in here anyway". A rename that looks obviously right
+  is still a change nobody asked for, arriving in a commit nobody is reviewing.
+- **No change of scope.** The patch does what its issue says it does. Making it
+  cover one more case, or dropping a case that has become awkward, is a
+  decision about the product — and it would reach `cmo/main` disguised as a
+  merge resolution.
+- **Nothing outside the patch.** A bug you spot in code the patch merely
+  touches is not yours to fix here.
+
+You may **recommend** any of it, and doing so is welcome: open an issue in the
+fork describing what you found and why, and carry on with the resolution. What
+you may not do is act on the recommendation in the same run. The distinction is
+the whole point — a recommendation gets read before it ships, a resolution does
+not.
+
 **Stop and report instead of resolving** when any of these holds. A branch left
 alone costs a release; a branch resolved wrongly ships.
 
@@ -119,6 +141,10 @@ Do not force it through.
   pass `--skip-tests` together with a publish.
 - **A missing branch** named in `patches.yml`. Stop; do not invent one and do
   not drop the entry.
+- **A patch without `requested_by`**, or one whose issue does not exist. That
+  issue is what a conflict is resolved against, so a patch without one cannot
+  be carried across a moved codebase by anybody, you included. Report it and
+  leave the patch alone.
 
 Leave `cmo/main` and the tags exactly as they are in both cases.
 

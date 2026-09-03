@@ -34,9 +34,13 @@ fork:
 #                commit set is an error rather than a silent skip.
 #                An unknown value stops the run: a typo must not quietly turn a
 #                permanent patch back into a droppable one.
-#   requested_by who asked for it -- an issue number in the fork. Only meaningful
-#                for internal patches; it is what tells the next reader why a
-#                permanent delta to upstream exists at all.
+#   requested_by an issue number in **this** fork, and required for every patch.
+#                That issue is the patch's scope: what it does, what it
+#                deliberately does not do, and acceptance criteria that can be
+#                checked. It is what a conflict is resolved against -- without
+#                it, whoever carries the patch across a moved codebase is
+#                guessing at what to preserve. Closed is fine; the work being
+#                done does not make the scope less true.
 patches:
   # Upstream issue #743 is open; PR #745 was closed pending discussion, so there
   # is no PR to track and the entry has to be retired by hand once upstream
@@ -47,6 +51,7 @@ patches:
     kind: feature
     upstream_pr:
     summary: '"System" theme follows the OS light/dark setting (upstream issue #743)'
+    requested_by: 6
 
   # The chooser GitHub shows when someone opens an issue here. Upstream's asks
   # for sponsors and stars; ours asks the two questions the triage needs
@@ -58,8 +63,7 @@ patches:
     kind: internal
     upstream_pr:
     summary: German issue forms that ask what this fork needs, not what upstream needs
-    # No issue asked for it; it came out of a conversation about the triage.
-    requested_by:
+    requested_by: 8
 
   # Idle keep-alive sockets and run_concurrent stragglers filled the request
   # pool until the server stopped accepting; see the commit for the analysis.
@@ -69,6 +73,7 @@ patches:
     kind: fix
     upstream_pr:
     summary: 'Idle keep-alive connections and run_concurrent stragglers no longer starve the request pool'
+    requested_by: 7
 
 # Files whose conflicts are resolved by regenerating them instead of merging.
 # web/index.html is a build artefact (web/Dev/build.sh compiles it from
