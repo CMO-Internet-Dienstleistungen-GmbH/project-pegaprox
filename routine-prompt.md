@@ -80,6 +80,12 @@ the resolution into `cmo/main`, and do not try to widen your own permissions:
 which branches a routine may rewrite is Dennis's decision, and a resolution
 nobody can see is better than one that arrived by a route nobody chose.
 
+Say in the report which branch was refused: the fix is to add it to this
+routine's allowed push targets, and the list is explicit on purpose — it holds
+exactly the branches `patches.yml` names, so a new patch branch needs adding
+there once. Nothing widens it by itself, and `main` and `cmo/automation` are
+deliberately not on it.
+
 Then start the rebuild again from the top.
 
 **Stop and report instead of resolving** when any of these holds. A branch left
