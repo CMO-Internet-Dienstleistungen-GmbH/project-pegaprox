@@ -12410,7 +12410,9 @@ echo "AGENT_INSTALLED_OK"
                     r = self._api_get(net_url)
                     if r.status_code == 200:
                         net_data = r.json().get('data', [])
-                except:
+                except Exception:
+                    # not a bare except: this runs as a run_concurrent task, and
+                    # the GreenletExit the straggler kill throws has to get out
                     pass
 
                 # VM configs on this node - extract bridge assignments
