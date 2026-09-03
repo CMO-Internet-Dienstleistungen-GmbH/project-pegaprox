@@ -29,10 +29,17 @@ git checkout cmo/automation
 
 - **Exit 0** — stop here. Report one line: no new upstream release. Change
   nothing, push nothing.
-- **Exit 10** — run `./scripts/run.sh publish`. It rebuilds the integration
-  branch on the new release, replays our patches, regenerates the frontend
-  bundle, runs the test suite in an isolated venv, and only then force-pushes
-  `cmo/main` and pushes the new `v<release>-cmo.<n>` tag.
+- **Exit 10** — bring every patch branch forward first (see *Making the
+  branches apply again*), then run `./scripts/run.sh publish`. It rebuilds the
+  integration branch on the new release, replays our patches in `patches.yml`
+  order, regenerates the frontend bundle, runs the test suite in an isolated
+  venv, and only then force-pushes `cmo/main` and pushes the new
+  `v<release>-cmo.<n>` tag.
+
+The order in `patches.yml` is the whole definition of the rebuild: `cmo/main`
+is the upstream release with those branches applied on top, in that sequence,
+and nothing else. It is never merged into and never edited directly — anything
+committed straight onto it is gone at the next sync.
 
 Then run `./scripts/run.sh verify` and include its output in your report.
 
@@ -42,19 +49,72 @@ has not attached, and add_repo refuses the upstream one. If a required tool is
 missing (node, npm, python3 with PyYAML), say so plainly in the report instead
 of working around it — that is an environment fix, not a code fix.
 
-## When the script stops with an error
+## Making the branches apply again
 
-Do not try to force it through. The two cases that stop it are deliberate:
+A conflict means upstream changed the same place one of our patches touches.
+Resolving it is your job, and it belongs **in the branch**, not in the rebuilt
+tree: a resolution that lives only inside the rebuild is thrown away with the
+worktree, and the identical conflict comes back at the next release.
 
-- **A conflict that is not a generated file.** An upstream change collides
-  with one of our patches. Report which patch and which files, with the
-  conflicting hunks summarized in plain words. Do not resolve it — that is a
-  decision for Dennis.
-- **Red tests.** Report the failing test names and the assertion output.
-  Never publish a tag from a tree whose tests fail, and never pass
-  `--skip-tests` together with a publish.
+For each patch whose branch no longer applies, in `patches.yml` order:
 
-In both cases leave `cmo/main` and the tags exactly as they are.
+1. Note the current tip — `git rev-parse "$remote/<branch>"` — and put it in
+   the report. It is how the branch is restored if the rebase turns out wrong.
+2. `git rebase --onto upstream/<base> <old merge-base> <branch>`.
+3. Resolve each conflicted file. Read what upstream changed there and what the
+   patch is for; `summary` in `patches.yml` and the commit messages say so. The
+   result has to still do what the patch set out to do — you are carrying an
+   intent across a moved codebase, not making a merge marker disappear.
+4. Run the test suite.
+5. **Check the patch survived.** `git rev-list --count upstream/<base>..<branch>`
+   must not be zero, and the diff against upstream must still contain the change
+   the summary describes. A conflict resolved by taking upstream's side
+   everywhere leaves green tests and no patch — that silent outcome is what this
+   step exists to catch.
+6. Only then `git push --force-with-lease` the branch.
+
+Then start the rebuild again from the top.
+
+**Stop and report instead of resolving** when any of these holds. A branch left
+alone costs a release; a branch resolved wrongly ships.
+
+- You cannot tell what the patch was for.
+- The resolution would change behaviour beyond what the patch covers.
+- The tests stay red after the resolution.
+- **The conflict is with another patch rather than with upstream.** Rebasing
+  onto upstream cannot fix that — the two patches touch the same lines and
+  which one gives way is a product decision. Name both patches and the file.
+
+## When the script stops for another reason
+
+Do not force it through.
+
+- **Red tests** on the rebuilt branch. Report the failing test names and the
+  assertion output. Never publish a tag from a tree whose tests fail, and never
+  pass `--skip-tests` together with a publish.
+- **A missing branch** named in `patches.yml`. Stop; do not invent one and do
+  not drop the entry.
+
+Leave `cmo/main` and the tags exactly as they are in both cases.
+
+## Bringing a finished branch in without an upstream release
+
+A branch that is done — tested and accepted — does not wait for upstream to cut
+a release. This is the same procedure, started by hand rather than by a webhook:
+
+1. Add it to `patches.yml` in the position it should be applied at. Choose
+   `kind` deliberately: `fix` and `feature` are meant to leave again once
+   upstream absorbs them, `internal` never does.
+2. Run `./scripts/run.sh publish` directly. Do not gate it on `check` — `check`
+   only asks whether there is a *new release*, and there is not. It says
+   `maybe-up-to-date` and notes that a full run rebuilds anyway, which is
+   exactly what is wanted here.
+3. The result is a new `<release>-cmo.<n+1>` tag on the same upstream release.
+   That is the intended shape: the upstream base did not move, our delta did.
+
+Everything else is unchanged — the branch is rebased if it no longer applies,
+the tests must be green, and `cmo/main` is rebuilt from `patches.yml` rather
+than committed to.
 
 ## Patches that landed upstream
 
@@ -114,14 +174,25 @@ Keep it short — a maintainer skims it on a phone.
 <one or two sentences on what happened>
 
 - applied: <patch names>
+- rebased: <patch name, old tip -> new tip, what the conflict was>
 - dropped: <patch names, with the merged PR>
 - tests: <pass/fail, count>
 ```
 
+Every rebased branch belongs in that list with its **previous tip**. It is a
+rewrite of the only copy of that work, and the old sha is what makes it
+reversible. If you resolved a conflict, say in one sentence what upstream had
+changed and what you kept — that is the part worth reading.
+
 Do not open pull requests and do not comment on upstream issues.
 
-Never delete or rewrite a patch branch named in `patches.yml`. `cmo/main` is
-rebuilt and force-pushed on every sync, so those branches are the only place
-the work exists — losing one means the fork cannot be rebuilt from the release
-tag any more. Retiring a patch means removing its entry from `patches.yml`,
-never touching the branch.
+Never **delete** a patch branch named in `patches.yml`, and never drop commits
+from one. `cmo/main` is rebuilt and force-pushed on every sync, so those
+branches are the only place the work exists — losing one means the fork cannot
+be rebuilt any more. Retiring a patch means removing its entry from
+`patches.yml`; the branch stays.
+
+Rebasing one onto a new upstream base is the exception, and the only one: that
+is how a branch keeps applying, and it is described above. It stays a rewrite of
+somebody's only copy, so it happens under those conditions and the previous tip
+goes in the report.
