@@ -48,6 +48,19 @@ patches:
     upstream_pr:
     summary: '"System" theme follows the OS light/dark setting (upstream issue #743)'
 
+  # The chooser GitHub shows when someone opens an issue here. Upstream's asks
+  # for sponsors and stars; ours asks the two questions the triage needs
+  # answered. It is `internal` on purpose -- there is no version of this that
+  # upstream would want, so the sync must never decide it has been absorbed.
+  - name: issue-templates
+    branch: chore/issue-templates
+    base: main
+    kind: internal
+    upstream_pr:
+    summary: German issue forms that ask what this fork needs, not what upstream needs
+    # No issue asked for it; it came out of a conversation about the triage.
+    requested_by:
+
 # Files whose conflicts are resolved by regenerating them instead of merging.
 # web/index.html is a build artefact (web/Dev/build.sh compiles it from
 # web/index.html.original + web/src/*.js) and conflicts on every backport
