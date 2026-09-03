@@ -1184,9 +1184,12 @@ def main(debug_mode=False):
     # box) could be consumed by ~16 open dashboard tabs and starve all other API
     # traffic (root of #526's "health spammed, absurdly large time"). Greenlets
     # are cheap so a big pool is fine. Still PEGAPROX_WORKERS-overridable.
-    #           1c VM: 32    4c: 64    8c: 128    32c: 512
+    # DF Sep 2026 — floor raised from 32 to 256: a slot is held for the life
+    # of a connection, not of a request, and four browsers with their six
+    # keep-alive sockets each plus an SSE stream filled 32 on a 2-core VM.
+    #           <=16c: 256    32c: 512
     cpu_count = multiprocessing.cpu_count()
-    workers = int(os.environ.get('PEGAPROX_WORKERS', max(32, cpu_count * 16)))
+    workers = int(os.environ.get('PEGAPROX_WORKERS', max(256, cpu_count * 16)))
 
     print(f"System: {cpu_count} CPU cores detected")
     print(f"Memory optimization: Garbage collection tuned for {workers} workers")
@@ -1500,8 +1503,19 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
 
     # NS: Custom handler to suppress SSL error tracebacks completely
     # These happen when users close browser tabs - totally normal
+    # DF Sep 2026 — idle keep-alive connections must not hold a request-pool
+    # slot forever: see KeepAliveTimeoutMixin. Applied to whichever handler
+    # class the server ends up with.
+    from gevent.pywsgi import WSGIHandler as _WSGIHandler
+    from pegaprox.utils.concurrent import (
+        KeepAliveTimeoutMixin, KeepAliveTimeoutServerMixin, bound_accepted_socket,
+    )
+
+    class KeepAliveWSGIHandler(KeepAliveTimeoutMixin, _WSGIHandler):
+        pass
+
     if use_websocket_handler:
-        class QuietWebSocketHandler(WebSocketHandler):
+        class QuietWebSocketHandler(KeepAliveTimeoutMixin, WebSocketHandler):
             def handle_one_response(self):
                 try:
                     return super().handle_one_response()
@@ -1518,7 +1532,7 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
         QuietWebSocketHandler = None
 
     # Custom error handler to suppress SSL errors (from bots/scanners/disconnects)
-    class QuietWSGIServer(WSGIServer):
+    class QuietWSGIServer(KeepAliveTimeoutServerMixin, WSGIServer):
         def wrap_socket_and_handle(self, client_socket, address):
             """Override to catch SSL errors during handshake"""
             try:
@@ -1559,6 +1573,8 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
             """Peek at first bytes to detect protocol"""
             if not self.ssl_args:
                 return super().wrap_socket_and_handle(client_socket, address)
+            # the peek below runs before the server mixin gets to bound the socket
+            bound_accepted_socket(client_socket)
             try:
                 first_byte = client_socket.recv(1, socket.MSG_PEEK)
                 if not first_byte:
@@ -1583,6 +1599,12 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
                             pass
                     self._handle_http_redirect(client_socket, address)
                     return
+            except socket.timeout:
+                # nothing arrived within the idle bound: a half-open client,
+                # not a protocol we failed to detect — trying the handshake
+                # would only wait the same bound a second time
+                client_socket.close()
+                return
             except Exception as e:
                 if 'ssl' in str(type(e).__name__).lower():
                     return
@@ -1687,6 +1709,8 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
     server_kwargs = {'log': None, 'spawn': _RequestPool(workers)}
     if use_websocket_handler and QuietWebSocketHandler:
         server_kwargs['handler_class'] = QuietWebSocketHandler
+    else:
+        server_kwargs['handler_class'] = KeepAliveWSGIHandler
 
     is_ipv6_bind = ':' in bind_host
 

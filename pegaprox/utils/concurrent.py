@@ -62,7 +62,15 @@ def run_concurrent(tasks: list, timeout: float = 30.0) -> list:
             # Wait for all with timeout
             from gevent import joinall
             joinall(greenlets, timeout=timeout)
-            
+            # A task that outlives the timeout keeps its pool slot until it
+            # returns on its own, and the pool is shared process-wide: enough
+            # stragglers and every later spawn blocks in Pool.add, taking the
+            # request that issued it down with it. The result is discarded
+            # anyway, so kill them.
+            for g in greenlets:
+                if not g.ready():
+                    g.kill(block=False)
+
             results = []
             for g in greenlets:
                 try:
@@ -305,3 +313,66 @@ def gevent_listen_socket(host, port, backlog=100):
     sock.setblocking(False)
     return sock
 
+
+# ============================================
+# Keep-alive idle timeout for the request pool — DF Sep 2026
+# ============================================
+#
+# gevent.pywsgi keeps an accepted connection open for as long as the client does
+# and never bounds the wait for the next request line. Every such connection
+# holds one greenlet of the request pool (`spawn=Pool(workers)`), and the server
+# stops accepting the moment that pool is full: a handful of browsers, each with
+# its idle keep-alive sockets plus an SSE stream, and nobody gets a connection
+# any more — the listen backlog fills and every request times out while the
+# process sits idle. Bound the *idle* wait only: a request that is being read,
+# an SSE stream, an upload or a websocket keeps an unbounded socket.
+
+KEEPALIVE_TIMEOUT = float(os.environ.get('PEGAPROX_KEEPALIVE_TIMEOUT', '60'))
+
+
+def bound_accepted_socket(sock, timeout=None):
+    """Give a freshly accepted socket the idle bound, so the TLS handshake and
+    the wait for the first request line cannot pin a pool slot forever. Called
+    by the server before it hands the socket to the handler; the handler lifts
+    the bound once the request headers are in. 0 or negative disables it."""
+    timeout = KEEPALIVE_TIMEOUT if timeout is None else timeout
+    if sock is not None and timeout and timeout > 0:
+        sock.settimeout(timeout)
+
+
+class KeepAliveTimeoutServerMixin:
+    """Mix into a gevent.pywsgi.WSGIServer subclass, ahead of it in the MRO:
+    bounds everything before the handler sees the connection — the TLS
+    handshake above all. A half-open client that never sends a ClientHello
+    used to hold its slot until TCP gave up."""
+
+    def wrap_socket_and_handle(self, client_socket, address):
+        bound_accepted_socket(client_socket)
+        return super().wrap_socket_and_handle(client_socket, address)
+
+
+class KeepAliveTimeoutMixin:
+    """Mix into a gevent.pywsgi.WSGIHandler subclass, ahead of it in the MRO.
+    The wait for a request line and its headers is bounded by
+    `keepalive_timeout`; the application phase after them is not — SSE
+    streams, uploads and websocket sessions live there and are allowed to
+    sit quiet for as long as they like. 0 or a negative value disables it."""
+
+    keepalive_timeout = KEEPALIVE_TIMEOUT
+
+    def _bound_idle(self, timeout):
+        sock = self.socket
+        if sock is not None:
+            sock.settimeout(timeout if timeout and timeout > 0 else None)
+
+    def read_requestline(self):
+        # socket.timeout is an OSError: handle_one_request treats it like any
+        # other socket error and closes the connection.
+        self._bound_idle(self.keepalive_timeout)
+        return super().read_requestline()
+
+    def read_request(self, raw_requestline):
+        try:
+            return super().read_request(raw_requestline)
+        finally:
+            self._bound_idle(None)
