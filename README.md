@@ -257,27 +257,7 @@ net in case the watcher host is down when a release lands.
 organization and simply stop when the allowance is used up — a watcher that
 quietly dies is worse than no watcher.
 
-## The patch set
-
-`patches.yml` is the authority: which patches are in the set, in which order
-they are applied, and what each one is for. It is deliberately not repeated
-here — of two lists saying the same thing, the prose is always the one that
-drifts.
-
-Three patches have left the set so far. Every one of them had to be removed by
-hand, because neither automatic check fires in the case that actually occurs:
-the maintainer reimplements the fix rather than taking our commits, which gives
-it a different patch-id, and our pull request is closed rather than merged, so
-the `upstream_pr` lookup stays silent. Checking each remaining patch against
-the new release by hand is therefore part of every sync, not a formality.
-
-| Patch | Upstream |
-|---|---|
-| vnc-console-under-gevent | issue #740, fixed in 1.1.0 |
-| taskbar-remount-expand | issue #738, fixed in 1.1.0 |
-| corporate-theme-source-of-truth | issue #742, fixed in 1.1.0 (702bfa5 + c53a859); our PR #744 was closed, not merged |
-
-### Keep the patch branches, and keep them atomic
+## Keep the patch branches, and keep them atomic
 
 A patch branch is the source `cmo/main` is rebuilt from — the integration branch
 itself is disposable, the branches are not. Two rules follow:
