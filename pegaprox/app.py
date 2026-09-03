@@ -1500,8 +1500,17 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
 
     # NS: Custom handler to suppress SSL error tracebacks completely
     # These happen when users close browser tabs - totally normal
+    # DF Sep 2026 — idle keep-alive connections must not hold a request-pool
+    # slot forever: see KeepAliveTimeoutMixin. Applied to whichever handler
+    # class the server ends up with.
+    from gevent.pywsgi import WSGIHandler as _WSGIHandler
+    from pegaprox.utils.concurrent import KeepAliveTimeoutMixin
+
+    class KeepAliveWSGIHandler(KeepAliveTimeoutMixin, _WSGIHandler):
+        pass
+
     if use_websocket_handler:
-        class QuietWebSocketHandler(WebSocketHandler):
+        class QuietWebSocketHandler(KeepAliveTimeoutMixin, WebSocketHandler):
             def handle_one_response(self):
                 try:
                     return super().handle_one_response()
@@ -1687,6 +1696,8 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
     server_kwargs = {'log': None, 'spawn': _RequestPool(workers)}
     if use_websocket_handler and QuietWebSocketHandler:
         server_kwargs['handler_class'] = QuietWebSocketHandler
+    else:
+        server_kwargs['handler_class'] = KeepAliveWSGIHandler
 
     is_ipv6_bind = ':' in bind_host
 
