@@ -264,8 +264,12 @@ they are applied, and what each one is for. It is deliberately not repeated
 here — of two lists saying the same thing, the prose is always the one that
 drifts.
 
-Three patches have left the set so far, each solved upstream in a different
-shape than our PR, which is why none of them was dropped automatically:
+Three patches have left the set so far. Every one of them had to be removed by
+hand, because neither automatic check fires in the case that actually occurs:
+the maintainer reimplements the fix rather than taking our commits, which gives
+it a different patch-id, and our pull request is closed rather than merged, so
+the `upstream_pr` lookup stays silent. Checking each remaining patch against
+the new release by hand is therefore part of every sync, not a formality.
 
 | Patch | Upstream |
 |---|---|
