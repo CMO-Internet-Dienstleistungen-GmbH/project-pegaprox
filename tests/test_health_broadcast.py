@@ -7,7 +7,7 @@ import pytest
 
 import pegaprox.background.health as hb
 import pegaprox.globals as ppglobals
-from pegaprox.core.health import invalidate_cluster_health
+from pegaprox.core.health import get_cluster_health, invalidate_cluster_health
 from tests.conftest import make_fake_manager
 
 
@@ -29,7 +29,7 @@ def _isolated(monkeypatch):
     invalidate_cluster_health()
 
 
-def _register(cluster_id='cluster_1', **overrides):
+def _register(cluster_id='cluster_1', requested=True, **overrides):
     kw = dict(
         get_node_status={'pve1': {'status': 'online'}},
         get_storage_list=[{'storage': 'local', 'active': 1, 'total': 100, 'used': 10}],
@@ -39,6 +39,11 @@ def _register(cluster_id='cluster_1', **overrides):
     mgr = make_fake_manager(cluster_id, **kw)
     mgr.is_connected = True
     ppglobals.cluster_managers[cluster_id] = mgr
+    if requested:
+        # Stands in for the badge's first REST read, which is what puts a cluster
+        # into the cache. The loop only keeps warm what someone asked for.
+        get_cluster_health(cluster_id, mgr)
+        mgr.get_storage_list.reset_mock()
     return mgr
 
 
@@ -121,22 +126,29 @@ def test_keepalive_resends_for_late_joiners(_isolated, monkeypatch):
     assert len(_isolated) == 2, 'round 3 should have re-sent despite no change'
 
 
-def test_unwatching_forgets_the_dedup_state(_isolated, monkeypatch):
-    """Otherwise the next viewer is deduped against a frame they never received."""
+def test_returning_viewer_gets_a_frame_again(_isolated, monkeypatch):
+    """Leaving and coming back must not leave a viewer staring at an empty badge.
+
+    The dedup etag is dropped on unsubscribe, so the returning client is not
+    silenced by a frame it never received. It re-enters through the same door as
+    the first time: the badge's REST read fills the cache, the loop takes over."""
     watched = {'v': True}
     monkeypatch.setattr(hb, 'is_cluster_watched', lambda cid: watched['v'])
     monkeypatch.setattr(hb, '_KEEPALIVE_ROUNDS', 0)
-    _register()
+    mgr = _register()
 
     hb._broadcast_round(1)
     assert len(_isolated) == 1
 
     watched['v'] = False
-    hb._broadcast_round(2)
+    hb._broadcast_round(2)                  # unsubscribed: etag and rollup dropped
+
     watched['v'] = True
+    get_cluster_health('cluster_1', mgr)    # the badge's first read on return
     hb._broadcast_round(3)
 
     assert len(_isolated) == 2, 'the returning viewer got no frame'
+    assert hb._last_etag.get('cluster_1'), 'dedup state was not re-established'
 
 
 def test_one_broken_cluster_does_not_stop_the_others(_isolated, monkeypatch):
@@ -149,3 +161,37 @@ def test_one_broken_cluster_does_not_stop_the_others(_isolated, monkeypatch):
 
     sent_for = {cid for _, cid, _ in _isolated}
     assert 'cluster_ok' in sent_for, 'a failing cluster suppressed a healthy one'
+
+
+def test_subscribed_but_never_requested_cluster_costs_nothing(_isolated, monkeypatch):
+    """A client subscribes to every cluster expanded in its sidebar, but the badge
+    renders for one of them. Computing the rest would spend a storage fan-out per
+    cluster on a number nobody displays — at a single viewer that is more work than
+    the polling this replaces, not less."""
+    monkeypatch.setattr(hb, 'is_cluster_watched', lambda cid: True)
+    shown = _register('cluster_shown', requested=True)
+    idle = _register('cluster_idle', requested=False)
+
+    hb._broadcast_round(1)
+
+    assert idle.get_storage_list.call_count == 0, (
+        'a subscribed but never-displayed cluster was computed'
+    )
+    assert shown.get_storage_list.call_count > 0
+    assert {cid for _, cid, _ in _isolated} == {'cluster_shown'}
+
+
+def test_unsubscribing_drops_the_rollup(_isolated, monkeypatch):
+    """Otherwise the loop keeps refreshing a cluster nobody has open any more."""
+    from pegaprox.core.health import peek_cluster_health
+    watched = {'v': True}
+    monkeypatch.setattr(hb, 'is_cluster_watched', lambda cid: watched['v'])
+    _register()
+
+    hb._broadcast_round(1)
+    assert peek_cluster_health('cluster_1') is not None
+
+    watched['v'] = False
+    hb._broadcast_round(2)
+    assert peek_cluster_health('cluster_1') is None, 'the rollup outlived its viewers'
+
