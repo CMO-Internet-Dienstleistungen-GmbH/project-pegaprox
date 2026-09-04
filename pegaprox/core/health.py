@@ -29,10 +29,20 @@ import threading
 import time
 from datetime import datetime, timezone
 
-# How long a computed rollup stays good. Short on purpose: this is a health
-# readout, and a viewer opening the dashboard should not see a minute-old number.
-# The point is that N viewers within one window cost one computation, not N.
-_HEALTH_TTL_S = float(os.environ.get('PEGAPROX_HEALTH_TTL', '15'))
+# How long a computed rollup stays good.
+#
+# This MUST exceed the broadcast refresher's interval (background/health.py,
+# 60s). The refresher is what keeps the cache warm; if entries expire before it
+# comes round again, the cache is cold for most of every cycle and whoever asks
+# in that window pays the full storage fan-out. Measured on a live instance with
+# a 15s TTL: requests came back in either 100ms (hit) or 4s (miss), which is that
+# gap made visible.
+#
+# The staleness this allows is bounded by the refresher, not by this number: it
+# rewrites the entry every 60s regardless. The TTL only decides what happens to a
+# cluster the refresher is NOT servicing — one nobody is watching — and there a
+# recomputation on first request is the right answer anyway.
+_HEALTH_TTL_S = float(os.environ.get('PEGAPROX_HEALTH_TTL', '90'))
 
 # cluster_id -> {'payload': dict, 'etag': str, 'at': float}
 _cache = {}

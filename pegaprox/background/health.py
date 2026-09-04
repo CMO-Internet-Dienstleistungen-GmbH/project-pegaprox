@@ -34,6 +34,10 @@ from pegaprox.utils.realtime import broadcast_sse, is_cluster_watched
 # Matches the interval the badge used to poll at. That is the point of reference
 # that matters: at one viewer this must cost what it cost before, or the change is
 # a regression dressed as an optimisation. Every additional viewer is then free.
+#
+# Keep this BELOW _HEALTH_TTL_S in core.health: this loop is what keeps the cache
+# warm, so an entry must not expire between two rounds. Otherwise the REST
+# endpoint recomputes from scratch for whoever asks in the gap.
 _INTERVAL_S = float(os.environ.get('PEGAPROX_HEALTH_BROADCAST_INTERVAL', '60'))
 
 # Re-send an unchanged rollup every Nth round, so a client that connected after
