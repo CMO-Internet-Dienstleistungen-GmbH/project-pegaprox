@@ -89,6 +89,20 @@ patches:
     summary: 'The UI stops re-arming its polling effects on every render, and the guest-info fan-out stops feeding itself'
     requested_by: 10
 
+  # The health rollup is a cluster-wide number, but every tab used to compute its
+  # own -- get_node_status() plus one uncached storage call per online node, per
+  # request. Now it is computed once per watched cluster and pushed over the SSE
+  # channel that already carries resources/metrics/tasks. Ordered after
+  # ui-request-amplification: both touch the guest-info filter in web/src/tables.js,
+  # and the resolution keeps BOTH guards (`!r.ip` plus that patch's cache probe).
+  - name: cluster-state-broadcast
+    branch: feat/cluster-state-broadcast
+    base: main
+    kind: feature
+    upstream_pr:
+    summary: 'Cluster health is computed once per cluster and broadcast, instead of polled by every tab'
+    requested_by: 11
+
 # Files whose conflicts are resolved by regenerating them instead of merging.
 # web/index.html is a build artefact (web/Dev/build.sh compiles it from
 # web/index.html.original + web/src/*.js) and conflicts on every backport
