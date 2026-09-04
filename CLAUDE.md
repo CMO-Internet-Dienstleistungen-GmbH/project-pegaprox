@@ -62,6 +62,30 @@ value would let a stranger do. A quantity lets them reproduce the finding. A
 name lets them find our machine. When a log line carries both — and it
 usually does — the numbers stay and the names become placeholders.
 
+### How a patch reaches `cmo/main`
+
+**One patch is one commit on `cmo/main`, squashed.** However many commits the
+feature branch carries, they land as a single commit in `patches.yml` order —
+`git merge --squash <branch>`, then one commit describing the patch as a whole.
+Don't let the squash inherit the last branch commit's subject; if the branch
+ends on a test commit, that subject describes the wrong thing.
+
+The branch keeps its own history and is never deleted or flattened. `cmo/main`
+is the rebuilt side, the branch is the source of truth, and the squash exists so
+each release rebuild moves one commit per patch instead of a chain.
+
+**Rebuild `web/index.html` rather than merging it.** It is a generated bundle,
+so git will happily auto-merge two builds line by line and produce something
+that no longer matches `web/src`. After the squash-merge, run `web/Dev/build.sh`
+and let it overwrite the file — `patches.yml` lists it under `generated_files`
+for exactly this reason. That the auto-merge sometimes matches the rebuild byte
+for byte is luck, not a reason to skip it.
+
+Adding a commit on top of `cmo/main` this way is a fast-forward and needs no
+force. It survives only until the next release rebuild, which regenerates
+`cmo/main` from the branches — which is fine, and precisely why the branch has
+to exist and stay.
+
 ### What a patch has to look like
 
 A patch is replayed onto every future upstream release, so its shape decides
