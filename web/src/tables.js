@@ -1532,14 +1532,25 @@
             }, [filteredResources, effectivePage, itemsPerPage]);
 
             // fetch IPs for visible running qemu VMs - #127
-            // Walks the list at most IP_CACHE_MAX_PARALLEL at a time: a page holds up
-            // to 500 rows, and the old unbounded forEach put every one of them on the
-            // wire at once, each costing up to six sequential guest-agent calls server
-            // side.
+            // Two filters before anything goes on the wire, and one bound on what
+            // does. They are independent savings — keep both.
+            //
+            // Skip any guest the resources frame already carries an address for:
+            // get_vm_resources() injects `ip`/`ip_addresses` from the manager's
+            // _ip_cache, which _ip_refresh_loop fills every 30s for watched
+            // clusters. For most guests the answer is already on screen. Guests
+            // the server has no address for (agent still booting, none at all)
+            // fall through to the per-VM call.
+            //
+            // What is left walks at most IP_CACHE_MAX_PARALLEL at a time: a page
+            // holds up to 500 rows, and the old unbounded forEach put every one of
+            // them on the wire at once, each costing up to six sequential
+            // guest-agent calls server side.
             useEffect(() => {
                 if (!paginatedResources?.length) return;
                 const toFetch = paginatedResources.filter(r =>
                     r.type === 'qemu' && r.status === 'running' &&
+                    !r.ip &&
                     _ipCacheEntry(r._clusterId || clusterId, r.vmid) === undefined
                 );
                 if (!toFetch.length) return;

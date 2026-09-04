@@ -5,7 +5,7 @@ import json
 import logging
 import threading
 import uuid
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, make_response, request
 
 from pegaprox.constants import *
 from pegaprox.globals import *
@@ -22,6 +22,10 @@ from pegaprox.utils.rbac import (
 )
 from pegaprox.utils.realtime import broadcast_sse, broadcast_update, push_immediate_update
 from pegaprox.core.config import load_config, save_config
+from pegaprox.core.health import (
+    get_cluster_health as compute_health_cached,
+    invalidate_cluster_health,
+)
 from pegaprox.core.manager import PegaProxManager
 from pegaprox.core.xcpng import XcpngManager, XENAPI_AVAILABLE
 from pegaprox.api.helpers import load_server_settings, get_connected_manager, check_cluster_access, safe_error
@@ -830,177 +834,23 @@ def get_cluster_health(cluster_id):
         return jsonify({'error': 'Cluster not found'}), 404
 
     mgr = cluster_managers[cluster_id]
-    score = 100
-    factors = []
-    issues = []
 
-    # Connectivity gate — if API isn't reachable, everything else is moot
-    if not mgr.is_connected:
-        return jsonify({
-            'score': 0,
-            'band': 'critical',
-            'factors': [{'key': 'api', 'label': 'API connectivity', 'value': 'disconnected', 'delta': -100}],
-            'issues': ['Cluster API not reachable'],
-            'computed_at': None,
-        })
+    # The rollup itself lives in pegaprox/core/health.py so the SSE broadcaster can
+    # compute it too. It is a cluster-wide number, identical for every viewer, so
+    # it is memoised there instead of being recomputed once per request per tab.
+    payload, etag, _from_cache = compute_health_cached(cluster_id, mgr)
 
-    # 1) Nodes online
-    try:
-        ns = mgr.get_node_status() or {}
-    except Exception:
-        ns = {}
-    total_nodes = len(ns)
-    online_nodes = sum(1 for n in ns.values() if (n.get('status') in ('online', 'running') or not n.get('offline')))
-    if total_nodes:
-        offline = total_nodes - online_nodes
-        delta = -25 * offline
-        score += delta
-        factors.append({
-            'key': 'nodes', 'label': 'Nodes online',
-            'value': f'{online_nodes}/{total_nodes}', 'delta': delta,
-            'severity': 'critical' if offline else 'ok',
-        })
-        if offline:
-            offline_names = [name for name, d in ns.items()
-                             if d.get('status') == 'offline' or d.get('offline')]
-            issues.append(f'{offline} node(s) offline: {", ".join(offline_names) or "?"}')
-
-    # 2) Storage pressure — worst-offender across all nodes
-    # MK 2026-05-31 (F1a) — parallelise the per-node get_storage_list fanout.
-    # Was sequential: N nodes × ~200ms = up to 1.2s for a 6-node cluster, and
-    # one slow node could push past 5s. /health is dashboard-polled every
-    # ~10-20s, so this used to chew gevent workers. run_concurrent_dict skips
-    # the broken `if GEVENT_POOL` truthy check in the older inline callsites.
-    worst_pct = 0.0
-    worst_label = None
-    try:
-        from pegaprox.utils.concurrent import run_concurrent_dict
-        # Only scan ONLINE nodes — a dead node's storage call would otherwise
-        # park the whole parallel batch at the 10s gevent-pool timeout (we'd
-        # be waiting for joinall to finish). Sequential code masked this
-        # because the connection failed fast, but parallel waits the full
-        # timeout. Net: post-parallelise /health was SLOWER on degraded
-        # clusters until this filter went in.
-        # MK 2026-05-31 (D2) — also drop any node-name that doesn't pass the
-        # RFC-1035-ish check. PVE controls these but if PVE itself were ever
-        # compromised, a crafted name like `../foo` would be interpolated
-        # into the storage-list URL. Belt-and-suspenders.
-        import re as _re
-        _SAFE_NODE = _re.compile(r'^[a-zA-Z][a-zA-Z0-9.\-]{0,62}$')
-        online_node_names = [
-            name for name, d in ns.items()
-            if (d.get('status') in ('online', 'running') or not d.get('offline'))
-            and name and _SAFE_NODE.match(name)
-        ]
-        if online_node_names:
-            tasks = {n: (lambda nn=n: mgr.get_storage_list(nn) or []) for n in online_node_names}
-            per_node_stors = run_concurrent_dict(tasks, timeout=8)
-        else:
-            per_node_stors = {}
-        for node_name, stors in per_node_stors.items():
-            for s in (stors or []):
-                if not s.get('active'):
-                    continue
-                total = s.get('total') or 0
-                used = s.get('used') or 0
-                if total <= 0:
-                    continue
-                pct = (used / total) * 100.0
-                if pct > worst_pct:
-                    worst_pct = pct
-                    worst_label = f"{s.get('storage', '?')} @ {node_name}"
-    except Exception as e:
-        logging.debug(f"[health] storage scan failed: {e}")
-    if worst_label is not None:
-        if worst_pct >= 95:
-            d = -25
-        elif worst_pct >= 90:
-            d = -15
-        elif worst_pct >= 80:
-            d = -5
-        else:
-            d = 0
-        score += d
-        factors.append({
-            'key': 'storage', 'label': 'Worst storage',
-            'value': f'{worst_label} ({worst_pct:.0f}%)', 'delta': d,
-            'severity': 'critical' if worst_pct >= 95 else 'warning' if worst_pct >= 80 else 'ok',
-        })
-        if worst_pct >= 90:
-            issues.append(f'Storage near full: {worst_label} at {worst_pct:.0f}%')
-
-    # 3) Replication — failed jobs hurt
-    try:
-        repl = mgr.get_replication_status() or []
-    except Exception:
-        repl = []
-    if repl:
-        # PVE flags failures via 'fail_count' or non-zero error
-        failed = sum(1 for r in repl if (r.get('fail_count') or 0) > 0 or r.get('error'))
-        d = max(-20, -5 * failed)
-        score += d
-        factors.append({
-            'key': 'replication', 'label': 'Replication',
-            'value': f'{failed} failing / {len(repl)} jobs',
-            'delta': d,
-            'severity': 'warning' if failed else 'ok',
-        })
-        if failed:
-            issues.append(f'{failed} replication job(s) failing')
-
-    # 4) Backup-SLA — only if admin set a max-age threshold on the cluster
-    try:
-        db = get_db()
-        row = db.conn.cursor().execute(
-            "SELECT backup_sla_max_age_hours FROM clusters WHERE id = ?", (cluster_id,)
-        ).fetchone()
-        max_age = (dict(row).get('backup_sla_max_age_hours') if row else None) or 0
-    except Exception:
-        max_age = 0
-    if max_age and max_age > 0:
-        # Pull the most-recent backup timestamp via cluster/backup-info — cheap call
-        try:
-            import time as _t
-            now = _t.time()
-            url = f"https://{mgr.host}:{mgr.api_port}/api2/json/cluster/backup-info/not-backed-up"
-            r = mgr._api_get(url)
-            stale = 0
-            if r is not None and r.status_code == 200:
-                stale = len(r.json().get('data') or [])
-            d = -10 if stale else 0
-            score += d
-            factors.append({
-                'key': 'backup_sla', 'label': 'Backup SLA',
-                'value': f'{stale} VM(s) past RPO ({max_age}h)' if stale else 'within RPO',
-                'delta': d,
-                'severity': 'warning' if stale else 'ok',
-            })
-            if stale:
-                issues.append(f'{stale} VMs past backup RPO of {max_age}h')
-        except Exception as e:
-            logging.debug(f"[health] backup-sla check failed: {e}")
-
-    # Clamp & band
-    score = max(0, min(100, score))
-    if score >= 90:
-        band = 'excellent'
-    elif score >= 70:
-        band = 'good'
-    elif score >= 50:
-        band = 'warning'
-    elif score >= 30:
-        band = 'degraded'
+    # A repeat with nothing changed costs a 304 instead of a fan-out over every
+    # node. app.py's after_request only applies no-store when the route set no
+    # Cache-Control of its own, so this header survives.
+    inm = request.headers.get('If-None-Match', '')
+    if etag in [t.strip() for t in inm.split(',') if t.strip()]:
+        resp = make_response('', 304)
     else:
-        band = 'critical'
-
-    import datetime as _dt
-    return jsonify({
-        'score': score,
-        'band': band,
-        'factors': factors,
-        'issues': issues,
-        'computed_at': _dt.datetime.utcnow().isoformat() + 'Z',
-    })
+        resp = make_response(jsonify(payload))
+    resp.headers['ETag'] = etag
+    resp.headers['Cache-Control'] = 'private, max-age=0, must-revalidate'
+    return resp
 
 
 # MK May 2026 — API latency dashboard backing endpoint. Reads the deque the

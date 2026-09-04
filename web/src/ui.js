@@ -1727,7 +1727,7 @@
 
         // NS May 2026 — single-number cluster health pill. Polls /health every 60s.
         // Hover for factor breakdown, click for full modal.
-        function ClusterHealthBadge({ clusterId, authFetch, apiUrl }) {
+        function ClusterHealthBadge({ clusterId, authFetch, apiUrl, health }) {
             const [data, setData] = React.useState(null);
             const [loading, setLoading] = React.useState(false);
             const [showDetails, setShowDetails] = React.useState(false);
@@ -1747,11 +1747,25 @@
                 finally { setLoading(false); }
             }, [clusterId, authFetch, apiUrl]);
 
+            // `health` arrives over SSE, computed once per cluster for everyone
+            // watching it. Feeding it into the same state the poll writes keeps the
+            // whole render path below unchanged — the badge does not care which of
+            // the two produced the number.
+            const pushed = !!health;
             React.useEffect(() => {
+                if (health) setData(health);
+            }, [health]);
+
+            React.useEffect(() => {
+                // The first read still goes over REST: without it the badge stays
+                // empty until the next broadcast, which can be a whole interval away.
                 fetchHealth();
-                const id = setInterval(fetchHealth, 60000);
+                // The poll stays as a fallback — a dropped stream, a server older
+                // than this bundle, or a stream carrying no health frames must still
+                // produce a number. It just runs far more slowly once frames arrive.
+                const id = setInterval(fetchHealth, pushed ? 600000 : 60000);
                 return () => clearInterval(id);
-            }, [fetchHealth]);
+            }, [fetchHealth, pushed]);
 
             if (!clusterId) return null;
             if (!data && loading) {

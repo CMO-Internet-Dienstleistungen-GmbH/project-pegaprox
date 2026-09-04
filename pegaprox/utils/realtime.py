@@ -322,7 +322,7 @@ def broadcast_sse(update_type: str, data: dict, cluster_id: str = None, target_c
         # NS: Added 'tasks' and 'resources' - broadcast loop sends these types
         cluster_specific_events = ['node_status', 'vm_update', 'task_update', 'tasks',
                                    'metrics', 'resources', 'migration', 'maintenance',
-                                   'ha_event', 'alert', 'ha_status']
+                                   'ha_event', 'alert', 'ha_status', 'health']
         is_cluster_specific = update_type in cluster_specific_events or cluster_id is not None
 
         # #736 — cache each scoped user's filtered 'resources' frame within this broadcast, so we
