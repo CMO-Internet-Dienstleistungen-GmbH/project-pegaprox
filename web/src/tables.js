@@ -2,6 +2,55 @@
         // PegaProx - Tables & Cards
         // NodeCard + ResourceTable
         // ═══════════════════════════════════════════════
+        // NS: #127 - lazy-loaded guest-agent IPs, cached at module scope.
+        //
+        // Module scope rather than a component ref: ResourceTable is conditionally
+        // rendered (activeTab / resourcesSubTab), so a ref lost every entry on a tab
+        // switch and the whole visible page was re-fetched on the way back.
+        //
+        // Keyed by cluster AND vmid: a module-scope cache outlives the cluster
+        // selection, and vmids repeat across clusters.
+        //
+        // Entries carry a timestamp, because a cache that outlives the component has
+        // to expire or a guest that changed address never updates. A "no address"
+        // answer is stored as a RESULT: while it was left falsy, the guard read it as
+        // a miss and re-requested the guest on every pass — and since each answer
+        // bumps ipTick (-> new paginatedResources -> effect runs again) that closed
+        // into a loop whose rate was bounded only by response latency.
+        //
+        // How many of these reads run at once, and for how long, is upstream's
+        // GUEST_INFO_AT_ONCE / GUEST_INFO_TIMEOUT_MS queue in ResourceTable.
+        const IP_CACHE_TTL_MS = 300000;    // 5 min for a resolved address
+        // 2 min before retrying a guest that reported no address. Long, on purpose:
+        // a guest that has no agent does not grow one within seconds, and this
+        // interval is paid once per such guest per window — at a page size of 500
+        // a short retry is its own steady request load.
+        const IP_CACHE_RETRY_MS = 120000;
+        // A refused or failed call (a 429 among them) waits longer than a guest
+        // that merely has no address yet: asking again soon only adds to the load
+        // that refused it.
+        const IP_CACHE_FAILED_RETRY_MS = 300000;
+        const _ipCache = new Map();        // "cid/vmid" -> {ip: string|null, at: ms} | 'loading'
+
+        function _ipCacheKey(clusterId, vmid) { return clusterId + '/' + vmid; }
+
+        // undefined = nothing usable cached, go fetch. 'loading' = already in flight.
+        function _ipCacheEntry(clusterId, vmid) {
+            const e = _ipCache.get(_ipCacheKey(clusterId, vmid));
+            if (e === undefined || e === 'loading') return e;
+            const ttl = e.retryMs || (e.ip === null ? IP_CACHE_RETRY_MS : IP_CACHE_TTL_MS);
+            return (Date.now() - e.at) > ttl ? undefined : e;
+        }
+
+        // Last known address for display. Ignores the TTL on purpose so a row keeps
+        // showing the previous address instead of blanking while it refreshes.
+        function _ipCacheValue(clusterId, vmid) {
+            const e = _ipCache.get(_ipCacheKey(clusterId, vmid));
+            return (e && e !== 'loading' && e.ip) ? e.ip : '';
+        }
+
+        try { window.PegaProxIpCache = { map: _ipCache, key: _ipCacheKey, entry: _ipCacheEntry, value: _ipCacheValue }; } catch (_) {}
+
         function getProxmoxNodeHost(target = {}, fallbackName = '') {
             const candidates = [
                 target.node_ip,
@@ -1530,12 +1579,9 @@
             const [openDropdown, setOpenDropdown] = useState(null); // action dropdown menu
             const prevResources = useRef(resources);  // for comparison, not really used
 
-            // NS: #127 - lazy-load IPs from guest agent for running qemu VMs
-            const ipCache = useRef({});
+            // NS: #127 - lazy-load IPs from guest agent for running qemu VMs.
+            // The cache itself lives at module scope (see _ipCache above).
             const [ipTick, setIpTick] = useState(0);
-            // vmid -> when a guest that gave no address may be asked again. Without it every
-            // render of the list asked it again, many times a second for each open tab
-            const ipRetryAt = useRef({});
 
             const filterLabels = {
                 all: t('all'),
@@ -1548,8 +1594,7 @@
             // NS #431: IP sorts by octet value, not as a string. Pull the IP from
             // the lazy guest-agent cache (qemu) or off the resource (lxc); blanks last.
             const getIp = (r) => {
-                const c = ipCache.current[r.vmid];
-                return (c && c !== 'loading') ? c : (r.ip || '');
+                return _ipCacheValue(r._clusterId || clusterId, r.vmid) || (r.ip || '');
             };
             const ipSortKey = (ip) => {
                 const m = String(ip || '').match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/);
@@ -1678,26 +1723,32 @@
                 while (q.busy < GUEST_INFO_AT_ONCE && q.queue.length) {
                     const vm = q.queue.shift();
                     // scrolled or filtered away while it waited
-                    if (!q.visible.has(vm.vmid)) { ipCache.current[vm.vmid] = null; continue; }
+                    const cid = vm._clusterId || clusterId;
+                    const key = _ipCacheKey(cid, vm.vmid);
+                    if (!q.visible.has(vm.vmid)) { _ipCache.delete(key); continue; }
                     q.busy++;
                     const ctrl = new AbortController();
                     q.ctrls.add(ctrl);
                     const timer = setTimeout(() => ctrl.abort(), GUEST_INFO_TIMEOUT_MS);
-                    const cid = vm._clusterId || clusterId;
-                    // no address yet (agent still starting or not installed): again in a minute.
-                    // A refused, failed or timed out call, a 429 among them, waits five
-                    const retryIn = (ms) => { ipCache.current[vm.vmid] = null; ipRetryAt.current[vm.vmid] = Date.now() + ms; };
+                    // no address yet (agent still starting or not installed) is an answer and
+                    // kept as one (IP_CACHE_RETRY_MS). A refused, failed or timed out call, a
+                    // 429 among them, waits longer (IP_CACHE_FAILED_RETRY_MS)
                     fetch(`/api/clusters/${cid}/vms/${vm.node}/qemu/${vm.vmid}/guest-info`, {
                         credentials: 'include', headers: getAuthHeaders(), signal: ctrl.signal
                     })
                     .then(r => r.ok ? r.json() : Promise.reject(r.status))
                     .then(data => {
-                        if (!data?.ip_addresses?.length) return retryIn(60000);
-                        ipCache.current[vm.vmid] = data.ip_addresses[0];
-                        delete ipRetryAt.current[vm.vmid];
-                        setIpTick(t => t + 1);
+                        _ipCache.set(key, {
+                            ip: data?.ip_addresses?.length ? data.ip_addresses[0] : null,
+                            at: Date.now()
+                        });
+                        if (!ctrl.left) setIpTick(t => t + 1);
                     })
-                    .catch(() => { if (ctrl.left) ipCache.current[vm.vmid] = null; else retryIn(300000); })
+                    .catch(() => {
+                        // stopped by a cluster switch: no answer, so nothing is kept
+                        if (ctrl.left) _ipCache.delete(key);
+                        else _ipCache.set(key, { ip: null, at: Date.now(), retryMs: IP_CACHE_FAILED_RETRY_MS });
+                    })
                     .finally(() => { clearTimeout(timer); q.ctrls.delete(ctrl); q.busy--; pumpIps(); });
                 }
             }, [clusterId]);
@@ -1705,19 +1756,18 @@
                 const q = ipFetch.current;
                 q.visible = new Set((paginatedResources || []).map(r => r.vmid));
                 if (!paginatedResources?.length) return;
-                const now = Date.now();
                 const toFetch = paginatedResources.filter(r =>
                     r.type === 'qemu' && r.status === 'running' && !r.ip && r.agent_running !== false
-                    && !ipCache.current[r.vmid] && !(ipRetryAt.current[r.vmid] > now)
+                    && _ipCacheEntry(r._clusterId || clusterId, r.vmid) === undefined
                 );
                 if (!toFetch.length) return;
-                toFetch.forEach(vm => { ipCache.current[vm.vmid] = 'loading'; q.queue.push(vm); });
+                toFetch.forEach(vm => { _ipCache.set(_ipCacheKey(vm._clusterId || clusterId, vm.vmid), 'loading'); q.queue.push(vm); });
                 pumpIps();
             }, [paginatedResources]);
             // another cluster (or the list gone): what waits is dropped, what runs is stopped
             useEffect(() => () => {
                 const q = ipFetch.current;
-                q.queue.forEach(vm => { ipCache.current[vm.vmid] = null; });
+                q.queue.forEach(vm => { _ipCache.delete(_ipCacheKey(vm._clusterId || clusterId, vm.vmid)); });
                 q.queue = [];
                 q.ctrls.forEach(c => { c.left = true; c.abort(); });
             }, [clusterId]);
