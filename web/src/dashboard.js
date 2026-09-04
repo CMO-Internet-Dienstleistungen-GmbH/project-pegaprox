@@ -7990,6 +7990,27 @@
             return true;
         }
 
+        // Joins an identical GET that is already on the wire instead of putting a
+        // second one there. The capture behind this change had 40% of all API calls
+        // starting while the same URL was still in flight.
+        //
+        // Deliberately narrow — only plain GETs with no timeout, signal or body. A
+        // shared request must not be abortable by one of its callers, and a caller
+        // that passed opts.timeout expects its own abort to apply to its own request.
+        //
+        // Every caller gets its own clone(): a Response body can be read once, so
+        // handing the same object to two callers would fail the second .json(). The
+        // stored response is never read itself, only cloned from.
+        const _inflightGets = new Map();   // url -> Promise<Response>
+
+        function _dedupeGet(url, doFetch) {
+            const running = _inflightGets.get(url);
+            if (running) return running.then(res => res.clone());
+            const p = doFetch().finally(() => { _inflightGets.delete(url); });
+            _inflightGets.set(url, p);
+            return p.then(res => res.clone());
+        }
+
         function PegaProxDashboard() {
             const { t } = useTranslation();
             const { user, sessionId, logout, getAuthHeaders, isAdmin, passwordExpiry, updatePreferences } = useAuth();
@@ -8628,12 +8649,17 @@
                     timer = setTimeout(() => ctrl.abort(), timeout);
                 }
                 try {
-                    const res = await fetch(url, {
+                    const init = {
                         ...rest,
                         credentials: 'include',
                         signal: ctrl ? ctrl.signal : rest.signal,
                         headers: { ...rest.headers, ...getAuthHeaders() }
-                    });
+                    };
+                    const dedupable = !timeout && !rest.signal && !rest.body &&
+                        (!rest.method || String(rest.method).toUpperCase() === 'GET');
+                    const res = dedupable
+                        ? await _dedupeGet(url, () => fetch(url, init))
+                        : await fetch(url, init);
                     // #144: detect session loss early — don't auto-logout on auth/check or SSE
                     if (res.status === 401 && !url.includes('/auth/') && !url.includes('/sse')) {
                         console.warn('[authFetch] 401 on', url.split('?')[0]);
