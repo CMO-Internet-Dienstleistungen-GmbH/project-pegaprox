@@ -75,6 +75,18 @@ patches:
     summary: 'Idle keep-alive connections and run_concurrent stragglers no longer starve the request pool'
     requested_by: 7
 
+  # One idle tab produced ~4 REST calls/s: authFetch was rebuilt on every render,
+  # so the seven ui.js components that depend on it had their polling effects
+  # re-armed by every SSE frame; and the guest-info cache treated a "no address"
+  # answer as a cache miss, which closed into a self-feeding loop.
+  - name: ui-request-amplification
+    branch: fix/ui-request-amplification
+    base: main
+    kind: fix
+    upstream_pr:
+    summary: 'The UI stops re-arming its polling effects on every render, and the guest-info fan-out stops feeding itself'
+    requested_by: 10
+
 # Files whose conflicts are resolved by regenerating them instead of merging.
 # web/index.html is a build artefact (web/Dev/build.sh compiles it from
 # web/index.html.original + web/src/*.js) and conflicts on every backport
