@@ -23,14 +23,18 @@ import os
 import threading
 import time
 
-from pegaprox.core.health import get_cluster_health
+from pegaprox.core.health import (
+    get_cluster_health,
+    invalidate_cluster_health,
+    peek_cluster_health,
+)
 from pegaprox.globals import cluster_managers
 from pegaprox.utils.realtime import broadcast_sse, is_cluster_watched
 
-# How often the rollup is recomputed for a watched cluster. Well above the TTL in
-# core.health so the REST endpoint keeps being served from a warm cache between
-# broadcasts rather than recomputing on the first request after expiry.
-_INTERVAL_S = float(os.environ.get('PEGAPROX_HEALTH_BROADCAST_INTERVAL', '20'))
+# Matches the interval the badge used to poll at. That is the point of reference
+# that matters: at one viewer this must cost what it cost before, or the change is
+# a regression dressed as an optimisation. Every additional viewer is then free.
+_INTERVAL_S = float(os.environ.get('PEGAPROX_HEALTH_BROADCAST_INTERVAL', '60'))
 
 # Re-send an unchanged rollup every Nth round, so a client that connected after
 # the last change still receives a value without waiting for one.
@@ -45,11 +49,24 @@ def _broadcast_round(round_no):
     for cid, mgr in list(cluster_managers.items()):
         try:
             if not is_cluster_watched(cid):
-                # Nobody is looking. Drop any remembered etag so the next viewer
-                # gets a frame instead of being deduped against a stale one.
+                # Nobody is subscribed. Drop the remembered etag so a returning
+                # viewer gets a frame instead of being deduped against one they
+                # never received, and drop the rollup so this cluster stops
+                # costing anything at all.
                 _last_etag.pop(cid, None)
+                invalidate_cluster_health(cid)
                 continue
             if not getattr(mgr, 'is_connected', False):
+                continue
+
+            # Only keep warm what someone actually asked for. A client subscribes
+            # to every cluster it has expanded in the sidebar, but the health
+            # badge renders for ONE of them — computing the rest would spend a
+            # storage fan-out per cluster on a number nobody displays, which at
+            # one viewer is worse than the polling this replaces. The badge's
+            # first read goes over REST and fills the cache; from then on this
+            # loop keeps it fresh.
+            if peek_cluster_health(cid) is None:
                 continue
 
             payload, etag, _from_cache = get_cluster_health(cid, mgr, force=True)
