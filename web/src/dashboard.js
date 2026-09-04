@@ -7947,6 +7947,10 @@
             const [allClusterGuests, setAllClusterGuests] = useState({}); // NS: Mar 2026 - per-cluster guests for topology
             const [knownNodes, setKnownNodes] = useState({}); // NS: Track all nodes ever seen to show offline ones
             const [clusterResources, setClusterResources] = useState([]);
+            // cluster_id -> health rollup, pushed over SSE (see the 'health' branch
+            // in the SSE handler). The REST poll in ClusterHealthBadge stays as a
+            // fallback for a dropped stream or a server that predates the push.
+            const [clusterHealth, setClusterHealth] = useState({});
             const [clusterDatastores, setClusterDatastores] = useState({ shared: [], local: {} }); // LW: Mar 2026 - sidebar datastore list
             const [clusterNetworks, setClusterNetworks] = useState([]); // NS: Mar 2026 - network view
             const [loadingNetworks, setLoadingNetworks] = useState(false);
@@ -10779,6 +10783,14 @@
                                         if (!prev[data.cluster_id]) return prev;
                                         return { ...prev, [data.cluster_id]: { ...prev[data.cluster_id], metrics: data.data } };
                                     });
+                                }
+                            } else if (data.type === 'health') {
+                                // The cluster health rollup, computed once per cluster on
+                                // the server instead of polled by every open tab. Keyed by
+                                // cluster so the sidebar and a switched-to cluster can use
+                                // the last value without asking for it again.
+                                if (data.cluster_id) {
+                                    setClusterHealth(prev => ({ ...prev, [data.cluster_id]: data.data }));
                                 }
                             } else if (data.type === 'resources') {
                                 if (currentCluster && data.cluster_id === currentCluster.id) {
@@ -15111,7 +15123,7 @@
                                                                 {selectedCluster.connected ? t('online') : t('offline')}
                                                             </span>
                                                             {selectedCluster.connected && (
-                                                                <ClusterHealthBadge clusterId={selectedCluster.id} authFetch={authFetch} apiUrl={API_URL} />
+                                                                <ClusterHealthBadge clusterId={selectedCluster.id} authFetch={authFetch} apiUrl={API_URL} health={clusterHealth[selectedCluster.id]} />
                                                             )}
                                                         </div>
                                                         <button onClick={() => loadTabData('overview')} className="text-xs" style={{color: 'var(--corp-text-muted)', background: 'none', border: 'none', cursor: 'pointer'}}>
