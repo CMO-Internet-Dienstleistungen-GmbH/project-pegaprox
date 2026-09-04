@@ -1289,6 +1289,49 @@
         // NS: Added bulk select for mass operations (migration, etc.)
         // This component does a lot... might need to split it up eventually
         // NS: filtering + sorting uses useMemo below (lines 1320+)
+        // NS: #127 - lazy-loaded guest-agent IPs, cached at module scope.
+        //
+        // Module scope rather than a component ref: ResourceTable is conditionally
+        // rendered (activeTab / resourcesSubTab), so a ref lost every entry on a tab
+        // switch and the whole visible page was re-fetched on the way back.
+        //
+        // Keyed by cluster AND vmid: a module-scope cache outlives the cluster
+        // selection, and vmids repeat across clusters.
+        //
+        // Entries carry a timestamp, because a cache that outlives the component has
+        // to expire or a guest that changed address never updates. A "no address"
+        // answer is stored as a RESULT: while it was left falsy, the guard read it as
+        // a miss and re-requested the guest on every pass — and since each answer
+        // bumps ipTick (-> new paginatedResources -> effect runs again) that closed
+        // into a loop whose rate was bounded only by response latency.
+        const IP_CACHE_TTL_MS = 300000;    // 5 min for a resolved address
+        // 2 min before retrying a guest that reported no address. Long, on purpose:
+        // a guest that has no agent does not grow one within seconds, and this
+        // interval is paid once per such guest per window — at a page size of 500
+        // a short retry is its own steady request load.
+        const IP_CACHE_RETRY_MS = 120000;
+        const IP_CACHE_MAX_PARALLEL = 6;   // page size goes up to 500 — do not fan out
+        const _ipCache = new Map();        // "cid/vmid" -> {ip: string|null, at: ms} | 'loading'
+
+        function _ipCacheKey(clusterId, vmid) { return clusterId + '/' + vmid; }
+
+        // undefined = nothing usable cached, go fetch. 'loading' = already in flight.
+        function _ipCacheEntry(clusterId, vmid) {
+            const e = _ipCache.get(_ipCacheKey(clusterId, vmid));
+            if (e === undefined || e === 'loading') return e;
+            const ttl = e.ip === null ? IP_CACHE_RETRY_MS : IP_CACHE_TTL_MS;
+            return (Date.now() - e.at) > ttl ? undefined : e;
+        }
+
+        // Last known address for display. Ignores the TTL on purpose so a row keeps
+        // showing the previous address instead of blanking while it refreshes.
+        function _ipCacheValue(clusterId, vmid) {
+            const e = _ipCache.get(_ipCacheKey(clusterId, vmid));
+            return (e && e !== 'loading' && e.ip) ? e.ip : '';
+        }
+
+        try { window.PegaProxIpCache = { map: _ipCache, key: _ipCacheKey, entry: _ipCacheEntry, value: _ipCacheValue }; } catch (_) {}
+
         function ResourceTable({ resources, clusterId, clusters, sourceCluster, onVmAction, onOpenConsole, onOpenSpice, onOpenConfig, onMigrate, onBulkMigrate, onDelete, onClone, onForceStop, onCrossClusterMigrate, nodes, datastores, onOpenTags, highlightedVm, addToast, pendingVmAction, onPendingActionConsumed, onVmNavigate, backupStatus }) {
             const { t } = useTranslation();
             const { getAuthHeaders, user } = useAuth();
@@ -1403,8 +1446,8 @@
             const [openDropdown, setOpenDropdown] = useState(null); // action dropdown menu
             const prevResources = useRef(resources);  // for comparison, not really used
 
-            // NS: #127 - lazy-load IPs from guest agent for running qemu VMs
-            const ipCache = useRef({});
+            // NS: #127 - lazy-load IPs from guest agent for running qemu VMs.
+            // The cache itself lives at module scope (see _ipCache above).
             const [ipTick, setIpTick] = useState(0);
 
             const filterLabels = {
@@ -1418,8 +1461,7 @@
             // NS #431: IP sorts by octet value, not as a string. Pull the IP from
             // the lazy guest-agent cache (qemu) or off the resource (lxc); blanks last.
             const getIp = (r) => {
-                const c = ipCache.current[r.vmid];
-                return (c && c !== 'loading') ? c : (r.ip || '');
+                return _ipCacheValue(r._clusterId || clusterId, r.vmid) || (r.ip || '');
             };
             const ipSortKey = (ip) => {
                 const m = String(ip || '').match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/);
@@ -1490,26 +1532,43 @@
             }, [filteredResources, effectivePage, itemsPerPage]);
 
             // fetch IPs for visible running qemu VMs - #127
+            // Walks the list at most IP_CACHE_MAX_PARALLEL at a time: a page holds up
+            // to 500 rows, and the old unbounded forEach put every one of them on the
+            // wire at once, each costing up to six sequential guest-agent calls server
+            // side.
             useEffect(() => {
                 if (!paginatedResources?.length) return;
                 const toFetch = paginatedResources.filter(r =>
-                    r.type === 'qemu' && r.status === 'running' && !ipCache.current[r.vmid]
+                    r.type === 'qemu' && r.status === 'running' &&
+                    _ipCacheEntry(r._clusterId || clusterId, r.vmid) === undefined
                 );
                 if (!toFetch.length) return;
-                toFetch.forEach(vm => {
-                    ipCache.current[vm.vmid] = 'loading';
+
+                let cancelled = false;
+                let cursor = 0;
+                const runNext = () => {
+                    if (cancelled || cursor >= toFetch.length) return;
+                    const vm = toFetch[cursor++];
                     const cid = vm._clusterId || clusterId;
+                    const key = _ipCacheKey(cid, vm.vmid);
+                    _ipCache.set(key, 'loading');
                     fetch(`/api/clusters/${cid}/vms/${vm.node}/qemu/${vm.vmid}/guest-info`, {
                         credentials: 'include', headers: getAuthHeaders()
                     })
                     .then(r => r.ok ? r.json() : null)
                     .then(data => {
-                        ipCache.current[vm.vmid] = data?.ip_addresses?.length ? data.ip_addresses[0] : null;
-                        setIpTick(t => t + 1);
+                        _ipCache.set(key, {
+                            ip: data?.ip_addresses?.length ? data.ip_addresses[0] : null,
+                            at: Date.now()
+                        });
+                        if (!cancelled) setIpTick(t => t + 1);
                     })
-                    .catch(() => { ipCache.current[vm.vmid] = null; });
-                });
-            }, [paginatedResources]);
+                    .catch(() => { _ipCache.set(key, { ip: null, at: Date.now() }); })
+                    .finally(runNext);
+                };
+                for (let i = 0; i < Math.min(IP_CACHE_MAX_PARALLEL, toFetch.length); i++) runNext();
+                return () => { cancelled = true; };
+            }, [paginatedResources, clusterId, getAuthHeaders]);
 
             const handleSort = (col) => {
                 let nextBy = col, nextDir = 'asc';
@@ -2195,7 +2254,7 @@
                                                     <span className="text-sm text-gray-300 truncate block" style={{maxWidth:'min(140px, 12vw)'}} title={resource.node}>{resource.node}</span>
                                                 </td>
                                                 <td className="px-4 py-3">
-                                                    <span className="text-xs font-mono text-gray-400">{ipCache.current[resource.vmid] && ipCache.current[resource.vmid] !== 'loading' ? ipCache.current[resource.vmid] : '-'}</span>
+                                                    <span className="text-xs font-mono text-gray-400">{_ipCacheValue(resource._clusterId || clusterId, resource.vmid) || '-'}</span>
                                                 </td>
                                                 <td className="px-4 py-3">
                                                     <div className="flex items-center gap-2">
