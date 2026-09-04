@@ -166,3 +166,17 @@ def test_offline_node_lowers_the_score(api):
     nodes = [f for f in payload['factors'] if f['key'] == 'nodes'][0]
     assert nodes['value'] == '1/2'
     assert any('offline' in i for i in payload['issues'])
+
+
+def test_ttl_outlives_the_refresher_interval():
+    """The refresher is what keeps the cache warm. If entries expire before it
+    comes round again, the cache is cold for most of every cycle and whoever asks
+    in that window pays the full storage fan-out — which is exactly what a live
+    instance showed: responses in either 100ms or 4s, never in between."""
+    from pegaprox.core.health import _HEALTH_TTL_S
+    from pegaprox.background.health import _INTERVAL_S
+
+    assert _HEALTH_TTL_S > _INTERVAL_S, (
+        f'TTL {_HEALTH_TTL_S}s must outlive the refresh interval {_INTERVAL_S}s, '
+        'or the cache is cold between rounds'
+    )
