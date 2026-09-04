@@ -79,6 +79,8 @@ patches:
   # so the seven ui.js components that depend on it had their polling effects
   # re-armed by every SSE frame; and the guest-info cache treated a "no address"
   # answer as a cache miss, which closed into a self-feeding loop.
+  # Upstream issue #782 carries the measurements. No PR yet, so `upstream_pr`
+  # stays empty and the patch-id heuristic is the only drop check for now.
   - name: ui-request-amplification
     branch: fix/ui-request-amplification
     base: main
