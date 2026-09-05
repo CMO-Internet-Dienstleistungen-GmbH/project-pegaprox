@@ -4172,15 +4172,17 @@ class PegaProxDB:
                 _ss = self.get_server_settings() or {}
                 _SECRET_KEYS = ('smtp_password', 'ldap_bind_password', 'oidc_client_secret',
                                 'acme_dns_rfc2136_secret', 'acme_dns_cloudflare_token')
-                _changed = False
                 for _k in _SECRET_KEYS:
                     _v = _ss.get(_k)
                     if _v and isinstance(_v, str) and _v.startswith('aes256:'):
-                        _ss[_k] = self._encrypt_with_key(
-                            self._decrypt_with_key(_v, old_aesgcm), new_aesgcm)
-                        _changed = True
-                if _changed:
-                    self.save_server_settings(_ss)
+                        # write through our own cursor, NOT save_server_settings — that helper
+                        # commits per key, which would land every re-encrypted row above while
+                        # the new key is still only in memory, and leave step 4's rollback with
+                        # nothing to undo. Everything here has to reach the same transaction.
+                        cursor.execute('INSERT OR REPLACE INTO server_settings (key, value) '
+                                       'VALUES (?, ?)',
+                                       (_k, json.dumps(self._encrypt_with_key(
+                                           self._decrypt_with_key(_v, old_aesgcm), new_aesgcm))))
             except Exception as e:
                 stats['errors'].append(f"Server settings secrets: {e}")
 

@@ -910,6 +910,28 @@ def test_key_rotation_aborts_cleanly_if_the_key_cannot_be_persisted(db, monkeypa
     assert db.get_cluster('c-abort')['pass'] == 'keepme'
 
 
+def test_key_rotation_rollback_survives_an_encrypted_server_setting(db, monkeypatch, tmp_path):
+    """Same abort, with a secret in server_settings. Rotating those went through
+    save_server_settings, which commits per key — so the re-encrypted clusters, BMC passwords
+    and audit signatures were all committed while the new key was still only in memory, and
+    the rollback below had nothing left to undo. The test above only passed because its
+    fixture has no encrypted server setting to trigger that commit."""
+    db.save_cluster('c-abort', {'name': 'a', 'host': 'h', 'user': 'root@pam', 'pass': 'keepme'})
+    db.save_server_setting('ldap_bind_password', db._encrypt('bindpw'))
+    real_open = open
+    def _boom(path, mode='r', *a, **kw):
+        if 'w' in mode and str(path).endswith(('.key', '.backup')) or '.backup.' in str(path):
+            raise OSError('no space left on device')
+        return real_open(path, mode, *a, **kw)
+    monkeypatch.setattr('builtins.open', _boom)
+    res = db.rotate_encryption_key()
+    monkeypatch.undo()
+    assert res.get('success') is False, res
+    # everything the rotation touched must still decrypt with the on-disk key
+    assert db.get_cluster('c-abort')['pass'] == 'keepme'
+    assert db._decrypt(db.get_server_settings()['ldap_bind_password']) == 'bindpw'
+
+
 def test_backup_verification_reads_are_scoped():
     """start_backup_verification gates the target per VM and binds the volid to the vmid, but
     the status, history and active reads beside it had only check_cluster_access — so a scoped
