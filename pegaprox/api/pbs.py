@@ -717,6 +717,17 @@ def _pbs_task_guest(worker_id):
     return parts[0], parts[1]
 
 
+def _pbs_upid_guest(upid):
+    """('vm'|'ct', '100') out of a PBS UPID.
+
+    A UPID is 'UPID:node:pid:pstart:taskid:starttime:worker_type:worker_id:user:' and the
+    worker_id is itself colon-separated, so pick the guest out of the whole string instead
+    of counting fields."""
+    import re
+    m = re.search(r'(?:^|[:/])(vm|ct)/(\d+)(?:[:/]|$)', str(upid or ''))
+    return (m.group(1), m.group(2)) if m else (None, None)
+
+
 def _authz_pbs_backup(mgr, backup_type, backup_id, permission='vm.backup', user=None):
     """NS Aug 2026 (sec-report, BOLA/CWE-639) — object-level scope for PBS backup ops.
 
@@ -810,7 +821,12 @@ def get_pbs_tasks(pbs_id):
     running = request.args.get('running', None)
     result = mgr.get_tasks(limit=limit, typefilter=typefilter,
                             running=bool(int(running)) if running is not None else None)
-    return jsonify(result.get('data', []))
+    # sec (audit) — the report path scopes these very rows; the raw list didn't, so a scoped
+    # caller read every guest's backup history off the same server. Rows with no guest (gc,
+    # prune, sync) carry no per-object question, so they go the same way as everywhere else:
+    # kept for an unconfined caller, dropped for a confined one.
+    return jsonify(_scope_pbs_rows(mgr, result.get('data', []) or [],
+                                   key_fn=lambda t: _pbs_task_guest(t.get('worker_id') or t.get('id'))))
 
 
 @bp.route('/api/pbs/<pbs_id>/tasks/<path:upid>', methods=['GET'])
@@ -824,6 +840,11 @@ def get_pbs_task_detail(pbs_id, upid):
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
+    # sec (audit) — the log names the archives and the guest it backed up
+    _bt, _bid = _pbs_upid_guest(upid)
+    ok, err = _authz_pbs_backup(mgr, _bt, _bid, 'vm.view')
+    if not ok:
+        return err
     status = mgr.get_task_status(upid)
     log = mgr.get_task_log(upid)
     return jsonify({
@@ -978,6 +999,11 @@ def get_pbs_snapshot_notes(pbs_id, store):
     btime = request.args.get('backup-time')
     if not all([bt, bid, btime]):
         return jsonify({'error': 'Missing backup-type, backup-id, or backup-time'}), 400
+    # sec (audit) — same per-backup owner check the PUT twin below carries. A datastore spans
+    # every guest on every linked cluster, so reading is as much a boundary as writing.
+    ok, err = _authz_pbs_backup(mgr, bt, bid, 'vm.view')
+    if not ok:
+        return err
     result = mgr.get_snapshot_notes(store, bt, bid, int(btime))
     if 'error' in result:
         return jsonify(result), 500
@@ -1027,6 +1053,9 @@ def get_pbs_group_notes(pbs_id, store):
     bid = request.args.get('backup-id')
     if not all([bt, bid]):
         return jsonify({'error': 'Missing backup-type or backup-id'}), 400
+    ok, err = _authz_pbs_backup(mgr, bt, bid, 'vm.view')      # sec (audit), as above
+    if not ok:
+        return err
     result = mgr.get_group_notes(store, bt, bid)
     if 'error' in result:
         return jsonify(result), 500
@@ -3262,6 +3291,11 @@ def diff_pbs_backups(pbs_id):
     ts_b = request.args.get('b', '')
     if not all([store, btype, bid, ts_a, ts_b]):
         return jsonify({'error': 'store, type, id, a, b query params required'}), 400
+    # sec (audit) — type+id name a guest, and the diff hands back its manifests; the seven
+    # sibling routes that take the same pair all gate on it.
+    ok, err = _authz_pbs_backup(pbs, btype, bid, 'vm.view')
+    if not ok:
+        return err
 
     try:
         _r = pbs.get_snapshots(store) or {}
