@@ -180,3 +180,54 @@ def test_ttl_outlives_the_refresher_interval():
         f'TTL {_HEALTH_TTL_S}s must outlive the refresh interval {_INTERVAL_S}s, '
         'or the cache is cold between rounds'
     )
+
+
+def test_a_request_between_two_refreshes_is_served_from_cache(api, seed):
+    """The cache has to be warm for the WHOLE refresh cycle, not the first part.
+
+    This is the test that was missing when a 15s TTL shipped against a 60s
+    refresher: entries expired a quarter of the way in, and every request after
+    that point paid the full storage fan-out. On the live instance it showed up as
+    /health answering in either 100ms or 4s. Both were 0ms against the fake
+    manager, so nothing here could tell them apart — hence the deliberate delay.
+    """
+    import time as _t
+    from pegaprox.background.health import _INTERVAL_S
+    from pegaprox.core import health as health_mod
+
+    root = seed.user('root', role='admin', tenant_id='default')
+    seed.db.save_cluster('cluster_1', {'name': 'c1', 'host': 'h'})
+
+    FANOUT_DELAY = 0.15
+
+    def slow_storage(_node):
+        _t.sleep(FANOUT_DELAY)
+        return [{'storage': 'local', 'active': 1, 'total': 100, 'used': 10}]
+
+    mgr = api.make_fake_manager(
+        'cluster_1',
+        get_node_status={'pve1': {'status': 'online'}},
+        get_replication_status=[],
+    )
+    mgr.is_connected = True
+    mgr.get_storage_list.side_effect = slow_storage
+    api.set_manager('cluster_1', mgr)
+
+    # The broadcaster has just refreshed the rollup.
+    get_cluster_health('cluster_1', mgr, force=True)
+
+    # Age the entry to just before the broadcaster's next round — the worst
+    # moment a client can ask, and the one the old TTL got wrong.
+    entry = health_mod._cache['cluster_1']
+    entry['at'] = _t.time() - (_INTERVAL_S - 1)
+
+    started = _t.monotonic()
+    r = api.as_user(root).get('/api/clusters/cluster_1/health')
+    elapsed = _t.monotonic() - started
+
+    assert r.status_code == 200
+    assert elapsed < FANOUT_DELAY, (
+        f'took {elapsed:.3f}s — the rollup was recomputed {_INTERVAL_S - 1:.0f}s '
+        f'into a {_INTERVAL_S:.0f}s refresh cycle, so the cache is cold for most '
+        'of every cycle'
+    )

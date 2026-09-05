@@ -10790,7 +10790,12 @@
                                 // cluster so the sidebar and a switched-to cluster can use
                                 // the last value without asking for it again.
                                 if (data.cluster_id) {
-                                    setClusterHealth(prev => ({ ...prev, [data.cluster_id]: data.data }));
+                                    // _receivedAt: der Badge muss unterscheiden koennen, ob ein
+                                    // Frame GERADE kam oder irgendwann einmal — sonst faellt es nach
+                                    // einem Serverneustart in einen langsamen Poll zurueck und zeigt
+                                    // minutenlang einen alten Wert.
+                                    setClusterHealth(prev => ({ ...prev,
+                                        [data.cluster_id]: { ...data.data, _receivedAt: Date.now() } }));
                                 }
                             } else if (data.type === 'resources') {
                                 if (currentCluster && data.cluster_id === currentCluster.id) {
