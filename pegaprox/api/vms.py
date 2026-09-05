@@ -7828,14 +7828,17 @@ def delete_cross_cluster_replication(job_id):
 
     # sec (audit): cluster reach alone — the create and list siblings gate the guest itself, so
     # a scoped caller could still delete or force-run a co-tenant's job (and with delete_target,
-    # tear down the replica).
-    _xu = build_authz_user(request.session.get('user', ''), request.session)
-    try:
-        if not user_can_access_vm(_xu, job.get('source_cluster') or '',
-                                  int(job.get('vmid')), 'vm.migrate'):
-            return jsonify({'error': 'Access denied to this replication job'}), 403
-    except (TypeError, ValueError):
-        return jsonify({'error': 'Replication job has no valid guest'}), 403
+    # tear down the replica). Under the same #563 carve-out as the loop above: once the source
+    # cluster is gone there are no ACLs or pool grants left to answer the question with, and the
+    # guest went with it — gating there would only make the orphaned job undeletable again.
+    _src = job.get('source_cluster') or ''
+    if _src in cluster_managers:
+        _xu = build_authz_user(request.session.get('user', ''), request.session)
+        try:
+            if not user_can_access_vm(_xu, _src, int(job.get('vmid')), 'vm.migrate'):
+                return jsonify({'error': 'Access denied to this replication job'}), 403
+        except (TypeError, ValueError):
+            return jsonify({'error': 'Replication job has no valid guest'}), 403
 
     want_teardown = _wants_delete_target(job)
 
