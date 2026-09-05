@@ -2230,6 +2230,27 @@ def start_backup_verification(cluster_id):
 
 @bp.route('/api/clusters/<cluster_id>/backup-verify/<task_id>', methods=['GET'])
 @require_auth(perms=['vm.backup'])
+def _verification_rows_visible(cluster_id, rows):
+    """sec (audit): start_backup_verification gates the target per VM (and binds the volid to
+    the vmid), but the status, history and active reads beside it had only check_cluster_access
+    — so a scoped caller could read back which of a co-tenant's guests were verified, when, and
+    the archive names. The rows carry vmid, so apply the same question here."""
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import user_can_access_vm
+    from pegaprox.api.helpers import caller_is_scoped
+    _u = build_authz_user(request.session.get('user', ''), request.session)
+    if not caller_is_scoped(_u, cluster_id):
+        return rows
+    out = []
+    for r in rows or []:
+        try:
+            if user_can_access_vm(_u, cluster_id, int(dict(r).get('vmid')), 'vm.backup'):
+                out.append(r)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def get_backup_verification_status(cluster_id, task_id):
     """Get status of a running or completed verification"""
     from pegaprox.core.backup_verify import get_verification, get_verification_history
@@ -2243,6 +2264,8 @@ def get_backup_verification_status(cluster_id, task_id):
     # check active first
     status = get_verification(task_id)
     if status:
+        if not _verification_rows_visible(cluster_id, [status]):
+            return jsonify({'error': 'Verification not found'}), 404
         return jsonify(status)
 
     # check database
@@ -2254,6 +2277,8 @@ def get_backup_verification_status(cluster_id, task_id):
             import json
             result['details'] = json.loads(result.get('details', '{}'))
             result['logs'] = result['details'].get('logs', [])
+            if not _verification_rows_visible(cluster_id, [result]):
+                return jsonify({'error': 'Verification not found'}), 404
             return jsonify(result)
     except Exception:
         pass
@@ -2277,7 +2302,7 @@ def get_backup_verification_history(cluster_id):
     limit = request.args.get('limit', 50, type=int)
 
     results = get_verification_history(cluster_id, vmid, limit)
-    return jsonify(results)
+    return jsonify(_verification_rows_visible(cluster_id, results))
 
 
 @bp.route('/api/clusters/<cluster_id>/backup-verify/active', methods=['GET'])
@@ -2293,7 +2318,10 @@ def get_active_verifications(cluster_id):
     active = get_active_verifications()
     # filter by cluster
     cluster_active = {k: v for k, v in active.items() if v.get('cluster_id') == cluster_id}
-    return jsonify(cluster_active)
+    # a scoped caller sees only their own guests' runs (see _verification_rows_visible)
+    _keys = [k for k, v in cluster_active.items()
+             if _verification_rows_visible(cluster_id, [v])]
+    return jsonify({k: cluster_active[k] for k in _keys})
 
 
 # ============================================================================

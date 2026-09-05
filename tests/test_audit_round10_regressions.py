@@ -908,3 +908,16 @@ def test_key_rotation_aborts_cleanly_if_the_key_cannot_be_persisted(db, monkeypa
     assert res.get('success') is False, res
     # the cluster must still be readable with the key that is actually on disk
     assert db.get_cluster('c-abort')['pass'] == 'keepme'
+
+
+def test_backup_verification_reads_are_scoped():
+    """start_backup_verification gates the target per VM and binds the volid to the vmid, but
+    the status, history and active reads beside it had only check_cluster_access — so a scoped
+    caller could read back which of a co-tenant's guests were verified and when."""
+    src = open('pegaprox/api/pbs.py').read()
+    for fn in ('def get_backup_verification_status(',
+               'def get_backup_verification_history(',
+               'def get_active_verifications('):
+        i = src.index(fn)
+        body = src[i:i + 1800]
+        assert '_verification_rows_visible' in body, f"{fn} is still unscoped"
