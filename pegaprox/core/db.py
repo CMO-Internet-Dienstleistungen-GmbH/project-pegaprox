@@ -114,10 +114,16 @@ class PegaProxDB:
             with open(aes_key_file, 'rb') as f:
                 aes_key = f.read()
             if len(aes_key) != 32:
-                logging.warning("Invalid AES key length, regenerating...")
-                aes_key = os.urandom(32)  # 256 bits
-                with open(aes_key_file, 'wb') as f:
-                    f.write(aes_key)
+                # MK: this used to regenerate the key in place. A short read here means a
+                # truncated write (disk full, power cut) or a half-restored backup — and
+                # overwriting is unrecoverable: every cluster password, SSH key, BMC password
+                # and server_settings secret in the DB was sealed with the old key, and the
+                # audit chain was signed with it. Refuse to start instead, same as below; we
+                # only ever write a fresh key when there is no file at all.
+                raise RuntimeError(
+                    f"FATAL: AES key file {aes_key_file} is {len(aes_key)} bytes, expected 32. "
+                    "Restore it from backup — regenerating would permanently destroy every "
+                    "stored credential. Remove the file only if you accept re-entering them.")
         else:
             # Generate new 256-bit key
             aes_key = os.urandom(32)
