@@ -62,6 +62,28 @@ def _fire_webhook(url):
 # at 50%" reports: storage/bridge mappings reference names that don't exist on the
 # target. Proxmox returns HTTP 500 mid-migration with a useless error. We now check
 # before we start.
+def _reverse_mapping(mapping, kind):
+    """Flip a {source: target} plan mapping for a failback run.
+
+    A plan is authored in one direction, so replaying it backwards with the forward
+    map puts every VM on the DR site's storage/bridge names — on the production
+    cluster. Two sources pointing at the same target can't be reversed unambiguously,
+    so say so rather than pick one. Returns (reversed, issues).
+    """
+    reversed_map, ambiguous = {}, set()
+    for src, tgt in (mapping or {}).items():
+        if not tgt:
+            continue
+        if tgt in reversed_map and reversed_map[tgt] != src:
+            ambiguous.add(tgt)
+        reversed_map[tgt] = src
+    issues = [{'severity': 'error',
+               'msg': f"{kind} mapping is not reversible for failback: "
+                      f"'{t}' is the target of more than one source"}
+              for t in sorted(ambiguous)]
+    return reversed_map, issues
+
+
 def validate_mappings(tgt_mgr, storage_map, net_map):
     """Validate that the mapping targets actually exist on the target cluster.
     Returns a list of {severity, msg} entries. Empty list = all good."""
@@ -447,10 +469,20 @@ def execute_failover(plan_id, failover_type='planned'):
     net_map = plan.get('network_mappings', {})
     stor_map = plan.get('storage_mappings', {})
 
+    reverse_issues = []
+    if failover_type == 'failback':
+        # the direction swap above is only half of it — the mappings are stored
+        # source→target and have to be read the other way round on the way home,
+        # or the VMs come back onto the DR site's storage and bridge names
+        stor_map, _si = _reverse_mapping(stor_map, 'Storage')
+        net_map, _ni = _reverse_mapping(net_map, 'Network')
+        reverse_issues = _si + _ni
+
     # NS 2026-04-24 — pre-flight: catch bad mappings BEFORE we start moving VMs.
     # A typo like `local-lvm` → `local-lvmm` used to fail silently mid-migration
     # with a Proxmox 500; now we fail fast with a clear message.
     preflight_issues = validate_mappings(tgt_mgr, stor_map, net_map) if failover_type != 'emergency' else []
+    preflight_issues = reverse_issues + preflight_issues
     preflight_errors = [i for i in preflight_issues if i.get('severity') == 'error']
     if preflight_errors:
         msg = '; '.join(i['msg'] for i in preflight_errors[:3])
