@@ -698,7 +698,9 @@ def _scope_pbs_rows(mgr, rows, type_key='backup-type', id_key='backup-id',
     out = []
     for r in rows or []:
         bt, bid = key_fn(r) if key_fn else (r.get(type_key), r.get(id_key))
-        ok, _ = _authz_pbs_backup(mgr, bt, bid, permission)
+        # hand the identity down — a datastore listing is the whole install's inventory and
+        # rebuilding it per row means a users-table read per snapshot
+        ok, _ = _authz_pbs_backup(mgr, bt, bid, permission, user=user)
         if ok:
             out.append(r)
     return out
@@ -715,7 +717,7 @@ def _pbs_task_guest(worker_id):
     return parts[0], parts[1]
 
 
-def _authz_pbs_backup(mgr, backup_type, backup_id, permission='vm.backup'):
+def _authz_pbs_backup(mgr, backup_type, backup_id, permission='vm.backup', user=None):
     """NS Aug 2026 (sec-report, BOLA/CWE-639) — object-level scope for PBS backup ops.
 
     check_pbs_access only proves the caller reaches ONE of the PBS's linked clusters; it
@@ -726,17 +728,27 @@ def _authz_pbs_backup(mgr, backup_type, backup_id, permission='vm.backup'):
     Resolve the backup's owning VMID and require user_can_access_vm on it against one of the
     linked clusters (ACL/pool-scope-wins via the fixed chokepoint in rbac.py). Admins pass;
     a scoped user whose vmid can't be resolved (host-type or non-numeric id) is denied.
-    Returns (ok, err_response)."""
-    from pegaprox.utils.auth import build_authz_user
+    Returns (ok, err_response).
+
+    `user` lets a caller in a loop hand down an identity it already built. build_authz_user
+    reads the whole users table and decrypts two TOTP columns per account, and _scope_pbs_rows
+    runs this once per snapshot — at 10k guests that is the difference between one read and
+    hundreds of thousands, on a greenlet that yields to nobody while it runs."""
     from pegaprox.utils.rbac import user_can_access_vm
-    user = build_authz_user(request.session.get('user', ''), request.session)
+    if user is None:
+        from pegaprox.utils.auth import build_authz_user
+        user = build_authz_user(request.session.get('user', ''), request.session)
     if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
         return True, None
-    deny = (jsonify({'error': 'Access denied: you do not have permission for this backup'}), 403)
+
+    def _deny():
+        # built on demand: constructing a Response for every row was the other half of the cost
+        return False, (jsonify({'error': 'Access denied: you do not have permission for this backup'}), 403)
+
     bt = (backup_type or '').strip().lower()
     # only vm/ct backups carry a VMID we can scope; host/other → deny scoped users
     if bt not in ('vm', 'ct') or backup_id is None or not str(backup_id).strip().isdigit():
-        return False, deny
+        return _deny()
     vmid = int(str(backup_id).strip())
     vm_type = 'lxc' if bt == 'ct' else 'qemu'
     # linked clusters own the backups; fall back to all connected clusters when a PBS has
@@ -746,7 +758,7 @@ def _authz_pbs_backup(mgr, backup_type, backup_id, permission='vm.backup'):
     for cid in cluster_ids:
         if user_can_access_vm(user, cid, vmid, permission, vm_type):
             return True, None
-    return False, deny
+    return _deny()
 
 
 @bp.route('/api/pbs/<pbs_id>/datastores/<store>/snapshots', methods=['DELETE'])
