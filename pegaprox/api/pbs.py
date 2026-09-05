@@ -675,7 +675,7 @@ def pbs_prune(pbs_id, store):
 
 
 def _scope_pbs_rows(mgr, rows, type_key='backup-type', id_key='backup-id',
-                    permission='vm.view'):
+                    permission='vm.view', key_fn=None):
     """sec (audit): a datastore is shared across every VM on every linked cluster, and
     pbs.datastore.view is a BUILTIN ROLE_USER and ROLE_VIEWER permission — so the snapshot and
     group listings handed every user the whole install's backup inventory (enriched with VM
@@ -683,7 +683,10 @@ def _scope_pbs_rows(mgr, rows, type_key='backup-type', id_key='backup-id',
 
     An admin or a caller who is not confined keeps everything; a scoped caller keeps only the
     rows whose guest they may see. Rows with no resolvable guest (host-type backups) are
-    dropped for a scoped caller, matching _authz_pbs_backup."""
+    dropped for a scoped caller, matching _authz_pbs_backup.
+
+    key_fn overrides the two dict lookups for rows that carry the guest somewhere else — task
+    rows name it in worker_id, not in backup-type/backup-id."""
     from pegaprox.utils.auth import build_authz_user
     user = build_authz_user(request.session.get('user', ''), request.session)
     if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
@@ -694,10 +697,22 @@ def _scope_pbs_rows(mgr, rows, type_key='backup-type', id_key='backup-id',
         return rows                      # plain cluster-wide operator — unchanged
     out = []
     for r in rows or []:
-        ok, _ = _authz_pbs_backup(mgr, r.get(type_key), r.get(id_key), permission)
+        bt, bid = key_fn(r) if key_fn else (r.get(type_key), r.get(id_key))
+        ok, _ = _authz_pbs_backup(mgr, bt, bid, permission)
         if ok:
             out.append(r)
     return out
+
+
+def _pbs_task_guest(worker_id):
+    """('vm'|'ct', '100') out of a PBS backup task's worker_id.
+
+    PBS spells it '<datastore>:<type>/<id>/<hex-backup-time>'. Returns (None, None) for
+    host-type backups and anything we can't read."""
+    parts = [p for p in str(worker_id or '').split(':')[-1].split('/') if p]
+    if len(parts) < 2 or parts[0] not in ('vm', 'ct'):
+        return None, None
+    return parts[0], parts[1]
 
 
 def _authz_pbs_backup(mgr, backup_type, backup_id, permission='vm.backup'):
@@ -1878,7 +1893,12 @@ def get_pbs_reports_summary(pbs_id):
 
     # ── Backup tasks in window ─────────────────────────────────────────────
     tasks_resp = mgr.get_tasks(limit=500, typefilter='backup', since=since_ts) or {}
-    tasks = tasks_resp.get('data', []) or []
+    # sec (audit): check_pbs_access above only proves the caller reaches ONE of this PBS's linked
+    # clusters, and pbs.view is a builtin ROLE_USER/ROLE_VIEWER permission — so the report described
+    # every guest on the install. Drop the tasks whose guest the caller may not see BEFORE the
+    # aggregation, so the totals and the per-day chart can't count them either.
+    tasks = _scope_pbs_rows(mgr, tasks_resp.get('data', []) or [],
+                            key_fn=lambda t: _pbs_task_guest(t.get('worker_id') or t.get('id')))
 
     totals = {'jobs': 0, 'success': 0, 'warning': 0, 'failed': 0}
     per_day = {}          # YYYY-MM-DD -> {date, success, warning, failed}
@@ -1907,9 +1927,8 @@ def get_pbs_reports_summary(pbs_id):
                 per_day[day] = {'date': day, 'success': 0, 'warning': 0, 'failed': 0}
             per_day[day][bucket] += 1
 
-        worker_id = t.get('worker_id') or t.get('id') or ''
-        if '/' in worker_id:
-            vm_type, vmid = worker_id.split('/', 1)
+        vm_type, vmid = _pbs_task_guest(t.get('worker_id') or t.get('id'))
+        if vm_type:
             key = (vm_type, vmid)
             prev = per_vm_latest.get(key)
             if (prev is None
@@ -1917,7 +1936,7 @@ def get_pbs_reports_summary(pbs_id):
                 per_vm_latest[key] = t
 
     # ── Snapshot inventory for size/verify info ────────────────────────────
-    snapshots = _pbs_collect_snapshots(mgr)
+    snapshots = _scope_pbs_rows(mgr, _pbs_collect_snapshots(mgr))
     snapshots_by_key = {}   # (type, vmid_str) -> [snap, ...]
     for s in snapshots:
         key = (s.get('backup-type', ''), str(s.get('backup-id', '')))
@@ -2022,7 +2041,10 @@ def get_pbs_reports_inventory(pbs_id):
     now_ts = int(time.time())
     min_bt = (now_ts - days * 86400) if days > 0 else 0
 
-    raw = _pbs_collect_snapshots(mgr, protected_only=protected_only, min_backup_time=min_bt)
+    # "every snapshot across all datastores/namespaces" means every snapshot the CALLER may
+    # read — see the note in the summary route above; this one also carries the owner. (audit)
+    raw = _scope_pbs_rows(mgr, _pbs_collect_snapshots(
+        mgr, protected_only=protected_only, min_backup_time=min_bt))
 
     vm_names = _pbs_resolve_vm_names(mgr)
 
