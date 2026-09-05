@@ -2250,8 +2250,6 @@ def start_backup_verification(cluster_id):
     return jsonify({'success': True, 'task_id': task_id})
 
 
-@bp.route('/api/clusters/<cluster_id>/backup-verify/<task_id>', methods=['GET'])
-@require_auth(perms=['vm.backup'])
 def _verification_rows_visible(cluster_id, rows):
     """sec (audit): start_backup_verification gates the target per VM (and binds the volid to
     the vmid), but the status, history and active reads beside it had only check_cluster_access
@@ -2273,6 +2271,8 @@ def _verification_rows_visible(cluster_id, rows):
     return out
 
 
+@bp.route('/api/clusters/<cluster_id>/backup-verify/<task_id>', methods=['GET'])
+@require_auth(perms=['vm.backup'])
 def get_backup_verification_status(cluster_id, task_id):
     """Get status of a running or completed verification"""
     from pegaprox.core.backup_verify import get_verification, get_verification_history
