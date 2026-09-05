@@ -4185,6 +4185,26 @@ class PegaProxDB:
             except Exception as e:
                 stats['errors'].append(f"BMC secrets: {e}")
 
+            # sec (audit): the loop above walks clusters/users/esxi/bmc, but PBS and ESXi server
+            # credentials live in their own tables and were never rotated — and _decrypt RAISES,
+            # so a rotation silently broke every PBS backup and every ESXi connection until
+            # someone re-entered the passwords. Same shape as the server_settings gap below.
+            for _tbl, _cols in (('pbs_servers', ('pass_encrypted', 'api_token_secret_encrypted',
+                                                 'ssh_key_encrypted')),
+                                ('vmware_servers', ('pass_encrypted',))):
+                try:
+                    cursor.execute(f"SELECT id, {', '.join(_cols)} FROM {_tbl}")
+                    for _r in cursor.fetchall():
+                        for _c in _cols:
+                            _v = _r[_c]
+                            if _v and str(_v).startswith('aes256:'):
+                                cursor.execute(f'UPDATE {_tbl} SET {_c} = ? WHERE id = ?',
+                                               (self._encrypt_with_key(
+                                                   self._decrypt_with_key(_v, old_aesgcm), new_aesgcm),
+                                                _r['id']))
+                except Exception as e:
+                    stats['errors'].append(f"{_tbl} secrets: {e}")
+
             try:
                 _ss = self.get_server_settings() or {}
                 _SECRET_KEYS = ('smtp_password', 'ldap_bind_password', 'oidc_client_secret',
@@ -4200,6 +4220,20 @@ class PegaProxDB:
                                        'VALUES (?, ?)',
                                        (_k, json.dumps(self._encrypt_with_key(
                                            self._decrypt_with_key(_v, old_aesgcm), new_aesgcm))))
+
+                # the VAPID private key is a setting too, but nested one level down inside the
+                # keypair object, so the loop above walks straight past it. Left behind it fails
+                # to decrypt, and _load_vapid answers that by generating a fresh keypair — which
+                # silently invalidates every existing push subscription.
+                _vk = _ss.get('webpush_vapid_keypair')
+                if isinstance(_vk, dict) and str(_vk.get('private_pem', '')).startswith('aes256:'):
+                    cursor.execute('INSERT OR REPLACE INTO server_settings (key, value) '
+                                   'VALUES (?, ?)',
+                                   ('webpush_vapid_keypair', json.dumps({
+                                       **_vk,
+                                       'private_pem': self._encrypt_with_key(
+                                           self._decrypt_with_key(_vk['private_pem'], old_aesgcm),
+                                           new_aesgcm)})))
             except Exception as e:
                 stats['errors'].append(f"Server settings secrets: {e}")
 
