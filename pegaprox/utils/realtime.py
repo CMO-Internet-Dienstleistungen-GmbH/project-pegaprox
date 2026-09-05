@@ -355,6 +355,36 @@ def _sse_user_can_view_vm(username, cluster_id, vmid):
         return False
 
 
+def _filtered_vmware_vms_frame(data, username, timestamp):
+    """A per-VM-authorized 'vmware_vms' frame for a NON-admin client. Returns the serialized
+    JSON, or None to send nothing (unknown user -> fail closed).
+
+    sec (audit): the frame carries an ESXi server's whole inventory and was gated on the bare
+    vmware.vm.view permission, which is a builtin viewer default — while the REST twin has
+    filtered per-VM since the Sep audit. Same leak, one transport over. The caller keeps the
+    perm gate (no permission still means no frame at all); this decides which guests survive."""
+    user = _sse_stored_user(username)
+    if not user:
+        return None
+    from pegaprox.utils.rbac import user_can_access_vmware_vm
+    data = data or {}
+    vmware_id = data.get('vmware_id')
+    allowed = [v for v in (data.get('vms') or [])
+               if user_can_access_vmware_vm(user, vmware_id, str(v.get('vm', '')), 'vmware.vm.view')]
+    return _serialize_sse_message('vmware_vms', {**data, 'vms': allowed}, None, timestamp)
+
+
+def _sse_user_can_view_vmware_vm(username, vmware_id, vm_id):
+    """Per-VM gate for the 'vmware_vm_detail' push. The watch registry it is driven from is
+    global, so one authorized watcher used to put a guest's detail — guest info and performance
+    included — in front of every client subscribed to the server's linked clusters."""
+    user = _sse_stored_user(username)
+    if not user:
+        return False
+    from pegaprox.utils.rbac import user_can_access_vmware_vm
+    return user_can_access_vmware_vm(user, vmware_id, str(vm_id), 'vmware.vm.view')
+
+
 def _sse_user_has_perm(username, permission):
     """sec (audit): the SSE stream carried the ESXi inventory ('vmware_*' frames) to every client,
     while the REST twin gates on a vmware.* permission — so a custom role built to hide ESXi still
@@ -546,6 +576,8 @@ def broadcast_sse(update_type: str, data: dict, cluster_id: str = None, target_c
         _cfg_access_cache = {}    # uname -> bool: may this user view THIS vm_config frame's vmid (audit M1)
         _tasks_frame_cache = {}   # uname -> per-VM-filtered 'tasks' frame (audit M1)
         _vmw_perm_cache = {}      # uname -> bool: holds the vmware.* perm the REST twin requires
+        _vmw_vms_frame_cache = {} # uname -> per-VM-filtered ESXi inventory frame (audit)
+        _vmw_detail_cache = {}    # uname -> bool: may see THIS watched ESXi guest's detail (audit)
         _obj_frame_cache = {}     # uname -> bool: may see THIS migration/DR-plan frame (audit)
         # sec/scale (audit): the per-client filtering below does uncached DB work — a single
         # user fetch plus the VM-ACL and pool lookups inside user_can_access_vm — and this loop
@@ -613,6 +645,31 @@ def broadcast_sse(update_type: str, data: dict, cluster_id: str = None, target_c
                         if client_message is _SSE_FILTER_MISSING:
                             client_message = _filtered_tasks_frame(data, cluster_id, uname, timestamp)
                             _tasks_frame_cache[uname] = client_message
+                    elif update_type == 'vmware_vms' and not client_info.get('is_admin', False):
+                        # audit — the ESXi twin of the 'resources' filter above. The perm gate
+                        # below still decides whether this client hears about ESXi at all; what
+                        # it never did was decide WHICH guests, so the frame carried the whole
+                        # server inventory to anyone holding a builtin viewer permission.
+                        uname = client_info.get('user')
+                        _ok_vmw = _vmw_perm_cache.get((uname, 'vmware.vm.view'), _SSE_FILTER_MISSING)
+                        if _ok_vmw is _SSE_FILTER_MISSING:
+                            _ok_vmw = _sse_user_has_perm(uname, 'vmware.vm.view')
+                            _vmw_perm_cache[uname, 'vmware.vm.view'] = _ok_vmw
+                        if not _ok_vmw:
+                            continue
+                        client_message = _vmw_vms_frame_cache.get(uname, _SSE_FILTER_MISSING)
+                        if client_message is _SSE_FILTER_MISSING:
+                            client_message = _filtered_vmware_vms_frame(data, uname, timestamp)
+                            _vmw_vms_frame_cache[uname] = client_message
+                    elif update_type == 'vmware_vm_detail' and not client_info.get('is_admin', False):
+                        uname = client_info.get('user')
+                        _ok_det = _vmw_detail_cache.get(uname, _SSE_FILTER_MISSING)
+                        if _ok_det is _SSE_FILTER_MISSING:
+                            _ok_det = _sse_user_can_view_vmware_vm(
+                                uname, (data or {}).get('vmware_id'), (data or {}).get('vm_id'))
+                            _vmw_detail_cache[uname] = _ok_det
+                        if not _ok_det:
+                            continue  # someone else's watch → not for this client
                     elif (update_type.startswith('vmware_')
                           and update_type not in _SSE_OBJECT_FRAMES
                           and not client_info.get('is_admin', False)):
