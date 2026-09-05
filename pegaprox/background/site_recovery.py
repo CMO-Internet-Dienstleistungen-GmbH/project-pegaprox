@@ -808,6 +808,7 @@ def cleanup_test(plan_id):
 
 _last_fail_times = {}  # plan_id -> first_fail_timestamp
 _cooldowns = {}  # plan_id -> cooldown_until_timestamp
+_missing_source_logged = set()  # plan_ids we've already warned about, so the loop doesn't spam
 
 
 def _heartbeat_check():
@@ -829,7 +830,21 @@ def _heartbeat_check():
             continue
 
         src_mgr = cluster_managers.get(plan['source_cluster'])
-        src_reachable = src_mgr and src_mgr.is_connected if src_mgr else False
+        if src_mgr is None:
+            # "not configured in PegaProx" is not "the site is down", and folding the two
+            # together is dangerous in one direction only: deleting the source cluster (or
+            # leaving a plan pointing at an id that no longer exists) looked exactly like an
+            # outage, and failover_timeout seconds later this started every replica at the DR
+            # site while production was still serving. Hold until a manager exists to ask.
+            _last_fail_times.pop(plan_id, None)
+            if plan_id not in _missing_source_logged:
+                _missing_source_logged.add(plan_id)
+                logger.warning(f"[SR] Heartbeat: plan '{_sl(plan['name'])}' names source cluster "
+                               f"'{_sl(plan['source_cluster'])}', which is not configured here — "
+                               f"auto-failover held")
+            continue
+        _missing_source_logged.discard(plan_id)
+        src_reachable = bool(src_mgr.is_connected)
 
         if src_reachable:
             # clear failure tracking
