@@ -2089,6 +2089,16 @@ class PegaProxDB:
                 migrated_any = True
         
         # Migrate users (always if needs_user_remigration or no users)
+        if needs_user_remigration and not self._read_legacy_users():
+            # MK: the DELETE below used to run unconditionally, and _migrate_users() writes
+            # nothing when the legacy file is gone or no longer decrypts — which is every
+            # install past the migration era. So one local row with an empty password_salt
+            # emptied the entire users table, admins included, with nothing to restore from,
+            # and the next request landed in first-run setup. Never clear what we can't put back.
+            logging.error("Users need re-migration but the legacy user file is unavailable — "
+                          "keeping the existing accounts")
+            needs_user_remigration = False
+
         if needs_user_remigration or cluster_count == 0:
             # Clear existing users if re-migrating
             if needs_user_remigration:
@@ -2098,7 +2108,7 @@ class PegaProxDB:
                     logging.info("Cleared users table for re-migration")
                 except Exception as e:
                     logging.error(f"Error clearing users: {e}")
-            
+
             if self._migrate_users():
                 migrated_any = True
         
@@ -2233,22 +2243,29 @@ class PegaProxDB:
         logging.info(f"Migrated {len(data)} clusters to SQLite")
         return True
     
-    def _migrate_users(self) -> bool:
-        """Migrate users from encrypted file"""
+    def _read_legacy_users(self):
+        """The legacy encrypted user file as a dict, or None when it isn't there or won't
+        decrypt. Split out of _migrate_users so the re-migration path can find out whether it
+        has anything to restore BEFORE it clears the table."""
         from pegaprox.core.config import get_fernet
         fernet = get_fernet()
         if not fernet or not os.path.exists(USERS_FILE_ENCRYPTED):
-            return False
-        
+            return None
+
         try:
             with open(USERS_FILE_ENCRYPTED, 'rb') as f:
                 encrypted_data = f.read()
-            decrypted = fernet.decrypt(encrypted_data)
-            data = json.loads(decrypted.decode('utf-8'))
+            return json.loads(fernet.decrypt(encrypted_data).decode('utf-8'))
         except Exception as e:
             logging.error(f"Failed to load users: {e}")
+            return None
+
+    def _migrate_users(self) -> bool:
+        """Migrate users from encrypted file"""
+        data = self._read_legacy_users()
+        if not data:
             return False
-        
+
         cursor = self.conn.cursor()
         now = datetime.now().isoformat()
         
