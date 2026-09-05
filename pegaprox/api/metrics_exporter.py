@@ -260,7 +260,9 @@ def prometheus_metrics():
     emit('# HELP pegaprox_ceph_osd_in Number of Ceph OSDs currently in')
     emit('# TYPE pegaprox_ceph_osd_in gauge')
 
-    for cid, mgr in cluster_managers.items():
+    # a scrape walks every cluster over the API; copy the dict so a cluster
+    # registered mid-scrape can't break the whole exposition
+    for cid, mgr in list(cluster_managers.items()):
         cname = getattr(getattr(mgr, 'config', None), 'name', cid) or cid
         base = {'cluster_id': cid, 'cluster': cname}
         connected = 1 if getattr(mgr, 'is_connected', False) else 0

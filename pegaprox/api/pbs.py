@@ -2941,7 +2941,7 @@ def get_vms_backup_status(cluster_id):
 
     # PBS-side tasks: one per linked + connected PBS server
     tasks = {}
-    for pbs_id, pbs in pbs_managers.items():
+    for pbs_id, pbs in list(pbs_managers.items()):
         if cluster_id not in (pbs.linked_clusters or []):
             continue
         if not pbs.connected:

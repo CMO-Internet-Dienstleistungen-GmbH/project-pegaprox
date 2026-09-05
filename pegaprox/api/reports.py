@@ -534,7 +534,7 @@ def get_top_vms():
 
     vms = []
 
-    for cluster_id, mgr in cluster_managers.items():
+    for cluster_id, mgr in list(cluster_managers.items()):
         # Skip clusters the user cannot access
         if accessible_clusters is not None and cluster_id not in accessible_clusters:
             continue

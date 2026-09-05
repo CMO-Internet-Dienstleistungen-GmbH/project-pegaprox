@@ -3848,7 +3848,7 @@ def generate_support_bundle():
             # 11. Recent Tasks
             try:
                 recent_tasks = []
-                for cluster_id, mgr in cluster_managers.items():
+                for cluster_id, mgr in list(cluster_managers.items()):
                     if mgr.is_connected:
                         try:
                             tasks = mgr.get_tasks(limit=50)
@@ -4061,7 +4061,7 @@ def check_cluster_updates(cluster_id):
     # and still shows everywhere (no breaking change for existing setups).
     pbs_results = {}
     try:
-        for pid, pmgr in pbs_managers.items():
+        for pid, pmgr in list(pbs_managers.items()):
             if not pmgr.connected:
                 continue
             linked = getattr(pmgr, 'linked_clusters', None) or []

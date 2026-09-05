@@ -5953,7 +5953,7 @@ def snapshots_overview():
             pass
 
     all_vms = []
-    for cluster_id, mgr in cluster_managers.items():
+    for cluster_id, mgr in list(cluster_managers.items()):
         if not mgr.is_connected:
             continue
         if filter_cluster and cluster_id != filter_cluster:

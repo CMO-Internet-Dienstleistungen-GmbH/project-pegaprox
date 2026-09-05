@@ -423,7 +423,10 @@ def check_tenant_quota(tenant_id, add_cores=0, add_mem_gb=0, add_vms=1, force=Fa
         used_vms = 0
         used_cores = 0
         used_mem = 0.0
-        for cid, mgr in cluster_managers.items():
+        # iterate a copy — get_vm_resources() below is a live API call, and a
+        # concurrent cluster add/remove used to blow up the walk. That lands in the
+        # fail-open except at the bottom, so the quota just stopped being enforced.
+        for cid, mgr in list(cluster_managers.items()):
             if allowed is not None and cid not in allowed:
                 continue
             try:

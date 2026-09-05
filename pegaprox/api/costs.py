@@ -419,7 +419,7 @@ def tenant_chargeback(tenant_id):
         all_rows = []
         grand_total = 0.0
         currency = 'EUR'
-        for cid, mgr in cluster_managers.items():
+        for cid, mgr in list(cluster_managers.items()):
             if allowed is not None and cid not in allowed:
                 continue
             cname = getattr(getattr(mgr, 'config', None), 'name', cid) or cid

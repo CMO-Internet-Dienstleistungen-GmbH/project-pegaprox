@@ -1049,7 +1049,7 @@ def get_vmware_migration_plan(vmware_id, vm_id):
     
     # Available Proxmox targets — only clusters the caller may reach (don't leak others' topology)
     targets = []
-    for cid, cmgr in cluster_managers.items():
+    for cid, cmgr in list(cluster_managers.items()):
         if cmgr.is_connected:
             allowed, _ = check_cluster_access(cid)
             if not allowed:

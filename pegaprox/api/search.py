@@ -146,7 +146,7 @@ def global_search():
     # MK: collect tags for the autocomplete dropdown in the frontend
     all_tags = set()
     
-    for cluster_id, mgr in cluster_managers.items():
+    for cluster_id, mgr in list(cluster_managers.items()):
         # Check cluster access - NS: important for multi-tenant setups
         if accessible_clusters is not None and cluster_id not in accessible_clusters:
             continue
@@ -336,7 +336,7 @@ def global_summary():
             'by_cluster': []
         }
         
-        for cluster_id, mgr in cluster_managers.items():
+        for cluster_id, mgr in list(cluster_managers.items()):
             # Check cluster access
             if accessible_clusters is not None and cluster_id not in accessible_clusters:
                 continue
