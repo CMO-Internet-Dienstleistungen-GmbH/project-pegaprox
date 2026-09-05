@@ -657,10 +657,13 @@ def test_parse_pve_error_is_imported_where_it_is_used():
 def test_open_sse_stream_closes_when_the_account_is_disabled(api, seed, monkeypatch):
     """The stream captures its identity at connect and lives for hours. Revoking the TOKEN —
     which this campaign added — does nothing for a stream that is already open, so disabling or
-    deleting an account left it receiving frames until the client hung up. The re-check rides
-    on the keepalive tick; force that branch immediately rather than waiting 30s for it."""
+    deleting an account left it receiving frames until the client hung up. This covers the idle
+    stream; test_sse_stream_reauthz.py covers the same check while frames are flowing, which is
+    where it originally sat and never ran. Interval to 0 rather than waiting 30s for it."""
     import queue as queue_module
     import pegaprox.api.realtime as rt
+
+    monkeypatch.setattr(rt, 'SSE_REAUTHZ_INTERVAL', 0)
 
     seed.tenant('acme', clusters=['cluster_1'])
     admin = seed.user('rootsse2', role='admin', tenant_id='acme')

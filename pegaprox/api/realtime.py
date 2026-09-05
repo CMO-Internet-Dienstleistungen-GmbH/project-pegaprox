@@ -7,10 +7,11 @@ WebSocket, SSE, and email test endpoints.
 import json
 import logging
 import threading
+import time
 import uuid
 import queue as queue_module
 from datetime import datetime
-from flask import Blueprint, jsonify, request, Response
+from flask import Blueprint, jsonify, request, Response, has_request_context
 
 from flask_sock import Sock
 # MK 2026-06-04 (CWE-117 log-injection scanner findings): strip CR/LF/U+2028/9
@@ -161,6 +162,10 @@ def _floor_by_token_role(user, token_role):
     return {**user, 'effective_role': next((r for r, lvl in _h.items() if lvl == _eff), ROLE_VIEWER)}
 
 
+# how often an open SSE stream re-reads its own account. One indexed read per client.
+SSE_REAUTHZ_INTERVAL = 30
+
+
 def _stream_identity(username):
     """Identity for SSE cluster scoping. Two reasons not to use load_users() here, both already
     learned on the WebSocket twins in this file: it can transiently degrade to {} under gevent/WAL
@@ -177,7 +182,14 @@ def _stream_identity(username):
         return None
     u = dict(stored)
     u['username'] = username
-    _eff = request.session.get('effective_role') if getattr(request, 'session', None) else None
+    # the open stream re-checks itself from inside the response generator, which the WSGI
+    # server iterates after the request context is gone. `request` is a LocalProxy there and
+    # raises RuntimeError, which getattr's default does NOT swallow — so ask first.
+    _eff = None
+    if has_request_context():
+        _sess = getattr(request, 'session', None)
+        if _sess:
+            _eff = _sess.get('effective_role')
     if _eff:
         u['effective_role'] = _eff
     return u
@@ -450,6 +462,7 @@ def sse_updates():
     logging.info(f"[SSE] Client connected: {client_id} (user: {user}, auth: {auth_method}) - Total: {len(sse_clients)}")
 
     def generate():
+        _next_authz = time.monotonic() + SSE_REAUTHZ_INTERVAL
         try:
             # Send initial connected message
             yield f"data: {json.dumps({'type': 'connected', 'client_id': client_id})}\n\n"
@@ -460,12 +473,20 @@ def sse_updates():
                     message = message_queue.get(timeout=30)
                     yield f"data: {message}\n\n"
                 except queue_module.Empty:
-                    # sec (audit): an SSE stream lives for hours and its identity was captured
-                    # once, at connect. Revoking the TOKEN (added earlier this campaign) does
-                    # nothing for a stream that is already open, so disabling, deleting or
-                    # demoting an account left it receiving frames until the client hung up.
-                    # The keepalive tick is the natural place to re-check: one indexed read per
-                    # client per 30s. Also refresh is_admin, so a demotion starts filtering.
+                    # Send keepalive
+                    yield f": keepalive\n\n"
+
+                # sec (audit): an SSE stream lives for hours and its identity was captured
+                # once, at connect. Revoking the TOKEN (added earlier this campaign) does
+                # nothing for a stream that is already open, so disabling, deleting or
+                # demoting an account left it receiving frames until the client hung up.
+                # Also refresh is_admin, so a demotion starts filtering.
+                # This hung off the queue timeout at first, which reads like the idle tick but
+                # isn't one: broadcast.py sends a heartbeat to every client once a second, so
+                # the queue is never Empty and the whole re-check never ran. Own clock instead,
+                # evaluated whether or not frames are flowing.
+                if time.monotonic() >= _next_authz:
+                    _next_authz = time.monotonic() + SSE_REAUTHZ_INTERVAL
                     _acct = _stream_identity(user)
                     if _acct is None or not _acct.get('enabled', True):
                         logging.info(f"[SSE] closing stream for '{_sl(user)}' — account gone or disabled")
@@ -475,8 +496,6 @@ def sse_updates():
                         if _ci is not None:
                             _ci['is_admin'] = (_acct.get('effective_role', _acct.get('role'))
                                                == ROLE_ADMIN and _token_role in (None, ROLE_ADMIN))
-                    # Send keepalive
-                    yield f": keepalive\n\n"
         except GeneratorExit:
             pass
         finally:
