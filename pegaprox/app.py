@@ -16,6 +16,7 @@ import gc
 import multiprocessing
 import ssl
 import socket
+from greenlet import GreenletExit
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -1240,7 +1241,11 @@ def main(debug_mode=False):
 
 
 def _start_console_servers(bind_host, port, ssl_context):
-    """Start VNC and SSH WebSocket servers on port+1 and port+2."""
+    """Start VNC and SSH WebSocket servers on port+1 and port+2.
+
+    Returns the SSH WebSocket subprocess (a Popen) so the caller can terminate it on
+    shutdown. The VNC server is a daemon thread and needs no handle; the SSH server is a
+    long-running asyncio subprocess that would otherwise outlive us. (#780)"""
     vnc_ws_port = port + 1
     ssh_ws_port = port + 2
 
@@ -1248,25 +1253,31 @@ def _start_console_servers(bind_host, port, ssl_context):
         from pegaprox.api.vms import start_vnc_websocket_server, start_ssh_websocket_server
     except ImportError as e:
         print(f"WARNING: Console WebSocket servers not available: {e}")
-        return
+        return None
 
     # NS Feb 2026 - asyncio/websockets creates IPv6-only socket for '::' (#95)
     # Use '' so asyncio binds to ALL interfaces (creates both IPv4 + IPv6 listeners)
     console_host = '' if bind_host == '::' else bind_host
 
     # MK Feb 2026 - start each server independently so one failure doesn't block the other
+    ssh_proc = None
     for name, start_fn, ws_port in [
         ("VNC", start_vnc_websocket_server, vnc_ws_port),
         ("SSH", start_ssh_websocket_server, ssh_ws_port),
     ]:
         try:
             if ssl_context:
-                start_fn(ws_port, ssl_cert=ssl_context[0], ssl_key=ssl_context[1], host=console_host)
+                result = start_fn(ws_port, ssl_cert=ssl_context[0], ssl_key=ssl_context[1], host=console_host)
             else:
-                start_fn(ws_port, host=console_host)
+                result = start_fn(ws_port, host=console_host)
+            # only the SSH server hands back a live subprocess
+            if name == "SSH" and result is not None:
+                ssh_proc = result
         except Exception as e:
             print(f"ERROR: {name} WebSocket server (port {ws_port}) failed to start: {e}")
             logging.error(f"{name} WebSocket server startup failed: {e}", exc_info=True)
+
+    return ssh_proc
 
 
 def _test_ipv6_available():
@@ -1572,14 +1583,18 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
     # Custom error handler to suppress SSL errors (from bots/scanners/disconnects)
     class QuietWSGIServer(WSGIServer):
         def wrap_socket_and_handle(self, client_socket, address):
-            """Override to catch SSL errors during handshake"""
+            """Override to catch SSL errors and the shutdown GreenletExit during handshake"""
             try:
                 return super().wrap_socket_and_handle(client_socket, address)
+            except GreenletExit:
+                # gevent cancels connection greenlets on stop(); expected at exit, and it
+                # is a BaseException so the handler below would never see it. Its siblings
+                # (KeyboardInterrupt, SystemExit, GeneratorExit) are deliberately not caught.
+                return
             except Exception as e:
                 if 'ssl' in str(type(e).__name__).lower() or 'ssl' in str(e).lower():
-                    pass
-                else:
-                    raise
+                    return
+                raise
 
         def handle_error(self, *args):
             """Suppress SSL errors - they're normal with self-signed certs"""
@@ -1786,30 +1801,32 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
         print("WARNING: Running without HTTPS - noVNC console may not work!", flush=True)
         http_server = QuietWSGIServer(_create_listener(bind_host, port), app, **server_kwargs)
 
-    # Start VNC/SSH WebSocket servers
-    _start_console_servers(bind_host, port, ssl_context)
+    # Start VNC/SSH WebSocket servers. The SSH one hands back its subprocess so the
+    # shutdown path can stop it; the VNC server is a daemon thread and needs no handle.
+    ssh_ws_proc = _start_console_servers(bind_host, port, ssl_context)
 
-    # Handle graceful shutdown
-    # MK Sep 2026 (#784) — stop() waits for in-flight greenlets, and a signal handler
-    # installed with signal.signal runs ON the hub, so waiting there raises
-    # BlockingSwitchOutError and systemd sees the unit exit 1 instead of a clean stop.
-    # gevent.signal_handler runs the callback in its own greenlet, which is allowed to block.
-    def signal_handler(*_):
+    # Handle graceful shutdown (#780 / #784)
+    def signal_handler(signum, frame):
         print("\nShutting down gracefully...")
-        try:
-            http_server.stop(timeout=10)
-        except Exception as e:
-            logging.warning(f"Shutdown: server stop returned {e}")
-        sys.exit(0)
+        # terminate() sends SIGTERM and returns immediately, so it is safe from the hub's
+        # signal callback. The SSH WebSocket server is a separate process sitting on an
+        # endless asyncio Future — nothing else ever stops it, so it survived us and got
+        # reparented to init.
+        if ssh_ws_proc is not None and ssh_ws_proc.poll() is None:
+            try:
+                ssh_ws_proc.terminate()
+            except Exception:
+                pass
+        # gevent runs signal handlers inside the hub greenlet, and http_server.stop()
+        # blocks on pool.join() — illegal there, which is the BlockingSwitchOutError that
+        # made a systemd stop exit 1. Defer it to its own greenlet and bound the join so a
+        # long-lived SSE or WebSocket connection cannot hold shutdown open. serve_forever()
+        # returns once stop() sets the stop event, so there is no sys.exit() to make here.
+        from gevent import spawn
+        spawn(lambda: http_server.stop(timeout=10))
 
-    try:
-        import gevent.signal as _gsig
-        _gsig.signal(signal.SIGINT, signal_handler)
-        _gsig.signal(signal.SIGTERM, signal_handler)
-    except (ImportError, AttributeError):
-        # non-gevent fallback (tests, or a build without the shim)
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
     print("SSL/WebSocket errors (bots, scanners, disconnects) are suppressed")
     http_server.serve_forever()
