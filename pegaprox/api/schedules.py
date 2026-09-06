@@ -93,6 +93,29 @@ def load_schedules():
     return {'actions': [], 'last_id': 0}
 
 
+def _record_action_run(action_id, last_run, disable=False):
+    """Record one action's run without rewriting the table around it.
+
+    The tick used to reload every row, execute (which blocks on the cluster API for as long as
+    a VM takes to start or stop), then hand the whole pre-tick snapshot to save_schedules —
+    which is a DELETE followed by a re-INSERT. So a schedule an operator added during that
+    window disappeared, and one they deleted came back and kept firing. Same shape, and the
+    same fix, as _touch_last_run in background/scheduler.py."""
+    if not action_id:
+        return
+    try:
+        db = get_db()
+        if disable:
+            db.conn.execute('UPDATE scheduled_actions SET last_run = ?, enabled = 0 WHERE id = ?',
+                            (last_run, action_id))
+        else:
+            db.conn.execute('UPDATE scheduled_actions SET last_run = ? WHERE id = ?',
+                            (last_run, action_id))
+        db.conn.commit()
+    except Exception as e:
+        logging.error(f"Failed to record run for scheduled action {action_id}: {e}")
+
+
 def save_schedules(schedules):
     """Save scheduled actions to SQLite database
     
@@ -151,8 +174,6 @@ def check_schedules():
             current_day = now.strftime('%A').lower()
             current_date = now.strftime('%Y-%m-%d')
             
-            modified = False
-            
             for action in schedules.get('actions', []):
                 if not action.get('enabled', True):
                     continue
@@ -168,7 +189,6 @@ def check_schedules():
                         if action.get('date') == current_date:
                             should_run = True
                             action['enabled'] = False  # Disable after running
-                            modified = True
                     
                     elif schedule_type == 'daily':
                         should_run = True
@@ -196,11 +216,8 @@ def check_schedules():
                     # Execute the action
                     execute_scheduled_action(action)
                     action['last_run'] = f"{current_date} {current_time}"
-                    action['run_count'] = action.get('run_count', 0) + 1
-                    modified = True
-            
-            if modified:
-                save_schedules(schedules)
+                    _record_action_run(action.get('id'), action['last_run'],
+                                       disable=not action.get('enabled', True))
             
             # MK: Check for scheduled rolling updates
             try:
