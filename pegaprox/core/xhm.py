@@ -125,6 +125,10 @@ class _StreamBody:
         return self._size
 
 
+# rolling window per migration — deep enough to debug a failure, bounded for a long one
+_MAX_LOG_LINES = 500
+
+
 class XHMigrationTask:
     """Tracks a cross-hypervisor migration (Proxmox <-> XCP-ng).
 
@@ -165,6 +169,9 @@ class XHMigrationTask:
         ts = datetime.now().strftime('%H:%M:%S')
         entry = f"[{ts}] {msg}"
         self.log_lines.append(entry)
+        # to_dict renders the last 30; a long transfer used to keep thousands nobody reads
+        if len(self.log_lines) > _MAX_LOG_LINES:
+            del self.log_lines[:-_MAX_LOG_LINES]
         logger.info(f"[XHM:{self.id}] {msg}")
         try:
             now = time.time()
