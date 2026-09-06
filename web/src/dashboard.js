@@ -14962,6 +14962,11 @@
                                         ))}
                                     </div>
                                 )}
+                                {/* inside the sticky block, not after it: the sidebar column is as
+                                    tall as the page, so anything below this container lands in dead
+                                    space halfway down and reads as stray text. */}
+                                <LegalNotice className="mt-3 pt-2 px-2"
+                                             style={{borderTop: '1px solid var(--corp-divider, rgba(255,255,255,0.10))'}} />
                                 </div>
                             </div>
                             {/* LW: sidebar resize handle */}
@@ -23353,6 +23358,7 @@
                             <div className="text-center mt-4 text-xs text-gray-600">
                                 <p>PegaProx {PEGAPROX_VERSION} • {t('madeWithLove') || 'Made with ❤️ for the Proxmox community'}</p>
                             </div>
+                            <LegalNotice className="mt-2" />
                         </div>
                     </footer>
 
@@ -24712,6 +24718,12 @@
                                             }} />
                                         {t('sponsorNagSnooze90') || "Don't show again for 90 days"}
                                     </label>
+                                    {/* one more place the attribution travels. Note it carries no
+                                        weight HERE: §7(b) protects the notice, not the box around
+                                        it, and a notice visible one day in ninety would be a poor
+                                        "prominently visible feature" (§0). The load-bearing copies
+                                        are the permanent ones. NS */}
+                                    <LegalNotice style={{marginTop: 10, opacity: 0.45}} />
                                 </div>
                                 {/* countdown bar: fills from 0 -> 100% as the 15s elapses */}
                                 <div style={{height: 4, background: 'rgba(0,0,0,0.4)', position: 'relative', overflow: 'hidden'}}>
@@ -25087,6 +25099,9 @@
                     </div>
                 );
             }
+            // ConsoleModal is a position:fixed overlay, so a flex sibling would end up
+            // underneath it — the console leaves the strip free instead (see `standalone`
+            // in ConsoleModal, which insets the overlay by exactly LEGAL_STRIP_H)
             return (
                 <div className="min-h-screen bg-proxmox-darker">
                     <ConsoleModal
@@ -25096,6 +25111,8 @@
                         onClose={closeWindow}
                         standalone
                     />
+                    <LegalNotice style={{position: 'fixed', left: 0, right: 0, bottom: 0,
+                                         height: LEGAL_STRIP_H, padding: '3px 10px', zIndex: 60}} />
                 </div>
             );
         }
@@ -25140,6 +25157,7 @@
                 return (
                     <div className="min-h-screen bg-proxmox-darker">
                         <Force2FASetupModal />
+                        <LegalNotice className="fixed bottom-0 inset-x-0 z-[60]" />
                     </div>
                 );
             }
@@ -25156,6 +25174,7 @@
                 return (
                     <div className="min-h-screen bg-proxmox-darker">
                         <LayoutSelectionModal />
+                        <LegalNotice className="fixed bottom-0 inset-x-0 z-[60]" />
                     </div>
                 );
             }

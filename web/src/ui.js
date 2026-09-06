@@ -195,6 +195,52 @@
             doc.save(filename || 'pegaprox-report.pdf');
         }
 
+        // ═══════════════════════════════════════════════
+        // REQUIRED LEGAL NOTICE — do not remove, hide, disable, obscure or alter.
+        //
+        // This line is part of this Program's "Appropriate Legal Notices" within the
+        // meaning of AGPL-3.0 §0, and a required author attribution under §7(b); see the
+        // NOTICE file at the repository root. It must remain visible, legible and
+        // functional in every copy conveyed and in every instance made available to users
+        // over a network (§13). The full notice — warranty disclaimer, redistribution
+        // terms and the source offer — is in Settings → About, which the license link
+        // below reaches.
+        //
+        // Deliberately not translated: it refers to an English-language license, and a
+        // translated legal notice is a weaker one. NS Sep 2026
+        // ═══════════════════════════════════════════════
+        const LEGAL_REPO = 'https://github.com/PegaProx/project-pegaprox';
+        const LEGAL_STRIP_H = 24;   // what a console window has to leave free for it
+
+        function LegalNotice({ className = '', style = {} }) {
+            const link = {color: 'inherit', textDecoration: 'underline', textUnderlineOffset: 2};
+            return (
+                <div id="pegaprox-legal-notice"
+                     className={className}
+                     style={{fontSize: 11, lineHeight: 1.6, textAlign: 'center',
+                             padding: '6px 10px',
+                             // body carries no colour of its own (everything here is Tailwind
+                             // utility classes), so inheriting gives black — invisible on the
+                             // dark skins. --color-text is themed but only defined per layout,
+                             // and the login runs as "modern" whatever the instance default
+                             // theme is; the literal is the modern-dark case.
+                             color: 'var(--color-text, #cbd5e1)', opacity: 0.72, ...style}}>
+                    {/* NBSP before each "·" so a wrap can never start a line with a stray
+                        separator, and a normal space after it so the line CAN break there —
+                        the 224px sidebar is the tight case. nowrap spans were the first
+                        attempt and overflowed it (315px of content in 223px). */}
+                    <a href="https://pegaprox.com" target="_blank" rel="noopener noreferrer"
+                       style={link}>PegaProx</a>
+                    {'\u00A0· © 2025-2026 PegaProx Team\u00A0· '}
+                    <a href={`${LEGAL_REPO}/blob/main/LICENSE`} target="_blank"
+                       rel="noopener noreferrer" style={link}>AGPL-3.0</a>
+                    {'\u00A0· '}
+                    <a href={LEGAL_REPO} target="_blank" rel="noopener noreferrer"
+                       style={link}>Source</a>
+                </div>
+            );
+        }
+
         function _hexToRgb(hex) {
             const r = parseInt(hex.slice(1,3), 16) || 0;
             const g = parseInt(hex.slice(3,5), 16) || 0;

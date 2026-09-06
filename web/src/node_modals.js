@@ -4046,7 +4046,8 @@
             return (
                 <div className={isCorporate ? "corp-vm-modal-overlay" : "fixed inset-0 z-50 flex items-center justify-center p-4 modal-backdrop bg-black/80"}
                      style={hidden ? {display: 'none'}
-                            : standalone ? {padding: 0, background: 'transparent', backdropFilter: 'none', WebkitBackdropFilter: 'none'}
+                            : standalone ? {padding: 0, bottom: LEGAL_STRIP_H, background: 'transparent',
+                                            backdropFilter: 'none', WebkitBackdropFilter: 'none'}
                             : undefined}>
                     <div
                         ref={containerRef}
@@ -4055,7 +4056,9 @@
                             : `bg-proxmox-card border border-proxmox-border shadow-2xl overflow-hidden flex flex-col ${fillWindow ? 'w-full h-full' : 'rounded-2xl animate-scale-in w-full max-w-5xl h-[80vh]'}`}
                         style={isCorporate
                             ? (fillWindow
-                                ? {maxWidth: '100vw', width: '100vw', height: '100vh', maxHeight: '100vh'}
+                                ? {maxWidth: '100vw', width: '100vw',
+                                   height: standalone ? `calc(100vh - ${LEGAL_STRIP_H}px)` : '100vh',
+                                   maxHeight: standalone ? `calc(100vh - ${LEGAL_STRIP_H}px)` : '100vh'}
                                 : {maxWidth: '1280px', width: '100%', height: '82vh', maxHeight: '82vh'})
                             : undefined}
                     >
