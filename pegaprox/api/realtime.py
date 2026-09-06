@@ -166,6 +166,24 @@ def _floor_by_token_role(user, token_role):
 # how often an open SSE stream re-reads its own account. One indexed read per client.
 SSE_REAUTHZ_INTERVAL = 30
 
+# sec (audit): an SSE stream is an open response, so it holds a request-pool slot for as long
+# as it lives — the #777 idle-connection reaper cannot touch it, because it is not idle. There
+# was no bound at all, so any authenticated account could open streams until the pool was gone
+# and the whole UI stopped answering. Generous enough for a wall of browser tabs; the oldest
+# stream of the same account is superseded rather than the new one refused, so a reconnect
+# (which the frontend does on its own watchdog) never locks the user out of their own session.
+MAX_SSE_STREAMS_PER_USER = 20
+
+
+def _supersede_oldest_streams(username):
+    """Drop this user's oldest streams once they are over the cap. Call with sse_clients_lock
+    held; the generators notice they were dropped and close on their next frame."""
+    mine = sorted(((c.get('connected_at', ''), cid) for cid, c in sse_clients.items()
+                   if c.get('user') == username))
+    for _, cid in mine[:max(0, len(mine) - MAX_SSE_STREAMS_PER_USER + 1)]:
+        sse_clients.pop(cid, None)
+        logging.info(f"[SSE] superseded stream {cid} — '{_sl(username)}' over the per-user cap")
+
 
 def _stream_identity(username):
     """Identity for SSE cluster scoping. Two reasons not to use load_users() here, both already
@@ -452,6 +470,7 @@ def sse_updates():
         _is_admin = False
 
     with sse_clients_lock:
+        _supersede_oldest_streams(user)
         sse_clients[client_id] = {
             'queue': message_queue,
             'user': user,
@@ -492,6 +511,13 @@ def sse_updates():
                 # isn't one: broadcast.py sends a heartbeat to every client once a second, so
                 # the queue is never Empty and the whole re-check never ran. Own clock instead,
                 # evaluated whether or not frames are flowing.
+                # a stream superseded by the per-user cap is no longer in the registry, so
+                # it will never be fed again — let go of the connection instead of holding a
+                # pool slot open sending keepalives to nobody
+                if client_id not in sse_clients:
+                    logging.info(f"[SSE] closing superseded stream {client_id}")
+                    return
+
                 if time.monotonic() >= _next_authz:
                     _next_authz = time.monotonic() + SSE_REAUTHZ_INTERVAL
                     _acct = _stream_identity(user)
