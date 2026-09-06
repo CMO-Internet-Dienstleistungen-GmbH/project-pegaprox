@@ -1790,13 +1790,26 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
     _start_console_servers(bind_host, port, ssl_context)
 
     # Handle graceful shutdown
-    def signal_handler(signum, frame):
+    # MK Sep 2026 (#784) — stop() waits for in-flight greenlets, and a signal handler
+    # installed with signal.signal runs ON the hub, so waiting there raises
+    # BlockingSwitchOutError and systemd sees the unit exit 1 instead of a clean stop.
+    # gevent.signal_handler runs the callback in its own greenlet, which is allowed to block.
+    def signal_handler(*_):
         print("\nShutting down gracefully...")
-        http_server.stop()
+        try:
+            http_server.stop(timeout=10)
+        except Exception as e:
+            logging.warning(f"Shutdown: server stop returned {e}")
         sys.exit(0)
 
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    try:
+        import gevent.signal as _gsig
+        _gsig.signal(signal.SIGINT, signal_handler)
+        _gsig.signal(signal.SIGTERM, signal_handler)
+    except (ImportError, AttributeError):
+        # non-gevent fallback (tests, or a build without the shim)
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
 
     print("SSL/WebSocket errors (bots, scanners, disconnects) are suppressed")
     http_server.serve_forever()

@@ -501,8 +501,18 @@ class PegaProxManager:
         self.logger.propagate = False  # MK: Don't propagate to root logger (prevents DEBUG spam)
         
         # Clear existing handlers to prevent duplicates - NS Jan 2026
-        if self.logger.handlers:
-            self.logger.handlers.clear()
+        # MK Sep 2026 (#783) — but the logger is keyed on the DISPLAY name, which nothing
+        # forces to be unique, while each manager's file handler is keyed on cluster_id. So a
+        # blanket clear here stripped a SIBLING manager's file handler whenever two clusters
+        # shared a name: that cluster's log went silent and its lines landed in ours, which is
+        # exactly the evidence you want during an incident. Drop only what would genuinely
+        # duplicate ours — our own file handler, and any console handler we are about to
+        # re-add — and leave a sibling's file handler attached.
+        _own_log = os.path.abspath(f"{LOG_DIR}/{cluster_id}.log")
+        for _h in list(self.logger.handlers):
+            _base = getattr(_h, 'baseFilename', None)
+            if _base is None or os.path.abspath(_base) == _own_log:
+                self.logger.removeHandler(_h)
         
         # File handler - DEBUG level (for troubleshooting). Capped at 3h of data,
         # rotated content is discarded — see #345 / #348. 3h because 20+ node
