@@ -473,10 +473,10 @@ def _valid_snapshot_name(name):
     """sec (audit): the portal interpolated the snapshot name straight into the PVE API path
     (.../{vmid}/snapshot/{snapname}), while the authz gate above it only validated the vmid — so
     a name carrying path separators or dot-segments reached a DIFFERENT guest's endpoint, or a
-    different endpoint entirely. PVE snapshot names are [A-Za-z0-9_-] starting with a letter;
-    anything else is not a name we produced."""
-    import re as _re
-    return bool(name) and bool(_re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,62}', str(name)))
+    different endpoint entirely. The dashboard turned out to have the same hole, so the rule
+    moved to utils.sanitization and the manager sinks enforce it for everyone."""
+    from pegaprox.utils.sanitization import validate_snapshot_name
+    return validate_snapshot_name(name)
 
 
 def _change_password():

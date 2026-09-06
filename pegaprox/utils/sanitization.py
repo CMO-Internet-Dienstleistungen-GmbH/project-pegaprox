@@ -144,6 +144,27 @@ def validate_esxi_path_component(value) -> bool:
     return bool(_ESXI_NAME_RE.match(value))
 
 
+# MK Sep 2026 (audit CRIT) — a snapshot name goes straight into the PVE API path
+# (.../{vmid}/snapshot/{snapname}), and the authz gate in front of those routes only ever
+# validates the vmid. So a name carrying dot-segments walked out of the guest the caller owns
+# and reached arbitrary PVE endpoints as the cluster's stored root ticket — five `../` from
+# the snapshot path lands on /access/users, and the verb is DELETE. The portal grew a private
+# copy of this check when the same bug was found there; the dashboard twins never got it, so
+# it lives here now and the sinks in manager.py enforce it for every caller.
+# PVE's own snapshot-name rule is [A-Za-z][A-Za-z0-9_-]*, so nothing legitimate is refused.
+_SNAPSHOT_NAME_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_\-]{0,62}$')
+
+
+def validate_snapshot_name(value) -> bool:
+    """True if `value` is a legitimate PVE snapshot name (one path segment, no dot-segments).
+
+    Empty is rejected; a caller that means "the running config" must check for PVE's synthetic
+    'current' before calling this."""
+    if not value or not isinstance(value, str):
+        return False
+    return bool(_SNAPSHOT_NAME_RE.match(value))
+
+
 def sanitize_csv_field(value) -> str:
     """Sanitize field for CSV export to prevent formula injection.
     

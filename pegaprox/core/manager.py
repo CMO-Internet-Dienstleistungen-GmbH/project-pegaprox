@@ -17,6 +17,7 @@ import subprocess
 import re
 import shlex
 from pegaprox.utils.ssh_security import cli_hostkey_opts  # secure host-key opts for subprocess ssh/scp
+from pegaprox.utils.sanitization import validate_snapshot_name, validate_hostname
 import requests
 import urllib3
 from datetime import datetime, timedelta
@@ -10505,6 +10506,15 @@ echo "AGENT_INSTALLED_OK"
     
     def create_snapshot(self, node: str, vmid: int, vm_type: str, snapname: str, description: str = '', vmstate: bool = False) -> Dict[str, Any]:
         """create a snapshot"""
+        # sec (audit CRIT): snapname and node are interpolated into the API path below, and
+        # the route gates in front of us only ever check the vmid — so a name with dot-segments
+        # reached a different guest, or a different PVE endpoint entirely, as our root ticket.
+        # Enforced here rather than per route: every caller reaches the same URL.
+        if not validate_snapshot_name(snapname):
+            return {'success': False, 'error': 'Invalid snapshot name'}
+        if not validate_hostname(node):
+            return {'success': False, 'error': 'Invalid node name'}
+
         # LW: this was surprisingly annoying to get right
         if not self.is_connected:
             if not self.connect_to_proxmox():
@@ -10555,6 +10565,15 @@ echo "AGENT_INSTALLED_OK"
     
     def delete_snapshot(self, node: str, vmid: int, vm_type: str, snapname: str) -> Dict[str, Any]:
         """delete snapshot"""
+        # sec (audit CRIT): snapname and node are interpolated into the API path below, and
+        # the route gates in front of us only ever check the vmid — so a name with dot-segments
+        # reached a different guest, or a different PVE endpoint entirely, as our root ticket.
+        # Enforced here rather than per route: every caller reaches the same URL.
+        if not validate_snapshot_name(snapname):
+            return {'success': False, 'error': 'Invalid snapshot name'}
+        if not validate_hostname(node):
+            return {'success': False, 'error': 'Invalid node name'}
+
         if not self.is_connected:
             if not self.connect_to_proxmox():
                 return {'success': False, 'error': 'Could not connect to Proxmox'}
@@ -10577,7 +10596,15 @@ echo "AGENT_INSTALLED_OK"
             return {'success': False, 'error': str(e)}
     
     def rollback_snapshot(self, node: str, vmid: int, vm_type: str, snapname: str) -> Dict[str, Any]:
-        
+        # sec (audit CRIT): snapname and node are interpolated into the API path below, and
+        # the route gates in front of us only ever check the vmid — so a name with dot-segments
+        # reached a different guest, or a different PVE endpoint entirely, as our root ticket.
+        # Enforced here rather than per route: every caller reaches the same URL.
+        if not validate_snapshot_name(snapname):
+            return {'success': False, 'error': 'Invalid snapshot name'}
+        if not validate_hostname(node):
+            return {'success': False, 'error': 'Invalid node name'}
+
         if not self.is_connected:
             if not self.connect_to_proxmox():
                 return {'success': False, 'error': 'Could not connect to Proxmox'}

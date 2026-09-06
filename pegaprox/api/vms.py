@@ -43,7 +43,7 @@ from pegaprox.utils.realtime import broadcast_sse, broadcast_action, push_immedi
 from pegaprox.core.config import save_config
 from pegaprox.api.helpers import get_connected_manager, check_cluster_access, register_task_user, safe_error, parse_pve_error, scope_vm_rows, require_unconfined, caller_is_scoped
 from pegaprox.utils.ssh import get_paramiko
-from pegaprox.utils.sanitization import sanitize_int
+from pegaprox.utils.sanitization import sanitize_int, validate_snapshot_name
 from urllib.parse import urlencode, quote as url_quote
 import signal
 import requests.exceptions
@@ -5724,6 +5724,11 @@ def get_snapshot_config_api(cluster_id, node, vm_type, vmid, snapname):
         return jsonify({'error': 'Cluster offline'}), 503
     if vm_type not in ('qemu', 'lxc'):
         return jsonify({'error': 'Invalid vm_type'}), 400
+    # sec (audit): <snapname> is a URL segment, so Flask's converter rules out '/' but not a
+    # dot-segment — '..' walks up to the guest's own config endpoint. Read-only here, but the
+    # same shape as the delete twin, so answer it the same way.
+    if not validate_snapshot_name(snapname):
+        return jsonify({'error': 'Invalid snapshot name'}), 400
     try:
         url = f"https://{mgr.host}:{mgr.api_port}/api2/json/nodes/{node}/{vm_type}/{vmid}/snapshot/{snapname}/config"
         r = mgr._api_get(url)
@@ -5749,8 +5754,11 @@ def diff_snapshots_api(cluster_id, node, vm_type, vmid):
     if not a or not b:
         return jsonify({'error': 'Both ?a and ?b query params are required'}), 400
     # disallow path-traversal-ish stuff
+    # sec (audit): the '/' check missed dot-segments, which is the half that actually walks
+    # out of the guest. 'current' is PVE's synthetic name for the running config and is
+    # answered by a different URL below, so let it through.
     for s in (a, b):
-        if '/' in s or '\x00' in s or len(s) > 64:
+        if s.lower() != 'current' and not validate_snapshot_name(s):
             return jsonify({'error': 'Invalid snapshot name'}), 400
 
     mgr = cluster_managers[cluster_id]
