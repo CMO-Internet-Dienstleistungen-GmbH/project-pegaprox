@@ -23380,7 +23380,23 @@
                         </div>
                     )}
 
-                    {/* Sponsor Footer */}
+                    {/* Sponsor footer.
+
+                        This block carries one of the Program's Appropriate Legal Notices — the
+                        LegalNotice line at the bottom of it — which is a required author
+                        attribution under AGPL-3.0 §7(b); the NOTICE file at the repository root
+                        names this footer explicitly. Delete the footer and the notice goes with
+                        it, and that is a license violation. Keep the two together: moving the
+                        notice out of here quietly removes the only thing that makes stripping
+                        this block actionable.
+
+                        The sponsor logos and the Open Collective button are NOT covered by that
+                        term, and we do not pretend otherwise. §7 does not permit requiring a
+                        funding appeal to be preserved, and a term that reached that far would be
+                        a "further restriction" any recipient may simply strike out — taking the
+                        attribution with it. They are here because the servers, the domains and
+                        the hours come out of our own pockets. NS Sep 2026
+                    */}
                     <footer className="border-t border-proxmox-border bg-proxmox-dark/50 mt-8">
                         <div className="max-w-[800px] mx-auto px-6 py-6">
                             <div className="text-center mb-4">

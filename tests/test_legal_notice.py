@@ -110,6 +110,31 @@ def test_notice_file_and_interface_agree():
     assert 'this term covers the notices described above' in notice
 
 
+def test_the_page_footer_and_the_notice_stay_coupled():
+    """The sponsor block cannot be made unremovable — §7 does not reach a funding appeal,
+    and a term that tried would be a further restriction a recipient may strike out. What
+    IS actionable is that the footer carries an Appropriate Legal Notice, so deleting the
+    footer deletes that too. That only holds while the two live in the same element: move
+    the notice out and stripping the footer becomes a clean, lawful edit."""
+    dash = open(SRC + 'dashboard.js', encoding='utf-8').read()
+    start = dash.index('<footer className="border-t border-proxmox-border')
+    end = dash.index('</footer>', start)
+    footer = dash[start:end]
+
+    assert '<LegalNotice' in footer, 'the notice left the footer — the coupling is gone'
+    assert 'opencollective.com/pegaprox' in footer
+    assert 'SponsorSlot' in footer
+
+
+def test_the_footer_is_not_rendered_conditionally():
+    """A footer behind a flag is a footer someone can turn off without editing anything."""
+    dash = open(SRC + 'dashboard.js', encoding='utf-8').read()
+    before = dash[:dash.index('<footer className="border-t border-proxmox-border')]
+
+    assert before.rstrip().endswith('*/}'), \
+        'something now gates the footer; it used to render unconditionally'
+
+
 def test_the_shipped_bundle_carries_it():
     bundle = open('web/index.html', encoding='utf-8').read()
 
