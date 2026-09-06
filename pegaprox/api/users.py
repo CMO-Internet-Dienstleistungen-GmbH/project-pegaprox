@@ -1581,36 +1581,25 @@ def update_custom_role(role_id):
         if permissions is not None and not _caller_can_grant_perms(permissions):
             return jsonify({'error': 'Cannot grant permissions beyond your own'}), 403
 
+    # validate before touching anything: get_custom_roles hands back the live cached dict, and
+    # the name used to be written into it before the permission list was checked — so a request
+    # rejected with 400 still renamed the role for the rest of the process's life
+    if permissions is not None:
+        for p in permissions:
+            if p not in PERMISSIONS:
+                return jsonify({'error': f'Invalid permission: {p}'}), 400
+
     custom = get_custom_roles()
-    
-    # find the role
-    found = False
-    if tenant_id:
-        tenant_roles = custom.get('tenants', {}).get(tenant_id, {})
-        if role_id in tenant_roles:
-            if name: tenant_roles[role_id]['name'] = name
-            if permissions is not None:
-                # validate
-                for p in permissions:
-                    if p not in PERMISSIONS:
-                        return jsonify({'error': f'Invalid permission: {p}'}), 400
-                tenant_roles[role_id]['permissions'] = permissions
-            tenant_roles[role_id]['modified'] = datetime.now().isoformat()
-            found = True
-    else:
-        global_roles = custom.get('global', {})
-        if role_id in global_roles:
-            if name: global_roles[role_id]['name'] = name
-            if permissions is not None:
-                for p in permissions:
-                    if p not in PERMISSIONS:
-                        return jsonify({'error': f'Invalid permission: {p}'}), 400
-                global_roles[role_id]['permissions'] = permissions
-            global_roles[role_id]['modified'] = datetime.now().isoformat()
-            found = True
-    
-    if not found:
+    roles = (custom.get('tenants', {}).get(tenant_id, {}) if tenant_id
+             else custom.get('global', {}))
+    if role_id not in roles:
         return jsonify({'error': 'Role not found'}), 404
+
+    if name:
+        roles[role_id]['name'] = name
+    if permissions is not None:
+        roles[role_id]['permissions'] = permissions
+    roles[role_id]['modified'] = datetime.now().isoformat()
     
     save_custom_roles(custom)
     invalidate_roles_cache()
@@ -1642,21 +1631,41 @@ def delete_custom_role(role_id):
         tenant_id = user_tenant
 
     custom = get_custom_roles()
-    found = False
-    
+    # look it up before touching anything: get_custom_roles hands back the live cached dict,
+    # so deleting first and deciding afterwards drops the role out of the running process even
+    # on a path that returns an error and never saves
     if tenant_id:
-        tenant_roles = custom.get('tenants', {}).get(tenant_id, {})
-        if role_id in tenant_roles:
-            del tenant_roles[role_id]
-            found = True
+        found = role_id in custom.get('tenants', {}).get(tenant_id, {})
     else:
-        if role_id in custom.get('global', {}):
-            del custom['global'][role_id]
-            found = True
-    
+        found = role_id in custom.get('global', {})
+
     if not found:
         return jsonify({'error': 'Role not found'}), 404
-    
+
+    # sec (audit): deleting a role does not revoke it from the accounts holding it, and
+    # get_role_permissions_for_user falls back to the ROLE_VIEWER defaults for a name it can no
+    # longer resolve. So removing a deliberately narrow role WIDENED its holders — a role
+    # granting vm.view left them with 31 permissions including the whole node, cluster and PBS
+    # read surface. An admin deleting a role means "revoke this", never "promote them".
+    _holders = sorted(
+        u for u, rec in (load_users() or {}).items()
+        if (rec or {}).get('role') == role_id
+        or any((_ov or {}).get('role') == role_id
+               for _ov in ((rec or {}).get('tenant_permissions', {}) or {}).values())
+    )
+    if _holders:
+        return jsonify({
+            'error': 'Role still assigned',
+            'detail': f"{len(_holders)} account(s) still hold '{role_id}' — reassign them "
+                      f"before deleting, or they would silently fall back to viewer access.",
+            'users': _holders[:20],
+        }), 409
+
+    if tenant_id:
+        del custom['tenants'][tenant_id][role_id]
+    else:
+        del custom['global'][role_id]
+
     save_custom_roles(custom)
     invalidate_roles_cache()
     
