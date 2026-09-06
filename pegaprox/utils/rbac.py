@@ -229,6 +229,26 @@ def save_tenants(tenants: dict):
 # tenant cache - reloaded on changes
 tenants_db = {}
 
+def _tenant_defining_role(role: str, tenant_id: str) -> str:
+    """The tenant whose custom-role table defines `role`, or `tenant_id` unchanged.
+
+    A user — or an API token — can sit in the default tenant while carrying a tenant-scoped
+    custom role; get_user_clusters has remapped for that since Dec 2025. get_user_permissions
+    never did, so the role resolved to nothing there and fell through to the VIEWER defaults:
+    a custom role written to grant three permissions handed out the full viewer set of 31
+    instead, which is the opposite of what someone builds a restrictive role for.
+
+    Deliberately narrow, matching the remap it is factored out of: only a caller sitting in
+    the DEFAULT tenant is remapped. A user placed in tenant A keeps tenant A's answer even if
+    some other tenant happens to define a role by the same name."""
+    if not role or role in BUILTIN_ROLES or tenant_id != DEFAULT_TENANT_ID:
+        return tenant_id
+    for tid, roles in get_custom_roles().get('tenants', {}).items():
+        if role in roles:
+            return tid
+    return tenant_id
+
+
 def get_user_permissions(user: dict, tenant_id: str = None) -> list:
     """Get effective permissions for a user
     
@@ -265,7 +285,7 @@ def get_user_permissions(user: dict, tenant_id: str = None) -> list:
         denied = user.get('denied_permissions', [])
     
     # get base permissions from role (supports custom roles now)
-    base_perms = get_role_permissions_for_user({'role': role}, tenant_id)
+    base_perms = get_role_permissions_for_user({'role': role}, _tenant_defining_role(role, tenant_id))
     
     # add extra
     for p in extra:
@@ -282,7 +302,7 @@ def get_user_permissions(user: dict, tenant_id: str = None) -> list:
     # a no-op there; an admin effective_role caps to everything, i.e. also a no-op.
     _eff = user.get('effective_role')
     if _eff and _eff != role:
-        _cap = set(get_role_permissions_for_user({'role': _eff}, tenant_id))
+        _cap = set(get_role_permissions_for_user({'role': _eff}, _tenant_defining_role(_eff, tenant_id)))
         base_perms = [p for p in base_perms if p in _cap]
 
     return base_perms
@@ -336,14 +356,11 @@ def get_user_clusters(user: dict, include_pools: bool = True) -> list:
 
     tenant_id = user.get('tenant_id', DEFAULT_TENANT_ID)
 
-    # MK: If user has default tenant but a tenant-specific role, use the role's tenant
+    # MK: If user has default tenant but a tenant-specific role, use the role's tenant.
+    # Shared with get_user_permissions — the two answered this differently for years, and the
+    # permission side silently fell back to the viewer defaults because of it.
     role = user.get('effective_role', user.get('role', ROLE_VIEWER))
-    if tenant_id == DEFAULT_TENANT_ID and role not in BUILTIN_ROLES:
-        custom_roles = load_custom_roles()
-        for tid, roles in custom_roles.get('tenants', {}).items():
-            if role in roles:
-                tenant_id = tid
-                break
+    tenant_id = _tenant_defining_role(role, tenant_id)
     
     tenant = tenants_db.get(tenant_id, {})
     clusters = tenant.get('clusters', [])

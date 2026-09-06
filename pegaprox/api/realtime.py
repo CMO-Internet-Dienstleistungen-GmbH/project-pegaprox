@@ -98,7 +98,13 @@ def ws_live_updates(ws):
                 'user': username,
                 'clusters': subscribed_clusters,
                 'is_admin': _is_admin,
-                'effective_role': (_user_data or {}).get('effective_role'),
+                # the stored record carries no effective_role — a WebSocket can only be
+                # session-authenticated (validate_api_token never writes to active_sessions),
+                # so the account's own role IS the effective one. Named explicitly rather than
+                # left None, so the per-frame filters get a definite answer and a custom role
+                # resolves as itself instead of falling back to the stored-role default.
+                'effective_role': (_user_data or {}).get('effective_role')
+                                  or (_user_data or {}).get('role'),
                 'connected_at': datetime.now().isoformat()
             }
 
@@ -123,9 +129,9 @@ def ws_live_updates(ws):
                 with ws_clients_lock:
                     _ci = ws_clients.get(client_id)
                     if _ci is not None:
-                        _ci['is_admin'] = (_acct.get('effective_role', _acct.get('role'))
-                                           == ROLE_ADMIN)
-                        _ci['effective_role'] = _acct.get('effective_role')
+                        _acct_role = _acct.get('effective_role') or _acct.get('role')
+                        _ci['is_admin'] = _acct_role == ROLE_ADMIN
+                        _ci['effective_role'] = _acct_role
                         # a demotion has to narrow the LIVE subscription too, not just future ones
                         _ci['clusters'] = _scope_ws_clusters(_allowed, _ci.get('clusters'))
 
