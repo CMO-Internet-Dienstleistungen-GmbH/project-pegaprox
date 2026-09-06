@@ -720,6 +720,49 @@ def install_debsecan(cluster_id):
 # CIS Hardening Endpoints - MK Mar 2026
 # ============================================
 
+# NS Sep 2026 (#717) — every SSH-backed node check answered a bare 502 "SSH to <node>
+# failed", which the compliance dashboard rendered as the string "err 502" next to the
+# node and nothing else. On a token-only cluster that is EVERY node, so the dashboard
+# looked broken rather than unconfigured. Same shape for all of them: a code the UI can
+# branch on, a sentence saying what happened, and one saying what to do about it.
+_SSH_ERRORS = {
+    'SSH_NO_CREDENTIALS': (412, 'Add an SSH key or a password to this cluster under '
+                                'Settings > Clusters. An API token alone cannot open a '
+                                'shell, which these checks need.'),
+    'NODE_BACKOFF':       (503, 'The node stopped answering and is being retried with a '
+                                'backoff. Check that it is up and reachable from PegaProx.'),
+    'SSH_FAILED':         (502, 'Credentials are configured but the connection did not '
+                                'succeed — check reachability on port 22, the stored '
+                                'username, and whether the host key changed.'),
+}
+
+
+def _ssh_unavailable(mgr, node):
+    """One JSON shape for 'this node check needs SSH and SSH did not happen'."""
+    # every manager class that reaches this route should have ssh_diagnose, but this is
+    # the error path — it must not be the thing that raises. Anything unexpected back
+    # from it falls through to the generic reason.
+    reason = None
+    try:
+        probe = getattr(mgr, 'ssh_diagnose', None)
+        if callable(probe):
+            reason = probe(node)
+    except Exception:
+        logging.debug('[hardening] ssh_diagnose failed on %s', node, exc_info=True)
+    if not (isinstance(reason, (tuple, list)) and len(reason) == 2):
+        reason = ('SSH_FAILED', None)
+    code, detail = reason
+    status, hint = _SSH_ERRORS.get(code, _SSH_ERRORS['SSH_FAILED'])
+    return jsonify({
+        'error': f'Cannot read {node} over SSH' + (f': {detail}' if detail else ''),
+        'code': code,
+        'hint': hint,
+        'node': node,
+        # cluster-wide causes let the caller stop asking about the other 99 nodes
+        'cluster_wide': code == 'SSH_NO_CREDENTIALS',
+    }), status
+
+
 @bp.route('/api/clusters/<cluster_id>/nodes/<node>/hardening', methods=['GET'])
 @require_auth(perms=['node.maintenance'])
 def check_hardening(cluster_id, node):
@@ -741,7 +784,7 @@ def check_hardening(cluster_id, node):
         return jsonify({'error': f'unknown profile: {profile}'}), 400
     result = mgr.check_node_hardening(node, verbose=verbose, profile=profile)
     if result is None:
-        return jsonify({'error': f'SSH to {node} failed'}), 502
+        return _ssh_unavailable(mgr, node)
 
     return jsonify({'node': node, 'controls': result, 'verbose': verbose, 'profile': profile or 'cis-l1'})
 

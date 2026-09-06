@@ -6192,6 +6192,15 @@
             const [auditCounts, setAuditCounts] = useState(null);
             const [refreshTick, setRefreshTick] = useState(0);
 
+            // #717 — the server answers with a machine code; the sentence the operator reads
+            // is chosen here, so it lands in their language. The English error/hint the API
+            // also returns stay the fallback for a code we do not know yet.
+            const sshReason = (info) => ({
+                SSH_NO_CREDENTIALS: [t('sshNoCredentials'), t('sshNoCredentialsHint')],
+                NODE_BACKOFF:       [t('sshNodeBackoff'),   t('sshNodeBackoffHint')],
+                SSH_FAILED:         [t('sshFailed'),        t('sshFailedHint')],
+            }[info?.code] || [info?.error, info?.hint]);
+
             // Fetch hardening data for one cluster (all nodes)
             const fetchCluster = async (cluster) => {
                 if (!cluster) return;
@@ -6205,7 +6214,24 @@
                     for (const n of nodes) {
                         try {
                             const r = await authFetch(`${API_URL}/clusters/${cluster.id}/nodes/${n}/hardening?profile=${encodeURIComponent(profile)}`);
-                            if (!r || !r.ok) { perNode[n] = { error: r ? r.status : 'unreachable' }; continue; }
+                            if (!r || !r.ok) {
+                                // #717 — the reason is in the body. Carry it so the node shows a
+                                // sentence rather than "err 502", and when the cause is the whole
+                                // cluster (no SSH credentials at all) stop here: asking the other
+                                // 99 nodes costs a second each and every answer is the same one.
+                                let info = { error: r ? r.status : 'unreachable' };
+                                try {
+                                    const body = r ? await r.json() : null;
+                                    if (body) info = { error: body.error || info.error, code: body.code,
+                                                       hint: body.hint, clusterWide: !!body.cluster_wide };
+                                } catch (_) {}
+                                perNode[n] = info;
+                                if (info.clusterWide) {
+                                    setResults(prev => ({ ...prev, [cluster.id]: { ...perNode, _cluster: info } }));
+                                    return;
+                                }
+                                continue;
+                            }
                             const d = await r.json();
                             const ctrls = d.controls || {};
                             const total = Object.keys(ctrls).length;
@@ -6973,9 +6999,31 @@
                     ) : (() => {
                         const c = selectedCluster;
                         const perNode = results[c.id] || {};
-                        const nodes = Object.entries(perNode);
+                        // #717 — `_cluster` is the one reason that applies to every node; it is not
+                        // a node and must not be drawn as one
+                        const clusterErr = perNode._cluster;
+                        const nodes = Object.entries(perNode).filter(([k]) => k !== '_cluster');
                         return (
                             <div key={c.id} className="bg-proxmox-card border border-proxmox-border rounded-xl p-4">
+                                {/* #717 — say why the dashboard is empty. It used to render "err 502"
+                                    next to each node and nothing else, which reads as broken rather
+                                    than as unconfigured. */}
+                                {clusterErr && (
+                                    <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/5 p-4">
+                                        <div className="flex items-start gap-3">
+                                            <Icons.AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+                                            <div className="min-w-0">
+                                                <p className="text-sm font-medium text-amber-300">
+                                                    {t('complianceUnavailable') || 'Compliance checks cannot run on this cluster'}
+                                                </p>
+                                                <p className="text-xs text-gray-400 mt-1">{sshReason(clusterErr)[0]}</p>
+                                                {sshReason(clusterErr)[1] && (
+                                                    <p className="text-xs text-gray-400 mt-2">{sshReason(clusterErr)[1]}</p>
+                                                )}
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
                                 <div className="flex items-center justify-between mb-3">
                                     <div className="flex items-center gap-2">
                                         <Icons.Server className="w-4 h-4 text-gray-400" />
@@ -6995,12 +7043,14 @@
                                                 <div className="flex items-center justify-between">
                                                     <span className="text-sm text-white">{n}</span>
                                                     {info.error ? (
-                                                        <span className="text-xs text-red-400">err {info.error}</span>
+                                                        <span className="text-xs text-amber-400">{t('unavailable') || 'unavailable'}</span>
                                                     ) : (
                                                         <span className={`text-sm font-medium ${scoreColor(info.score)}`}>{info.score}%</span>
                                                     )}
                                                 </div>
-                                                {!info.error && (
+                                                {info.error ? (
+                                                    <p className="text-xs text-gray-500 mt-1">{sshReason(info)[0] || `HTTP ${info.error}`}</p>
+                                                ) : (
                                                     <p className="text-xs text-gray-500 mt-1">{info.passed}/{info.total} {t('passed') || 'passed'}</p>
                                                 )}
                                             </div>

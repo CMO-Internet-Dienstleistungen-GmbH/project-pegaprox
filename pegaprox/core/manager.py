@@ -15291,6 +15291,33 @@ echo "AGENT_INSTALLED_OK"
     # MK Mar 2026 - SSH-based node security scanning
     # =====================================================
 
+    def ssh_diagnose(self, node_name):
+        """Why an SSH-backed check could not run on this node — (code, detail), or None.
+
+        NS Sep 2026 (#717) — the compliance dashboard and the Harden-node panel both go
+        through _ssh_node_output, which answers None for every reason there is: no
+        credentials stored, node in reachability backoff, address unresolved, auth
+        rejected, host down. The caller then had a bare 502 to show, and the dashboard
+        just never loaded. This does not retry anything and does not probe — it reports
+        the reasons we already know, so the route can say which one it was. None means
+        nothing here explains it and it really was the connection.
+        """
+        blocked, remaining = self._is_node_blocked(node_name)
+        if blocked:
+            return ('NODE_BACKOFF',
+                    f"{node_name} is in reachability backoff for another {remaining}s "
+                    f"after repeated failures")
+        # config.pass_ holds the TOKEN SECRET when the cluster authenticates with an API
+        # token, not an SSH password — _ssh_node_output will happily offer it to sshd and
+        # get nowhere. Treating it as a credential is what made this report "connection
+        # failed" on exactly the setup it was written for.
+        has_password = bool(getattr(self.config, 'pass_', '')) and not getattr(self, '_using_api_token', False)
+        if not getattr(self.config, 'ssh_key', '') and not has_password:
+            return ('SSH_NO_CREDENTIALS',
+                    "this cluster authenticates with an API token and has no SSH key or "
+                    "password stored, and these checks read the node over SSH")
+        return None
+
     def _ssh_node_output(self, node_name, cmd, timeout=60):
         """Run command on a node, tries all available SSH auth methods.
         Returns stdout string or None.

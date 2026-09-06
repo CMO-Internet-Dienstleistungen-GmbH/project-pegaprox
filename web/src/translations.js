@@ -4,6 +4,15 @@
         // ═══════════════════════════════════════════════
         const translations = {
             de: {
+                sshNoCredentials: 'Dieser Cluster authentifiziert sich nur mit einem API-Token. Er hat weder einen SSH-Schlüssel noch ein Passwort hinterlegt — diese Prüfungen lesen den Node aber über SSH.',
+                sshNoCredentialsHint: 'Hinterlege unter Einstellungen > Cluster einen SSH-Schlüssel oder ein Passwort. Ein API-Token allein kann keine Shell öffnen.',
+                sshNodeBackoff: 'Der Node antwortet nicht mehr und wird mit Verzögerung erneut versucht.',
+                sshNodeBackoffHint: 'Prüfe, ob der Node läuft und von PegaProx aus erreichbar ist.',
+                sshFailed: 'Zugangsdaten sind hinterlegt, die Verbindung kam aber nicht zustande.',
+                sshFailedHint: 'Prüfe die Erreichbarkeit auf Port 22, den hinterlegten Benutzernamen und ob sich der Host-Key geändert hat.',
+                // #717 — Compliance ohne SSH-Zugang
+                unavailable: 'nicht verfügbar',
+                complianceUnavailable: 'Compliance-Prüfungen können auf diesem Cluster nicht laufen',
                 // #767 — VM-Konsole im eigenen Browserfenster
                 openInOwnWindow: 'In eigenem Fenster öffnen',
                 popupBlocked: 'Der Browser hat das Konsolenfenster blockiert. Bitte Pop-ups für PegaProx erlauben und erneut versuchen.',
@@ -4473,6 +4482,15 @@
                 zone: 'Zone',
             },
             en: {
+                sshNoCredentials: 'This cluster authenticates with an API token and has no SSH key or password stored — these checks read the node over SSH.',
+                sshNoCredentialsHint: 'Add an SSH key or a password to this cluster under Settings > Clusters. An API token alone cannot open a shell.',
+                sshNodeBackoff: 'The node stopped answering and is being retried with a backoff.',
+                sshNodeBackoffHint: 'Check that it is up and reachable from PegaProx.',
+                sshFailed: 'Credentials are configured but the connection did not succeed.',
+                sshFailedHint: 'Check reachability on port 22, the stored username, and whether the host key changed.',
+                // #717 — compliance without SSH access
+                unavailable: 'unavailable',
+                complianceUnavailable: 'Compliance checks cannot run on this cluster',
                 // #767 — VM console in its own browser window
                 openInOwnWindow: 'Open in its own window',
                 popupBlocked: 'Your browser blocked the console window. Allow popups for PegaProx and try again.',
@@ -9083,6 +9101,15 @@
                 allAttributes: 'All attributes',
             },
             zh: {
+                sshNoCredentials: '此集群仅使用 API 令牌认证，未保存 SSH 密钥或密码 — 而这些检查需要通过 SSH 读取节点。',
+                sshNoCredentialsHint: '请在“设置 > 集群”中添加 SSH 密钥或密码。仅有 API 令牌无法打开 shell。',
+                sshNodeBackoff: '该节点已停止响应，正在以退避方式重试。',
+                sshNodeBackoffHint: '请确认节点已启动并且 PegaProx 可以访问它。',
+                sshFailed: '已配置凭据，但连接未成功。',
+                sshFailedHint: '请检查 22 端口的可达性、保存的用户名，以及主机密钥是否已更改。',
+                // #717 — 无 SSH 访问时的合规检查
+                unavailable: '不可用',
+                complianceUnavailable: '无法在此集群上运行合规检查',
                 // #767 — 独立浏览器窗口中的虚拟机控制台
                 openInOwnWindow: '在独立窗口中打开',
                 popupBlocked: '浏览器阻止了控制台窗口。请允许 PegaProx 的弹出窗口后重试。',
@@ -13032,6 +13059,15 @@
                 appliedTickToRollback: '已应用 — 勾选以回滚',
             },
             pl: {
+                sshNoCredentials: 'Ten klaster uwierzytelnia się tokenem API i nie ma zapisanego klucza SSH ani hasła — a te kontrole odczytują węzeł przez SSH.',
+                sshNoCredentialsHint: 'Dodaj klucz SSH lub hasło w Ustawienia > Klastry. Sam token API nie otworzy powłoki.',
+                sshNodeBackoff: 'Węzeł przestał odpowiadać i jest ponawiany z opóźnieniem.',
+                sshNodeBackoffHint: 'Sprawdź, czy działa i czy jest osiągalny z PegaProx.',
+                sshFailed: 'Poświadczenia są skonfigurowane, ale połączenie nie doszło do skutku.',
+                sshFailedHint: 'Sprawdź dostępność na porcie 22, zapisaną nazwę użytkownika i czy klucz hosta się zmienił.',
+                // #717 — zgodnosc bez dostepu SSH
+                unavailable: 'niedostępne',
+                complianceUnavailable: 'Kontrole zgodności nie mogą działać na tym klastrze',
                 // #767 — konsola VM we własnym oknie przeglądarki
                 openInOwnWindow: 'Otwórz w osobnym oknie',
                 popupBlocked: 'Przeglądarka zablokowała okno konsoli. Zezwól na wyskakujące okienka dla PegaProx i spróbuj ponownie.',
@@ -17168,6 +17204,15 @@
             // French translations by @IMNotMax (PR #186)
             // Falls back to EN for missing keys
             fr: {
+                sshNoCredentials: 'Ce cluster s’authentifie avec un jeton API et n’a ni clé SSH ni mot de passe enregistré — or ces contrôles lisent le nœud via SSH.',
+                sshNoCredentialsHint: 'Ajoutez une clé SSH ou un mot de passe dans Paramètres > Clusters. Un jeton API seul ne peut pas ouvrir de shell.',
+                sshNodeBackoff: 'Le nœud ne répond plus et est réessayé avec un délai croissant.',
+                sshNodeBackoffHint: 'Vérifiez qu’il est démarré et joignable depuis PegaProx.',
+                sshFailed: 'Les identifiants sont configurés mais la connexion n’a pas abouti.',
+                sshFailedHint: 'Vérifiez l’accessibilité sur le port 22, le nom d’utilisateur enregistré et si la clé d’hôte a changé.',
+                // #717 — conformite sans acces SSH
+                unavailable: 'indisponible',
+                complianceUnavailable: 'Les contrôles de conformité ne peuvent pas fonctionner sur ce cluster',
                 // #767 — console VM dans sa propre fenêtre
                 openInOwnWindow: 'Ouvrir dans une fenêtre séparée',
                 popupBlocked: 'Votre navigateur a bloqué la fenêtre de console. Autorisez les pop-ups pour PegaProx et réessayez.',
@@ -21545,6 +21590,15 @@
                 zoomOut: 'Zoom arrière',
             },
             es: {
+                sshNoCredentials: 'Este clúster se autentica con un token de API y no tiene clave SSH ni contraseña guardada, pero estas comprobaciones leen el nodo por SSH.',
+                sshNoCredentialsHint: 'Añade una clave SSH o una contraseña en Ajustes > Clústeres. Un token de API por sí solo no puede abrir una shell.',
+                sshNodeBackoff: 'El nodo dejó de responder y se reintenta con una espera creciente.',
+                sshNodeBackoffHint: 'Comprueba que está encendido y accesible desde PegaProx.',
+                sshFailed: 'Las credenciales están configuradas pero la conexión no se estableció.',
+                sshFailedHint: 'Comprueba el acceso al puerto 22, el usuario guardado y si cambió la clave del host.',
+                // #717 — cumplimiento sin acceso SSH
+                unavailable: 'no disponible',
+                complianceUnavailable: 'Las comprobaciones de cumplimiento no pueden ejecutarse en este clúster',
                 // #767 — consola de VM en su propia ventana
                 openInOwnWindow: 'Abrir en su propia ventana',
                 popupBlocked: 'Tu navegador bloqueó la ventana de la consola. Permite las ventanas emergentes para PegaProx e inténtalo de nuevo.',
@@ -25938,6 +25992,15 @@
                 zoomOut: 'Alejar',
             },
             pt: {
+                sshNoCredentials: 'Este cluster autentica-se com um token de API e não tem chave SSH nem palavra-passe guardada — mas estas verificações leem o nó por SSH.',
+                sshNoCredentialsHint: 'Adicione uma chave SSH ou uma palavra-passe em Definições > Clusters. Um token de API sozinho não abre uma shell.',
+                sshNodeBackoff: 'O nó deixou de responder e está a ser repetido com espera crescente.',
+                sshNodeBackoffHint: 'Verifique se está ligado e acessível a partir do PegaProx.',
+                sshFailed: 'As credenciais estão configuradas mas a ligação não foi estabelecida.',
+                sshFailedHint: 'Verifique o acesso na porta 22, o nome de utilizador guardado e se a chave do host mudou.',
+                // #717 — conformidade sem acesso SSH
+                unavailable: 'indisponível',
+                complianceUnavailable: 'As verificações de conformidade não podem ser executadas neste cluster',
                 // #767 — consola da VM em janela própria
                 openInOwnWindow: 'Abrir em janela própria',
                 popupBlocked: 'O seu navegador bloqueou a janela da consola. Permita pop-ups para o PegaProx e tente novamente.',
@@ -30175,6 +30238,15 @@
                 zoomOut: 'Afastar',
             },
             ko: {
+                sshNoCredentials: '이 클러스터는 API 토큰으로만 인증하며 SSH 키나 비밀번호가 저장되어 있지 않습니다. 이 점검은 SSH로 노드를 읽습니다.',
+                sshNoCredentialsHint: '설정 > 클러스터에서 SSH 키 또는 비밀번호를 추가하세요. API 토큰만으로는 셸을 열 수 없습니다.',
+                sshNodeBackoff: '노드가 응답을 멈춰 대기 시간을 두고 재시도하고 있습니다.',
+                sshNodeBackoffHint: '노드가 켜져 있고 PegaProx에서 접근 가능한지 확인하세요.',
+                sshFailed: '자격 증명은 설정되어 있으나 연결에 실패했습니다.',
+                sshFailedHint: '22번 포트 접근성, 저장된 사용자 이름, 호스트 키 변경 여부를 확인하세요.',
+                // #717 — SSH 접근 없는 규정 준수 점검
+                unavailable: '사용할 수 없음',
+                complianceUnavailable: '이 클러스터에서는 규정 준수 점검을 실행할 수 없습니다',
                 // #767 — 별도 브라우저 창의 VM 콘솔
                 openInOwnWindow: '별도 창에서 열기',
                 popupBlocked: '브라우저가 콘솔 창을 차단했습니다. PegaProx의 팝업을 허용한 후 다시 시도하세요.',
@@ -34644,6 +34716,15 @@
                 zoomOut: '축소',
             },
             it: {
+                sshNoCredentials: 'Questo cluster si autentica con un token API e non ha una chiave SSH né una password salvata, ma questi controlli leggono il nodo via SSH.',
+                sshNoCredentialsHint: 'Aggiungi una chiave SSH o una password in Impostazioni > Cluster. Un token API da solo non può aprire una shell.',
+                sshNodeBackoff: 'Il nodo ha smesso di rispondere e viene ritentato con attesa crescente.',
+                sshNodeBackoffHint: 'Verifica che sia acceso e raggiungibile da PegaProx.',
+                sshFailed: 'Le credenziali sono configurate ma la connessione non è riuscita.',
+                sshFailedHint: 'Verifica la raggiungibilità sulla porta 22, il nome utente salvato e se la chiave host è cambiata.',
+                // #717 — conformita senza accesso SSH
+                unavailable: 'non disponibile',
+                complianceUnavailable: 'I controlli di conformità non possono essere eseguiti su questo cluster',
                 // #767 — console della VM in una finestra dedicata
                 openInOwnWindow: 'Apri in una finestra dedicata',
                 popupBlocked: 'Il browser ha bloccato la finestra della console. Consenti i popup per PegaProx e riprova.',
