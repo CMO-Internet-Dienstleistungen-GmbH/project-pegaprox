@@ -127,7 +127,8 @@ def broadcast_update(update_type: str, data: dict, cluster_id: str = None):
                     and not client_info.get('is_admin', False)):
                 _rid = (data or {}).get('resource_id')
                 if (data or {}).get('resource_type') in ('vm', 'qemu', 'lxc', 'ct'):
-                    if not _sse_user_can_view_vm(client_info.get('user'), cluster_id, _rid):
+                    if not _sse_user_can_view_vm(client_info.get('user'), cluster_id, _rid,
+                                                 client_info.get('effective_role')):
                         continue
             clients_to_send.append((client_id, client_info['ws'], client_info['lock']))
 
@@ -301,7 +302,7 @@ def _serialize_sse_message(update_type, data, cluster_id, timestamp):
     }, default=str)
 
 
-def _filtered_resources_frame(resources, cluster_id, username, timestamp):
+def _filtered_resources_frame(resources, cluster_id, username, timestamp, effective_role=None):
     """A per-VM-authorized 'resources' frame for a NON-admin client. Returns the serialized JSON,
     or None to send nothing (unknown user -> fail closed).
 
@@ -313,18 +314,12 @@ def _filtered_resources_frame(resources, cluster_id, username, timestamp):
     load_users() — that call is the documented hot-path landmine. user_can_access_vm admin-fast-
     returns and reads the cached ACL map, so the per-VM pass is a dict lookup per VM.
     """
-    if not isinstance(resources, list) or not username:
+    if not isinstance(resources, list):
         return None
-    from pegaprox.core.db import get_db
     from pegaprox.utils.rbac import user_can_access_vm
-    try:
-        stored = get_db().get_user(username)
-    except Exception:
-        stored = None
-    if not stored:
+    user = _sse_stored_user(username, effective_role)
+    if not user:
         return None
-    user = dict(stored)
-    user['username'] = username
     allowed = [
         r for r in resources
         if user_can_access_vm(user, cluster_id, r.get('vmid'), 'vm.view', r.get('type'))
@@ -332,30 +327,22 @@ def _filtered_resources_frame(resources, cluster_id, username, timestamp):
     return _serialize_sse_message('resources', allowed, cluster_id, timestamp)
 
 
-def _sse_user_can_view_vm(username, cluster_id, vmid):
+def _sse_user_can_view_vm(username, cluster_id, vmid, effective_role=None):
     """sec (private disclosure Sep 2026 — audit M1): SSE only per-VM-filtered the 'resources' frame;
     'vm_config' (full VM config incl. possible cloud-init secrets) and per-VM 'tasks' rows were
     broadcast cluster-wide to any subscribed non-admin. This is the per-VM gate for those frames.
     Single-user fetch (never load_users, the hot-path landmine), same pattern as the resources frame."""
-    if not username:
-        return False
-    from pegaprox.core.db import get_db
     from pegaprox.utils.rbac import user_can_access_vm
-    try:
-        stored = get_db().get_user(username)
-    except Exception:
-        stored = None
-    if not stored:
+    user = _sse_stored_user(username, effective_role)
+    if not user:
         return False
-    user = dict(stored)
-    user['username'] = username
     try:
         return user_can_access_vm(user, cluster_id, int(vmid), 'vm.view')
     except (TypeError, ValueError):
         return False
 
 
-def _filtered_vmware_vms_frame(data, username, timestamp):
+def _filtered_vmware_vms_frame(data, username, timestamp, effective_role=None):
     """A per-VM-authorized 'vmware_vms' frame for a NON-admin client. Returns the serialized
     JSON, or None to send nothing (unknown user -> fail closed).
 
@@ -363,7 +350,7 @@ def _filtered_vmware_vms_frame(data, username, timestamp):
     vmware.vm.view permission, which is a builtin viewer default — while the REST twin has
     filtered per-VM since the Sep audit. Same leak, one transport over. The caller keeps the
     perm gate (no permission still means no frame at all); this decides which guests survive."""
-    user = _sse_stored_user(username)
+    user = _sse_stored_user(username, effective_role)
     if not user:
         return None
     from pegaprox.utils.rbac import user_can_access_vmware_vm
@@ -374,39 +361,38 @@ def _filtered_vmware_vms_frame(data, username, timestamp):
     return _serialize_sse_message('vmware_vms', {**data, 'vms': allowed}, None, timestamp)
 
 
-def _sse_user_can_view_vmware_vm(username, vmware_id, vm_id):
+def _sse_user_can_view_vmware_vm(username, vmware_id, vm_id, effective_role=None):
     """Per-VM gate for the 'vmware_vm_detail' push. The watch registry it is driven from is
     global, so one authorized watcher used to put a guest's detail — guest info and performance
     included — in front of every client subscribed to the server's linked clusters."""
-    user = _sse_stored_user(username)
+    user = _sse_stored_user(username, effective_role)
     if not user:
         return False
     from pegaprox.utils.rbac import user_can_access_vmware_vm
     return user_can_access_vmware_vm(user, vmware_id, str(vm_id), 'vmware.vm.view')
 
 
-def _sse_user_has_perm(username, permission):
+def _sse_user_has_perm(username, permission, effective_role=None):
     """sec (audit): the SSE stream carried the ESXi inventory ('vmware_*' frames) to every client,
     while the REST twin gates on a vmware.* permission — so a custom role built to hide ESXi still
     saw it over the stream. Same single-user fetch as _sse_user_can_view_vm."""
-    if not username:
-        return False
-    from pegaprox.core.db import get_db
     from pegaprox.utils.rbac import has_permission
-    try:
-        stored = get_db().get_user(username)
-    except Exception:
-        stored = None
-    if not stored:
+    user = _sse_stored_user(username, effective_role)
+    if not user:
         return False
-    user = dict(stored)
-    user['username'] = username
     return has_permission(user, permission)
 
 
-def _sse_stored_user(username):
+def _sse_stored_user(username, effective_role=None):
     """The acting user as a plain dict, fetched one row at a time. SSE runs in background threads
-    with no request context, so there is no session to build an identity from."""
+    with no request context, so there is no session to build an identity from.
+
+    sec (audit): pass the role the STREAM was minted with. The connect path floors an
+    admin-owned but viewer-scoped API token down to its token role and stores that on the
+    client, which is what switches the per-VM filters on — but every filter then rebuilt the
+    identity from this stored record, whose role is still the owner's `admin`. So each filter
+    admin-fast-returned and passed everything through, and the floor was captured and thrown
+    away one level down. Whoever reads a user for a filter decision must carry it."""
     if not username:
         return None
     from pegaprox.core.db import get_db
@@ -418,6 +404,8 @@ def _sse_stored_user(username):
         return None
     user = dict(stored)
     user['username'] = username
+    if effective_role:
+        user['effective_role'] = effective_role
     return user
 
 
@@ -430,14 +418,14 @@ _SSE_OBJECT_FRAMES = ('xhm_migration', 'xhm_migration_log',
                       'vmware_migration', 'vmware_migration_log', 'site_recovery')
 
 
-def _sse_may_see_object_frame(username, update_type, data):
+def _sse_may_see_object_frame(username, update_type, data, effective_role=None):
     """True if this client may see one of the _SSE_OBJECT_FRAMES. Fails closed: an unknown user, or
     a frame naming an object we can no longer resolve, gets nothing (an admin short-circuits)."""
     from pegaprox.models.permissions import ROLE_ADMIN
-    user = _sse_stored_user(username)
+    user = _sse_stored_user(username, effective_role)
     if not user:
         return False
-    if user.get('role') == ROLE_ADMIN:
+    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
         return True
     data = data or {}
     try:
@@ -480,22 +468,16 @@ def _sse_may_see_object_frame(username, update_type, data):
         return False
 
 
-def _filtered_tasks_frame(tasks, cluster_id, username, timestamp):
+def _filtered_tasks_frame(tasks, cluster_id, username, timestamp, effective_role=None):
     """Per-VM-authorized 'tasks' frame for a non-admin client: keep only rows whose vmid the caller
     may view (task rows without a resolvable vmid — node/cluster tasks — are dropped for a scoped
     client). None => unknown user, fail closed."""
-    if not isinstance(tasks, list) or not username:
+    if not isinstance(tasks, list):
         return None
-    from pegaprox.core.db import get_db
     from pegaprox.utils.rbac import user_can_access_vm
-    try:
-        stored = get_db().get_user(username)
-    except Exception:
-        stored = None
-    if not stored:
+    user = _sse_stored_user(username, effective_role)
+    if not user:
         return None
-    user = dict(stored)
-    user['username'] = username
 
     # audit regression fix — only CONFINE a pool-/ACL-scoped client; a plain cluster-wide operator
     # (non-admin, tenant owns the cluster, no pool/ACL scope) keeps the FULL task log, matching the
@@ -572,6 +554,8 @@ def broadcast_sse(update_type: str, data: dict, cluster_id: str = None, target_c
 
         # #736 — cache each scoped user's filtered 'resources' frame within this broadcast, so we
         # filter O(distinct-scoped-users) times rather than once per client.
+        # keyed on (user, the role the STREAM was minted with) — two streams of the same
+        # account can be floored differently, and must not share a filter decision
         _res_frame_cache = {}
         _cfg_access_cache = {}    # uname -> bool: may this user view THIS vm_config frame's vmid (audit M1)
         _tasks_frame_cache = {}   # uname -> per-VM-filtered 'tasks' frame (audit M1)
@@ -623,51 +607,54 @@ def broadcast_sse(update_type: str, data: dict, cluster_id: str = None, target_c
                     # per-VM-authorized frame (cached per distinct user above). Fail-closed: a client
                     # registered without the is_admin flag is treated as non-admin and filtered.
                     if update_type == 'resources' and cluster_id is not None and not client_info.get('is_admin', False):
-                        uname = client_info.get('user')
-                        client_message = _res_frame_cache.get(uname, _SSE_FILTER_MISSING)
+                        uname, _eff = client_info.get('user'), client_info.get('effective_role')
+                        client_message = _res_frame_cache.get((uname, _eff), _SSE_FILTER_MISSING)
                         if client_message is _SSE_FILTER_MISSING:
-                            client_message = _filtered_resources_frame(data, cluster_id, uname, timestamp)
-                            _res_frame_cache[uname] = client_message
+                            client_message = _filtered_resources_frame(data, cluster_id, uname,
+                                                                       timestamp, _eff)
+                            _res_frame_cache[uname, _eff] = client_message
                     elif update_type == 'vm_config' and cluster_id is not None and not client_info.get('is_admin', False):
                         # audit M1 — vm_config carries the full VM config (disks/net/cloud-init);
                         # deliver only to a scoped client that may view this vmid.
-                        uname = client_info.get('user')
-                        _ok_cfg = _cfg_access_cache.get(uname, _SSE_FILTER_MISSING)
+                        uname, _eff = client_info.get('user'), client_info.get('effective_role')
+                        _ok_cfg = _cfg_access_cache.get((uname, _eff), _SSE_FILTER_MISSING)
                         if _ok_cfg is _SSE_FILTER_MISSING:
-                            _ok_cfg = _sse_user_can_view_vm(uname, cluster_id, (data or {}).get('vmid'))
-                            _cfg_access_cache[uname] = _ok_cfg
+                            _ok_cfg = _sse_user_can_view_vm(uname, cluster_id,
+                                                            (data or {}).get('vmid'), _eff)
+                            _cfg_access_cache[uname, _eff] = _ok_cfg
                         if not _ok_cfg:
                             continue  # foreign VM's config → not for this scoped client
                     elif update_type == 'tasks' and cluster_id is not None and not client_info.get('is_admin', False):
                         # audit M1 — filter per-VM task rows to the ones this client may view.
-                        uname = client_info.get('user')
-                        client_message = _tasks_frame_cache.get(uname, _SSE_FILTER_MISSING)
+                        uname, _eff = client_info.get('user'), client_info.get('effective_role')
+                        client_message = _tasks_frame_cache.get((uname, _eff), _SSE_FILTER_MISSING)
                         if client_message is _SSE_FILTER_MISSING:
-                            client_message = _filtered_tasks_frame(data, cluster_id, uname, timestamp)
-                            _tasks_frame_cache[uname] = client_message
+                            client_message = _filtered_tasks_frame(data, cluster_id, uname,
+                                                                   timestamp, _eff)
+                            _tasks_frame_cache[uname, _eff] = client_message
                     elif update_type == 'vmware_vms' and not client_info.get('is_admin', False):
                         # audit — the ESXi twin of the 'resources' filter above. The perm gate
                         # below still decides whether this client hears about ESXi at all; what
                         # it never did was decide WHICH guests, so the frame carried the whole
                         # server inventory to anyone holding a builtin viewer permission.
-                        uname = client_info.get('user')
-                        _ok_vmw = _vmw_perm_cache.get((uname, 'vmware.vm.view'), _SSE_FILTER_MISSING)
+                        uname, _eff = client_info.get('user'), client_info.get('effective_role')
+                        _ok_vmw = _vmw_perm_cache.get((uname, _eff, 'vmware.vm.view'), _SSE_FILTER_MISSING)
                         if _ok_vmw is _SSE_FILTER_MISSING:
-                            _ok_vmw = _sse_user_has_perm(uname, 'vmware.vm.view')
-                            _vmw_perm_cache[uname, 'vmware.vm.view'] = _ok_vmw
+                            _ok_vmw = _sse_user_has_perm(uname, 'vmware.vm.view', _eff)
+                            _vmw_perm_cache[uname, _eff, 'vmware.vm.view'] = _ok_vmw
                         if not _ok_vmw:
                             continue
-                        client_message = _vmw_vms_frame_cache.get(uname, _SSE_FILTER_MISSING)
+                        client_message = _vmw_vms_frame_cache.get((uname, _eff), _SSE_FILTER_MISSING)
                         if client_message is _SSE_FILTER_MISSING:
-                            client_message = _filtered_vmware_vms_frame(data, uname, timestamp)
-                            _vmw_vms_frame_cache[uname] = client_message
+                            client_message = _filtered_vmware_vms_frame(data, uname, timestamp, _eff)
+                            _vmw_vms_frame_cache[uname, _eff] = client_message
                     elif update_type == 'vmware_vm_detail' and not client_info.get('is_admin', False):
-                        uname = client_info.get('user')
-                        _ok_det = _vmw_detail_cache.get(uname, _SSE_FILTER_MISSING)
+                        uname, _eff = client_info.get('user'), client_info.get('effective_role')
+                        _ok_det = _vmw_detail_cache.get((uname, _eff), _SSE_FILTER_MISSING)
                         if _ok_det is _SSE_FILTER_MISSING:
                             _ok_det = _sse_user_can_view_vmware_vm(
-                                uname, (data or {}).get('vmware_id'), (data or {}).get('vm_id'))
-                            _vmw_detail_cache[uname] = _ok_det
+                                uname, (data or {}).get('vmware_id'), (data or {}).get('vm_id'), _eff)
+                            _vmw_detail_cache[uname, _eff] = _ok_det
                         if not _ok_det:
                             continue  # someone else's watch → not for this client
                     elif (update_type.startswith('vmware_')
@@ -676,20 +663,20 @@ def broadcast_sse(update_type: str, data: dict, cluster_id: str = None, target_c
                         # audit — mirror the REST perm gate (vmware.vm.view / vmware.view) that
                         # the stream skipped entirely. Both are default viewer perms, so this
                         # only bites a custom role that deliberately withholds them.
-                        uname = client_info.get('user')
+                        uname, _eff = client_info.get('user'), client_info.get('effective_role')
                         _need = 'vmware.view' if update_type == 'vmware_servers' else 'vmware.vm.view'
-                        _ok_vmw = _vmw_perm_cache.get((uname, _need), _SSE_FILTER_MISSING)
+                        _ok_vmw = _vmw_perm_cache.get((uname, _eff, _need), _SSE_FILTER_MISSING)
                         if _ok_vmw is _SSE_FILTER_MISSING:
-                            _ok_vmw = _sse_user_has_perm(uname, _need)
-                            _vmw_perm_cache[uname, _need] = _ok_vmw
+                            _ok_vmw = _sse_user_has_perm(uname, _need, _eff)
+                            _vmw_perm_cache[uname, _eff, _need] = _ok_vmw
                         if not _ok_vmw:
                             continue
                     elif update_type in _SSE_OBJECT_FRAMES and not client_info.get('is_admin', False):
-                        uname = client_info.get('user')
-                        _ok_obj = _obj_frame_cache.get(uname, _SSE_FILTER_MISSING)
+                        uname, _eff = client_info.get('user'), client_info.get('effective_role')
+                        _ok_obj = _obj_frame_cache.get((uname, _eff), _SSE_FILTER_MISSING)
                         if _ok_obj is _SSE_FILTER_MISSING:
-                            _ok_obj = _sse_may_see_object_frame(uname, update_type, data)
-                            _obj_frame_cache[uname] = _ok_obj
+                            _ok_obj = _sse_may_see_object_frame(uname, update_type, data, _eff)
+                            _obj_frame_cache[uname, _eff] = _ok_obj
                         if not _ok_obj:
                             continue
                     if client_message is None:

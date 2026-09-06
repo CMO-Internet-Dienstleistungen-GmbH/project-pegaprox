@@ -98,6 +98,7 @@ def ws_live_updates(ws):
                 'user': username,
                 'clusters': subscribed_clusters,
                 'is_admin': _is_admin,
+                'effective_role': (_user_data or {}).get('effective_role'),
                 'connected_at': datetime.now().isoformat()
             }
 
@@ -447,6 +448,7 @@ def sse_updates():
         _eff = _token_role or (_ident or {}).get('effective_role') or (_ident or {}).get('role')
         _is_admin = bool(_ident) and _eff == ROLE_ADMIN
     except Exception:
+        _eff = _token_role
         _is_admin = False
 
     with sse_clients_lock:
@@ -455,6 +457,11 @@ def sse_updates():
             'user': user,
             'clusters': subscribed_clusters,
             'is_admin': _is_admin,
+            # sec (audit): the boolean alone was not enough. The per-frame filters re-read the
+            # account from the DB, where the role is still the token OWNER's, so each of them
+            # admin-fast-returned and the floor above was thrown away one level down. Carry the
+            # role itself so every filter decides as this stream, not as its owner.
+            'effective_role': _eff,
             'connected_at': datetime.now().isoformat(),
             'auth_method': auth_method
         }
