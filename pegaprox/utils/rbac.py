@@ -516,6 +516,10 @@ _vm_acls_cache = None
 # TTL: 300 seconds (5 min) - pools don't change often
 # Stale TTL: 30 seconds - return stale data while refreshing in background
 _pool_membership_cache = {}
+# Bumped by every invalidate_pool_cache(). A rebuild captures it before it starts reading and
+# refuses to publish if it changed meanwhile — otherwise a revocation that lands during the
+# seconds a rebuild spends on the network gets overwritten by the pre-revocation snapshot.
+_pool_cache_generation = 0
 POOL_CACHE_TTL = 300  # 5 minutes - pools rarely change
 POOL_CACHE_STALE_TTL = 30  # Return stale data for 30s while refreshing
 _pool_cache_lock = threading.Lock()
@@ -549,7 +553,10 @@ def _stamp_pool_cache(cluster_id, pools, membership, had_error):
 def _refresh_pool_cache_async(cluster_id: str):
     """Background refresh of pool cache - doesn't block requests"""
     global _pool_membership_cache
-    
+
+    with _pool_cache_lock:
+        _gen = _pool_cache_generation
+
     try:
         if cluster_id not in cluster_managers:
             return
@@ -579,6 +586,11 @@ def _refresh_pool_cache_async(cluster_id: str):
                 continue
 
         with _pool_cache_lock:
+            if _pool_cache_generation != _gen:
+                # someone revoked a grant while we were reading — our snapshot predates it
+                _pool_membership_cache.pop(cluster_id, None)
+                logging.info(f"[POOL-CACHE] Discarded refresh for {cluster_id} — invalidated mid-read")
+                return
             _pool_membership_cache[cluster_id] = {
                 'data': membership,
                 'timestamp': _stamp_pool_cache(cluster_id, pools, membership, had_error),
@@ -629,6 +641,9 @@ def get_pool_membership_cache(cluster_id: str) -> dict:
     if cluster_id not in cluster_managers:
         return cache_entry.get('data', {}) if cache_entry else {}
     
+    with _pool_cache_lock:
+        _gen = _pool_cache_generation
+
     try:
         mgr = cluster_managers[cluster_id]
         pools = mgr.get_pools()
@@ -654,6 +669,10 @@ def get_pool_membership_cache(cluster_id: str) -> dict:
                 continue
 
         with _pool_cache_lock:
+            if _pool_cache_generation != _gen:
+                _pool_membership_cache.pop(cluster_id, None)
+                logging.info(f"[POOL-CACHE] Discarded initial build for {cluster_id} — invalidated mid-read")
+                return membership          # answer THIS caller, but publish nothing
             _pool_membership_cache[cluster_id] = {
                 'data': membership,
                 'timestamp': _stamp_pool_cache(cluster_id, pools, membership, had_error),
@@ -669,8 +688,14 @@ def get_pool_membership_cache(cluster_id: str) -> dict:
 
 def invalidate_pool_cache(cluster_id: str = None):
     """Invalidate pool membership cache"""
-    global _pool_membership_cache
+    global _pool_membership_cache, _pool_cache_generation
     with _pool_cache_lock:
+        # sec (audit): a rebuild reads every pool over the network, which takes seconds. An
+        # admin who removed a VM from a pool in that window called this, we popped the entry —
+        # and then the in-flight rebuild wrote its PRE-revocation snapshot back with a fresh
+        # timestamp, re-pinning the revoked grant for another full TTL and silently undoing
+        # the invalidation. Bump a generation so a refresh that started earlier is discarded.
+        _pool_cache_generation += 1
         if cluster_id:
             _pool_membership_cache.pop(cluster_id, None)
         else:

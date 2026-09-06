@@ -2327,6 +2327,11 @@ def get_backup_verification_status(cluster_id, task_id):
     # check active first
     status = get_verification(task_id)
     if status:
+        # sec (audit): the registry is keyed on task_id alone, so a task belonging to ANOTHER
+        # cluster answered here — and _verification_rows_visible passes an unconfined caller
+        # through unchanged, which is exactly the caller whose tenant may not own that cluster.
+        if status.get('cluster_id') != cluster_id:
+            return jsonify({'error': 'Verification not found'}), 404
         if not _verification_rows_visible(cluster_id, [status]):
             return jsonify({'error': 'Verification not found'}), 404
         return jsonify(status)
@@ -2334,7 +2339,8 @@ def get_backup_verification_status(cluster_id, task_id):
     # check database
     db = get_db()
     try:
-        row = db.query_one('SELECT * FROM backup_verifications WHERE id = ?', (task_id,))
+        row = db.query_one('SELECT * FROM backup_verifications WHERE id = ? AND cluster_id = ?',
+                           (task_id, cluster_id))
         if row:
             result = dict(row)
             import json

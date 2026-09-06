@@ -106,7 +106,29 @@ def ws_live_updates(ws):
         ws.send(json.dumps({'type': 'connected', 'client_id': client_id}))
 
         # Keep connection alive
+        _next_authz = time.monotonic() + SSE_REAUTHZ_INTERVAL
         while True:
+            # sec (audit): identity, cluster scope and is_admin were all resolved during the
+            # handshake and then frozen for the life of the socket, with no re-check anywhere —
+            # not even a dead one. Disabling, deleting or demoting an account left it receiving
+            # live frames until the client hung up. Same interval and same fail-closed rule as
+            # the SSE twin; ws.receive below wakes us at least that often.
+            if time.monotonic() >= _next_authz:
+                _next_authz = time.monotonic() + SSE_REAUTHZ_INTERVAL
+                _acct = _stream_identity(username)
+                if _acct is None or not _acct.get('enabled', True):
+                    logging.info(f"[WS] closing stream for '{_sl(username)}' — account gone or disabled")
+                    break
+                _allowed = get_user_clusters(_acct)
+                with ws_clients_lock:
+                    _ci = ws_clients.get(client_id)
+                    if _ci is not None:
+                        _ci['is_admin'] = (_acct.get('effective_role', _acct.get('role'))
+                                           == ROLE_ADMIN)
+                        _ci['effective_role'] = _acct.get('effective_role')
+                        # a demotion has to narrow the LIVE subscription too, not just future ones
+                        _ci['clusters'] = _scope_ws_clusters(_allowed, _ci.get('clusters'))
+
             try:
                 # Wait for incoming messages with timeout
                 msg = ws.receive(timeout=30)
