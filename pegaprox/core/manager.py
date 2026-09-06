@@ -2681,7 +2681,7 @@ class PegaProxManager:
             self.logger.info(f"[AFFINITY] Completed {migrations} affinity enforcement migration(s)")
         return migrations
 
-    def find_migration_candidate(self, source_node: str, target_node: str, exclude_vmids: list = None, include_containers: bool = None, node_status: dict = None) -> Optional[Dict]:
+    def find_migration_candidate(self, source_node: str, target_node: str, exclude_vmids: list = None, include_containers: bool = None, node_status: dict = None, target_mgr=None) -> Optional[Dict]:
         """
         Find the best VM to migrate from source to target node.
         
@@ -2699,6 +2699,10 @@ class PegaProxManager:
         MK: Container migrations are tricky - they ALWAYS restart.
         We learned this the hard way in production...
         LW: Feb 2026 - exclude_vmids used for multi-migration cycles to avoid re-picking
+
+        MK: target_mgr is for the cross-cluster balancer — target_node then names a node on
+        ANOTHER cluster, so the storage lookup below has to go to that cluster's API instead
+        of ours. Left None for intra-cluster balancing, where target_node is one of our own.
         """
         if exclude_vmids is None:
             exclude_vmids = []
@@ -2838,8 +2842,9 @@ class PegaProxManager:
         target_storage_names = set()
         if balance_local_disks:
             try:
-                st_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{target_node}/storage"
-                st_r = self._create_session().get(st_url, timeout=10)
+                _tm = target_mgr or self
+                st_url = f"https://{_tm.host}:{_tm.api_port}/api2/json/nodes/{target_node}/storage"
+                st_r = _tm._create_session().get(st_url, timeout=10)
                 if st_r.status_code == 200:
                     target_storage_names = {s['storage'] for s in st_r.json().get('data', []) if s.get('active')}
             except Exception:
