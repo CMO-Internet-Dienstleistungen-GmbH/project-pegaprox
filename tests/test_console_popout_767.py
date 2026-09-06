@@ -40,14 +40,16 @@ def test_the_popout_url_is_the_one_the_standalone_view_parses(modals, dash):
     assert "`${cid}:${vm.type}:${vm.vmid}:${vm.node}`" in modals
 
     assert "URLSearchParams(window.location.search).get('console')" in dash
-    # cluster / type / vmid, then the node from everything that is left
-    assert 'const [clusterId, type, vmid] = parts' in dash
-    assert "const node = parts.slice(3).join(':')" in dash
+    assert 'const [clusterId, type, vmid, node] = parts' in dash
 
 
-def test_a_node_name_with_a_colon_cannot_shift_the_other_fields(dash):
-    """slice(3).join(':') rather than parts[3] — the node is the only free-form field."""
-    assert 'parts[3]' not in dash.split('function StandaloneConsole')[1][:2000]
+def test_the_node_from_the_address_bar_is_held_to_a_hostname(dash):
+    """It rides straight into /api/clusters/<id>/vms/<node>/... — in the app that string comes
+    from the cluster, here it comes from whatever someone typed."""
+    body = dash[dash.index('function StandaloneConsole'):dash.index('        function App() {')]
+
+    assert "/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(node" in body
+    assert 'parts.length !== 4' in body
 
 
 def test_the_url_is_checked_before_anything_is_built_out_of_it(dash):
@@ -81,13 +83,26 @@ def test_the_standalone_branch_sits_between_the_2fa_gate_and_the_layout_picker(d
 
 
 def test_the_standalone_view_asks_for_nothing_it_does_not_need(dash):
-    """One /api/clusters read for the host, and that is the whole popup's cost. A per-window
-    resource poll would multiply by however many consoles an operator has open."""
+    """Two O(1) reads — the cluster list for the host, one VM config for the label — and that
+    is the whole window's cost. A per-window resource poll would multiply by however many
+    consoles an operator has open, which on a 10k estate is the whole point of not doing it."""
     body = dash[dash.index('function StandaloneConsole'):dash.index('        function App() {')]
 
-    assert body.count('fetch(') == 1
-    assert '/clusters`' in body
+    assert body.count('fetch(') == 2
+    assert '/clusters`' in body and '/config`' in body
     assert 'resources' not in body and 'sse' not in body.lower()
+
+
+def test_the_label_on_the_console_comes_from_the_cluster_not_the_link(dash, modals):
+    """The header drops the vmid the moment it has a name, so a name taken from the query
+    string would let whoever writes the link choose what an operator reads above a live root
+    console. The link carries the key only; the name is resolved and falls back to the vmid."""
+    body = dash[dash.index('function StandaloneConsole'):dash.index('        function App() {')]
+
+    assert "get('name')" not in body, 'the window is reading its label out of the URL again'
+    assert '&name=' not in modals, 'the pop-out link is carrying a label again'
+    assert "g.name || g.hostname" in body
+    assert "const label = `${type === 'lxc' ? 'CT' : 'VM'} ${vmid}`" in body
 
 
 def test_the_popup_does_not_offer_to_pop_itself_out_again(modals):

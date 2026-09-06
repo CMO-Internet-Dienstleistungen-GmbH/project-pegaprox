@@ -25003,14 +25003,14 @@
             useEffect(() => {
                 let cancelled = false;
                 const parts = String(consoleKey || '').split(':');
-                // cluster/type/vmid sit in fixed slots; everything after them is the node,
-                // joined back so a node name containing a colon can't shift the fields
-                const [clusterId, type, vmid] = parts;
-                const node = parts.slice(3).join(':');
-                // the whole view is driven off a URL, so check it before we build requests
-                // out of it — a typo should say so, not send /vms/x/y/NaN/console upstream
-                if (parts.length < 4 || !clusterId || !node ||
-                    (type !== 'qemu' && type !== 'lxc') || !/^\d+$/.test(vmid)) {
+                const [clusterId, type, vmid, node] = parts;
+                // Every one of these four ends up in a request path, and unlike the in-app
+                // console they come from whatever is in the address bar. The node is a PVE
+                // node name, so hold it to a hostname; the cluster id is checked against the
+                // list below, which is the only place a real one can come from.
+                if (parts.length !== 4 || !clusterId ||
+                    (type !== 'qemu' && type !== 'lxc') || !/^\d+$/.test(vmid) ||
+                    !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(node || '')) {
                     setState({ status: 'error', error: 'malformed' });
                     return;
                 }
@@ -25024,15 +25024,33 @@
                         const cluster = (Array.isArray(list) ? list : []).find(c => c.id === clusterId);
                         if (!cluster) throw new Error('noAccess');
                         if (cancelled) return;
-                        let name = '';
-                        try { name = new URLSearchParams(window.location.search).get('name') || ''; }
-                        catch (_) {}
-                        const vm = { vmid: Number(vmid), node, type, name, _clusterId: clusterId };
+                        const label = `${type === 'lxc' ? 'CT' : 'VM'} ${vmid}`;
+                        const vm = { vmid: Number(vmid), node, type, name: '', _clusterId: clusterId };
                         setState({
                             status: 'ready', clusterId, vm,
                             info: { vmid: Number(vmid), node, type, host: cluster.host },
                         });
-                        document.title = `${name || (type === 'lxc' ? 'CT' : 'VM') + ' ' + vmid} — PegaProx`;
+                        document.title = `${label} — PegaProx`;
+                        // The header hides the vmid as soon as it has a name, so the name has to
+                        // come from the cluster and not from the link — otherwise whoever writes
+                        // the link chooses the label on someone else's root console. One small
+                        // gated read; if it fails we keep showing the vmid, which is the truth.
+                        try {
+                            const c = await fetch(
+                                `${API_URL}/clusters/${clusterId}/vms/${encodeURIComponent(node)}` +
+                                `/${type}/${vmid}/config`,
+                                { credentials: 'include', headers: getAuthHeaders() });
+                            if (c.ok && !cancelled) {
+                                const cfg = await c.json();
+                                const g = cfg.general || {};
+                                const real = g.name || g.hostname || '';
+                                if (real) {
+                                    setState(prev => prev.vm
+                                        ? { ...prev, vm: { ...prev.vm, name: real } } : prev);
+                                    document.title = `${real} — PegaProx`;
+                                }
+                            }
+                        } catch (_) { /* label stays the vmid */ }
                     } catch (e) {
                         if (!cancelled) setState({ status: 'error', error: e.message || String(e) });
                     }

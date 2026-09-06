@@ -3997,8 +3997,9 @@
                 const cid = clusterId || vm?._clusterId;
                 if (!cid || !vm) return;
                 const key = `${cid}:${vm.type}:${vm.vmid}:${vm.node}`;
-                const url = `${window.location.origin}/?console=${encodeURIComponent(key)}`
-                    + (vm.name ? `&name=${encodeURIComponent(vm.name)}` : '');
+                // deliberately NOT carrying vm.name: the window resolves it from the
+                // cluster, so a hand-written link cannot put its own label on a console
+                const url = `${window.location.origin}/?console=${encodeURIComponent(key)}`;
                 const win = window.open(
                     url,
                     `pegaprox-console-${key.replace(/[^A-Za-z0-9]/g, '_')}`,
