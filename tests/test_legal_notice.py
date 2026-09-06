@@ -110,6 +110,29 @@ def test_notice_file_and_interface_agree():
     assert 'this term covers the notices described above' in notice
 
 
+def test_the_funding_link_rides_along_with_the_notice():
+    """The widest honest reach we have: the notice renders on every surface, so putting the
+    donation link inside that element puts it on every surface too — login, setup, sidebar,
+    console window, cloud nav, footer. That is worth more than a clause could be."""
+    ui = _read('ui.js')
+    notice = ui[ui.index('function LegalNotice('):]
+    notice = notice[:notice.index('function _hexToRgb')]
+
+    assert 'opencollective.com/pegaprox' in notice
+
+
+def test_the_notice_term_does_not_claim_the_funding_link():
+    """The whole point of keeping it narrow. A §7 additional term reaching past the
+    enumerated cases is a further restriction a recipient may strike out — and they would
+    strike the attribution next to it at the same time. NOTICE names the four attribution
+    elements and stops there; the donate link lives in the element without being claimed."""
+    notice = open('NOTICE', encoding='utf-8').read()
+
+    assert 'opencollective' not in notice.lower()
+    assert 'donat' not in notice.lower()
+    assert 'this term covers the notices described above' in notice
+
+
 def test_the_page_footer_and_the_notice_stay_coupled():
     """The sponsor block cannot be made unremovable — §7 does not reach a funding appeal,
     and a term that tried would be a further restriction a recipient may strike out. What

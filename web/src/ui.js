@@ -237,6 +237,16 @@
                     {'\u00A0· '}
                     <a href={LEGAL_REPO} target="_blank" rel="noopener noreferrer"
                        style={link}>Source</a>
+                    {'\u00A0· '}
+                    {/* The funding link sits INSIDE this element on purpose. Not because §7(b)
+                        reaches it — it does not, and NOTICE deliberately keeps naming only the
+                        four attribution elements above so the term stays narrow enough to hold.
+                        It is here because this element is the one thing that renders on every
+                        surface there is, which makes it the widest honest reach a
+                        donation-funded project has. Removing just this link is lawful;
+                        removing the element it lives in is not. */}
+                    <a href="https://opencollective.com/pegaprox" target="_blank"
+                       rel="noopener noreferrer" style={link}>Donate</a>
                 </div>
             );
         }
