@@ -24990,8 +24990,105 @@
             );
         }
 
+        // NS Sep 2026 (#767) — the console in its own browser window. Same bundle, same
+        // origin, so the session carries over; we just skip the whole dashboard and mount
+        // the console alone. Everything ConsoleModal needs is in the URL plus the cluster's
+        // host, which is one /api/clusters read — the parent window is not involved at all,
+        // so the popup survives the opener being closed or navigated away.
+        function StandaloneConsole({ consoleKey }) {
+            const { getAuthHeaders } = useAuth();
+            const { t } = useTranslation();
+            const [state, setState] = useState({ status: 'loading', vm: null, info: null, clusterId: null });
+
+            useEffect(() => {
+                let cancelled = false;
+                const parts = String(consoleKey || '').split(':');
+                // cluster/type/vmid sit in fixed slots; everything after them is the node,
+                // joined back so a node name containing a colon can't shift the fields
+                const [clusterId, type, vmid] = parts;
+                const node = parts.slice(3).join(':');
+                // the whole view is driven off a URL, so check it before we build requests
+                // out of it — a typo should say so, not send /vms/x/y/NaN/console upstream
+                if (parts.length < 4 || !clusterId || !node ||
+                    (type !== 'qemu' && type !== 'lxc') || !/^\d+$/.test(vmid)) {
+                    setState({ status: 'error', error: 'malformed' });
+                    return;
+                }
+
+                (async () => {
+                    try {
+                        const resp = await fetch(`${API_URL}/clusters`, {
+                            credentials: 'include', headers: getAuthHeaders() });
+                        if (!resp.ok) throw new Error(`clusters ${resp.status}`);
+                        const list = await resp.json();
+                        const cluster = (Array.isArray(list) ? list : []).find(c => c.id === clusterId);
+                        if (!cluster) throw new Error('noAccess');
+                        if (cancelled) return;
+                        let name = '';
+                        try { name = new URLSearchParams(window.location.search).get('name') || ''; }
+                        catch (_) {}
+                        const vm = { vmid: Number(vmid), node, type, name, _clusterId: clusterId };
+                        setState({
+                            status: 'ready', clusterId, vm,
+                            info: { vmid: Number(vmid), node, type, host: cluster.host },
+                        });
+                        document.title = `${name || (type === 'lxc' ? 'CT' : 'VM') + ' ' + vmid} — PegaProx`;
+                    } catch (e) {
+                        if (!cancelled) setState({ status: 'error', error: e.message || String(e) });
+                    }
+                })();
+                return () => { cancelled = true; };
+            }, [consoleKey]);  // eslint-disable-line react-hooks/exhaustive-deps
+
+            // window.close() is only allowed for a window script opened. Someone who pasted
+            // or bookmarked the link is in an ordinary tab, where it does nothing at all and
+            // would strand them on a console with no way out — send them to the dashboard.
+            const closeWindow = () => {
+                window.close();
+                setTimeout(() => { if (!window.closed) window.location.assign('/'); }, 200);
+            };
+
+            if (state.status === 'loading') {
+                return (
+                    <div className="min-h-screen bg-proxmox-darker flex items-center justify-center">
+                        <p className="text-gray-400">{t('openingConsole')}</p>
+                    </div>
+                );
+            }
+            if (state.status === 'error') {
+                return (
+                    <div className="min-h-screen bg-proxmox-darker flex items-center justify-center">
+                        <div className="text-center">
+                            <p className="text-red-400 mb-2">{t('consoleWindowFailed')}</p>
+                            <p className="text-gray-500 text-sm">{
+                                state.error === 'malformed' ? t('consoleLinkMalformed')
+                                : state.error === 'noAccess' ? t('consoleNoClusterAccess')
+                                : state.error
+                            }</p>
+                        </div>
+                    </div>
+                );
+            }
+            return (
+                <div className="min-h-screen bg-proxmox-darker">
+                    <ConsoleModal
+                        vm={state.vm}
+                        consoleInfo={state.info}
+                        clusterId={state.clusterId}
+                        onClose={closeWindow}
+                        standalone
+                    />
+                </div>
+            );
+        }
+
         function App() {
             const { user, loading, requires2FASetup, needsSetup } = useAuth();
+            // #767 — read once; a popup must not re-evaluate this on every render
+            const consoleKey = useMemo(() => {
+                try { return new URLSearchParams(window.location.search).get('console'); }
+                catch (_) { return null; }
+            }, []);
 
             if (loading) {
                 return (
@@ -25027,6 +25124,13 @@
                         <Force2FASetupModal />
                     </div>
                 );
+            }
+
+            // #767 — a console window renders the console and nothing else. Placed after the
+            // login and 2FA gates so a popup is still fully authenticated, but before the
+            // layout picker: that is a first-login choice for the main window, not for this.
+            if (consoleKey) {
+                return <StandaloneConsole consoleKey={consoleKey} />;
             }
 
             // LW: Show layout picker on first login (before dashboard)

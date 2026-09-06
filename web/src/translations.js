@@ -4,6 +4,13 @@
         // ═══════════════════════════════════════════════
         const translations = {
             de: {
+                // #767 — VM-Konsole im eigenen Browserfenster
+                openInOwnWindow: 'In eigenem Fenster öffnen',
+                popupBlocked: 'Der Browser hat das Konsolenfenster blockiert. Bitte Pop-ups für PegaProx erlauben und erneut versuchen.',
+                openingConsole: 'Konsole wird geöffnet…',
+                consoleWindowFailed: 'Diese Konsole konnte nicht geöffnet werden.',
+                consoleLinkMalformed: 'Ungültiger Konsolen-Link',
+                consoleNoClusterAccess: 'Kein Zugriff auf dieses Cluster',
                 guestRam: 'Gast-RAM',
                 guestMemory: 'Gastspeicher',
                 guestMemoryUnavailable: 'Gastspeicher nicht verfügbar',
@@ -4466,6 +4473,13 @@
                 zone: 'Zone',
             },
             en: {
+                // #767 — VM console in its own browser window
+                openInOwnWindow: 'Open in its own window',
+                popupBlocked: 'Your browser blocked the console window. Allow popups for PegaProx and try again.',
+                openingConsole: 'Opening console…',
+                consoleWindowFailed: 'Could not open this console.',
+                consoleLinkMalformed: 'Malformed console link',
+                consoleNoClusterAccess: 'No access to that cluster',
                 guestRam: 'Guest RAM',
                 guestMemory: 'Guest memory',
                 guestMemoryUnavailable: 'Guest memory unavailable',
@@ -9069,6 +9083,13 @@
                 allAttributes: 'All attributes',
             },
             zh: {
+                // #767 — 独立浏览器窗口中的虚拟机控制台
+                openInOwnWindow: '在独立窗口中打开',
+                popupBlocked: '浏览器阻止了控制台窗口。请允许 PegaProx 的弹出窗口后重试。',
+                openingConsole: '正在打开控制台…',
+                consoleWindowFailed: '无法打开此控制台。',
+                consoleLinkMalformed: '控制台链接格式无效',
+                consoleNoClusterAccess: '无权访问该集群',
                 guestRam: '客户机内存',
                 guestMemory: '客户机内存',
                 guestMemoryUnavailable: '客户机内存不可用',
@@ -13011,6 +13032,13 @@
                 appliedTickToRollback: '已应用 — 勾选以回滚',
             },
             pl: {
+                // #767 — konsola VM we własnym oknie przeglądarki
+                openInOwnWindow: 'Otwórz w osobnym oknie',
+                popupBlocked: 'Przeglądarka zablokowała okno konsoli. Zezwól na wyskakujące okienka dla PegaProx i spróbuj ponownie.',
+                openingConsole: 'Otwieranie konsoli…',
+                consoleWindowFailed: 'Nie udało się otworzyć tej konsoli.',
+                consoleLinkMalformed: 'Nieprawidłowy link do konsoli',
+                consoleNoClusterAccess: 'Brak dostępu do tego klastra',
                 // Polish translations by @mdobprv-lab (PR #737 — translation extracted; the PR's
                 // frontend refactor was NOT taken). Missing keys fall back to EN.
                 languageSimplifiedChinese: 'Chiński uproszczony',
@@ -17140,6 +17168,13 @@
             // French translations by @IMNotMax (PR #186)
             // Falls back to EN for missing keys
             fr: {
+                // #767 — console VM dans sa propre fenêtre
+                openInOwnWindow: 'Ouvrir dans une fenêtre séparée',
+                popupBlocked: 'Votre navigateur a bloqué la fenêtre de console. Autorisez les pop-ups pour PegaProx et réessayez.',
+                openingConsole: 'Ouverture de la console…',
+                consoleWindowFailed: 'Impossible d’ouvrir cette console.',
+                consoleLinkMalformed: 'Lien de console invalide',
+                consoleNoClusterAccess: 'Aucun accès à ce cluster',
                 guestRam: 'RAM invitée',
                 guestMemory: 'Mémoire invitée',
                 guestMemoryUnavailable: 'Mémoire invitée indisponible',
@@ -21510,6 +21545,13 @@
                 zoomOut: 'Zoom arrière',
             },
             es: {
+                // #767 — consola de VM en su propia ventana
+                openInOwnWindow: 'Abrir en su propia ventana',
+                popupBlocked: 'Tu navegador bloqueó la ventana de la consola. Permite las ventanas emergentes para PegaProx e inténtalo de nuevo.',
+                openingConsole: 'Abriendo la consola…',
+                consoleWindowFailed: 'No se pudo abrir esta consola.',
+                consoleLinkMalformed: 'Enlace de consola no válido',
+                consoleNoClusterAccess: 'Sin acceso a ese clúster',
                 guestRam: 'RAM del invitado',
                 guestMemory: 'Memoria del invitado',
                 guestMemoryUnavailable: 'Memoria del invitado no disponible',
@@ -25896,6 +25938,13 @@
                 zoomOut: 'Alejar',
             },
             pt: {
+                // #767 — consola da VM em janela própria
+                openInOwnWindow: 'Abrir em janela própria',
+                popupBlocked: 'O seu navegador bloqueou a janela da consola. Permita pop-ups para o PegaProx e tente novamente.',
+                openingConsole: 'A abrir a consola…',
+                consoleWindowFailed: 'Não foi possível abrir esta consola.',
+                consoleLinkMalformed: 'Ligação de consola inválida',
+                consoleNoClusterAccess: 'Sem acesso a esse cluster',
                 guestRam: 'RAM do convidado',
                 guestMemory: 'Memória do convidado',
                 guestMemoryUnavailable: 'Memória do convidado indisponível',
@@ -30126,6 +30175,13 @@
                 zoomOut: 'Afastar',
             },
             ko: {
+                // #767 — 별도 브라우저 창의 VM 콘솔
+                openInOwnWindow: '별도 창에서 열기',
+                popupBlocked: '브라우저가 콘솔 창을 차단했습니다. PegaProx의 팝업을 허용한 후 다시 시도하세요.',
+                openingConsole: '콘솔을 여는 중…',
+                consoleWindowFailed: '이 콘솔을 열 수 없습니다.',
+                consoleLinkMalformed: '잘못된 콘솔 링크',
+                consoleNoClusterAccess: '해당 클러스터에 접근할 수 없습니다',
                 guestRam: '게스트 RAM',
                 guestMemory: '게스트 메모리',
                 guestMemoryUnavailable: '게스트 메모리를 사용할 수 없음',
@@ -34588,6 +34644,13 @@
                 zoomOut: '축소',
             },
             it: {
+                // #767 — console della VM in una finestra dedicata
+                openInOwnWindow: 'Apri in una finestra dedicata',
+                popupBlocked: 'Il browser ha bloccato la finestra della console. Consenti i popup per PegaProx e riprova.',
+                openingConsole: 'Apertura della console…',
+                consoleWindowFailed: 'Impossibile aprire questa console.',
+                consoleLinkMalformed: 'Link della console non valido',
+                consoleNoClusterAccess: 'Nessun accesso a quel cluster',
                 guestRam: 'RAM guest',
                 guestMemory: 'Memoria guest',
                 guestMemoryUnavailable: 'Memoria guest non disponibile',

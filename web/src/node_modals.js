@@ -3593,7 +3593,7 @@
         // NS May 2026 — `hidden` lets multiple consoles stay mounted while only one is
         // visible (multi-console tabs). When hidden the overlay backdrop is suppressed
         // via display:none on the wrapper.
-        function ConsoleModal({ vm, consoleInfo, clusterId, onClose, hidden = false, onMinimize = null }) {
+        function ConsoleModal({ vm, consoleInfo, clusterId, onClose, hidden = false, onMinimize = null, standalone = false }) {
             const { t } = useTranslation();
             const { isCorporate } = useLayout(); // LW: corporate corporate chrome
             const canvasRef = useRef(null);
@@ -3988,6 +3988,30 @@
                 }
             };
 
+            // NS Sep 2026 (#767) — pop the console into its own browser window. An MSP asked
+            // for this to watch several guests side by side; the workaround until now was to
+            // open PVE's own GUI (the External button below) and lose our console entirely.
+            // Named window per guest, so clicking twice focuses the existing one instead of
+            // stacking duplicates. The in-app tab closes: the session lives in the popup now.
+            const popOutConsole = () => {
+                const cid = clusterId || vm?._clusterId;
+                if (!cid || !vm) return;
+                const key = `${cid}:${vm.type}:${vm.vmid}:${vm.node}`;
+                const url = `${window.location.origin}/?console=${encodeURIComponent(key)}`
+                    + (vm.name ? `&name=${encodeURIComponent(vm.name)}` : '');
+                const win = window.open(
+                    url,
+                    `pegaprox-console-${key.replace(/[^A-Za-z0-9]/g, '_')}`,
+                    'width=1280,height=860,menubar=no,toolbar=no,location=no,status=no,resizable=yes,scrollbars=yes'
+                );
+                if (!win) {                      // blocked by a popup blocker — keep the tab
+                    alert(t('popupBlocked') || 'Your browser blocked the console window. Allow popups for PegaProx and try again.');
+                    return;
+                }
+                try { win.focus(); } catch (_) {}
+                onClose?.();
+            };
+
             const openInProxmox = () => {
                 // NS: IPv6 needs brackets in URLs
                 const h = consoleInfo.host.includes(':') && !consoleInfo.host.startsWith('[') ? `[${consoleInfo.host}]` : consoleInfo.host;
@@ -4013,16 +4037,23 @@
                 : connectionStatus === 'reconnecting' ? 'Reconnecting…'
                 : 'Error';
 
+            // #767 — in its own window there is nothing behind the console to dim, and the
+            // 82vh card would just leave a black gutter. Same geometry as fullscreen, but a
+            // separate flag: isFullscreen tracks the browser Fullscreen API, this doesn't.
+            const fillWindow = isFullscreen || standalone;
+
             return (
                 <div className={isCorporate ? "corp-vm-modal-overlay" : "fixed inset-0 z-50 flex items-center justify-center p-4 modal-backdrop bg-black/80"}
-                     style={hidden ? {display: 'none'} : undefined}>
+                     style={hidden ? {display: 'none'}
+                            : standalone ? {padding: 0, background: 'transparent', backdropFilter: 'none', WebkitBackdropFilter: 'none'}
+                            : undefined}>
                     <div
                         ref={containerRef}
                         className={isCorporate
                             ? "corp-vm-modal"
-                            : `bg-proxmox-card border border-proxmox-border rounded-2xl shadow-2xl animate-scale-in overflow-hidden flex flex-col ${isFullscreen ? 'w-full h-full rounded-none' : 'w-full max-w-5xl h-[80vh]'}`}
+                            : `bg-proxmox-card border border-proxmox-border shadow-2xl overflow-hidden flex flex-col ${fillWindow ? 'w-full h-full' : 'rounded-2xl animate-scale-in w-full max-w-5xl h-[80vh]'}`}
                         style={isCorporate
-                            ? (isFullscreen
+                            ? (fillWindow
                                 ? {maxWidth: '100vw', width: '100vw', height: '100vh', maxHeight: '100vh'}
                                 : {maxWidth: '1280px', width: '100%', height: '82vh', maxHeight: '82vh'})
                             : undefined}
@@ -4083,6 +4114,12 @@
                                     >
                                         <Icons.ClipboardList className="w-3.5 h-3.5" />
                                         Paste
+                                    </button>
+                                )}
+                                {!standalone && (
+                                    <button onClick={popOutConsole} className="corp-vm-btn corp-vm-btn-ghost"
+                                        title={t('openInOwnWindow') || 'Open in its own window'}>
+                                        <Icons.ExternalLink className="w-3.5 h-3.5" />
                                     </button>
                                 )}
                                 <button onClick={openInProxmox} className="corp-vm-btn corp-vm-btn-ghost">
@@ -4159,6 +4196,15 @@
                                         title={t('pasteClipboard') || 'Paste from clipboard'}
                                     >
                                         <Icons.ClipboardList className="w-3.5 h-3.5 inline mr-1" />Paste
+                                    </button>
+                                )}
+                                {!standalone && (
+                                    <button
+                                        onClick={popOutConsole}
+                                        className="px-3 py-1.5 bg-proxmox-dark border border-proxmox-border rounded-lg text-xs text-gray-300 hover:text-white hover:border-proxmox-orange transition-colors"
+                                        title={t('openInOwnWindow') || 'Open in its own window'}
+                                    >
+                                        <Icons.ExternalLink className="w-3.5 h-3.5 inline" />
                                     </button>
                                 )}
                                 <button
