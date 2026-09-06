@@ -184,3 +184,13 @@ PREDICTIVE_WMA_DECAY = 0.7
 PREDICTIVE_COMPOSITE_WEIGHT = (0.6, 0.4)  # cpu, mem
 PREDICTIVE_OVERSHOOT_FACTOR = 1.15  # compensate for bursty workloads
 PREDICTIVE_ENGINE_TAG = 'pega-wma-v2'
+
+# MK Sep 2026 — how long the VNC relay's reader may sit in one recv before it releases the
+# pve_ws lock for a writer. The #713 lock funnels SSL_read and SSL_write through one mutex so
+# they can't splice a TLS record, and this slice is what keeps the reader from starving the
+# writer. It started at 50ms, which is also the worst-case delay an outbound pointer or key
+# event inherits on an idle screen — that is the mouse jitter people reported on 1.1.0, since
+# an idle desktop sends no framebuffer traffic to cut the wait short. 10ms is below the
+# threshold where pointer motion reads as steady, and costs only more timed-out wakeups
+# (~100/s per OPEN CONSOLE — a human-bounded number, unrelated to how many guests exist).
+VNC_PVE_RECV_SLICE = float(os.environ.get('PEGAPROX_VNC_RECV_SLICE', '0.01'))

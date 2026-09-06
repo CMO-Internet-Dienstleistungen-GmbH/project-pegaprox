@@ -20,6 +20,7 @@ MK Apr 2026 — added as the third defensive layer alongside Stable Mode and the
 SSH tunnel, after a customer reported their WSS was killed at the security
 boundary even with both prior layers active.
 """
+from pegaprox.constants import VNC_PVE_RECV_SLICE
 import base64
 import logging
 import secrets
@@ -84,7 +85,7 @@ class VncPollSession:
         # decode error. Funnel both through _pve_io_lock and release it between reads.
         # websocket-client's frame_buffer is resumable across a timed-out recv → no drop.
         try:
-            self.pve_ws.settimeout(0.05)
+            self.pve_ws.settimeout(VNC_PVE_RECV_SLICE)
         except Exception:
             pass
         while not self._closed:

@@ -8145,9 +8145,9 @@ def handle_vnc_websocket(ws, cluster_id, node, vm_type, vmid):
         # record and pveproxy tears the session with a tlsv1 decode-error. The
         # standalone vnc_handler leg already funnels its pve_ws ops through one lock;
         # the reverse-proxy / geventwebsocket console lands HERE on the main port and
-        # needed the same. Bounded 50ms read slice so the writer isn't starved on an
-        # empty recv.
-        pve_ws.settimeout(0.05)
+        # needed the same. Bounded read slice so the writer isn't starved on an empty recv —
+        # and short enough that an outbound pointer event doesn't inherit it (the 1.1.0 jitter).
+        pve_ws.settimeout(VNC_PVE_RECV_SLICE)
         _pve_io_lock = threading.Lock()
 
         bytes_sent = 0
@@ -8645,7 +8645,9 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
             # header/length/payload persist in recv_buffer), so a slice expiring mid-frame loses NO
             # bytes; the worker thread keeps the event loop free. 50ms slice = ≤50ms worst-case
             # keystroke latency on a fully idle screen, negligible while the framebuffer streams.
-            _PVE_RECV_SLICE = 0.05
+            # MK Sep 2026 — that idle-screen worst case IS the reported mouse jitter; the slice
+            # now comes from one constant (VNC_PVE_RECV_SLICE, 10ms) shared by all four legs.
+            _PVE_RECV_SLICE = VNC_PVE_RECV_SLICE
             pve_ws.settimeout(_PVE_RECV_SLICE)
 
             # The only three call sites that touch the pve_ws SSL object — all funnelled through
@@ -9144,9 +9146,9 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
         # record and pveproxy tears the session with a tlsv1 decode-error. The
         # standalone vnc_handler leg already funnels its pve_ws ops through one lock;
         # the reverse-proxy / geventwebsocket console lands HERE on the main port and
-        # needed the same. Bounded 50ms read slice so the writer isn't starved on an
-        # empty recv.
-        pve_ws.settimeout(0.05)
+        # needed the same. Bounded read slice so the writer isn't starved on an empty recv —
+        # and short enough that an outbound pointer event doesn't inherit it (the 1.1.0 jitter).
+        pve_ws.settimeout(VNC_PVE_RECV_SLICE)
         _pve_io_lock = threading.Lock()
 
         bytes_sent = 0

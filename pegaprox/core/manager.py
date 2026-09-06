@@ -65,6 +65,21 @@ def get_paramiko():
 # Gevent pool
 GEVENT_AVAILABLE = False
 GEVENT_POOL = None
+IP_SWEEP_POOL = None
+# MK Sep 2026 — ONE number for how many node calls may be in flight at once. It sizes
+# both the greenlet pool that issues them and the HTTPS keep-alive pool that carries
+# them; when the two drifted apart (fan-out 100 vs pool 64) the excess opened throwaway
+# connections that could never be returned, so every sweep left 36 fresh TLS handshakes
+# on the node's pveproxy — and a VNC console riding that same pveproxy got torn down.
+NODE_FANOUT_CONCURRENCY = int(os.environ.get('PEGAPROX_NODE_POOL_SIZE', '100'))
+
+# The IP/disk sweep issues up to two calls per RUNNING GUEST, so its task count grows with the
+# estate while every other fan-out is bounded by node count. Its own slice of the budget keeps a
+# 10k-guest sweep from holding the shared pool — and with it the broadcast tick and every
+# interactive request — for the length of the sweep. Full coverage either way.
+IP_SWEEP_CONCURRENCY = max(8, int(os.environ.get(
+    'PEGAPROX_IP_SWEEP_CONCURRENCY', str(max(8, NODE_FANOUT_CONCURRENCY // 4)))))
+
 try:
     from gevent.pool import Pool as GeventPool
     # NS: was 50 (100 caused fd exhaustion on the old Hetzner box at ulimit 1024).
@@ -72,7 +87,8 @@ try:
     # reuse connections so the per-node fan-out no longer burns one fd per call,
     # and the entry point now raises RLIMIT_NOFILE. Shared across all managers,
     # so this caps total concurrent node-fetches process-wide.
-    GEVENT_POOL = GeventPool(size=int(os.environ.get('PEGAPROX_NODE_POOL_SIZE', '100')))
+    GEVENT_POOL = GeventPool(size=NODE_FANOUT_CONCURRENCY)
+    IP_SWEEP_POOL = GeventPool(size=IP_SWEEP_CONCURRENCY)
     GEVENT_AVAILABLE = True
 except ImportError:
     pass
@@ -92,15 +108,22 @@ _TASK_USER_NEGCACHE = {}
 _TASK_USER_NEGCACHE_MAX = 5000
 _TASK_USER_NEGCACHE_TTL = 120.0
 
-def run_concurrent(tasks: list, timeout: float = 30.0) -> list:
+def run_concurrent(tasks: list, timeout: float = 30.0, pool=None) -> list:
     # MK 2026-05-31 — paired bugfix with utils/concurrent.py: gevent.pool.Pool's
     # __bool__ is len(), so `if GEVENT_POOL and ...` was always-False on entry.
     # `is not None` is the right gate.
+    #
+    # MK Sep 2026 — `pool` lets a caller bring its OWN bounded pool. A sweep whose task count
+    # scales with the ESTATE rather than the node count (the IP/disk cache: up to two calls per
+    # running guest) otherwise fills all 100 shared slots for the length of the sweep, and every
+    # other node call — the broadcast tick, a UI request, opening a console — queues behind it.
+    # Coverage is unchanged; this only bounds how much of the machine it holds at once.
     if not tasks:
         return []
-    if GEVENT_POOL is not None and GEVENT_AVAILABLE:
+    _pool = pool if pool is not None else GEVENT_POOL
+    if _pool is not None and GEVENT_AVAILABLE:
         try:
-            greenlets = [GEVENT_POOL.spawn(task) for task in tasks]
+            greenlets = [_pool.spawn(task) for task in tasks]
             from gevent import joinall
             joinall(greenlets, timeout=timeout)
             results = []
@@ -666,7 +689,14 @@ class PegaProxManager:
         # calls at once on this one session; with only 16 keep-alive slots the
         # excess churned throwaway connections (pool_block=False), re-incurring
         # the handshake cost the cache is meant to remove.
-        _pool_kw = dict(pool_connections=8, pool_maxsize=64, pool_block=False, max_retries=0)
+        # MK Sep 2026: "matches" was aspirational — it was hardcoded 64 against a fan-out of
+        # 100, so 36 of every 100 calls still churned. Measured: 36 warnings at 64/100, none
+        # once the two are the same number.
+        # pool_maxsize is derived from the SAME constant that sizes the fan-out, so the two
+        # cannot drift again — that drift is what produced the "Connection pool is full,
+        # discarding connection … pool size: 64" storm at 100-way fan-out.
+        _pool_kw = dict(pool_connections=8, pool_maxsize=NODE_FANOUT_CONCURRENCY,
+                        pool_block=False, max_retries=0)
         # NS: use system CA store when verifying - certifi bundle doesn't include custom CAs (#246)
         if self._ssl_verify:
             _ca = ssl.get_default_verify_paths()
@@ -2037,135 +2067,9 @@ class PegaProxManager:
         except:
             return []
     
-    def _fetch_qemu_ips(self, node: str, vmid: int) -> list:
-        """Fetch IP addresses from QEMU guest agent for a running VM.
-        Returns IPv4 addresses first, then IPv6 (so ips[0] is primary IPv4 when available).
-        Returns [] if agent not running, VM unreachable, or any error."""
-        # #237: skip VMs known to have no guest agent to avoid pvedaemon error spam
-        if vmid in self._no_agent_vms:
-            return []
-        try:
-            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces"
-            resp = self._create_session().get(url, timeout=8)
-            if resp.status_code == 500:
-                # agent socket not available — remember this VM
-                self._no_agent_vms.add(vmid)
-                return []
-            if resp.status_code != 200:
-                return []
-            interfaces = resp.json().get('data', {}).get('result', [])
-            ipv4s, ipv6s = [], []
-            for iface in interfaces:
-                if iface.get('name') == 'lo':
-                    continue
-                for addr in iface.get('ip-addresses', []):
-                    ip = addr.get('ip-address', '')
-                    if not ip:
-                        continue
-                    if ip.startswith('127.') or ip == '::1':
-                        continue
-                    if ip.lower().startswith('fe80:'):
-                        continue
-                    if addr.get('ip-address-type') == 'ipv4':
-                        ipv4s.append(ip)
-                    else:
-                        ipv6s.append(ip)
-            return ipv4s + ipv6s
-        except Exception:
-            return []
 
-    def _fetch_lxc_ips(self, node: str, vmid: int) -> list:
-        """Fetch IP addresses for a running LXC container.
-        MK: Apr 2026 — tries /interfaces first, falls back to config + status (#300)
-        """
-        try:
-            # method 1: /interfaces — preferred, returns all IPs
-            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/interfaces"
-            resp = self._create_session().get(url, timeout=8)
-            if resp.status_code == 200:
-                interfaces = resp.json().get('data', [])
-                ipv4s, ipv6s = [], []
-                for iface in interfaces:
-                    if iface.get('name') == 'lo':
-                        continue
-                    inet = iface.get('inet', '')
-                    if inet:
-                        ip = inet.split('/')[0]
-                        if not ip.startswith('127.'):
-                            ipv4s.append(ip)
-                    inet6 = iface.get('inet6', '')
-                    if inet6:
-                        ip = inet6.split('/')[0]
-                        if ip != '::1' and not ip.lower().startswith('fe80:'):
-                            ipv6s.append(ip)
-                if ipv4s or ipv6s:
-                    return ipv4s + ipv6s
 
-            # method 2: /config — extract static IPs from net0..net9
-            cfg_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
-            cfg_resp = self._create_session().get(cfg_url, timeout=5)
-            if cfg_resp.status_code == 200:
-                cfg = cfg_resp.json().get('data', {})
-                import re
-                for key in sorted(cfg.keys()):
-                    if not key.startswith('net'):
-                        continue
-                    val = cfg[key]
-                    # format: name=eth0,bridge=vmbr0,ip=10.0.0.5/24,...
-                    m = re.search(r'ip=(\d+\.\d+\.\d+\.\d+)', str(val))
-                    if m:
-                        return [m.group(1)]
 
-            return []
-        except Exception:
-            return []
-
-    def refresh_ip_cache(self) -> None:
-        """Fetch IPs for all currently running VMs and containers, update cache.
-        Called from the background IP refresh loop every 30 seconds."""
-        if not self.is_connected or not self.session:
-            return
-        try:
-            resources = self.get_vm_resources()
-            running = [r for r in resources if r.get('status') == 'running']
-            if not running:
-                return
-
-            def fetch_one(r):
-                node = r.get('node', '')
-                vmid = r.get('vmid')
-                if not node or not vmid:
-                    return None
-                if r.get('type') == 'lxc':
-                    ips = self._fetch_lxc_ips(node, vmid)
-                else:
-                    ips = self._fetch_qemu_ips(node, vmid)
-                return (node, vmid, ips)
-
-            tasks = [lambda r=r: fetch_one(r) for r in running]
-            results = run_concurrent(tasks, timeout=15.0)
-
-            with self._ip_cache_lock:
-                for result in results:
-                    if result is None:
-                        continue
-                    node, vmid, ips = result
-                    self._ip_cache[(node, vmid)] = ips
-        except Exception as e:
-            self.logger.debug(f"[IP cache] refresh failed: {e}")
-
-    def _ip_refresh_loop(self) -> None:
-        """Background loop that refreshes the IP cache every 30 seconds.
-        Uses stop_event so it exits cleanly when the manager stops."""
-        if self.stop_event.wait(15):  # 15s initial delay; returns True if stopping
-            return
-        while not self.stop_event.is_set():
-            try:
-                if self.is_connected:
-                    self.refresh_ip_cache()
-            except Exception as e:
-                self.logger.debug(f"[IP refresh loop] error: {e}")
-            self.stop_event.wait(30)  # wait 30s or until stop requested
 
     def _format_bytes(self, bytes_value: int) -> str:
         # NS: quick helper, nothing fancy
@@ -16977,7 +16881,8 @@ echo DONE""",
                     return (node, vmid, ips, disk)
 
             tasks = [lambda r=r: fetch_one(r) for r in running]
-            results = run_concurrent(tasks, timeout=15.0)
+            # own pool — this is the one sweep whose size follows the estate, not the nodes
+            results = run_concurrent(tasks, timeout=15.0, pool=IP_SWEEP_POOL)
 
             with self._ip_cache_lock:
                 for result in results:
