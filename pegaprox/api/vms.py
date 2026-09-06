@@ -7906,7 +7906,6 @@ def run_cross_cluster_replication(job_id):
             if not ok:
                 return err
 
-    # MK May 2026 (#455 @DarmokNoob) — block duplicate triggers while a previous
     # sec (audit): same gap as the delete twin — cluster reach only, while create and list
     # gate the guest. Forcing a run snapshots and clones that guest.
     _xu = build_authz_user(request.session.get('user', ''), request.session)
@@ -7917,7 +7916,8 @@ def run_cross_cluster_replication(job_id):
     except (TypeError, ValueError):
         return jsonify({'error': 'Replication job has no valid guest'}), 403
 
-    # run is still in-flight. The scheduler uses the same _claim_job() guard.
+    # MK May 2026 (#455) — block duplicate triggers while a previous run is still
+    # in-flight. The scheduler uses the same _claim_job() guard.
     from pegaprox.background.cross_cluster_replication import _claim_job, _release_job, _tracked_run
     if not _claim_job(job_id):
         return jsonify({

@@ -59,6 +59,19 @@ def scoped(api, seed):
 
 
 @pytest.fixture
+def operator(api, seed):
+    """The fixture this file was missing: a plain non-admin whose tenant owns the linked
+    cluster, with no pool grant and no VM ACL. Not confined, so not the caller these gates
+    were written for — and the reason the first version of them 403'd normal operators on
+    every garbage-collection and prune task."""
+    seed.tenant('tenant_a', clusters=['cluster_1'])
+    bob = seed.user('bob', role='user', tenant_id='tenant_a',
+                    permissions=['pbs.datastore.view', 'pbs.tasks.view'])
+    api.set_manager('cluster_1', api.make_fake_manager('cluster_1', get_vm_resources=[]))
+    return api.as_user(bob)
+
+
+@pytest.fixture
 def admin(api, seed):
     api.set_manager('cluster_1', api.make_fake_manager('cluster_1', get_vm_resources=[]))
     return api.as_user(seed.user('root_admin', role='admin'))
@@ -131,3 +144,48 @@ def test_admin_keeps_every_row_and_every_read(admin, pbs):
 def test_upid_guest_parsing(upid, expected):
     from pegaprox.api.pbs import _pbs_upid_guest      # imported here so the rest of the file
     assert _pbs_upid_guest(upid) == expected          # still collects without it
+
+
+# ── the unconfined operator: gated routes must not narrow a shipped role ──────
+
+def test_an_operator_still_reads_a_garbage_collection_task(operator, pbs):
+    """A GC task has no owning guest, so the per-backup gate cannot answer for it. The
+    listing beside this route hands the row to the same caller, so 403 here means the page
+    lists a task nobody can open."""
+    gc_upid = 'UPID:pbs:1:1:1:1:garbage-collection:store1:root@pam:'
+
+    r = operator.get(f'/api/pbs/{PBS}/tasks/{gc_upid}')
+
+    assert r.status_code == 200, r.get_data(as_text=True)[:200]
+
+
+def test_an_operator_keeps_the_whole_task_list(operator, pbs):
+    r = operator.get(f'/api/pbs/{PBS}/tasks')
+
+    assert r.status_code == 200, r.get_data(as_text=True)[:200]
+    assert len(r.get_json()) == 3, 'an unconfined operator must keep the gc row too'
+
+
+@pytest.mark.parametrize('path,query', [
+    (NOTES, f'?backup-type=vm&backup-id={THEIRS}&backup-time=1756000000'),
+    (GROUP_NOTES, f'?backup-type=vm&backup-id={THEIRS}'),
+])
+def test_an_operator_reads_any_guest_on_their_own_cluster(operator, pbs, path, query):
+    """Not confined means not confined — the BOLA gate is for pool-/ACL-scoped callers."""
+    r = operator.get(path + query)
+
+    assert r.status_code == 200, r.get_data(as_text=True)[:200]
+
+
+def test_an_operator_reads_a_host_type_backup(operator, pbs):
+    """proxmox-backup-client on a bare host: backup-type 'host', no vmid to resolve."""
+    r = operator.get(NOTES + '?backup-type=host&backup-id=fileserver&backup-time=1756000000')
+
+    assert r.status_code == 200, r.get_data(as_text=True)[:200]
+
+
+def test_a_scoped_caller_still_cannot_read_a_host_type_backup(scoped, pbs):
+    """The deny that must survive: a confined caller has no claim on an object with no guest."""
+    r = scoped.get(NOTES + '?backup-type=host&backup-id=fileserver&backup-time=1756000000')
+
+    assert r.status_code == 403, r.get_data(as_text=True)[:200]

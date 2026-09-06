@@ -691,16 +691,16 @@ def _scope_pbs_rows(mgr, rows, type_key='backup-type', id_key='backup-id',
     user = build_authz_user(request.session.get('user', ''), request.session)
     if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
         return rows
-    from pegaprox.api.helpers import caller_is_scoped
-    _cids = list(mgr.linked_clusters or []) or list(cluster_managers.keys())
-    if not any(caller_is_scoped(user, c) for c in _cids):
+    scoped = _caller_is_scoped_here(mgr, user)
+    if not scoped:
         return rows                      # plain cluster-wide operator — unchanged
     out = []
     for r in rows or []:
         bt, bid = key_fn(r) if key_fn else (r.get(type_key), r.get(id_key))
-        # hand the identity down — a datastore listing is the whole install's inventory and
-        # rebuilding it per row means a users-table read per snapshot
-        ok, _ = _authz_pbs_backup(mgr, bt, bid, permission, user=user)
+        # hand down both the identity and the confinement answer — a datastore listing is the
+        # whole install's inventory, and each of those costs a users-table read or a pool and
+        # ACL enumeration per row otherwise
+        ok, _ = _authz_pbs_backup(mgr, bt, bid, permission, user=user, scoped=scoped)
         if ok:
             out.append(r)
     return out
@@ -728,7 +728,18 @@ def _pbs_upid_guest(upid):
     return (m.group(1), m.group(2)) if m else (None, None)
 
 
-def _authz_pbs_backup(mgr, backup_type, backup_id, permission='vm.backup', user=None):
+def _caller_is_scoped_here(mgr, user):
+    """True when this caller is confined on any cluster this PBS backs up for.
+
+    Linked clusters own the backups; a PBS with no linking falls back to every connected
+    cluster, matching _pbs_vm_name_lookup. Conservative on purpose: confined anywhere means
+    confined here."""
+    from pegaprox.api.helpers import caller_is_scoped
+    _cids = list(mgr.linked_clusters or []) or list(cluster_managers.keys())
+    return any(caller_is_scoped(user, c) for c in _cids)
+
+
+def _authz_pbs_backup(mgr, backup_type, backup_id, permission='vm.backup', user=None, scoped=None):
     """NS Aug 2026 (sec-report, BOLA/CWE-639) — object-level scope for PBS backup ops.
 
     check_pbs_access only proves the caller reaches ONE of the PBS's linked clusters; it
@@ -741,16 +752,29 @@ def _authz_pbs_backup(mgr, backup_type, backup_id, permission='vm.backup', user=
     a scoped user whose vmid can't be resolved (host-type or non-numeric id) is denied.
     Returns (ok, err_response).
 
-    `user` lets a caller in a loop hand down an identity it already built. build_authz_user
-    reads the whole users table and decrypts two TOTP columns per account, and _scope_pbs_rows
-    runs this once per snapshot — at 10k guests that is the difference between one read and
-    hundreds of thousands, on a greenlet that yields to nobody while it runs."""
+    A caller who is not confined ANYWHERE on the linked clusters passes too — the same
+    carve-out _scope_pbs_rows has had from the start. Without it, extending this gate to the
+    read routes denied every plain operator and viewer on anything that is not a per-guest
+    backup: garbage-collection, prune, verify and sync tasks, and host-type backups. Those are
+    most of a PBS task list, and the listing route beside these hands them to the same caller,
+    so the page listed a GC task and 403'd the moment anyone clicked it.
+
+    `user` and `scoped` let a caller in a loop hand down what it already worked out.
+    build_authz_user reads the whole users table and decrypts two TOTP columns per account, and
+    caller_is_scoped enumerates pool grants and VM ACLs per linked cluster — _scope_pbs_rows
+    runs this once per snapshot, so at 10k guests both are the difference between one lookup
+    and hundreds of thousands, on a greenlet that yields to nobody while it runs."""
     from pegaprox.utils.rbac import user_can_access_vm
     if user is None:
         from pegaprox.utils.auth import build_authz_user
         user = build_authz_user(request.session.get('user', ''), request.session)
     if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
         return True, None
+
+    if scoped is None:
+        scoped = _caller_is_scoped_here(mgr, user)
+    if not scoped:
+        return True, None                # plain cluster-wide operator — unchanged
 
     def _deny():
         # built on demand: constructing a Response for every row was the other half of the cost

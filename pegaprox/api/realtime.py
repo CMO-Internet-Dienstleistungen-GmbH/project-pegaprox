@@ -511,6 +511,7 @@ def sse_updates():
 
     def generate():
         _next_authz = time.monotonic() + SSE_REAUTHZ_INTERVAL
+        _authz_misses = 0
         try:
             # Send initial connected message
             yield f"data: {json.dumps({'type': 'connected', 'client_id': client_id})}\n\n"
@@ -543,14 +544,33 @@ def sse_updates():
                 if time.monotonic() >= _next_authz:
                     _next_authz = time.monotonic() + SSE_REAUTHZ_INTERVAL
                     _acct = _stream_identity(user)
+                    if _acct is None:
+                        # _stream_identity folds "row missing" and "the read failed" into the
+                        # same None, and this now runs for every client every 30s — so one
+                        # WAL-contention blip would drop every stream at once and stampede
+                        # them all back in. A deleted account still goes within two ticks.
+                        _authz_misses += 1
+                        if _authz_misses < 2:
+                            yield ": keepalive\n\n"
+                            continue
                     if _acct is None or not _acct.get('enabled', True):
                         logging.info(f"[SSE] closing stream for '{_sl(user)}' — account gone or disabled")
                         return
+                    _authz_misses = 0
+                    # Both constraints have to hold, and each is authoritative in one
+                    # direction: a scoped token must not widen because its owner was promoted,
+                    # and the stream must not stay wide because the owner was demoted. So the
+                    # token decides when it carries a restriction, the live account decides
+                    # otherwise, and neither alone can make the stream an admin.
+                    # effective_role has to be refreshed as well as the boolean — is_admin only
+                    # gates whether the filters RUN; effective_role is what they decide with.
+                    _acct_role = _acct.get('effective_role') or _acct.get('role')
+                    _token_restricts = _token_role not in (None, ROLE_ADMIN)
                     with sse_clients_lock:
                         _ci = sse_clients.get(client_id)
                         if _ci is not None:
-                            _ci['is_admin'] = (_acct.get('effective_role', _acct.get('role'))
-                                               == ROLE_ADMIN and _token_role in (None, ROLE_ADMIN))
+                            _ci['effective_role'] = _token_role if _token_restricts else _acct_role
+                            _ci['is_admin'] = (_acct_role == ROLE_ADMIN) and not _token_restricts
         except GeneratorExit:
             pass
         finally:
