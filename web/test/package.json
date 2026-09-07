@@ -1,0 +1,14 @@
+{
+  "name": "pegaprox-web-test",
+  "private": true,
+  "type": "commonjs",
+  "description": "Behaviour tests for web/src/*.js. Run: npm install && npm test",
+  "scripts": {
+    "test": "node --test ."
+  },
+  "devDependencies": {
+    "@babel/core": "^7.23.0",
+    "@babel/preset-react": "^7.23.0",
+    "jsdom": "^25.0.1"
+  }
+}
