@@ -593,9 +593,29 @@ def delete_cluster(cluster_id):
                     hosts_to_clean.add(ip)
         except Exception:
             pass
+        # NS Sep 2026 (Aikido 469089277) — a host can be reachable through more than one
+        # configured cluster (shared management IP, a node moved between clusters, two entries
+        # for the same box). Dropping its pin here would silently re-TOFU it for the OTHER
+        # cluster on its next SSH connection, which is exactly the window reject-on-change
+        # exists to close. Keep any host another manager still points at; only local state is
+        # consulted, no per-cluster network calls.
+        still_pinned = set()
+        for _cid, _other in list(cluster_managers.items()):
+            if _cid == cluster_id:
+                continue
+            v = getattr(_other, 'host', None) or getattr(getattr(_other, 'config', None), 'host', None)
+            if v:
+                still_pinned.add(v)
+        for (_cid, _node), val in list(_node_ip_cache.items()):
+            if _cid != cluster_id and val and val[0]:
+                still_pinned.add(val[0])
+        hosts_to_clean -= still_pinned
+
         n_removed = remove_host_keys(hosts_to_clean)
         if n_removed:
             logging.info(f"Removed {n_removed} SSH host-key pin(s) for deleted cluster {cluster_id}")
+        if still_pinned:
+            logging.debug(f"Kept {len(still_pinned)} host-key pin(s) still referenced by another cluster")
     except Exception as e:
         logging.debug(f"known_hosts cleanup on cluster delete failed (non-critical): {e}")
 

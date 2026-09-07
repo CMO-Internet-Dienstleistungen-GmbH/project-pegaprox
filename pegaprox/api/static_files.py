@@ -403,18 +403,20 @@ def get_user_vm_access(username):
 def get_user_perms(username):
     """Get effective permissions for a user"""
     users = load_users()
-    
-    if username not in users:
-        return jsonify({'error': 'User not found'}), 404
-    
-    user = users[username]
+
     # NS Aug 2026 (AI-pentest) — a tenant-scoped admin.users holder must not read RBAC metadata for a
     # user in ANOTHER tenant (cross-tenant disclosure + existence oracle). Mirror the user PUT/DELETE
     # siblings; a global admin (session role ROLE_ADMIN) still sees everyone.
-    if request.session.get('role') != ROLE_ADMIN:
+    # NS Sep 2026 — and answer 404, not 403, for a user outside the caller's tenant: the missing-user
+    # branch used to run first, so 404-vs-403 still told a tenant admin whether a name existed
+    # elsewhere. Both cases now look identical from outside.
+    user = users.get(username)
+    if user is not None and request.session.get('role') != ROLE_ADMIN:
         _caller = users.get(request.session.get('user', ''), {})
         if user.get('tenant_id', DEFAULT_TENANT_ID) != _caller.get('tenant_id', DEFAULT_TENANT_ID):
-            return jsonify({'error': 'Access denied'}), 403
+            user = None
+    if user is None:
+        return jsonify({'error': 'User not found'}), 404
     tenant_id = request.args.get('tenant_id', user.get('tenant_id', DEFAULT_TENANT_ID))
     
     effective = get_user_permissions(user, tenant_id)

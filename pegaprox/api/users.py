@@ -1712,7 +1712,11 @@ def apply_role_template(template_id):
     # must not inject a role into another tenant, create a global role, or mint a role granting
     # perms it doesn't hold (templates carry admin.* perms). create_custom_role guards this; the
     # template path did not.
-    if request.session.get('role') != ROLE_ADMIN:
+    # sec (audit): read the role the way the create sibling does. request.session['role'] is the
+    # value cached when the session was minted, so a demoted admin kept the old answer here until
+    # they logged out — build_authz_user resolves it live and applies a token's floor.
+    _caller = build_authz_user(request.session.get('user', ''), request.session)
+    if _caller.get('effective_role', _caller.get('role')) != ROLE_ADMIN:
         _caller_tenant = _caller_tenant_or_none()
         if tenant_id and tenant_id != _caller_tenant:
             return jsonify({'error': 'Access denied - cannot create roles in other tenants'}), 403

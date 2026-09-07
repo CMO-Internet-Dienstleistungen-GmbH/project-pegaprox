@@ -310,7 +310,12 @@ def _run_deploy(dep_id, cluster_id, node, template_id, storage, vmid, vm_name):
         # never fetches a URL that skipped it. allow_private=True keeps air-gapped mirrors working.
         from pegaprox.utils.url_security import sanitize_outbound_url, SsrfError
         try:
-            sanitize_outbound_url(tpl['image_url'], allowed_schemes=('https', 'http'), allow_private=True)
+            # NS Sep 2026 — allow_loopback=False: an internal mirror lives on the LAN, never on
+            # the fetching node's own 127.0.0.1, and the bytes wget pulls become a disk image the
+            # requester can boot and read. That turns a blind SSRF into a read of whatever is
+            # bound to the node's loopback, which no guest could otherwise reach.
+            sanitize_outbound_url(tpl['image_url'], allowed_schemes=('https', 'http'),
+                                  allow_private=True, allow_loopback=False)
         except SsrfError as _se:
             raise RuntimeError(f"image_url rejected by SSRF guard: {_se}")
 
@@ -418,7 +423,8 @@ def add_custom_template():
     # image mirrors working while cloud-metadata endpoints stay blocked).
     from pegaprox.utils.url_security import sanitize_outbound_url, SsrfError
     try:
-        sanitize_outbound_url(image_url, allowed_schemes=('https', 'http'), allow_private=True)
+        sanitize_outbound_url(image_url, allowed_schemes=('https', 'http'),
+                              allow_private=True, allow_loopback=False)
     except SsrfError as _se:
         return jsonify({'error': f'image_url rejected by SSRF guard: {_se}'}), 400
 
@@ -488,7 +494,12 @@ def delete_custom_template(tpl_id):
             return jsonify({'error': 'not found'}), 404
         _owner = (_row['created_by'] if hasattr(_row, 'keys') else _row[0]) or ''
         from pegaprox.models.permissions import ROLE_ADMIN
-        if _owner != _current_user() and request.session.get('role') != ROLE_ADMIN:
+        # sec (audit): resolve the role live rather than reading the value cached when the session
+        # was minted — same drift the role-template path in users.py had, and build_authz_user also
+        # applies an API token's floor here.
+        from pegaprox.utils.auth import build_authz_user
+        _caller = build_authz_user(_current_user(), request.session)
+        if _owner != _current_user() and _caller.get('effective_role', _caller.get('role')) != ROLE_ADMIN:
             return jsonify({'error': 'Access denied'}), 403
         c.execute('DELETE FROM custom_cloud_templates WHERE id = ?', (tpl_id,))
         get_db().conn.commit()

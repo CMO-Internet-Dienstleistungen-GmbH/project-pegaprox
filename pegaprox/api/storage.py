@@ -171,7 +171,12 @@ def connect_esxi_host(cluster_id):
     host = data.get('host', '').strip()
     username = data.get('username', 'root')
     password = data.get('password', '')
-    skip_verify = data.get('skip_cert_verification', True)
+    # NS Sep 2026 (Aikido 469089274) — this defaulted to True, so an omitted field turned OFF
+    # certificate checking on the storage PVE creates. The UI's own checkbox renders unchecked
+    # and does not send the key until it is touched, i.e. the dialog said "verify" while the
+    # storage was created with skip-cert-verification=1. Default to verifying; a self-signed
+    # ESXi still works, the operator just has to tick the box they are already being shown.
+    skip_verify = bool(data.get('skip_cert_verification', False))
     
     if not host or not password:
         return jsonify({'error': 'Host and password required'}), 400

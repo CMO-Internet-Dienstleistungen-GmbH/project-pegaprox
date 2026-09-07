@@ -84,17 +84,29 @@ def _plan_with_vms(plan):
 # protects, otherwise they could failover/read VMs outside their explicit grant.
 # ACL-scope-wins (mirrors add_plan_vm's per-VM gate). Returns (True, None) when the
 # caller can access every plan VM, else (False, <403 response>) to `return err`.
-def _authz_plan_vms(plan):
+def _authz_plan_vms(plan, starts_vms=False):
+    """Every VM in the plan has to be one the caller may touch.
+
+    NS Sep 2026 (Aikido 469089217) — starts_vms=True on the routes that actually power VMs on at
+    the target. For a caller confined by a pool or a VM-ACL, vm.view was too weak a question there:
+    a read-only pool grant let them fire a failover that starts every VM in it. Ask for vm.start
+    instead, but only for a confined caller — site_recovery.failover is admin-only by default, so
+    demanding vm.start from an unconfined DR operator would just break a legitimate custom role
+    without closing anything."""
     from pegaprox.utils.auth import build_authz_user
     from pegaprox.utils.rbac import user_can_access_vm
+    from pegaprox.api.helpers import caller_is_scoped
     user = build_authz_user(request.session['user'], request.session)
+    perm = 'vm.view'
+    if starts_vms and caller_is_scoped(user, plan.get('source_cluster') or ''):
+        perm = 'vm.start'
     for vm in _get_plan_vms(plan['id']):
         try:
             vmid = int(vm['vmid'])
         except (ValueError, TypeError, KeyError):
             # can't derive the vmid → deny for scoped users
             return False, (jsonify({'error': 'Access denied: unresolved VM in plan'}), 403)
-        if not user_can_access_vm(user, plan['source_cluster'], vmid, 'vm.view', vm.get('vm_type', 'qemu')):
+        if not user_can_access_vm(user, plan['source_cluster'], vmid, perm, vm.get('vm_type', 'qemu')):
             return False, (jsonify({'error': 'Access denied: you do not have permission for every VM in this plan'}), 403)
     return True, None
 
@@ -593,7 +605,7 @@ def execute_planned_failover(plan_id):
 
     # per-VM scope (BOLA sec-report): cluster reach isn't enough — the caller must
     # be scoped to every VM in the plan before we drive an authorized failover.
-    ok, err = _authz_plan_vms(plan)
+    ok, err = _authz_plan_vms(plan, starts_vms=True)
     if not ok:
         return err
 
@@ -657,7 +669,7 @@ def execute_emergency_failover(plan_id):
         return err
 
     # per-VM scope (BOLA sec-report): scoped caller must be scoped to every plan VM
-    ok, err = _authz_plan_vms(plan)
+    ok, err = _authz_plan_vms(plan, starts_vms=True)
     if not ok:
         return err
 
@@ -713,7 +725,7 @@ def execute_test_failover(plan_id):
         return err
 
     # per-VM scope (BOLA sec-report): scoped caller must be scoped to every plan VM
-    ok, err = _authz_plan_vms(plan)
+    ok, err = _authz_plan_vms(plan, starts_vms=True)
     if not ok:
         return err
 
@@ -781,7 +793,7 @@ def execute_failback(plan_id):
         return err
 
     # per-VM scope (BOLA sec-report): scoped caller must be scoped to every plan VM
-    ok, err = _authz_plan_vms(plan)
+    ok, err = _authz_plan_vms(plan, starts_vms=True)
     if not ok:
         return err
 

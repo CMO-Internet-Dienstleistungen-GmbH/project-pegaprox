@@ -26,6 +26,7 @@ get drift notifications without extra plumbing.
 """
 import json
 import time
+import hashlib
 import uuid
 import logging
 import threading
@@ -58,12 +59,33 @@ _NETWORK_VOLATILE = {'active'}
 # stable.
 _CSV_NORMALIZE_KEYS = {'content', 'tags', 'nodes'}
 
+# NS Sep 2026 (Aikido 469089254) — raising the read gate to admin.audit stopped a plain cluster
+# viewer reading these, but the value was still being written to the baseline and the event diff
+# in the clear, where it outlives the VM and lands in every DB backup. Nothing about drift needs
+# the value itself — only whether it CHANGED — so store a digest instead. Diffs stay accurate
+# (a new password produces a new digest) and there is no secret left to leak. Storage state runs
+# through the same helper, which also covers a CIFS password and a Ceph keyring.
+_SECRET_KEYS = {'cipassword', 'password', 'smbpassword', 'keyring', 'encryption-key'}
+
+
+def _redact_secret(value):
+    """Stable stand-in for a secret: same value in, same marker out, so a change is still a
+    change. Existing baselines hold the old cleartext, so the first scan after an upgrade
+    reports one drift event per affected VM — acknowledge and it settles."""
+    if value in (None, ''):
+        return value
+    digest = hashlib.sha256(str(value).encode('utf-8', 'replace')).hexdigest()
+    return f"<redacted:{digest[:16]}>"
+
 
 def _strip_volatile(d, volatile_keys):
     if not isinstance(d, dict): return d
     out = {}
     for k, v in d.items():
         if k in volatile_keys: continue
+        if k in _SECRET_KEYS:
+            out[k] = _redact_secret(v)
+            continue
         if k in _CSV_NORMALIZE_KEYS and isinstance(v, str) and ',' in v:
             parts = [p.strip() for p in v.split(',') if p.strip()]
             v = ','.join(sorted(parts))
