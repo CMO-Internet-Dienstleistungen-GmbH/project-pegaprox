@@ -1907,7 +1907,7 @@ def _pool_visibility(cluster_id):
 
     Returns (confined, granted_pools): confined=True means restrict to granted_pools."""
     from pegaprox.utils.auth import build_authz_user
-    from pegaprox.utils.rbac import _pool_perms_for, user_has_any_pool_access
+    from pegaprox.utils.rbac import _pool_perms_for
     user = build_authz_user(request.session.get('user', ''), request.session)
     if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
         return False, set()

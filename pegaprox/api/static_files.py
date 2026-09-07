@@ -120,8 +120,7 @@ def _authorize_pool_assignment(cluster_id, pool_id, vmid, vm_type=None):
     manages the target pool — admins and plain cluster-wide operators manage all pools on an owned
     cluster; a pool-scoped caller only pools they hold a grant on. Returns (ok, error_response)."""
     from pegaprox.utils.auth import build_authz_user
-    from pegaprox.utils.rbac import (user_can_access_vm, _pool_perms_for,
-                                     get_user_clusters, user_has_any_pool_access)
+    from pegaprox.utils.rbac import user_can_access_vm, _pool_perms_for, get_user_clusters
     from pegaprox.models.permissions import ROLE_ADMIN
     try:
         _vid = int(vmid)
