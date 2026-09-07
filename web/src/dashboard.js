@@ -13497,33 +13497,33 @@
 
             // LW: Mar 2026 - build menu items for sidebar right-click
             // NS: kept this in dashboard so it has direct access to all the handlers
-            const buildContextMenuItems = (type, target) => {
+            const buildContextMenuItemsRaw = (type, target) => {
                 if (type === 'cluster') {
                     const cluster = target;
                     return [
-                        { label: t('newVm') || 'New VM', icon: <Icons.Monitor className="w-3.5 h-3.5" />, onClick: () => {
+                        { perm: 'vm.create', label: t('newVm') || 'New VM', icon: <Icons.Monitor className="w-3.5 h-3.5" />, onClick: () => {
                             // NS May 2026 — if cluster is changing, defer modal until new metrics loaded
                             if (selectedCluster?.id === cluster.id) { setShowCreateVm('qemu'); return; }
                             setClusterMetrics({}); setClusterResources([]); setClusterDatastores({shared:[], local:{}});
                             setSelectedCluster(cluster);
                             setPendingCreateVm({ type: 'qemu', clusterId: cluster.id });
                         }},
-                        { label: t('newContainer') || 'New Container', icon: <Icons.Box className="w-3.5 h-3.5" />, onClick: () => {
+                        { perm: 'vm.create', label: t('newContainer') || 'New Container', icon: <Icons.Box className="w-3.5 h-3.5" />, onClick: () => {
                             if (selectedCluster?.id === cluster.id) { setShowCreateVm('lxc'); return; }
                             setClusterMetrics({}); setClusterResources([]); setClusterDatastores({shared:[], local:{}});
                             setSelectedCluster(cluster);
                             setPendingCreateVm({ type: 'lxc', clusterId: cluster.id });
                         }},
                         { separator: true },
-                        { label: t('renameCluster') || 'Rename', icon: <Icons.Edit className="w-3.5 h-3.5" />, onClick: () => { setRenamingCluster(cluster); setRenameValue(cluster.display_name || cluster.name || ''); } },
-                        { label: t('assignToGroup') || 'Assign to Group', icon: <Icons.FolderPlus className="w-3.5 h-3.5" />, onClick: () => setShowAssignGroup(cluster) },
-                        { label: t('bulkMigration') || 'Bulk Migration', icon: <Icons.ArrowRight className="w-3.5 h-3.5" />, onClick: () => { setSelectedCluster(cluster); setActiveTab('resources'); setResourcesSubTab('management'); } },
+                        { perm: 'cluster.config', label: t('renameCluster') || 'Rename', icon: <Icons.Edit className="w-3.5 h-3.5" />, onClick: () => { setRenamingCluster(cluster); setRenameValue(cluster.display_name || cluster.name || ''); } },
+                        { perm: 'cluster.config', label: t('assignToGroup') || 'Assign to Group', icon: <Icons.FolderPlus className="w-3.5 h-3.5" />, onClick: () => setShowAssignGroup(cluster) },
+                        { perm: 'vm.migrate', label: t('bulkMigration') || 'Bulk Migration', icon: <Icons.ArrowRight className="w-3.5 h-3.5" />, onClick: () => { setSelectedCluster(cluster); setActiveTab('resources'); setResourcesSubTab('management'); } },
                         { separator: true },
                         { label: t('refreshData') || 'Refresh', icon: <Icons.RefreshCw className="w-3.5 h-3.5" />, onClick: () => { fetchSidebarClusterData(cluster.id); if (selectedCluster?.id === cluster.id) { fetchClusterMetrics(cluster.id); fetchClusterResources(cluster.id); } } },
                         { separator: true },
-                        { label: t('reconfigureCluster') || 'Re-configure', icon: <Icons.Settings className="w-3.5 h-3.5" />, onClick: () => setReconfigureCluster(cluster) },
-                        { label: t('repinHostKeys') || 'Re-pin SSH host keys', icon: <Icons.Key className="w-3.5 h-3.5" />, onClick: () => handleRepinHostKeys(cluster.id) },
-                        { label: t('deleteCluster') || 'Remove Cluster', icon: <Icons.Trash className="w-3.5 h-3.5" />, danger: true, onClick: () => handleDeleteCluster(cluster.id) },
+                        { perm: 'cluster.config', label: t('reconfigureCluster') || 'Re-configure', icon: <Icons.Settings className="w-3.5 h-3.5" />, onClick: () => setReconfigureCluster(cluster) },
+                        { perm: 'cluster.config', label: t('repinHostKeys') || 'Re-pin SSH host keys', icon: <Icons.Key className="w-3.5 h-3.5" />, onClick: () => handleRepinHostKeys(cluster.id) },
+                        { perm: 'cluster.delete', label: t('deleteCluster') || 'Remove Cluster', icon: <Icons.Trash className="w-3.5 h-3.5" />, danger: true, onClick: () => handleDeleteCluster(cluster.id) },
                     ];
                 }
 
@@ -13540,10 +13540,10 @@
                         setPendingCreateVm({ type: vmType, clusterId });
                     };
                     return [
-                        { label: t('newVm') || 'New VM', icon: <Icons.Monitor className="w-3.5 h-3.5" />, onClick: () => openCreateOnCluster('qemu') },
-                        { label: t('newContainer') || 'New Container', icon: <Icons.Box className="w-3.5 h-3.5" />, onClick: () => openCreateOnCluster('lxc') },
+                        { perm: 'vm.create', label: t('newVm') || 'New VM', icon: <Icons.Monitor className="w-3.5 h-3.5" />, onClick: () => openCreateOnCluster('qemu') },
+                        { perm: 'vm.create', label: t('newContainer') || 'New Container', icon: <Icons.Box className="w-3.5 h-3.5" />, onClick: () => openCreateOnCluster('lxc') },
                         { separator: true },
-                        { label: maintenance ? (t('exitMaintenance') || 'Exit Maintenance') : (t('enterMaintenance') || 'Enter Maintenance'), icon: <Icons.Wrench className="w-3.5 h-3.5" />, onClick: async () => {
+                        { perm: 'node.maintenance', label: maintenance ? (t('exitMaintenance') || 'Exit Maintenance') : (t('enterMaintenance') || 'Enter Maintenance'), icon: <Icons.Wrench className="w-3.5 h-3.5" />, onClick: async () => {
                             // NS: Mar 2026 - inline API call with known clusterId to avoid stale closure on selectedCluster
                             const mMsg = maintenance ? `${t('disableMaintenance') || 'Disable maintenance'}: "${nodeName}"?` : `${t('startingMaintenanceMode') || 'Enable maintenance mode'}: "${nodeName}"? VMs will be evacuated.`;
                             const mWarn = maintenance ? '' : await buildMaintPreviewWarning(clusterId, nodeName);
@@ -13563,7 +13563,7 @@
                                 fetchSidebarClusterData(clusterId);
                             } catch (e) { addToast(t('connectionError'), 'error'); }
                         }, disabled: !online },
-                        { label: t('sshConsole') || 'SSH Console', icon: <Icons.Terminal className="w-3.5 h-3.5" />, onClick: () => { selectCluster(); const c = clusters.find(cl => cl.id === clusterId); if (c) { setConsoleInfo({ vmid: 0, node: nodeName, type: 'node', host: c.host }); setConsoleVm({ vmid: 0, node: nodeName, type: 'node', name: nodeName }); } }, disabled: !online },
+                        { perm: 'node.shell', label: t('sshConsole') || 'SSH Console', icon: <Icons.Terminal className="w-3.5 h-3.5" />, onClick: () => { selectCluster(); const c = clusters.find(cl => cl.id === clusterId); if (c) { setConsoleInfo({ vmid: 0, node: nodeName, type: 'node', host: c.host }); setConsoleVm({ vmid: 0, node: nodeName, type: 'node', name: nodeName }); } }, disabled: !online },
                         { separator: true },
                         { label: t('refreshData') || 'Refresh', icon: <Icons.RefreshCw className="w-3.5 h-3.5" />, onClick: () => { fetchSidebarClusterData(clusterId); } },
                     ];
@@ -13573,13 +13573,13 @@
                 if (type === 'pool') {
                     const { poolid, clusterId, comment } = target;
                     return [
-                        { label: t('editPool') || 'Edit Pool', icon: <Icons.Edit className="w-3.5 h-3.5" />, onClick: () => {
+                        { perm: 'admin.users', label: t('editPool') || 'Edit Pool', icon: <Icons.Edit className="w-3.5 h-3.5" />, onClick: () => {
                             setInlinePoolEdit({ clusterId, poolid, comment: comment || '' });
                         }},
                         { separator: true },
                         { label: t('refreshData') || 'Refresh', icon: <Icons.RefreshCw className="w-3.5 h-3.5" />, onClick: () => { fetchSidebarClusterData(clusterId); fetchClusterPools(clusterId); } },
                         { separator: true },
-                        { label: t('delete') || 'Delete', icon: <Icons.Trash className="w-3.5 h-3.5" />, danger: true, onClick: async () => {
+                        { perm: 'admin.users', label: t('delete') || 'Delete', icon: <Icons.Trash className="w-3.5 h-3.5" />, danger: true, onClick: async () => {
                             if (!confirm(t('confirmDeletePool') || 'Really delete this pool?')) return;
                             try {
                                 const res = await authFetch(`${API_URL}/clusters/${clusterId}/pools/${encodeURIComponent(poolid)}`, { method: 'DELETE' });
@@ -13612,30 +13612,31 @@
 
                     // power submenu
                     const powerItems = [
-                        { label: t('start') || 'Start', icon: <Icons.PlayCircle className="w-3.5 h-3.5" style={{color: '#60b515'}} />, onClick: () => handleVmAction(vm, 'start'), disabled: isRunning },
-                        { label: t('shutdown') || 'Shutdown', icon: <Icons.Power className="w-3.5 h-3.5" style={{color: '#f54f47'}} />, onClick: () => handleVmAction(vm, 'shutdown'), disabled: !isRunning },
-                        { label: t('reboot') || 'Reboot', icon: <Icons.RefreshCw className="w-3.5 h-3.5" style={{color: '#efc006'}} />, onClick: () => handleVmAction(vm, 'reboot'), disabled: !isRunning },
+                        { perm: 'vm.start', label: t('start') || 'Start', icon: <Icons.PlayCircle className="w-3.5 h-3.5" style={{color: '#60b515'}} />, onClick: () => handleVmAction(vm, 'start'), disabled: isRunning },
+                        { perm: 'vm.stop', label: t('shutdown') || 'Shutdown', icon: <Icons.Power className="w-3.5 h-3.5" style={{color: '#f54f47'}} />, onClick: () => handleVmAction(vm, 'shutdown'), disabled: !isRunning },
+                        { perm: 'vm.restart', label: t('reboot') || 'Reboot', icon: <Icons.RefreshCw className="w-3.5 h-3.5" style={{color: '#efc006'}} />, onClick: () => handleVmAction(vm, 'reboot'), disabled: !isRunning },
                         { separator: true },
-                        { label: t('forceStop') || 'Force Stop', icon: <Icons.XCircle className="w-3.5 h-3.5" />, onClick: () => handleForceStop(vm), disabled: !isRunning, danger: true },
+                        { perm: 'vm.stop', label: t('forceStop') || 'Force Stop', icon: <Icons.XCircle className="w-3.5 h-3.5" />, onClick: () => handleForceStop(vm), disabled: !isRunning, danger: true },
                     ];
                     if (isQemu) {
-                        powerItems.splice(4, 0, { label: t('forceReset') || 'Force Reset', icon: <Icons.Zap className="w-3.5 h-3.5" />, onClick: () => handleVmAction(vm, 'reset'), disabled: !isRunning, danger: true });
+                        powerItems.splice(4, 0, { perm: 'vm.restart', label: t('forceReset') || 'Force Reset', icon: <Icons.Zap className="w-3.5 h-3.5" />, onClick: () => handleVmAction(vm, 'reset'), disabled: !isRunning, danger: true });
                     }
 
                     const items = [
                         { label: t('power') || 'Power', icon: <Icons.Power className="w-3.5 h-3.5" />, submenu: powerItems },
                         { separator: true },
-                        { label: t('console') || 'Console', icon: <Icons.Terminal className="w-3.5 h-3.5" />, onClick: () => handleOpenConsole(vm), disabled: !isRunning },
-                        ...(vm.type === 'qemu' ? [{ label: t('spiceConsole') || 'SPICE', icon: <Icons.ExternalLink className="w-3.5 h-3.5" />, onClick: () => handleOpenSpice(vm), disabled: !isRunning }] : []),
+                        { perm: 'vm.console', label: t('console') || 'Console', icon: <Icons.Terminal className="w-3.5 h-3.5" />, onClick: () => handleOpenConsole(vm), disabled: !isRunning },
+                        ...(vm.type === 'qemu' ? [{ perm: 'vm.console', label: t('spiceConsole') || 'SPICE', icon: <Icons.ExternalLink className="w-3.5 h-3.5" />, onClick: () => handleOpenSpice(vm), disabled: !isRunning }] : []),
                         // NS May 2026 — VNC ↔ Term toggle now lives inside the Console modal,
                         // so the separate Terminal entry was removed (one entry point = clearer UX).
-                        { label: t('editSettings') || 'Settings', icon: <Icons.Settings className="w-3.5 h-3.5" />, onClick: () => handleOpenConfig(vm) },
+                        { perm: 'vm.config', label: t('editSettings') || 'Settings', icon: <Icons.Settings className="w-3.5 h-3.5" />, onClick: () => handleOpenConfig(vm) },
                     ];
                     // MK May 2026 — recovery action for V2P-migrated VMs whose static
                     // sector-size args broke after the customer changed disk bus
                     // (scsi0 → sata0) via the Proxmox UI. Only useful for QEMU.
                     if (isQemu) {
                         items.push({
+                            perm: 'vm.config',
                             label: t('fixQemuArgs') || 'Fix QEMU args (after disk-bus change)',
                             icon: <Icons.Wrench className="w-3.5 h-3.5" />,
                             onClick: async () => {
@@ -13657,7 +13658,7 @@
                     }
                     items.push(
                         { separator: true },
-                        { label: t('migrate') || 'Migrate', icon: <Icons.ArrowRight className="w-3.5 h-3.5" />, onClick: () => {
+                        { perm: 'vm.migrate', label: t('migrate') || 'Migrate', icon: <Icons.ArrowRight className="w-3.5 h-3.5" />, onClick: () => {
                             if (isCorporate) { setDashMigrateVm(vm); }
                             else { selectAndNav(); setPendingVmAction({ vm, action: 'migrate' }); }
                         }},
@@ -13665,7 +13666,7 @@
 
                     // cross-cluster only if multiple clusters
                     if (clusters.length > 1) {
-                        items.push({ label: t('crossClusterMigrate') || 'Cross-Cluster', icon: <Icons.Globe className="w-3.5 h-3.5" />, onClick: () => {
+                        items.push({ perm: 'vm.migrate', label: t('crossClusterMigrate') || 'Cross-Cluster', icon: <Icons.Globe className="w-3.5 h-3.5" />, onClick: () => {
                             if (isCorporate) { setDashCrossClusterVm(vm); }
                             else { selectAndNav(); setPendingVmAction({ vm, action: 'crossCluster' }); }
                         }});
@@ -13697,7 +13698,7 @@
                                 }
                             })),
                             { separator: true },
-                            { label: t('removeFromPool') || 'Remove from Pool', icon: <Icons.XCircle className="w-3.5 h-3.5" />, danger: true, onClick: async () => {
+                            { perm: 'pool.assign', label: t('removeFromPool') || 'Remove from Pool', icon: <Icons.XCircle className="w-3.5 h-3.5" />, danger: true, onClick: async () => {
                                 // find which pool this VM is in
                                 const currentPool = poolsForCluster.find(p => (p.members || []).some(m => String(m.vmid || m.id) === String(vm.vmid)));
                                 if (!currentPool) { addToast('VM is not in a pool', 'info'); return; }
@@ -13718,19 +13719,19 @@
                                 } catch { addToast(t('connectionError'), 'error'); }
                             }}
                         ];
-                        items.push({ label: t('assignToPool') || 'Assign to Pool', icon: <Icons.FolderPlus className="w-3.5 h-3.5" />, submenu: poolSubmenu });
+                        items.push({ perm: 'pool.assign', label: t('assignToPool') || 'Assign to Pool', icon: <Icons.FolderPlus className="w-3.5 h-3.5" />, submenu: poolSubmenu });
                     }
 
                     items.push(
-                        { label: t('clone') || 'Clone', icon: <Icons.Copy className="w-3.5 h-3.5" />, onClick: () => {
+                        { perm: 'vm.clone', label: t('clone') || 'Clone', icon: <Icons.Copy className="w-3.5 h-3.5" />, onClick: () => {
                             if (isCorporate) { setDashCloneVm(vm); }
                             else { selectAndNav(); setPendingVmAction({ vm, action: 'clone' }); }
                         }},
-                        { label: t('snapshot') || 'Snapshot', icon: <Icons.Camera className="w-3.5 h-3.5" />, onClick: () => {
+                        { perm: 'vm.snapshot', label: t('snapshot') || 'Snapshot', icon: <Icons.Camera className="w-3.5 h-3.5" />, onClick: () => {
                             setDashSnapshotVm(vm);
                         }},
                         { separator: true },
-                        { label: t('delete') || 'Delete', icon: <Icons.Trash className="w-3.5 h-3.5" />, onClick: () => {
+                        { perm: 'vm.delete', label: t('delete') || 'Delete', icon: <Icons.Trash className="w-3.5 h-3.5" />, onClick: () => {
                             if (isCorporate) { setDashDeleteVm(vm); }
                             else { selectAndNav(); setPendingVmAction({ vm, action: 'delete' }); }
                         }, danger: true }
@@ -13740,6 +13741,31 @@
                 }
 
                 return [];
+            };
+
+            // sec (private disclosure Sep 2026): the context menu built every entry
+            // unconditionally, so a user saw actions their role cannot perform and only found out
+            // by clicking one and getting an error. The backend does gate all of them — that was
+            // verified action by action — but a menu that shows everything is how a future entry
+            // whose endpoint forgot its own check would go unnoticed. Each entry above carries the
+            // permission its endpoint requires; this drops the ones the caller lacks, so that
+            // table is the single place to audit instead of 25 call sites.
+            const buildContextMenuItems = (type, target) => {
+                const kept = buildContextMenuItemsRaw(type, target).filter(i => !i.perm || can(i.perm));
+                const out = [];
+                for (const item of kept) {
+                    if (item.submenu) {
+                        const sub = item.submenu.filter(i => !i.perm || can(i.perm));
+                        if (!sub.length) continue;          // no children left, drop the parent
+                        out.push({ ...item, submenu: sub });
+                        continue;
+                    }
+                    // a dropped entry must not leave its separators stacked up or leading
+                    if (item.separator && (!out.length || out[out.length - 1].separator)) continue;
+                    out.push(item);
+                }
+                while (out.length && out[out.length - 1].separator) out.pop();
+                return out;
             };
 
             // NS 2026-06-05 — Cloud skin (Preview): the whole console layout is its own

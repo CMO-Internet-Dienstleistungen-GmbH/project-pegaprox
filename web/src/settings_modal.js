@@ -3180,7 +3180,7 @@
                                                 </div>
                                                 <div>
                                                     <label className="block text-sm text-gray-400 mb-1">{t('clusters') || 'Clusters'}</label>
-                                                    <p className="text-xs text-gray-500 mb-2">Select clusters this tenant can access (empty = all)</p>
+                                                    <p className="text-xs text-gray-500 mb-2">Select clusters this tenant can access (empty = none)</p>
                                                     <div className="grid grid-cols-2 gap-2 max-h-40 overflow-y-auto">
                                                         {clusters.map(c => (
                                                             <label key={c.id} className="flex items-center gap-2 p-2 bg-proxmox-darker rounded cursor-pointer hover:bg-proxmox-hover">
@@ -3353,7 +3353,7 @@
                                                     
                                                     <div>
                                                         <label className="block text-sm text-gray-400 mb-1">{t('clusters') || 'Clusters'}</label>
-                                                        <p className="text-xs text-gray-500 mb-2">{t('tenantClustersHint') || 'Select which clusters this tenant can access (empty = all)'}</p>
+                                                        <p className="text-xs text-gray-500 mb-2">{t('tenantClustersHint') || 'Select which clusters this tenant can access (empty = none)'}</p>
                                                         <div className="grid grid-cols-2 gap-2 max-h-48 overflow-y-auto bg-proxmox-dark rounded-lg p-3">
                                                             {clusters.map(c => (
                                                                 <label key={c.id} className="flex items-center gap-2 p-2 hover:bg-proxmox-hover rounded cursor-pointer">

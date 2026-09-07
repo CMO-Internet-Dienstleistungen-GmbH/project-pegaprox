@@ -1133,8 +1133,7 @@ def get_cluster_resources(cluster_id):
 
     # NS Aug 2026 — build the authz user so an admin-owned scoped API token is floored to its
     # effective_role (the stored-role fast-path let such a token see everything).
-    from pegaprox.utils.rbac import (user_can_access_vm as _ucav, get_user_clusters as _guc,
-                                     user_has_any_pool_access as _uhpa)
+    from pegaprox.utils.rbac import user_can_access_vm as _ucav
     from pegaprox.utils.auth import build_authz_user
     user = build_authz_user(request.session['user'], request.session)
     user['username'] = request.session['user']
@@ -1147,8 +1146,6 @@ def get_cluster_resources(cluster_id):
     # pool / #248 ACL fallback (tenant does NOT own it) must NOT get that blanket vm.view fallback —
     # confine them to exactly the VMs their pool/ACL grants, via user_can_access_vm (which enforces
     # the tenant gate). None => admin/default-tenant (unscoped).
-    _tenant_clusters = _guc(user, include_pools=False)
-    _is_tenant_owner = _tenant_clusters is None or cluster_id in _tenant_clusters
     # MK Sep 2026 (#773, mbo-nw) — a caller with an explicit POOL grant is confined to their pool's
     # (+ any ACL'd) VMs even on a cluster their tenant owns. The restrictive-ACL listing below would
     # otherwise fall a pool-scoped operator through to the blanket vm.view branch and hand back the
@@ -1157,7 +1154,15 @@ def get_cluster_resources(cluster_id):
     # callers, like non-owners, through the same per-VM user_can_access_vm check (which confines
     # them to exactly their ACL + pool VMs), so the list matches per-VM access. Pure operators with no
     # pool/ACL grant keep the restrictive tenant-owner listing below unchanged.
-    if (not _is_tenant_owner) or _uhpa(user, cluster_id):
+    # sec (private disclosure Sep 2026): this predicate was open-coded here as
+    # `(not owner) or user_has_any_pool_access(...)`, which asks about POOL grants only. A caller
+    # whose tenant OWNS the cluster and who is confined by a VM-ACL instead of a pool has neither
+    # condition true, so they fell past this into the restrictive listing below — where the
+    # `elif has_general_view` arm hands back every VM that has no ACL entry of its own. helpers
+    # .caller_is_scoped was written for exactly this miss and the other endpoints moved onto it;
+    # this one kept its copy. Use the shared predicate so the two cannot drift again.
+    from pegaprox.api.helpers import caller_is_scoped as _scoped
+    if _scoped(user, cluster_id):
         filtered = []
         for vm in all_resources:
             _vmid = vm.get('vmid')
