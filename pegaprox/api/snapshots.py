@@ -535,7 +535,16 @@ def list_policies(cluster_id):
     try:
         c = get_db().conn.cursor()
         c.execute('SELECT * FROM snapshot_policies WHERE cluster_id=? ORDER BY created_at DESC', (cluster_id,))
-        return jsonify({'policies': [_row_to_policy(r) for r in c.fetchall()]})
+        _pols = [_row_to_policy(r) for r in c.fetchall()]
+        # sec (audit): a policy names the guests it snapshots, and every other route on this
+        # object is per-target gated — the listing was not, so a scoped caller read the whole
+        # cluster's policies. Same predicate the run-log route already uses.
+        from pegaprox.utils.auth import build_authz_user
+        from pegaprox.api.helpers import caller_is_scoped
+        if caller_is_scoped(build_authz_user(request.session.get('user', ''), request.session),
+                            cluster_id):
+            _pols = [p for p in _pols if _policy_targets_authorized(cluster_id, p, 'vm.view')]
+        return jsonify({'policies': _pols})
     except Exception:
         logging.exception('snapshot policies list failed')
         return jsonify({'error': 'internal error'}), 500
@@ -624,29 +633,39 @@ def update_policy(cluster_id, pid):
     if not ok: return err
     body = request.get_json(silent=True) or {}
 
-    # re-validate target authz if the policy's targeting is being changed
-    if 'target_type' in body or 'target_value' in body:
-        mgr = cluster_managers.get(cluster_id)
-        if not mgr:
-            return jsonify({'error': 'cluster manager not found'}), 404
-        cc = get_db().conn.cursor()
-        cc.execute('SELECT * FROM snapshot_policies WHERE id=? AND cluster_id=?', (pid, cluster_id))
-        row0 = cc.fetchone()
-        if not row0:
-            return jsonify({'error': 'not found'}), 404
-        cur = _row_to_policy(row0)
-        tt = body.get('target_type', cur['target_type'])
-        tv = body.get('target_value', cur['target_value'])
-        creator = build_authz_user(request.session.get('user', ''), request.session)
+    # sec (private disclosure Sep 2026 — audit): ALWAYS re-validate the caller against the policy's
+    # target VMs, not only when the body changes targeting — else a bare {"enabled":0} could edit a
+    # policy whose targets are out of scope. Effective target = new value if supplied, else the stored
+    # one. Resolve via the live manager when present; when the cluster is OFFLINE, authorize a direct-VM
+    # target by its vmid (no round-trip) and fail closed for a scoped caller on a tag target we can't
+    # expand — but NEVER 404 a non-targeting edit just because the manager is momentarily absent.
+    cc = get_db().conn.cursor()
+    cc.execute('SELECT * FROM snapshot_policies WHERE id=? AND cluster_id=?', (pid, cluster_id))
+    row0 = cc.fetchone()
+    if not row0:
+        return jsonify({'error': 'not found'}), 404
+    cur = _row_to_policy(row0)
+    tt = body.get('target_type', cur['target_type'])
+    tv = body.get('target_value', cur['target_value'])
+    creator = build_authz_user(request.session.get('user', ''), request.session)
+    mgr = cluster_managers.get(cluster_id)
+    if mgr:
         try:
             denied = [f"{t}/{v}@{n}" for n, v, t in _resolve_targets(mgr, {
                           'target_type': tt, 'target_value': tv, 'cluster_id': cluster_id})
                       if not user_can_access_vm(creator, cluster_id, v, 'vm.snapshot', t)]
         except Exception as e:
             return jsonify({'error': f'failed to resolve targets: {e}'}), 400
-        if denied:
-            logging.warning(f"[SNAP-POLICY] {request.session.get('user','?')} denied on {len(denied)} out-of-scope target VM(s) updating policy {pid}@{cluster_id}")
-            return jsonify({'error': "Permission denied: you lack vm.snapshot on some of this policy's target VMs"}), 403
+    else:
+        _tv = str(tv).strip()
+        if str(tt).lower() in ('vm', 'vmid') and _tv.lstrip('-').isdigit():
+            denied = [] if user_can_access_vm(creator, cluster_id, int(_tv), 'vm.snapshot') else [_tv]
+        else:
+            from pegaprox.api.helpers import caller_is_scoped
+            denied = ['<unresolved: cluster offline>'] if caller_is_scoped(creator, cluster_id) else []
+    if denied:
+        logging.warning(f"[SNAP-POLICY] {request.session.get('user','?')} denied on {len(denied)} out-of-scope target VM(s) updating policy {pid}@{cluster_id}")
+        return jsonify({'error': "Permission denied: you lack vm.snapshot on some of this policy's target VMs"}), 403
 
     # #586 — validate the new schedule fields when present
     if body.get('schedule') and body['schedule'] not in ('hourly', 'daily', 'weekly', 'monthly', 'once', 'cron'):
@@ -778,6 +797,32 @@ def run_policy_now(cluster_id, pid):
     return jsonify({'ok': True, 'message': 'policy run started'})
 
 
+def _policy_targets_authorized(cluster_id, policy, perm='vm.snapshot'):
+    """sec (private disclosure Sep 2026 — audit): may the caller see/act on this policy's target
+    VMs? Admins and plain cluster-wide operators always may; a scoped caller must be able to reach
+    every target. snapshot_runs rows carry no vmid (the VM identities are in the free-text log and
+    summary), so the run history has to be gated on the POLICY, the way update/delete already are.
+    Offline cluster: a direct-VM target is authorized by its vmid, anything we cannot expand fails
+    closed for a scoped caller."""
+    from pegaprox.api.helpers import caller_is_scoped
+    creator = build_authz_user(request.session.get('user', ''), request.session)
+    if not caller_is_scoped(creator, cluster_id):
+        return True
+    mgr = cluster_managers.get(cluster_id)
+    if mgr:
+        try:
+            for _n, _v, _t in _resolve_targets(mgr, policy):
+                if not user_can_access_vm(creator, cluster_id, _v, perm, _t):
+                    return False
+            return True
+        except Exception:
+            return False
+    _tv = str(policy.get('target_value') or '').strip()
+    if str(policy.get('target_type') or '').lower() in ('vm', 'vmid') and _tv.lstrip('-').isdigit():
+        return user_can_access_vm(creator, cluster_id, int(_tv), perm)
+    return False
+
+
 @bp.route('/api/clusters/<cluster_id>/snapshot-policies/<pid>/runs', methods=['GET'])
 @require_auth(perms=['vm.snapshot'])
 def list_runs(cluster_id, pid):
@@ -785,9 +830,12 @@ def list_runs(cluster_id, pid):
     if not ok: return err
     try:
         c = get_db().conn.cursor()
-        c.execute('SELECT id FROM snapshot_policies WHERE id=? AND cluster_id=?', (pid, cluster_id))
-        if not c.fetchone():
+        c.execute('SELECT * FROM snapshot_policies WHERE id=? AND cluster_id=?', (pid, cluster_id))
+        _prow = c.fetchone()
+        if not _prow:
             return jsonify({'error': 'not found'}), 404
+        if not _policy_targets_authorized(cluster_id, _row_to_policy(_prow)):
+            return jsonify({'error': "Permission denied: this policy's target VMs are outside your scope"}), 403
         c.execute('''SELECT * FROM snapshot_runs WHERE policy_id=?
                      ORDER BY started_at DESC LIMIT 50''', (pid,))
         return jsonify({'runs': [dict(r) for r in c.fetchall()]})

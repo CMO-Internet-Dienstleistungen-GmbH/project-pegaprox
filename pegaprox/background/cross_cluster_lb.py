@@ -165,7 +165,15 @@ def run_cross_cluster_balance_check(group):
         return
 
     # 6. find migration candidate on source
-    vm = hi_mgr.find_migration_candidate(source_node, source_node, include_containers=include_containers)
+    # sec/correctness (audit): this passed source_node as its OWN target. Two gates inside
+    # find_migration_candidate then evaluated against the node the guest is already on, so
+    # neither could ever refuse: a guest with a plb_pin tag matched its own node and got picked
+    # to be moved off the pin, and the "does the target have this storage" check asked our own
+    # cluster about our own node and always said yes. target_mgr sends the storage lookup to
+    # the cluster that will actually receive the guest.
+    vm = hi_mgr.find_migration_candidate(source_node, target_node,
+                                         include_containers=include_containers,
+                                         target_mgr=lo_mgr)
     if not vm:
         logger.info(f"[XCLB] No migration candidate on {hi_cid}/{source_node}")
         return

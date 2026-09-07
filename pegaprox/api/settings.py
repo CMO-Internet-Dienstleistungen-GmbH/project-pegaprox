@@ -28,7 +28,7 @@ from pegaprox.utils.audit import log_audit, get_client_ip
 from pegaprox.api.helpers import (
     load_server_settings, save_server_settings, check_cluster_access,
     get_login_settings, get_session_timeout, safe_error,
-    acme_dns_config_from_settings,
+    acme_dns_config_from_settings, require_unconfined,
 )
 from pegaprox.app import get_allowed_origins, add_allowed_origin
 from pegaprox.globals import _cors_origins_env, _auto_allowed_origins
@@ -2169,6 +2169,36 @@ def complete_acme_dns_challenge():
 # MK: AES-256-GCM with PBKDF2 key derivation
 # ============================================
 
+# Any field whose NAME says "secret" is one. Matching by shape rather than by an
+# enumerated list means a field added later is stripped by default instead of shipping
+# in a backup the operator believes carries no secrets.
+_SECRET_FIELD_MARKERS = ('password', 'passwd', 'secret', 'token', 'ssh_key', 'private_key',
+                         'api_key', 'apikey', 'credential')
+# Exact names that carry a secret but match no marker. `pass` is the important one: it is the
+# key get_all_clusters() decrypts the cluster's root password into (db.py:2884) and 'password'
+# is not a substring of it — the substring sweep alone shipped every cluster's root password
+# in an archive labelled "secrets excluded".
+_SECRET_FIELD_NAMES = ('pass', 'passphrase', 'pw', 'totp_secret', 'totp_pending_secret')
+_SECRET_FIELD_KEEP = ('token_prefix', 'token_name', 'api_token_name', 'api_token_user',
+                      'has_password',
+                      'has_token', 'has_ssh_key', 'password_expires_at',
+                      'password_changed_at', 'token_id')
+
+
+def _strip_secret_fields(d):
+    """Drop secret-bearing keys from a dict destined for an export."""
+    if not isinstance(d, dict):
+        return d
+    for k in list(d.keys()):
+        lk = str(k).lower()
+        if lk in _SECRET_FIELD_KEEP:
+            continue
+        if (lk in _SECRET_FIELD_NAMES or lk.endswith('_encrypted')
+                or any(m in lk for m in _SECRET_FIELD_MARKERS)):
+            d.pop(k, None)
+    return d
+
+
 @bp.route('/api/config/backup', methods=['POST'])
 
 @require_auth(roles=[ROLE_ADMIN])
@@ -2286,15 +2316,13 @@ def backup_config():
         clusters = database.get_all_clusters()
         if not include_secrets:
             # Remove passwords and keys - clusters is a dict: {'id': {data}}
+            # sec (audit): this popped GUESSED key names and get_all_clusters returns DECRYPTED
+            # values, so 'api_token_secret' (the name it actually uses) shipped in a backup
+            # labelled "secrets excluded" — the two api_token* pops matched nothing. Sweep by
+            # shape as well as by name so a newly added secret field can't slip through again.
             for cluster_id, cluster_data in clusters.items():
                 if isinstance(cluster_data, dict):
-                    cluster_data.pop('password_encrypted', None)
-                    cluster_data.pop('password', None)
-                    cluster_data.pop('pass', None)
-                    cluster_data.pop('ssh_key_encrypted', None)
-                    cluster_data.pop('ssh_key', None)
-                    cluster_data.pop('api_token_encrypted', None)
-                    cluster_data.pop('api_token', None)
+                    _strip_secret_fields(cluster_data)
         backup_data['clusters'] = clusters
         
         # Users (optional)
@@ -2302,12 +2330,12 @@ def backup_config():
             users_data = database.get_all_users()
             if not include_secrets:
                 # users_data is a dict: {'username': {data}}
-                for username, user_data in users_data.items():
+                for _uname, user_data in users_data.items():
                     if isinstance(user_data, dict):
+                        # same sweep — 'totp_pending_secret' (a live enrolment seed) was missed
+                        _strip_secret_fields(user_data)
                         user_data.pop('password_hash', None)
                         user_data.pop('password_salt', None)
-                        user_data.pop('totp_secret', None)
-                        user_data.pop('totp_secret_encrypted', None)
             backup_data['users'] = users_data
         
         # Tenants
@@ -2649,8 +2677,15 @@ def restore_config():
                     
                     if existing and mode == 'merge':
                         # Keep existing passwords if not in backup
-                        if not cluster.get('password_encrypted') and existing.get('password_encrypted'):
-                            cluster['password_encrypted'] = existing['password_encrypted']
+                        # sec (audit): this keyed off 'password_encrypted', which neither the
+                        # backup nor get_cluster() ever emits — the credential lives under 'pass'
+                        # (db.py:2884/2971) and save_cluster reads data.get('pass'). Dead as
+                        # written, and load-bearing now that a "secrets excluded" backup really
+                        # does omit them: without this a merge-restore encrypts '' over every
+                        # cluster password and SSH key.
+                        for _sk in ('pass', 'ssh_key', 'api_token_secret'):
+                            if not cluster.get(_sk) and existing.get(_sk):
+                                cluster[_sk] = existing[_sk]
                         if not cluster.get('ssh_key_encrypted') and existing.get('ssh_key_encrypted'):
                             cluster['ssh_key_encrypted'] = existing['ssh_key_encrypted']
                     
@@ -3171,7 +3206,37 @@ def get_cluster_audit_log_api(cluster_id):
         filtered.append(entry)
         if len(filtered) >= limit:
             break
-    
+
+    # sec (private disclosure Sep 2026 — audit): the cluster audit trail (co-tenants' usernames,
+    # source IPs, actions) was returned to any cluster-reaching caller. Confine a pool-/ACL-scoped
+    # caller to entries that reference a VM they can access; admins and plain cluster-wide operators
+    # keep the full log (mirrors the /clusters/<id>/tasks confinement). vmids are detected from the
+    # entry's free-text details with the same patterns the ?vmid filter above uses.
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import (get_user_clusters as _guc, user_has_any_pool_access as _uhpa,
+                                     get_user_pool_vmids as _gupv, get_vm_acls as _gva)
+    _au = build_authz_user(request.session.get('user', ''), request.session)
+    if True:
+        from pegaprox.api.helpers import caller_is_scoped
+        if caller_is_scoped(_au, cluster_id):
+            _acc = set(_gupv(_au, cluster_id) or [])
+            for _v, _a in (_gva().get(cluster_id, {}) or {}).items():
+                if _au.get('username') in (_a.get('users') or []) and str(_v).lstrip('-').isdigit():
+                    _acc.add(int(_v))
+
+            def _mentions_accessible(_d):
+                for _vid in _acc:
+                    s = str(_vid)
+                    for p in (f"VM {s} ", f"VM {s}-", f"VM {s})", f"CT {s} ", f"CT {s}-", f"CT {s})",
+                              f"QEMU {s} ", f"LXC {s} ", f"/{s} ", f"/{s})", f"qemu/{s}", f"lxc/{s}"):
+                        if p in _d:
+                            return True
+                    if _d.endswith((f"VM {s}", f"CT {s}", f"QEMU {s}", f"LXC {s}")):
+                        return True
+                return False
+
+            filtered = [e for e in filtered if _mentions_accessible(e.get('details', ''))]
+
     return jsonify(filtered)
 
 
@@ -3621,11 +3686,30 @@ def generate_support_bundle():
                 settings = load_server_settings()
                 safe_settings = {}
                 sensitive_keys = ['smtp_password', 'ssl_key', 'password', 'secret', 'token', 'api_key']
+
+                def _redact(value):
+                    # sec (audit): the old pass matched TOP-LEVEL key names only, so
+                    # 'alert_webhooks' — a list of dicts each holding a raw webhook url and
+                    # token — matched nothing and went into the bundle verbatim. Support
+                    # bundles get emailed to third parties, so recurse.
+                    if isinstance(value, dict):
+                        return {k: ('[REDACTED]' if v and any(s in str(k).lower() for s in sensitive_keys)
+                                    else _redact(v))
+                                for k, v in value.items()}
+                    if isinstance(value, list):
+                        return [_redact(v) for v in value]
+                    return value
+
+                from pegaprox.api.alerts import _mask_channel
                 for key, value in settings.items():
-                    if any(s in key.lower() for s in sensitive_keys):
+                    if key == 'alert_webhooks' and isinstance(value, list):
+                        # keep id/name/type/enabled for diagnostics, mask the bearer bits
+                        safe_settings[key] = [_mask_channel(c) if isinstance(c, dict) else c
+                                              for c in value]
+                    elif any(s in key.lower() for s in sensitive_keys):
                         safe_settings[key] = '[REDACTED]' if value else ''
                     else:
-                        safe_settings[key] = value
+                        safe_settings[key] = _redact(value)
                 zf.writestr(f"{bundle_prefix}/server_settings.json", json.dumps(safe_settings, indent=2))
             except Exception as e:
                 zf.writestr(f"{bundle_prefix}/server_settings_error.txt", f"Failed: {str(e)}")
@@ -3764,7 +3848,7 @@ def generate_support_bundle():
             # 11. Recent Tasks
             try:
                 recent_tasks = []
-                for cluster_id, mgr in cluster_managers.items():
+                for cluster_id, mgr in list(cluster_managers.items()):
                     if mgr.is_connected:
                         try:
                             tasks = mgr.get_tasks(limit=50)
@@ -3874,6 +3958,9 @@ def check_cluster_updates(cluster_id):
     """Check for updates on all nodes in the cluster"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -3974,7 +4061,7 @@ def check_cluster_updates(cluster_id):
     # and still shows everywhere (no breaking change for existing setups).
     pbs_results = {}
     try:
-        for pid, pmgr in pbs_managers.items():
+        for pid, pmgr in list(pbs_managers.items()):
             if not pmgr.connected:
                 continue
             linked = getattr(pmgr, 'linked_clusters', None) or []
@@ -4054,6 +4141,17 @@ def get_cluster_update_status(cluster_id):
             mgr._rolling_update = None
             rolling_update = None
     
+    # sec (audit): the evacuation log names each VM that failed to migrate ("✗ Failed: <name>
+    # (VMID: n)"), and node.view is a default viewer perm reached through the pool/ACL fallbacks.
+    # A confined caller gets the progress but not the per-guest lines.
+    if rolling_update:
+        from pegaprox.utils.auth import build_authz_user
+        from pegaprox.api.helpers import caller_is_scoped
+        if caller_is_scoped(build_authz_user(request.session.get('user', ''), request.session),
+                            cluster_id):
+            rolling_update = {k: v for k, v in rolling_update.items()
+                              if k not in ('logs', 'paused_details')}
+
     return jsonify({
         'success': True,
         'rolling_update': rolling_update,
@@ -4156,6 +4254,9 @@ def start_rolling_update(cluster_id):
     """
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -4758,6 +4859,9 @@ def cancel_rolling_update(cluster_id):
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
@@ -4788,6 +4892,9 @@ def resume_rolling_update(cluster_id):
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     manager = cluster_managers[cluster_id]
@@ -4809,6 +4916,9 @@ def clear_rolling_update_status(cluster_id):
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
@@ -5060,6 +5170,9 @@ def update_node_repo(cluster_id, node, repo_id):
     """
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -5183,6 +5296,9 @@ def refresh_node_repos(cluster_id, node):
     """Run apt update on a node to refresh package lists"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404

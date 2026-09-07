@@ -17,7 +17,7 @@ from pegaprox.core.db import get_db
 from pegaprox.utils.auth import require_auth, load_users, build_authz_user
 from pegaprox.utils.rbac import has_permission
 from pegaprox.utils.audit import log_audit
-from pegaprox.api.helpers import check_cluster_access, safe_error
+from pegaprox.api.helpers import check_cluster_access, safe_error, require_unconfined
 from pegaprox.api.nodes import cleanup_deleted_scripts, cleanup_orphaned_excluded_vms
 
 bp = Blueprint('schedules', __name__)
@@ -93,6 +93,29 @@ def load_schedules():
     return {'actions': [], 'last_id': 0}
 
 
+def _record_action_run(action_id, last_run, disable=False):
+    """Record one action's run without rewriting the table around it.
+
+    The tick used to reload every row, execute (which blocks on the cluster API for as long as
+    a VM takes to start or stop), then hand the whole pre-tick snapshot to save_schedules —
+    which is a DELETE followed by a re-INSERT. So a schedule an operator added during that
+    window disappeared, and one they deleted came back and kept firing. Same shape, and the
+    same fix, as _touch_last_run in background/scheduler.py."""
+    if not action_id:
+        return
+    try:
+        db = get_db()
+        if disable:
+            db.conn.execute('UPDATE scheduled_actions SET last_run = ?, enabled = 0 WHERE id = ?',
+                            (last_run, action_id))
+        else:
+            db.conn.execute('UPDATE scheduled_actions SET last_run = ? WHERE id = ?',
+                            (last_run, action_id))
+        db.conn.commit()
+    except Exception as e:
+        logging.error(f"Failed to record run for scheduled action {action_id}: {e}")
+
+
 def save_schedules(schedules):
     """Save scheduled actions to SQLite database
     
@@ -151,8 +174,6 @@ def check_schedules():
             current_day = now.strftime('%A').lower()
             current_date = now.strftime('%Y-%m-%d')
             
-            modified = False
-            
             for action in schedules.get('actions', []):
                 if not action.get('enabled', True):
                     continue
@@ -168,7 +189,6 @@ def check_schedules():
                         if action.get('date') == current_date:
                             should_run = True
                             action['enabled'] = False  # Disable after running
-                            modified = True
                     
                     elif schedule_type == 'daily':
                         should_run = True
@@ -196,11 +216,8 @@ def check_schedules():
                     # Execute the action
                     execute_scheduled_action(action)
                     action['last_run'] = f"{current_date} {current_time}"
-                    action['run_count'] = action.get('run_count', 0) + 1
-                    modified = True
-            
-            if modified:
-                save_schedules(schedules)
+                    _record_action_run(action.get('id'), action['last_run'],
+                                       disable=not action.get('enabled', True))
             
             # MK: Check for scheduled rolling updates
             try:
@@ -521,23 +538,39 @@ def get_schedules():
     schedules = load_schedules()
     
     user = request.session.get('user', '')
-    users_db = load_users()
-    user_data = users_db.get(user, {})
-    is_admin = user_data.get('role') == ROLE_ADMIN
+    from pegaprox.utils.auth import build_authz_user
+    # sec (audit): the raw stored record skips API-token effective_role flooring, so an
+    # admin-owned viewer token hit the all-clusters early return below and read every
+    # scheduled action in the install.
+    user_data = build_authz_user(user, request.session)
+    is_admin = user_data.get('effective_role', user_data.get('role')) == ROLE_ADMIN
 
     # NS Jul 2026 (CodeAnt IDOR) — use the real access model. The old filter read the raw
     # user_data['clusters'] field and FELL OPEN (`if not user_clusters` -> returned every tenant's
     # schedules) when it was empty. get_user_clusters returns None only for a genuine admin/
     # default-tenant all-cluster user; otherwise it's the caller's reachable cluster set.
-    from pegaprox.utils.rbac import get_user_clusters
+    from pegaprox.utils.rbac import get_user_clusters, user_can_access_vm
     _ud = dict(user_data)
     _ud['username'] = user
     allowed = get_user_clusters(_ud)
     if is_admin or allowed is None:
         return jsonify(schedules.get('actions', []))
 
-    filtered = [a for a in schedules.get('actions', []) if a.get('cluster_id') in allowed]
-    return jsonify(filtered)
+    # sec (private disclosure Sep 2026 — audit M6): the cluster filter alone let a pool-/ACL-scoped
+    # caller read per-VM schedule rows (incl. other users' created_by) for every VM on a reachable
+    # cluster. The create/update paths already gate per-VM via user_can_access_vm; gate the LIST too.
+    # Plain operators keep every action on their clusters (user_can_access_vm returns True for them).
+    authz = _ud
+    out = []
+    for a in schedules.get('actions', []):
+        if a.get('cluster_id') not in allowed:
+            continue
+        try:
+            if user_can_access_vm(authz, a['cluster_id'], int(a.get('vmid')), 'vm.view', a.get('vm_type')):
+                out.append(a)
+        except (TypeError, ValueError):
+            continue   # malformed / non-VM action → drop from a scoped listing (fail closed)
+    return jsonify(out)
 
 
 @bp.route('/api/schedules', methods=['POST'])
@@ -681,8 +714,20 @@ def update_schedule(schedule_id):
         return jsonify({'error': 'vmid must be a number'}), 400
     from pegaprox.utils.auth import build_authz_user
     from pegaprox.utils.rbac import user_can_access_vm
-    if not user_can_access_vm(build_authz_user(request.session.get('user', ''), request.session),
-                              schedule.get('cluster_id', ''), _uv,
+    _authz = build_authz_user(request.session.get('user', ''), request.session)
+    _cid = schedule.get('cluster_id', '')
+    # sec (audit): only the NEW target was authorized, so a caller who owns ANY VM on the cluster
+    # could point someone else's schedule at their own VM — silently destroying the stored action
+    # while the row kept the victim's created_by. Authorize the STORED target first.
+    try:
+        _stored_vmid = int(schedule.get('vmid'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Schedule has no valid target'}), 403
+    if not user_can_access_vm(_authz, _cid, _stored_vmid,
+                              _perm_for_action(schedule.get('action', 'start')),
+                              schedule.get('vm_type', 'qemu')):
+        return jsonify({'error': 'Permission denied for this VM'}), 403
+    if not user_can_access_vm(_authz, _cid, _uv,
                               _perm_for_action(data.get('action', schedule.get('action', 'start'))),
                               data.get('vm_type', schedule.get('vm_type', 'qemu'))):
         return jsonify({'error': 'Permission denied for this VM'}), 403
@@ -740,8 +785,20 @@ def delete_schedule(schedule_id):
     if perm_err:
         return perm_err
 
+    # sec (private disclosure Sep 2026 — audit): create/update gate the target VM per-object; delete
+    # did not, so a co-tenant could delete another tenant's scheduled action by its enumerable id.
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import user_can_access_vm
+    try:
+        if not user_can_access_vm(build_authz_user(request.session.get('user', ''), request.session),
+                                  schedule.get('cluster_id', ''), int(schedule.get('vmid')),
+                                  _perm_for_action(schedule.get('action', 'start')), schedule.get('vm_type')):
+            return jsonify({'error': 'Access denied to this VM'}), 403
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Invalid schedule target'}), 400
+
     schedules['actions'] = [s for s in schedules.get('actions', []) if s.get('id') != schedule_id]
-    
+
     save_schedules(schedules)
     
     log_audit(request.session.get('user', 'system'), 'schedule.deleted', 
@@ -913,11 +970,20 @@ def get_update_schedule(cluster_id):
 
 
 @bp.route('/api/clusters/<cluster_id>/updates/schedule', methods=['POST'])
-@require_auth(perms=['backup.schedule'])
+# sec (audit): was backup.schedule — but this schedules a ROLLING NODE UPDATE (evacuate every VM,
+# apt upgrade, reboot each node), not a backup. node.update is the perm the manual rolling-update
+# routes already use (settings.py). A role delegated "may schedule backups" must not also be able
+# to schedule a cluster-wide reboot.
+@require_auth(perms=['node.update'])
 def set_update_schedule(cluster_id):
     """Set the scheduled update configuration for a cluster"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    # sec (audit): the DELETE twin below got this gate in the sweep and the POST — the one that
+    # ARMS a cluster-wide evacuate-and-reboot — did not.
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -954,11 +1020,14 @@ def set_update_schedule(cluster_id):
 
 
 @bp.route('/api/clusters/<cluster_id>/updates/schedule', methods=['DELETE'])
-@require_auth(perms=['backup.schedule'])
+@require_auth(perms=['node.update'])
 def delete_update_schedule(cluster_id):
     """Delete/disable the scheduled update for a cluster"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404

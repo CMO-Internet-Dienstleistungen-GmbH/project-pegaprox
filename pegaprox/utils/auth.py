@@ -398,6 +398,22 @@ def _load_users_legacy() -> dict:
     return {}
 
 
+def save_single_user(username: str, data: dict):
+    """Persist ONE account.
+
+    sec/correctness (audit): every auth handler did `users_db = load_users()` (a full snapshot),
+    mutated one entry and then `save_users(users_db)` — writing the whole table back. Two
+    concurrent requests each hold a snapshot taken before the other's write, so the second
+    save silently reverts the first: a password change can undo a role change, a 2FA enrolment
+    can undo an account creation. Under gevent the password hashing in between is a generous
+    window. Handlers that touch a single account use this instead.
+    """
+    try:
+        get_db().save_user(username, data)
+    except Exception as e:
+        logging.error(f"save failed for '{username}': {e}")
+
+
 def save_users(users: dict):
     """save users to db"""
     try:
@@ -706,6 +722,33 @@ def create_api_token(username: str, token_name: str, role: str = None,
     # non-admins can't create admin tokens at all
     if role == ROLE_ADMIN and user.get('role') != ROLE_ADMIN:
         return {'error': 'Only admins can create admin tokens'}
+    # sec (audit): the numeric hierarchy above scores EVERY custom role as level 2, so a plain
+    # ROLE_USER (also 2) passed the check for any custom role name — and build_authz_user keeps a
+    # non-builtin token role verbatim, so the token then resolved that role's permissions. Role
+    # names are discoverable (GET /api/roles has no perm), which made this a self-service upgrade.
+    # Compare the actual permission sets instead: a token may never carry a permission its owner
+    # lacks. Admins hold everything, so their custom-role tokens are unaffected.
+    if role not in role_hierarchy:
+        try:
+            from pegaprox.utils.rbac import (get_user_permissions,
+                                              get_role_permissions_for_user, DEFAULT_TENANT_ID)
+            _owner = dict(user, username=username)
+            # Resolve BOTH sides in the owner's tenant. get_role_permissions_for_user only
+            # consults tenant custom roles when it is given a tenant_id (rbac.py:161) — calling
+            # it without one fell through to the viewer fallback, so _extra came out empty and
+            # this guard passed every TENANT custom role: exactly the case it was written to
+            # catch. Request time resolves the same role WITH the tenant, so the token then
+            # carried the elevated set.
+            _tid = _owner.get('tenant_id') or DEFAULT_TENANT_ID
+            _owner_perms = set(get_user_permissions(_owner, _tid))
+            _token_perms = set(get_role_permissions_for_user(dict(_owner, role=role), _tid))
+            _extra = _token_perms - _owner_perms
+            if _extra:
+                return {'error': 'Cannot create token with permissions beyond your own role: '
+                                 + ', '.join(sorted(_extra)[:5])}
+        except Exception as _e:
+            logging.warning(f"[APIToken] custom-role scope check failed for '{username}': {_e}")
+            return {'error': 'Cannot verify token role permissions'}
     
     token, token_hash, prefix = generate_api_token()
     
@@ -738,6 +781,26 @@ def create_api_token(username: str, token_name: str, role: str = None,
     except Exception as e:
         logging.error(f"[APIToken] Failed to create token: {e}")
         return {'error': str(e)}
+
+
+def revoke_user_api_tokens(username: str) -> int:
+    """Revoke ALL of a user's API tokens. sec (private disclosure Sep 2026 — audit): a password
+    change / admin reset already invalidates the user's sessions but NOT their pgx_ tokens, so an
+    exfiltrated token survived the standard 'lock the intruder out' action. Called alongside
+    invalidate_all_user_sessions. Returns the number of tokens removed."""
+    try:
+        ensure_api_tokens_table()
+        db = get_db()
+        cur = db.conn.cursor()
+        cur.execute('DELETE FROM api_tokens WHERE username = ?', (username,))
+        db.conn.commit()
+        n = cur.rowcount or 0
+        if n:
+            logging.info(f"[APIToken] Revoked {n} token(s) for '{username}' on credential change")
+        return n
+    except Exception as e:
+        logging.error(f"[APIToken] Failed to revoke tokens for '{username}': {e}")
+        return 0
 
 
 def validate_api_token(token: str) -> dict:
@@ -984,6 +1047,21 @@ def require_auth(roles: list = None, perms: list = None):
                         return jsonify({'error': 'Permission denied', 'code': 'MISSING_PERMISSION', 'required': p}), 403
             
             # Add session info to request context
+            # sec (audit): publish the floored role here. Several routes gate on
+            # `session.get('effective_role', session.get('role'))` — for token auth session['role']
+            # is deliberately left at the token's declared value (audit/logging), so without this
+            # every one of those guards read a stale role and silently did nothing. fresh_role is
+            # already min(token, owner) for tokens and the DB-refreshed role for sessions.
+            # A non-builtin (custom) token role keeps its NAME here, matching build_authz_user
+            # (auth.py:334) — collapsing it to a builtin level would make the two disagree about
+            # the same request, and it is the name that lets get_user_clusters do the
+            # custom-role -> tenant remap.
+            _eff_pub = fresh_role
+            if session.get('api_token'):
+                _tr = session.get('role')
+                if _tr and _tr not in (ROLE_ADMIN, ROLE_USER, ROLE_VIEWER):
+                    _eff_pub = _tr
+            session = {**session, 'effective_role': _eff_pub}
             request.session = session
             
             return f(*args, **kwargs)

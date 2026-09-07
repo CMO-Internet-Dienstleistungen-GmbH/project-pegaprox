@@ -32,7 +32,7 @@ from flask import Blueprint, jsonify, request
 
 from pegaprox.globals import cluster_managers
 from pegaprox.utils.auth import require_auth
-from pegaprox.api.helpers import check_cluster_access
+from pegaprox.api.helpers import check_cluster_access, scope_vm_rows
 from pegaprox.core.db import get_db
 
 bp = Blueprint('templates_lib', __name__)
@@ -592,7 +592,8 @@ def deployments(cluster_id):
             ORDER BY started_at DESC LIMIT 50
         ''', (cluster_id,))
         rows = [dict(r) for r in c.fetchall()]
-        return jsonify({'deployments': rows})
+        # sec (audit): deployment rows carry vmid + started_by — scope per-VM like templates/existing
+        return jsonify({'deployments': scope_vm_rows(cluster_id, rows)})
     except Exception as e:
         logging.exception('handler error in templates_lib.py'); return jsonify({'error': 'internal error'}), 500
 
@@ -630,9 +631,11 @@ def existing_templates(cluster_id):
     mgr = cluster_managers[cluster_id]
     out = []
     try:
-        for r in (mgr.get_vm_resources() or []):
-            if r.get('type') != 'qemu': continue
-            if r.get('template') != 1: continue
+        # sec (private disclosure Sep 2026 — audit M4): scope templates to the caller's grant so a
+        # pool-/ACL-scoped user can't enumerate every template VM on the cluster.
+        _templates = [r for r in (mgr.get_vm_resources() or [])
+                      if r.get('type') == 'qemu' and r.get('template') == 1]
+        for r in scope_vm_rows(cluster_id, _templates):
             out.append({
                 'vmid': r.get('vmid'),
                 'name': r.get('name'),

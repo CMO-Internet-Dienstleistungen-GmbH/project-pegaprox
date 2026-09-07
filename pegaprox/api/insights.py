@@ -19,7 +19,7 @@ from flask import Blueprint, jsonify, request
 
 from pegaprox.globals import cluster_managers
 from pegaprox.utils.auth import require_auth
-from pegaprox.api.helpers import check_cluster_access, safe_error, load_metrics_window
+from pegaprox.api.helpers import check_cluster_access, safe_error, load_metrics_window, scope_vm_rows
 from pegaprox.core.db import get_db
 
 bp = Blueprint('insights', __name__)
@@ -394,7 +394,9 @@ def rollups(cluster_id):
     if not mgr.is_connected:
         return jsonify({'error': 'Cluster not connected', 'offline': True}), 503
 
-    vms = mgr.get_vm_resources() or []
+    # sec (private disclosure Sep 2026 — audit M5): scope before aggregating so a pool-/ACL-scoped
+    # caller's per-pool/per-tag rollups reflect only their VMs, not the whole cluster's totals/names.
+    vms = scope_vm_rows(cluster_id, mgr.get_vm_resources() or [])
     only_running = (request.args.get('status') or 'all').lower() == 'running'
     if only_running:
         vms = [v for v in vms if v.get('status') == 'running']
@@ -678,9 +680,15 @@ def force_snapshot():
         from pegaprox.background.metrics import collect_metrics_snapshot, save_metrics_snapshot
         snap = collect_metrics_snapshot()
         save_metrics_snapshot(snap)
-        # mini-summary
+        # mini-summary — sec (private disclosure Sep 2026 — audit): the summary leaked every cluster's
+        # name + VM/storage/node counts to a cluster-scoped admin.api holder. Confine to their clusters.
+        from pegaprox.utils.auth import build_authz_user
+        from pegaprox.utils.rbac import get_user_clusters as _guc
+        _allowed = _guc(build_authz_user(request.session.get('user', ''), request.session))
         out = {'ok': True, 'clusters': {}}
         for cid, cd in (snap.get('clusters') or {}).items():
+            if _allowed is not None and cid not in _allowed:
+                continue
             out['clusters'][cid] = {
                 'name': cd.get('name'),
                 'vms_sampled': len(cd.get('vms') or {}),

@@ -28,6 +28,17 @@ def _load_config():
         return {"allowed_actions": ["vm.view", "vm.start", "vm.stop", "vm.console"]}
 
 
+def _portal_user(username):
+    """The acting user for authz checks.
+
+    Always build this with build_authz_user rather than a raw load_users() lookup: the stored
+    record carries no effective_role, so an admin-owned but viewer-scoped API token would reach
+    user_can_access_vm with its owner's admin role and short-circuit the per-VM gate.
+    """
+    from pegaprox.utils.auth import build_authz_user
+    return build_authz_user(username, request.session)
+
+
 def _get_portal_config():
     """Return portal configuration (public, no secrets)"""
     cfg = _load_config()
@@ -57,13 +68,12 @@ def _get_my_vms():
     if not username:
         return {'error': 'Not authenticated'}, 401
 
-    users = load_users()
-    user = users.get(username, {})
+    user = _portal_user(username)
     user['username'] = username
 
     # don't let admins use the portal — redirect them
     from pegaprox.models.permissions import ROLE_ADMIN
-    if user.get('role') == ROLE_ADMIN:
+    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
         return {'redirect': '/', 'reason': 'admin'}
 
     cfg = _load_config()
@@ -238,8 +248,7 @@ def _vm_power():
 def _vm_console():
     """Get VNC console ticket + WS token for embedded noVNC"""
     username = request.session.get('user', '')
-    users = load_users()
-    user = users.get(username, {})
+    user = _portal_user(username)
     user['username'] = username
     cfg = _load_config()
 
@@ -268,7 +277,11 @@ def _vm_console():
         result = mgr.get_vnc_ticket(vm.get('node'), int(vmid), vm.get('type', 'qemu'))
         if result.get('success'):
             from pegaprox.utils.realtime import create_ws_token
-            ws_token = create_ws_token(username, user.get('role', 'viewer'))
+            # sec (audit): mint at the caller's EFFECTIVE role. Using the stored role handed an
+            # admin-owned viewer token a ws_token stamped 'admin', and the ws-token validate path
+            # floors its gates by exactly that stamp — so the ceiling was defeated at the source.
+            ws_token = create_ws_token(username,
+                                       user.get('effective_role', user.get('role', 'viewer')))
             result['ws_token'] = ws_token
             from pegaprox.utils.audit import log_audit
             log_audit(username, 'vm.console', f'Portal: VNC console opened for VM {vmid}', cluster=mgr.config.name)
@@ -281,8 +294,7 @@ def _vm_console():
 def _vm_snapshots():
     """List or create snapshots for a VM"""
     username = request.session.get('user', '')
-    users = load_users()
-    user = users.get(username, {})
+    user = _portal_user(username)
     user['username'] = username
     cfg = _load_config()
 
@@ -363,8 +375,7 @@ def _vm_snapshots():
 def _vm_snapshot_rollback():
     """Rollback VM to a snapshot"""
     username = request.session.get('user', '')
-    users = load_users()
-    user = users.get(username, {})
+    user = _portal_user(username)
     user['username'] = username
     cfg = _load_config()
 
@@ -396,6 +407,8 @@ def _vm_snapshot_rollback():
         node = vm.get('node')
         vm_type = vm.get('type', 'qemu')
 
+        if not _valid_snapshot_name(snapname):
+            return {'error': 'Invalid snapshot name'}
         result = mgr.rollback_snapshot(node, int(vmid), vm_type, snapname)
         if result.get('success'):
             from pegaprox.utils.audit import log_audit
@@ -409,8 +422,7 @@ def _vm_snapshot_rollback():
 def _vm_snapshot_delete():
     """Delete a snapshot"""
     username = request.session.get('user', '')
-    users = load_users()
-    user = users.get(username, {})
+    user = _portal_user(username)
     user['username'] = username
     cfg = _load_config()
 
@@ -443,6 +455,8 @@ def _vm_snapshot_delete():
         node = vm.get('node')
         vm_type = vm.get('type', 'qemu')
 
+        if not _valid_snapshot_name(snapname):
+            return {'error': 'Invalid snapshot name'}
         resp = mgr._api_delete(
             f"https://{host}:8006/api2/json/nodes/{node}/{vm_type}/{vmid}/snapshot/{snapname}"
         )
@@ -453,6 +467,16 @@ def _vm_snapshot_delete():
         return {'error': f'Delete failed: {resp.text[:100]}'}
     except Exception as e:
         return {'error': str(e)}
+
+
+def _valid_snapshot_name(name):
+    """sec (audit): the portal interpolated the snapshot name straight into the PVE API path
+    (.../{vmid}/snapshot/{snapname}), while the authz gate above it only validated the vmid — so
+    a name carrying path separators or dot-segments reached a DIFFERENT guest's endpoint, or a
+    different endpoint entirely. The dashboard turned out to have the same hole, so the rule
+    moved to utils.sanitization and the manager sinks enforce it for everyone."""
+    from pegaprox.utils.sanitization import validate_snapshot_name
+    return validate_snapshot_name(name)
 
 
 def _change_password():
@@ -469,9 +493,8 @@ def _change_password():
     if not current or not new_pwd:
         return {'error': 'Current and new password required'}
 
-    from pegaprox.utils.auth import verify_password, hash_password, save_users
-    users = load_users()
-    user = users.get(username, {})
+    from pegaprox.utils.auth import verify_password, hash_password, save_single_user
+    user = _portal_user(username)
 
     if user.get('auth_source', 'local') != 'local':
         return {'error': 'Password managed by external provider'}
@@ -485,7 +508,11 @@ def _change_password():
 
     from datetime import datetime
     user['password_changed_at'] = datetime.now().isoformat()
-    save_users(users)
+    # regression fix (audit): the identity rewrite in this campaign removed the `users =
+    # load_users()` binding but left `save_users(users)` here, so this route raised NameError
+    # and the portal password change was dead — the hash was never written and the session
+    # revocation below never ran. Single-row write, same as api/auth.py uses.
+    save_single_user(username, user)
 
     # NS Aug 2026 (Aikido pentest) — a password change must revoke the user's other live
     # sessions (matches the main dashboard's behaviour, users.py). Keep the current portal
@@ -553,8 +580,17 @@ def _mount_iso():
         return {'error': 'cluster_id, vmid, iso required'}, 400
 
     # check VM access
-    if not user_can_access_vm(username, cluster_id, vmid):
-        return {'error': 'Access denied'}, 403
+    # fix (audit): user_can_access_vm takes the user DICT — passing the username string made
+    # its first `user.get(...)` raise AttributeError, so mounting an ISO from the portal has
+    # always 500'd. Build the identity the same way every other handler here does, and gate on
+    # vm.config: attaching a CD-ROM is a config change, not a read.
+    from pegaprox.utils.auth import build_authz_user as _bau
+    _iso_user = _bau(username, request.session)
+    try:
+        if not user_can_access_vm(_iso_user, cluster_id, int(vmid), 'vm.config'):
+            return {'error': 'Access denied'}, 403
+    except (TypeError, ValueError):
+        return {'error': 'vmid must be a number'}, 400
 
     # MK: security audit — verify ISO is in explicit allowed list or allowed storage
     cfg = _load_config()
@@ -604,8 +640,14 @@ def _unmount_iso():
 
     if not all([cluster_id, vmid]):
         return {'error': 'cluster_id, vmid required'}, 400
-    if not user_can_access_vm(username, cluster_id, vmid):
-        return {'error': 'Access denied'}, 403
+    # same defect as _mount_iso — a username string where a user dict belongs
+    from pegaprox.utils.auth import build_authz_user as _bau
+    _iso_user = _bau(username, request.session)
+    try:
+        if not user_can_access_vm(_iso_user, cluster_id, int(vmid), 'vm.config'):
+            return {'error': 'Access denied'}, 403
+    except (TypeError, ValueError):
+        return {'error': 'vmid must be a number'}, 400
 
     mgr = cluster_managers.get(cluster_id)
     if not mgr or not mgr.is_connected:
@@ -634,8 +676,7 @@ def _portal_snapshot_policies():
     caller has access to (via VM-ACL / pool / tenant). NS May 2026."""
     from pegaprox.core.db import get_db
     username = request.session.get('user', '')
-    users = load_users()
-    user = users.get(username, {})
+    user = _portal_user(username)
     user['username'] = username
 
     # collect (cluster_id, vmid, tags) the caller can reach via _get_my_vms logic
@@ -687,9 +728,9 @@ def _ct_create_options():
     username = request.session.get('user', '')
     if not username:
         return {'error': 'Not authenticated'}, 401
-    users = load_users(); user = users.get(username, {}); user['username'] = username
+    user = _portal_user(username)
     from pegaprox.models.permissions import ROLE_ADMIN
-    if user.get('role') == ROLE_ADMIN:
+    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
         return {'redirect': '/', 'reason': 'admin'}
     cfg = _load_config(); cc = cfg.get('ct_create') or {}
     enabled = bool(cfg.get('allow_ct_create')) and bool(cc.get('cluster_id')) and bool(cc.get('node'))
@@ -723,9 +764,9 @@ def _create_ct():
     username = request.session.get('user', '')
     if not username:
         return {'error': 'Not authenticated'}, 401
-    users = load_users(); user = users.get(username, {}); user['username'] = username
+    user = _portal_user(username)
     from pegaprox.models.permissions import ROLE_ADMIN
-    if user.get('role') == ROLE_ADMIN:
+    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
         return {'redirect': '/', 'reason': 'admin'}
 
     cfg = _load_config(); cc = cfg.get('ct_create') or {}
@@ -805,9 +846,9 @@ def _destroy_options():
     username = request.session.get('user', '')
     if not username:
         return {'error': 'Not authenticated'}, 401
-    users = load_users(); user = users.get(username, {}); user['username'] = username
+    user = _portal_user(username)
     from pegaprox.models.permissions import ROLE_ADMIN
-    if user.get('role') == ROLE_ADMIN:
+    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
         return {'redirect': '/', 'reason': 'admin'}
     cfg = _load_config()
     return {'enabled': bool(cfg.get('allow_destroy'))}
@@ -831,9 +872,9 @@ def _destroy_guest():
     username = request.session.get('user', '')
     if not username:
         return {'error': 'Not authenticated'}, 401
-    users = load_users(); user = users.get(username, {}); user['username'] = username
+    user = _portal_user(username)
     from pegaprox.models.permissions import ROLE_ADMIN
-    if user.get('role') == ROLE_ADMIN:
+    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
         return {'redirect': '/', 'reason': 'admin'}
 
     cfg = _load_config()

@@ -7409,7 +7409,7 @@
                                         <h2 className="text-3xl font-bold text-white">PegaProx</h2>
                                         <p className="text-xl text-proxmox-orange mt-1">{PEGAPROX_VERSION}</p>
                                         <p className="text-sm text-gray-400 mt-2">Multi-Cluster Proxmox Management</p>
-                                        <p className="text-xs text-gray-500 mt-1">Build 2026.02 • © 2025-2026 PegaProx Team</p>
+                                        <p className="text-xs text-gray-500 mt-1">© 2025-2026 PegaProx Team</p>
                                     </div>
                                     
                                     {/* Team */}
@@ -7596,11 +7596,42 @@
                                         </div>
                                     </div>
 
-                                    {/* License */}
-                                    <div className="text-center text-sm text-gray-500 space-y-1">
-                                        <p>PegaProx is open source software licensed under the AGPL-3.0 License.</p>
-                                        <p>Made with ❤️ in Austria and Germany</p>
-                                        <p>© 2025-2026 PegaProx Team</p>
+                                    {/* REQUIRED LEGAL NOTICE — do not remove, hide, disable or alter.
+                                        This is the full "Appropriate Legal Notices" block the short
+                                        LegalNotice line throughout the UI points at: copyright, the
+                                        absence of warranty, the right to convey under this License,
+                                        how to read it, and the §13 source offer. Together with the
+                                        NOTICE file at the repository root it is a required author
+                                        attribution under AGPL-3.0 §7(b). English on purpose — it
+                                        refers to an English-language license. NS Sep 2026 */}
+                                    <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-6 text-sm text-gray-400 space-y-3">
+                                        <p className="text-gray-300 font-medium">© 2025-2026 PegaProx Team</p>
+                                        <p>
+                                            PegaProx is free software: you can redistribute it and/or modify it
+                                            under the terms of the GNU Affero General Public License, version 3,
+                                            as published by the Free Software Foundation.{' '}
+                                            <a href="https://github.com/PegaProx/project-pegaprox/blob/main/LICENSE"
+                                                target="_blank" rel="noopener noreferrer"
+                                                className="text-proxmox-orange hover:underline">Read the license</a>.
+                                        </p>
+                                        <p>
+                                            This program is distributed in the hope that it will be useful, but
+                                            WITHOUT ANY WARRANTY — without even the implied warranty of
+                                            MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the license
+                                            for details.
+                                        </p>
+                                        <p>
+                                            If you run a modified version of PegaProx and make it available to
+                                            users over a network, section 13 of the license requires you to offer
+                                            those users the complete source of your modified version.{' '}
+                                            <a href="https://github.com/PegaProx/project-pegaprox"
+                                                target="_blank" rel="noopener noreferrer"
+                                                className="text-proxmox-orange hover:underline">Source code</a>{' · '}
+                                            <a href="https://github.com/PegaProx/project-pegaprox/blob/main/NOTICE"
+                                                target="_blank" rel="noopener noreferrer"
+                                                className="text-proxmox-orange hover:underline">NOTICE</a>
+                                        </p>
+                                        <p className="text-center text-gray-500 pt-1">Made with ❤️ in Austria and Germany</p>
                                     </div>
                                 </div>
                             )}

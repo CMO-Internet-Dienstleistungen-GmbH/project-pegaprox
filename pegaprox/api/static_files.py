@@ -31,12 +31,28 @@ bp = Blueprint('static_files', __name__)
 # Create, edit, delete pools and manage pool members directly from PegaProx
 # ============================================================================
 
+def _pool_write_denied(cluster_id):
+    """Pool create/update is grant-level: a pool's membership is what user_can_access_vm reads."""
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.api.helpers import caller_is_scoped
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    if caller_is_scoped(user, cluster_id):
+        return jsonify({'error': 'Access denied: you cannot manage pools on this cluster'}), 403
+    return None
+
+
 @bp.route('/api/clusters/<cluster_id>/pools', methods=['POST'])
 @require_auth(perms=['admin.users'])
 def create_pool(cluster_id):
     """Create a new resource pool in Proxmox"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    # sec (audit): duplicate of users.create_pool_api / update_pool_api — that blueprint wins
+    # at registration so this is currently unreachable, but an unguarded second implementation
+    # of a grant-level action is not something to leave lying around.
+    _perr = _pool_write_denied(cluster_id)
+    if _perr:
+        return _perr
     
     data = request.get_json() or {}
     poolid = data.get('poolid', '').strip()
@@ -94,6 +110,12 @@ def update_pool(cluster_id, pool_id):
     """Update a pool's comment"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    # sec (audit): duplicate of users.create_pool_api / update_pool_api — that blueprint wins
+    # at registration so this is currently unreachable, but an unguarded second implementation
+    # of a grant-level action is not something to leave lying around.
+    _perr = _pool_write_denied(cluster_id)
+    if _perr:
+        return _perr
     
     data = request.get_json() or {}
     comment = data.get('comment', '')
@@ -182,8 +204,43 @@ def delete_pool(cluster_id, pool_id):
         return jsonify({'error': f'Failed to delete pool: {error_msg}'}), 500
 
 
+def _authorize_pool_assignment(cluster_id, pool_id, vmid, vm_type=None):
+    """sec (private disclosure Sep 2026 — regression of #766): the pool-member add/remove gate was
+    lowered from admin.users to pool.assign (a DEFAULT ROLE_USER perm). Without a per-object check a
+    pool.assign holder could re-pool a FOREIGN VM into a pool they control and self-grant access to it
+    (pool membership drives user_can_access_vm), or detach any VM from any reachable pool. Require BOTH:
+    (1) the caller can ALREADY manage the VM (so assigning cannot CONFER new access), and (2) the caller
+    manages the target pool — admins and plain cluster-wide operators manage all pools on an owned
+    cluster; a pool-scoped caller only pools they hold a grant on. Returns (ok, error_response)."""
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import (user_can_access_vm, _pool_perms_for,
+                                     get_user_clusters, user_has_any_pool_access)
+    from pegaprox.models.permissions import ROLE_ADMIN
+    try:
+        _vid = int(vmid)
+    except (TypeError, ValueError):
+        return False, (jsonify({'error': 'Invalid VMID'}), 400)
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    # (1) assigning/removing must not itself grant access — the caller must already be able to reach
+    # the VM. vm.view is the access floor: a foreign VM the caller can't see is blocked (kills the
+    # self-grant escalation), while a VM already in the caller's scope stays assignable (#766 intact).
+    if not user_can_access_vm(user, cluster_id, _vid, 'vm.view', vm_type):
+        return False, (jsonify({'error': 'Access denied to this VM'}), 403)
+    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+        return True, None
+    # (2) confine a scoped caller to pools they manage; a plain cluster-wide operator keeps all
+    from pegaprox.api.helpers import caller_is_scoped
+    if not caller_is_scoped(user, cluster_id):
+        return True, None
+    _granted = {pid for pid, perms in (_pool_perms_for(cluster_id, user.get('username', ''),
+                                                        user.get('groups', [])) or {}).items() if perms}
+    if pool_id not in _granted:
+        return False, (jsonify({'error': 'Access denied to this pool'}), 403)
+    return True, None
+
+
 @bp.route('/api/clusters/<cluster_id>/pools/<pool_id>/members', methods=['POST'])
-@require_auth(perms=['admin.users'])
+@require_auth(perms=['pool.assign'])   # #766 (cybrwerk) — was admin.users; the granular perm for this action is pool.assign
 def add_pool_member(cluster_id, pool_id):
     """Add a VM/CT to a pool"""
     logging.info(f"add_pool_member called: cluster={_sl(cluster_id)}, pool={_sl(pool_id)}")
@@ -199,7 +256,10 @@ def add_pool_member(cluster_id, pool_id):
     
     if not vmid:
         return jsonify({'error': 'VMID is required'}), 400
-    
+
+    ok, err = _authorize_pool_assignment(cluster_id, pool_id, vmid, vm_type)
+    if not ok: return err
+
     manager = cluster_managers.get(cluster_id)
     if not manager:
         logging.error(f"Cluster {_sl(cluster_id)} not found in cluster_managers")
@@ -264,12 +324,15 @@ def add_pool_member(cluster_id, pool_id):
 
 
 @bp.route('/api/clusters/<cluster_id>/pools/<pool_id>/members/<int:vmid>', methods=['DELETE'])
-@require_auth(perms=['admin.users'])
+@require_auth(perms=['pool.assign'])   # #766 — same as add: removing a VM from a pool is pool.assign, not admin.users
 def remove_pool_member(cluster_id, pool_id, vmid):
     """Remove a VM/CT from a pool"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
-    
+
+    ok, err = _authorize_pool_assignment(cluster_id, pool_id, vmid)
+    if not ok: return err
+
     manager = cluster_managers.get(cluster_id)
     if not manager:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -404,7 +467,13 @@ def get_user_vm_access(username):
     users = load_users()
     if username not in users:
         return jsonify({'error': 'User not found'}), 404
-    
+    # sec (private disclosure Sep 2026 — audit): a tenant-scoped admin.users holder must not read a
+    # user's VM-ACL grants in ANOTHER tenant (cross-tenant disclosure). Mirror get_user_perms.
+    if request.session.get('role') != ROLE_ADMIN:
+        _caller = users.get(request.session.get('user', ''), {})
+        if users[username].get('tenant_id', DEFAULT_TENANT_ID) != _caller.get('tenant_id', DEFAULT_TENANT_ID):
+            return jsonify({'error': 'Access denied'}), 403
+
     acls = get_vm_acls()
     access = []
     
@@ -575,13 +644,18 @@ def remove_user_tenant_perms(username, tenant_id):
 @require_auth()
 def get_my_permissions():
     """Get current user's permissions"""
-    users = load_users()
-    user = users.get(request.session['user'], {})
+    from pegaprox.utils.auth import build_authz_user
+    # sec (audit): was the raw stored record, so an admin-owned viewer token was told it had
+    # the owner's role and the UI offered actions the backend then refused.
+    user = build_authz_user(request.session.get('user', ''), request.session)
     tenant_id = request.args.get('tenant_id', user.get('tenant_id', DEFAULT_TENANT_ID))
-    
+    # For an API-token session, report the TOKEN's role everywhere: get_user_effective_role reads
+    # user['role'], which is still the owner's, so hand it a record already floored to the token.
+    scoped = dict(user, role=user.get('effective_role', user.get('role')))
+
     return jsonify({
-        'role': user.get('role'),
-        'effective_role': get_user_effective_role(user, tenant_id),
+        'role': scoped.get('role'),
+        'effective_role': get_user_effective_role(scoped, tenant_id),
         'tenant_id': tenant_id,
         'tenant_permissions': user.get('tenant_permissions', {}),
         'permissions': get_user_permissions(user, tenant_id)

@@ -23,7 +23,7 @@ from pegaprox.utils.auth import require_auth, load_users
 from pegaprox.utils.audit import log_audit
 from pegaprox.utils.rbac import user_can_access_vm
 from pegaprox.core.cache import APIRateLimiter, StorageDataCache
-from pegaprox.api.helpers import get_connected_manager, check_cluster_access, safe_error, parse_pve_error
+from pegaprox.api.helpers import get_connected_manager, check_cluster_access, safe_error, parse_pve_error, scope_vm_rows, require_unconfined
 from pegaprox.utils.ssh import get_paramiko, _ssh_track_connection
 from pegaprox import globals as _g
 
@@ -158,6 +158,9 @@ def connect_esxi_host(cluster_id):
     """
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -241,6 +244,9 @@ def disconnect_esxi_host(cluster_id, host_id):
     """Remove ESXi storage from Proxmox"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -618,6 +624,17 @@ def delete_storage_cluster(cluster_id, sc_id):
     """Delete a storage cluster"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    # sec (audit): the POST and PUT siblings both gate on tenant ownership with
+    # include_pools=False; the DELETE had nothing. Mirror them rather than reaching for
+    # require_unconfined — that also denies on a pool grant or a VM-ACL entry, so an
+    # owning-tenant admin who happens to hold one pool could still arm auto_balance via PUT
+    # but no longer disarm it by deleting the group. Same predicate as the siblings.
+    from pegaprox.utils.rbac import get_user_clusters as _guc
+    from pegaprox.utils.auth import build_authz_user as _bau
+    _allowed = _guc(_bau(request.session.get('user', 'system'), request.session),
+                    include_pools=False)
+    if _allowed is not None and cluster_id not in _allowed:
+        return jsonify({'error': 'Access denied to this cluster'}), 403
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -1383,6 +1400,9 @@ def create_storage(cluster_id):
     """create new storage on proxmox - NS Dec 2025"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -1519,6 +1539,9 @@ def update_storage(cluster_id, storage_id):
     """
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -1578,6 +1601,9 @@ def delete_storage(cluster_id, storage_id):
     """
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -1674,6 +1700,9 @@ def rescan_storage(cluster_id, storage_id):
     """
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -1986,6 +2015,9 @@ def scan_storage(cluster_id):
     """
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -2254,6 +2286,14 @@ def get_node_storage_content(cluster_id, node, storage):
                 if entry.get('size') in (None, 0) and entry.get('approximate-size') is not None:
                     entry['size'] = entry['approximate-size']
                     entry['size_is_approx'] = True
+            # sec (private disclosure Sep 2026 — audit): content rows for images/rootdir/backup carry a
+            # vmid + volid (vm-<id>-disk, vzdump-<type>-<id>-...), so an unscoped list leaked every VM's
+            # disks + backups to any pool-/ACL-scoped storage.view holder. Scope the vmid-carrying rows
+            # per-VM; ISO/vztmpl rows have no vmid (shared storage content) and stay for everyone.
+            _ok_vmids = {r.get('vmid') for r in scope_vm_rows(cluster_id, [r for r in data
+                         if isinstance(r, dict) and r.get('vmid') is not None])}
+            data = [r for r in data if not (isinstance(r, dict) and r.get('vmid') is not None)
+                    or r.get('vmid') in _ok_vmids]
             return jsonify(data)
         else:
             return jsonify([])
@@ -2333,7 +2373,9 @@ def download_from_url(cluster_id, node, storage):
         # validation defeats a rebind on its own — an internal IP won't present the mirror's cert).
         from pegaprox.utils.url_security import resolve_and_pin_url, SsrfError
         try:
-            url = resolve_and_pin_url(url, allowed_schemes=('https', 'http'))
+            # sec (audit): tls_verified=False pins the resolved IP for https too (defense-in-depth vs
+            # DNS-rebind), matching the sibling ISO-download path in vms.py; PVE still cert-verifies.
+            url = resolve_and_pin_url(url, allowed_schemes=('https', 'http'), tls_verified=False)
         except SsrfError as _ssrf:
             return jsonify({'error': f'URL rejected by SSRF guard: {_ssrf}'}), 400
 
@@ -2393,7 +2435,32 @@ def get_backup_jobs(cluster_id):
         r = manager._create_session().get(url, timeout=5)
         
         if r.status_code == 200:
-            return jsonify(r.json().get('data', []))
+            jobs = r.json().get('data', [])
+            # sec (private disclosure Sep 2026 — audit): a scoped caller must not see backup coverage
+            # for VMs outside their grant. The first revision reused the WRITE gate
+            # (_authz_backup_targets) here, which also demanded vm.backup on every target and treated
+            # cluster-wide jobs as admin-only — that blanked the Backup page for EVERY non-admin,
+            # viewers and plain cluster-wide operators included. Confine only a genuinely scoped
+            # caller, and to viewing rights: explicit-vmid jobs whose targets they can all see.
+            # all=1 / pool / exclude jobs span VMs beyond their grant, so those stay hidden from them.
+            from pegaprox.utils.auth import build_authz_user
+            from pegaprox.utils.rbac import user_can_access_vm
+            from pegaprox.api.helpers import caller_is_scoped
+            _bu = build_authz_user(request.session.get('user', ''), request.session)
+            if caller_is_scoped(_bu, cluster_id):
+                def _job_visible(j):
+                    if (str(j.get('all', '')).strip() in ('1', 'true', 'True', 'yes')
+                            or (j.get('pool') or '').strip() or (j.get('exclude') or '').strip()):
+                        return False
+                    _vmids = [x.strip() for x in str(j.get('vmid') or '').split(',') if x.strip()]
+                    if not _vmids:
+                        return False
+                    try:
+                        return all(user_can_access_vm(_bu, cluster_id, int(v), 'vm.view') for v in _vmids)
+                    except (TypeError, ValueError):
+                        return False
+                jobs = [j for j in jobs if _job_visible(j)]
+            return jsonify(jobs)
         return jsonify([])
     except:
         return jsonify([])
@@ -2478,9 +2545,30 @@ def update_backup_job(cluster_id, job_id):
         host, port = manager.host, manager.api_port
         url = f"https://{host}:{port}/api2/json/cluster/backup/{job_id}"
         data = dict(request.json or {})
+        # What is being ASKED for — cheap, no I/O, so an obviously-bad payload is refused here.
         _aerr = _authz_backup_targets(cluster_id, data)
         if _aerr:
             return _aerr
+        # sec (audit): ...and then what is being TOUCHED. Checking only `data` assumed the
+        # client round-trips the whole job back; a crafted PUT naming nothing but the caller's
+        # own vmid passed and still landed on a job targeting someone else's guests. Same shape
+        # as the schedule-PUT hijack, same narrowing as delete_backup_job — only a confined
+        # caller pays for the read-back.
+        from pegaprox.api.helpers import caller_is_scoped as _cis
+        from pegaprox.utils.auth import build_authz_user as _bau
+        if _cis(_bau(request.session.get('user', ''), request.session), cluster_id):
+            _read_ok, _stored = False, {}
+            try:
+                _sr = manager._create_session().get(url, timeout=10)
+                if _sr.status_code == 200:
+                    _read_ok, _stored = True, (_sr.json().get('data') or {})
+            except Exception:
+                _read_ok = False
+            if not _read_ok:
+                return jsonify({'error': 'Cannot verify backup job ownership right now'}), 503
+            _serr = _authz_backup_targets(cluster_id, _stored)
+            if _serr:
+                return _serr
 
         # MK Apr 2026 (#338) — sanitise the payload before bouncing back to PVE.
         # When a job was created in PVE itself, GETing it returns fields that
@@ -2543,11 +2631,40 @@ def delete_backup_job(cluster_id, job_id):
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
-    
+
     try:
         host, port = manager.host, manager.api_port
         url = f"https://{host}:{port}/api2/json/cluster/backup/{job_id}"
-        
+
+        # sec (audit): create/update authorize the job's targets, delete did not — so a scoped
+        # backup.delete holder could drop ANY job on the cluster, including an admin's cluster-wide
+        # one.
+        #
+        # ...but _authz_backup_targets is the WRITE gate: it short-circuits only on admin and then
+        # rejects every all=1/pool/exclude job. Applied unconditionally it 403s an unconfined
+        # tenant_admin deleting the cluster-wide job PVE creates by default, and locks out
+        # backup_operator entirely (that template has backup.delete but not vm.backup). The read
+        # sibling above hit this exact wall and narrowed to caller_is_scoped; do the same here
+        # instead of repeating it. An unconfined owning-tenant caller keeps the route.
+        from pegaprox.api.helpers import caller_is_scoped as _cis
+        from pegaprox.utils.auth import build_authz_user as _bau
+        _dbu = _bau(request.session.get('user', ''), request.session)
+        if _cis(_dbu, cluster_id):
+            _read_ok, _job = False, {}
+            try:
+                _jr = manager._create_session().get(url, timeout=10)
+                if _jr.status_code == 200:
+                    _read_ok, _job = True, (_jr.json().get('data') or {})
+            except Exception:
+                _read_ok = False
+            if not _read_ok:
+                # can't see what we'd be deleting — fail closed, but say so rather than
+                # reporting it as a permission problem
+                return jsonify({'error': 'Cannot verify backup job ownership right now'}), 503
+            _aerr = _authz_backup_targets(cluster_id, _job)
+            if _aerr:
+                return _aerr
+
         response = manager._create_session().delete(url, timeout=10)
         
         if response.status_code == 200:

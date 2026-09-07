@@ -229,6 +229,26 @@ def save_tenants(tenants: dict):
 # tenant cache - reloaded on changes
 tenants_db = {}
 
+def _tenant_defining_role(role: str, tenant_id: str) -> str:
+    """The tenant whose custom-role table defines `role`, or `tenant_id` unchanged.
+
+    A user — or an API token — can sit in the default tenant while carrying a tenant-scoped
+    custom role; get_user_clusters has remapped for that since Dec 2025. get_user_permissions
+    never did, so the role resolved to nothing there and fell through to the VIEWER defaults:
+    a custom role written to grant three permissions handed out the full viewer set of 31
+    instead, which is the opposite of what someone builds a restrictive role for.
+
+    Deliberately narrow, matching the remap it is factored out of: only a caller sitting in
+    the DEFAULT tenant is remapped. A user placed in tenant A keeps tenant A's answer even if
+    some other tenant happens to define a role by the same name."""
+    if not role or role in BUILTIN_ROLES or tenant_id != DEFAULT_TENANT_ID:
+        return tenant_id
+    for tid, roles in get_custom_roles().get('tenants', {}).items():
+        if role in roles:
+            return tid
+    return tenant_id
+
+
 def get_user_permissions(user: dict, tenant_id: str = None) -> list:
     """Get effective permissions for a user
     
@@ -254,7 +274,10 @@ def get_user_permissions(user: dict, tenant_id: str = None) -> list:
         tp = tenant_perms[tenant_id]
         role = tp.get('role', user.get('role', ROLE_VIEWER))
         extra = tp.get('extra', [])
-        denied = tp.get('denied', [])
+        # sec (audit): the user's GLOBAL denies were dropped entirely in this branch, so an
+        # explicit deny stopped applying the moment the user gained a tenant override — a
+        # silent un-deny. They compose; a tenant override may add, never un-forbid.
+        denied = list(tp.get('denied', []) or []) + list(user.get('denied_permissions', []) or [])
     else:
         # use global user settings — effective_role wins when set (API-token scoping)
         role = user.get('effective_role', user.get('role', ROLE_VIEWER))
@@ -262,7 +285,7 @@ def get_user_permissions(user: dict, tenant_id: str = None) -> list:
         denied = user.get('denied_permissions', [])
     
     # get base permissions from role (supports custom roles now)
-    base_perms = get_role_permissions_for_user({'role': role}, tenant_id)
+    base_perms = get_role_permissions_for_user({'role': role}, _tenant_defining_role(role, tenant_id))
     
     # add extra
     for p in extra:
@@ -271,7 +294,17 @@ def get_user_permissions(user: dict, tenant_id: str = None) -> list:
     
     # remove denied
     base_perms = [p for p in base_perms if p not in denied]
-    
+
+    # sec (audit): an API token must never out-grant its own role — but the tenant-override
+    # branch above reads tp['role'] and never looked at effective_role, so an admin-owned
+    # viewer-scoped token inherited the full tenant role wherever the owner had an override.
+    # Cap the result by what the token's own role grants. Unset for session auth, so this is
+    # a no-op there; an admin effective_role caps to everything, i.e. also a no-op.
+    _eff = user.get('effective_role')
+    if _eff and _eff != role:
+        _cap = set(get_role_permissions_for_user({'role': _eff}, _tenant_defining_role(_eff, tenant_id)))
+        base_perms = [p for p in base_perms if p in _cap]
+
     return base_perms
 
 def has_permission(user: dict, permission: str, tenant_id: str = None) -> bool:
@@ -296,6 +329,16 @@ def get_user_effective_role(user: dict, tenant_id: str = None) -> str:
         return tenant_perms[tenant_id].get('role', user.get('role', ROLE_VIEWER))
     return user.get('role', ROLE_VIEWER)
 
+def invalidate_tenants_cache():
+    """sec (audit): tenants_db is the cache get_user_clusters reads, and it was only ever
+    populated (`if not tenants_db`) — never invalidated. So removing a cluster from a tenant
+    did not revoke anything until the process restarted; the tenant's users kept working.
+    costs.py already reloaded it inline for exactly this reason. Call this after every
+    tenant write."""
+    global tenants_db
+    tenants_db = {}
+
+
 def get_user_clusters(user: dict, include_pools: bool = True) -> list:
     """Get list of cluster IDs user can access based on tenant
     
@@ -313,14 +356,11 @@ def get_user_clusters(user: dict, include_pools: bool = True) -> list:
 
     tenant_id = user.get('tenant_id', DEFAULT_TENANT_ID)
 
-    # MK: If user has default tenant but a tenant-specific role, use the role's tenant
+    # MK: If user has default tenant but a tenant-specific role, use the role's tenant.
+    # Shared with get_user_permissions — the two answered this differently for years, and the
+    # permission side silently fell back to the viewer defaults because of it.
     role = user.get('effective_role', user.get('role', ROLE_VIEWER))
-    if tenant_id == DEFAULT_TENANT_ID and role not in BUILTIN_ROLES:
-        custom_roles = load_custom_roles()
-        for tid, roles in custom_roles.get('tenants', {}).items():
-            if role in roles:
-                tenant_id = tid
-                break
+    tenant_id = _tenant_defining_role(role, tenant_id)
     
     tenant = tenants_db.get(tenant_id, {})
     clusters = tenant.get('clusters', [])
@@ -400,7 +440,10 @@ def check_tenant_quota(tenant_id, add_cores=0, add_mem_gb=0, add_vms=1, force=Fa
         used_vms = 0
         used_cores = 0
         used_mem = 0.0
-        for cid, mgr in cluster_managers.items():
+        # iterate a copy — get_vm_resources() below is a live API call, and a
+        # concurrent cluster add/remove used to blow up the walk. That lands in the
+        # fail-open except at the bottom, so the quota just stopped being enforced.
+        for cid, mgr in list(cluster_managers.items()):
             if allowed is not None and cid not in allowed:
                 continue
             try:
@@ -490,6 +533,10 @@ _vm_acls_cache = None
 # TTL: 300 seconds (5 min) - pools don't change often
 # Stale TTL: 30 seconds - return stale data while refreshing in background
 _pool_membership_cache = {}
+# Bumped by every invalidate_pool_cache(). A rebuild captures it before it starts reading and
+# refuses to publish if it changed meanwhile — otherwise a revocation that lands during the
+# seconds a rebuild spends on the network gets overwritten by the pre-revocation snapshot.
+_pool_cache_generation = 0
 POOL_CACHE_TTL = 300  # 5 minutes - pools rarely change
 POOL_CACHE_STALE_TTL = 30  # Return stale data for 30s while refreshing
 _pool_cache_lock = threading.Lock()
@@ -523,7 +570,10 @@ def _stamp_pool_cache(cluster_id, pools, membership, had_error):
 def _refresh_pool_cache_async(cluster_id: str):
     """Background refresh of pool cache - doesn't block requests"""
     global _pool_membership_cache
-    
+
+    with _pool_cache_lock:
+        _gen = _pool_cache_generation
+
     try:
         if cluster_id not in cluster_managers:
             return
@@ -553,6 +603,11 @@ def _refresh_pool_cache_async(cluster_id: str):
                 continue
 
         with _pool_cache_lock:
+            if _pool_cache_generation != _gen:
+                # someone revoked a grant while we were reading — our snapshot predates it
+                _pool_membership_cache.pop(cluster_id, None)
+                logging.info(f"[POOL-CACHE] Discarded refresh for {cluster_id} — invalidated mid-read")
+                return
             _pool_membership_cache[cluster_id] = {
                 'data': membership,
                 'timestamp': _stamp_pool_cache(cluster_id, pools, membership, had_error),
@@ -603,6 +658,9 @@ def get_pool_membership_cache(cluster_id: str) -> dict:
     if cluster_id not in cluster_managers:
         return cache_entry.get('data', {}) if cache_entry else {}
     
+    with _pool_cache_lock:
+        _gen = _pool_cache_generation
+
     try:
         mgr = cluster_managers[cluster_id]
         pools = mgr.get_pools()
@@ -628,6 +686,10 @@ def get_pool_membership_cache(cluster_id: str) -> dict:
                 continue
 
         with _pool_cache_lock:
+            if _pool_cache_generation != _gen:
+                _pool_membership_cache.pop(cluster_id, None)
+                logging.info(f"[POOL-CACHE] Discarded initial build for {cluster_id} — invalidated mid-read")
+                return membership          # answer THIS caller, but publish nothing
             _pool_membership_cache[cluster_id] = {
                 'data': membership,
                 'timestamp': _stamp_pool_cache(cluster_id, pools, membership, had_error),
@@ -643,8 +705,14 @@ def get_pool_membership_cache(cluster_id: str) -> dict:
 
 def invalidate_pool_cache(cluster_id: str = None):
     """Invalidate pool membership cache"""
-    global _pool_membership_cache
+    global _pool_membership_cache, _pool_cache_generation
     with _pool_cache_lock:
+        # sec (audit): a rebuild reads every pool over the network, which takes seconds. An
+        # admin who removed a VM from a pool in that window called this, we popped the entry —
+        # and then the in-flight rebuild wrote its PRE-revocation snapshot back with a fresh
+        # timestamp, re-pinning the revoked grant for another full TTL and silently undoing
+        # the invalidation. Bump a generation so a refresh that started earlier is discarded.
+        _pool_cache_generation += 1
         if cluster_id:
             _pool_membership_cache.pop(cluster_id, None)
         else:
@@ -664,6 +732,34 @@ def get_vm_pool_cached(cluster_id: str, vmid: int, vm_type: str = None) -> str:
         # Try both types
         return membership.get(f"{vmid}:qemu") or membership.get(f"{vmid}:lxc")
 
+def _pool_perms_for(cluster_id: str, username: str, groups=None) -> dict:
+    """get_user_pool_permissions, memoised for the current request.
+
+    MK Sep 2026 (#773 scale follow-up): the per-VM authz loop over a /resources read on a
+    large cluster called get_user_pool_permissions once PER VM with identical args — up to
+    ~10k indexed SELECTs to answer one list. The grant set is the same for a given
+    (cluster, user, groups) throughout a request, so memoise it on Flask's request global.
+    Outside a request context (background workers, tests) it reads straight through; the memo
+    only ever lives for one request, so there's no stale-grant window across requests, and
+    writers (api/users pool grant/revoke) don't need to invalidate anything. Callers only read
+    the returned dict, never mutate it, so sharing the memoised object is safe."""
+    db = get_db()
+    key = (cluster_id, username, tuple(sorted(groups or [])))
+    try:
+        from flask import g, has_request_context
+        if has_request_context():
+            memo = getattr(g, '_pool_perms_memo', None)
+            if memo is None:
+                memo = {}
+                g._pool_perms_memo = memo
+            if key not in memo:
+                memo[key] = db.get_user_pool_permissions(cluster_id, username, groups)
+            return memo[key]
+    except Exception:
+        pass
+    return db.get_user_pool_permissions(cluster_id, username, groups)
+
+
 def user_has_any_pool_access(user: dict, cluster_id: str) -> bool:
     """#555 — does this user hold ANY pool permission in this cluster?
     One cheap DB read, no membership scan. For the cluster gates."""
@@ -673,7 +769,7 @@ def user_has_any_pool_access(user: dict, cluster_id: str) -> bool:
     if not username:
         return False
     try:
-        perms = get_db().get_user_pool_permissions(cluster_id, username, user.get('groups', []))
+        perms = _pool_perms_for(cluster_id, username, user.get('groups', []))
     except Exception as e:
         logging.error(f"[POOL] any-access check failed for {username}@{cluster_id}: {e}")
         return False
@@ -697,7 +793,7 @@ def get_user_pool_vmids(user: dict, cluster_id: str, permission: str = None, _pe
         user_pool_perms = _perms
     else:
         try:
-            user_pool_perms = get_db().get_user_pool_permissions(cluster_id, username, user.get('groups', []))
+            user_pool_perms = _pool_perms_for(cluster_id, username, user.get('groups', []))
         except Exception as e:
             logging.error(f"[POOL] vmid-list failed for {username}@{cluster_id}: {e}")
             return set()
@@ -828,9 +924,8 @@ def user_can_access_vm(user: dict, cluster_id: str, vmid: int, permission: str =
             # Get user's groups
             user_groups = user.get('groups', [])
             
-            # Get user's pool permissions from DB (not API)
-            db = get_db()
-            user_pool_perms = db.get_user_pool_permissions(cluster_id, username, user_groups)
+            # Get user's pool permissions (request-memoised — same grants for every VM in the loop)
+            user_pool_perms = _pool_perms_for(cluster_id, username, user_groups)
             
             # Check if user has required permission for this pool
             pool_perms = user_pool_perms.get(pool_id, [])
@@ -876,11 +971,11 @@ def user_can_access_vm(user: dict, cluster_id: str, vmid: int, permission: str =
     # to their granted resources — even when live pool membership can't be resolved to concrete
     # vmids, so an unresolvable pool membership fails CLOSED (deny) instead of widening to the
     # whole tenant cluster. Pure operators (no ACL, no pool grant) keep cluster-wide access.
-    # Resolve the pool grant ONCE (get_user_pool_permissions is not cached) and reuse it, so the
-    # per-VM authz path stays a single DB read instead of two.
+    # Resolve the pool grant ONCE and reuse it via _perms= below, so this per-VM authz path stays
+    # a single lookup instead of two (and _pool_perms_for memoises the DB read across the request).
     has_pool_grant = False
     try:
-        _pp = get_db().get_user_pool_permissions(cluster_id, username, user.get('groups', []))
+        _pp = _pool_perms_for(cluster_id, username, user.get('groups', []))
         has_pool_grant = any(p for p in (_pp or {}).values())
         if has_pool_grant:
             scoped_vms |= get_user_pool_vmids(user, cluster_id, _perms=_pp)
@@ -991,7 +1086,13 @@ def user_can_access_vmware_vm(user: dict, vmware_id: str, vm_id: str, permission
         _mgr = vmware_managers.get(vmware_id)
         _linked = (getattr(_mgr, 'linked_clusters', None) or []) if _mgr else []
         if _linked:
-            _uc = get_user_clusters(user)   # None => all clusters (admin/default-tenant)
+            # sec (audit): include_pools=False. A Proxmox POOL grant says nothing about the ESXi
+            # guests on a server that happens to be linked to that cluster — but the default
+            # (include_pools=True) let a pool-scoped caller through this gate, and the scope-wins
+            # guard below only confines callers who hold a vmware:<id> ACL. So a pool grant on one
+            # Proxmox cluster widened into every VM on a linked ESXi server. Tenant ownership is
+            # the right question here.
+            _uc = get_user_clusters(user, include_pools=False)   # None => all (admin/default tenant)
             if _uc is not None and not any(c in _uc for c in _linked):
                 logging.debug(f"[VMWARE-ACL] {username} cannot reach any linked cluster of {vmware_id} → deny {permission}")
                 return False

@@ -18,7 +18,7 @@ from pegaprox.utils.audit import log_audit
 # vmware_id from URL. Sanitise both before logging for consistency.
 from pegaprox.utils.sanitization import sanitize_log_message as _sl
 from pegaprox.utils.rbac import user_can_access_vmware_vm
-from pegaprox.api.helpers import check_cluster_access, check_vmware_access
+from pegaprox.api.helpers import check_cluster_access, check_vmware_access, caller_is_scoped
 from pegaprox.core.vmware import VMwareManager, load_vmware_servers, save_vmware_server
 from pegaprox.core.v2p import V2PMigrationTask, _run_v2p_migration
 from pegaprox.background.broadcast import broadcast_resources_loop
@@ -287,7 +287,16 @@ def get_vmware_vms(vmware_id):
                 result = mgr.get_vms()
     if 'error' in result:
         return jsonify(result), result.get('status_code', 500)
-    return jsonify(result.get('data', []))
+    # sec (private disclosure Sep 2026 — audit H2): the list returned the FULL ESXi inventory gated
+    # only by server reach (check_vmware_access admits a tenant caller, and returns True when the
+    # server has no linked_clusters — the common single-ESXi case). Every sibling per-VM route calls
+    # user_can_access_vmware_vm; the list didn't → the ESXi analog of the #773 /resources leak. Filter
+    # per-VM so an ACL-scoped caller sees only their VMs; admins/plain operators pass the helper.
+    _vmw_user = build_authz_user(request.session.get('user', ''), request.session)
+    _vms = result.get('data', []) or []
+    _scoped = [v for v in _vms
+               if user_can_access_vmware_vm(_vmw_user, vmware_id, str(v.get('vm', '')), 'vmware.vm.view')]
+    return jsonify(_scoped)
 
 
 @bp.route('/api/vmware/<vmware_id>/vms/<vm_id>', methods=['GET'])
@@ -654,7 +663,19 @@ def watch_vmware_vm(vmware_id, vm_id):
         return err
     if not hasattr(broadcast_resources_loop, '_vmw_watched'):
         broadcast_resources_loop._vmw_watched = {}
-    broadcast_resources_loop._vmw_watched[(vmware_id, vm_id)] = time.time()
+    _w = broadcast_resources_loop._vmw_watched
+    # sec (audit): this dict is keyed on a caller-supplied vm_id and had no bound, while the
+    # detail push walks EVERY entry every 5s and issues three ESXi calls per entry. A caller
+    # holding vmware.vm.view — a builtin viewer permission — could enqueue unlimited ids and
+    # keep a worker thread busy indefinitely. Expire stale entries and cap the registry.
+    _now = time.time()
+    for _k in [k for k, t in list(_w.items()) if _now - t > 120]:
+        _w.pop(_k, None)
+    _MAX_WATCHED = 200
+    if (vmware_id, vm_id) not in _w and len(_w) >= _MAX_WATCHED:
+        for _k, _ in sorted(_w.items(), key=lambda kv: kv[1])[:max(1, len(_w) - _MAX_WATCHED + 1)]:
+            _w.pop(_k, None)
+    _w[(vmware_id, vm_id)] = _now
     return jsonify({'ok': True, 'watching': vm_id, 'ttl': 120})
 
 
@@ -1028,7 +1049,7 @@ def get_vmware_migration_plan(vmware_id, vm_id):
     
     # Available Proxmox targets — only clusters the caller may reach (don't leak others' topology)
     targets = []
-    for cid, cmgr in cluster_managers.items():
+    for cid, cmgr in list(cluster_managers.items()):
         if cmgr.is_connected:
             allowed, _ = check_cluster_access(cid)
             if not allowed:
@@ -1130,6 +1151,13 @@ def start_vmware_migration(vmware_id, vm_id):
         return jsonify({'error': 'Target cluster not found'}), 404
 
     # gate the migration target on cluster access
+    # sec (audit): reachability only — but this CREATES a guest on the target, and a new vmid
+    # matches no per-object grant, so a pool-scoped caller admitted by the #555 fallback could
+    # land a VM on a cluster they do not own. The XHM twin (api/xhm.py) already asks the
+    # confinement question about its target; ask it here too.
+    _v2p_u = build_authz_user(request.session.get('user', ''), request.session)
+    if caller_is_scoped(_v2p_u, data['target_cluster']):
+        return jsonify({'error': 'Access denied to the target cluster'}), 403
     allowed, err_response = check_cluster_access(data['target_cluster'])
     if not allowed:
         return err_response
@@ -1173,7 +1201,19 @@ def _migration_reachable(t):
     # NS Jul 2026 (CodeAnt IDOR) — a caller may see a migration only if they can reach one of the
     # clusters it touches (source or target). Tasks with no determinable cluster are shown.
     cids = [c for c in (getattr(t, 'target_cluster', None), getattr(t, 'source_cluster', None)) if c]
-    return (not cids) or any(check_cluster_access(c)[0] for c in cids)
+    if cids and not any(check_cluster_access(c)[0] for c in cids):
+        return False
+    # sec (audit): reaching the TARGET cluster was the whole gate, so anyone who could migrate
+    # into a shared target could read another tenant's V2P run — and drive its cutover. The XHM
+    # twin (_xhm_reachable) already checks the source VM; mirror it on the ESXi source here.
+    vmw, vid = getattr(t, 'vmware_id', None), getattr(t, 'vm_id', None)
+    if vmw and vid:
+        try:
+            _u = build_authz_user(request.session.get('user', ''), request.session)
+            return user_can_access_vmware_vm(_u, vmw, str(vid), 'vmware.vm.migrate')
+        except Exception:
+            return False
+    return True
 
 
 # NS Aug 2026 (#654) — the route + auth decorators were stuck on the _migration_reachable helper

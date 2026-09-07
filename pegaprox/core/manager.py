@@ -17,6 +17,7 @@ import subprocess
 import re
 import shlex
 from pegaprox.utils.ssh_security import cli_hostkey_opts  # secure host-key opts for subprocess ssh/scp
+from pegaprox.utils.sanitization import validate_snapshot_name, validate_hostname
 import requests
 import urllib3
 from datetime import datetime, timedelta
@@ -64,6 +65,21 @@ def get_paramiko():
 # Gevent pool
 GEVENT_AVAILABLE = False
 GEVENT_POOL = None
+IP_SWEEP_POOL = None
+# MK Sep 2026 — ONE number for how many node calls may be in flight at once. It sizes
+# both the greenlet pool that issues them and the HTTPS keep-alive pool that carries
+# them; when the two drifted apart (fan-out 100 vs pool 64) the excess opened throwaway
+# connections that could never be returned, so every sweep left 36 fresh TLS handshakes
+# on the node's pveproxy — and a VNC console riding that same pveproxy got torn down.
+NODE_FANOUT_CONCURRENCY = int(os.environ.get('PEGAPROX_NODE_POOL_SIZE', '100'))
+
+# The IP/disk sweep issues up to two calls per RUNNING GUEST, so its task count grows with the
+# estate while every other fan-out is bounded by node count. Its own slice of the budget keeps a
+# 10k-guest sweep from holding the shared pool — and with it the broadcast tick and every
+# interactive request — for the length of the sweep. Full coverage either way.
+IP_SWEEP_CONCURRENCY = max(8, int(os.environ.get(
+    'PEGAPROX_IP_SWEEP_CONCURRENCY', str(max(8, NODE_FANOUT_CONCURRENCY // 4)))))
+
 try:
     from gevent.pool import Pool as GeventPool
     # NS: was 50 (100 caused fd exhaustion on the old Hetzner box at ulimit 1024).
@@ -71,7 +87,8 @@ try:
     # reuse connections so the per-node fan-out no longer burns one fd per call,
     # and the entry point now raises RLIMIT_NOFILE. Shared across all managers,
     # so this caps total concurrent node-fetches process-wide.
-    GEVENT_POOL = GeventPool(size=int(os.environ.get('PEGAPROX_NODE_POOL_SIZE', '100')))
+    GEVENT_POOL = GeventPool(size=NODE_FANOUT_CONCURRENCY)
+    IP_SWEEP_POOL = GeventPool(size=IP_SWEEP_CONCURRENCY)
     GEVENT_AVAILABLE = True
 except ImportError:
     pass
@@ -91,15 +108,22 @@ _TASK_USER_NEGCACHE = {}
 _TASK_USER_NEGCACHE_MAX = 5000
 _TASK_USER_NEGCACHE_TTL = 120.0
 
-def run_concurrent(tasks: list, timeout: float = 30.0) -> list:
+def run_concurrent(tasks: list, timeout: float = 30.0, pool=None) -> list:
     # MK 2026-05-31 — paired bugfix with utils/concurrent.py: gevent.pool.Pool's
     # __bool__ is len(), so `if GEVENT_POOL and ...` was always-False on entry.
     # `is not None` is the right gate.
+    #
+    # MK Sep 2026 — `pool` lets a caller bring its OWN bounded pool. A sweep whose task count
+    # scales with the ESTATE rather than the node count (the IP/disk cache: up to two calls per
+    # running guest) otherwise fills all 100 shared slots for the length of the sweep, and every
+    # other node call — the broadcast tick, a UI request, opening a console — queues behind it.
+    # Coverage is unchanged; this only bounds how much of the machine it holds at once.
     if not tasks:
         return []
-    if GEVENT_POOL is not None and GEVENT_AVAILABLE:
+    _pool = pool if pool is not None else GEVENT_POOL
+    if _pool is not None and GEVENT_AVAILABLE:
         try:
-            greenlets = [GEVENT_POOL.spawn(task) for task in tasks]
+            greenlets = [_pool.spawn(task) for task in tasks]
             from gevent import joinall
             joinall(greenlets, timeout=timeout)
             results = []
@@ -179,6 +203,25 @@ def _wrap_with_sudo(cmd):
     return f"echo {enc} | base64 -d | sudo -n bash"
 
 
+def _normalise_private_key(key):
+    """Make a configured private key safe to write to a file for `ssh -i`.
+
+    #717 — OpenSSH refuses a key file that does not end in a newline, and one with CRLF
+    line endings; both fail as `Load key "...": invalid format`. ssh then has no identity
+    to offer, the node answers `Permission denied (publickey).`, and the operator is told
+    to add an SSH key they already added — the key never left the container. The paste
+    path does not normalise anything (the textarea sends `e.target.value` verbatim and the
+    DB stores it encrypted as-is), so normalise here, once, for every SSH path.
+
+    Returns '' when there is no usable key, so callers can bail instead of writing an
+    empty file and getting the same opaque `invalid format` back.
+    """
+    if not key or not key.strip():
+        return ''
+    data = key.replace('\r\n', '\n').replace('\r', '\n').strip()
+    return data + '\n'
+
+
 def _ssh_stderr_excerpt(stderr, max_chars=240):
     """Last meaningful line of SSH stderr, capped.
 
@@ -194,6 +237,13 @@ def _ssh_stderr_excerpt(stderr, max_chars=240):
     lines = [ln.strip() for ln in stderr.splitlines() if ln.strip()]
     if not lines:
         return 'no error output'
+    # #717 — but OpenSSH prints `Load key "...": invalid format` BEFORE the generic
+    # `Permission denied (publickey).`, so last-line-only threw away the one line that
+    # says our own key never loaded, and what remained read as a node-side rejection.
+    # Keep both when the key itself failed to load.
+    load_err = next((ln for ln in lines if ln.lower().startswith('load key')), None)
+    if load_err and load_err != lines[-1]:
+        return f"{load_err} | {lines[-1]}"[:max_chars]
     return lines[-1][:max_chars]
 
 
@@ -210,6 +260,14 @@ def _ssh_auth_hint(stderr):
     if not stderr:
         return None
     low = stderr.lower()
+    # #717 — check this BEFORE 'permission denied': when our key fails to load, ssh emits
+    # BOTH lines, and the publickey branch below would otherwise tell an operator who has
+    # already configured a key to go add one.
+    if 'load key' in low and ('invalid format' in low or 'error in libcrypto' in low
+                              or 'bad permissions' in low):
+        return ("the configured SSH private key could not be loaded (invalid format) — "
+                "re-paste it in the cluster's SSH key field: it must be the complete "
+                "PEM/OpenSSH block with LF line endings, ending in a newline")
     if 'host key verification failed' in low:
         return ("the node's SSH host key changed — clear the pinned entry to re-pin it "
                 "(cluster edit reconnects and re-learns it)")
@@ -466,8 +524,18 @@ class PegaProxManager:
         self.logger.propagate = False  # MK: Don't propagate to root logger (prevents DEBUG spam)
         
         # Clear existing handlers to prevent duplicates - NS Jan 2026
-        if self.logger.handlers:
-            self.logger.handlers.clear()
+        # MK Sep 2026 (#783) — but the logger is keyed on the DISPLAY name, which nothing
+        # forces to be unique, while each manager's file handler is keyed on cluster_id. So a
+        # blanket clear here stripped a SIBLING manager's file handler whenever two clusters
+        # shared a name: that cluster's log went silent and its lines landed in ours, which is
+        # exactly the evidence you want during an incident. Drop only what would genuinely
+        # duplicate ours — our own file handler, and any console handler we are about to
+        # re-add — and leave a sibling's file handler attached.
+        _own_log = os.path.abspath(f"{LOG_DIR}/{cluster_id}.log")
+        for _h in list(self.logger.handlers):
+            _base = getattr(_h, 'baseFilename', None)
+            if _base is None or os.path.abspath(_base) == _own_log:
+                self.logger.removeHandler(_h)
         
         # File handler - DEBUG level (for troubleshooting). Capped at 3h of data,
         # rotated content is discarded — see #345 / #348. 3h because 20+ node
@@ -621,7 +689,14 @@ class PegaProxManager:
         # calls at once on this one session; with only 16 keep-alive slots the
         # excess churned throwaway connections (pool_block=False), re-incurring
         # the handshake cost the cache is meant to remove.
-        _pool_kw = dict(pool_connections=8, pool_maxsize=64, pool_block=False, max_retries=0)
+        # MK Sep 2026: "matches" was aspirational — it was hardcoded 64 against a fan-out of
+        # 100, so 36 of every 100 calls still churned. Measured: 36 warnings at 64/100, none
+        # once the two are the same number.
+        # pool_maxsize is derived from the SAME constant that sizes the fan-out, so the two
+        # cannot drift again — that drift is what produced the "Connection pool is full,
+        # discarding connection … pool size: 64" storm at 100-way fan-out.
+        _pool_kw = dict(pool_connections=8, pool_maxsize=NODE_FANOUT_CONCURRENCY,
+                        pool_block=False, max_retries=0)
         # NS: use system CA store when verifying - certifi bundle doesn't include custom CAs (#246)
         if self._ssl_verify:
             _ca = ssl.get_default_verify_paths()
@@ -1992,135 +2067,9 @@ class PegaProxManager:
         except:
             return []
     
-    def _fetch_qemu_ips(self, node: str, vmid: int) -> list:
-        """Fetch IP addresses from QEMU guest agent for a running VM.
-        Returns IPv4 addresses first, then IPv6 (so ips[0] is primary IPv4 when available).
-        Returns [] if agent not running, VM unreachable, or any error."""
-        # #237: skip VMs known to have no guest agent to avoid pvedaemon error spam
-        if vmid in self._no_agent_vms:
-            return []
-        try:
-            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces"
-            resp = self._create_session().get(url, timeout=8)
-            if resp.status_code == 500:
-                # agent socket not available — remember this VM
-                self._no_agent_vms.add(vmid)
-                return []
-            if resp.status_code != 200:
-                return []
-            interfaces = resp.json().get('data', {}).get('result', [])
-            ipv4s, ipv6s = [], []
-            for iface in interfaces:
-                if iface.get('name') == 'lo':
-                    continue
-                for addr in iface.get('ip-addresses', []):
-                    ip = addr.get('ip-address', '')
-                    if not ip:
-                        continue
-                    if ip.startswith('127.') or ip == '::1':
-                        continue
-                    if ip.lower().startswith('fe80:'):
-                        continue
-                    if addr.get('ip-address-type') == 'ipv4':
-                        ipv4s.append(ip)
-                    else:
-                        ipv6s.append(ip)
-            return ipv4s + ipv6s
-        except Exception:
-            return []
 
-    def _fetch_lxc_ips(self, node: str, vmid: int) -> list:
-        """Fetch IP addresses for a running LXC container.
-        MK: Apr 2026 — tries /interfaces first, falls back to config + status (#300)
-        """
-        try:
-            # method 1: /interfaces — preferred, returns all IPs
-            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/interfaces"
-            resp = self._create_session().get(url, timeout=8)
-            if resp.status_code == 200:
-                interfaces = resp.json().get('data', [])
-                ipv4s, ipv6s = [], []
-                for iface in interfaces:
-                    if iface.get('name') == 'lo':
-                        continue
-                    inet = iface.get('inet', '')
-                    if inet:
-                        ip = inet.split('/')[0]
-                        if not ip.startswith('127.'):
-                            ipv4s.append(ip)
-                    inet6 = iface.get('inet6', '')
-                    if inet6:
-                        ip = inet6.split('/')[0]
-                        if ip != '::1' and not ip.lower().startswith('fe80:'):
-                            ipv6s.append(ip)
-                if ipv4s or ipv6s:
-                    return ipv4s + ipv6s
 
-            # method 2: /config — extract static IPs from net0..net9
-            cfg_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
-            cfg_resp = self._create_session().get(cfg_url, timeout=5)
-            if cfg_resp.status_code == 200:
-                cfg = cfg_resp.json().get('data', {})
-                import re
-                for key in sorted(cfg.keys()):
-                    if not key.startswith('net'):
-                        continue
-                    val = cfg[key]
-                    # format: name=eth0,bridge=vmbr0,ip=10.0.0.5/24,...
-                    m = re.search(r'ip=(\d+\.\d+\.\d+\.\d+)', str(val))
-                    if m:
-                        return [m.group(1)]
 
-            return []
-        except Exception:
-            return []
-
-    def refresh_ip_cache(self) -> None:
-        """Fetch IPs for all currently running VMs and containers, update cache.
-        Called from the background IP refresh loop every 30 seconds."""
-        if not self.is_connected or not self.session:
-            return
-        try:
-            resources = self.get_vm_resources()
-            running = [r for r in resources if r.get('status') == 'running']
-            if not running:
-                return
-
-            def fetch_one(r):
-                node = r.get('node', '')
-                vmid = r.get('vmid')
-                if not node or not vmid:
-                    return None
-                if r.get('type') == 'lxc':
-                    ips = self._fetch_lxc_ips(node, vmid)
-                else:
-                    ips = self._fetch_qemu_ips(node, vmid)
-                return (node, vmid, ips)
-
-            tasks = [lambda r=r: fetch_one(r) for r in running]
-            results = run_concurrent(tasks, timeout=15.0)
-
-            with self._ip_cache_lock:
-                for result in results:
-                    if result is None:
-                        continue
-                    node, vmid, ips = result
-                    self._ip_cache[(node, vmid)] = ips
-        except Exception as e:
-            self.logger.debug(f"[IP cache] refresh failed: {e}")
-
-    def _ip_refresh_loop(self) -> None:
-        """Background loop that refreshes the IP cache every 30 seconds.
-        Uses stop_event so it exits cleanly when the manager stops."""
-        if self.stop_event.wait(15):  # 15s initial delay; returns True if stopping
-            return
-        while not self.stop_event.is_set():
-            try:
-                if self.is_connected:
-                    self.refresh_ip_cache()
-            except Exception as e:
-                self.logger.debug(f"[IP refresh loop] error: {e}")
-            self.stop_event.wait(30)  # wait 30s or until stop requested
 
     def _format_bytes(self, bytes_value: int) -> str:
         # NS: quick helper, nothing fancy
@@ -2647,7 +2596,7 @@ class PegaProxManager:
             self.logger.info(f"[AFFINITY] Completed {migrations} affinity enforcement migration(s)")
         return migrations
 
-    def find_migration_candidate(self, source_node: str, target_node: str, exclude_vmids: list = None, include_containers: bool = None, node_status: dict = None) -> Optional[Dict]:
+    def find_migration_candidate(self, source_node: str, target_node: str, exclude_vmids: list = None, include_containers: bool = None, node_status: dict = None, target_mgr=None) -> Optional[Dict]:
         """
         Find the best VM to migrate from source to target node.
         
@@ -2665,6 +2614,10 @@ class PegaProxManager:
         MK: Container migrations are tricky - they ALWAYS restart.
         We learned this the hard way in production...
         LW: Feb 2026 - exclude_vmids used for multi-migration cycles to avoid re-picking
+
+        MK: target_mgr is for the cross-cluster balancer — target_node then names a node on
+        ANOTHER cluster, so the storage lookup below has to go to that cluster's API instead
+        of ours. Left None for intra-cluster balancing, where target_node is one of our own.
         """
         if exclude_vmids is None:
             exclude_vmids = []
@@ -2804,8 +2757,9 @@ class PegaProxManager:
         target_storage_names = set()
         if balance_local_disks:
             try:
-                st_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{target_node}/storage"
-                st_r = self._create_session().get(st_url, timeout=10)
+                _tm = target_mgr or self
+                st_url = f"https://{_tm.host}:{_tm.api_port}/api2/json/nodes/{target_node}/storage"
+                st_r = _tm._create_session().get(st_url, timeout=10)
                 if st_r.status_code == 200:
                     target_storage_names = {s['storage'] for s in st_r.json().get('data', []) if s.get('active')}
             except Exception:
@@ -5707,7 +5661,10 @@ done
             agent_script = self._SELF_FENCE_AGENT_SCRIPT
             agent_script = agent_script.replace('__MANAGER_IP__', manager_ip)
             agent_script = agent_script.replace('__OTHER_NODES__', other_nodes_str)
-            agent_script = agent_script.replace('__PEGAPROX_VMID__', str(self.ha_config.get('pegaprox_vmid', '')))
+            # sec (audit): substituted into a root-run agent script, so coerce rather than trust
+            # whatever landed in ha_config — a vmid is a number or nothing.
+            _pvmid = str(self.ha_config.get('pegaprox_vmid', '') or '')
+            agent_script = agent_script.replace('__PEGAPROX_VMID__', _pvmid if _pvmid.isdigit() else '')
             # MK 2026-06-03: bake the fence-strategy decision in at install
             # time. Default to 'quorum' if detection fails; 'wait' is only
             # selected for confirmed 2-node-no-qdevice topology so admins
@@ -6732,8 +6689,16 @@ echo "AGENT_INSTALLED_OK"
         try:
             import tempfile
 
+            # #717 — write a key OpenSSH can actually load (see _normalise_private_key).
+            # The sibling _ssh_run_command_with_key has always done this; this path did not,
+            # so a stored key missing its trailing newline failed here and nowhere else.
+            key_data = _normalise_private_key(key)
+            if not key_data:
+                self.logger.debug(f"[SSH] No usable private key configured for {host}")
+                return None
+
             with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.key') as f:
-                f.write(key)
+                f.write(key_data)
                 key_file = f.name
             os.chmod(key_file, 0o600)
             
@@ -7648,7 +7613,8 @@ echo "AGENT_INSTALLED_OK"
         if host and host.startswith('[') and host.endswith(']'):
             host = host[1:-1]
 
-        if not key_content or not key_content.strip():
+        key_content = _normalise_private_key(key_content)
+        if not key_content:
             return False
         
         key_fd = None
@@ -7660,11 +7626,8 @@ echo "AGENT_INSTALLED_OK"
             os.chmod(key_path, 0o600)
             
             with os.fdopen(key_fd, 'w') as f:
-                # Ensure key has proper newlines
-                key_data = key_content.strip()
-                if not key_data.endswith('\n'):
-                    key_data += '\n'
-                f.write(key_data)
+                # normalised above by _normalise_private_key (#717)
+                f.write(key_content)
             key_fd = None  # fd is now closed
             
             self.logger.info(f"[HA] Trying SSH with configured key...")
@@ -8386,6 +8349,30 @@ echo "AGENT_INSTALLED_OK"
             self.logger.error(f"Error removing from Proxmox HA: {e}")
             return {'success': False, 'error': str(e)}
     
+    def member_node_ip(self, node_name: str) -> Optional[str]:
+        """Resolve a node NAME to its management IP, but only for an actual cluster member.
+
+        sec (audit): several routes take <node> straight from the URL or the request body and
+        hand the result to _ssh_connect, which presents this cluster's STORED credentials. The
+        old idiom was `_get_node_ip(node) or node` — so an unresolvable name fell through to the
+        caller's own string and PegaProx dialled it, leaking the cluster root password/key to a
+        host of the caller's choosing. Reachable at node.view and storage.upload, both builtin
+        ROLE_USER permissions.
+
+        Returns None when the name is not a member or cannot be resolved. Callers must treat
+        None as "refuse", never as "use the name".
+        """
+        if not node_name or not isinstance(node_name, str):
+            return None
+        try:
+            members = self.nodes or {}
+        except Exception:
+            members = {}
+        if members and node_name not in members:
+            self.logger.warning(f"[NodeIP] refusing non-member node name '{node_name}'")
+            return None
+        return self._get_node_ip(node_name)
+
     def _get_node_ip(self, node_name: str) -> Optional[str]:
         """Thin wrapper around _get_node_ip_impl that gates on the per-node
         circuit breaker (skip lookups for known-dead nodes) and feeds the
@@ -9551,8 +9538,18 @@ echo "AGENT_INSTALLED_OK"
                 with context.wrap_socket(sock, server_hostname=self.config.host) as ssock:
                     cert_der = ssock.getpeercert(binary_form=True)
                     fingerprint = hashlib.sha256(cert_der).hexdigest()
-                    # Format as colon-separated
-                    fingerprint_formatted = ':'.join(fingerprint[i:i+2] for i in range(0, len(fingerprint), 2))
+                    # Format as colon-separated UPPERCASE hex.
+                    #
+                    # (#733) This is not cosmetic. PVE looks the fingerprint we hand it up as a
+                    # raw hash key with no case normalisation — PVE::APIClient::LWP does
+                    # `$fingerprint->{cache}->{$fp}`, and the $fp it compares against comes from
+                    # Net::SSLeay::X509_get_fingerprint, which formats with "%02X:" (uppercase).
+                    # A lowercase fingerprint parses fine (the pve-fingerprint-sha256 format
+                    # accepts [A-Fa-f0-9]) but never matches, so remote_migrate aborts on the
+                    # cert check and PVE returns a bare {"data":null}/500 with the real reason
+                    # swallowed. Every other fingerprint path here already uppercases —
+                    # api/vms.py:421, :470, :2748 — this one was the outlier.
+                    fingerprint_formatted = ':'.join(fingerprint[i:i+2].upper() for i in range(0, len(fingerprint), 2))
             
             return {
                 'success': True, 
@@ -10423,6 +10420,15 @@ echo "AGENT_INSTALLED_OK"
     
     def create_snapshot(self, node: str, vmid: int, vm_type: str, snapname: str, description: str = '', vmstate: bool = False) -> Dict[str, Any]:
         """create a snapshot"""
+        # sec (audit CRIT): snapname and node are interpolated into the API path below, and
+        # the route gates in front of us only ever check the vmid — so a name with dot-segments
+        # reached a different guest, or a different PVE endpoint entirely, as our root ticket.
+        # Enforced here rather than per route: every caller reaches the same URL.
+        if not validate_snapshot_name(snapname):
+            return {'success': False, 'error': 'Invalid snapshot name'}
+        if not validate_hostname(node):
+            return {'success': False, 'error': 'Invalid node name'}
+
         # LW: this was surprisingly annoying to get right
         if not self.is_connected:
             if not self.connect_to_proxmox():
@@ -10473,6 +10479,15 @@ echo "AGENT_INSTALLED_OK"
     
     def delete_snapshot(self, node: str, vmid: int, vm_type: str, snapname: str) -> Dict[str, Any]:
         """delete snapshot"""
+        # sec (audit CRIT): snapname and node are interpolated into the API path below, and
+        # the route gates in front of us only ever check the vmid — so a name with dot-segments
+        # reached a different guest, or a different PVE endpoint entirely, as our root ticket.
+        # Enforced here rather than per route: every caller reaches the same URL.
+        if not validate_snapshot_name(snapname):
+            return {'success': False, 'error': 'Invalid snapshot name'}
+        if not validate_hostname(node):
+            return {'success': False, 'error': 'Invalid node name'}
+
         if not self.is_connected:
             if not self.connect_to_proxmox():
                 return {'success': False, 'error': 'Could not connect to Proxmox'}
@@ -10495,7 +10510,15 @@ echo "AGENT_INSTALLED_OK"
             return {'success': False, 'error': str(e)}
     
     def rollback_snapshot(self, node: str, vmid: int, vm_type: str, snapname: str) -> Dict[str, Any]:
-        
+        # sec (audit CRIT): snapname and node are interpolated into the API path below, and
+        # the route gates in front of us only ever check the vmid — so a name with dot-segments
+        # reached a different guest, or a different PVE endpoint entirely, as our root ticket.
+        # Enforced here rather than per route: every caller reaches the same URL.
+        if not validate_snapshot_name(snapname):
+            return {'success': False, 'error': 'Invalid snapshot name'}
+        if not validate_hostname(node):
+            return {'success': False, 'error': 'Invalid node name'}
+
         if not self.is_connected:
             if not self.connect_to_proxmox():
                 return {'success': False, 'error': 'Could not connect to Proxmox'}
@@ -12679,7 +12702,9 @@ echo "AGENT_INSTALLED_OK"
         if not online_nodes:
             return [{'error': 'No target nodes available'}]
 
-        src_ip = self._get_node_ip(source_node) or source_node
+        src_ip = self.member_node_ip(source_node)
+        if not src_ip:
+            return [{'error': f'Unknown or unreachable source node {source_node!r}'}]
         src_path = self._resolve_storage_path(source_node, storage, content_type)
         if not src_path:
             return [{'error': f'Cannot resolve storage path on {source_node}'}]
@@ -12690,7 +12715,13 @@ echo "AGENT_INSTALLED_OK"
         ssh_pass = getattr(self.config, 'ssh_password', None) or self.config.pass_
 
         for tgt_node in online_nodes:
-            tgt_ip = self._get_node_ip(tgt_node) or tgt_node
+            # already an intersection with the live online-node list, but resolve it the same
+            # way as everything else so no path can regrow the caller-string fallback
+            tgt_ip = self.member_node_ip(tgt_node)
+            if not tgt_ip:
+                results.append({'node': tgt_node, 'success': False,
+                                'error': f'Unknown or unreachable node {tgt_node!r}'})
+                continue
             _, err = self._get_syncable_storage(tgt_node, storage, content_type)
             if err:
                 results.append({'node': tgt_node, 'success': False, 'error': err})
@@ -12812,7 +12843,9 @@ echo "AGENT_INSTALLED_OK"
     def _resolve_storage_path(self, node, storage, content_type='iso'):
         """Get filesystem path for a storage's ISO/template directory on a node"""
         try:
-            node_ip = self._get_node_ip(node) or node
+            node_ip = self.member_node_ip(node)
+            if not node_ip:
+                return None
             ssh = self._ssh_connect(node_ip)
             # use pvesm to get the base path
             subdir = 'template/iso' if content_type == 'iso' else 'template/cache'
@@ -15258,6 +15291,33 @@ echo "AGENT_INSTALLED_OK"
     # MK Mar 2026 - SSH-based node security scanning
     # =====================================================
 
+    def ssh_diagnose(self, node_name):
+        """Why an SSH-backed check could not run on this node — (code, detail), or None.
+
+        NS Sep 2026 (#717) — the compliance dashboard and the Harden-node panel both go
+        through _ssh_node_output, which answers None for every reason there is: no
+        credentials stored, node in reachability backoff, address unresolved, auth
+        rejected, host down. The caller then had a bare 502 to show, and the dashboard
+        just never loaded. This does not retry anything and does not probe — it reports
+        the reasons we already know, so the route can say which one it was. None means
+        nothing here explains it and it really was the connection.
+        """
+        blocked, remaining = self._is_node_blocked(node_name)
+        if blocked:
+            return ('NODE_BACKOFF',
+                    f"{node_name} is in reachability backoff for another {remaining}s "
+                    f"after repeated failures")
+        # config.pass_ holds the TOKEN SECRET when the cluster authenticates with an API
+        # token, not an SSH password — _ssh_node_output will happily offer it to sshd and
+        # get nowhere. Treating it as a credential is what made this report "connection
+        # failed" on exactly the setup it was written for.
+        has_password = bool(getattr(self.config, 'pass_', '')) and not getattr(self, '_using_api_token', False)
+        if not getattr(self.config, 'ssh_key', '') and not has_password:
+            return ('SSH_NO_CREDENTIALS',
+                    "this cluster authenticates with an API token and has no SSH key or "
+                    "password stored, and these checks read the node over SSH")
+        return None
+
     def _ssh_node_output(self, node_name, cmd, timeout=60):
         """Run command on a node, tries all available SSH auth methods.
         Returns stdout string or None.
@@ -16848,7 +16908,8 @@ echo DONE""",
                     return (node, vmid, ips, disk)
 
             tasks = [lambda r=r: fetch_one(r) for r in running]
-            results = run_concurrent(tasks, timeout=15.0)
+            # own pool — this is the one sweep whose size follows the estate, not the nodes
+            results = run_concurrent(tasks, timeout=15.0, pool=IP_SWEEP_POOL)
 
             with self._ip_cache_lock:
                 for result in results:

@@ -111,6 +111,7 @@ def list_plans():
     # allowed=None = all, unchanged (same pattern as the replication-jobs fix).
     from pegaprox.utils.auth import build_authz_user
     from pegaprox.utils.rbac import get_user_clusters
+    from pegaprox.api.helpers import caller_is_scoped
     _user = build_authz_user(request.session.get('user', ''), request.session)
     _allowed = get_user_clusters(_user)
     rows = db.query('SELECT * FROM site_recovery_plans ORDER BY created_at DESC')
@@ -119,6 +120,18 @@ def list_plans():
         p = dict(row)
         if _allowed is not None and p.get('source_cluster') not in _allowed and p.get('target_cluster') not in _allowed:
             continue
+        # sec (audit): the cluster filter alone left two holes. get_user_clusters returns None
+        # (= all) for a default-tenant VM-ACL user, so they saw every plan in the install; and a
+        # pool-scoped caller saw plans the detail route (_authz_plan_vms) refuses to open. Confine
+        # a genuinely scoped caller to the plans whose VMs they may all view.
+        if caller_is_scoped(_user, p.get('source_cluster') or ''):
+            _ok, _ = _authz_plan_vms(p)
+            if not _ok:
+                continue
+        # a list view has no use for the failover webhooks, and those URLs are bearer secrets —
+        # get_plan_detail (properly gated) still serves them.
+        p.pop('pre_failover_webhook', None)
+        p.pop('post_failover_webhook', None)
         for k in ('network_mappings', 'storage_mappings'):
             try:
                 p[k] = json.loads(p[k] or '{}')
@@ -221,6 +234,12 @@ def update_plan(plan_id):
     ok, err = check_cluster_access(plan['target_cluster'])
     if not ok:
         return err
+    # sec (private disclosure Sep 2026 — audit): the read/failover siblings gate the plan's VMs
+    # per-object (_authz_plan_vms); the write routes did not, so a co-tenant reaching the plan's
+    # clusters could edit/delete another tenant's DR plan (and repoint its failover webhooks). Match them.
+    ok, err = _authz_plan_vms(plan)
+    if not ok:
+        return err
 
     data = request.json or {}
     allowed = {'name', 'network_mappings', 'storage_mappings', 'auto_failover',
@@ -267,6 +286,9 @@ def delete_plan(plan_id):
     if not ok:
         return err
     ok, err = check_cluster_access(plan['target_cluster'])
+    if not ok:
+        return err
+    ok, err = _authz_plan_vms(plan)   # sec (audit): per-VM gate, matching the read/failover routes
     if not ok:
         return err
 
@@ -327,6 +349,12 @@ def add_plan_vm(plan_id):
     ok, err = check_cluster_access(plan['target_cluster'])
     if not ok:
         return err
+    # sec (audit): every other plan-mutating route gates the plan itself; this one only gated the
+    # VM being added, so a scoped caller could inject their VM into another tenant's DR plan and
+    # have it dragged along on the next failover.
+    ok, err = _authz_plan_vms(plan)
+    if not ok:
+        return err
 
     data = request.json or {}
     if not data.get('vmid'):
@@ -385,6 +413,9 @@ def update_plan_vm(plan_id, vm_id):
     ok, err = check_cluster_access(plan['target_cluster'])
     if not ok:
         return err
+    ok, err = _authz_plan_vms(plan)   # sec (audit): per-VM gate, matching the read/failover routes
+    if not ok:
+        return err
 
     db = get_db()
     row = db.query_one('SELECT * FROM site_recovery_vms WHERE id = ? AND plan_id = ?', (vm_id, plan_id))
@@ -424,6 +455,9 @@ def remove_plan_vm(plan_id, vm_id):
     ok, err = check_cluster_access(plan['target_cluster'])
     if not ok:
         return err
+    ok, err = _authz_plan_vms(plan)   # sec (audit): per-VM gate, matching the read/failover routes
+    if not ok:
+        return err
 
     db = get_db()
     row = db.query_one('SELECT vmid FROM site_recovery_vms WHERE id = ? AND plan_id = ?', (vm_id, plan_id))
@@ -450,6 +484,9 @@ def check_readiness(plan_id):
     if not ok:
         return err
     ok, err = check_cluster_access(plan['target_cluster'])
+    if not ok:
+        return err
+    ok, err = _authz_plan_vms(plan)   # sec (audit): per-VM gate, matching the read/failover routes
     if not ok:
         return err
 
@@ -714,6 +751,9 @@ def cleanup_test_failover(plan_id):
     ok, err = check_cluster_access(plan['target_cluster'])
     if not ok:
         return err
+    ok, err = _authz_plan_vms(plan)   # sec (audit): per-VM gate, matching the read/failover routes
+    if not ok:
+        return err
 
     from pegaprox.background.site_recovery import cleanup_test
     _safe_spawn_failover(cleanup_test, plan_id)
@@ -781,6 +821,9 @@ def cancel_action(plan_id):
     if not ok:
         return err
     ok, err = check_cluster_access(plan['target_cluster'])
+    if not ok:
+        return err
+    ok, err = _authz_plan_vms(plan)   # sec (audit): per-VM gate, matching the read/failover routes
     if not ok:
         return err
 

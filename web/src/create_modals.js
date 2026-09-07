@@ -1947,7 +1947,11 @@
                     if (rc.cluster_type === 'xcpng') {
                         setXcpConfig(prev => ({ ...prev, name: rc.name || '', host: rc.host || '', user: rc.user || '', pass: '', ssl_verification: rc.ssl_verification || false, migration_threshold: rc.migration_threshold || 20, check_interval: rc.check_interval || 300, auto_migrate: rc.auto_migrate || false, dry_run: rc.dry_run || false }));
                     } else {
-                        setConfig(prev => ({ ...prev, name: rc.name || '', host: rc.host || '', api_port: rc.api_port || 8006, node_ui_suffix: rc.node_ui_suffix || '', user: rc.user || '', pass: '', ssl_verification: rc.ssl_verification || false, migration_threshold: rc.migration_threshold || 20, migration_tolerance: rc.migration_tolerance || 10, check_interval: rc.check_interval || 300, auto_migrate: rc.auto_migrate || false, balance_containers: rc.balance_containers || false, balance_local_disks: rc.balance_local_disks || false, dry_run: rc.dry_run || false, ssh_key: '' }));
+                        // #762 — carry EVERY persisted cluster setting into the reconfigure form, not
+                        // just this subset. The omitted toggles (HA, ProxLB tags, predictive balancing +
+                        // its weights/baseline) started at their defaults, so hitting Re-configure quietly
+                        // switched them back off. The list GET already returns all of these.
+                        setConfig(prev => ({ ...prev, name: rc.name || '', host: rc.host || '', api_port: rc.api_port || 8006, node_ui_suffix: rc.node_ui_suffix || '', user: rc.user || '', pass: '', ssl_verification: rc.ssl_verification || false, migration_threshold: rc.migration_threshold || 20, migration_tolerance: rc.migration_tolerance || 10, check_interval: rc.check_interval || 300, auto_migrate: rc.auto_migrate || false, balance_containers: rc.balance_containers || false, balance_local_disks: rc.balance_local_disks || false, dry_run: rc.dry_run || false, ssh_key: '', ha_enabled: rc.ha_enabled || false, proxlb_tags_enabled: rc.proxlb_tags_enabled || false, predictive_balancing: rc.predictive_balancing || false, predictive_threshold: rc.predictive_threshold || 75, balance_cpu_weight: rc.balance_cpu_weight || 1.0, balance_mem_weight: rc.balance_mem_weight || 1.0, balance_io_weight: rc.balance_io_weight || 0.0, cpu_baseline: rc.cpu_baseline || null }));
                     }
                 }
             }, [isOpen, initialType, reconfigureConfig]);
@@ -2281,7 +2285,7 @@
                                     <label className="block text-sm font-medium text-gray-300 mb-2">{t('name')}</label>
                                     <input type="text" value={vmwConfig.name} onChange={e => setVmwConfig({...vmwConfig, name: e.target.value})} required
                                         className="w-full px-4 py-2.5 bg-proxmox-dark border border-proxmox-border rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-emerald-400 transition-colors"
-                                        placeholder="ESXi Host 1" />
+                                        placeholder={t('esxiServerNameExamplePlaceholder')} />
                                 </div>
                                 <div>
                                     <label className="block text-sm font-medium text-gray-300 mb-2">{t('host')}</label>
@@ -2301,10 +2305,10 @@
                                     <label className="block text-sm font-medium text-gray-300 mb-2">{t('password')}</label>
                                     <input type="password" value={vmwConfig.password} onChange={e => setVmwConfig({...vmwConfig, password: e.target.value})} required
                                         className="w-full px-4 py-2.5 bg-proxmox-dark border border-proxmox-border rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-emerald-400 transition-colors"
-                                        placeholder="Password" />
+                                        placeholder={t('password')} />
                                 </div>
                                 <div>
-                                    <label className="block text-sm font-medium text-gray-300 mb-2">Port</label>
+                                    <label className="block text-sm font-medium text-gray-300 mb-2">{t('port')}</label>
                                     <input type="number" value={vmwConfig.port} onChange={e => setVmwConfig({...vmwConfig, port: parseInt(e.target.value) || 443})}
                                         className="w-full px-4 py-2.5 bg-proxmox-dark border border-proxmox-border rounded-lg text-white focus:outline-none focus:border-emerald-400 transition-colors" />
                                 </div>
@@ -2316,7 +2320,7 @@
                                 <label className="block text-sm font-medium text-gray-300 mb-2">{t('notes') || 'Notes'} ({t('optional') || 'Optional'})</label>
                                 <input type="text" value={vmwConfig.notes} onChange={e => setVmwConfig({...vmwConfig, notes: e.target.value})}
                                     className="w-full px-4 py-2.5 bg-proxmox-dark border border-proxmox-border rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-emerald-400 transition-colors"
-                                    placeholder="Production ESXi host" />
+                                    placeholder={t('esxiServerNotesPlaceholder')} />
                             </div>
                             </>)}
 
@@ -2334,7 +2338,7 @@
                                     }`}>
                                     {loading ? t('connecting') : reconfigureConfig ? (t('reconfigure') || 'Re-configure')
                                         : connectionType === 'pbs' ? (t('addPbsServer') || 'Add Backup Server')
-                                        : connectionType === 'vmware' ? (t('addVmwareServer') || 'Add VMware')
+                                        : connectionType === 'vmware' ? t('addEsxiServer')
                                         : connectionType === 'xcpng' ? (t('addXcpngPool') || 'Add XCP-ng Pool')
                                         : t('addCluster')}
                                 </button>

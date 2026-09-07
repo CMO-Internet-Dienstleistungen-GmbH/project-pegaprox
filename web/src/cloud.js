@@ -475,6 +475,8 @@
                     <button type="button" className="cloud-nav-collapse" onClick={onToggle} title={collapsed ? 'Expand' : 'Collapse'}>
                         {collapsed ? <Icons.ChevronRight /> : <Icons.ChevronLeft />}
                     </button>
+                    {/* the nav is the one piece of chrome on screen in every cloud view */}
+                    {!collapsed && <LegalNotice style={{padding: '8px 6px'}} />}
                 </nav>
             );
         }
@@ -1927,6 +1929,7 @@
                             <img src="/images/oc_contribute_button.png" alt="Contribute on Open Collective" style={{ height: 26, opacity: 0.9 }} />
                         </a>
                     </div>
+                    <LegalNotice style={{marginTop: 12}} />
                 </footer>
             );
         }

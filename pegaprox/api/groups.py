@@ -16,7 +16,7 @@ from pegaprox.utils.audit import log_audit
 # MK 2026-06-04 (CWE-117): group_id from URL path goes into the logger below.
 from pegaprox.utils.sanitization import sanitize_log_message as _sl
 from pegaprox.utils.rbac import DEFAULT_TENANT_ID, get_user_clusters
-from pegaprox.api.helpers import load_server_settings, save_server_settings, check_cluster_access
+from pegaprox.api.helpers import load_server_settings, save_server_settings, check_cluster_access, require_unconfined
 
 bp = Blueprint('groups', __name__)
 
@@ -235,6 +235,9 @@ def rename_cluster(cluster_id):
     """Rename a cluster (set display_name) - requires admin.groups permission"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     
     data = request.json or {}
     new_name = data.get('display_name', '').strip() if data.get('display_name') is not None else None
@@ -279,6 +282,9 @@ def assign_cluster_to_group(cluster_id):
     """Assign a cluster to a group (or remove from group with null) - requires admin.groups permission"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     
     data = request.json or {}
     group_id = data.get('group_id')  # Can be None to ungroup
@@ -349,10 +355,18 @@ def toggle_group_collapse(group_id):
     db = get_db()
     
     # Verify group exists
-    group = db.query_one('SELECT id FROM cluster_groups WHERE id = ?', (group_id,))
+    group = db.query_one('SELECT id, tenant_id FROM cluster_groups WHERE id = ?', (group_id,))
     if not group:
         return jsonify({'error': 'Group not found'}), 404
-    
+    # sec (audit): this writes the same column update_cluster_group guards behind admin.groups,
+    # but had no tenant check at all — any account could flip any group, and the 404/200 split
+    # was a group-id oracle. Same rule as update_cluster_group.
+    from pegaprox.utils.auth import build_authz_user
+    _ut = _user_tenant(build_authz_user(getattr(request, 'session', {}).get('user', ''),
+                                        getattr(request, 'session', {}) or {}))
+    if _ut and (group['tenant_id'] is None or group['tenant_id'] != _ut):
+        return jsonify({'error': 'Group not found'}), 404
+
     db.execute('''
         UPDATE cluster_groups SET collapsed = ? WHERE id = ?
     ''', (1 if data.get('collapsed') else 0, group_id))
@@ -373,16 +387,23 @@ def get_cluster_group_status(group_id):
             return jsonify({'error': 'Group not found'}), 404
 
         # tenant check - same logic as the list endpoint
+        # sec (audit): three defects here. The identity was the raw stored record (an admin-owned
+        # scoped token read as admin, so _user_tenant returned None and the check was skipped);
+        # `group['tenant_id'] and ...` let ANY tenant through a global (NULL-tenant) group, the
+        # exact form update/delete_cluster_group were hardened away from; and the member clusters
+        # were aggregated with no per-cluster access check at all.
+        from pegaprox.utils.auth import build_authz_user
         usr = getattr(request, 'session', {}).get('user', 'system')
-        users = load_users()
-        user = users.get(usr, {})
+        user = build_authz_user(usr, getattr(request, 'session', {}) or {})
         tenant_id = _user_tenant(user)
         if tenant_id:
-            if group['tenant_id'] and group['tenant_id'] != tenant_id:
+            if group['tenant_id'] is None or group['tenant_id'] != tenant_id:
                 return jsonify({'error': 'Access denied'}), 403
 
         clusters = db.query('SELECT id FROM clusters WHERE group_id = ?', (group_id,))
         cluster_ids = [c['id'] for c in clusters] if clusters else []
+        # only aggregate the members this caller can actually reach
+        cluster_ids = [cid for cid in cluster_ids if check_cluster_access(cid)[0]]
 
         # aggregate stats across all clusters in group
         total_nodes_online = 0
@@ -496,9 +517,11 @@ def get_cluster_group_lb_history(group_id):
         return jsonify({'error': 'Group not found'}), 404
 
     # M-3: don't leak another tenant's xclb audit trail. Admins/default unscoped.
+    # sec (audit): raw record + the NULL-tenant short-circuit, same as the status route above.
+    from pegaprox.utils.auth import build_authz_user
     usr = getattr(request, 'session', {}).get('user', 'system')
-    _ut = _user_tenant(load_users().get(usr, {}))
-    if _ut and group['tenant_id'] and group['tenant_id'] != _ut:
+    _ut = _user_tenant(build_authz_user(usr, getattr(request, 'session', {}) or {}))
+    if _ut and (group['tenant_id'] is None or group['tenant_id'] != _ut):
         return jsonify({'error': 'Access denied'}), 403
 
     # MK: grab anything tagged with xclb.* that mentions this group
@@ -563,6 +586,9 @@ def update_node_options_api(cluster_id, node):
     """Update node options"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -599,6 +625,9 @@ def refresh_node_apt_api(cluster_id, node):
     """Refresh APT package database"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404

@@ -2,6 +2,7 @@
 """auth routes (login, logout, 2FA, OIDC, API tokens) - split from monolith dec 2025, NS"""
 
 import time
+import threading
 import logging
 import secrets
 import base64
@@ -16,11 +17,11 @@ from pegaprox.core.db import get_db
 
 from pegaprox.utils.auth import (
     hash_password, verify_password, needs_password_rehash,
-    validate_password_policy, load_users, save_users,
+    validate_password_policy, load_users, save_users, save_single_user,
     create_initial_admin, is_initialized,
     create_session, validate_session, invalidate_session,
     invalidate_all_user_sessions, cleanup_expired_sessions,
-    generate_api_token, create_api_token, validate_api_token,
+    generate_api_token, create_api_token, validate_api_token, revoke_user_api_tokens,
     list_user_tokens, revoke_api_token, require_auth,
     generate_session_id, mark_admin_initialized, ensure_api_tokens_table,
     dummy_verify_password,
@@ -487,6 +488,24 @@ def auth_setup():
     })
 
 
+_totp_used = {}
+_totp_used_lock = threading.Lock()
+
+
+def _totp_replayed(username, code):
+    """True if this (user, code) pair was already accepted inside the current acceptance
+    window. valid_window=1 spans ~90s, so remember for a little longer than that."""
+    now = time.time()
+    key = (username or '', str(code or ''))
+    with _totp_used_lock:
+        for k, t in [(k, t) for k, t in _totp_used.items() if now - t > 120]:
+            _totp_used.pop(k, None)
+        if key in _totp_used:
+            return True
+        _totp_used[key] = now
+    return False
+
+
 @bp.route('/api/auth/login', methods=['POST'])
 def auth_login():
     """login endpoint - MK"""
@@ -580,6 +599,16 @@ def auth_login():
         locked = False
         log_audit(target_username or 'unknown', 'auth.login_failed',
                   f"Failed login from {client_ip}" + (f" for user '{target_username}'" if target_username else ""))
+
+        # sec (audit): entries were removed only on a successful login from the same IP, so a
+        # rotating source (an IPv6 /64 is free) grew these dicts without bound. Sweep anything
+        # whose newest attempt is outside the window and whose lockout has expired.
+        _cutoff = current_time - attempt_window
+        for _store in (login_attempts_by_ip, login_attempts_by_user):
+            for _k in [k for k, v in list(_store.items())
+                       if v.get('locked_until', 0) < current_time
+                       and max((v.get('attempts') or [0])) < _cutoff]:
+                _store.pop(_k, None)
 
         # Track by IP
         if client_ip not in login_attempts_by_ip:
@@ -754,6 +783,12 @@ def auth_login():
         elif totp_code and has_totp:
             if TOTP_AVAILABLE:
                 totp = pyotp.TOTP(user['totp_secret'])
+                # sec (audit): RFC 6238 5.2 — a code must be accepted once. valid_window=1
+                # gives a ~90s window in which an intercepted code was replayable.
+                if _totp_replayed(username, totp_code):
+                    logging.warning(f"Replayed 2FA code for user: {username} from {client_ip}")
+                    record_failed_attempt(username)
+                    return jsonify({'error': 'Invalid 2FA code'}), 401
                 if not totp.verify(totp_code, valid_window=1):
                     logging.warning(f"Invalid 2FA code for user: {username} from {client_ip}")
                     locked = record_failed_attempt(username)
@@ -792,7 +827,7 @@ def auth_login():
             new_salt, new_hash = hash_password(password)
             user['password_salt'] = new_salt
             user['password_hash'] = new_hash
-            save_users(users_db)
+            save_single_user(username, user)
             logging.info(f"Migrated password for user '{username}' to Argon2id (Military Grade)")
         except Exception as e:
             logging.warning(f"Failed to migrate password for {username}: {e}")
@@ -803,7 +838,7 @@ def auth_login():
     
     # Update last login
     user['last_login'] = datetime.now().isoformat()
-    save_users(users_db)
+    save_single_user(username, user)
     
     logging.info(f"User '{username}' logged in successfully")
     log_audit(username, 'user.login', f"User logged in" + (" (with 2FA)" if user.get('totp_enabled') else ""))
@@ -965,6 +1000,14 @@ def auth_logout():
         if session:
             logging.info(f"User '{session['user']}' logged out")
             log_audit(session['user'], 'user.logout', f"User logged out")
+        # sec (audit): logout dropped the session but left a live SSE token (and its already-open
+        # stream) behind for up to its full 10-minute TTL.
+        try:
+            from pegaprox.utils.realtime import invalidate_user_sse_tokens, invalidate_user_ws_tokens
+            invalidate_user_sse_tokens(session['user'])
+            invalidate_user_ws_tokens(session['user'])
+        except Exception:
+            pass
         invalidate_session(session_id)
     
     response = jsonify({'success': True})
@@ -1298,7 +1341,10 @@ def get_cluster_creds_internal(cluster_id):
     # ships self-signed certs by default; admins flip it on in cluster settings
     # once they've installed a real cert + uploaded the CA).
     ssh_port = getattr(getattr(mgr, 'config', None), 'ssh_port', 22) or 22
-    verify_pve_tls = bool(getattr(mgr, 'ssl_verify', False))
+    # NB: the attribute is _ssl_verify (manager.py:547/1131) — the public name never existed here,
+    # so this silently reported False and the console subprocess pinned CERT_NONE even when the
+    # admin had enabled verification. The ws-token twin (realtime.py) always had it right.
+    verify_pve_tls = bool(getattr(mgr, '_ssl_verify', False))
     # NS 2026-06-05 (C-1): the termproxy WS proxy gets the PVE session cookie
     # from here (server-side) instead of the browser. Mint fresh; None for
     # token-only clusters. Other consumers (SSH) ignore the field.
@@ -1487,16 +1533,19 @@ def auth_change_password():
         user['is_default'] = False
         mark_admin_initialized()
 
-    save_users(users_db)
+    save_single_user(username, user)
     
     # NS 2026-04-24 — security audit finding #1: invalidate ALL sessions including the
     # caller's current one. If a stolen cookie is the one changing the password, we don't
     # want it to keep access. Frontend reads relogin_required and redirects to /login.
     current_session_id = request.cookies.get('session_id') or request.headers.get('X-Session-ID')
     sessions_removed = invalidate_all_user_sessions(username)  # no except_session — all go
+    tokens_revoked = revoke_user_api_tokens(username)  # sec (audit): tokens survived a password change
+    from pegaprox.utils.realtime import invalidate_user_sse_tokens
+    invalidate_user_sse_tokens(username)               # ...as did the SSE stream token
 
-    logging.info(f"User '{username}' changed their password — all sessions invalidated")
-    log_audit(username, 'user.password_changed', f"Password changed, {sessions_removed} session(s) invalidated (incl. current)")
+    logging.info(f"User '{username}' changed their password — all sessions invalidated, {tokens_revoked} token(s) revoked")
+    log_audit(username, 'user.password_changed', f"Password changed, {sessions_removed} session(s) invalidated (incl. current), {tokens_revoked} API token(s) revoked")
 
     resp = jsonify({
         'success': True,
@@ -1542,7 +1591,7 @@ def setup_2fa():
     
     # Store pending secret (not activated yet)
     user['totp_pending_secret'] = secret
-    save_users(users_db)
+    save_single_user(username, user)
     logging.info(f"2FA setup: saved pending secret for user {username}")  # MK: Debug
     
     # Generate provisioning URI
@@ -1612,7 +1661,7 @@ def verify_2fa_setup():
     user['totp_secret'] = pending_secret
     user['totp_enabled'] = True
     del user['totp_pending_secret']
-    save_users(users_db)
+    save_single_user(username, user)
     
     logging.info(f"User '{username}' enabled 2FA")
     log_audit(username, '2fa.enabled', "User enabled 2FA")
@@ -1663,7 +1712,7 @@ def disable_2fa():
     user['totp_enabled'] = False
     user.pop('totp_secret', None)
     user.pop('totp_pending_secret', None)
-    save_users(users_db)
+    save_single_user(username, user)
     
     logging.info(f"User '{username}' disabled 2FA")
     log_audit(username, '2fa.disabled', "User disabled 2FA")
@@ -1710,7 +1759,10 @@ def list_api_tokens():
     
     # MK 2026-06-10 (RBAC): the admin.api perm (not the admin role) sees all tokens — admin holds it via all-perms.
     from pegaprox.utils.rbac import has_permission as _has_perm
-    if _has_perm(load_users().get(username, {}), 'admin.api') and request.args.get('all') == 'true':
+    from pegaprox.utils.auth import build_authz_user
+    # sec (audit): the raw record kept the OWNER's admin role, so an admin-owned viewer token
+    # could enumerate every user's tokens here (and revoke any of them below).
+    if _has_perm(build_authz_user(username, request.session), 'admin.api') and request.args.get('all') == 'true':
         try:
             db = get_db()
             cursor = db.conn.cursor()
@@ -1784,7 +1836,8 @@ def revoke_api_token_endpoint(token_id):
     
     # MK 2026-06-10 (RBAC): the admin.api perm can revoke any token (admin holds it via all-perms).
     from pegaprox.utils.rbac import has_permission as _has_perm
-    if _has_perm(load_users().get(username, {}), 'admin.api'):
+    from pegaprox.utils.auth import build_authz_user
+    if _has_perm(build_authz_user(username, request.session), 'admin.api'):
         try:
             db = get_db()
             cursor = db.conn.cursor()

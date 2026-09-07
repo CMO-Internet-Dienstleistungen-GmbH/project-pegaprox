@@ -16,6 +16,7 @@ import gc
 import multiprocessing
 import ssl
 import socket
+from greenlet import GreenletExit
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -190,7 +191,12 @@ def create_app():
                 origin = request.headers.get('Origin', '')
                 referer = request.headers.get('Referer', '')
                 allowed_origins = get_allowed_origins() or []
-                fwd_host = request.headers.get('X-Forwarded-Host', '')
+                # NS: only trust the forwarded host from a trusted proxy — otherwise a client
+                # sets X-Forwarded-Host to its own domain and its foreign Origin matches.
+                # (Same discipline as X-Forwarded-Proto in add_security_headers below.)
+                from pegaprox.utils.audit import _is_trusted_proxy
+                fwd_host = (request.headers.get('X-Forwarded-Host', '')
+                            if _is_trusted_proxy(request.remote_addr) else '')
 
                 # NS May 2026 (#382 follow-up) — safer Origin matcher.
                 # The previous version used `value.startswith(f"{scheme}://{host}")`
@@ -300,7 +306,13 @@ def create_app():
                 # in non-browser contexts).
                 # MK May 2026: Referer parses as a full URL — pass it directly to
                 # _origin_ok which now uses urlparse, no manual splitting needed.
-                ok_origin = _origin_ok(origin) or _origin_ok(referer)
+                # Origin is authoritative when the browser sends it: a matching Referer must not
+                # rescue a foreign Origin (the `origin and not _origin_ok(origin)` guard below sits
+                # inside the not-ok_origin branch, so a same-host Referer skipped it entirely).
+                if origin:
+                    ok_origin = _origin_ok(origin)
+                else:
+                    ok_origin = _origin_ok(referer)
                 if not ok_origin:
                     # If neither Origin nor Referer matches, only allow when XHR
                     # marker is set AND there's no foreign Origin/Referer.
@@ -384,6 +396,15 @@ def _check_api_rate_limit(client_ip: str) -> bool:
     current_time = time.time()
 
     with g.api_rate_limit_lock:
+        # sec (audit): this map is keyed by an unauthenticated remote IP and entries were only
+        # ever added — a rotating source (an IPv6 /64 costs nothing) grew it without bound.
+        # Sweep windows that have already expired; the check below resets a live one anyway.
+        if len(g.api_request_counts) > 1024:
+            _stale = [ip for ip, i in g.api_request_counts.items()
+                      if current_time - i.get('window_start', 0) > API_RATE_WINDOW]
+            for _ip in _stale:
+                g.api_request_counts.pop(_ip, None)
+
         if client_ip not in g.api_request_counts:
             g.api_request_counts[client_ip] = {'count': 1, 'window_start': current_time}
             return True
@@ -1220,7 +1241,11 @@ def main(debug_mode=False):
 
 
 def _start_console_servers(bind_host, port, ssl_context):
-    """Start VNC and SSH WebSocket servers on port+1 and port+2."""
+    """Start VNC and SSH WebSocket servers on port+1 and port+2.
+
+    Returns the SSH WebSocket subprocess (a Popen) so the caller can terminate it on
+    shutdown. The VNC server is a daemon thread and needs no handle; the SSH server is a
+    long-running asyncio subprocess that would otherwise outlive us. (#780)"""
     vnc_ws_port = port + 1
     ssh_ws_port = port + 2
 
@@ -1228,25 +1253,31 @@ def _start_console_servers(bind_host, port, ssl_context):
         from pegaprox.api.vms import start_vnc_websocket_server, start_ssh_websocket_server
     except ImportError as e:
         print(f"WARNING: Console WebSocket servers not available: {e}")
-        return
+        return None
 
     # NS Feb 2026 - asyncio/websockets creates IPv6-only socket for '::' (#95)
     # Use '' so asyncio binds to ALL interfaces (creates both IPv4 + IPv6 listeners)
     console_host = '' if bind_host == '::' else bind_host
 
     # MK Feb 2026 - start each server independently so one failure doesn't block the other
+    ssh_proc = None
     for name, start_fn, ws_port in [
         ("VNC", start_vnc_websocket_server, vnc_ws_port),
         ("SSH", start_ssh_websocket_server, ssh_ws_port),
     ]:
         try:
             if ssl_context:
-                start_fn(ws_port, ssl_cert=ssl_context[0], ssl_key=ssl_context[1], host=console_host)
+                result = start_fn(ws_port, ssl_cert=ssl_context[0], ssl_key=ssl_context[1], host=console_host)
             else:
-                start_fn(ws_port, host=console_host)
+                result = start_fn(ws_port, host=console_host)
+            # only the SSH server hands back a live subprocess
+            if name == "SSH" and result is not None:
+                ssh_proc = result
         except Exception as e:
             print(f"ERROR: {name} WebSocket server (port {ws_port}) failed to start: {e}")
             logging.error(f"{name} WebSocket server startup failed: {e}", exc_info=True)
+
+    return ssh_proc
 
 
 def _test_ipv6_available():
@@ -1397,6 +1428,38 @@ def _create_listener(bind_host, port_num):
         return (bind_host, port_num)
 
 
+# #777 (Frisch12) — the gevent pywsgi request pool holds one greenlet per CONNECTION, and an idle
+# keep-alive (or a client that finished the TLS handshake then went silent) parks in
+# read_requestline forever, pinning its pool slot; once the pool fills, gevent.baseserver stops
+# accepting and the whole instance goes unreachable while the process sits idle. This mixin bounds
+# ONLY the inter-request idle read — a request that is actually being served (headers/body, SSE
+# streams, uploads, websocket upgrades) is never touched. PEGAPROX_KEEPALIVE_TIMEOUT=0 restores the
+# old unbounded behaviour.
+_KEEPALIVE_IDLE_TIMEOUT = float(os.environ.get('PEGAPROX_KEEPALIVE_TIMEOUT', '75'))
+
+
+class _IdleTimeoutMixin:
+    """Bound the idle wait for the next request line. Compose ahead of a gevent pywsgi handler
+    class in the MRO so `super().read_requestline()` reaches the real handler."""
+    _idle_timeout = _KEEPALIVE_IDLE_TIMEOUT
+
+    def read_requestline(self):
+        to = self._idle_timeout
+        if not to or to <= 0:
+            return super().read_requestline()          # disabled → old unbounded behaviour
+        import gevent
+        t = gevent.Timeout(to)
+        t.start()
+        try:
+            return super().read_requestline()
+        except gevent.Timeout as ex:
+            if ex is t:
+                return b''    # idle → empty requestline; gevent closes the conn, slot returns
+            raise
+        finally:
+            t.close()
+
+
 def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, http_redirect_port=-1):
     """Start production server with Gevent."""
     from gevent.pywsgi import WSGIServer
@@ -1520,14 +1583,18 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
     # Custom error handler to suppress SSL errors (from bots/scanners/disconnects)
     class QuietWSGIServer(WSGIServer):
         def wrap_socket_and_handle(self, client_socket, address):
-            """Override to catch SSL errors during handshake"""
+            """Override to catch SSL errors and the shutdown GreenletExit during handshake"""
             try:
                 return super().wrap_socket_and_handle(client_socket, address)
+            except GreenletExit:
+                # gevent cancels connection greenlets on stop(); expected at exit, and it
+                # is a BaseException so the handler below would never see it. Its siblings
+                # (KeyboardInterrupt, SystemExit, GeneratorExit) are deliberately not caught.
+                return
             except Exception as e:
                 if 'ssl' in str(type(e).__name__).lower() or 'ssl' in str(e).lower():
-                    pass
-                else:
-                    raise
+                    return
+                raise
 
         def handle_error(self, *args):
             """Suppress SSL errors - they're normal with self-signed certs"""
@@ -1560,7 +1627,17 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
             if not self.ssl_args:
                 return super().wrap_socket_and_handle(client_socket, address)
             try:
-                first_byte = client_socket.recv(1, socket.MSG_PEEK)
+                # #777 — bound the pre-request wait: a client that opens the socket but never
+                # sends a byte would otherwise park here holding a pool slot until TCP gives up.
+                # Drop it after the keep-alive idle window (None = disabled = old blocking behaviour).
+                import gevent as _gv
+                _pk = _KEEPALIVE_IDLE_TIMEOUT if _KEEPALIVE_IDLE_TIMEOUT > 0 else None
+                try:
+                    with _gv.Timeout(_pk):
+                        first_byte = client_socket.recv(1, socket.MSG_PEEK)
+                except _gv.Timeout:
+                    client_socket.close()
+                    return
                 if not first_byte:
                     client_socket.close()
                     return
@@ -1684,9 +1761,18 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
     # `workers`; per-request fanouts (storage scan, PBS scan, SSH calls)
     # still spawn inside their own request handler.
     from gevent.pool import Pool as _RequestPool
-    server_kwargs = {'log': None, 'spawn': _RequestPool(workers)}
+
+    # #777 — compose the idle-read timeout (module-scope _IdleTimeoutMixin) onto whichever handler
+    # is in use, so an idle keep-alive hands its request-pool slot back instead of pinning it.
+    from gevent.pywsgi import WSGIHandler as _BaseWSGIHandler
     if use_websocket_handler and QuietWebSocketHandler:
-        server_kwargs['handler_class'] = QuietWebSocketHandler
+        class _IdleTimeoutHandler(_IdleTimeoutMixin, QuietWebSocketHandler):
+            pass
+    else:
+        class _IdleTimeoutHandler(_IdleTimeoutMixin, _BaseWSGIHandler):
+            pass
+
+    server_kwargs = {'log': None, 'spawn': _RequestPool(workers), 'handler_class': _IdleTimeoutHandler}
 
     is_ipv6_bind = ':' in bind_host
 
@@ -1715,14 +1801,29 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
         print("WARNING: Running without HTTPS - noVNC console may not work!", flush=True)
         http_server = QuietWSGIServer(_create_listener(bind_host, port), app, **server_kwargs)
 
-    # Start VNC/SSH WebSocket servers
-    _start_console_servers(bind_host, port, ssl_context)
+    # Start VNC/SSH WebSocket servers. The SSH one hands back its subprocess so the
+    # shutdown path can stop it; the VNC server is a daemon thread and needs no handle.
+    ssh_ws_proc = _start_console_servers(bind_host, port, ssl_context)
 
-    # Handle graceful shutdown
+    # Handle graceful shutdown (#780 / #784)
     def signal_handler(signum, frame):
         print("\nShutting down gracefully...")
-        http_server.stop()
-        sys.exit(0)
+        # terminate() sends SIGTERM and returns immediately, so it is safe from the hub's
+        # signal callback. The SSH WebSocket server is a separate process sitting on an
+        # endless asyncio Future — nothing else ever stops it, so it survived us and got
+        # reparented to init.
+        if ssh_ws_proc is not None and ssh_ws_proc.poll() is None:
+            try:
+                ssh_ws_proc.terminate()
+            except Exception:
+                pass
+        # gevent runs signal handlers inside the hub greenlet, and http_server.stop()
+        # blocks on pool.join() — illegal there, which is the BlockingSwitchOutError that
+        # made a systemd stop exit 1. Defer it to its own greenlet and bound the join so a
+        # long-lived SSE or WebSocket connection cannot hold shutdown open. serve_forever()
+        # returns once stop() sets the stop event, so there is no sys.exit() to make here.
+        from gevent import spawn
+        spawn(lambda: http_server.stop(timeout=10))
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)

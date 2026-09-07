@@ -414,6 +414,72 @@ def check_cluster_access(cluster_id):
     return True, None
 
 
+def caller_is_scoped(user, cluster_id):
+    """True when this caller is confined to specific resources in `cluster_id`.
+
+    Confined means: they reached the cluster through a non-owning tenant (the #248 ACL / #555 pool
+    fallback in check_cluster_access), OR they hold a pool grant here, OR they hold any VM-ACL entry
+    here. Admins and plain cluster-wide operators (their tenant owns the cluster and they have no
+    pool/ACL grant) are NOT confined and keep whole-cluster views.
+
+    sec (private disclosure Sep 2026 — audit): the confinement predicate was open-coded in several
+    endpoints as `(not is_owner) or user_has_any_pool_access(...)`, which misses the VM-ACL-scoped
+    caller whose tenant DOES own the cluster — the Client Portal case. Those endpoints therefore
+    treated a portal user as a cluster-wide operator and handed back the whole cluster. Centralised
+    here so the rule can't drift between call sites again."""
+    from pegaprox.models.permissions import ROLE_ADMIN
+    from pegaprox.utils.rbac import get_user_clusters, user_has_any_pool_access, get_vm_acls
+    if not user:
+        return True   # unknown identity → treat as confined (fail closed)
+    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+        return False
+    tenant_clusters = get_user_clusters(user, include_pools=False)
+    if tenant_clusters is not None and cluster_id not in tenant_clusters:
+        return True
+    try:
+        if user_has_any_pool_access(user, cluster_id):
+            return True
+    except Exception:
+        return True
+    username = user.get('username', '')
+    try:
+        for _vmid, acl in (get_vm_acls().get(cluster_id, {}) or {}).items():
+            if username in (acl.get('users') or []):
+                return True
+    except Exception:
+        return True
+    return False
+
+
+def scope_vm_rows(cluster_id, rows, *, vmid_key='vmid', type_key='type'):
+    """Filter a list of per-VM row dicts to the VMs the current caller may actually see.
+
+    MK Sep 2026 (#773 follow-up audit) — several read endpoints (costs / power / topology /
+    top-vms) enumerate EVERY VM on a cluster via get_vm_resources() and hand back per-VM rows
+    (vmid / name / node / usage / cost). check_cluster_access above only gates cluster
+    REACHABILITY — its own #555 pool fallback (line 402) admits a pool-scoped user and defers
+    "per-VM gating downstream" — so without this filter a pool-/ACL-scoped user received per-VM
+    data for VMs outside their grant (the same class as the #773 /resources leak).
+
+    Admins and plain cluster-wide operators keep every row (user_can_access_vm returns True for
+    them); a pool-/ACL-scoped caller is confined to their VMs. A row whose vmid can't be parsed
+    is dropped (fail closed). Cheap at scale: the pool-perm read behind user_can_access_vm is
+    request-memoised (rbac._pool_perms_for), so this is one DB read for the whole list."""
+    from flask import request
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import user_can_access_vm
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    out = []
+    for r in rows or []:
+        try:
+            vmid = int(r.get(vmid_key))
+        except (TypeError, ValueError):
+            continue
+        if user_can_access_vm(user, cluster_id, vmid, 'vm.view', r.get(type_key)):
+            out.append(r)
+    return out
+
+
 def check_pbs_access(pbs_id):
     """Check if current user can access a PBS server based on its linked clusters.
     Returns (True, None) if allowed, (False, error_response) if not.
@@ -463,6 +529,24 @@ def check_pbs_access(pbs_id):
             return True, None
     
     return False, (jsonify({'error': 'Access denied to this PBS server'}), 403)
+
+
+def require_unconfined(cluster_id):
+    """sec (audit): guard for a WHOLE-CLUSTER operation — one with no per-object notion, so
+    user_can_access_vm has nothing to ask about: rebooting a node, draining it, rewriting the
+    cluster's credentials or network, arming fencing, wiping a disk.
+
+    check_cluster_access gates reachability and its #248/#555 fallbacks deliberately admit a
+    pool-/ACL-scoped caller, deferring the real decision downstream. For these routes downstream
+    is where the decision has to happen, and the only correct answer for a confined caller is no.
+
+    Returns an error response to `return`, or None when the caller may proceed."""
+    from flask import request, jsonify
+    from pegaprox.utils.auth import build_authz_user
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    if caller_is_scoped(user, cluster_id):
+        return jsonify({'error': 'Access denied: this action affects the whole cluster'}), 403
+    return None
 
 
 def check_vmware_access(vmware_id):

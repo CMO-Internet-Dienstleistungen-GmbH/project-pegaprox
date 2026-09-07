@@ -7,10 +7,11 @@ WebSocket, SSE, and email test endpoints.
 import json
 import logging
 import threading
+import time
 import uuid
 import queue as queue_module
 from datetime import datetime
-from flask import Blueprint, jsonify, request, Response
+from flask import Blueprint, jsonify, request, Response, has_request_context
 
 from flask_sock import Sock
 # MK 2026-06-04 (CWE-117 log-injection scanner findings): strip CR/LF/U+2028/9
@@ -84,12 +85,26 @@ def ws_live_updates(ws):
         _allowed = get_user_clusters(_user_data or {})  # None = admin (all clusters)
         subscribed_clusters = _scope_ws_clusters(_allowed, auth_data.get('clusters', None))
 
+        # sec (audit): the delivery loop now filters per-VM 'action' frames for non-admins, and
+        # `subscribed is None` does NOT mean admin (get_user_clusters returns None for a
+        # default-tenant scoped user too) — capture the real role once, like the SSE path does.
+        # Fail closed: an unresolvable identity is treated as non-admin and gets filtered.
+        _is_admin = (_user_data or {}).get('role') == ROLE_ADMIN
+
         with ws_clients_lock:
             ws_clients[client_id] = {
                 'ws': ws,
                 'lock': client_lock,
                 'user': username,
                 'clusters': subscribed_clusters,
+                'is_admin': _is_admin,
+                # the stored record carries no effective_role — a WebSocket can only be
+                # session-authenticated (validate_api_token never writes to active_sessions),
+                # so the account's own role IS the effective one. Named explicitly rather than
+                # left None, so the per-frame filters get a definite answer and a custom role
+                # resolves as itself instead of falling back to the stored-role default.
+                'effective_role': (_user_data or {}).get('effective_role')
+                                  or (_user_data or {}).get('role'),
                 'connected_at': datetime.now().isoformat()
             }
 
@@ -97,7 +112,29 @@ def ws_live_updates(ws):
         ws.send(json.dumps({'type': 'connected', 'client_id': client_id}))
 
         # Keep connection alive
+        _next_authz = time.monotonic() + SSE_REAUTHZ_INTERVAL
         while True:
+            # sec (audit): identity, cluster scope and is_admin were all resolved during the
+            # handshake and then frozen for the life of the socket, with no re-check anywhere —
+            # not even a dead one. Disabling, deleting or demoting an account left it receiving
+            # live frames until the client hung up. Same interval and same fail-closed rule as
+            # the SSE twin; ws.receive below wakes us at least that often.
+            if time.monotonic() >= _next_authz:
+                _next_authz = time.monotonic() + SSE_REAUTHZ_INTERVAL
+                _acct = _stream_identity(username)
+                if _acct is None or not _acct.get('enabled', True):
+                    logging.info(f"[WS] closing stream for '{_sl(username)}' — account gone or disabled")
+                    break
+                _allowed = get_user_clusters(_acct)
+                with ws_clients_lock:
+                    _ci = ws_clients.get(client_id)
+                    if _ci is not None:
+                        _acct_role = _acct.get('effective_role') or _acct.get('role')
+                        _ci['is_admin'] = _acct_role == ROLE_ADMIN
+                        _ci['effective_role'] = _acct_role
+                        # a demotion has to narrow the LIVE subscription too, not just future ones
+                        _ci['clusters'] = _scope_ws_clusters(_allowed, _ci.get('clusters'))
+
             try:
                 # Wait for incoming messages with timeout
                 msg = ws.receive(timeout=30)
@@ -139,16 +176,84 @@ def ws_live_updates(ws):
         logging.info(f"WebSocket client disconnected: {client_id}")
 
 
+def _floor_by_token_role(user, token_role):
+    """Cap a stored user record at the role its ws/API token was issued with, so a token can
+    never out-rank itself through its owner's account. Mirrors build_authz_user / the inline
+    floor in api/helpers.check_cluster_access; a non-builtin (custom) role name is kept as-is,
+    exactly like build_authz_user does, so the tenant remap still resolves."""
+    from pegaprox.models.permissions import ROLE_ADMIN, ROLE_USER, ROLE_VIEWER
+    if not isinstance(user, dict) or not token_role:
+        return user
+    _h = {ROLE_ADMIN: 3, ROLE_USER: 2, ROLE_VIEWER: 1}
+    if token_role not in _h:
+        return {**user, 'effective_role': token_role}
+    _eff = min(_h[token_role], _h.get(user.get('role'), 1))
+    return {**user, 'effective_role': next((r for r, lvl in _h.items() if lvl == _eff), ROLE_VIEWER)}
+
+
+# how often an open SSE stream re-reads its own account. One indexed read per client.
+SSE_REAUTHZ_INTERVAL = 30
+
+# sec (audit): an SSE stream is an open response, so it holds a request-pool slot for as long
+# as it lives — the #777 idle-connection reaper cannot touch it, because it is not idle. There
+# was no bound at all, so any authenticated account could open streams until the pool was gone
+# and the whole UI stopped answering. Generous enough for a wall of browser tabs; the oldest
+# stream of the same account is superseded rather than the new one refused, so a reconnect
+# (which the frontend does on its own watchdog) never locks the user out of their own session.
+MAX_SSE_STREAMS_PER_USER = 20
+
+
+def _supersede_oldest_streams(username):
+    """Drop this user's oldest streams once they are over the cap. Call with sse_clients_lock
+    held; the generators notice they were dropped and close on their next frame."""
+    mine = sorted(((c.get('connected_at', ''), cid) for cid, c in sse_clients.items()
+                   if c.get('user') == username))
+    for _, cid in mine[:max(0, len(mine) - MAX_SSE_STREAMS_PER_USER + 1)]:
+        sse_clients.pop(cid, None)
+        logging.info(f"[SSE] superseded stream {cid} — '{_sl(username)}' over the per-user cap")
+
+
+def _stream_identity(username):
+    """Identity for SSE cluster scoping. Two reasons not to use load_users() here, both already
+    learned on the WebSocket twins in this file: it can transiently degrade to {} under gevent/WAL
+    contention, and an EMPTY dict resolves to "all clusters" in get_user_clusters (default tenant,
+    no cluster list) — i.e. it fails OPEN. It also skips the API-token role floor, so an
+    admin-owned viewer-scoped token inherited its owner's reach. Single-user read + the floored
+    role require_auth published. Returns None when the account is gone: caller must fail closed."""
+    from pegaprox.core.db import get_db
+    try:
+        stored = get_db().get_user(username)
+    except Exception:
+        stored = None
+    if not stored:
+        return None
+    u = dict(stored)
+    u['username'] = username
+    # the open stream re-checks itself from inside the response generator, which the WSGI
+    # server iterates after the request context is gone. `request` is a LocalProxy there and
+    # raises RuntimeError, which getattr's default does NOT swallow — so ask first.
+    _eff = None
+    if has_request_context():
+        _sess = getattr(request, 'session', None)
+        if _sess:
+            _eff = _sess.get('effective_role')
+    if _eff:
+        u['effective_role'] = _eff
+    return u
+
+
 @bp.route('/api/sse/token', methods=['POST'])
 @require_auth()
 def get_sse_token():
     """Get SSE token for URL param auth"""
     user = request.session.get('user', 'unknown')
-    users = load_users()
-    user_data = users.get(user, {})
+    user_data = _stream_identity(user)
+    if user_data is None:
+        return jsonify({'error': 'Unauthorized'}), 401
     allowed_clusters = get_user_clusters(user_data)
 
-    token = create_sse_token(user, allowed_clusters)
+    token = create_sse_token(user, allowed_clusters,
+                             user_data.get('effective_role', user_data.get('role')))
 
     return jsonify({
         'token': token,
@@ -227,6 +332,14 @@ def validate_ws_token_api():
             if not user.get('enabled', True):
                 logging.warning(f"[WS-TOKEN] user '{_sl(data['user'])}' is disabled")
                 return jsonify({'error': 'Account disabled'}), 401
+            # sec (audit): `user` is the OWNER's stored record, so every gate below read the
+            # owner's role. For an admin-owned but viewer-scoped API token that meant
+            # get_user_clusters returned None (= all clusters) and the node.shell check
+            # short-circuited on the admin bypass — a read-only CI token could open a root
+            # shell on any node. The token's own role is right here in `data`; floor by it.
+            # (check_cluster_access does the same inline from request.session; there is no
+            # session on this route, so the token role is the source.)
+            user = _floor_by_token_role(user, data.get('role'))
             allowed = get_user_clusters(user)
             access_ok = allowed is None or requested_cluster in allowed
             if not access_ok:
@@ -330,6 +443,7 @@ def sse_updates():
     user = None
     allowed_clusters = None
     auth_method = None
+    _token_role = None
 
     if sse_token:
         # Validate SSE token
@@ -337,6 +451,7 @@ def sse_updates():
         if token_data:
             user = token_data['user']
             allowed_clusters = token_data['allowed_clusters']
+            _token_role = token_data.get('effective_role')
             auth_method = 'token'
 
     # NS Mar 2026 - removed session_id fallback, token-only auth for SSE
@@ -368,18 +483,32 @@ def sse_updates():
     # `subscribed is None` does NOT mean admin: get_user_clusters() returns None for a default-tenant
     # scoped user too (rbac.py:347). Capture the real admin role ONCE here so the broadcast loop
     # filters those users' frames instead of leaking the full inventory. Fail-closed (unknown → filter).
+    # sec (audit): this read the STORED role, so an admin-owned but viewer-scoped API token was
+    # flagged is_admin and every per-VM filter in the broadcast loop was skipped for it —
+    # unfiltered 'resources', 'vm_config' (full guest configs incl. cloud-init) and 'tasks'.
+    # _stream_identity carries the floored role require_auth published.
     try:
-        from pegaprox.core.db import get_db as _gdb_role
-        _is_admin = ((_gdb_role().get_user(user) or {}).get('role') == ROLE_ADMIN)
+        _ident = _stream_identity(user)
+        # the token's minted role wins — this route has no session, so the stored role would
+        # hand an admin-owned scoped token the admin flag again
+        _eff = _token_role or (_ident or {}).get('effective_role') or (_ident or {}).get('role')
+        _is_admin = bool(_ident) and _eff == ROLE_ADMIN
     except Exception:
+        _eff = _token_role
         _is_admin = False
 
     with sse_clients_lock:
+        _supersede_oldest_streams(user)
         sse_clients[client_id] = {
             'queue': message_queue,
             'user': user,
             'clusters': subscribed_clusters,
             'is_admin': _is_admin,
+            # sec (audit): the boolean alone was not enough. The per-frame filters re-read the
+            # account from the DB, where the role is still the token OWNER's, so each of them
+            # admin-fast-returned and the floor above was thrown away one level down. Carry the
+            # role itself so every filter decides as this stream, not as its owner.
+            'effective_role': _eff,
             'connected_at': datetime.now().isoformat(),
             'auth_method': auth_method
         }
@@ -387,6 +516,8 @@ def sse_updates():
     logging.info(f"[SSE] Client connected: {client_id} (user: {user}, auth: {auth_method}) - Total: {len(sse_clients)}")
 
     def generate():
+        _next_authz = time.monotonic() + SSE_REAUTHZ_INTERVAL
+        _authz_misses = 0
         try:
             # Send initial connected message
             yield f"data: {json.dumps({'type': 'connected', 'client_id': client_id})}\n\n"
@@ -399,6 +530,53 @@ def sse_updates():
                 except queue_module.Empty:
                     # Send keepalive
                     yield f": keepalive\n\n"
+
+                # sec (audit): an SSE stream lives for hours and its identity was captured
+                # once, at connect. Revoking the TOKEN (added earlier this campaign) does
+                # nothing for a stream that is already open, so disabling, deleting or
+                # demoting an account left it receiving frames until the client hung up.
+                # Also refresh is_admin, so a demotion starts filtering.
+                # This hung off the queue timeout at first, which reads like the idle tick but
+                # isn't one: broadcast.py sends a heartbeat to every client once a second, so
+                # the queue is never Empty and the whole re-check never ran. Own clock instead,
+                # evaluated whether or not frames are flowing.
+                # a stream superseded by the per-user cap is no longer in the registry, so
+                # it will never be fed again — let go of the connection instead of holding a
+                # pool slot open sending keepalives to nobody
+                if client_id not in sse_clients:
+                    logging.info(f"[SSE] closing superseded stream {client_id}")
+                    return
+
+                if time.monotonic() >= _next_authz:
+                    _next_authz = time.monotonic() + SSE_REAUTHZ_INTERVAL
+                    _acct = _stream_identity(user)
+                    if _acct is None:
+                        # _stream_identity folds "row missing" and "the read failed" into the
+                        # same None, and this now runs for every client every 30s — so one
+                        # WAL-contention blip would drop every stream at once and stampede
+                        # them all back in. A deleted account still goes within two ticks.
+                        _authz_misses += 1
+                        if _authz_misses < 2:
+                            yield ": keepalive\n\n"
+                            continue
+                    if _acct is None or not _acct.get('enabled', True):
+                        logging.info(f"[SSE] closing stream for '{_sl(user)}' — account gone or disabled")
+                        return
+                    _authz_misses = 0
+                    # Both constraints have to hold, and each is authoritative in one
+                    # direction: a scoped token must not widen because its owner was promoted,
+                    # and the stream must not stay wide because the owner was demoted. So the
+                    # token decides when it carries a restriction, the live account decides
+                    # otherwise, and neither alone can make the stream an admin.
+                    # effective_role has to be refreshed as well as the boolean — is_admin only
+                    # gates whether the filters RUN; effective_role is what they decide with.
+                    _acct_role = _acct.get('effective_role') or _acct.get('role')
+                    _token_restricts = _token_role not in (None, ROLE_ADMIN)
+                    with sse_clients_lock:
+                        _ci = sse_clients.get(client_id)
+                        if _ci is not None:
+                            _ci['effective_role'] = _token_role if _token_restricts else _acct_role
+                            _ci['is_admin'] = (_acct_role == ROLE_ADMIN) and not _token_restricts
         except GeneratorExit:
             pass
         finally:
@@ -430,8 +608,9 @@ def update_sse_subscription():
     username = request.session.get('user', 'unknown')
 
     # RBAC: what clusters is this user allowed to see?
-    users = load_users()
-    user_data = users.get(username, {})
+    user_data = _stream_identity(username)
+    if user_data is None:
+        return jsonify({'error': 'Unauthorized'}), 401
     allowed = get_user_clusters(user_data)  # None = admin
 
     # filter requested against allowed

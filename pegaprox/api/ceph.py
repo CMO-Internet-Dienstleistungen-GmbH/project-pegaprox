@@ -11,7 +11,7 @@ from flask import Blueprint, jsonify, request
 from pegaprox.models.permissions import ROLE_ADMIN
 from pegaprox.utils.auth import require_auth
 from pegaprox.utils.audit import log_audit
-from pegaprox.api.helpers import get_connected_manager, check_cluster_access, safe_error
+from pegaprox.api.helpers import get_connected_manager, check_cluster_access, safe_error, require_unconfined
 
 bp = Blueprint('ceph', __name__)
 
@@ -425,6 +425,9 @@ def get_ceph_osds(cluster_id, node):
 def create_ceph_osd(cluster_id, node):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error: return error
@@ -460,6 +463,9 @@ def create_ceph_osd(cluster_id, node):
 def destroy_ceph_osd(cluster_id, node, osdid):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     # NS: Feb 2026 - SECURITY: require confirmation for destructive operations
     data = request.get_json(silent=True) or {}
@@ -499,6 +505,9 @@ def destroy_ceph_osd(cluster_id, node, osdid):
 def ceph_osd_action(cluster_id, node, osdid, action):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     if action not in ('in', 'out', 'scrub', 'deep-scrub'):
         return jsonify({'error': f'Invalid OSD action: {action}'}), 400
@@ -541,6 +550,9 @@ def get_ceph_mons(cluster_id, node):
 def create_ceph_mon(cluster_id, node, monid):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error: return error
@@ -561,6 +573,9 @@ def create_ceph_mon(cluster_id, node, monid):
 def destroy_ceph_mon(cluster_id, node, monid):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error: return error
@@ -601,6 +616,9 @@ def get_ceph_mds(cluster_id, node):
 def create_ceph_mds(cluster_id, node, name):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error: return error
@@ -620,6 +638,9 @@ def create_ceph_mds(cluster_id, node, name):
 def destroy_ceph_mds(cluster_id, node, name):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error: return error
@@ -664,6 +685,9 @@ def get_ceph_mgr(cluster_id, node):
 def create_ceph_mgr(cluster_id, node, mgrid):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error: return error
@@ -684,6 +708,9 @@ def create_ceph_mgr(cluster_id, node, mgrid):
 def destroy_ceph_mgr(cluster_id, node, mgrid):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error: return error
@@ -724,6 +751,9 @@ def get_ceph_pools(cluster_id, node):
 def create_ceph_pool(cluster_id, node):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error: return error
@@ -744,6 +774,9 @@ def create_ceph_pool(cluster_id, node):
 def update_ceph_pool(cluster_id, node, name):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error: return error
@@ -764,6 +797,9 @@ def update_ceph_pool(cluster_id, node, name):
 def destroy_ceph_pool(cluster_id, node, name):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     # NS: Feb 2026 - SECURITY: require confirmation for destructive operations
     data = request.get_json(silent=True) or {}
@@ -813,6 +849,9 @@ def get_ceph_fs(cluster_id, node):
 def create_ceph_fs(cluster_id, node):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error: return error
@@ -843,6 +882,9 @@ def create_ceph_fs(cluster_id, node):
 def destroy_ceph_fs(cluster_id, node, name):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     # NS: Feb 2026 - SECURITY: require confirmation for destructive operations
     data = request.get_json(silent=True) or {}
@@ -901,6 +943,9 @@ def get_ceph_rules(cluster_id, node):
 def ceph_service_action(cluster_id, node, action):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     if action not in ('start', 'stop', 'restart'):
         return jsonify({'error': f'Invalid service action: {action}'}), 400
@@ -923,6 +968,9 @@ def ceph_service_action(cluster_id, node, action):
 def init_ceph(cluster_id, node):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error: return error
@@ -1026,6 +1074,9 @@ def get_mirror_pool_status(cluster_id, pool):
 def enable_mirror_pool(cluster_id, pool):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     if not _valid_pool(pool):
         return jsonify({'error': 'Invalid pool name'}), 400
 
@@ -1054,6 +1105,9 @@ def enable_mirror_pool(cluster_id, pool):
 def disable_mirror_pool(cluster_id, pool):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     if not _valid_pool(pool):
         return jsonify({'error': 'Invalid pool name'}), 400
 
@@ -1080,6 +1134,9 @@ def add_mirror_peer(cluster_id, pool):
     """MK: add a mirroring peer to a pool"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     if not _valid_pool(pool):
         return jsonify({'error': 'Invalid pool name'}), 400
 
@@ -1123,6 +1180,9 @@ def add_mirror_peer(cluster_id, pool):
 def remove_mirror_peer(cluster_id, pool, uuid):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     if not _valid_pool(pool):
         return jsonify({'error': 'Invalid pool name'}), 400
     # MK: UUID format validation
@@ -1195,13 +1255,48 @@ def list_mirror_images(cluster_id, pool):
             continue
         result.append({'name': img, 'mirroring': by_name.get(img)})
 
+    # sec (audit): PVE names RBD images vm-<vmid>-disk-N / base-<vmid>-disk-N, so this list is
+    # the cluster's whole guest inventory by another route — same leak class as /resources, and
+    # cluster.view is a default viewer perm. Confine a scoped caller to their own guests.
+    import re as _re
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import user_can_access_vm
+    from pegaprox.api.helpers import caller_is_scoped
+    _au = build_authz_user(request.session.get('user', ''), request.session)
+    if caller_is_scoped(_au, cluster_id):
+        def _own(name):
+            m = _re.match(r'(?:base|vm)-(\d+)-disk', str(name))
+            if not m:
+                return False        # unattributable image → not for a confined caller
+            return user_can_access_vm(_au, cluster_id, int(m.group(1)), 'vm.view')
+        result = [r for r in result if _own(r['name'])]
+
     return jsonify({'images': result, 'pool': pool})
+
+
+def _mirror_image_visible(cluster_id, image):
+    """An RBD image is named vm-<vmid>-disk-N / base-<vmid>-disk-N, so the image name IS a
+    guest reference. The listing route was scoped earlier this campaign; the per-image status
+    beside it was not, and it confirms a guest's existence plus its mirror state."""
+    import re as _re
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import user_can_access_vm
+    from pegaprox.api.helpers import caller_is_scoped
+    _u = build_authz_user(request.session.get('user', ''), request.session)
+    if not caller_is_scoped(_u, cluster_id):
+        return True
+    m = _re.match(r'(?:base|vm)-(\d+)-disk', str(image))
+    if not m:
+        return False
+    return user_can_access_vm(_u, cluster_id, int(m.group(1)), 'vm.view')
 
 
 @bp.route('/api/clusters/<cluster_id>/ceph/mirror/pool/<pool>/image/<image>/status', methods=['GET'])
 @require_auth(perms=['cluster.view'])
 def get_mirror_image_status(cluster_id, pool, image):
     ok, err = check_cluster_access(cluster_id)
+    if ok and not _mirror_image_visible(cluster_id, image):
+        return jsonify({'error': 'Access denied to this image'}), 403
     if not ok: return err
     if not _valid_pool(pool) or not _valid_image(image):
         return jsonify({'error': 'Invalid pool or image name'}), 400
@@ -1223,6 +1318,9 @@ def get_mirror_image_status(cluster_id, pool, image):
 def enable_mirror_image(cluster_id, pool, image):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     if not _valid_pool(pool) or not _valid_image(image):
         return jsonify({'error': 'Invalid pool or image name'}), 400
 
@@ -1251,6 +1349,9 @@ def enable_mirror_image(cluster_id, pool, image):
 def disable_mirror_image(cluster_id, pool, image):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     if not _valid_pool(pool) or not _valid_image(image):
         return jsonify({'error': 'Invalid pool or image name'}), 400
 
@@ -1274,6 +1375,9 @@ def disable_mirror_image(cluster_id, pool, image):
 def promote_mirror_image(cluster_id, pool, image):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     if not _valid_pool(pool) or not _valid_image(image):
         return jsonify({'error': 'Invalid pool or image name'}), 400
 
@@ -1304,6 +1408,9 @@ def promote_mirror_image(cluster_id, pool, image):
 def demote_mirror_image(cluster_id, pool, image):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     if not _valid_pool(pool) or not _valid_image(image):
         return jsonify({'error': 'Invalid pool or image name'}), 400
 
@@ -1327,6 +1434,9 @@ def demote_mirror_image(cluster_id, pool, image):
 def resync_mirror_image(cluster_id, pool, image):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     if not _valid_pool(pool) or not _valid_image(image):
         return jsonify({'error': 'Invalid pool or image name'}), 400
 
@@ -1382,6 +1492,9 @@ def get_mirror_schedules(cluster_id, pool):
 def add_mirror_schedule(cluster_id, pool):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     if not _valid_pool(pool):
         return jsonify({'error': 'Invalid pool name'}), 400
 
@@ -1410,6 +1523,9 @@ def add_mirror_schedule(cluster_id, pool):
 def remove_mirror_schedule(cluster_id, pool):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     if not _valid_pool(pool):
         return jsonify({'error': 'Invalid pool name'}), 400
 

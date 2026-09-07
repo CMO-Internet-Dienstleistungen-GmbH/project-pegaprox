@@ -12,7 +12,7 @@ from pegaprox.core.db import get_db
 
 from pegaprox.utils.auth import require_auth
 from pegaprox.utils.audit import log_audit
-from pegaprox.api.helpers import safe_error, check_pbs_access, check_cluster_access
+from pegaprox.api.helpers import safe_error, check_pbs_access, check_cluster_access, scope_vm_rows, require_unconfined
 from pegaprox.core.pbs import PBSManager, load_pbs_servers, save_pbs_server
 
 bp = Blueprint('pbs', __name__)
@@ -571,7 +571,7 @@ def get_pbs_snapshots(pbs_id, store):
             nm = name_map.get((bt, str(bid)))
             if nm:
                 s['vm_name'] = nm
-    return jsonify(snaps)
+    return jsonify(_scope_pbs_rows(mgr, snaps))
 
 
 @bp.route('/api/pbs/<pbs_id>/datastores/<store>/groups', methods=['GET'])
@@ -600,7 +600,7 @@ def get_pbs_groups(pbs_id, store):
             nm = name_map.get((bt, str(bid)))
             if nm:
                 g['vm_name'] = nm
-    return jsonify(groups)
+    return jsonify(_scope_pbs_rows(mgr, groups))
 
 
 @bp.route('/api/pbs/<pbs_id>/datastores/<store>/gc', methods=['POST'])
@@ -674,7 +674,72 @@ def pbs_prune(pbs_id, store):
     return jsonify(result)
 
 
-def _authz_pbs_backup(mgr, backup_type, backup_id, permission='vm.backup'):
+def _scope_pbs_rows(mgr, rows, type_key='backup-type', id_key='backup-id',
+                    permission='vm.view', key_fn=None):
+    """sec (audit): a datastore is shared across every VM on every linked cluster, and
+    pbs.datastore.view is a BUILTIN ROLE_USER and ROLE_VIEWER permission — so the snapshot and
+    group listings handed every user the whole install's backup inventory (enriched with VM
+    names), while the per-object routes beside them were gated. Same predicate, applied per row.
+
+    An admin or a caller who is not confined keeps everything; a scoped caller keeps only the
+    rows whose guest they may see. Rows with no resolvable guest (host-type backups) are
+    dropped for a scoped caller, matching _authz_pbs_backup.
+
+    key_fn overrides the two dict lookups for rows that carry the guest somewhere else — task
+    rows name it in worker_id, not in backup-type/backup-id."""
+    from pegaprox.utils.auth import build_authz_user
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+        return rows
+    scoped = _caller_is_scoped_here(mgr, user)
+    if not scoped:
+        return rows                      # plain cluster-wide operator — unchanged
+    out = []
+    for r in rows or []:
+        bt, bid = key_fn(r) if key_fn else (r.get(type_key), r.get(id_key))
+        # hand down both the identity and the confinement answer — a datastore listing is the
+        # whole install's inventory, and each of those costs a users-table read or a pool and
+        # ACL enumeration per row otherwise
+        ok, _ = _authz_pbs_backup(mgr, bt, bid, permission, user=user, scoped=scoped)
+        if ok:
+            out.append(r)
+    return out
+
+
+def _pbs_task_guest(worker_id):
+    """('vm'|'ct', '100') out of a PBS backup task's worker_id.
+
+    PBS spells it '<datastore>:<type>/<id>/<hex-backup-time>'. Returns (None, None) for
+    host-type backups and anything we can't read."""
+    parts = [p for p in str(worker_id or '').split(':')[-1].split('/') if p]
+    if len(parts) < 2 or parts[0] not in ('vm', 'ct'):
+        return None, None
+    return parts[0], parts[1]
+
+
+def _pbs_upid_guest(upid):
+    """('vm'|'ct', '100') out of a PBS UPID.
+
+    A UPID is 'UPID:node:pid:pstart:taskid:starttime:worker_type:worker_id:user:' and the
+    worker_id is itself colon-separated, so pick the guest out of the whole string instead
+    of counting fields."""
+    import re
+    m = re.search(r'(?:^|[:/])(vm|ct)/(\d+)(?:[:/]|$)', str(upid or ''))
+    return (m.group(1), m.group(2)) if m else (None, None)
+
+
+def _caller_is_scoped_here(mgr, user):
+    """True when this caller is confined on any cluster this PBS backs up for.
+
+    Linked clusters own the backups; a PBS with no linking falls back to every connected
+    cluster, matching _pbs_vm_name_lookup. Conservative on purpose: confined anywhere means
+    confined here."""
+    from pegaprox.api.helpers import caller_is_scoped
+    _cids = list(mgr.linked_clusters or []) or list(cluster_managers.keys())
+    return any(caller_is_scoped(user, c) for c in _cids)
+
+
+def _authz_pbs_backup(mgr, backup_type, backup_id, permission='vm.backup', user=None, scoped=None):
     """NS Aug 2026 (sec-report, BOLA/CWE-639) — object-level scope for PBS backup ops.
 
     check_pbs_access only proves the caller reaches ONE of the PBS's linked clusters; it
@@ -685,17 +750,40 @@ def _authz_pbs_backup(mgr, backup_type, backup_id, permission='vm.backup'):
     Resolve the backup's owning VMID and require user_can_access_vm on it against one of the
     linked clusters (ACL/pool-scope-wins via the fixed chokepoint in rbac.py). Admins pass;
     a scoped user whose vmid can't be resolved (host-type or non-numeric id) is denied.
-    Returns (ok, err_response)."""
-    from pegaprox.utils.auth import build_authz_user
+    Returns (ok, err_response).
+
+    A caller who is not confined ANYWHERE on the linked clusters passes too — the same
+    carve-out _scope_pbs_rows has had from the start. Without it, extending this gate to the
+    read routes denied every plain operator and viewer on anything that is not a per-guest
+    backup: garbage-collection, prune, verify and sync tasks, and host-type backups. Those are
+    most of a PBS task list, and the listing route beside these hands them to the same caller,
+    so the page listed a GC task and 403'd the moment anyone clicked it.
+
+    `user` and `scoped` let a caller in a loop hand down what it already worked out.
+    build_authz_user reads the whole users table and decrypts two TOTP columns per account, and
+    caller_is_scoped enumerates pool grants and VM ACLs per linked cluster — _scope_pbs_rows
+    runs this once per snapshot, so at 10k guests both are the difference between one lookup
+    and hundreds of thousands, on a greenlet that yields to nobody while it runs."""
     from pegaprox.utils.rbac import user_can_access_vm
-    user = build_authz_user(request.session.get('user', ''), request.session)
+    if user is None:
+        from pegaprox.utils.auth import build_authz_user
+        user = build_authz_user(request.session.get('user', ''), request.session)
     if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
         return True, None
-    deny = (jsonify({'error': 'Access denied: you do not have permission for this backup'}), 403)
+
+    if scoped is None:
+        scoped = _caller_is_scoped_here(mgr, user)
+    if not scoped:
+        return True, None                # plain cluster-wide operator — unchanged
+
+    def _deny():
+        # built on demand: constructing a Response for every row was the other half of the cost
+        return False, (jsonify({'error': 'Access denied: you do not have permission for this backup'}), 403)
+
     bt = (backup_type or '').strip().lower()
     # only vm/ct backups carry a VMID we can scope; host/other → deny scoped users
     if bt not in ('vm', 'ct') or backup_id is None or not str(backup_id).strip().isdigit():
-        return False, deny
+        return _deny()
     vmid = int(str(backup_id).strip())
     vm_type = 'lxc' if bt == 'ct' else 'qemu'
     # linked clusters own the backups; fall back to all connected clusters when a PBS has
@@ -705,7 +793,7 @@ def _authz_pbs_backup(mgr, backup_type, backup_id, permission='vm.backup'):
     for cid in cluster_ids:
         if user_can_access_vm(user, cid, vmid, permission, vm_type):
             return True, None
-    return False, deny
+    return _deny()
 
 
 @bp.route('/api/pbs/<pbs_id>/datastores/<store>/snapshots', methods=['DELETE'])
@@ -757,7 +845,12 @@ def get_pbs_tasks(pbs_id):
     running = request.args.get('running', None)
     result = mgr.get_tasks(limit=limit, typefilter=typefilter,
                             running=bool(int(running)) if running is not None else None)
-    return jsonify(result.get('data', []))
+    # sec (audit) — the report path scopes these very rows; the raw list didn't, so a scoped
+    # caller read every guest's backup history off the same server. Rows with no guest (gc,
+    # prune, sync) carry no per-object question, so they go the same way as everywhere else:
+    # kept for an unconfined caller, dropped for a confined one.
+    return jsonify(_scope_pbs_rows(mgr, result.get('data', []) or [],
+                                   key_fn=lambda t: _pbs_task_guest(t.get('worker_id') or t.get('id'))))
 
 
 @bp.route('/api/pbs/<pbs_id>/tasks/<path:upid>', methods=['GET'])
@@ -771,6 +864,11 @@ def get_pbs_task_detail(pbs_id, upid):
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
+    # sec (audit) — the log names the archives and the guest it backed up
+    _bt, _bid = _pbs_upid_guest(upid)
+    ok, err = _authz_pbs_backup(mgr, _bt, _bid, 'vm.view')
+    if not ok:
+        return err
     status = mgr.get_task_status(upid)
     log = mgr.get_task_log(upid)
     return jsonify({
@@ -925,6 +1023,11 @@ def get_pbs_snapshot_notes(pbs_id, store):
     btime = request.args.get('backup-time')
     if not all([bt, bid, btime]):
         return jsonify({'error': 'Missing backup-type, backup-id, or backup-time'}), 400
+    # sec (audit) — same per-backup owner check the PUT twin below carries. A datastore spans
+    # every guest on every linked cluster, so reading is as much a boundary as writing.
+    ok, err = _authz_pbs_backup(mgr, bt, bid, 'vm.view')
+    if not ok:
+        return err
     result = mgr.get_snapshot_notes(store, bt, bid, int(btime))
     if 'error' in result:
         return jsonify(result), 500
@@ -974,6 +1077,9 @@ def get_pbs_group_notes(pbs_id, store):
     bid = request.args.get('backup-id')
     if not all([bt, bid]):
         return jsonify({'error': 'Missing backup-type or backup-id'}), 400
+    ok, err = _authz_pbs_backup(mgr, bt, bid, 'vm.view')      # sec (audit), as above
+    if not ok:
+        return err
     result = mgr.get_group_notes(store, bt, bid)
     if 'error' in result:
         return jsonify(result), 500
@@ -1852,7 +1958,12 @@ def get_pbs_reports_summary(pbs_id):
 
     # ── Backup tasks in window ─────────────────────────────────────────────
     tasks_resp = mgr.get_tasks(limit=500, typefilter='backup', since=since_ts) or {}
-    tasks = tasks_resp.get('data', []) or []
+    # sec (audit): check_pbs_access above only proves the caller reaches ONE of this PBS's linked
+    # clusters, and pbs.view is a builtin ROLE_USER/ROLE_VIEWER permission — so the report described
+    # every guest on the install. Drop the tasks whose guest the caller may not see BEFORE the
+    # aggregation, so the totals and the per-day chart can't count them either.
+    tasks = _scope_pbs_rows(mgr, tasks_resp.get('data', []) or [],
+                            key_fn=lambda t: _pbs_task_guest(t.get('worker_id') or t.get('id')))
 
     totals = {'jobs': 0, 'success': 0, 'warning': 0, 'failed': 0}
     per_day = {}          # YYYY-MM-DD -> {date, success, warning, failed}
@@ -1881,9 +1992,8 @@ def get_pbs_reports_summary(pbs_id):
                 per_day[day] = {'date': day, 'success': 0, 'warning': 0, 'failed': 0}
             per_day[day][bucket] += 1
 
-        worker_id = t.get('worker_id') or t.get('id') or ''
-        if '/' in worker_id:
-            vm_type, vmid = worker_id.split('/', 1)
+        vm_type, vmid = _pbs_task_guest(t.get('worker_id') or t.get('id'))
+        if vm_type:
             key = (vm_type, vmid)
             prev = per_vm_latest.get(key)
             if (prev is None
@@ -1891,7 +2001,7 @@ def get_pbs_reports_summary(pbs_id):
                 per_vm_latest[key] = t
 
     # ── Snapshot inventory for size/verify info ────────────────────────────
-    snapshots = _pbs_collect_snapshots(mgr)
+    snapshots = _scope_pbs_rows(mgr, _pbs_collect_snapshots(mgr))
     snapshots_by_key = {}   # (type, vmid_str) -> [snap, ...]
     for s in snapshots:
         key = (s.get('backup-type', ''), str(s.get('backup-id', '')))
@@ -1996,7 +2106,10 @@ def get_pbs_reports_inventory(pbs_id):
     now_ts = int(time.time())
     min_bt = (now_ts - days * 86400) if days > 0 else 0
 
-    raw = _pbs_collect_snapshots(mgr, protected_only=protected_only, min_backup_time=min_bt)
+    # "every snapshot across all datastores/namespaces" means every snapshot the CALLER may
+    # read — see the note in the summary route above; this one also carries the owner. (audit)
+    raw = _scope_pbs_rows(mgr, _pbs_collect_snapshots(
+        mgr, protected_only=protected_only, min_backup_time=min_bt))
 
     vm_names = _pbs_resolve_vm_names(mgr)
 
@@ -2052,6 +2165,14 @@ def get_pbs_reports_protected_vms(pbs_id):
     cluster_id = request.args.get('cluster_id', '')
     if not cluster_id:
         return jsonify({'error': 'cluster_id query param required'}), 400
+    # sec (private disclosure Sep 2026 — audit HIGH): cluster_id comes straight from the query
+    # string and was never authorized — check_pbs_access only vets the PBS server (and passes
+    # unconditionally for a PBS with no linked_clusters). A pbs.view holder could therefore name ANY
+    # cluster and read its complete guest inventory plus which guests are unprotected. Gate the named
+    # cluster, then scope the rows per-VM exactly like /vms-backup-status does.
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
     pve_mgr = cluster_managers.get(cluster_id)
     if not pve_mgr:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -2064,7 +2185,7 @@ def get_pbs_reports_protected_vms(pbs_id):
     cutoff = int(time.time()) - days * 86400
 
     try:
-        resources = pve_mgr.get_vm_resources() or []
+        resources = scope_vm_rows(cluster_id, pve_mgr.get_vm_resources() or [])
     except Exception as e:
         return jsonify({'error': f'Could not load cluster resources: {e}'}), 502
 
@@ -2194,6 +2315,27 @@ def start_backup_verification(cluster_id):
     return jsonify({'success': True, 'task_id': task_id})
 
 
+def _verification_rows_visible(cluster_id, rows):
+    """sec (audit): start_backup_verification gates the target per VM (and binds the volid to
+    the vmid), but the status, history and active reads beside it had only check_cluster_access
+    — so a scoped caller could read back which of a co-tenant's guests were verified, when, and
+    the archive names. The rows carry vmid, so apply the same question here."""
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import user_can_access_vm
+    from pegaprox.api.helpers import caller_is_scoped
+    _u = build_authz_user(request.session.get('user', ''), request.session)
+    if not caller_is_scoped(_u, cluster_id):
+        return rows
+    out = []
+    for r in rows or []:
+        try:
+            if user_can_access_vm(_u, cluster_id, int(dict(r).get('vmid')), 'vm.backup'):
+                out.append(r)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 @bp.route('/api/clusters/<cluster_id>/backup-verify/<task_id>', methods=['GET'])
 @require_auth(perms=['vm.backup'])
 def get_backup_verification_status(cluster_id, task_id):
@@ -2209,17 +2351,27 @@ def get_backup_verification_status(cluster_id, task_id):
     # check active first
     status = get_verification(task_id)
     if status:
+        # sec (audit): the registry is keyed on task_id alone, so a task belonging to ANOTHER
+        # cluster answered here — and _verification_rows_visible passes an unconfined caller
+        # through unchanged, which is exactly the caller whose tenant may not own that cluster.
+        if status.get('cluster_id') != cluster_id:
+            return jsonify({'error': 'Verification not found'}), 404
+        if not _verification_rows_visible(cluster_id, [status]):
+            return jsonify({'error': 'Verification not found'}), 404
         return jsonify(status)
 
     # check database
     db = get_db()
     try:
-        row = db.query_one('SELECT * FROM backup_verifications WHERE id = ?', (task_id,))
+        row = db.query_one('SELECT * FROM backup_verifications WHERE id = ? AND cluster_id = ?',
+                           (task_id, cluster_id))
         if row:
             result = dict(row)
             import json
             result['details'] = json.loads(result.get('details', '{}'))
             result['logs'] = result['details'].get('logs', [])
+            if not _verification_rows_visible(cluster_id, [result]):
+                return jsonify({'error': 'Verification not found'}), 404
             return jsonify(result)
     except Exception:
         pass
@@ -2243,7 +2395,7 @@ def get_backup_verification_history(cluster_id):
     limit = request.args.get('limit', 50, type=int)
 
     results = get_verification_history(cluster_id, vmid, limit)
-    return jsonify(results)
+    return jsonify(_verification_rows_visible(cluster_id, results))
 
 
 @bp.route('/api/clusters/<cluster_id>/backup-verify/active', methods=['GET'])
@@ -2259,7 +2411,10 @@ def get_active_verifications(cluster_id):
     active = get_active_verifications()
     # filter by cluster
     cluster_active = {k: v for k, v in active.items() if v.get('cluster_id') == cluster_id}
-    return jsonify(cluster_active)
+    # a scoped caller sees only their own guests' runs (see _verification_rows_visible)
+    _keys = [k for k, v in cluster_active.items()
+             if _verification_rows_visible(cluster_id, [v])]
+    return jsonify({k: cluster_active[k] for k in _keys})
 
 
 # ============================================================================
@@ -2637,6 +2792,9 @@ def storage_preflight(cluster_id):
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     data = request.json or {}
@@ -2753,27 +2911,11 @@ def get_vms_backup_status(cluster_id):
     now = _t.time()
 
     def _scope_backup_out(rows):
-        # per-VM ACL scoping for non-admins; admins see all
-        from pegaprox.utils.auth import load_users
-        from pegaprox.utils.rbac import get_vm_acls, has_permission
-        u = load_users().get(request.session['user'], {})
-        u['username'] = request.session['user']
-        if u.get('role') == ROLE_ADMIN:
-            return rows
-        cluster_acls = get_vm_acls().get(cluster_id, {})
-        has_general = has_permission(u, 'vm.view')
-        if not cluster_acls:
-            return rows if has_general else []
-        scoped = []
-        for row in rows:
-            acl = cluster_acls.get(str(row.get('vmid', '')), {})
-            if acl:
-                allowed = acl.get('users', [])
-                if u['username'] in allowed or '*' in allowed:
-                    scoped.append(row)
-            elif has_general:
-                scoped.append(row)
-        return scoped
+        # sec (private disclosure Sep 2026 — audit M2): the old inline filter honoured VM-ACLs +
+        # global vm.view but NOT pool grants, so a pool-scoped caller with global vm.view saw the
+        # whole cluster's backup posture. scope_vm_rows is the canonical per-VM gate (ACL + pool +
+        # tenant, admins/plain operators keep all) used by /resources and search — reuse it.
+        return scope_vm_rows(cluster_id, rows)
 
     _bc = _backup_status_cache.get(cluster_id)
     if _bc and (now - _bc[0]) < _bc[2]:
@@ -2892,7 +3034,7 @@ def get_vms_backup_status(cluster_id):
 
     # PBS-side tasks: one per linked + connected PBS server
     tasks = {}
-    for pbs_id, pbs in pbs_managers.items():
+    for pbs_id, pbs in list(pbs_managers.items()):
         if cluster_id not in (pbs.linked_clusters or []):
             continue
         if not pbs.connected:
@@ -3179,6 +3321,11 @@ def diff_pbs_backups(pbs_id):
     ts_b = request.args.get('b', '')
     if not all([store, btype, bid, ts_a, ts_b]):
         return jsonify({'error': 'store, type, id, a, b query params required'}), 400
+    # sec (audit) — type+id name a guest, and the diff hands back its manifests; the seven
+    # sibling routes that take the same pair all gate on it.
+    ok, err = _authz_pbs_backup(pbs, btype, bid, 'vm.view')
+    if not ok:
+        return err
 
     try:
         _r = pbs.get_snapshots(store) or {}

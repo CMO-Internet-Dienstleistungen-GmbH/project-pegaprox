@@ -23,6 +23,7 @@ from pegaprox.globals import (
 )
 from pegaprox.api.helpers import load_server_settings
 from pegaprox.utils.auth import validate_api_token, load_users
+from pegaprox.core.db import get_db
 from pegaprox.models.permissions import ROLE_ADMIN
 from pegaprox.utils import auth as auth_state
 
@@ -134,8 +135,19 @@ def _auth_ok():
         token = auth[7:].strip()
         try:
             info = validate_api_token(token)
+            # sec (audit): this route has no @require_auth, so it never ran the decorator's
+            # account-exists / account-enabled checks. validate_api_token only looks at revoked +
+            # expires_at, and disabling a user does NOT revoke their tokens — so a disabled or
+            # demoted admin kept scraping every cluster's inventory. Re-check the owner here.
             if info and info.get('role') == ROLE_ADMIN:
-                return True
+                try:
+                    owner = get_db().get_user(info.get('user'))
+                except Exception:
+                    owner = None
+                if owner and owner.get('enabled', True) and owner.get('role') == ROLE_ADMIN:
+                    return True
+                logging.warning(f"[metrics] rejected admin token for '{info.get('user')}' — "
+                                "account is gone, disabled, or no longer admin")
         except Exception as e:
             logging.debug(f"[metrics] token validate failed: {e}")
     return False
@@ -248,7 +260,9 @@ def prometheus_metrics():
     emit('# HELP pegaprox_ceph_osd_in Number of Ceph OSDs currently in')
     emit('# TYPE pegaprox_ceph_osd_in gauge')
 
-    for cid, mgr in cluster_managers.items():
+    # a scrape walks every cluster over the API; copy the dict so a cluster
+    # registered mid-scrape can't break the whole exposition
+    for cid, mgr in list(cluster_managers.items()):
         cname = getattr(getattr(mgr, 'config', None), 'name', cid) or cid
         base = {'cluster_id': cid, 'cluster': cname}
         connected = 1 if getattr(mgr, 'is_connected', False) else 0

@@ -32,7 +32,7 @@ from flask import Blueprint, jsonify, request
 from pegaprox.globals import cluster_managers
 from pegaprox.utils.auth import require_auth
 from pegaprox.utils.sanitization import sanitize_csv_field
-from pegaprox.api.helpers import check_cluster_access, load_metrics_window
+from pegaprox.api.helpers import check_cluster_access, load_metrics_window, scope_vm_rows
 from pegaprox.core.db import get_db
 from pegaprox.models.permissions import ROLE_ADMIN
 
@@ -310,6 +310,9 @@ def cluster_summary(cluster_id):
     hours_window = days * 24
     mgr = cluster_managers[cluster_id]
     rows = _compute_per_vm(snapshots, mgr, rates, hours_window)
+    # #773 audit — confine per-VM cost rows (top_spenders/by_node/vm_count all derive from these)
+    # to VMs the caller may see, so a pool-scoped user doesn't get the whole cluster's spend.
+    rows = scope_vm_rows(cluster_id, rows)
 
     total = sum(r['cost_total'] for r in rows)
     cpu = sum(r['cost_cpu'] for r in rows)
@@ -366,6 +369,7 @@ def per_vm(cluster_id):
         return jsonify({'enough_data': False, 'rates': rates, 'rows': []})
     mgr = cluster_managers[cluster_id]
     rows = _compute_per_vm(snapshots, mgr, rates, days * 24)
+    rows = scope_vm_rows(cluster_id, rows)  # #773 audit — per-VM rows scoped to the caller
     factor = 30.0 / days if days < 30 else 1.0
     for r in rows:
         # also expose monthly extrapolation per row for direct UI display
@@ -404,7 +408,7 @@ def tenant_chargeback(tenant_id):
         # MK Jun 2026 (sec-review) — admin.tenants can be a tenant-scoped custom role;
         # scope to the caller's own tenant unless a real admin, else one tenant could
         # read another tenant's full VM inventory + per-VM cost breakdown (BOLA).
-        if request.session.get('role') != _rbac.ROLE_ADMIN:
+        if request.session.get('effective_role', request.session.get('role')) != _rbac.ROLE_ADMIN:
             _caller = get_db().get_user(request.session.get('user', '')) or {}
             if tenant_id != _caller.get('tenant_id', _rbac.DEFAULT_TENANT_ID):
                 return jsonify({'error': 'Access denied to this tenant'}), 403
@@ -415,7 +419,7 @@ def tenant_chargeback(tenant_id):
         all_rows = []
         grand_total = 0.0
         currency = 'EUR'
-        for cid, mgr in cluster_managers.items():
+        for cid, mgr in list(cluster_managers.items()):
             if allowed is not None and cid not in allowed:
                 continue
             cname = getattr(getattr(mgr, 'config', None), 'name', cid) or cid

@@ -21,7 +21,7 @@ from pegaprox.models.permissions import *
 
 from pegaprox.utils.auth import require_auth, load_users
 from pegaprox.utils.rbac import get_user_clusters
-from pegaprox.api.helpers import check_cluster_access, load_server_settings
+from pegaprox.api.helpers import check_cluster_access, load_server_settings, scope_vm_rows, require_unconfined
 from pegaprox.background.metrics import load_metrics_history, start_metrics_collector
 from pegaprox.background.syslog_server import DB_FILE, SEVERITY_MAP
 from pegaprox.api.schedules import start_scheduler
@@ -121,9 +121,12 @@ def get_reports_summary():
     period = request.args.get('period', 'day')
 
     # NS: Feb 2026 - tenant filtering for multi-tenant security
+    # sec (audit): was the raw stored record, so an admin-owned viewer-scoped token inherited the
+    # owner's admin reach and get_user_clusters returned None = every cluster. (top-vms in this
+    # same file already builds its identity correctly — these three were the stragglers.)
+    from pegaprox.utils.auth import build_authz_user
     usr = getattr(request, 'session', {}).get('user', 'system')
-    users_db = load_users()
-    user_data = users_db.get(usr, {})
+    user_data = build_authz_user(usr, getattr(request, 'session', {}) or {})
     accessible_clusters = get_user_clusters(user_data)  # None = admin (all clusters)
 
     history = load_metrics_history()
@@ -432,9 +435,12 @@ def get_reports_timeline():
     metric = request.args.get('metric', 'all')
 
     # NS: Feb 2026 - tenant filtering for multi-tenant security
+    # sec (audit): was the raw stored record, so an admin-owned viewer-scoped token inherited the
+    # owner's admin reach and get_user_clusters returned None = every cluster. (top-vms in this
+    # same file already builds its identity correctly — these three were the stragglers.)
+    from pegaprox.utils.auth import build_authz_user
     usr = getattr(request, 'session', {}).get('user', 'system')
-    users_db = load_users()
-    user_data = users_db.get(usr, {})
+    user_data = build_authz_user(usr, getattr(request, 'session', {}) or {})
     accessible_clusters = get_user_clusters(user_data)  # None = admin (all clusters)
 
     history = load_metrics_history()
@@ -518,14 +524,17 @@ def get_top_vms():
     limit = int(request.args.get('limit', 10))
 
     # NS: Feb 2026 - tenant filtering for multi-tenant security
+    # sec (audit): was the raw stored record, so an admin-owned viewer-scoped token inherited the
+    # owner's admin reach and get_user_clusters returned None = every cluster. (top-vms in this
+    # same file already builds its identity correctly — these three were the stragglers.)
+    from pegaprox.utils.auth import build_authz_user
     usr = getattr(request, 'session', {}).get('user', 'system')
-    users_db = load_users()
-    user_data = users_db.get(usr, {})
+    user_data = build_authz_user(usr, getattr(request, 'session', {}) or {})
     accessible_clusters = get_user_clusters(user_data)  # None = admin (all clusters)
 
     vms = []
 
-    for cluster_id, mgr in cluster_managers.items():
+    for cluster_id, mgr in list(cluster_managers.items()):
         # Skip clusters the user cannot access
         if accessible_clusters is not None and cluster_id not in accessible_clusters:
             continue
@@ -533,11 +542,13 @@ def get_top_vms():
             continue
         
         try:
-            resources = mgr.get_vm_resources()
+            # #773 audit — tenant filtering (accessible_clusters) gates the CLUSTER; still scope
+            # the per-VM rows so a pool-/ACL-scoped user doesn't see every VM on a cluster they own.
+            resources = scope_vm_rows(cluster_id, mgr.get_vm_resources())
             for r in resources:
                 if r.get('status') != 'running':
                     continue
-                
+
                 vm_data = {
                     'cluster_id': cluster_id,
                     'cluster_name': mgr.config.name,
@@ -581,6 +592,15 @@ def scan_all_nodes_cves(cluster_id):
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
+    # sec (audit): node.view is a default viewer perm and check_cluster_access admits a
+    # pool-/ACL-scoped caller by design — but this returns every node's kernel, pveversion,
+    # pending-reboot state and full CVE list (an unpatched-target map), and fans out one SSH
+    # session per node. There is no per-object notion for a node, so deny a confined caller.
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.api.helpers import caller_is_scoped
+    if caller_is_scoped(build_authz_user(request.session.get('user', ''), request.session), cluster_id):
+        return jsonify({'error': 'Access denied to this cluster'}), 403
+
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -605,7 +625,8 @@ def scan_all_nodes_cves(cluster_id):
             scan = mgr.scan_node_packages(node_name)
             results.append(scan)
         except Exception as e:
-            results.append({'node': node_name, 'error': str(e)})
+            logging.warning(f"[cve-scan] node {node_name} scan failed: {e}")  # detail to logs, not the response
+            results.append({'node': node_name, 'error': 'package scan failed'})   # sec (audit): no raw str(e) to the client
 
     total_sec = sum(r.get('security_count', 0) for r in results)
     total_upd = sum(r.get('total_count', 0) for r in results)
@@ -635,6 +656,15 @@ def scan_single_node_cves(cluster_id, node):
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
+    # sec (audit): node.view is a default viewer perm and check_cluster_access admits a
+    # pool-/ACL-scoped caller by design — but this returns every node's kernel, pveversion,
+    # pending-reboot state and full CVE list (an unpatched-target map), and fans out one SSH
+    # session per node. There is no per-object notion for a node, so deny a confined caller.
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.api.helpers import caller_is_scoped
+    if caller_is_scoped(build_authz_user(request.session.get('user', ''), request.session), cluster_id):
+        return jsonify({'error': 'Access denied to this cluster'}), 403
+
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -654,6 +684,9 @@ def install_debsecan(cluster_id):
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -687,6 +720,49 @@ def install_debsecan(cluster_id):
 # CIS Hardening Endpoints - MK Mar 2026
 # ============================================
 
+# NS Sep 2026 (#717) — every SSH-backed node check answered a bare 502 "SSH to <node>
+# failed", which the compliance dashboard rendered as the string "err 502" next to the
+# node and nothing else. On a token-only cluster that is EVERY node, so the dashboard
+# looked broken rather than unconfigured. Same shape for all of them: a code the UI can
+# branch on, a sentence saying what happened, and one saying what to do about it.
+_SSH_ERRORS = {
+    'SSH_NO_CREDENTIALS': (412, 'Add an SSH key or a password to this cluster under '
+                                'Settings > Clusters. An API token alone cannot open a '
+                                'shell, which these checks need.'),
+    'NODE_BACKOFF':       (503, 'The node stopped answering and is being retried with a '
+                                'backoff. Check that it is up and reachable from PegaProx.'),
+    'SSH_FAILED':         (502, 'Credentials are configured but the connection did not '
+                                'succeed — check reachability on port 22, the stored '
+                                'username, and whether the host key changed.'),
+}
+
+
+def _ssh_unavailable(mgr, node):
+    """One JSON shape for 'this node check needs SSH and SSH did not happen'."""
+    # every manager class that reaches this route should have ssh_diagnose, but this is
+    # the error path — it must not be the thing that raises. Anything unexpected back
+    # from it falls through to the generic reason.
+    reason = None
+    try:
+        probe = getattr(mgr, 'ssh_diagnose', None)
+        if callable(probe):
+            reason = probe(node)
+    except Exception:
+        logging.debug('[hardening] ssh_diagnose failed on %s', node, exc_info=True)
+    if not (isinstance(reason, (tuple, list)) and len(reason) == 2):
+        reason = ('SSH_FAILED', None)
+    code, detail = reason
+    status, hint = _SSH_ERRORS.get(code, _SSH_ERRORS['SSH_FAILED'])
+    return jsonify({
+        'error': f'Cannot read {node} over SSH' + (f': {detail}' if detail else ''),
+        'code': code,
+        'hint': hint,
+        'node': node,
+        # cluster-wide causes let the caller stop asking about the other 99 nodes
+        'cluster_wide': code == 'SSH_NO_CREDENTIALS',
+    }), status
+
+
 @bp.route('/api/clusters/<cluster_id>/nodes/<node>/hardening', methods=['GET'])
 @require_auth(perms=['node.maintenance'])
 def check_hardening(cluster_id, node):
@@ -708,7 +784,7 @@ def check_hardening(cluster_id, node):
         return jsonify({'error': f'unknown profile: {profile}'}), 400
     result = mgr.check_node_hardening(node, verbose=verbose, profile=profile)
     if result is None:
-        return jsonify({'error': f'SSH to {node} failed'}), 502
+        return _ssh_unavailable(mgr, node)
 
     return jsonify({'node': node, 'controls': result, 'verbose': verbose, 'profile': profile or 'cis-l1'})
 
@@ -720,6 +796,9 @@ def apply_hardening(cluster_id, node):
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     mgr = cluster_managers[cluster_id]
@@ -772,6 +851,9 @@ def rollback_hardening(cluster_id, node):
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     mgr = cluster_managers[cluster_id]

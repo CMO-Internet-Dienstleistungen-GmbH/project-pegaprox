@@ -62,6 +62,28 @@ def _fire_webhook(url):
 # at 50%" reports: storage/bridge mappings reference names that don't exist on the
 # target. Proxmox returns HTTP 500 mid-migration with a useless error. We now check
 # before we start.
+def _reverse_mapping(mapping, kind):
+    """Flip a {source: target} plan mapping for a failback run.
+
+    A plan is authored in one direction, so replaying it backwards with the forward
+    map puts every VM on the DR site's storage/bridge names — on the production
+    cluster. Two sources pointing at the same target can't be reversed unambiguously,
+    so say so rather than pick one. Returns (reversed, issues).
+    """
+    reversed_map, ambiguous = {}, set()
+    for src, tgt in (mapping or {}).items():
+        if not tgt:
+            continue
+        if tgt in reversed_map and reversed_map[tgt] != src:
+            ambiguous.add(tgt)
+        reversed_map[tgt] = src
+    issues = [{'severity': 'error',
+               'msg': f"{kind} mapping is not reversible for failback: "
+                      f"'{t}' is the target of more than one source"}
+              for t in sorted(ambiguous)]
+    return reversed_map, issues
+
+
 def validate_mappings(tgt_mgr, storage_map, net_map):
     """Validate that the mapping targets actually exist on the target cluster.
     Returns a list of {severity, msg} entries. Empty list = all good."""
@@ -232,7 +254,13 @@ def _migrate_vm_cross_cluster(src_mgr, tgt_mgr, vmid, vm_type, storage_map, net_
             target_bridge = ','.join(f"{s}:{t}" for s, t in net_map.items())
 
         # create temp token on target for migration auth
-        token_result = tgt_mgr.create_api_token('pegaprox-sr')
+        # fix (audit): the name used to be the fixed string 'pegaprox-sr', and the cleanup below
+        # deletes BY NAME after a one-hour grace. Two failovers running at once — or one
+        # starting while an earlier grace is still pending — meant the first cleanup revoked the
+        # token the second migration was still authenticating with. The xclb path already mints
+        # per-job names for the same reason; do the same here.
+        _sr_token_name = f"pegaprox-sr-{uuid.uuid4().hex[:8]}"
+        token_result = tgt_mgr.create_api_token(_sr_token_name)
         if not token_result.get('success'):
             return False, f"Failed to create API token on target: {token_result.get('error', 'unknown')}"
 
@@ -242,7 +270,7 @@ def _migrate_vm_cross_cluster(src_mgr, tgt_mgr, vmid, vm_type, storage_map, net_
         # get target fingerprint
         fp_result = tgt_mgr.get_cluster_fingerprint()
         if not fp_result.get('success'):
-            tgt_mgr.delete_api_token('pegaprox-sr')
+            tgt_mgr.delete_api_token(_sr_token_name)
             return False, f"Failed to get target fingerprint: {fp_result.get('error', '')}"
 
         fingerprint = fp_result['fingerprint']
@@ -264,7 +292,7 @@ def _migrate_vm_cross_cluster(src_mgr, tgt_mgr, vmid, vm_type, storage_map, net_
         def _delayed_cleanup():
             time.sleep(3600)  # 1h grace - large disks (1TB+) need time
             try:
-                tgt_mgr.delete_api_token('pegaprox-sr')
+                tgt_mgr.delete_api_token(_sr_token_name)
             except Exception:
                 pass
 
@@ -441,10 +469,20 @@ def execute_failover(plan_id, failover_type='planned'):
     net_map = plan.get('network_mappings', {})
     stor_map = plan.get('storage_mappings', {})
 
+    reverse_issues = []
+    if failover_type == 'failback':
+        # the direction swap above is only half of it — the mappings are stored
+        # source→target and have to be read the other way round on the way home,
+        # or the VMs come back onto the DR site's storage and bridge names
+        stor_map, _si = _reverse_mapping(stor_map, 'Storage')
+        net_map, _ni = _reverse_mapping(net_map, 'Network')
+        reverse_issues = _si + _ni
+
     # NS 2026-04-24 — pre-flight: catch bad mappings BEFORE we start moving VMs.
     # A typo like `local-lvm` → `local-lvmm` used to fail silently mid-migration
     # with a Proxmox 500; now we fail fast with a clear message.
     preflight_issues = validate_mappings(tgt_mgr, stor_map, net_map) if failover_type != 'emergency' else []
+    preflight_issues = reverse_issues + preflight_issues
     preflight_errors = [i for i in preflight_issues if i.get('severity') == 'error']
     if preflight_errors:
         msg = '; '.join(i['msg'] for i in preflight_errors[:3])
@@ -770,6 +808,7 @@ def cleanup_test(plan_id):
 
 _last_fail_times = {}  # plan_id -> first_fail_timestamp
 _cooldowns = {}  # plan_id -> cooldown_until_timestamp
+_missing_source_logged = set()  # plan_ids we've already warned about, so the loop doesn't spam
 
 
 def _heartbeat_check():
@@ -791,7 +830,21 @@ def _heartbeat_check():
             continue
 
         src_mgr = cluster_managers.get(plan['source_cluster'])
-        src_reachable = src_mgr and src_mgr.is_connected if src_mgr else False
+        if src_mgr is None:
+            # "not configured in PegaProx" is not "the site is down", and folding the two
+            # together is dangerous in one direction only: deleting the source cluster (or
+            # leaving a plan pointing at an id that no longer exists) looked exactly like an
+            # outage, and failover_timeout seconds later this started every replica at the DR
+            # site while production was still serving. Hold until a manager exists to ask.
+            _last_fail_times.pop(plan_id, None)
+            if plan_id not in _missing_source_logged:
+                _missing_source_logged.add(plan_id)
+                logger.warning(f"[SR] Heartbeat: plan '{_sl(plan['name'])}' names source cluster "
+                               f"'{_sl(plan['source_cluster'])}', which is not configured here — "
+                               f"auto-failover held")
+            continue
+        _missing_source_logged.discard(plan_id)
+        src_reachable = bool(src_mgr.is_connected)
 
         if src_reachable:
             # clear failure tracking

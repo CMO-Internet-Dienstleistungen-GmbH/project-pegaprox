@@ -16,7 +16,7 @@ from pegaprox.core.db import get_db
 
 from pegaprox.utils.auth import require_auth
 from pegaprox.utils.audit import log_audit
-from pegaprox.api.helpers import get_connected_manager, check_cluster_access, safe_error, parse_pve_error
+from pegaprox.api.helpers import get_connected_manager, check_cluster_access, safe_error, parse_pve_error, require_unconfined
 
 bp = Blueprint('datacenter', __name__)
 
@@ -113,7 +113,10 @@ def _get_node_multipath_data(manager, node):
     ssh = None
     try:
         # Resolve node IP from Proxmox API (node name might not be in DNS)
-        node_ip = manager._get_node_ip(node) or node
+        node_ip = manager.member_node_ip(node)
+        if not node_ip:
+            result['error'] = f'Unknown or unreachable node {node!r}'
+            return result
         logging.debug(f"[Multipath] Resolved {node} → {node_ip}")
 
         # Connect via paramiko (handles SSH key + password auth correctly)
@@ -320,6 +323,9 @@ def setup_multipath(cluster_id):
     """
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -364,7 +370,12 @@ def setup_multipath(cluster_id):
             ssh = None
 
             # Resolve node IP
-            node_ip = manager._get_node_ip(node) or node
+            node_ip = manager.member_node_ip(node)
+            if not node_ip:
+                node_result['success'] = False
+                node_result['error'] = f'Unknown or unreachable node {node!r}'
+                results.append(node_result)
+                continue
 
             try:
                 # Connect via paramiko (handles SSH key + password auth correctly)
@@ -636,6 +647,9 @@ def reconfigure_multipath(cluster_id, node):
     """Reconfigure multipath on a specific node (rescan devices)"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -649,7 +663,9 @@ def reconfigure_multipath(cluster_id, node):
         if node not in set(_list_cluster_node_names(manager)):
             return jsonify({'error': f'Unknown cluster node: {node}'}), 400
         # Resolve node IP
-        node_ip = manager._get_node_ip(node) or node
+        node_ip = manager.member_node_ip(node)
+        if not node_ip:
+            return jsonify({'error': f'Unknown or unreachable node {node!r}'}), 400
 
         # Connect via paramiko
         ssh = manager._ssh_connect(node_ip, retries=2, retry_delay=1.0)
@@ -687,6 +703,9 @@ def discover_iscsi_targets(cluster_id, node):
     """Discover iSCSI targets on a portal - for Easy Setup"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -766,6 +785,9 @@ def login_iscsi_target(cluster_id, node):
     """Login to an iSCSI target - creates persistent connection"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -802,7 +824,9 @@ def login_iscsi_target(cluster_id, node):
         if node not in set(_list_cluster_node_names(manager)):
             return jsonify({'error': f'Unknown cluster node: {node}'}), 400
         # Resolve node IP
-        node_ip = manager._get_node_ip(node) or node
+        node_ip = manager.member_node_ip(node)
+        if not node_ip:
+            return jsonify({'error': f'Unknown or unreachable node {node!r}'}), 400
 
         # Connect via paramiko
         ssh = manager._ssh_connect(node_ip, retries=2, retry_delay=1.0)
@@ -1046,6 +1070,9 @@ def create_sdn_zone(cluster_id):
     """Create a new SDN zone"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -1073,6 +1100,9 @@ def update_sdn_zone(cluster_id, zone_id):
     """Update an SDN zone"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -1100,6 +1130,9 @@ def delete_sdn_zone(cluster_id, zone_id):
     """Delete an SDN zone"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -1152,6 +1185,9 @@ def create_sdn_vnet(cluster_id):
     """Create a new SDN VNet"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -1179,6 +1215,9 @@ def update_sdn_vnet(cluster_id, vnet_id):
     """Update an SDN VNet"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -1206,6 +1245,9 @@ def delete_sdn_vnet(cluster_id, vnet_id):
     """Delete an SDN VNet"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -1258,6 +1300,9 @@ def create_sdn_subnet(cluster_id, vnet_id):
     """Create a subnet in a VNet"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -1285,6 +1330,9 @@ def delete_sdn_subnet(cluster_id, vnet_id, subnet_id):
     """Delete a subnet from a VNet"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -1318,6 +1366,9 @@ def apply_sdn_config(cluster_id):
     """
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -1376,6 +1427,9 @@ def get_sdn_fabrics(cluster_id):
 def create_sdn_fabric(cluster_id):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     manager, error = get_connected_manager(cluster_id)
     if error: return error
     try:
@@ -1401,6 +1455,9 @@ def create_sdn_fabric(cluster_id):
 def update_sdn_fabric(cluster_id, fabric_id):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     manager, error = get_connected_manager(cluster_id)
     if error: return error
     try:
@@ -1421,6 +1478,9 @@ def update_sdn_fabric(cluster_id, fabric_id):
 def delete_sdn_fabric(cluster_id, fabric_id):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     manager, error = get_connected_manager(cluster_id)
     if error: return error
     try:
@@ -1495,6 +1555,9 @@ def list_sdn_routemaps(cluster_id):
 def create_sdn_routemap(cluster_id):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     user = getattr(request, 'session', {}).get('user', 'system')
     name = (request.json or {}).get('routemap', '?')
     result = _sdn_crud_resource(cluster_id, 'route-maps')
@@ -1510,6 +1573,9 @@ def create_sdn_routemap(cluster_id):
 def update_sdn_routemap(cluster_id, routemap_id):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     return _sdn_crud_resource(cluster_id, 'route-maps', routemap_id)
 
 
@@ -1518,6 +1584,9 @@ def update_sdn_routemap(cluster_id, routemap_id):
 def delete_sdn_routemap(cluster_id, routemap_id):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     return _sdn_crud_resource(cluster_id, 'route-maps', routemap_id)
 
 
@@ -1535,6 +1604,9 @@ def list_sdn_prefixlists(cluster_id):
 def create_sdn_prefixlist(cluster_id):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     user = getattr(request, 'session', {}).get('user', 'system')
     name = (request.json or {}).get('prefixlist', '?')
     result = _sdn_crud_resource(cluster_id, 'prefix-lists')
@@ -1550,6 +1622,9 @@ def create_sdn_prefixlist(cluster_id):
 def update_sdn_prefixlist(cluster_id, prefixlist_id):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     return _sdn_crud_resource(cluster_id, 'prefix-lists', prefixlist_id)
 
 
@@ -1558,6 +1633,9 @@ def update_sdn_prefixlist(cluster_id, prefixlist_id):
 def delete_sdn_prefixlist(cluster_id, prefixlist_id):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     return _sdn_crud_resource(cluster_id, 'prefix-lists', prefixlist_id)
 
 
@@ -1597,6 +1675,9 @@ def create_sdn_controller(cluster_id):
     """Create a new SDN controller (BGP, EVPN, ISIS)"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -1624,6 +1705,9 @@ def update_sdn_controller(cluster_id, controller_id):
     """Update an SDN controller"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -1651,6 +1735,9 @@ def delete_sdn_controller(cluster_id, controller_id):
     """Delete an SDN controller"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -1707,6 +1794,9 @@ def create_sdn_ipam(cluster_id):
     """Create a new IPAM configuration (pve, netbox, phpipam)"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -1734,6 +1824,9 @@ def update_sdn_ipam(cluster_id, ipam_id):
     """Update an IPAM configuration"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -1761,6 +1854,9 @@ def delete_sdn_ipam(cluster_id, ipam_id):
     """Delete an IPAM configuration"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -1817,6 +1913,9 @@ def create_sdn_dns(cluster_id):
     """Create a new DNS configuration (powerdns)"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -1844,6 +1943,9 @@ def update_sdn_dns(cluster_id, dns_id):
     """Update a DNS configuration"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -1871,6 +1973,9 @@ def delete_sdn_dns(cluster_id, dns_id):
     """Delete a DNS configuration"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -1947,6 +2052,9 @@ def update_sdn_subnet(cluster_id, vnet_id, subnet_id):
     """Update a subnet (DHCP range, gateway, etc.)"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -2028,6 +2136,9 @@ def create_node_lvm_api(cluster_id, node):
     """Create LVM volume group"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -2069,6 +2180,9 @@ def create_node_lvmthin_api(cluster_id, node):
     """Create LVM-Thin pool"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -2110,6 +2224,9 @@ def create_node_zfs_api(cluster_id, node):
     """Create ZFS pool"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -2140,6 +2257,9 @@ def create_node_directory_api(cluster_id, node):
     """Create directory storage"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -2168,6 +2288,9 @@ def init_node_disk_gpt_api(cluster_id, node):
     """Initialize disk with GPT partition table"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -2194,6 +2317,9 @@ def wipe_node_disk_api(cluster_id, node):
     """Wipe disk (delete partition table)"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -2224,6 +2350,9 @@ def create_sr_api(cluster_id, node):
     LW: type-specific dispatch to NFS, iSCSI, LVM, EXT creation methods."""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -2276,6 +2405,9 @@ def create_sr_api(cluster_id, node):
 def discover_iscsi_api(cluster_id, node):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404

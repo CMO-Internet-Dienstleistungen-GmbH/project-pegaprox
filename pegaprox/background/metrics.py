@@ -248,7 +248,12 @@ def collect_metrics_snapshot():
         'clusters': {}
     }
     
-    for cluster_id, mgr in cluster_managers.items():
+    # snapshot the dict first: the body below fans out over SSH (run_per_node) and
+    # hits the API, so one cycle can sit on the wire for minutes. Every one of those
+    # is a gevent yield point, and a cluster added or deleted meanwhile would raise
+    # "dictionary changed size during iteration" — metrics_collector_loop swallows
+    # that and we silently lose the whole 5-minute cycle. MK
+    for cluster_id, mgr in list(cluster_managers.items()):
         if not mgr.is_connected:
             continue
         

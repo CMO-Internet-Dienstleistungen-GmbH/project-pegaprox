@@ -19,7 +19,7 @@ from pegaprox.utils.rbac import (
     has_permission, filter_clusters_for_user, user_can_access_vm,
     get_user_clusters,
 )
-from pegaprox.api.helpers import get_connected_manager, safe_error, check_cluster_access
+from pegaprox.api.helpers import get_connected_manager, safe_error, check_cluster_access, scope_vm_rows
 
 bp = Blueprint('search', __name__)
 
@@ -146,7 +146,7 @@ def global_search():
     # MK: collect tags for the autocomplete dropdown in the frontend
     all_tags = set()
     
-    for cluster_id, mgr in cluster_managers.items():
+    for cluster_id, mgr in list(cluster_managers.items()):
         # Check cluster access - NS: important for multi-tenant setups
         if accessible_clusters is not None and cluster_id not in accessible_clusters:
             continue
@@ -159,7 +159,12 @@ def global_search():
         # Search VMs and Containers
         if search_type in ['all', 'vm', 'ct']:
             try:
-                resources = mgr.get_vm_resources()
+                # sec (private disclosure Sep 2026) — the #285 filter above only gates cluster
+                # REACHABILITY; check_cluster_access' #555 pool fallback admits a pool-scoped user to
+                # the whole cluster, so global search enumerated every VM (name/vmid/node/ip/tags) and
+                # every tag for autocomplete regardless of grant. Confine to the caller's VMs, same
+                # per-VM check as get_cluster_tags / scope_vm_rows. Admins/plain operators keep all.
+                resources = scope_vm_rows(cluster_id, mgr.get_vm_resources())
                 for r in resources:
                     name = (r.get('name') or '').lower()
                     vmid = str(r.get('vmid', ''))
@@ -331,7 +336,7 @@ def global_summary():
             'by_cluster': []
         }
         
-        for cluster_id, mgr in cluster_managers.items():
+        for cluster_id, mgr in list(cluster_managers.items()):
             # Check cluster access
             if accessible_clusters is not None and cluster_id not in accessible_clusters:
                 continue
@@ -372,7 +377,10 @@ def global_summary():
                 
                 # Count VMs
                 try:
-                    resources = mgr.get_vm_resources() or []
+                    # sec (private disclosure Sep 2026) — scope the per-VM enumeration so a
+                    # pool-/ACL-scoped caller's VM/CT totals reflect only their grant, not the whole
+                    # cluster (node + resource aggregates below stay cluster-level infra, as elsewhere).
+                    resources = scope_vm_rows(cluster_id, mgr.get_vm_resources() or [])
                     for r in resources:
                         if not r:
                             continue
@@ -665,10 +673,18 @@ def get_vm_tags(cluster_id, vmid):
     ok, err = check_cluster_access(cluster_id)  # sec-review: was unscoped (CWE-285)
     if not ok:
         return err
+    # sec (private disclosure Sep 2026) — cluster access alone let a pool-scoped caller read the
+    # tags of any vmid they named. Gate on per-VM access like get_cluster_tags does for the counts.
+    _tag_user = build_authz_user(request.session.get('user', ''), request.session)
+    try:
+        if not user_can_access_vm(_tag_user, cluster_id, int(str(vmid).split(':')[0]), 'vm.view'):
+            return jsonify({'error': 'Access denied to this VM'}), 403
+    except (ValueError, TypeError):
+        return jsonify({'error': 'Invalid VM id'}), 400
     tags_db = load_vm_tags()
     cluster_tags = tags_db.get(cluster_id, {})
     vm_tags = cluster_tags.get(str(vmid), [])
-    
+
     return jsonify(vm_tags)
 
 
@@ -697,6 +713,14 @@ def update_vm_tags(cluster_id, vmid):
         vmid = int(vmid)
     except (TypeError, ValueError):
         return jsonify({'error': 'Invalid VM ID'}), 400
+    # sec (private disclosure Sep 2026 — audit): the GET sibling gates per-VM but these tag WRITES did
+    # not — a pool-/ACL-scoped vm.config holder (admitted to the cluster via the #248/#555 fallback)
+    # could rewrite/erase a FOREIGN VM's tags, which drive backup/snapshot/affinity selection. Gate the
+    # target VM per-object like get_vm_tags does. Own-scope VM passes; a VM outside the grant is denied.
+    from pegaprox.utils.auth import build_authz_user
+    if not user_can_access_vm(build_authz_user(request.session.get('user', ''), request.session),
+                              cluster_id, vmid, 'vm.config'):
+        return jsonify({'error': 'Access denied to this VM'}), 403
     data = request.json or {}
     tags_db = load_vm_tags()
     
@@ -746,6 +770,15 @@ def remove_vm_tag(cluster_id, vmid, tag_name):
     # any vm.config holder could yank tags off a VM in a cluster they don't own.
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    # sec (private disclosure Sep 2026 — audit): per-VM gate on the tag WRITE, matching the GET sibling
+    from pegaprox.utils.auth import build_authz_user
+    try:
+        _v = int(str(vmid).split(':')[0])
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Invalid VM ID'}), 400
+    if not user_can_access_vm(build_authz_user(request.session.get('user', ''), request.session),
+                              cluster_id, _v, 'vm.config'):
+        return jsonify({'error': 'Access denied to this VM'}), 403
     tags_db = load_vm_tags()
 
     if cluster_id not in tags_db:
@@ -807,12 +840,21 @@ def search_vms_by_tag():
         cluster_name = mgr.config.name if mgr else cluster_id
         
         for vm_key, vm_tags in cluster_tags.items():
+            # sec (private disclosure Sep 2026) — don't reveal tagged VMs outside the caller's
+            # grant. Same per-VM gate as get_cluster_tags; a pool-/ACL-scoped user is confined,
+            # admins/plain operators pass. vm_key is 'vmid' (occasionally 'vmid:type').
+            try:
+                if not user_can_access_vm(user_data, cluster_id, int(str(vm_key).split(':')[0]), 'vm.view'):
+                    continue
+            except (ValueError, TypeError):
+                continue
+
             # Check if this VM has the tag
             has_tag = any(
-                (t.get('name') if isinstance(t, dict) else t) == tag_name 
+                (t.get('name') if isinstance(t, dict) else t) == tag_name
                 for t in vm_tags
             )
-            
+
             if has_tag:
                 # Try to get VM details
                 vm_info = {'vmid': vm_key, 'cluster_id': cluster_id, 'cluster_name': cluster_name}

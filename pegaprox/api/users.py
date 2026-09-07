@@ -18,10 +18,12 @@ from pegaprox.utils.sanitization import sanitize_username, sanitize_log_message 
 from pegaprox.utils.auth import (
     hash_password, verify_password, validate_password_policy,
     load_users, save_users, require_auth, ARGON2_AVAILABLE,
-    mark_admin_initialized, invalidate_all_user_sessions,
+    mark_admin_initialized, invalidate_all_user_sessions, revoke_user_api_tokens,
+    build_authz_user,
 )
 from pegaprox.utils.audit import log_audit
 from pegaprox.utils.rbac import (
+    invalidate_tenants_cache,
     load_custom_roles, save_custom_roles, get_custom_roles, invalidate_roles_cache,
     get_role_permissions_for_user, load_tenants, save_tenants,
     get_user_permissions, has_permission, get_user_effective_role,
@@ -102,6 +104,39 @@ def _caller_can_grant_perms(permissions):
     from pegaprox.utils.auth import build_authz_user
     caller = build_authz_user(request.session.get('user', ''), request.session)
     return all(has_permission(caller, p) for p in (permissions or []))
+
+
+def _authz_object_write(cluster_id, subjects=(), permissions=()):
+    """sec (audit): vm-acls, pool permissions and the pools themselves are the authorization
+    objects the per-VM gate
+    consults — writing them IS granting access, so cluster reach is nowhere near enough. Every
+    other grant path in this file already asks these questions; these routes asked none of them.
+    Returns an error response, or None when the write is allowed.
+
+    Global admins pass. Otherwise the caller must not be confined on this cluster (a pool-/ACL-
+    scoped caller has no business authoring grants at all), the subjects must be inside their
+    tenant, and they may not hand out permissions they do not hold themselves."""
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.api.helpers import caller_is_scoped
+    caller = build_authz_user(request.session.get('user', ''), request.session)
+    if caller.get('effective_role', caller.get('role')) == ROLE_ADMIN:
+        return None
+    if caller_is_scoped(caller, cluster_id):
+        return jsonify({'error': 'Access denied: you cannot manage access rules on this cluster'}), 403
+    _ct = _caller_tenant_or_none()
+    if _ct is not None:
+        _users = load_users()
+        for s in subjects:
+            if not s or s == '*':
+                # a wildcard grant reaches every account, including other tenants'
+                return jsonify({'error': 'Access denied: wildcard grants require a global admin'}), 403
+            _t = (_users.get(s) or {}).get('tenant_id', DEFAULT_TENANT_ID)
+            if _t != _ct:
+                return jsonify({'error': f'Access denied: {s} is not in your tenant'}), 403
+    _over = [p for p in (permissions or []) if not has_permission(caller, p)]
+    if _over:
+        return jsonify({'error': 'Cannot grant permissions you do not hold: ' + ', '.join(_over)}), 403
+    return None
 
 
 def _caller_can_manage_user(target_user):
@@ -392,9 +427,12 @@ def admin_change_password(username):
     
     # Invalidate ALL sessions for this user (security: force re-login)
     sessions_removed = invalidate_all_user_sessions(username)
+    tokens_revoked = revoke_user_api_tokens(username)  # sec (audit): revoke API tokens too, not just sessions
+    from pegaprox.utils.realtime import invalidate_user_sse_tokens
+    invalidate_user_sse_tokens(username)               # ...and the SSE stream token
 
     admin_username = request.session['user']
-    logging.info(f"Admin '{admin_username}' changed password for user '{username}'")
+    logging.info(f"Admin '{admin_username}' changed password for user '{username}' — {tokens_revoked} token(s) revoked")
     log_audit(admin_username, 'user.password_reset', f"Admin reset password for user: {username} ({sessions_removed} sessions invalidated)")
 
     # NS 2026-04-24 — if admin reset their OWN password, their session just died too
@@ -961,6 +999,10 @@ def update_user(username):
     
     _disabled = False
     if 'enabled' in data:
+        # sec (audit): same tier guard as the password/2FA paths — disabling is an availability
+        # attack a delegate must not be able to run against a peer who outranks them.
+        if not _caller_can_manage_user(user):
+            return jsonify({'error': 'Access denied: target has privileges beyond your own'}), 403
         # Prevent disabling last admin
         if user['role'] == ROLE_ADMIN and not data['enabled']:
             admin_count = sum(1 for u in users_db.values() if u['role'] == ROLE_ADMIN and u.get('enabled', True))
@@ -1019,17 +1061,24 @@ def update_user(username):
     if _password_changed:
         from pegaprox.utils.auth import invalidate_all_user_sessions
         invalidate_all_user_sessions(username)
+        # sec (audit): the dedicated reset route revokes API tokens too; this one didn't, so an
+        # exfiltrated pgx_ token survived the standard "lock the intruder out" action for up to a year.
+        _revoked = revoke_user_api_tokens(username)
+        from pegaprox.utils.realtime import invalidate_user_sse_tokens
+        invalidate_user_sse_tokens(username)
         log_audit(request.session['user'], 'user.sessions_invalidated',
-                  f"Invalidated sessions after password change for {username}")
+                  f"Invalidated sessions after password change for {username} "
+                  f"({_revoked} API token(s) revoked)")
 
     # NS Aug 2026 (audit) — disabling an account must immediately drop its live sessions (root cause
     # of the "disabled operator keeps node-shell" gap); the enabled recheck added to the WS-auth
     # endpoints is the defence-in-depth backstop.
     if _disabled:
         from pegaprox.utils.auth import invalidate_all_user_sessions
-        from pegaprox.utils.realtime import invalidate_user_ws_tokens
+        from pegaprox.utils.realtime import invalidate_user_ws_tokens, invalidate_user_sse_tokens
         invalidate_all_user_sessions(username)
         invalidate_user_ws_tokens(username)   # a pre-minted ws_token must not outlive the disable
+        invalidate_user_sse_tokens(username)  # ...nor a pre-minted SSE token (audit)
         log_audit(request.session['user'], 'user.sessions_invalidated',
                   f"Invalidated sessions after disabling {username}")
 
@@ -1059,6 +1108,10 @@ def delete_user(username):
     _ct = _caller_tenant_or_none()
     if _ct is not None and user.get('tenant_id', DEFAULT_TENANT_ID) != _ct:
         return jsonify({'error': 'Access denied: cannot delete users in other tenants'}), 403
+    # sec (audit): same tier guard the password-reset and 2FA-clear paths use — a delegate must
+    # not be able to remove a same-tenant peer whose grants exceed their own.
+    if not _caller_can_manage_user(user):
+        return jsonify({'error': 'Access denied: target has privileges beyond your own'}), 403
     if user['role'] == ROLE_ADMIN:
         admin_count = sum(1 for u in users_db.values() if u['role'] == ROLE_ADMIN)
         if admin_count <= 1:
@@ -1088,9 +1141,10 @@ def delete_user(username):
     # LIVE store and persists. Also revoke the user's API tokens so a long-lived pgx_ token
     # can't outlive the account.
     from pegaprox.utils.auth import invalidate_all_user_sessions
-    from pegaprox.utils.realtime import invalidate_user_ws_tokens
+    from pegaprox.utils.realtime import invalidate_user_ws_tokens, invalidate_user_sse_tokens
     invalidate_all_user_sessions(username)
     invalidate_user_ws_tokens(username)   # drop any pre-minted console/shell ws_token too
+    invalidate_user_sse_tokens(username)  # and the SSE stream token (audit)
     try:
         db.execute('UPDATE api_tokens SET revoked = 1 WHERE username = ?', (username,))
     except Exception as e:
@@ -1213,6 +1267,9 @@ def create_tenant():
     }
     
     save_tenants(tenants_db)
+    
+    # new tenant, so the cached copy in rbac is stale either way
+    invalidate_tenants_cache()
     log_audit(request.session['user'], 'tenant.created', f"Created tenant: {name} (id={tid})")
     
     return jsonify({'success': True, 'tenant': tenants_db[tid]})
@@ -1240,7 +1297,17 @@ def update_tenant(tenant_id):
     if 'name' in data:
         tenants_db[tenant_id]['name'] = data['name']
     if 'clusters' in data:
-        tenants_db[tenant_id]['clusters'] = data['clusters']
+        # sec (audit): tenant['clusters'] IS the list get_user_clusters reads, so a non-global
+        # admin.tenants holder could append arbitrary cluster ids to their own tenant and become
+        # a cluster-wide operator there. Only a global admin may change the cluster set.
+        # Compare VALUES, not key presence — the tenant edit form posts the whole object every
+        # time, so keying on presence 403'd a group_manager renaming a tenant or editing a quota.
+        _cur = list(tenants_db[tenant_id].get('clusters') or [])
+        _new = list(data['clusters'] or [])
+        if sorted(map(str, _cur)) != sorted(map(str, _new)):
+            if request.session.get('effective_role', request.session.get('role')) != ROLE_ADMIN:
+                return jsonify({'error': 'Only a global admin can change a tenant\'s clusters'}), 403
+            tenants_db[tenant_id]['clusters'] = _new
     # NS #502 — quota fields
     for _qk in ('quota_max_vms', 'quota_max_cores', 'quota_max_memory_gb'):
         if _qk in data:
@@ -1252,6 +1319,9 @@ def update_tenant(tenant_id):
         tenants_db[tenant_id]['quota_enforcement'] = data['quota_enforcement'] or 'block'
 
     save_tenants(tenants_db)
+
+    # a cluster removed here must stop being reachable now, not after the next restart
+    invalidate_tenants_cache()
     log_audit(request.session['user'], 'tenant.updated', f"Updated tenant: {tenant_id}")
     
     return jsonify({'success': True, 'tenant': tenants_db[tenant_id]})
@@ -1302,10 +1372,11 @@ def delete_tenant(tenant_id):
         logging.error(f"Error deleting tenant from database: {e}")
         return jsonify({'error': 'Database error'}), 500
     
-    # Update cache
+    # Update cache — this module's copy AND rbac's, which is the one get_user_clusters reads
     if tenant_id in tenants_db:
         del tenants_db[tenant_id]
-    
+    invalidate_tenants_cache()
+
     log_audit(request.session['user'], 'tenant.deleted', f"Deleted tenant: {tenant_id}")
     
     return jsonify({'success': True})
@@ -1352,10 +1423,9 @@ def list_all_roles():
     custom = get_custom_roles()
     
     # Get user's tenant for filtering
-    users = load_users()
-    user = users.get(request.session['user'], {})
+    user = build_authz_user(request.session.get('user', ''), request.session)
     user_tenant = user.get('tenant_id', DEFAULT_TENANT_ID)
-    is_admin = user.get('role') == ROLE_ADMIN
+    is_admin = user.get('effective_role', user.get('role')) == ROLE_ADMIN
     
     roles = []
     # builtins
@@ -1426,9 +1496,8 @@ def create_custom_role():
             return jsonify({'error': f'Invalid permission: {p}'}), 400
     
     # Tenant validation: non-admins can only create roles for their own tenant
-    users = load_users()
-    user = users.get(request.session['user'], {})
-    if user.get('role') != ROLE_ADMIN:
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    if user.get('effective_role', user.get('role')) != ROLE_ADMIN:
         user_tenant = user.get('tenant_id', DEFAULT_TENANT_ID)
         if tenant_id and tenant_id != user_tenant:
             log_audit(request.session['user'], 'role.create_denied',
@@ -1495,9 +1564,8 @@ def update_custom_role(role_id):
     tenant_id = data.get('tenant_id')  # which tenant's role to update
     
     # Tenant validation: non-admins can only update roles in their own tenant
-    users = load_users()
-    user = users.get(request.session['user'], {})
-    if user.get('role') != ROLE_ADMIN:
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    if user.get('effective_role', user.get('role')) != ROLE_ADMIN:
         user_tenant = user.get('tenant_id', DEFAULT_TENANT_ID)
         # Check if trying to update a role in a different tenant
         if tenant_id and tenant_id != user_tenant:
@@ -1513,36 +1581,25 @@ def update_custom_role(role_id):
         if permissions is not None and not _caller_can_grant_perms(permissions):
             return jsonify({'error': 'Cannot grant permissions beyond your own'}), 403
 
+    # validate before touching anything: get_custom_roles hands back the live cached dict, and
+    # the name used to be written into it before the permission list was checked — so a request
+    # rejected with 400 still renamed the role for the rest of the process's life
+    if permissions is not None:
+        for p in permissions:
+            if p not in PERMISSIONS:
+                return jsonify({'error': f'Invalid permission: {p}'}), 400
+
     custom = get_custom_roles()
-    
-    # find the role
-    found = False
-    if tenant_id:
-        tenant_roles = custom.get('tenants', {}).get(tenant_id, {})
-        if role_id in tenant_roles:
-            if name: tenant_roles[role_id]['name'] = name
-            if permissions is not None:
-                # validate
-                for p in permissions:
-                    if p not in PERMISSIONS:
-                        return jsonify({'error': f'Invalid permission: {p}'}), 400
-                tenant_roles[role_id]['permissions'] = permissions
-            tenant_roles[role_id]['modified'] = datetime.now().isoformat()
-            found = True
-    else:
-        global_roles = custom.get('global', {})
-        if role_id in global_roles:
-            if name: global_roles[role_id]['name'] = name
-            if permissions is not None:
-                for p in permissions:
-                    if p not in PERMISSIONS:
-                        return jsonify({'error': f'Invalid permission: {p}'}), 400
-                global_roles[role_id]['permissions'] = permissions
-            global_roles[role_id]['modified'] = datetime.now().isoformat()
-            found = True
-    
-    if not found:
+    roles = (custom.get('tenants', {}).get(tenant_id, {}) if tenant_id
+             else custom.get('global', {}))
+    if role_id not in roles:
         return jsonify({'error': 'Role not found'}), 404
+
+    if name:
+        roles[role_id]['name'] = name
+    if permissions is not None:
+        roles[role_id]['permissions'] = permissions
+    roles[role_id]['modified'] = datetime.now().isoformat()
     
     save_custom_roles(custom)
     invalidate_roles_cache()
@@ -1561,9 +1618,8 @@ def delete_custom_role(role_id):
     tenant_id = request.args.get('tenant_id')
     
     # Tenant validation: non-admins can only delete roles in their own tenant
-    users = load_users()
-    user = users.get(request.session['user'], {})
-    if user.get('role') != ROLE_ADMIN:
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    if user.get('effective_role', user.get('role')) != ROLE_ADMIN:
         user_tenant = user.get('tenant_id', DEFAULT_TENANT_ID)
         # Check if trying to delete a role in a different tenant
         if tenant_id and tenant_id != user_tenant:
@@ -1575,21 +1631,41 @@ def delete_custom_role(role_id):
         tenant_id = user_tenant
 
     custom = get_custom_roles()
-    found = False
-    
+    # look it up before touching anything: get_custom_roles hands back the live cached dict,
+    # so deleting first and deciding afterwards drops the role out of the running process even
+    # on a path that returns an error and never saves
     if tenant_id:
-        tenant_roles = custom.get('tenants', {}).get(tenant_id, {})
-        if role_id in tenant_roles:
-            del tenant_roles[role_id]
-            found = True
+        found = role_id in custom.get('tenants', {}).get(tenant_id, {})
     else:
-        if role_id in custom.get('global', {}):
-            del custom['global'][role_id]
-            found = True
-    
+        found = role_id in custom.get('global', {})
+
     if not found:
         return jsonify({'error': 'Role not found'}), 404
-    
+
+    # sec (audit): deleting a role does not revoke it from the accounts holding it, and
+    # get_role_permissions_for_user falls back to the ROLE_VIEWER defaults for a name it can no
+    # longer resolve. So removing a deliberately narrow role WIDENED its holders — a role
+    # granting vm.view left them with 31 permissions including the whole node, cluster and PBS
+    # read surface. An admin deleting a role means "revoke this", never "promote them".
+    _holders = sorted(
+        u for u, rec in (load_users() or {}).items()
+        if (rec or {}).get('role') == role_id
+        or any((_ov or {}).get('role') == role_id
+               for _ov in ((rec or {}).get('tenant_permissions', {}) or {}).values())
+    )
+    if _holders:
+        return jsonify({
+            'error': 'Role still assigned',
+            'detail': f"{len(_holders)} account(s) still hold '{role_id}' — reassign them "
+                      f"before deleting, or they would silently fall back to viewer access.",
+            'users': _holders[:20],
+        }), 409
+
+    if tenant_id:
+        del custom['tenants'][tenant_id][role_id]
+    else:
+        del custom['global'][role_id]
+
     save_custom_roles(custom)
     invalidate_roles_cache()
     
@@ -1742,7 +1818,17 @@ def set_vm_acl(cluster_id, vmid):
     for p in permissions:
         if p not in PERMISSIONS:
             return jsonify({'error': f'Invalid permission: {p}'}), 400
-    
+
+    _err = _authz_object_write(cluster_id, subjects=users, permissions=permissions)
+    if _err:
+        return _err
+    # and the caller must actually control the VM they are writing a rule for
+    from pegaprox.utils.auth import build_authz_user as _bau
+    from pegaprox.utils.rbac import user_can_access_vm as _ucav
+    _caller = _bau(request.session.get('user', ''), request.session)
+    if not _ucav(_caller, cluster_id, vmid, 'vm.config'):
+        return jsonify({'error': 'Access denied to this VM'}), 403
+
     acls = get_vm_acls()
     if cluster_id not in acls:
         acls[cluster_id] = {}
@@ -1770,6 +1856,9 @@ def set_vm_acl(cluster_id, vmid):
 @require_auth(perms=['admin.users'])
 def delete_vm_acl(cluster_id, vmid):
     """Remove VM-specific ACL (use default permissions)"""
+    _err = _authz_object_write(cluster_id)
+    if _err:
+        return _err
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
     
@@ -1808,19 +1897,45 @@ POOL_PERMISSIONS = [
 ]
 
 
+def _pool_visibility(cluster_id):
+    """sec (private disclosure Sep 2026 — audit H3): pool list/detail were gated only by
+    check_cluster_access (cluster reach), whose #555 pool fallback admits a pool-scoped user to the
+    whole cluster — so they enumerated every pool's members, and /pools/<id> was a straight IDOR
+    (pool-A user read pool-B). Gate at the POOL level: an admin or a plain cluster-wide operator sees
+    all pools; a pool-/ACL-scoped caller sees only pools they hold a grant on. A pool grant authorizes
+    viewing that pool's membership, so no per-member scoping is needed once the pool gate passes.
+
+    Returns (confined, granted_pools): confined=True means restrict to granted_pools."""
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import _pool_perms_for, user_has_any_pool_access
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+        return False, set()
+    _pp = _pool_perms_for(cluster_id, user.get('username', ''), user.get('groups', []))
+    granted = {pid for pid, perms in (_pp or {}).items() if perms}
+    # shared predicate — also catches the VM-ACL-scoped (Client Portal) caller the old inline
+    # check missed; a plain cluster-wide operator on an owned cluster still keeps every pool.
+    from pegaprox.api.helpers import caller_is_scoped
+    return caller_is_scoped(user, cluster_id), granted
+
+
 @bp.route('/api/clusters/<cluster_id>/pools', methods=['GET'])
 @require_auth(perms=['cluster.view'])
 def get_cluster_pools(cluster_id):
     """Get all resource pools from Proxmox"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
-    
+
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
-    
+
     mgr = cluster_managers[cluster_id]
     pools = mgr.get_pools()
-    
+
+    _confined, _granted = _pool_visibility(cluster_id)
+    if _confined:
+        pools = [p for p in pools if p.get('poolid') in _granted]
+
     # Add pool member details
     for pool in pools:
         try:
@@ -1850,10 +1965,16 @@ def get_pool_details(cluster_id, pool_id):
     """Get pool details including members"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
-    
+
+    # sec (private disclosure Sep 2026 — audit H3): this was an IDOR — a pool-scoped caller could read
+    # ANY pool's members by naming its id. Confine to pools the caller holds a grant on.
+    _confined, _granted = _pool_visibility(cluster_id)
+    if _confined and pool_id not in _granted:
+        return jsonify({'error': 'Access denied to this pool'}), 403
+
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
-    
+
     mgr = cluster_managers[cluster_id]
     pool_data = mgr.get_pool_members(pool_id)
     
@@ -1902,7 +2023,20 @@ def add_pool_permission_api(cluster_id, pool_id):
     invalid_perms = [p for p in permissions if p not in POOL_PERMISSIONS]
     if invalid_perms:
         return jsonify({'error': f'Invalid permissions: {invalid_perms}'}), 400
-    
+
+    # sec (audit): pool_id and subject_id are attacker-chosen and POOL_PERMISSIONS includes
+    # pool.admin, which short-circuits the per-VM gate for every VM in the pool — this is the
+    # strongest grant primitive in the product and it had no object gate. _pool_visibility (the
+    # H3 fix, ~100 lines up) gates pool READS; apply the same confinement to the write.
+    _err = _authz_object_write(cluster_id,
+                               subjects=[subject_id] if subject_type == 'user' else [],
+                               permissions=[])
+    if _err:
+        return _err
+    _confined, _granted = _pool_visibility(cluster_id)
+    if _confined and pool_id not in _granted:
+        return jsonify({'error': 'Access denied to this pool'}), 403
+
     db = get_db()
     success = db.save_pool_permission(cluster_id, pool_id, subject_type, subject_id, permissions)
     
@@ -1922,7 +2056,13 @@ def delete_pool_permission_api(cluster_id, pool_id, subject_type, subject_id):
     """Delete pool permission"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
-    
+    _err = _authz_object_write(cluster_id)
+    if _err:
+        return _err
+    _confined, _granted = _pool_visibility(cluster_id)
+    if _confined and pool_id not in _granted:
+        return jsonify({'error': 'Access denied to this pool'}), 403
+
     db = get_db()
     deleted = db.delete_pool_permission(cluster_id, pool_id, subject_type, subject_id)
     
@@ -1968,6 +2108,9 @@ def refresh_pool_cache_api(cluster_id):
     """
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _perr = _authz_object_write(cluster_id)
+    if _perr:
+        return _perr
     
     # Invalidate and refresh
     invalidate_pool_cache(cluster_id)
@@ -1990,6 +2133,9 @@ def refresh_pool_cache_api(cluster_id):
 def create_pool_api(cluster_id):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _perr = _authz_object_write(cluster_id)
+    if _perr:
+        return _perr
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
 
@@ -2018,6 +2164,12 @@ def create_pool_api(cluster_id):
 def update_pool_api(cluster_id, pool_id):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _perr = _authz_object_write(cluster_id)
+    if _perr:
+        return _perr
+    _confined, _granted = _pool_visibility(cluster_id)
+    if _confined and pool_id not in _granted:
+        return jsonify({'error': 'Access denied to this pool'}), 403
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
 
@@ -2040,6 +2192,12 @@ def rm_pool(cluster_id, pool_id):
     # LW: intentionally different name than the others, we're not consistent lol
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _perr = _authz_object_write(cluster_id)
+    if _perr:
+        return _perr
+    _confined, _granted = _pool_visibility(cluster_id)
+    if _confined and pool_id not in _granted:
+        return jsonify({'error': 'Access denied to this pool'}), 403
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
 

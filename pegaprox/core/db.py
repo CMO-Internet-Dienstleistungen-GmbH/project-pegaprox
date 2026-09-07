@@ -114,10 +114,16 @@ class PegaProxDB:
             with open(aes_key_file, 'rb') as f:
                 aes_key = f.read()
             if len(aes_key) != 32:
-                logging.warning("Invalid AES key length, regenerating...")
-                aes_key = os.urandom(32)  # 256 bits
-                with open(aes_key_file, 'wb') as f:
-                    f.write(aes_key)
+                # MK: this used to regenerate the key in place. A short read here means a
+                # truncated write (disk full, power cut) or a half-restored backup — and
+                # overwriting is unrecoverable: every cluster password, SSH key, BMC password
+                # and server_settings secret in the DB was sealed with the old key, and the
+                # audit chain was signed with it. Refuse to start instead, same as below; we
+                # only ever write a fresh key when there is no file at all.
+                raise RuntimeError(
+                    f"FATAL: AES key file {aes_key_file} is {len(aes_key)} bytes, expected 32. "
+                    "Restore it from backup — regenerating would permanently destroy every "
+                    "stored credential. Remove the file only if you accept re-entering them.")
         else:
             # Generate new 256-bit key
             aes_key = os.urandom(32)
@@ -2083,6 +2089,16 @@ class PegaProxDB:
                 migrated_any = True
         
         # Migrate users (always if needs_user_remigration or no users)
+        if needs_user_remigration and not self._read_legacy_users():
+            # MK: the DELETE below used to run unconditionally, and _migrate_users() writes
+            # nothing when the legacy file is gone or no longer decrypts — which is every
+            # install past the migration era. So one local row with an empty password_salt
+            # emptied the entire users table, admins included, with nothing to restore from,
+            # and the next request landed in first-run setup. Never clear what we can't put back.
+            logging.error("Users need re-migration but the legacy user file is unavailable — "
+                          "keeping the existing accounts")
+            needs_user_remigration = False
+
         if needs_user_remigration or cluster_count == 0:
             # Clear existing users if re-migrating
             if needs_user_remigration:
@@ -2092,7 +2108,7 @@ class PegaProxDB:
                     logging.info("Cleared users table for re-migration")
                 except Exception as e:
                     logging.error(f"Error clearing users: {e}")
-            
+
             if self._migrate_users():
                 migrated_any = True
         
@@ -2227,22 +2243,29 @@ class PegaProxDB:
         logging.info(f"Migrated {len(data)} clusters to SQLite")
         return True
     
-    def _migrate_users(self) -> bool:
-        """Migrate users from encrypted file"""
+    def _read_legacy_users(self):
+        """The legacy encrypted user file as a dict, or None when it isn't there or won't
+        decrypt. Split out of _migrate_users so the re-migration path can find out whether it
+        has anything to restore BEFORE it clears the table."""
         from pegaprox.core.config import get_fernet
         fernet = get_fernet()
         if not fernet or not os.path.exists(USERS_FILE_ENCRYPTED):
-            return False
-        
+            return None
+
         try:
             with open(USERS_FILE_ENCRYPTED, 'rb') as f:
                 encrypted_data = f.read()
-            decrypted = fernet.decrypt(encrypted_data)
-            data = json.loads(decrypted.decode('utf-8'))
+            return json.loads(fernet.decrypt(encrypted_data).decode('utf-8'))
         except Exception as e:
             logging.error(f"Failed to load users: {e}")
+            return None
+
+    def _migrate_users(self) -> bool:
+        """Migrate users from encrypted file"""
+        data = self._read_legacy_users()
+        if not data:
             return False
-        
+
         cursor = self.conn.cursor()
         now = datetime.now().isoformat()
         
@@ -3133,10 +3156,27 @@ class PegaProxDB:
         self.conn.commit()
 
     def delete_cluster(self, cluster_id: str):
-        """Delete cluster"""
+        """Delete a cluster and ALL of its cluster-scoped rows.
+
+        #779 (zobsg) — this used to remove only the clusters row + xcpng_vmid_map, leaving orphaned
+        rows in pool_permissions, vm_acls, node_maintenance, migration_history and ~20 other
+        cluster_id-keyed tables (stale UI counts, DB bloat, and a small tail where a reused 8-char
+        cluster id could inherit a stale pool/VM grant). Sweep every table that actually carries a
+        cluster_id column so the delete is exhaustive and stays correct as new cluster-scoped tables
+        are added, instead of a hand-maintained list that silently drifts. tenants.clusters is a JSON
+        array (not a cluster_id column) — the caller prunes that separately.
+        """
         cursor = self.conn.cursor()
         cursor.execute('DELETE FROM clusters WHERE id = ?', (cluster_id,))
-        cursor.execute('DELETE FROM xcpng_vmid_map WHERE cluster_id = ?', (cluster_id,))
+        # table names come from sqlite_master (not user input) → safe to interpolate; cluster_id is bound
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+        for (tbl,) in cursor.fetchall():
+            try:
+                cols = [row[1] for row in cursor.execute('PRAGMA table_info("%s")' % tbl).fetchall()]
+            except Exception:
+                continue
+            if 'cluster_id' in cols:
+                cursor.execute('DELETE FROM "%s" WHERE cluster_id = ?' % tbl, (cluster_id,))
         self.conn.commit()
 
     # XCP-ng VMID mapping helpers - MK Mar 2026
@@ -4047,11 +4087,23 @@ class PegaProxDB:
                     stats['errors'].append(f"Cluster {row['id']}: {str(e)}")
 
             # Also rotate SSH keys and API token secrets if present.
-            cursor.execute('SELECT id, ssh_key_encrypted, api_token_secret_encrypted FROM clusters')
+            # NOTE: ha_settings has no _encrypted suffix but IS encrypted (save_cluster stores
+            # _encrypt(json.dumps(...)) and both read paths _decrypt it). It was missed here, and
+            # _decrypt RAISES on a key mismatch — so rotating the key, a compliance feature, made
+            # get_all_clusters throw and every cluster vanish from the UI. Rotate it too.
+            cursor.execute('SELECT id, ssh_key_encrypted, api_token_secret_encrypted, ha_settings '
+                           'FROM clusters')
             for row in cursor.fetchall():
                 try:
                     ssh_key = row['ssh_key_encrypted']
                     api_token = row['api_token_secret_encrypted']
+                    ha_settings = row['ha_settings']
+
+                    if ha_settings and str(ha_settings).startswith('aes256:'):
+                        decrypted = self._decrypt_with_key(ha_settings, old_aesgcm)
+                        new_encrypted = self._encrypt_with_key(decrypted, new_aesgcm)
+                        cursor.execute('UPDATE clusters SET ha_settings = ? WHERE id = ?',
+                                     (new_encrypted, row['id']))
 
                     if ssh_key and ssh_key.startswith('aes256:'):
                         decrypted = self._decrypt_with_key(ssh_key, old_aesgcm)
@@ -4112,18 +4164,162 @@ class PegaProxDB:
             # because clusters failed first). stats['sessions_rotated'] stays
             # at 0 for backwards-compat with the UI counter.
             
-            self.conn.commit()
-            
-            # 4. Save new key (backup old key first)
+            # 3a2. Rotate the remaining encrypted stores.
+            # sec (audit): the loop above only covers columns whose NAME ends in _encrypted,
+            # so BMC endpoint passwords and every secret living in server_settings were left on
+            # the old key. _decrypt RAISES, so after a rotation ldap_bind_password broke every
+            # LDAP login, smtp_password broke all alert mail, and the ACME DNS secrets broke
+            # renewals — silently, on a feature run FOR compliance.
+            try:
+                cursor.execute("SELECT cluster_id, node, bmc_password_encrypted "
+                               "FROM node_bmc_endpoints "
+                               "WHERE bmc_password_encrypted IS NOT NULL "
+                               "AND bmc_password_encrypted != ''")
+                for _r in cursor.fetchall():
+                    _v = _r['bmc_password_encrypted']
+                    if _v and str(_v).startswith('aes256:'):
+                        _p = self._decrypt_with_key(_v, old_aesgcm)
+                        cursor.execute('UPDATE node_bmc_endpoints SET bmc_password_encrypted = ? '
+                                       'WHERE cluster_id = ? AND node = ?',
+                                       (self._encrypt_with_key(_p, new_aesgcm), _r['cluster_id'], _r['node']))
+            except Exception as e:
+                stats['errors'].append(f"BMC secrets: {e}")
+
+            # sec (audit): the loop above walks clusters/users/esxi/bmc, but PBS and ESXi server
+            # credentials live in their own tables and were never rotated — and _decrypt RAISES,
+            # so a rotation silently broke every PBS backup and every ESXi connection until
+            # someone re-entered the passwords. Same shape as the server_settings gap below.
+            for _tbl, _cols in (('pbs_servers', ('pass_encrypted', 'api_token_secret_encrypted',
+                                                 'ssh_key_encrypted')),
+                                ('vmware_servers', ('pass_encrypted',))):
+                try:
+                    cursor.execute(f"SELECT id, {', '.join(_cols)} FROM {_tbl}")
+                    for _r in cursor.fetchall():
+                        for _c in _cols:
+                            _v = _r[_c]
+                            if _v and str(_v).startswith('aes256:'):
+                                cursor.execute(f'UPDATE {_tbl} SET {_c} = ? WHERE id = ?',
+                                               (self._encrypt_with_key(
+                                                   self._decrypt_with_key(_v, old_aesgcm), new_aesgcm),
+                                                _r['id']))
+                except Exception as e:
+                    stats['errors'].append(f"{_tbl} secrets: {e}")
+
+            try:
+                _ss = self.get_server_settings() or {}
+                _SECRET_KEYS = ('smtp_password', 'ldap_bind_password', 'oidc_client_secret',
+                                'acme_dns_rfc2136_secret', 'acme_dns_cloudflare_token')
+                for _k in _SECRET_KEYS:
+                    _v = _ss.get(_k)
+                    if _v and isinstance(_v, str) and _v.startswith('aes256:'):
+                        # write through our own cursor, NOT save_server_settings — that helper
+                        # commits per key, which would land every re-encrypted row above while
+                        # the new key is still only in memory, and leave step 4's rollback with
+                        # nothing to undo. Everything here has to reach the same transaction.
+                        cursor.execute('INSERT OR REPLACE INTO server_settings (key, value) '
+                                       'VALUES (?, ?)',
+                                       (_k, json.dumps(self._encrypt_with_key(
+                                           self._decrypt_with_key(_v, old_aesgcm), new_aesgcm))))
+
+                # the VAPID private key is a setting too, but nested one level down inside the
+                # keypair object, so the loop above walks straight past it. Left behind it fails
+                # to decrypt, and _load_vapid answers that by generating a fresh keypair — which
+                # silently invalidates every existing push subscription.
+                _vk = _ss.get('webpush_vapid_keypair')
+                if isinstance(_vk, dict) and str(_vk.get('private_pem', '')).startswith('aes256:'):
+                    cursor.execute('INSERT OR REPLACE INTO server_settings (key, value) '
+                                   'VALUES (?, ?)',
+                                   ('webpush_vapid_keypair', json.dumps({
+                                       **_vk,
+                                       'private_pem': self._encrypt_with_key(
+                                           self._decrypt_with_key(_vk['private_pem'], old_aesgcm),
+                                           new_aesgcm)})))
+            except Exception as e:
+                stats['errors'].append(f"Server settings secrets: {e}")
+
+            # 3b. Re-sign the audit log.
+            # sec (audit): _audit_hmac signs with self.aes_key, so after a rotation every
+            # historical row verifies against a key that no longer exists and the whole trail
+            # reads as tampered — on a feature offered FOR compliance, where an intact audit
+            # trail is the other half of the requirement. Verify each row with the OLD key
+            # first: anything that already failed stays failed and is counted, so rotation
+            # cannot be used to launder a tampered entry.
+            stats['audit_resigned'] = 0
+            stats['audit_unverifiable'] = 0
+            try:
+                _saved_key = self.aes_key
+                cursor.execute('SELECT id, timestamp, user, action, details, ip_address, '
+                               'cluster, severity, hmac_signature FROM audit_log '
+                               'WHERE hmac_signature IS NOT NULL AND hmac_signature != ""')
+                _rows = cursor.fetchall()
+                for _r in _rows:
+                    _entry = {
+                        'timestamp': _r['timestamp'], 'user': _r['user'], 'action': _r['action'],
+                        'details': _r['details'], 'ip_address': _r['ip_address'],
+                        'cluster': _r['cluster'], 'severity': _r['severity'],
+                        'hmac_signature': _r['hmac_signature'],
+                    }
+                    self.aes_key = old_key
+                    _ok = self._verify_audit_hmac(_entry)
+                    if not _ok:
+                        stats['audit_unverifiable'] += 1
+                        continue                     # leave it as-is; it was already broken
+                    self.aes_key = new_key
+                    _new_sig = self._generate_audit_hmac(
+                        _r['timestamp'], _r['user'], _r['action'], _r['details'],
+                        _r['ip_address'], _r['cluster'], _r['severity'])
+                    cursor.execute('UPDATE audit_log SET hmac_signature = ? WHERE id = ?',
+                                   (_new_sig, _r['id']))
+                    stats['audit_resigned'] += 1
+                self.aes_key = _saved_key
+            except Exception as e:
+                self.aes_key = _saved_key
+                stats['errors'].append(f"Audit re-sign: {e}")
+
+            # 4. Persist the new key BEFORE committing the re-encrypted rows.
+            # sec (audit): this used to commit first and write the key afterwards, so a failure
+            # in the file step (full disk, permissions, read-only mount) left a database
+            # encrypted with a key that existed only in this process's memory — unreadable
+            # after the next restart, with no way back. Write the key first, fsync it, and roll
+            # the transaction back if anything about the file step fails; the rows are still
+            # readable with the old key in that case.
             backup_file = aes_key_file + f'.backup.{datetime.now().strftime("%Y%m%d_%H%M%S")}'
-            with open(backup_file, 'wb') as f:
-                f.write(old_key)
-            os.chmod(backup_file, 0o600)
-            
-            with open(aes_key_file, 'wb') as f:
-                f.write(new_key)
-            os.chmod(aes_key_file, 0o600)
-            
+            try:
+                with open(backup_file, 'wb') as f:
+                    f.write(old_key)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.chmod(backup_file, 0o600)
+
+                with open(aes_key_file, 'wb') as f:
+                    f.write(new_key)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.chmod(aes_key_file, 0o600)
+            except Exception as e:
+                self.conn.rollback()
+                logging.error(f"Key rotation aborted while persisting the new key: {e}")
+                stats['errors'].append(f"Could not persist the new key: {e}")
+                stats['success'] = False
+                return stats
+
+            try:
+                self.conn.commit()
+            except Exception as e:
+                # the rows did not land — put the old key back so the database stays readable
+                try:
+                    with open(aes_key_file, 'wb') as f:
+                        f.write(old_key)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.chmod(aes_key_file, 0o600)
+                except Exception:
+                    logging.critical("Key rotation: commit failed AND the old key could not be "
+                                     f"restored — recover it from {backup_file}")
+                stats['errors'].append(f"Commit failed, rotation rolled back: {e}")
+                stats['success'] = False
+                return stats
+
             # 5. Update in-memory key
             self.aes_key = new_key
             self.aesgcm = new_aesgcm
