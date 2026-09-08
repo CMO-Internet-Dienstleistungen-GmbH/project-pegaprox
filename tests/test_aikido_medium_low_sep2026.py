@@ -131,6 +131,24 @@ def test_an_omitted_skip_cert_flag_means_verify():
     assert 'False' in line, line
 
 
+@pytest.mark.parametrize('raw,skips', [
+    (True, True), (1, True), ('true', True), ('1', True), ('yes', True),
+    (False, False), (0, False), (None, False), ('', False),
+    ('false', False),   # the one bool() got wrong — bool("false") is True
+    ('0', False),
+])
+def test_the_skip_cert_flag_is_coerced_not_just_truthiness_tested(raw, skips):
+    """A `bool()` around the .get() looked like it sanitised the value and did not, so a client
+    sending the JSON string "false" would have switched certificate checking off. Mirrors the
+    handler's own expression rather than the source text, so it fails if the rule drifts."""
+    coerced = raw is True or raw == 1 or (
+        isinstance(raw, str) and raw.strip().lower() in ('true', '1', 'yes', 'on'))
+
+    assert coerced is skips, f'{raw!r} coerced to {coerced}'
+    src = open('pegaprox/api/storage.py').read()
+    assert "in ('true', '1', 'yes', 'on')" in src, 'the handler no longer coerces explicitly'
+
+
 # ── 469089277: host-key pins shared with another cluster ─────────────────────
 
 def test_deleting_a_cluster_keeps_a_pin_another_cluster_still_uses():

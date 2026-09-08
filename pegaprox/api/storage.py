@@ -176,7 +176,12 @@ def connect_esxi_host(cluster_id):
     # and does not send the key until it is touched, i.e. the dialog said "verify" while the
     # storage was created with skip-cert-verification=1. Default to verifying; a self-signed
     # ESXi still works, the operator just has to tick the box they are already being shown.
-    skip_verify = bool(data.get('skip_cert_verification', False))
+    # The bool() that stood here read like it sanitised the value and did not: bool("false") is
+    # True, so a client sending the JSON *string* "false" would have turned verification off.
+    # Only a real true / 1 / "true" counts as opt-out; anything else verifies.
+    _skip_raw = data.get('skip_cert_verification', False)
+    skip_verify = _skip_raw is True or _skip_raw == 1 or \
+        (isinstance(_skip_raw, str) and _skip_raw.strip().lower() in ('true', '1', 'yes', 'on'))
     
     if not host or not password:
         return jsonify({'error': 'Host and password required'}), 400
