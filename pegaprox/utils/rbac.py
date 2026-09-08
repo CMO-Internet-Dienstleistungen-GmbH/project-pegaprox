@@ -939,7 +939,21 @@ def user_can_access_vm(user: dict, cluster_id: str, vmid: int, permission: str =
                 if permission in pool_perms:
                     logging.debug(f"[POOL-PERM] User {username} has {permission} for pool '{pool_id}'")
                     return True
-                
+
+                # NS Sep 2026 (#793) — a non-empty grant on the pool confers VISIBILITY of its
+                # members. vm.view can't be stored in a grant at all: POOL_PERMISSIONS (users.py) is
+                # the allowlist the grant endpoint validates against and has never carried it, so
+                # for vm.view the exact match above could only ever be satisfied by pool.admin. Once
+                # 6441b70 correctly stopped pool-scoped callers falling through to the blanket
+                # role-level vm.view, every preset below Admin started listing an EMPTY pool, and
+                # the only way to make a VM appear was to hand out pool.admin — which carries
+                # vm.delete. get_user_pool_vmids already draws this line (its `permission is None`
+                # arm); the inventory gate never learned it. Actions stay on the exact match above:
+                # this only answers "may they SEE it".
+                if permission in ('vm.view', 'pool.view'):
+                    logging.debug(f"[POOL-PERM] {username} holds {pool_perms} on '{pool_id}' → visibility")
+                    return True
+
                 logging.debug(f"[POOL-PERM] User {username} has pool perms {pool_perms} but not {permission}")
             else:
                 logging.debug(f"[POOL-PERM] User {username} has no permissions for pool '{pool_id}'")
