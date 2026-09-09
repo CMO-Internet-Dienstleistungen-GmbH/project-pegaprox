@@ -4,6 +4,11 @@
         // ═══════════════════════════════════════════════
         const translations = {
             de: {
+                // tenant limits — NS Sep 2026
+                maxDiskGb: 'Max. Disk (GB)',
+                vmidRangeStart: 'VMID von',
+                vmidRangeEnd: 'VMID bis',
+                actingInTenant: 'Aktiv in',
                 sshNoCredentials: 'Dieser Cluster authentifiziert sich nur mit einem API-Token. Er hat weder einen SSH-Schlüssel noch ein Passwort hinterlegt — diese Prüfungen lesen den Node aber über SSH.',
                 sshNoCredentialsHint: 'Hinterlege unter Einstellungen > Cluster einen SSH-Schlüssel oder ein Passwort. Ein API-Token allein kann keine Shell öffnen.',
                 sshNodeBackoff: 'Der Node antwortet nicht mehr und wird mit Verzögerung erneut versucht.',
@@ -4482,6 +4487,11 @@
                 zone: 'Zone',
             },
             en: {
+                // tenant limits — NS Sep 2026
+                maxDiskGb: 'Max Disk (GB)',
+                vmidRangeStart: 'VMID from',
+                vmidRangeEnd: 'VMID to',
+                actingInTenant: 'Acting in',
                 sshNoCredentials: 'This cluster authenticates with an API token and has no SSH key or password stored — these checks read the node over SSH.',
                 sshNoCredentialsHint: 'Add an SSH key or a password to this cluster under Settings > Clusters. An API token alone cannot open a shell.',
                 sshNodeBackoff: 'The node stopped answering and is being retried with a backoff.',
@@ -9101,6 +9111,11 @@
                 allAttributes: 'All attributes',
             },
             zh: {
+                // tenant limits — NS Sep 2026
+                maxDiskGb: '最大磁盘 (GB)',
+                vmidRangeStart: 'VMID 起始',
+                vmidRangeEnd: 'VMID 结束',
+                actingInTenant: '当前所在',
                 sshNoCredentials: '此集群仅使用 API 令牌认证，未保存 SSH 密钥或密码 — 而这些检查需要通过 SSH 读取节点。',
                 sshNoCredentialsHint: '请在“设置 > 集群”中添加 SSH 密钥或密码。仅有 API 令牌无法打开 shell。',
                 sshNodeBackoff: '该节点已停止响应，正在以退避方式重试。',
@@ -13059,6 +13074,11 @@
                 appliedTickToRollback: '已应用 — 勾选以回滚',
             },
             pl: {
+                // tenant limits — NS Sep 2026
+                maxDiskGb: 'Maks. dysk (GB)',
+                vmidRangeStart: 'VMID od',
+                vmidRangeEnd: 'VMID do',
+                actingInTenant: 'Działa w',
                 sshNoCredentials: 'Ten klaster uwierzytelnia się tokenem API i nie ma zapisanego klucza SSH ani hasła — a te kontrole odczytują węzeł przez SSH.',
                 sshNoCredentialsHint: 'Dodaj klucz SSH lub hasło w Ustawienia > Klastry. Sam token API nie otworzy powłoki.',
                 sshNodeBackoff: 'Węzeł przestał odpowiadać i jest ponawiany z opóźnieniem.',
@@ -17204,6 +17224,11 @@
             // French translations by @IMNotMax (PR #186)
             // Falls back to EN for missing keys
             fr: {
+                // tenant limits — NS Sep 2026
+                maxDiskGb: 'Disque max (Go)',
+                vmidRangeStart: 'VMID de',
+                vmidRangeEnd: 'VMID à',
+                actingInTenant: 'Actif dans',
                 sshNoCredentials: 'Ce cluster s’authentifie avec un jeton API et n’a ni clé SSH ni mot de passe enregistré — or ces contrôles lisent le nœud via SSH.',
                 sshNoCredentialsHint: 'Ajoutez une clé SSH ou un mot de passe dans Paramètres > Clusters. Un jeton API seul ne peut pas ouvrir de shell.',
                 sshNodeBackoff: 'Le nœud ne répond plus et est réessayé avec un délai croissant.',
@@ -21590,6 +21615,11 @@
                 zoomOut: 'Zoom arrière',
             },
             es: {
+                // tenant limits — NS Sep 2026
+                maxDiskGb: 'Disco máx. (GB)',
+                vmidRangeStart: 'VMID desde',
+                vmidRangeEnd: 'VMID hasta',
+                actingInTenant: 'Actuando en',
                 sshNoCredentials: 'Este clúster se autentica con un token de API y no tiene clave SSH ni contraseña guardada, pero estas comprobaciones leen el nodo por SSH.',
                 sshNoCredentialsHint: 'Añade una clave SSH o una contraseña en Ajustes > Clústeres. Un token de API por sí solo no puede abrir una shell.',
                 sshNodeBackoff: 'El nodo dejó de responder y se reintenta con una espera creciente.',
@@ -25992,6 +26022,11 @@
                 zoomOut: 'Alejar',
             },
             pt: {
+                // tenant limits — NS Sep 2026
+                maxDiskGb: 'Disco máx. (GB)',
+                vmidRangeStart: 'VMID de',
+                vmidRangeEnd: 'VMID até',
+                actingInTenant: 'A atuar em',
                 sshNoCredentials: 'Este cluster autentica-se com um token de API e não tem chave SSH nem palavra-passe guardada — mas estas verificações leem o nó por SSH.',
                 sshNoCredentialsHint: 'Adicione uma chave SSH ou uma palavra-passe em Definições > Clusters. Um token de API sozinho não abre uma shell.',
                 sshNodeBackoff: 'O nó deixou de responder e está a ser repetido com espera crescente.',
@@ -30238,6 +30273,11 @@
                 zoomOut: 'Afastar',
             },
             ko: {
+                // tenant limits — NS Sep 2026
+                maxDiskGb: '최대 디스크 (GB)',
+                vmidRangeStart: 'VMID 시작',
+                vmidRangeEnd: 'VMID 끝',
+                actingInTenant: '현재 위치',
                 sshNoCredentials: '이 클러스터는 API 토큰으로만 인증하며 SSH 키나 비밀번호가 저장되어 있지 않습니다. 이 점검은 SSH로 노드를 읽습니다.',
                 sshNoCredentialsHint: '설정 > 클러스터에서 SSH 키 또는 비밀번호를 추가하세요. API 토큰만으로는 셸을 열 수 없습니다.',
                 sshNodeBackoff: '노드가 응답을 멈춰 대기 시간을 두고 재시도하고 있습니다.',
@@ -34716,6 +34756,11 @@
                 zoomOut: '축소',
             },
             it: {
+                // tenant limits — NS Sep 2026
+                maxDiskGb: 'Disco max (GB)',
+                vmidRangeStart: 'VMID da',
+                vmidRangeEnd: 'VMID a',
+                actingInTenant: 'Attivo in',
                 sshNoCredentials: 'Questo cluster si autentica con un token API e non ha una chiave SSH né una password salvata, ma questi controlli leggono il nodo via SSH.',
                 sshNoCredentialsHint: 'Aggiungi una chiave SSH o una password in Impostazioni > Cluster. Un token API da solo non può aprire una shell.',
                 sshNodeBackoff: 'Il nodo ha smesso di rispondere e viene ritentato con attesa crescente.',

@@ -417,12 +417,16 @@ def filter_clusters_for_user(clusters: dict, user: dict) -> dict:
     return {k: v for k, v in clusters.items() if k in allowed}
 
 
-def check_tenant_quota(tenant_id, add_cores=0, add_mem_gb=0, add_vms=1, force=False):
+def check_tenant_quota(tenant_id, add_cores=0, add_mem_gb=0, add_vms=1, add_disk_gb=0, force=False):
     """#502 — sum a tenant's current resource usage across its clusters and decide
-    whether adding (add_cores, add_mem_gb, add_vms) would exceed its quota.
+    whether adding (add_cores, add_mem_gb, add_vms, add_disk_gb) would exceed its quota.
     Returns {'ok', 'enforce', 'violations', 'usage', 'quota'}. FAIL-OPEN: any error
     returns ok=True so a quota bug can never block a legitimate VM create.
-    force=True computes usage even when no quota is set (for the usage display)."""
+    force=True computes usage even when no quota is set (for the usage display).
+
+    NS Sep 2026 — disk joins cores/memory/vms as the fourth dimension. It is the one an MSP
+    actually runs out of first, and it was the only one of the four a tenant could grow without
+    limit. Same shape as the others: 0 = unlimited, same enforce mode, same fail-open."""
     try:
         global tenants_db
         # NS #502 — always refresh: the cached global goes stale after a quota edit,
@@ -432,14 +436,16 @@ def check_tenant_quota(tenant_id, add_cores=0, add_mem_gb=0, add_vms=1, force=Fa
         qv = int(t.get('quota_max_vms', 0) or 0)
         qc = int(t.get('quota_max_cores', 0) or 0)
         qm = int(t.get('quota_max_memory_gb', 0) or 0)
+        qd = int(t.get('quota_max_disk_gb', 0) or 0)
         enforce = t.get('quota_enforcement') or 'block'
-        if not force and qv <= 0 and qc <= 0 and qm <= 0:
+        if not force and qv <= 0 and qc <= 0 and qm <= 0 and qd <= 0:
             return {'ok': True, 'enforce': enforce, 'violations': [], 'usage': {}, 'quota': {}}
         allowed = get_user_clusters({'role': ROLE_VIEWER, 'tenant_id': tenant_id})  # None = all clusters
         from pegaprox.globals import cluster_managers
         used_vms = 0
         used_cores = 0
         used_mem = 0.0
+        used_disk = 0.0
         # iterate a copy — get_vm_resources() below is a live API call, and a
         # concurrent cluster add/remove used to blow up the walk. That lands in the
         # fail-open except at the bottom, so the quota just stopped being enforced.
@@ -457,6 +463,10 @@ def check_tenant_quota(tenant_id, add_cores=0, add_mem_gb=0, add_vms=1, force=Fa
                     used_mem += float(vm.get('maxmem') or 0) / (1024.0 ** 3)
                 except (ValueError, TypeError):
                     pass
+                try:
+                    used_disk += float(vm.get('maxdisk') or 0) / (1024.0 ** 3)
+                except (ValueError, TypeError):
+                    pass
         violations = []
         if qv > 0 and used_vms + add_vms > qv:
             violations.append('vms')
@@ -464,14 +474,56 @@ def check_tenant_quota(tenant_id, add_cores=0, add_mem_gb=0, add_vms=1, force=Fa
             violations.append('cores')
         if qm > 0 and used_mem + add_mem_gb > qm:
             violations.append('memory')
+        if qd > 0 and used_disk + add_disk_gb > qd:
+            violations.append('disk')
         return {
             'ok': not violations, 'enforce': enforce, 'violations': violations,
-            'usage': {'vms': used_vms, 'cores': used_cores, 'memory_gb': round(used_mem, 1)},
-            'quota': {'vms': qv, 'cores': qc, 'memory_gb': qm},
+            'usage': {'vms': used_vms, 'cores': used_cores, 'memory_gb': round(used_mem, 1),
+                      'disk_gb': round(used_disk, 1)},
+            'quota': {'vms': qv, 'cores': qc, 'memory_gb': qm, 'disk_gb': qd},
         }
     except Exception as e:
         logging.warning(f"[quota] check failed, allowing create (fail-open): {e}")
         return {'ok': True, 'enforce': 'warn', 'violations': [], 'usage': {}, 'quota': {}}
+
+
+def tenant_vmid_range(tenant_id):
+    """(start, end) of the VMID slice a tenant may create in, or (0, 0) for no restriction.
+
+    NS Sep 2026 — two tenants creating guests on a shared cluster otherwise compete for the same
+    ids: PVE hands out the next free VMID globally, so whoever creates first takes it and the
+    other's numbering drifts into their neighbour's block. Giving each tenant its own slice keeps
+    a customer's guests recognisable by id alone, which is what makes per-tenant backup selectors
+    and log greps usable at all."""
+    try:
+        t = (load_tenants() or {}).get(tenant_id) or {}
+        start = int(t.get('vmid_range_start', 0) or 0)
+        end = int(t.get('vmid_range_end', 0) or 0)
+        if start <= 0 or end <= 0 or end < start:
+            return 0, 0
+        return start, end
+    except Exception as e:
+        logging.debug(f"[vmid-range] lookup failed for {tenant_id}: {e}")
+        return 0, 0
+
+
+def check_tenant_vmid(tenant_id, vmid):
+    """Return (ok, message). A tenant with a configured range may only create inside it.
+
+    Unlike the quota this does NOT honour quota_enforcement: a range is not a soft ceiling you
+    can be over by one, it is the boundary that stops two tenants colliding on the same id. A
+    'warn' here would just let the collision happen quietly. No range configured → always ok,
+    which is every install that has not set one."""
+    start, end = tenant_vmid_range(tenant_id)
+    if not start:
+        return True, ''
+    try:
+        v = int(vmid)
+    except (TypeError, ValueError):
+        return True, ''      # nothing to judge; PVE allocates and the id lands wherever it lands
+    if start <= v <= end:
+        return True, ''
+    return False, f'VMID {v} is outside this tenant\'s range ({start}-{end})'
 
 
 # =============================================================================

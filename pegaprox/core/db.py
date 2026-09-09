@@ -397,17 +397,26 @@ class PegaProxDB:
                 quota_max_vms INTEGER DEFAULT 0,
                 quota_max_cores INTEGER DEFAULT 0,
                 quota_max_memory_gb INTEGER DEFAULT 0,
-                quota_enforcement TEXT DEFAULT 'block'
+                quota_max_disk_gb INTEGER DEFAULT 0,
+                quota_enforcement TEXT DEFAULT 'block',
+                vmid_range_start INTEGER DEFAULT 0,
+                vmid_range_end INTEGER DEFAULT 0
             )
         ''')
         # NS #502 — per-tenant quota columns for existing tenants tables (0 = unlimited)
         try:
             cursor.execute("PRAGMA table_info(tenants)")
             _tcols = [c[1] for c in cursor.fetchall()]
+            # NS Sep 2026 — quota_max_disk_gb joins the family, and vmid_range_* gives a tenant its
+            # own slice of the VMID space so two tenants creating guests on a shared cluster can't
+            # land on the same id. 0 keeps the old behaviour in both cases (no cap / no range).
             for _cn, _cd in (('quota_max_vms', 'INTEGER DEFAULT 0'),
                              ('quota_max_cores', 'INTEGER DEFAULT 0'),
                              ('quota_max_memory_gb', 'INTEGER DEFAULT 0'),
-                             ('quota_enforcement', "TEXT DEFAULT 'block'")):
+                             ('quota_max_disk_gb', 'INTEGER DEFAULT 0'),
+                             ('quota_enforcement', "TEXT DEFAULT 'block'"),
+                             ('vmid_range_start', 'INTEGER DEFAULT 0'),
+                             ('vmid_range_end', 'INTEGER DEFAULT 0')):
                 if _cn not in _tcols:
                     cursor.execute(f"ALTER TABLE tenants ADD COLUMN {_cn} {_cd}")
                     logging.info(f"Added {_cn} column to tenants table")
@@ -4548,7 +4557,10 @@ class PegaProxDB:
             'quota_max_vms': _q(row, 'quota_max_vms', 0),
             'quota_max_cores': _q(row, 'quota_max_cores', 0),
             'quota_max_memory_gb': _q(row, 'quota_max_memory_gb', 0),
+            'quota_max_disk_gb': _q(row, 'quota_max_disk_gb', 0),
             'quota_enforcement': _q(row, 'quota_enforcement', 'block') or 'block',
+            'vmid_range_start': _q(row, 'vmid_range_start', 0),
+            'vmid_range_end': _q(row, 'vmid_range_end', 0),
         } for row in cursor.fetchall()]
     
     def save_tenant(self, tenant_id: str, data: dict):
@@ -4558,9 +4570,10 @@ class PegaProxDB:
         
         cursor.execute('''
             INSERT OR REPLACE INTO tenants (id, name, clusters, created_at,
-                quota_max_vms, quota_max_cores, quota_max_memory_gb, quota_enforcement)
+                quota_max_vms, quota_max_cores, quota_max_memory_gb, quota_max_disk_gb,
+                quota_enforcement, vmid_range_start, vmid_range_end)
             VALUES (?, ?, ?, COALESCE((SELECT created_at FROM tenants WHERE id = ?), ?),
-                ?, ?, ?, ?)
+                ?, ?, ?, ?, ?, ?, ?)
         ''', (
             tenant_id,
             data.get('name', ''),
@@ -4569,7 +4582,10 @@ class PegaProxDB:
             int(data.get('quota_max_vms', 0) or 0),
             int(data.get('quota_max_cores', 0) or 0),
             int(data.get('quota_max_memory_gb', 0) or 0),
+            int(data.get('quota_max_disk_gb', 0) or 0),
             (data.get('quota_enforcement') or 'block'),
+            int(data.get('vmid_range_start', 0) or 0),
+            int(data.get('vmid_range_end', 0) or 0),
         ))
         self.conn.commit()
     

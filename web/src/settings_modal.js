@@ -798,6 +798,7 @@
                     fetchServerSettings();
                     fetchPlugins();
                     fetchTenants();
+                    fetchMyTenants();
                     fetchPermissions();
                     fetchClusters();
                     fetchClusterGroups();
@@ -849,6 +850,19 @@
                     if(r.ok) setTenants(await r.json());
                     else console.warn('Failed to fetch tenants:', r.status);
                 } catch(e) { console.error('fetchTenants error:', e); }
+            };
+
+            // NS Sep 2026 — which tenants this account actually acts in: its own plus any it was
+            // delegated into via tenant_permissions. /api/tenants cannot answer that (it lists
+            // what you may SEE, and for a non-admin that is home + default), so someone delegated
+            // into a second tenant had no way to find out they were. Display only — the backend
+            // keeps deriving the acting tenant from the session, this changes no permission.
+            const [myTenants, setMyTenants] = useState({ tenants: [], home: '' });
+            const fetchMyTenants = async () => {
+                try {
+                    const r = await fetch(`${API_URL}/me/tenants`, { credentials: 'include', headers: getAuthHeaders() });
+                    if(r.ok) setMyTenants(await r.json());
+                } catch(e) { /* display-only, a failure just hides the line */ }
             };
             
             // fetch clusters for tenant assignment
@@ -3238,6 +3252,24 @@
                                     )}
                                     
                                     {/* Tenants list */}
+                                    {/* NS Sep 2026 — which tenant this account is acting in, and which others it has
+                                        been delegated into. Only rendered when there is more than one, which is the
+                                        only case where it tells anyone anything. Display only. */}
+                                    {(myTenants.tenants || []).length > 1 && (
+                                        <div className="mb-3 px-4 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-xs text-gray-400 flex items-center gap-2 flex-wrap">
+                                            <Icons.Building className="w-3.5 h-3.5 flex-shrink-0" />
+                                            <span>{t('actingInTenant') || 'Acting in'}:</span>
+                                            {(myTenants.tenants || []).map(mt => (
+                                                <span key={mt.id}
+                                                    className={`px-2 py-0.5 rounded whitespace-nowrap ${mt.is_home
+                                                        ? 'bg-proxmox-orange/20 text-proxmox-orange'
+                                                        : 'bg-proxmox-darker text-gray-400'}`}
+                                                    title={`${mt.id} — ${mt.effective_role}`}>
+                                                    {mt.name}{mt.is_home ? '' : ` (${mt.effective_role})`}
+                                                </span>
+                                            ))}
+                                        </div>
+                                    )}
                                     <div className="bg-proxmox-dark border border-proxmox-border rounded-xl overflow-hidden">
                                         <table className="w-full">
                                             <thead>
@@ -3262,9 +3294,9 @@
                                                         </td>
                                                         <td className="px-4 py-3 text-sm text-gray-400">
                                                             {tenant.clusters.length === 0 ? 'All clusters' : tenant.clusters.length + ' clusters'}
-                                                            {(tenant.quota_max_vms > 0 || tenant.quota_max_cores > 0 || tenant.quota_max_memory_gb > 0) && (
+                                                            {(tenant.quota_max_vms > 0 || tenant.quota_max_cores > 0 || tenant.quota_max_memory_gb > 0 || tenant.quota_max_disk_gb > 0) && (
                                                                 <div className="text-xs text-gray-600 mt-0.5">
-                                                                    {t('quota') || 'Quota'}: {tenant.quota_max_vms > 0 ? `${tenant.quota_max_vms} VMs ` : ''}{tenant.quota_max_cores > 0 ? `${tenant.quota_max_cores}c ` : ''}{tenant.quota_max_memory_gb > 0 ? `${tenant.quota_max_memory_gb}GB` : ''}
+                                                                    {t('quota') || 'Quota'}: {tenant.quota_max_vms > 0 ? `${tenant.quota_max_vms} VMs ` : ''}{tenant.quota_max_cores > 0 ? `${tenant.quota_max_cores}c ` : ''}{tenant.quota_max_memory_gb > 0 ? `${tenant.quota_max_memory_gb}GB RAM ` : ''}{tenant.quota_max_disk_gb > 0 ? `${tenant.quota_max_disk_gb}GB disk` : ''}
                                                                 </div>
                                                             )}
                                                         </td>
@@ -3399,6 +3431,28 @@
                                                                     onChange={e => setEditingTenant({...editingTenant, quota_max_memory_gb: parseInt(e.target.value) || 0})}
                                                                     className="w-full px-2 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm" />
                                                             </div>
+                                                            <div>
+                                                                <label className="block text-xs text-gray-500 mb-1">{t('maxDiskGb') || 'Max Disk (GB)'}</label>
+                                                                <input type="number" min="0" value={editingTenant.quota_max_disk_gb || 0}
+                                                                    onChange={e => setEditingTenant({...editingTenant, quota_max_disk_gb: parseInt(e.target.value) || 0})}
+                                                                    className="w-full px-2 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm" />
+                                                            </div>
+                                                        </div>
+                                                        {/* NS Sep 2026 — VMID slice. 0/0 leaves numbering to the cluster, which is
+                                                            what every install does until it has more than one customer on a node. */}
+                                                        <div className="grid grid-cols-2 gap-3 mt-2">
+                                                            <div>
+                                                                <label className="block text-xs text-gray-500 mb-1">{t('vmidRangeStart') || 'VMID from'}</label>
+                                                                <input type="number" min="0" placeholder="0 = any" value={editingTenant.vmid_range_start || 0}
+                                                                    onChange={e => setEditingTenant({...editingTenant, vmid_range_start: parseInt(e.target.value) || 0})}
+                                                                    className="w-full px-2 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm" />
+                                                            </div>
+                                                            <div>
+                                                                <label className="block text-xs text-gray-500 mb-1">{t('vmidRangeEnd') || 'VMID to'}</label>
+                                                                <input type="number" min="0" placeholder="0 = any" value={editingTenant.vmid_range_end || 0}
+                                                                    onChange={e => setEditingTenant({...editingTenant, vmid_range_end: parseInt(e.target.value) || 0})}
+                                                                    className="w-full px-2 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm" />
+                                                            </div>
                                                         </div>
                                                         <div className="mt-2">
                                                             <label className="block text-xs text-gray-500 mb-1">{t('quotaEnforcement') || 'When exceeded'}</label>
@@ -3426,7 +3480,10 @@
                                                                         quota_max_vms: editingTenant.quota_max_vms || 0,
                                                                         quota_max_cores: editingTenant.quota_max_cores || 0,
                                                                         quota_max_memory_gb: editingTenant.quota_max_memory_gb || 0,
-                                                                        quota_enforcement: editingTenant.quota_enforcement || 'block'
+                                                                        quota_max_disk_gb: editingTenant.quota_max_disk_gb || 0,
+                                                                        quota_enforcement: editingTenant.quota_enforcement || 'block',
+                                                                        vmid_range_start: editingTenant.vmid_range_start || 0,
+                                                                        vmid_range_end: editingTenant.vmid_range_end || 0
                                                                     })
                                                                 });
                                                                 if(r.ok) {

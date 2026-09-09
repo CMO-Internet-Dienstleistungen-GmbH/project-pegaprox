@@ -3685,11 +3685,35 @@ def get_next_vmid_api(cluster_id):
     
     mgr = cluster_managers[cluster_id]
     result = mgr.get_next_vmid()
-    
-    if result['success']:
-        return jsonify({'vmid': result['vmid']})
-    else:
+
+    if not result['success']:
         return jsonify({'error': result['error']}), 500
+
+    # NS Sep 2026 — when the caller's tenant has a VMID range, hand back the next free id INSIDE
+    # it rather than PVE's global next. Without this the range would only ever be a rejection at
+    # create time: the dialog pre-fills from here, so a user would be offered an id their own
+    # tenant is then not allowed to use. Falls straight back to PVE's answer when no range is set
+    # (every install that has not configured one) or when the range is full.
+    try:
+        from pegaprox.utils.rbac import tenant_vmid_range, DEFAULT_TENANT_ID
+        _u = load_users().get(request.session.get('user', ''), {})
+        _start, _end = tenant_vmid_range(_u.get('tenant_id') or DEFAULT_TENANT_ID)
+        if _start:
+            _taken = set()
+            for _vm in (mgr.get_vm_resources() or []):
+                try:
+                    _taken.add(int(_vm.get('vmid')))
+                except (TypeError, ValueError):
+                    continue
+            _free = next((v for v in range(_start, _end + 1) if v not in _taken), None)
+            if _free is not None:
+                return jsonify({'vmid': _free, 'range': [_start, _end]})
+            return jsonify({'vmid': result['vmid'], 'range': [_start, _end],
+                            'range_exhausted': True})
+    except Exception as _re:
+        logging.debug(f"[vmid-range] nextid fallback to cluster-wide: {_re}")
+
+    return jsonify({'vmid': result['vmid']})
 
 
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/clone', methods=['POST'])
@@ -11028,12 +11052,28 @@ def create_vm_api(cluster_id, node):
         _tid = _qu.get('tenant_id') or DEFAULT_TENANT_ID
         _qcores = int(vm_config.get('cores') or 1) * int(vm_config.get('sockets') or 1)
         _qmem = float(vm_config.get('memory') or 0) / 1024.0  # MB → GB
-        _qchk = check_tenant_quota(_tid, add_cores=_qcores, add_mem_gb=_qmem, add_vms=1)
+        _qdisk = float(vm_config.get('disk_size') or 0)       # already GB
+        _qchk = check_tenant_quota(_tid, add_cores=_qcores, add_mem_gb=_qmem, add_vms=1,
+                                   add_disk_gb=_qdisk)
         if not _qchk['ok'] and _qchk.get('enforce') == 'block':
             return jsonify({'error': f"Tenant quota exceeded ({', '.join(_qchk['violations'])}) — "
                             f"usage {_qchk['usage']} vs quota {_qchk['quota']}", 'quota': _qchk}), 403
     except Exception as _qe:
         logging.debug(f"[quota] qemu pre-flight skipped: {_qe}")
+
+    # NS Sep 2026 — VMID range. Deliberately NOT inside the fail-open block above: the quota is a
+    # ceiling and erring open there is right, but a range exists to stop two tenants landing on
+    # the same id, and silently allowing that produces a collision nobody notices until restore
+    # time. A tenant with no range configured is unaffected.
+    try:
+        from pegaprox.utils.rbac import check_tenant_vmid, DEFAULT_TENANT_ID as _DT
+        _ru = load_users().get(request.session.get('user', ''), {})
+        _rok, _rmsg = check_tenant_vmid(_ru.get('tenant_id') or _DT, vm_config.get('vmid'))
+    except Exception as _re:
+        logging.debug(f"[vmid-range] qemu pre-flight skipped: {_re}")
+        _rok, _rmsg = True, ''
+    if not _rok:
+        return jsonify({'error': _rmsg}), 403
 
     result = manager.create_vm(node, vm_config)
 
@@ -11075,12 +11115,26 @@ def create_container_api(cluster_id, node):
         _tid = _qu.get('tenant_id') or DEFAULT_TENANT_ID
         _qcores = int(ct_config.get('cores') or 1)
         _qmem = float(ct_config.get('memory') or 0) / 1024.0  # MB → GB
-        _qchk = check_tenant_quota(_tid, add_cores=_qcores, add_mem_gb=_qmem, add_vms=1)
+        # CT root disk is 'disk_size' like the VM path; 'rootfs'/'disk' are the PVE-side spellings
+        _qdisk = float(ct_config.get('disk_size') or ct_config.get('disk') or 0)
+        _qchk = check_tenant_quota(_tid, add_cores=_qcores, add_mem_gb=_qmem, add_vms=1,
+                                   add_disk_gb=_qdisk)
         if not _qchk['ok'] and _qchk.get('enforce') == 'block':
             return jsonify({'error': f"Tenant quota exceeded ({', '.join(_qchk['violations'])}) — "
                             f"usage {_qchk['usage']} vs quota {_qchk['quota']}", 'quota': _qchk}), 403
     except Exception as _qe:
         logging.debug(f"[quota] lxc pre-flight skipped: {_qe}")
+
+    # NS Sep 2026 — VMID range, same reasoning as the qemu twin above.
+    try:
+        from pegaprox.utils.rbac import check_tenant_vmid, DEFAULT_TENANT_ID as _DT
+        _ru = load_users().get(request.session.get('user', ''), {})
+        _rok, _rmsg = check_tenant_vmid(_ru.get('tenant_id') or _DT, ct_config.get('vmid'))
+    except Exception as _re:
+        logging.debug(f"[vmid-range] lxc pre-flight skipped: {_re}")
+        _rok, _rmsg = True, ''
+    if not _rok:
+        return jsonify({'error': _rmsg}), 403
 
     result = manager.create_container(node, ct_config)
     

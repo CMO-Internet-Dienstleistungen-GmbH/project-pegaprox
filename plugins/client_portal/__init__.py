@@ -801,7 +801,9 @@ def _create_ct():
     if tenant_id:
         try:
             from pegaprox.utils.rbac import check_tenant_quota
-            q = check_tenant_quota(tenant_id, add_cores=cores, add_mem_gb=memory / 1024.0, add_vms=1)
+            # `disk` is the already-validated disk_gb from the form above, in GB
+            q = check_tenant_quota(tenant_id, add_cores=cores, add_mem_gb=memory / 1024.0, add_vms=1,
+                                   add_disk_gb=float(disk))
             if q.get('violations') and q.get('enforce') == 'block':
                 return {'error': 'Quota exceeded (' + ', '.join(q['violations']) + ')',
                         'quota': q.get('quota'), 'usage': q.get('usage')}, 403

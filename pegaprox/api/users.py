@@ -1162,6 +1162,35 @@ def delete_user(username):
 # on Reddit. MSPs use this to manage multiple customers separately.
 # ============================================
 
+# NS Sep 2026 — the tenant limit fields are all "non-negative int, 0 = unlimited/none". They used
+# to be read as int(data.get(k, 0) or 0), which raises on a non-numeric value and returns a bare
+# 500; the update path swallowed it to 0 instead, which is worse for a LIMIT — a typo silently
+# removed the ceiling. Parse once, refuse loudly. Found by the scan on this change: both routes
+# were reachable with {"vmid_range_start": "abc"} and answered 500.
+_TENANT_INT_FIELDS = ('quota_max_vms', 'quota_max_cores', 'quota_max_memory_gb',
+                      'quota_max_disk_gb', 'vmid_range_start', 'vmid_range_end')
+
+
+def _tenant_ints(data):
+    """Return (values, error_response). values holds only the keys actually present."""
+    out = {}
+    for k in _TENANT_INT_FIELDS:
+        if k not in data:
+            continue
+        v = data[k]
+        if v in (None, ''):
+            out[k] = 0
+            continue
+        try:
+            iv = int(v)
+        except (TypeError, ValueError):
+            return None, (jsonify({'error': f'{k} must be a whole number'}), 400)
+        if iv < 0:
+            return None, (jsonify({'error': f'{k} must not be negative'}), 400)
+        out[k] = iv
+    return out, None
+
+
 @bp.route('/api/tenants', methods=['GET'])
 @require_auth()
 def get_tenants():
@@ -1189,7 +1218,10 @@ def get_tenants():
                 'quota_max_vms': t.get('quota_max_vms', 0),
                 'quota_max_cores': t.get('quota_max_cores', 0),
                 'quota_max_memory_gb': t.get('quota_max_memory_gb', 0),
+                'quota_max_disk_gb': t.get('quota_max_disk_gb', 0),
                 'quota_enforcement': t.get('quota_enforcement', 'block'),
+                'vmid_range_start': t.get('vmid_range_start', 0),
+                'vmid_range_end': t.get('vmid_range_end', 0),
                 'user_count': sum(1 for u in load_users().values() if u.get('tenant_id') == tid)
             })
         return jsonify(result)
@@ -1213,11 +1245,54 @@ def get_tenants():
             'quota_max_vms': t.get('quota_max_vms', 0),
             'quota_max_cores': t.get('quota_max_cores', 0),
             'quota_max_memory_gb': t.get('quota_max_memory_gb', 0),
+            'quota_max_disk_gb': t.get('quota_max_disk_gb', 0),
             'quota_enforcement': t.get('quota_enforcement', 'block'),
+            'vmid_range_start': t.get('vmid_range_start', 0),
+            'vmid_range_end': t.get('vmid_range_end', 0),
             'user_count': sum(1 for u in users.values() if u.get('tenant_id') == tid)
         })
-    
+
     return jsonify(result)
+
+
+@bp.route('/api/me/tenants', methods=['GET'])
+@require_auth()
+def get_my_tenants():
+    """The tenants the caller can act in — home tenant plus any they hold tenant_permissions for.
+
+    NS Sep 2026 — /api/tenants answers "which tenants exist that you may SEE", and for a non-admin
+    that is their home tenant plus default. It does not know about tenant_permissions, so someone
+    delegated into a second tenant had no way to tell the UI about it. This is that list.
+
+    Presentational ONLY. It grants nothing and no endpoint consumes it for a decision: everything
+    downstream still derives the acting tenant from the session user, as it did before. Read this
+    as "what should the switcher offer", never as "what is this caller allowed to do" — the moment
+    something authorises off a client-chosen tenant id we are back to the class of bug the pool
+    and ACL scoping already cost us twice."""
+    from pegaprox.utils.auth import build_authz_user
+    tenants = load_tenants() or {}
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    home = user.get('tenant_id') or DEFAULT_TENANT_ID
+    is_admin = user.get('effective_role', user.get('role')) == ROLE_ADMIN
+
+    if is_admin:
+        ids = list(tenants.keys())
+    else:
+        ids = [home] + [t for t in (user.get('tenant_permissions') or {}) if t != home]
+
+    out = []
+    for tid in ids:
+        t = tenants.get(tid)
+        if t is None:
+            continue          # a stale tenant_permissions entry must not invent a tenant
+        out.append({
+            'id': tid,
+            'name': t.get('name', tid),
+            'is_home': tid == home,
+            'effective_role': get_user_effective_role(user, tid),
+        })
+    return jsonify({'tenants': out, 'home': home})
+
 
 @bp.route('/api/tenants', methods=['POST'])
 @require_auth(perms=['admin.tenants'])
@@ -1234,7 +1309,11 @@ def create_tenant():
     
     if not name:
         return jsonify({'error': 'Name required'}), 400
-    
+
+    _ints, _ierr = _tenant_ints(data)
+    if _ierr:
+        return _ierr
+
     # generate ID from name
     import re
     base_tid = re.sub(r'[^a-z0-9]', '-', name.lower())
@@ -1260,10 +1339,14 @@ def create_tenant():
         'clusters': clusters,
         'created': datetime.now().isoformat(),
         # NS #502 — resource quotas (0 = unlimited); enforcement 'block' | 'warn'
-        'quota_max_vms': int(data.get('quota_max_vms', 0) or 0),
-        'quota_max_cores': int(data.get('quota_max_cores', 0) or 0),
-        'quota_max_memory_gb': int(data.get('quota_max_memory_gb', 0) or 0),
+        'quota_max_vms': _ints.get('quota_max_vms', 0),
+        'quota_max_cores': _ints.get('quota_max_cores', 0),
+        'quota_max_memory_gb': _ints.get('quota_max_memory_gb', 0),
+        'quota_max_disk_gb': _ints.get('quota_max_disk_gb', 0),
         'quota_enforcement': data.get('quota_enforcement') or 'block',
+        # NS Sep 2026 — 0/0 = no range, which is every tenant that does not ask for one
+        'vmid_range_start': _ints.get('vmid_range_start', 0),
+        'vmid_range_end': _ints.get('vmid_range_end', 0),
     }
     
     save_tenants(tenants_db)
@@ -1285,6 +1368,10 @@ def update_tenant(tenant_id):
     if tenant_id not in tenants_db:
         return jsonify({'error': 'Tenant not found'}), 404
 
+    # snapshot before anything below writes into the dict — the range guard further down has to
+    # compare against the STORED value, not against what the quota loop just put there
+    _before = dict(tenants_db[tenant_id])
+
     # NS Aug 2026 (Aikido pentest) — mirror get_tenant_quota: a tenant-scoped admin.tenants holder
     # may only edit its OWN tenant, else one tenant rewrites another's name/clusters/quota.
     if request.session.get('role') != ROLE_ADMIN:
@@ -1293,6 +1380,19 @@ def update_tenant(tenant_id):
             return jsonify({'error': 'Access denied to this tenant'}), 403
 
     data = request.json
+
+    # NS Sep 2026 — the VMID range is a boundary the PROVIDER draws between customers, so it sits
+    # with `clusters` below rather than with the quotas: only a global admin may move it. A tenant
+    # admin who could widen their own slice to 100-999999 would simply erase the separation the
+    # range exists for. Checked BEFORE anything is written, so a refusal leaves the in-memory
+    # tenants_db untouched rather than half-updated.
+    _ints, _ierr = _tenant_ints(data)
+    if _ierr:
+        return _ierr
+    for _rk in ('vmid_range_start', 'vmid_range_end'):
+        if _rk in _ints and _ints[_rk] != int(_before.get(_rk, 0) or 0):
+            if request.session.get('effective_role', request.session.get('role')) != ROLE_ADMIN:
+                return jsonify({'error': 'Only a global admin can change a tenant\'s VMID range'}), 403
 
     if 'name' in data:
         tenants_db[tenant_id]['name'] = data['name']
@@ -1309,12 +1409,18 @@ def update_tenant(tenant_id):
                 return jsonify({'error': 'Only a global admin can change a tenant\'s clusters'}), 403
             tenants_db[tenant_id]['clusters'] = _new
     # NS #502 — quota fields
-    for _qk in ('quota_max_vms', 'quota_max_cores', 'quota_max_memory_gb'):
-        if _qk in data:
-            try:
-                tenants_db[tenant_id][_qk] = int(data[_qk] or 0)
-            except (ValueError, TypeError):
-                tenants_db[tenant_id][_qk] = 0
+    for _qk, _qv in _ints.items():
+        tenants_db[tenant_id][_qk] = _qv
+    # NS Sep 2026 — reject an inverted or reserved range rather than storing it: tenant_vmid_range
+    # treats anything malformed as "no range", so a silently accepted 5000-100 would look saved in
+    # the UI while enforcing nothing. PVE keeps VMIDs below 100 for itself.
+    _rs = int(tenants_db[tenant_id].get('vmid_range_start', 0) or 0)
+    _re_ = int(tenants_db[tenant_id].get('vmid_range_end', 0) or 0)
+    if (_rs or _re_):
+        if _rs < 100 or _re_ < 100:
+            return jsonify({'error': 'VMID range must start at 100 or above'}), 400
+        if _re_ < _rs:
+            return jsonify({'error': 'VMID range end must not be below its start'}), 400
     if 'quota_enforcement' in data:
         tenants_db[tenant_id]['quota_enforcement'] = data['quota_enforcement'] or 'block'
 
