@@ -6,6 +6,13 @@ lives on this branch; see `README.md` for how a sync builds `v<release>-cmo.<n>`
 
 ## Rules & Constraints
 
+### Local verification environment
+
+Local verification may create a disposable `.venv`, use local Docker, and run
+browser tests against a locally provisioned PegaProx instance in Docker. Keep
+test data synthetic and local; this permission does not extend to production or
+shared environments.
+
 ### Everything that leaves this repository is public
 
 Upstream issues, pull requests, comments, commit messages on patch branches
