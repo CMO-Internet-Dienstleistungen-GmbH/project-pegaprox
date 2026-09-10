@@ -8131,6 +8131,10 @@
             // LW Sep 2026 (#802) - keyed by pbs id: neither the entries nor the status were
             // ever cleared when you picked a different PBS, so server B showed server A's log.
             const [pbsSyslogStatus, setPbsSyslogStatus] = useState({ id: null, state: 'idle', message: '' });
+            // and a sequence for the fetch itself: "Load More" while the first request is still
+            // out, or a click on another PBS, can land the older answer last and hand the panel
+            // back to whichever request happened to be slowest.
+            const pbsSyslogSeq = useRef(0);
             const [pbsCatalog, setPbsCatalog] = useState([]);
             const [pbsCatalogPath, setPbsCatalogPath] = useState('/');
             const [pbsCatalogSnapshot, setPbsCatalogSnapshot] = useState(null);
@@ -11330,20 +11334,26 @@
             };
 
             const fetchPBSSyslog = async (pbsId, limit = 100) => {
+                const seq = ++pbsSyslogSeq.current;
+                const stale = () => seq !== pbsSyslogSeq.current;
                 setPbsSyslogStatus({ id: pbsId, state: 'loading', message: '' });
                 try {
                     const resp = await authFetch(`${API_URL}/pbs/${pbsId}/syslog?limit=${limit}`);
                     if (resp && resp.ok) {
-                        setPbsSyslog(await resp.json());
+                        const entries = await resp.json();
+                        if (stale()) return;
+                        setPbsSyslog(entries);
                         setPbsSyslogStatus({ id: pbsId, state: 'loaded', message: '' });
                         return;
                     }
                     let code = '';
                     try { code = ((await resp.json()) || {}).code || ''; } catch (parseErr) { /* error body isn't always json */ }
+                    if (stale()) return;
                     setPbsSyslog([]);
                     setPbsSyslogStatus({ id: pbsId, state: 'error', message: pbsSyslogErrorText(code, resp && resp.status) });
                 } catch (e) {
                     console.warn('PBS syslog error:', e);
+                    if (stale()) return;
                     setPbsSyslog([]);
                     setPbsSyslogStatus({ id: pbsId, state: 'error', message: t('pbsSyslogFailed') || 'Could not read the system log from PBS.' });
                 }
