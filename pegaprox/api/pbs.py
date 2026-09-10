@@ -17,6 +17,33 @@ from pegaprox.core.pbs import PBSManager, load_pbs_servers, save_pbs_server
 
 bp = Blueprint('pbs', __name__)
 
+
+# MK Sep 2026 (#802) — PBSManager.api_get does not raise; on a refusal it returns
+# {'error': 'HTTP 403', 'status_code': 403}. Routes that then reach for result.get('data', [])
+# hand the browser an empty 200, so a refusal and an empty log look identical to the UI. The
+# syslog panel re-rendered its own "click to load" prompt on both, which is why the reporter
+# could click it forever with nothing in the browser console and nothing on screen.
+def pbs_upstream_error(result):
+    """Return (status, payload) if result is a failed api_* call, else None.
+
+    The description stays bounded on purpose — api_get puts the requests exception
+    (which carries the PBS host, port and full URL) in the server log already, and the
+    browser picks its own sentence from the code, so there is nothing to gain from
+    reflecting that string back out of the API.
+    """
+    if not isinstance(result, dict) or 'error' not in result:
+        return None
+    upstream = result.get('status_code')
+    if upstream == 403:
+        # PBS guards the node log with Sys.Audit on /system/log. A token minted for
+        # backup work alone (Datastore.*) does not carry it, and that is the common case.
+        return 403, {'error': 'PBS denied the request', 'code': 'PBS_FORBIDDEN'}
+    if upstream is None:
+        # never got an answer: DNS, refused, timed out, TLS
+        return 502, {'error': 'PBS is unreachable', 'code': 'PBS_UNREACHABLE', 'upstream_status': None}
+    return 502, {'error': f'PBS returned HTTP {upstream}', 'code': 'PBS_UPSTREAM',
+                 'upstream_status': upstream}
+
 @bp.route('/api/pbs', methods=['GET'])
 @require_auth(perms=['pbs.view'])
 def list_pbs_servers():
@@ -1175,6 +1202,10 @@ def get_pbs_syslog(pbs_id):
     limit = request.args.get('limit', 100, type=int)
     since = request.args.get('since')
     result = mgr.get_syslog(limit=limit, since=since)
+    failed = pbs_upstream_error(result)
+    if failed:
+        status, payload = failed
+        return jsonify(payload), status
     return jsonify(result.get('data', []))
 
 # ── PBS Node RRD ──
@@ -1214,7 +1245,18 @@ def get_pbs_notifications(pbs_id):
     # Notification endpoints may differ between PBS versions, handle gracefully
     targets = targets_result.get('data', []) if isinstance(targets_result, dict) and 'error' not in targets_result else []
     matchers = matchers_result.get('data', []) if isinstance(matchers_result, dict) and 'error' not in matchers_result else []
-    return jsonify({'targets': targets, 'matchers': matchers})
+    # MK Sep 2026 (#803) — the two lists stay independent (one PBS version dropping matchers
+    # shouldn't blank the targets), but say WHICH one we failed to read. Empty-because-none
+    # and empty-because-refused rendered identically before, i.e. as nothing at all.
+    errors = {}
+    for key, res in (('targets', targets_result), ('matchers', matchers_result)):
+        failed = pbs_upstream_error(res)
+        if failed:
+            errors[key] = failed[1]
+    payload = {'targets': targets, 'matchers': matchers}
+    if errors:
+        payload['errors'] = errors
+    return jsonify(payload)
 
 # ── PBS Catalog / File-Level Restore ──
 

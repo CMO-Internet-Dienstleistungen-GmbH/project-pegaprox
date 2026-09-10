@@ -696,7 +696,13 @@ class PBSManager:
     
     def get_notification_targets(self) -> dict:
         """Get notification endpoint configuration (sendmail, gotify, smtp, webhook)"""
-        return self.api_get('/config/notifications/endpoints')
+        # MK Sep 2026 (#803) — /endpoints is an index node, not a data one: its declared
+        # return type is null and its children are the four per-type paths. Reading it back
+        # gave us the subdir listing, which has no name and no type, so every target in the
+        # UI came out as "unknown -". /targets is the one that returns the real list
+        # (name, type, disable, origin) across all four types. The per-type endpoints paths
+        # below are still right for create/update/delete — only the listing was wrong.
+        return self.api_get('/config/notifications/targets')
     
     def get_notification_matchers(self) -> dict:
         """Get notification matcher rules"""
