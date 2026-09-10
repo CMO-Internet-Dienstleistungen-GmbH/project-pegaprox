@@ -106,6 +106,17 @@ patches:
     summary: 'Snapshot action toasts show the error returned by the server'
     requested_by: 13
 
+  # The Corporate QEMU summary already fetches the VM config for hardware
+  # details. Reuse that response to show a non-empty description as escaped,
+  # multiline text without changing the Config editor or Markdown preview.
+  - name: vm-description-summary
+    branch: feat/vm-description-summary
+    base: main
+    kind: feature
+    upstream_pr:
+    summary: 'Corporate QEMU summaries show the VM description as safe multiline text'
+    requested_by: 14
+
 # Files whose conflicts are resolved by regenerating them instead of merging.
 # web/index.html is a build artefact (web/Dev/build.sh compiles it from
 # web/index.html.original + web/src/*.js) and conflicts on every backport
