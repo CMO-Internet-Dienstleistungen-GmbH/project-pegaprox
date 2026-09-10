@@ -8128,6 +8128,9 @@
             const [pbsNotifications, setPbsNotifications] = useState({ targets: [], matchers: [] });
             const [pbsTrafficControl, setPbsTrafficControl] = useState([]);
             const [pbsSyslog, setPbsSyslog] = useState([]);
+            // LW Sep 2026 (#802) - keyed by pbs id: neither the entries nor the status were
+            // ever cleared when you picked a different PBS, so server B showed server A's log.
+            const [pbsSyslogStatus, setPbsSyslogStatus] = useState({ id: null, state: 'idle', message: '' });
             const [pbsCatalog, setPbsCatalog] = useState([]);
             const [pbsCatalogPath, setPbsCatalogPath] = useState('/');
             const [pbsCatalogSnapshot, setPbsCatalogSnapshot] = useState(null);
@@ -11298,10 +11301,13 @@
                 } catch (e) { console.warn('PBS remotes error:', e); }
             };
             
+            // LW Sep 2026 (#803) - stamp the server it came from. The section below only renders
+            // for a matching id, which keeps an unfetched (or previous) PBS from showing an empty
+            // notification block as though it were this server's answer.
             const fetchPBSNotifications = async (pbsId) => {
                 try {
                     const resp = await authFetch(`${API_URL}/pbs/${pbsId}/notifications`);
-                    if (resp && resp.ok) setPbsNotifications(await resp.json());
+                    if (resp && resp.ok) setPbsNotifications({ ...(await resp.json()), _pbsId: pbsId });
                 } catch (e) { console.warn('PBS notifications error:', e); }
             };
             
@@ -11312,11 +11318,35 @@
                 } catch (e) { console.warn('PBS traffic control error:', e); }
             };
             
+            // LW Sep 2026 (#802) - this used to drop every non-ok response on the floor. The
+            // route answered 200 with [] on a PBS refusal, so the panel re-rendered its own
+            // "click to load" prompt and the button looked dead however often you pressed it.
+            // The backend now says why; pick the sentence here so it stays localised.
+            const pbsSyslogErrorText = (code, status) => {
+                if (code === 'PBS_FORBIDDEN') return t('pbsSyslogForbidden') || 'PBS refused access to the system log. The API token needs the Sys.Audit privilege on /system/log.';
+                if (code === 'PBS_UNREACHABLE') return t('pbsUnreachable') || 'PBS is not reachable.';
+                if (status === 404) return t('pbsSyslogNoServer') || 'This PBS server is not connected.';
+                return t('pbsSyslogFailed') || 'Could not read the system log from PBS.';
+            };
+
             const fetchPBSSyslog = async (pbsId, limit = 100) => {
+                setPbsSyslogStatus({ id: pbsId, state: 'loading', message: '' });
                 try {
                     const resp = await authFetch(`${API_URL}/pbs/${pbsId}/syslog?limit=${limit}`);
-                    if (resp && resp.ok) setPbsSyslog(await resp.json());
-                } catch (e) { console.warn('PBS syslog error:', e); }
+                    if (resp && resp.ok) {
+                        setPbsSyslog(await resp.json());
+                        setPbsSyslogStatus({ id: pbsId, state: 'loaded', message: '' });
+                        return;
+                    }
+                    let code = '';
+                    try { code = ((await resp.json()) || {}).code || ''; } catch (parseErr) { /* error body isn't always json */ }
+                    setPbsSyslog([]);
+                    setPbsSyslogStatus({ id: pbsId, state: 'error', message: pbsSyslogErrorText(code, resp && resp.status) });
+                } catch (e) {
+                    console.warn('PBS syslog error:', e);
+                    setPbsSyslog([]);
+                    setPbsSyslogStatus({ id: pbsId, state: 'error', message: t('pbsSyslogFailed') || 'Could not read the system log from PBS.' });
+                }
             };
             
             const fetchPBSCatalog = async (pbsId, store, snapshot, filepath = '/') => {
@@ -19102,15 +19132,22 @@
                                                 )}
 
                                                 {/* Notification Targets */}
-                                                {pbsNotifications && (pbsNotifications.targets?.length > 0 || pbsNotifications.matchers?.length > 0) && (
+                                                {pbsNotifications && pbsNotifications._pbsId === selectedPBS.id && (
                                                     <div>
                                                         <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-4">{t('notifications') || 'Notifications'}</h2>
                                                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                                            {pbsNotifications.targets?.length > 0 && (
-                                                                <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4">
+                                                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4">
                                                                     <h3 className="text-sm font-medium text-gray-300 mb-3 flex items-center gap-2">
-                                                                        <Icons.Bell className="w-4 h-4 text-blue-400" />{t('pbsNotificationTargets') || 'Targets'} ({pbsNotifications.targets.length})
+                                                                        <Icons.Bell className="w-4 h-4 text-blue-400" />{t('pbsNotificationTargets') || 'Targets'} ({pbsNotifications.targets?.length || 0})
                                                                     </h3>
+                                                                    {/* LW Sep 2026 (#803) - the card used to vanish entirely when the list was
+                                                                        empty, so "none configured" and "we could not read it" both looked like
+                                                                        the feature was missing. */}
+                                                                    {pbsNotifications.errors?.targets ? (
+                                                                        <p className="text-xs text-red-400">{t('pbsNotificationsReadFailed') || 'Could not read the notification configuration from PBS.'}</p>
+                                                                    ) : !pbsNotifications.targets?.length ? (
+                                                                        <p className="text-xs text-gray-500">{t('pbsNoNotificationTargets') || 'No notification targets configured on this PBS.'}</p>
+                                                                    ) : (
                                                                     <div className="space-y-2">
                                                                         {pbsNotifications.targets.map((target, i) => (
                                                                             <div key={i} className="flex items-center justify-between p-2 rounded bg-proxmox-dark/50">
@@ -19128,13 +19165,17 @@
                                                                             </div>
                                                                         ))}
                                                                     </div>
-                                                                </div>
-                                                            )}
-                                                            {pbsNotifications.matchers?.length > 0 && (
-                                                                <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4">
+                                                                    )}
+                                                            </div>
+                                                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4">
                                                                     <h3 className="text-sm font-medium text-gray-300 mb-3 flex items-center gap-2">
-                                                                        <Icons.Filter className="w-4 h-4 text-yellow-400" />{t('pbsNotificationMatchers') || 'Matchers'} ({pbsNotifications.matchers.length})
+                                                                        <Icons.Filter className="w-4 h-4 text-yellow-400" />{t('pbsNotificationMatchers') || 'Matchers'} ({pbsNotifications.matchers?.length || 0})
                                                                     </h3>
+                                                                    {pbsNotifications.errors?.matchers ? (
+                                                                        <p className="text-xs text-red-400">{t('pbsNotificationsReadFailed') || 'Could not read the notification configuration from PBS.'}</p>
+                                                                    ) : !pbsNotifications.matchers?.length ? (
+                                                                        <p className="text-xs text-gray-500">{t('pbsNoNotificationMatchers') || 'No notification matchers configured on this PBS.'}</p>
+                                                                    ) : (
                                                                     <div className="space-y-2">
                                                                         {pbsNotifications.matchers.map((m, i) => (
                                                                             <div key={i} className="flex items-center justify-between p-2 rounded bg-proxmox-dark/50">
@@ -19146,8 +19187,8 @@
                                                                             </div>
                                                                         ))}
                                                                     </div>
-                                                                </div>
-                                                            )}
+                                                                    )}
+                                                            </div>
                                                         </div>
                                                     </div>
                                                 )}
@@ -19160,22 +19201,48 @@
                                                             <Icons.RefreshCw className="w-3 h-3" />{t('pbsLoadMore') || 'Load More'}
                                                         </button>
                                                     </div>
-                                                    {pbsSyslog.length > 0 ? (
-                                                        <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-3 max-h-64 overflow-y-auto font-mono text-xs">
-                                                            {pbsSyslog.map((entry, i) => (
-                                                                <div key={i} className={`py-0.5 ${
-                                                                    (entry.t || entry.n || '').toLowerCase().includes('error') ? 'text-red-400' :
-                                                                    (entry.t || entry.n || '').toLowerCase().includes('warn') ? 'text-yellow-400' :
-                                                                    'text-gray-400'
-                                                                }`}>{entry.t || entry.n || JSON.stringify(entry)}</div>
-                                                            ))}
-                                                        </div>
-                                                    ) : (
-                                                        <button onClick={() => fetchPBSSyslog(selectedPBS.id)} className="w-full text-center py-6 text-gray-500 bg-proxmox-card border border-proxmox-border rounded-xl hover:border-blue-500/30 transition-all cursor-pointer">
-                                                            <Icons.Terminal className="w-6 h-6 mx-auto mb-2 opacity-30" />
-                                                            <span className="text-sm">{t('pbsLoadSyslog') || 'Click to load syslog'}</span>
-                                                        </button>
-                                                    )}
+                                                    {(() => {
+                                                        // LW Sep 2026 (#802) - a status from a previously selected PBS says nothing
+                                                        // about this one, so anything not stamped with the current id is "idle".
+                                                        const syslogState = pbsSyslogStatus.id === selectedPBS.id ? pbsSyslogStatus.state : 'idle';
+                                                        if (syslogState !== 'idle' && pbsSyslog.length > 0) return (
+                                                            <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-3 max-h-64 overflow-y-auto font-mono text-xs">
+                                                                {pbsSyslog.map((entry, i) => (
+                                                                    <div key={i} className={`py-0.5 ${
+                                                                        (entry.t || entry.n || '').toLowerCase().includes('error') ? 'text-red-400' :
+                                                                        (entry.t || entry.n || '').toLowerCase().includes('warn') ? 'text-yellow-400' :
+                                                                        'text-gray-400'
+                                                                    }`}>{entry.t || entry.n || JSON.stringify(entry)}</div>
+                                                                ))}
+                                                            </div>
+                                                        );
+                                                        if (syslogState === 'loading') return (
+                                                            <div className="w-full text-center py-6 text-gray-500 bg-proxmox-card border border-proxmox-border rounded-xl">
+                                                                <span className="text-sm">{t('loading') || 'Loading...'}</span>
+                                                            </div>
+                                                        );
+                                                        if (syslogState === 'error') return (
+                                                            <div className="bg-proxmox-card border border-red-500/30 rounded-xl p-4 text-center">
+                                                                <Icons.AlertTriangle className="w-6 h-6 mx-auto mb-2 text-red-400" />
+                                                                <p className="text-sm text-gray-300">{pbsSyslogStatus.message}</p>
+                                                                <button onClick={() => fetchPBSSyslog(selectedPBS.id)} className="mt-3 text-xs text-gray-400 hover:text-white underline">
+                                                                    {t('retry') || 'Retry'}
+                                                                </button>
+                                                            </div>
+                                                        );
+                                                        if (syslogState === 'loaded') return (
+                                                            <div className="w-full text-center py-6 text-gray-500 bg-proxmox-card border border-proxmox-border rounded-xl">
+                                                                <Icons.Terminal className="w-6 h-6 mx-auto mb-2 opacity-30" />
+                                                                <span className="text-sm">{t('pbsSyslogEmpty') || 'PBS returned no syslog entries.'}</span>
+                                                            </div>
+                                                        );
+                                                        return (
+                                                            <button onClick={() => fetchPBSSyslog(selectedPBS.id)} className="w-full text-center py-6 text-gray-500 bg-proxmox-card border border-proxmox-border rounded-xl hover:border-blue-500/30 transition-all cursor-pointer">
+                                                                <Icons.Terminal className="w-6 h-6 mx-auto mb-2 opacity-30" />
+                                                                <span className="text-sm">{t('pbsLoadSyslog') || 'Click to load syslog'}</span>
+                                                            </button>
+                                                        );
+                                                    })()}
                                                 </div>
                                             </div>
                                         )}
