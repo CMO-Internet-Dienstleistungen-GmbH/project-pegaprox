@@ -95,6 +95,17 @@ patches:
     summary: 'Cluster health is computed once per cluster and broadcast, instead of polled by every tab'
     requested_by: 11
 
+  # Snapshot mutations in the Corporate VM detail discarded the JSON error
+  # returned by the server. Keep the existing generic text only as a fallback
+  # when the response is missing or cannot be parsed.
+  - name: snapshot-error-toasts
+    branch: fix/snapshot-error-toasts
+    base: main
+    kind: fix
+    upstream_pr:
+    summary: 'Snapshot action toasts show the error returned by the server'
+    requested_by: 13
+
 # Files whose conflicts are resolved by regenerating them instead of merging.
 # web/index.html is a build artefact (web/Dev/build.sh compiles it from
 # web/index.html.original + web/src/*.js) and conflicts on every backport
