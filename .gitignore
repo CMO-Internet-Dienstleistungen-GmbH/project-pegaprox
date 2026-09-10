@@ -5,3 +5,4 @@ patches.*.yml
 # Anything a local run leaves behind.
 .venv/
 __pycache__/
+config
