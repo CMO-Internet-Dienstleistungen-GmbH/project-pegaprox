@@ -2960,8 +2960,11 @@
                                                                     )}
                                                                 </select>
                                                             ) : (
-                                                                <>
-                                                                <span className={`px-2 py-1 rounded text-xs font-medium ${
+                                                                /* LW Sep 2026 (#795) - these were bare inline siblings, so a custom role id
+                                                                   long enough to fill the 10% column pushed the source badge into a mid-word
+                                                                   break and it read as if it belonged to the tenant next door. */
+                                                                <div className="flex flex-wrap items-center gap-1">
+                                                                <span className={`px-2 py-1 rounded text-xs font-medium whitespace-nowrap ${
                                                                     user.role === 'admin' ? 'bg-red-500/10 text-red-400' :
                                                                     user.role === 'user' ? 'bg-blue-500/10 text-blue-400' :
                                                                     user.role === 'viewer' ? 'bg-gray-500/10 text-gray-400' :
@@ -2973,15 +2976,15 @@
                                                                      user.role}
                                                                 </span>
                                                                 {user.auth_source === 'ldap' && (
-                                                                    <span className="px-1.5 py-0.5 rounded text-xs bg-blue-500/10 text-blue-400 border border-blue-500/20">LDAP</span>
+                                                                    <span className="px-1.5 py-0.5 rounded text-xs whitespace-nowrap bg-blue-500/10 text-blue-400 border border-blue-500/20">LDAP</span>
                                                                 )}
                                                                 {user.auth_source === 'entra' && (
-                                                                    <span className="px-1.5 py-0.5 rounded text-xs bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">Entra ID</span>
+                                                                    <span className="px-1.5 py-0.5 rounded text-xs whitespace-nowrap bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">Entra ID</span>
                                                                 )}
                                                                 {user.auth_source === 'oidc' && (
-                                                                    <span className="px-1.5 py-0.5 rounded text-xs bg-purple-500/10 text-purple-400 border border-purple-500/20">OIDC</span>
+                                                                    <span className="px-1.5 py-0.5 rounded text-xs whitespace-nowrap bg-purple-500/10 text-purple-400 border border-purple-500/20">OIDC</span>
                                                                 )}
-                                                                </>
+                                                                </div>
                                                             )}
                                                         </td>
                                                         <td className="px-4 py-3 text-gray-400 text-sm">

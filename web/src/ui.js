@@ -294,7 +294,10 @@
 
         function UserAvatar({ user, sizeClass = 'w-8 h-8', textClass = 'text-sm', className = '' }) {
             const initials = getUserInitials(user);
-            const classes = `${sizeClass} rounded-full overflow-hidden flex items-center justify-center ${className}`.trim();
+            // LW Sep 2026 (#795) - shrink-0 belongs here, not at one call site: a fixed circle is
+            // what an avatar IS, and as a flex child next to a long username it was being squeezed
+            // to a sliver with the initials bleeding into the text.
+            const classes = `${sizeClass} flex-shrink-0 rounded-full overflow-hidden flex items-center justify-center ${className}`.trim();
 
             if (user?.avatar_url) {
                 return (
