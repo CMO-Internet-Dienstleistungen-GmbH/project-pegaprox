@@ -6505,6 +6505,9 @@ def _execute_local_replication(job):
         # tag it so the cleanup below can find it by tag now that it no longer carries the repl-* name.
         try:
             _restore_vm_identity(mgr, target_node, clone_vmid, vm_type, _identity, force_onboot_off=True)
+            # the result is deliberately not fatal here: unlike the cross-cluster paths, an
+            # untagged replica in-cluster only costs us the cleanup below finding it, so old
+            # replicas pile up instead of the job refusing to run. _tag_as_replica logs it.
             _tag_as_replica(mgr, target_node, clone_vmid, vm_type, job_id)
         except Exception as _ident_e:
             logging.warning(f"[REPL] Job {job_id}: identity/onboot restore failed on replica {clone_vmid}: {_ident_e}")
@@ -6698,8 +6701,13 @@ def _job_tag(job_id):
     return f'xcrepl-job-{job_id}'
 
 
-def _read_target_tags(mgr, node, vmid, vm_type):
-    """Return the set of tags on a VM, or None if config fetch failed."""
+def _read_target_tag_list(mgr, node, vmid, vm_type):
+    """Tags in the order PVE stores them, or None if the config fetch failed.
+
+    MK Sep 2026 (#799) — _tag_as_replica appends to this list and writes it back,
+    and leaving the operator's own tags alone includes not reshuffling them, so the
+    merge works on the ordered form rather than on the set below.
+    """
     try:
         cfg_url = f"https://{mgr.host}:{mgr.api_port}/api2/json/nodes/{node}/{vm_type}/{vmid}/config"
         resp = mgr._api_get(cfg_url)
@@ -6708,9 +6716,15 @@ def _read_target_tags(mgr, node, vmid, vm_type):
         cfg = resp.json().get('data', {})
         tags_raw = cfg.get('tags', '') or ''
         # PVE separates tags by ';' for both LXC and QEMU.
-        return {t.strip() for t in tags_raw.split(';') if t.strip()}
+        return [t.strip() for t in tags_raw.split(';') if t.strip()]
     except Exception:
         return None
+
+
+def _read_target_tags(mgr, node, vmid, vm_type):
+    """Return the set of tags on a VM, or None if config fetch failed."""
+    tags = _read_target_tag_list(mgr, node, vmid, vm_type)
+    return None if tags is None else set(tags)
 
 
 def _is_replica_of_job(mgr, node, vmid, vm_type, job_id):
@@ -6721,33 +6735,62 @@ def _is_replica_of_job(mgr, node, vmid, vm_type, job_id):
     return _job_tag(job_id) in tags
 
 
-def _tag_as_replica(mgr, node, vmid, vm_type, job_id):
+def _tag_as_replica(mgr, node, vmid, vm_type, job_id, attempts=3):
     """Mark the freshly-migrated replica with the job-specific + general
     pegaprox-replica tags. Preserves any pre-existing tags so users' own
-    organisation tags stay intact."""
+    organisation tags stay intact. Returns (ok, detail).
+
+    MK Sep 2026 (#799) — this was best-effort in every direction: a failed config
+    read returned silently and a rejected PUT only logged a warning, while
+    _is_replica_of_job, which READS the same tag on the next run, aborts the job
+    outright. So the run that actually broke the pairing reported success, and the
+    operator heard about it a day later through a message about a tag nobody had
+    told them we failed to write.
+
+    A 200 on the PUT is not proof either. PVE queues a config write behind the
+    guest lock the migration has only just released, and the guard reads the config
+    rather than our status code — so confirm it the way the guard will, by reading
+    it back. Retry a couple of times first: the lock is the likely cause and it
+    clears on its own, which makes this transient far more often than fatal.
+    """
     cfg_url = f"https://{mgr.host}:{mgr.api_port}/api2/json/nodes/{node}/{vm_type}/{vmid}/config"
-    try:
-        resp = mgr._api_get(cfg_url)
-        if resp.status_code != 200:
-            return
-        cfg = resp.json().get('data', {})
-        tags_raw = cfg.get('tags', '') or ''
-        existing = [t.strip() for t in tags_raw.split(';') if t.strip()]
-        want = [PEGAPROX_REPLICA_TAG, _job_tag(job_id)]
-        merged = list(existing)
-        for t in want:
-            if t not in merged:
-                merged.append(t)
-        if merged == existing:
-            return  # nothing to do
-        new_tags = ';'.join(merged)
-        put = mgr._api_put(cfg_url, data={'tags': new_tags})
-        if put.status_code == 200:
-            logging.info(f"[XCREPL] Tagged replica {vm_type}/{vmid} on {node} with {want}")
-        else:
-            logging.warning(f"[XCREPL] tag PUT returned {put.status_code}: {put.text[:200]}")
-    except Exception as e:
-        logging.warning(f"[XCREPL] Could not tag replica {vmid}: {e}")
+    want = [PEGAPROX_REPLICA_TAG, _job_tag(job_id)]
+    detail = 'no attempt made'
+    for attempt in range(1, attempts + 1):
+        try:
+            existing = _read_target_tag_list(mgr, node, vmid, vm_type)
+            if existing is None:
+                detail = 'could not read the replica config'
+            else:
+                merged = list(existing)
+                for t in want:
+                    if t not in merged:
+                        merged.append(t)
+                if merged == existing:
+                    return True, ''
+                put = mgr._api_put(cfg_url, data={'tags': ';'.join(merged)})
+                if put.status_code != 200:
+                    detail = f'PVE rejected the tag write with HTTP {put.status_code}'
+                else:
+                    back = _read_target_tags(mgr, node, vmid, vm_type)
+                    if back is not None and _job_tag(job_id) in back:
+                        logging.info(f"[XCREPL] Tagged replica {vm_type}/{vmid} on {node} with {want}")
+                        return True, ''
+                    detail = 'PVE accepted the tag write but the tag was not on the guest afterwards'
+        except Exception as e:
+            detail = f'{type(e).__name__}: {e}'
+        if attempt < attempts:
+            time.sleep(2 * attempt)
+    logging.error(f"[XCREPL] Job {job_id}: replica {vm_type}/{vmid} on {node} is NOT carrying "
+                  f"{_job_tag(job_id)} after {attempts} attempts — {detail}")
+    return False, detail
+
+
+def _untagged_replica_error(job_id, vmid, node, detail):
+    """The sentence the operator gets on the run that failed, not the one after it."""
+    return (f"Replica {vmid} was created on {node} but could not be tagged "
+            f"{_job_tag(job_id)} ({detail}). The next run refuses to replace an untagged "
+            f"target, so tag it by hand or the job stays stuck here.")
 
 
 # ============================================================================
@@ -7028,12 +7071,15 @@ def _execute_replication_incremental(job):
         logging.info(f"[XCINCR] Job {job_id}: shipped {total/1e6:.1f} MB ({', '.join(m for _,_,m in replicated)})")
 
         # 4. build the replica VM shell on a (re)build (disks already seeded)
+        tag_ok, tag_detail = True, ''
         if rebuild:
             _build_incremental_replica_vm(target_mgr, target_node, tgt_vmid, cfg, replicated, target_storage, job)
             try: _restore_vm_identity(target_mgr, target_node, tgt_vmid, vm_type, identity)
             except Exception as e: logging.warning(f"[XCINCR] {job_id}: identity: {e}")
-            try: _tag_as_replica(target_mgr, target_node, tgt_vmid, vm_type, job_id)
-            except Exception as e: logging.warning(f"[XCINCR] {job_id}: tag: {e}")
+            try: tag_ok, tag_detail = _tag_as_replica(target_mgr, target_node, tgt_vmid, vm_type, job_id)
+            except Exception as e:
+                tag_ok, tag_detail = False, f'{type(e).__name__}: {e}'
+                logging.warning(f"[XCINCR] {job_id}: tag: {e}")
 
         # 4. advance the base: keep @new_snap (next diff base), drop the old one, prune strays
         db.execute("UPDATE cross_cluster_replications SET last_snapshot=? WHERE id=?", (new_snap, job_id))
@@ -7050,7 +7096,14 @@ def _execute_replication_incremental(job):
                     zfs_prune_snapshots(tgt_ssh, f"{_xcincr_zfs_pool(tgt_ssh, target_storage)}/{tgt_vol}", {new_snap}, 'xcincr-')
             except Exception:
                 pass
-        _update_repl_status(db, job_id, 'ok', '')
+        # MK Sep 2026 (#799) — the base advance above is what makes the next run an
+        # incremental one, and that run's first move is the tag check. Reporting ok here
+        # while the tag is missing means the job is already broken and says otherwise.
+        if tag_ok:
+            _update_repl_status(db, job_id, 'ok', '')
+        else:
+            _update_repl_status(db, job_id, 'error',
+                                _untagged_replica_error(job_id, tgt_vmid, target_node, tag_detail))
         logging.info(f"[XCINCR] Job {job_id}: done, base advanced to {new_snap}")
         return True
     except Exception as e:
@@ -7387,10 +7440,15 @@ def _execute_replication(job):
                     # MK May 2026 (#413) — tag the replica so the safety gate on the next
                     # run recognises it as ours and can cycle it without operator action.
                     try:
-                        _tag_as_replica(target_mgr, target_node, tgt_vmid, vm_type, job_id)
+                        tag_ok, tag_detail = _tag_as_replica(target_mgr, target_node, tgt_vmid, vm_type, job_id)
                     except Exception as e:
+                        tag_ok, tag_detail = False, f'{type(e).__name__}: {e}'
                         logging.warning(f"[XCREPL] Job {job_id}: replica-tag write failed: {e}")
-                    _update_repl_status(db, job_id, 'ok', '')
+                    if tag_ok:
+                        _update_repl_status(db, job_id, 'ok', '')
+                    else:
+                        _update_repl_status(db, job_id, 'error',
+                                            _untagged_replica_error(job_id, tgt_vmid, target_node, tag_detail))
                 else:
                     logging.error(f"[XCREPL] Job {job_id}: migration task failed: {mig_detail}")
                     _update_repl_status(db, job_id, 'error', f'Migration task failed: {mig_detail}')
