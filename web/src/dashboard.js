@@ -8133,8 +8133,11 @@
             const [pbsSyslogStatus, setPbsSyslogStatus] = useState({ id: null, state: 'idle', message: '' });
             // and a sequence for the fetch itself: "Load More" while the first request is still
             // out, or a click on another PBS, can land the older answer last and hand the panel
-            // back to whichever request happened to be slowest.
+            // back to whichever request happened to be slowest. Same for the notification read,
+            // where a late answer from the server you just left blanks the section for the one
+            // you are looking at, because it is keyed on the id it was stamped with.
             const pbsSyslogSeq = useRef(0);
+            const pbsNotificationsSeq = useRef(0);
             const [pbsCatalog, setPbsCatalog] = useState([]);
             const [pbsCatalogPath, setPbsCatalogPath] = useState('/');
             const [pbsCatalogSnapshot, setPbsCatalogSnapshot] = useState(null);
@@ -11309,9 +11312,14 @@
             // for a matching id, which keeps an unfetched (or previous) PBS from showing an empty
             // notification block as though it were this server's answer.
             const fetchPBSNotifications = async (pbsId) => {
+                const seq = ++pbsNotificationsSeq.current;
                 try {
                     const resp = await authFetch(`${API_URL}/pbs/${pbsId}/notifications`);
-                    if (resp && resp.ok) setPbsNotifications({ ...(await resp.json()), _pbsId: pbsId });
+                    if (resp && resp.ok) {
+                        const cfg = await resp.json();
+                        if (seq !== pbsNotificationsSeq.current) return;
+                        setPbsNotifications({ ...cfg, _pbsId: pbsId });
+                    }
                 } catch (e) { console.warn('PBS notifications error:', e); }
             };
             
