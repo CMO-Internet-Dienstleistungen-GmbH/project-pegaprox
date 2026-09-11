@@ -13,6 +13,19 @@ browser tests against a locally provisioned PegaProx instance in Docker. Keep
 test data synthetic and local; this permission does not extend to production or
 shared environments.
 
+### Push authorization and local-only tags
+
+- A tag that exists only in the local repository and was created by local
+  verification may be deleted without asking for confirmation. Verify that the
+  exact tag is absent from every configured remote immediately before deleting
+  it. This exception does not apply to any tag that has been published.
+- An explicit instruction from Dennis to push or publish is the approval for
+  all pushes required to complete the stated repository workflow. Do not ask
+  for another confirmation before those pushes. This includes the documented
+  `cmo/main` force-push performed by `./scripts/run.sh publish` when publishing
+  a rebuilt release. The authorization remains limited to the branches, tags
+  and workflow named or necessarily implied by that instruction.
+
 ### Everything that leaves this repository is public
 
 Upstream issues, pull requests, comments, commit messages on patch branches
