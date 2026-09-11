@@ -1783,7 +1783,7 @@
 
         // NS May 2026 — single-number cluster health pill. Polls /health every 60s.
         // Hover for factor breakdown, click for full modal.
-        function ClusterHealthBadge({ clusterId, authFetch, apiUrl }) {
+        function ClusterHealthBadge({ clusterId, authFetch, apiUrl, health }) {
             const [data, setData] = React.useState(null);
             const [loading, setLoading] = React.useState(false);
             const [showDetails, setShowDetails] = React.useState(false);
@@ -1803,9 +1803,37 @@
                 finally { setLoading(false); }
             }, [clusterId, authFetch, apiUrl]);
 
+            // `health` arrives over SSE, computed once per cluster for everyone
+            // watching it. Feeding it into the same state the poll writes keeps the
+            // whole render path below unchanged — the badge does not care which of
+            // the two produced the number.
             React.useEffect(() => {
+                if (health) setData(health);
+            }, [health]);
+
+            // How long a pushed rollup counts as current. Three broadcast intervals:
+            // long enough that a single missed round is not treated as a failure,
+            // short enough that a stream which stops feeding us is noticed quickly.
+            const PUSH_FRESH_MS = 180000;
+            const lastPushRef = React.useRef(0);
+            if (health && health._receivedAt && health._receivedAt > lastPushRef.current) {
+                lastPushRef.current = health._receivedAt;
+            }
+
+            React.useEffect(() => {
+                // The first read still goes over REST: without it the badge stays
+                // empty until the next broadcast, which can be a whole interval away.
                 fetchHealth();
-                const id = setInterval(fetchHealth, 60000);
+                // The timer keeps its old one-minute cadence and SKIPS the request
+                // while pushed data is fresh, rather than running on a slow cadence.
+                // The difference matters after a server restart: the rollup cache is
+                // empty, the broadcaster only refreshes clusters already in it, and
+                // nothing would refill it until the next poll. Skipping means that
+                // poll is at most a minute away instead of ten.
+                const id = setInterval(() => {
+                    if (Date.now() - lastPushRef.current < PUSH_FRESH_MS) return;
+                    fetchHealth();
+                }, 60000);
                 return () => clearInterval(id);
             }, [fetchHealth]);
 
