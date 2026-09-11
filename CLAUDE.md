@@ -6,6 +6,11 @@ lives on this branch; see `README.md` for how a sync builds `v<release>-cmo.<n>`
 
 ## Rules & Constraints
 
+### Shared instruction language
+
+Repository instruction files are shared. Refer to people and requesters by
+their role, such as "the user" or "a maintainer", and never use a personal name.
+
 ### Local verification environment
 
 Local verification may create a disposable `.venv`, use local Docker, and run
@@ -19,7 +24,7 @@ shared environments.
   verification may be deleted without asking for confirmation. Verify that the
   exact tag is absent from every configured remote immediately before deleting
   it. This exception does not apply to any tag that has been published.
-- An explicit instruction from Dennis to push or publish is the approval for
+- An explicit instruction from the user to push or publish is the approval for
   all pushes required to complete the stated repository workflow. Do not ask
   for another confirmation before those pushes. This includes the documented
   `cmo/main` force-push performed by `./scripts/run.sh publish` when publishing
@@ -63,7 +68,7 @@ goes into any of them:
   `~/Projekte/CMO/project-pegaprox-gh-upstream-communication/` as
   `ISSUE-<yyyy-mm-dd>-<topic>.md` / `PR-<yyyy-mm-dd>-<topic>.md`, checked
   against the live upstream templates (GitHub API, not the local clone), and
-  opened by Dennis — never posted by the assistant.
+  opened manually by a repository maintainer — never posted by the assistant.
 
 Which values that splits into:
 

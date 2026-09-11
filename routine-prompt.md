@@ -84,8 +84,9 @@ If that push is **refused because the branch is not one this routine may write
 to**, stop there and report it, with the resolved commits still on your local
 branch and their shas in the report. Do not push it somewhere else, do not fold
 the resolution into `cmo/main`, and do not try to widen your own permissions:
-which branches a routine may rewrite is Dennis's decision, and a resolution
-nobody can see is better than one that arrived by a route nobody chose.
+which branches a routine may rewrite requires a repository maintainer's
+decision, and a resolution nobody can see is better than one that arrived by a
+route nobody chose.
 
 Say in the report which branch was refused: the fix is to add it to this
 routine's allowed push targets, and the list is explicit on purpose — it holds
