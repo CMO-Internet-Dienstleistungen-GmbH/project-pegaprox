@@ -47,6 +47,12 @@ cmo/main` reads as the upstream release plus a short list of our deltas. The
 script does this for you; do not assemble it by hand, and never merge a branch
 in.
 
+The squash subject is the patch's required `commit_message` in `patches.yml`,
+not a subject inferred from the branch history. It follows
+`<type>(<area>): <what changed>` and stays identical across rebuilds. Change it
+only when the patch scope changed or the existing subject is materially wrong;
+the `cmo/automation` commit body must state that reason.
+
 Then run `./scripts/run.sh verify` and include its output in your report.
 
 The scripts use plain git for everything about the upstream repository. Do not
@@ -156,7 +162,8 @@ a release. This is the same procedure, started by hand rather than by a webhook:
 
 1. Add it to `patches.yml` in the position it should be applied at. Choose
    `kind` deliberately: `fix` and `feature` are meant to leave again once
-   upstream absorbs them, `internal` never does.
+   upstream absorbs them, `internal` never does. Set a `commit_message` that
+   describes the complete patch in `<type>(<area>): <what changed>` form.
 2. Run `./scripts/run.sh publish` directly. Do not gate it on `check` — `check`
    only asks whether there is a *new release*, and there is not. It says
    `maybe-up-to-date` and notes that a full run rebuilds anyway, which is

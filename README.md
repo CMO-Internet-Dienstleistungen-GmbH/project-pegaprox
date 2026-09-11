@@ -58,7 +58,9 @@ upstream release with a changed patch set (a fix added, reworked, or dropped).
    - if a single commit is already contained, skip it;
    - if a conflict is limited to a **generated file** (`web/index.html`),
      regenerate it with `web/Dev/build.sh` and continue;
-   - any other conflict stops the run and asks for a human.
+   - any other conflict stops the run and asks for a human;
+   - squash the applied branch commits under that patch's stable
+     `commit_message`; branch commit order never decides the subject.
 4. Regenerate the artefacts once more and commit them if they changed.
 5. Run the test suite in an isolated venv, exactly like the upstream CI does.
 6. Compare the result against the newest existing tag. Identical tree → nothing
@@ -165,6 +167,7 @@ patches:
     upstream_pr: 812            # drops the patch automatically once merged
     requested_by: 12            # issue in the fork; for internal patches
     summary: one line for the tag message
+    commit_message: 'fix(web): describe the patch as a whole'
 ```
 
 `kind` is the promise the entry makes. `fix` and `feature` are meant to end up
@@ -175,6 +178,13 @@ must not quietly turn a permanent patch back into a droppable one.
 
 The commits taken are `merge-base(upstream/<base>, origin/<branch>)..<branch>`,
 so rebasing the fix branch onto a newer upstream is transparent here.
+
+`commit_message` is the stable subject of the patch's one squash commit on
+`cmo/main`. It follows `<type>(<area>): <what changed>` and describes the whole
+patch, not whichever branch commit happens to come first or last. Keep it
+unchanged across rebuilds. Change it only when the patch scope changed or the
+existing subject is materially wrong, and explain that reason in the
+`cmo/automation` commit body.
 
 When a fix lands upstream, you do not have to do anything: the next sync sees
 the merged PR and drops it. Deleting the entry afterwards keeps the file tidy.

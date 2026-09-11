@@ -36,7 +36,8 @@ PY
 }
 
 # Emit the patch list, one record per line, fields separated by US (0x1f):
-# name, branch, base, upstream_pr, summary, kind, requested_by. Not TAB: `read`
+# name, branch, base, upstream_pr, summary, kind, requested_by, commit_message.
+# Not TAB: `read`
 # treats TAB as IFS whitespace and collapses runs of it, which drops empty fields.
 #
 # `kind` defaults to 'fix' when the entry does not say otherwise, so every
@@ -50,6 +51,7 @@ for p in data.get('patches') or []:
     fields = [str(p.get(k) or '') for k in ('name', 'branch', 'base', 'upstream_pr', 'summary')]
     fields.append(str(p.get('kind') or 'fix'))
     fields.append(str(p.get('requested_by') or ''))
+    fields.append(str(p.get('commit_message') or ''))
     print('\x1f'.join(fields))
 PY
 }

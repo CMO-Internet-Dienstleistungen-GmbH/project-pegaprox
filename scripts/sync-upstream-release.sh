@@ -197,12 +197,21 @@ apply_commit() {   # apply_commit <sha> <patch-name>
     return 0
 }
 
-while IFS=$'\x1f' read -r name branch base pr summary kind requested_by; do
+validate_commit_message() {
+    local name="$1" message="$2"
+    [ -n "$message" ] || die "$name: commit_message is required"
+    [[ "$message" =~ ^[a-z][a-z0-9-]*\([a-z0-9][a-z0-9-]*\):\ .+ ]] \
+        || die "$name: commit_message must match <type>(<area>): <what changed>"
+    [[ "$message" != *. ]] || die "$name: commit_message must not end with a full stop"
+}
+
+while IFS=$'\x1f' read -r name branch base pr summary kind requested_by commit_message; do
     [ -n "$name" ] || continue
     case "$kind" in
         fix|feature|internal) ;;
         *) die "$name: unknown kind '$kind' (expected fix, feature or internal)" ;;
     esac
+    validate_commit_message "$name" "$commit_message"
     if [ "$kind" = internal ]; then
         info "patch: $name — $summary [internal${requested_by:+, requested by $requested_by}]"
     else
@@ -271,8 +280,7 @@ while IFS=$'\x1f' read -r name branch base pr summary kind requested_by; do
         ok "  nothing left to apply — all $n commit(s) already in $RELEASE_TAG"
     else
         landed="$(git -C "$WORKTREE" rev-list --count "$before..HEAD")"
-        subject="$(git -C "$WORKTREE" log -1 --format=%s "$before..HEAD" --reverse | head -1)"
-        [ -n "$subject" ] || subject="$name: $summary"
+        subject="$commit_message"
         git -C "$WORKTREE" reset --quiet --soft "$before"
         if [ "$landed" -gt 1 ]; then
             git -C "$WORKTREE" commit --quiet \

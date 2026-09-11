@@ -41,6 +41,12 @@ fork:
 #                it, whoever carries the patch across a moved codebase is
 #                guessing at what to preserve. Closed is fine; the work being
 #                done does not make the scope less true.
+#   commit_message the stable squash subject used on cmo/main. It must follow
+#                `<type>(<area>): <what changed>` and describe the patch as a
+#                whole. Rebuilds must not derive it from branch commit order.
+#                Change it only when the patch scope changed or the existing
+#                subject is materially wrong, and explain why in the
+#                cmo/automation commit body.
 patches:
   # Upstream issue #743 is open; PR #745 was closed pending discussion, so there
   # is no PR to track and the entry has to be retired by hand once upstream
@@ -51,6 +57,7 @@ patches:
     kind: feature
     upstream_pr:
     summary: '"System" theme follows the OS light/dark setting (upstream issue #743)'
+    commit_message: 'feat(theme): follow the OS light/dark setting'
     requested_by: 6
 
   # The chooser GitHub shows when someone opens an issue here. Upstream's asks
@@ -63,6 +70,7 @@ patches:
     kind: internal
     upstream_pr:
     summary: German issue forms that ask what this fork needs, not what upstream needs
+    commit_message: 'chore(issue-templates): ask what this fork needs from requesters'
     requested_by: 8
 
   # One idle tab produced ~4 REST calls/s: authFetch was rebuilt on every render,
@@ -79,6 +87,7 @@ patches:
     kind: fix
     upstream_pr:
     summary: 'The UI stops re-arming its polling effects on every render, and the guest-info fan-out stops feeding itself'
+    commit_message: 'fix(web): stop the UI amplifying its own requests'
     requested_by: 10
 
   # The health rollup is a cluster-wide number, but every tab used to compute its
@@ -93,6 +102,7 @@ patches:
     kind: feature
     upstream_pr:
     summary: 'Cluster health is computed once per cluster and broadcast, instead of polled by every tab'
+    commit_message: 'feat(health): broadcast one shared cluster health rollup'
     requested_by: 11
 
   # Snapshot mutations in the Corporate VM detail discarded the JSON error
@@ -100,10 +110,11 @@ patches:
   # when the response is missing or cannot be parsed.
   - name: snapshot-error-toasts
     branch: fix/snapshot-error-toasts
-    base: main
+    base: Testing
     kind: fix
     upstream_pr:
     summary: 'Snapshot action toasts show the error returned by the server'
+    commit_message: 'fix(web): surface snapshot API errors in toasts'
     requested_by: 13
 
   # The Corporate QEMU summary already fetches the VM config for hardware
@@ -115,6 +126,7 @@ patches:
     kind: feature
     upstream_pr:
     summary: 'Corporate QEMU summaries show the VM description as safe multiline text'
+    commit_message: 'feat(web): show VM descriptions in Corporate summary'
     requested_by: 14
 
 # Files whose conflicts are resolved by regenerating them instead of merging.

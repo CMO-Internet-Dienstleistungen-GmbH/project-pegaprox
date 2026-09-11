@@ -95,6 +95,12 @@ feature branch carries, they land as a single commit in `patches.yml` order —
 Don't let the squash inherit the last branch commit's subject; if the branch
 ends on a test commit, that subject describes the wrong thing.
 
+The required `commit_message` in `patches.yml` is that squash subject. It must
+follow `<type>(<area>): <what changed>` and remain stable across rebuilds so the
+same patch does not acquire a different identity whenever its branch history
+changes. Change it only when the patch scope changed or the existing message is
+materially wrong, and explain the reason in the `cmo/automation` commit body.
+
 The branch keeps its own history and is never deleted or flattened. `cmo/main`
 is the rebuilt side, the branch is the source of truth, and the squash exists so
 each release rebuild moves one commit per patch instead of a chain.
