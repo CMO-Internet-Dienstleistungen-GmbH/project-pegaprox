@@ -301,3 +301,28 @@ def test_a_broken_metadata_store_does_not_fail_a_delete(monkeypatch):
     monkeypatch.setattr(snapshot_meta, 'forget', explode)
 
     assert mgr.delete_snapshot('pve1', 100, 'qemu', 'pre-upgrade')['success'] is True
+
+
+def test_a_snapshot_replaced_outside_pegaprox_does_not_inherit_the_author(api, seed):
+    """The record is bound at creation, so a same-name replacement stays unknown.
+
+    Without that binding the row is still unbound when the replacement appears,
+    and a snapshot nobody here made would be shown as ours.
+    """
+    user = seed.user('alice', role='admin')
+    client = api.as_user(user)
+    made_at = int(time.time())
+
+    fake = api.make_fake_manager(
+        create_snapshot={'success': True, 'task': 'UPID:test'},
+        get_snapshots=[{'name': 'nightly', 'snaptime': made_at, 'description': ''}],
+    )
+    api.set_manager(CLUSTER, fake)
+
+    client.post(f'/api/clusters/{CLUSTER}/vms/node1/qemu/101/snapshots', json={'snapname': 'nightly'})
+
+    # deleted and recreated on the node itself: same name, a later timestamp
+    fake.get_snapshots.return_value = [{'name': 'nightly', 'snaptime': made_at + 120, 'description': ''}]
+
+    listed = client.get(f'/api/clusters/{CLUSTER}/vms/node1/qemu/101/snapshots')
+    assert listed.get_json()[0]['author'] == ''
