@@ -5654,6 +5654,11 @@ def create_snapshot_api(cluster_id, node, vm_type, vmid):
     if result['success']:
         usr = getattr(request, 'session', {}).get('user', 'system')
         snapshot_meta.record_creation(cluster_id, vm_type, vmid, snapname, usr)
+        # Bind the record to the snapshot that was just made, while we still know
+        # it is ours: a name that is replaced outside PegaProx before anyone opens
+        # a snapshot list would otherwise be able to claim this author.
+        snapshot_meta.annotate_snapshots(cluster_id, vm_type, vmid,
+                                         mgr.get_snapshots(node, vmid, vm_type))
         log_audit(usr, 'snapshot.created', f"{vm_type.upper()} {vmid} - snapshot '{snapname}' created" + (" (with RAM)" if vmstate else ""), cluster=mgr.config.name)
         return jsonify({'message': f'Snapshot {snapname} erstellt', 'task': result.get('task')})
     else:
