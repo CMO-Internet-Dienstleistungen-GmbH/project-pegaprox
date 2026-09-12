@@ -326,3 +326,70 @@ def test_a_snapshot_replaced_outside_pegaprox_does_not_inherit_the_author(api, s
 
     listed = client.get(f'/api/clusters/{CLUSTER}/vms/node1/qemu/101/snapshots')
     assert listed.get_json()[0]['author'] == ''
+
+
+def test_a_snapshot_deleted_on_the_node_stops_costing_us_a_row():
+    """Deleted outside PegaProx, so `forget` never ran — the listing reconciles."""
+    now = int(time.time())
+    snapshot_meta.record_creation(CLUSTER, 'qemu', 101, 'nightly', 'alice')
+    snapshot_meta.record_creation(CLUSTER, 'qemu', 101, 'weekly', 'alice')
+    snapshot_meta.annotate_snapshots(CLUSTER, 'qemu', 101, [
+        _snap('nightly', now), _snap('weekly', now),
+    ])
+
+    # only one of them is still there the next time we look
+    snapshot_meta.annotate_snapshots(CLUSTER, 'qemu', 101, [_snap('nightly', now)])
+
+    rows = snapshot_meta._connection().cursor().execute(
+        'SELECT snapname FROM snapshot_authors WHERE vmid = 101'
+    ).fetchall()
+    assert [r[0] for r in rows] == ['nightly']
+
+
+def test_an_empty_listing_is_not_taken_as_proof_of_deletion():
+    """An empty answer and a failed query look the same — so keep the rows."""
+    now = int(time.time())
+    snapshot_meta.record_creation(CLUSTER, 'qemu', 101, 'nightly', 'alice')
+    snapshot_meta.annotate_snapshots(CLUSTER, 'qemu', 101, [_snap('nightly', now)])
+
+    snapshot_meta.annotate_snapshots(CLUSTER, 'qemu', 101, [])
+
+    assert snapshot_meta.annotate_snapshots(
+        CLUSTER, 'qemu', 101, [_snap('nightly', now)])[0]['author'] == 'alice'
+
+
+def test_another_guests_records_are_left_alone_by_the_reconciliation():
+    now = int(time.time())
+    snapshot_meta.record_creation(CLUSTER, 'qemu', 101, 'nightly', 'alice')
+    snapshot_meta.record_creation(CLUSTER, 'qemu', 202, 'nightly', 'bob')
+    snapshot_meta.annotate_snapshots(CLUSTER, 'qemu', 202, [_snap('nightly', now)])
+
+    # listing guest 101 with a different snapshot must not touch guest 202
+    snapshot_meta.annotate_snapshots(CLUSTER, 'qemu', 101, [_snap('other', now)])
+
+    assert snapshot_meta.annotate_snapshots(
+        CLUSTER, 'qemu', 202, [_snap('nightly', now)])[0]['author'] == 'bob'
+
+
+def test_a_listing_reads_only_the_guests_it_asks_about():
+    """Cost must follow the page, not everything the cluster ever tracked."""
+    now = int(time.time())
+    for vmid in range(100, 140):
+        snapshot_meta.record_creation(CLUSTER, 'qemu', vmid, f'snap-{vmid}', 'alice')
+
+    statements = []
+    conn = snapshot_meta._connection()
+    conn.set_trace_callback(statements.append)
+    try:
+        snapshot_meta.annotate_rows([
+            {'cluster_id': CLUSTER, 'vm_type': 'qemu', 'vmid': 100,
+             'snapshot_name': 'snap-100', 'snaptime': now},
+        ])
+    finally:
+        conn.set_trace_callback(None)
+
+    selects = [s for s in statements if s.lstrip().upper().startswith('SELECT')]
+    assert len(selects) == 1
+    # the trace shows bound values already expanded, so this asserts the guest
+    # filter is there and that the other 39 guests were not read
+    assert 'vmid IN (100)' in selects[0]
