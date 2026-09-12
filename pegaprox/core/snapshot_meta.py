@@ -22,9 +22,13 @@ we see the snapshot itself:
   * A row that is never claimed inside the window describes a creation that
     failed, and is dropped rather than left to be adopted by a later snapshot.
 
-The one case this cannot separate is a snapshot deleted and recreated under
-the same name within the same second, which PVE timestamps identically. That
-is accepted: the alternative is an identity PVE does not offer us.
+Two cases this cannot separate, both accepted because the alternative is an
+identity PVE does not offer us: a snapshot deleted and recreated under the
+same name within the same second, which PVE timestamps identically; and a
+snapshot that is replaced under the same name before it first becomes visible
+to us at all — the route binds the record right after a successful creation,
+so that window is the time PVE needs to make the snapshot appear, which for a
+VM-state snapshot is as long as writing RAM to disk takes.
 
 Deliberately additive — the fork's patch for issue #39 owns this file, so an
 upstream release can move the code around it without a conflict.
@@ -51,6 +55,10 @@ _CLOCK_SKEW_SECONDS = 300
 _CREATION_WINDOW_SECONDS = 6 * 3600
 
 _TABLE = 'snapshot_authors'
+
+# SQLite takes at most 999 bound variables per statement; stay well inside it
+# and let the callers page instead of building one giant IN list.
+_MAX_VARIABLES = 400
 
 _Key = Tuple[str, str, int, str]
 
@@ -157,6 +165,52 @@ def forget(cluster_id: str, vm_type: str, vmid: Any, snapname: str) -> None:
         _log.warning("[SnapshotMeta] could not drop author for %s/%s: %s", vmid, snapname, e)
 
 
+def _guests_by_cluster(keys: Iterable[_Key]) -> Dict[str, List[int]]:
+    guests: Dict[str, List[int]] = {}
+    for cluster_id, _vm_type, vmid, _snapname in keys:
+        bucket = guests.setdefault(cluster_id, [])
+        if vmid not in bucket:
+            bucket.append(vmid)
+    return guests
+
+
+def _chunks(values: Sequence[int], size: int) -> Iterable[Sequence[int]]:
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
+
+
+def forget_missing(cluster_id: str, vm_type: str, vmid: Any,
+                   present: Iterable[str]) -> None:
+    """Drop rows of one guest whose snapshot no longer exists.
+
+    A snapshot deleted on the node itself never reaches `forget()`, so without
+    this the table would keep a row for every snapshot PegaProx ever made. Only
+    called with a complete, non-empty snapshot listing of that guest: an empty
+    answer cannot be told apart from a failed query, and a row nobody can match
+    is harmless, so nothing is removed in that case.
+    """
+    names = [str(n) for n in (present or []) if n]
+    if not names:
+        return
+    key = _normalise(cluster_id, vm_type, vmid, names[0])
+    if key is None:
+        return
+    try:
+        _ensure_schema()
+        cursor = _connection().cursor()
+        for chunk in _chunks(names, _MAX_VARIABLES):
+            placeholders = ','.join('?' for _ in chunk)
+            cursor.execute(
+                f'DELETE FROM {_TABLE} '
+                f'WHERE cluster_id = ? AND vm_type = ? AND vmid = ? '
+                f'AND snapname NOT IN ({placeholders})',
+                [key[0], key[1], key[2], *chunk]
+            )
+        _connection().commit()
+    except Exception as e:
+        _log.warning("[SnapshotMeta] could not reconcile authors for %s: %s", vmid, e)
+
+
 def _claimable(requested_at: int, snaptime: int) -> bool:
     return (requested_at - _CLOCK_SKEW_SECONDS) <= snaptime <= (requested_at + _CREATION_WINDOW_SECONDS)
 
@@ -183,14 +237,19 @@ def resolve(entries: Sequence[Tuple[str, str, Any, str, Any]]) -> Dict[_Key, Dic
     try:
         _ensure_schema()
         cursor = _connection().cursor()
-        clusters = sorted({key[0] for key in wanted})
-        placeholders = ','.join('?' for _ in clusters)
-        cursor.execute(
-            f'SELECT cluster_id, vm_type, vmid, snapname, author, origin, requested_at, snaptime '
-            f'FROM {_TABLE} WHERE cluster_id IN ({placeholders})',
-            clusters
-        )
-        rows = cursor.fetchall()
+        rows = []
+        for cluster_id, vmids in _guests_by_cluster(wanted).items():
+            # Read only the guests that were asked about. Reading a whole
+            # cluster would make every snapshot list cost what the cluster has
+            # ever tracked, rather than what is on the page.
+            for chunk in _chunks(vmids, _MAX_VARIABLES):
+                placeholders = ','.join('?' for _ in chunk)
+                cursor.execute(
+                    f'SELECT cluster_id, vm_type, vmid, snapname, author, origin, requested_at, snaptime '
+                    f'FROM {_TABLE} WHERE cluster_id = ? AND vmid IN ({placeholders})',
+                    [cluster_id, *chunk]
+                )
+                rows.extend(cursor.fetchall())
     except Exception as e:
         _log.warning("[SnapshotMeta] could not read snapshot authors: %s", e)
         return {}
@@ -259,6 +318,9 @@ def annotate_snapshots(cluster_id: str, vm_type: str, vmid: Any,
         entry = meta.get(key) if key else None
         snap['author'] = entry['author'] if entry else ''
         snap['author_origin'] = entry['origin'] if entry else ''
+    # This is the one caller that sees a guest's snapshots in full, so it is
+    # the only place that can tell a record apart from a leftover.
+    forget_missing(cluster_id, vm_type, vmid, [s.get('name') for s in items])
     return items
 
 
