@@ -22,6 +22,7 @@ from pegaprox.constants import *
 from pegaprox.globals import *
 from pegaprox.models.permissions import *
 from pegaprox.core.db import get_db
+from pegaprox.core import snapshot_meta  # fork patch (issue #39): snapshot author metadata
 
 from pegaprox.utils.auth import (require_auth, load_users, validate_session, build_authz_user,
                                  resolve_authz_user)
@@ -7266,6 +7267,7 @@ def get_snapshots_api(cluster_id, node, vm_type, vmid):
     
     manager = cluster_managers[cluster_id]
     snapshots = manager.get_snapshots(node, vmid, vm_type)
+    snapshot_meta.annotate_snapshots(cluster_id, vm_type, vmid, snapshots)
     return jsonify(snapshots)
 
 
@@ -7297,6 +7299,7 @@ def create_snapshot_api(cluster_id, node, vm_type, vmid):
     
     if result['success']:
         usr = getattr(request, 'session', {}).get('user', 'system')
+        snapshot_meta.record_creation(cluster_id, vm_type, vmid, snapname, usr)
         log_audit(usr, 'snapshot.created', f"{vm_type.upper()} {vmid} - snapshot '{snapname}' created" + (" (with RAM)" if vmstate else ""), cluster=mgr.config.name)
         return jsonify({'message': f'Snapshot {snapname} erstellt', 'task': result.get('task')})
     else:
@@ -7485,6 +7488,7 @@ def get_efficient_snapshots_api(cluster_id, node, vm_type, vmid):
     # writes the result into a synced table. A standby shows what the active recorded.
     refresh = request.args.get('refresh', 'false').lower() == 'true' and not ha.is_standby()
     snapshots = mgr.get_efficient_snapshots(cluster_id, vmid, refresh_usage=refresh)
+    snapshot_meta.annotate_efficient(snapshots)
     return jsonify(snapshots)
 
 
@@ -7510,7 +7514,9 @@ def create_efficient_snapshot_api(cluster_id, node, vm_type, vmid):
     description = data.get('description', '')
     snap_size_gb = data.get('snap_size_gb')
 
-    result = mgr.create_efficient_snapshot(node, vmid, vm_type, snapname, description, snap_size_gb)
+    created_by = getattr(request, 'session', {}).get('user', '') or ''
+    result = mgr.create_efficient_snapshot(node, vmid, vm_type, snapname, description, snap_size_gb,
+                                           created_by=created_by)
 
     if result['success']:
         usr = getattr(request, 'session', {}).get('user', 'system')
@@ -7665,7 +7671,12 @@ def snapshots_overview():
                     # which page you opened. snapshot_date stays for older frontends and
                     # because the table sorts on it.
                     "snapshot_ts": int(snap_ts),
-                    "age": age, "cluster_id": cid
+                    "age": age, "cluster_id": cid,
+                    # fork patch (issue #39): the description was already in the
+                    # hypervisor's answer and used to be dropped here; snaptime is
+                    # what the author record is bound to.
+                    "snaptime": snap_ts,
+                    "description": snap.get('description', '') or '',
                 })
             return results
         except Exception:
@@ -7681,6 +7692,8 @@ def snapshots_overview():
 
     snapshots.sort(key=lambda s: s["snapshot_date"], reverse=False)
     snapshots = snapshots[:filter_limit]
+    # fork patch (issue #39): one query for the whole page, never one per row
+    snapshot_meta.annotate_rows(snapshots)
 
     return jsonify({"snapshots": snapshots})
 
