@@ -129,6 +129,22 @@ patches:
     commit_message: 'feat(web): show VM descriptions in Corporate summary'
     requested_by: 14
 
+  # Hyper-V as a restricted migration source, per the epic in issue #15. All of
+  # its phases -- connection, inventory, preflight, offline import, console --
+  # belong to this one branch and this one entry; the sub-issues do not get
+  # branches of their own. Additive by construction: a HyperVManager and its own
+  # UI files, with one-line hooks where an upstream file has to know they exist.
+  # `feature`, because it is meant to go upstream and is offered there, but no PR
+  # exists yet, so `upstream_pr` stays empty and the drop heuristics cannot fire.
+  - name: hyperv-migration-source
+    branch: feat/hyperv-migration-source
+    base: main
+    kind: feature
+    upstream_pr:
+    summary: 'Hyper-V as a migration source: connect, inspect, preflight and import VMs into Proxmox'
+    commit_message: 'feat(hyperv): add Hyper-V as a migration source'
+    requested_by: 15
+
 # Files whose conflicts are resolved by regenerating them instead of merging.
 # web/index.html is a build artefact (web/Dev/build.sh compiles it from
 # web/index.html.original + web/src/*.js) and conflicts on every backport
