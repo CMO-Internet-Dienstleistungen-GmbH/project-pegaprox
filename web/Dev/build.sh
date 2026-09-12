@@ -50,6 +50,7 @@ SRC_FILES=(
     auth.js
     icons.js
     ui.js
+    snapshot_meta.js
     datacenter.js
     security.js
     storage.js

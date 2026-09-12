@@ -2925,9 +2925,15 @@
                                                                             {snap.snaptime ? new Date(snap.snaptime * 1000).toLocaleString() : t('unknown')}
                                                                             {snap.vmstate && <span className="ml-2 text-blue-400">+ RAM</span>}
                                                                         </div>
-                                                                        {snap.description && (
-                                                                            <div className="text-sm text-gray-500 mt-1">{snap.description}</div>
-                                                                        )}
+                                                                        {/* fork patch (issue #39): author and description, same rules everywhere */}
+                                                                        <div className="text-xs text-gray-400 mt-0.5">
+                                                                            {t('snapshotAuthor') || 'Author'}:{' '}
+                                                                            <SnapshotAuthor snap={snap} t={t} />
+                                                                        </div>
+                                                                        <div className="text-sm text-gray-500 mt-1">
+                                                                            {t('description') || 'Description'}:{' '}
+                                                                            <SnapshotDescription text={snap.description} t={t} />
+                                                                        </div>
                                                                     </div>
                                                                 </div>
                                                                 <div className="flex items-center gap-2">
@@ -2993,7 +2999,15 @@
                                                                                         {snap.total_snap_alloc_gb?.toFixed(1)} GB / {snap.total_disk_size_gb?.toFixed(1)} GB
                                                                                     </span>
                                                                                 </div>
-                                                                                {snap.description && <div className="text-sm text-gray-500 mt-1">{snap.description}</div>}
+                                                                                {/* fork patch (issue #39): author and description, same rules everywhere */}
+                                                                                <div className="text-xs text-gray-400 mt-0.5">
+                                                                                    {t('snapshotAuthor') || 'Author'}:{' '}
+                                                                                    <SnapshotAuthor snap={snap} t={t} />
+                                                                                </div>
+                                                                                <div className="text-sm text-gray-500 mt-1">
+                                                                                    {t('description') || 'Description'}:{' '}
+                                                                                    <SnapshotDescription text={snap.description} t={t} />
+                                                                                </div>
                                                                                 {isInvalidated && <div className="text-xs text-red-400 mt-1">{t('snapshotInvalidated')}</div>}
                                                                             </div>
                                                                         </div>
