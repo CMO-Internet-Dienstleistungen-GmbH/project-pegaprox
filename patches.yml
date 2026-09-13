@@ -145,6 +145,25 @@ patches:
     commit_message: 'feat(hyperv): add Hyper-V as a migration source'
     requested_by: 15
 
+  # PVE keeps no author for a snapshot -- the call arrives as the cluster's root
+  # ticket -- so the fork records who asked for one, in a table of its own, and
+  # binds each record to the snapshot's snaptime so a reused name cannot inherit
+  # it. Shown together with the description PVE does store, under one set of
+  # display rules, in the VM views and the cluster-wide overview. The efficient
+  # snapshots' existing `created_by` column was always written empty and now
+  # carries the acting account. Ordered last of the three that touch the
+  # Corporate VM detail in web/src/vm_modals.js: it rewrites the snapshot rows
+  # that vm-description-summary and snapshot-error-toasts leave alone. A
+  # system-wide overview is deliberately out of scope (issue #39).
+  - name: snapshot-author-metadata
+    branch: feat/snapshot-author-metadata
+    base: main
+    kind: feature
+    upstream_pr:
+    summary: 'Snapshots say who created them, next to the description, in the VM and cluster views'
+    commit_message: 'feat(snapshots): show who created a snapshot'
+    requested_by: 39
+
 # Files whose conflicts are resolved by regenerating them instead of merging.
 # web/index.html is a build artefact (web/Dev/build.sh compiles it from
 # web/index.html.original + web/src/*.js) and conflicts on every backport
