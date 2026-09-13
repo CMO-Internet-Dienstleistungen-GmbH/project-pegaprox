@@ -1390,6 +1390,14 @@ def _msdn_scan_once():
                                 h(payload)
                             except Exception:
                                 pass
+                        # same gap as #815 on the config-drift side: handlers are the
+                        # plugin hook, the configured webhook channels are a separate
+                        # dispatch that nobody here was calling.
+                        try:
+                            from pegaprox.utils.webhooks import send_to_channels
+                            send_to_channels(payload)
+                        except Exception as _we:
+                            logging.warning(f"[multi_sdn] webhook dispatch failed: {_we}")
                 except Exception as e:
                     logging.debug(f"[multi_sdn] drift alert emit failed: {e}")
 
