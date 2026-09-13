@@ -91,7 +91,10 @@ def test_a_global_custom_role_resolves_to_its_own_permissions(roles):
     assert sorted(perms) == sorted(GLOBAL_OPS)
 
 
-@pytest.mark.parametrize('role,count', [('admin', 127), ('viewer', 31)])
+# Hyper-V patch (fork issue #15) — the eight hyperv.* permissions are added to the
+# builtin roles, so both totals move. Written as upstream + patch rather than as the
+# new totals, so a rebase can see at a glance which half belongs to this fork.
+@pytest.mark.parametrize('role,count', [('admin', 127 + 8), ('viewer', 31 + 2)])
 def test_the_builtin_roles_are_unchanged(roles, role, count):
     """The remap must not touch a builtin — that is the regression this could cause."""
     assert len(rbac.get_user_permissions({'username': 'u', 'role': role,

@@ -126,6 +126,10 @@ def get_datacenter_status(cluster_id):
     if error:
         return error
 
+    # Hyper-V patch (#15) — a migration source has no Proxmox API to aggregate from.
+    if getattr(manager, 'cluster_type', 'proxmox') == 'hyperv':
+        return jsonify(manager.datacenter_status())
+
     # MK: XCP-ng clusters build status from their own cached data
     if getattr(manager, 'cluster_type', 'proxmox') == 'xcpng':
         try:
@@ -646,6 +650,11 @@ def get_datastores(cluster_id):
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
+
+    # Hyper-V patch (#15) — its disks are found through the VM that owns them, never
+    # through a host-wide storage list, so there is nothing honest to put here.
+    if getattr(manager, 'cluster_type', 'proxmox') == 'hyperv':
+        return jsonify({'shared': [], 'local': {}})
 
     # XCP-ng: return SR list as datastores
     if getattr(manager, 'cluster_type', 'proxmox') == 'xcpng':
@@ -3639,6 +3648,13 @@ def vm_action_api(cluster_id, node, vm_type, vmid, action):
     except Exception as e:
         logging.warning(f"[VM-ACTION] Error parsing body: {e}")
     
+    # CMO fork patch #15: an imported VM and its Hyper-V original are one machine twice.
+    if action in ('start', 'resume'):
+        from pegaprox.core.hyperv_xhm import refuse_target_start
+        _refused = refuse_target_start(cluster_id, vmid)
+        if _refused:
+            return jsonify({'error': _refused}), 409
+
     logging.info(f"[VM-ACTION] Executing {action} with force={force}")
     manager = cluster_managers[cluster_id]
     try:

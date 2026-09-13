@@ -191,6 +191,11 @@ def add_cluster():
         if not manager.connect():
             error_detail = manager.connection_error or 'Failed to connect to XCP-ng pool'
             return jsonify({'error': f'Failed to connect: {error_detail}'}), 400
+    elif cluster_type == 'hyperv':
+        from pegaprox.core.hyperv_cluster import connect_hyperv_source
+        manager, hv_error = connect_hyperv_source(cluster_id, data)
+        if hv_error:
+            return jsonify({'error': f"Failed to connect: {hv_error['message']}", **hv_error}), 400
     else:
         manager = PegaProxManager(cluster_id, config)
         # Test connection - MK: return actual error instead of generic message (#88)
@@ -211,7 +216,7 @@ def add_cluster():
         db.update_cluster(cluster_id, {'cluster_type': cluster_type})
 
     # Audit log
-    type_label = 'XCP-ng' if cluster_type == 'xcpng' else 'Proxmox'
+    type_label = {'xcpng': 'XCP-ng', 'hyperv': 'Hyper-V'}.get(cluster_type, 'Proxmox')
     log_audit(request.session['user'], 'cluster.added', f"Added {type_label} cluster: {data.get('name')} ({data.get('host')})")
 
     result = {'id': cluster_id, 'message': 'Cluster added successfully'}
@@ -386,6 +391,11 @@ def reconfigure_cluster(cluster_id):
         new_mgr = XcpngManager(cluster_id, new_config)
         if not new_mgr.connect():
             return jsonify({'error': f'Connection failed: {new_mgr.connection_error or "unknown"}'}), 400
+    elif cluster_type == 'hyperv':
+        from pegaprox.core.hyperv_cluster import connect_hyperv_source
+        new_mgr, hv_error = connect_hyperv_source(cluster_id, data)
+        if hv_error:
+            return jsonify({'error': f"Connection failed: {hv_error['message']}", **hv_error}), 400
     else:
         new_mgr = PegaProxManager(cluster_id, new_config)
         if not new_mgr.connect_to_proxmox():
@@ -427,7 +437,8 @@ def get_cluster_nodes(cluster_id):
     manager = cluster_managers[cluster_id]
 
     # MK: XCP-ng clusters use their own get_nodes()
-    if getattr(manager, 'cluster_type', 'proxmox') == 'xcpng':
+    # CMO: so does a Hyper-V source, for the same reason — it has no Proxmox API to ask.
+    if getattr(manager, 'cluster_type', 'proxmox') in ('xcpng', 'hyperv'):
         try:
             nodes = manager.get_nodes()
             return jsonify(nodes)

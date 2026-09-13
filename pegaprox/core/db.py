@@ -1376,6 +1376,14 @@ class PegaProxDB:
         except Exception as e:
             logging.error(f"Error creating xcpng_vmid_map table: {e}")
 
+        # Hyper-V migration source - fork issue #15. The tables are defined in
+        # pegaprox/core/hyperv_db.py so this file does not grow a second schema.
+        try:
+            from pegaprox.core import hyperv_db
+            hyperv_db.ensure_schema(cursor)
+        except Exception as e:
+            logging.error(f"Error creating Hyper-V tables: {e}")
+
         # LW Mar 2026 - resource pools for XCP-ng (DB-backed, XAPI has no equivalent)
         try:
             cursor.execute('''

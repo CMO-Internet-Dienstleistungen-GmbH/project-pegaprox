@@ -1,0 +1,1176 @@
+# The Hyper-V to Proxmox migration, driven without either hypervisor.
+#
+# The runner's shape is the thing under test: what it asks before doing anything
+# irreversible, what it cleans up when a step fails, and what it deliberately leaves alone.
+# Both ends are faked — the Hyper-V source answers from a dict, and the target node records
+# the commands it was told to run instead of running them.
+#
+# The one thing this cannot prove is that the commands work. That is proved in the Docker
+# testbed, where a real cifs mount and a real qemu-img conversion produce a raw image whose
+# checksum matches the source VHDX.
+
+import threading
+
+import pytest
+
+from pegaprox.core import hyperv_db, hyperv_xhm
+from pegaprox.core.hyperv_transfer import TransferError
+
+SOURCE = 'hv_1'
+TARGET = 'pve_1'
+VMID = 100
+GUID = '11111111-1111-1111-1111-111111111111'
+SECRET = 'fixture-' + 'not-a-real-credential'
+
+
+# ---------------------------------------------------------------------------
+# Stand-ins
+# ---------------------------------------------------------------------------
+
+class FakeConfig:
+    def __init__(self, **kw):
+        self.name = kw.get('name', 'source')
+        self.host = kw.get('host', 'source-host.invalid')
+        self.user = kw.get('user', 'CORP\\svc-migrate')
+        self.pass_ = kw.get('pass_', SECRET)
+        self.smb_share_map = kw.get('smb_share_map', {})
+        self.smb_domain = kw.get('smb_domain', '')
+        self.ssh_user = kw.get('ssh_user', 'root')
+        self.ssh_key = ''
+        self.ssh_port = 22
+
+
+class FakeSource:
+    cluster_type = 'hyperv'
+
+    def __init__(self, detail, safe=(True, 'Off, no background operation')):
+        self.id = SOURCE
+        self.is_connected = True
+        self.config = FakeConfig()
+        self._detail = detail
+        self._safe = safe
+        self.manager = self
+
+    def guid_for(self, vmid):
+        return GUID if int(vmid) == VMID else None
+
+    def get_vm_config(self, vmid):
+        return dict(self._detail)
+
+    def disks_are_safe_to_read(self, guid):
+        return self._safe
+
+
+class FakeResponse:
+    def __init__(self, status_code=200, payload=None, text=''):
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {}
+        self.text = text
+
+    def json(self):
+        return self._payload
+
+
+class FakeTarget:
+    cluster_type = 'proxmox'
+
+    def __init__(self, free_bytes=10 * 1024 ** 4, next_id=120):
+        self.id = TARGET
+        self.is_connected = True
+        self.host = 'target-host.invalid'
+        self.api_port = 8006
+        self.config = FakeConfig(name='target')
+        self._free = free_bytes
+        self._next_id = next_id
+        self.posts = []
+        # _get_pve_targets reads this to enumerate storages and bridges for the wizard.
+        self.nodes = {'node-a': {}}
+
+    def _api_get(self, url):
+        if url.endswith('/nextid'):
+            return FakeResponse(payload={'data': self._next_id})
+        if '/storage/' in url:
+            return FakeResponse(payload={'data': {'avail': self._free}})
+        if url.endswith('/config') and self.vm_configs is not None:
+            vmid = url.rsplit('/qemu/', 1)[-1].split('/')[0]
+            config = self.vm_configs.get(vmid)
+            if config is None:
+                return FakeResponse(status_code=404)
+            return FakeResponse(payload={'data': config})
+        return FakeResponse(status_code=404)
+
+    def _api_post(self, url, data=None):
+        self.posts.append((url, dict(data or {})))
+        return FakeResponse(status_code=200)
+
+    # -- what a cleanup asks of a target -------------------------------------------
+    # `vm_configs` maps a VMID to what /config answers, so a test can put somebody
+    # else's guest on the number a failed migration recorded.
+    vm_configs = None
+
+    def _api_delete(self, url):
+        self.deleted.append(url)
+        return FakeResponse(status_code=200)
+
+    @property
+    def deleted(self):
+        if not hasattr(self, '_deleted'):
+            self._deleted = []
+        return self._deleted
+
+
+class FakeNode:
+    """Records commands instead of running them, and answers the few that are read."""
+
+    def __init__(self, convert_exit=0, alloc_exit=0, probe_exit=0):
+        self.commands = []
+        self.stdin_data = []
+        self.closed = False
+        self.convert_exit = convert_exit
+        self.alloc_exit = alloc_exit
+        self.probe_exit = probe_exit
+        self._alloc_count = 0
+
+    def run(self, command, stdin_data=None, timeout=None):
+        self.commands.append(command)
+        if stdin_data is not None:
+            self.stdin_data.append(stdin_data)
+        if command.startswith('test -r'):
+            return self.probe_exit, '42949672960\n', ''
+        if command.startswith('pvesm alloc'):
+            if self.alloc_exit != 0:
+                return self.alloc_exit, '', 'no space left on device'
+            index = self._alloc_count
+            self._alloc_count += 1
+            # What pvesm actually prints on an LVM-thin storage: a warning line, then the
+            # volume in quotes. The runner has to find the volume in both shapes.
+            return 0, ('  WARNING: Sum of all thin volume sizes exceeds the size of '
+                       'thin pool.\n'
+                       f"successfully created 'local-lvm:vm-120-disk-{index}'\n"), ''
+        if command.startswith('pvesm path'):
+            return 0, '/dev/pve/vm-120-disk-0\n', ''
+        return 0, '', ''
+
+    def run_with_progress(self, command, on_progress, cancelled, timeout=None):
+        self.commands.append(command)
+        on_progress(50.0)
+        if self.convert_exit != 0:
+            return self.convert_exit, '', 'qemu-img: error while reading sector'
+        on_progress(100.0)
+        return 0, '', ''
+
+    def close(self):
+        self.closed = True
+
+
+class FakeTask:
+    """The fields the runner touches on an XHMigrationTask."""
+
+    def __init__(self, **kw):
+        self.id = kw.get('id', 'mig12345')
+        self.source_cluster = SOURCE
+        self.target_cluster = TARGET
+        self.source_vmid = VMID
+        self.target_node = 'node-a'
+        self.target_storage = 'local-lvm'
+        self.vm_name = ''
+        self.config = kw.get('config', {})
+        self.network_map = kw.get('network_map', {})
+        self.phase = 'planning'
+        self.status = 'running'
+        self.progress = 0
+        self.error = None
+        self.target_vmid = None
+        self.disk_progress = {}
+        self.log_lines = []
+        self.cancel_event = threading.Event()
+
+    def log(self, message):
+        self.log_lines.append(message)
+
+    def set_phase(self, phase, error=None):
+        self.phase = phase
+        if phase == 'failed':
+            self.status = 'failed'
+            self.error = error
+        elif phase == 'completed':
+            self.status = 'completed'
+
+    def update_progress(self, key, copied, total):
+        self.disk_progress[key] = {'copied': copied, 'total': total}
+
+
+def _detail(**overrides):
+    detail = {
+        'guid': GUID, 'name': 'guest-a', 'state': 'Off', 'generation': 2,
+        'cpu_count': 4, 'memory_mb': 8192, 'checkpoint_count': 0, 'checkpoints': [],
+        'secure_boot_enabled': False, 'vtpm_enabled': False,
+        'bitlocker_state': None, 'virtio_driver_state': None,
+        'disks': [{'path': 'C:\\vm\\a.vhdx', 'size': 42949672960, 'vhd_type': 'Dynamic',
+                   'parent_path': None, 'target_controller_hint': 'scsi',
+                   'read_error': None}],
+        'network_adapters': [{'name': 'Network Adapter',
+                              'mac_address': '00:15:5d:00:00:01',
+                              'switch_name': 'External'}],
+    }
+    detail.update(overrides)
+    return detail
+
+
+@pytest.fixture
+def wired(db, monkeypatch):
+    """Source, target and node in cluster_managers, with the SSH layer replaced."""
+    import pegaprox.globals as ppglobals
+
+    source = FakeSource(_detail())
+    target = FakeTarget()
+    node = FakeNode()
+
+    ppglobals.cluster_managers.clear()
+    ppglobals.cluster_managers[SOURCE] = source
+    ppglobals.cluster_managers[TARGET] = target
+
+    monkeypatch.setattr(hyperv_xhm, '_open_target_node',
+                        lambda task, src, tgt: (node, '/mnt/pegaprox-hyperv/x.credentials'))
+    # The retry backoff is real seconds in production and dead time here. Zeroing the
+    # constant keeps the retry behaviour under test and the suite fast.
+    monkeypatch.setattr(hyperv_xhm, '_RETRY_BACKOFF_SECONDS', 0)
+    try:
+        yield source, target, node
+    finally:
+        ppglobals.cluster_managers.clear()
+
+
+# Every warning this fixture produces. A real run collects these from the operator; a test
+# about the transfer should not fail because of a confirmation the wizard would have taken.
+ACKNOWLEDGED = sorted(__import__('pegaprox.core.hyperv_preflight', fromlist=['x'])
+                      ._ACKNOWLEDGEABLE_CHECKS)
+
+
+def _run(task, network_map=None, acknowledged=None):
+    task.network_map = network_map if network_map is not None else {
+        '00:15:5d:00:00:01': 'vmbr0'}
+    task.config = {**task.config,
+                   'acknowledged': ACKNOWLEDGED if acknowledged is None else acknowledged}
+    hyperv_xhm._run_hyperv_to_pve(task)
+    return task
+
+
+# ===========================================================================
+# Planning
+# ===========================================================================
+
+class TestPlanning:
+    def test_a_source_that_is_not_hyperv_is_refused(self, db):
+        import pegaprox.globals as ppglobals
+        ppglobals.cluster_managers.clear()
+        ppglobals.cluster_managers[TARGET] = FakeTarget()
+        try:
+            result = hyperv_xhm.plan_hyperv_to_pve(TARGET, VMID, TARGET)
+        finally:
+            ppglobals.cluster_managers.clear()
+        assert 'error' in result
+
+    def test_the_plan_carries_the_preflight_verdict(self, db, wired):
+        """The other directions answer "here is what we found".
+
+        This one also answers "here is why you cannot start yet", because a Hyper-V source
+        has states that produce a corrupt copy rather than a failure.
+        """
+        source, _, _ = wired
+        source.get_vm_disks_for_export = lambda vmid: {'data': {
+            'name': 'guest-a', 'cpu_count': 4, 'memory_mb': 8192, 'generation': 2,
+            'disks': [{'key': 'disk-0', 'capacity_bytes': 42949672960,
+                       'target_controller_hint': 'scsi'}],
+            'network_adapters': [], 'power_state': 'Off', 'checkpoint_count': 0,
+            'hyperv_guid': GUID}}
+
+        plan = hyperv_xhm.plan_hyperv_to_pve(SOURCE, VMID, TARGET)
+        assert plan['direction'] == 'hyperv_to_pve'
+        assert 'preflight' in plan
+        assert plan['source']['bios'] == 'ovmf'
+        assert plan['source']['machine'] == 'q35'
+
+    def test_the_plan_names_each_adapter_by_the_key_the_mapping_uses(self, db, wired):
+        """The wizard, the preflight and the runner must address one adapter alike.
+
+        The migration wizard keys its network map by the `network` field of each plan
+        entry; the preflight and the runner look the choice up by MAC. If those drift
+        apart nothing fails visibly — the wizard writes under one key, the preflight reads
+        another, every adapter stays "unmapped", and the migration can never be started.
+        Found in the browser, where the start button stayed disabled with the form filled.
+        """
+        from pegaprox.core.hyperv_preflight import _adapter_key, check_network_mapping
+
+        adapter = {'name': 'Network Adapter', 'mac_address': '00:15:5d:00:00:01',
+                   'switch_name': 'External'}
+        source, _, _ = wired
+        source.get_vm_disks_for_export = lambda vmid: {'data': {
+            'disks': [], 'network_adapters': [adapter], 'generation': 2,
+            'power_state': 'Off', 'checkpoint_count': 0, 'hyperv_guid': GUID}}
+
+        plan = hyperv_xhm.plan_hyperv_to_pve(SOURCE, VMID, TARGET)
+        entry = plan['source']['networks'][0]
+
+        assert entry['network'] == _adapter_key(adapter)
+        # And a map built the way the wizard builds it satisfies the check.
+        chosen = {entry['network'] or entry['bridge'] or '0': 'vmbr0'}
+        assert check_network_mapping([adapter], chosen).severity == 'ok'
+
+    def test_an_adapter_row_is_labelled_with_something_a_person_recognises(self, db, wired):
+        """The wizard labels the row with `bridge`; a MAC there tells nobody anything."""
+        source, _, _ = wired
+        source.get_vm_disks_for_export = lambda vmid: {'data': {
+            'disks': [], 'generation': 1, 'hyperv_guid': GUID,
+            'network_adapters': [{'name': 'Network Adapter', 'switch_name': 'External',
+                                  'mac_address': '00:15:5d:00:00:01'}]}}
+
+        entry = hyperv_xhm.plan_hyperv_to_pve(SOURCE, VMID, TARGET)['source']['networks'][0]
+        assert entry['bridge'] == 'External'
+
+    def test_the_plan_gives_no_time_estimate(self, db, wired):
+        """The other directions divide bytes by a fixed rate and present the result as a
+        number. Nothing here has measured the file share this one reads from."""
+        source, _, _ = wired
+        source.get_vm_disks_for_export = lambda vmid: {'data': {
+            'disks': [], 'network_adapters': [], 'generation': 1, 'hyperv_guid': GUID}}
+        plan = hyperv_xhm.plan_hyperv_to_pve(SOURCE, VMID, TARGET)
+        assert 'estimated_seconds' not in plan
+        assert 'total_bytes' in plan
+
+
+# ===========================================================================
+# What the run asks before it does anything
+# ===========================================================================
+
+class TestTheStartContract:
+    def test_a_source_still_merging_its_disks_is_refused(self, db, wired):
+        """Deleting a checkpoint returns at once and the merge runs on afterwards.
+
+        A VM that reports Off with no checkpoints can still be rewriting its own disk
+        files, and copying them then produces an image that mounts and is wrong.
+        """
+        source, _, node = wired
+        source._safe = (False, 'Merging Disks')
+
+        task = _run(FakeTask())
+        assert task.status == 'failed'
+        assert 'Merging Disks' in task.error
+        assert 'pvesm alloc' not in ' '.join(node.commands)
+
+    def test_preflight_runs_again_at_the_moment_of_starting(self, db, wired):
+        """The wizard's verdict can be minutes old. A checkpoint taken in between is
+        exactly the case this catches."""
+        source, _, node = wired
+        source._detail = _detail(checkpoint_count=2)
+
+        task = _run(FakeTask())
+        assert task.status == 'failed'
+        assert 'checkpoint' in task.error.lower()
+        assert not any(c.startswith('pvesm alloc') for c in node.commands)
+
+    def test_an_unmapped_adapter_stops_the_run_rather_than_guessing(self, db, wired):
+        """A VM that arrives on the wrong VLAN is reachable by the wrong people, and that
+        is not visible from the migration's own result."""
+        task = _run(FakeTask(), network_map={})
+        assert task.status == 'failed'
+        assert 'network' in task.error.lower()
+
+    def test_an_unconfirmed_warning_stops_the_run(self, db, wired):
+        """A warning nobody confirmed is a risk nobody accepted.
+
+        The unbuilt transport proof is one of them, and it must not be possible to start a
+        migration past it by calling the API directly.
+        """
+        task = _run(FakeTask(), acknowledged=[])
+        assert task.status == 'failed'
+        assert 'confirmed' in task.error
+
+    def test_a_target_with_no_room_stops_before_anything_is_allocated(self, db, wired):
+        _, target, node = wired
+        target._free = 1024
+
+        task = _run(FakeTask())
+        assert task.status == 'failed'
+        assert not any(c.startswith('pvesm alloc') for c in node.commands)
+
+
+# ===========================================================================
+# The transfer
+# ===========================================================================
+
+class TestTheTransfer:
+    def test_a_whole_run_reaches_completed_and_leaves_the_source_alone(self, db, wired):
+        source, target, node = wired
+        task = _run(FakeTask())
+
+        assert task.status == 'completed', task.error
+        assert task.target_vmid == 120
+        # Nothing was asked of the source but reading it.
+        assert not hasattr(source, 'started')
+        assert 'untouched' in ' '.join(task.log_lines)
+
+    def test_the_share_credentials_never_appear_in_a_command(self, db, wired):
+        _, _, node = wired
+        _run(FakeTask())
+        assert not any(SECRET in command for command in node.commands)
+
+    def test_the_mount_is_undone_even_when_the_conversion_fails(self, db, wired):
+        """A mount left behind holds a connection open to a customer's hypervisor."""
+        _, _, node = wired
+        node.convert_exit = 1
+
+        task = _run(FakeTask())
+        assert task.status == 'failed'
+        assert any(c.startswith('umount') for c in node.commands)
+        assert node.closed
+
+    def test_a_failed_conversion_frees_its_partial_volume(self, db, wired):
+        """qemu-img writes the target in whatever order the source's block table
+        dictates, so a partial volume is not a partial disk anybody can resume."""
+        _, _, node = wired
+        node.convert_exit = 1
+
+        _run(FakeTask())
+        assert any(c.startswith('pvesm free') for c in node.commands)
+
+    def test_a_conversion_is_retried_on_a_fresh_volume(self, db, wired):
+        _, _, node = wired
+        node.convert_exit = 1
+
+        _run(FakeTask())
+        allocs = [c for c in node.commands if c.startswith('pvesm alloc')]
+        frees = [c for c in node.commands if c.startswith('pvesm free')]
+        assert len(allocs) == hyperv_xhm.TRANSFER_ATTEMPTS
+        assert len(frees) == hyperv_xhm.TRANSFER_ATTEMPTS
+
+    def test_a_disk_missing_from_the_share_fails_before_allocating(self, db, wired):
+        """The commonest failure is a share that mounted but does not hold what the
+        inventory named. It must not cost a volume to discover."""
+        _, _, node = wired
+        node.probe_exit = 1
+
+        task = _run(FakeTask())
+        assert task.status == 'failed'
+        assert not any(c.startswith('pvesm alloc') for c in node.commands)
+
+    def test_the_allocation_is_rounded_up(self, db, wired):
+        """pvesm alloc takes kibibytes and rounds down. A disk whose size is not a whole
+        number of them would get a volume one write short, failing at the very end."""
+        source, _, node = wired
+        source._detail = _detail(disks=[{'path': 'C:\\vm\\a.vhdx', 'size': 1024 * 1024 + 1,
+                                         'vhd_type': 'Fixed', 'parent_path': None,
+                                         'target_controller_hint': 'scsi',
+                                         'read_error': None}])
+        _run(FakeTask())
+        alloc = next(c for c in node.commands if c.startswith('pvesm alloc'))
+        assert alloc.split()[-1] == '1025'
+
+    def test_a_disk_with_no_size_is_refused(self, db, wired):
+        source, _, node = wired
+        source._detail = _detail(disks=[{'path': 'C:\\vm\\a.vhdx', 'size': None,
+                                         'vhd_type': 'Dynamic', 'parent_path': None,
+                                         'target_controller_hint': 'scsi',
+                                         'read_error': None}])
+        task = _run(FakeTask())
+        assert task.status == 'failed'
+
+    def test_cancelling_stops_before_the_next_disk(self, db, wired):
+        task = FakeTask()
+        task.cancel_event.set()
+        _run(task)
+        assert task.status == 'failed'
+        assert 'ancel' in task.error
+
+
+# ===========================================================================
+# What lands on the target
+# ===========================================================================
+
+class TestTheTargetVm:
+    def _created(self, target):
+        return next(data for url, data in target.posts if url.endswith('/qemu'))
+
+    def test_a_generation_two_source_becomes_a_uefi_q35_machine(self, db, wired):
+        _, target, _ = wired
+        _run(FakeTask())
+        created = self._created(target)
+        assert created['bios'] == 'ovmf'
+        assert created['machine'] == 'q35'
+
+    def test_a_generation_one_source_becomes_a_seabios_i440fx_machine(self, db, wired):
+        source, target, _ = wired
+        source._detail = _detail(generation=1)
+        _run(FakeTask())
+        created = self._created(target)
+        assert created['bios'] == 'seabios'
+        assert created['machine'] == 'i440fx'
+
+    def test_a_uefi_guest_gets_somewhere_to_keep_its_variables(self, db, wired):
+        """Without an EFI disk the VM starts into the firmware shell, which reads as a
+        failed conversion rather than as a missing device."""
+        _, target, _ = wired
+        _run(FakeTask())
+        assert any('efidisk0' in data for _, data in target.posts)
+
+    def test_the_mac_address_comes_across(self, db, wired):
+        """Licence bindings, DHCP reservations and firewall rules are written against it.
+        A new MAC turns a migration into a new machine for all of them."""
+        _, target, _ = wired
+        _run(FakeTask())
+        created = self._created(target)
+        assert '00:15:5d:00:00:01' in created['net0']
+
+    def test_the_guest_operating_system_is_not_guessed(self, db, wired):
+        """Nothing on this side can see inside the guest."""
+        _, target, _ = wired
+        _run(FakeTask())
+        assert self._created(target)['ostype'] == 'other'
+
+    def test_the_migrated_vm_is_not_started(self, db, wired):
+        """It boots when somebody has looked at it. An automatic start would put a second
+        copy of a live machine on the network beside the original."""
+        _, target, _ = wired
+        _run(FakeTask())
+        assert not any('/status/start' in url for url, _ in target.posts)
+
+
+# ===========================================================================
+# The durable record
+# ===========================================================================
+
+class TestWhatSurvivesTheProcess:
+    def test_everything_created_on_the_target_is_recorded(self, db, wired):
+        """This is the list that makes an interrupted migration recoverable by a person:
+        what exists now that did not exist before."""
+        task = _run(FakeTask())
+        row = hyperv_db.get_migration(db.conn, task.id)
+        kinds = {resource['kind'] for resource in row['created_resources']}
+        assert {'volume', 'vm'} <= kinds
+
+    def test_a_failed_run_is_recorded_as_failed_with_its_reason(self, db, wired):
+        _, _, node = wired
+        node.convert_exit = 1
+        task = _run(FakeTask())
+
+        row = hyperv_db.get_migration(db.conn, task.id)
+        assert row['status'] == hyperv_db.STATUS_FAILED
+        assert row['error']
+
+    def test_a_completed_run_is_recorded_as_completed(self, db, wired):
+        task = _run(FakeTask())
+        row = hyperv_db.get_migration(db.conn, task.id)
+        assert row['status'] == hyperv_db.STATUS_COMPLETED
+        assert row['target_vmid'] == 120
+
+
+# ===========================================================================
+# One import at a time, and what a failed one leaves behind
+# ===========================================================================
+
+class TestOneImportAtATime:
+    """Two starts on one source must not become two transfers of the same disks.
+
+    The danger is not a confusing UI. Each run allocates its own volumes and its own
+    target VMID, so a second one copies the same hundreds of gigabytes into a second
+    place, fills the storage, and leaves two half-machines that nobody can tell apart.
+    """
+
+    def test_a_second_start_while_one_runs_creates_nothing(self, db, wired):
+        source, target, node = wired
+        # What the first runner has done by the time the second one starts: recorded the
+        # migration, then claimed the source. A claim is live only while its migration is.
+        hyperv_db.create_migration(db.conn, source_cluster=SOURCE, source_vm_guid=GUID,
+                                   migration_id='mig-first')
+        assert hyperv_db.claim_source(db.conn, SOURCE, GUID, 'mig-first') is None
+
+        second = _run(FakeTask(id='mig-second'))
+
+        assert second.status == 'failed'
+        assert 'mig-first' in second.error
+        assert target.posts == [], 'the loser created something on the target'
+        # The refused attempt is recorded rather than silently dropped, and it recorded
+        # nothing as created, so it never blocks a later start.
+        row = hyperv_db.get_migration(db.conn, 'mig-second')
+        assert row['status'] == hyperv_db.STATUS_FAILED
+        assert row['created_resources'] == []
+        # And the loser's cleanup must not release the winner's claim on its way out.
+        held = hyperv_db.active_claim(db.conn, SOURCE, GUID)
+        assert held and held['migration_id'] == 'mig-first'
+
+    def test_the_claim_is_given_back_when_the_run_ends(self, db, wired):
+        task = _run(FakeTask(id='mig-done'))
+        assert task.status == 'completed'
+        assert hyperv_db.active_claim(db.conn, SOURCE, GUID) is None
+
+    def test_the_claim_is_given_back_when_the_run_fails(self, db, wired, monkeypatch):
+        monkeypatch.setattr(hyperv_xhm, '_open_target_node',
+                            lambda *a: (_ for _ in ()).throw(TransferError('no route')))
+        task = _run(FakeTask(id='mig-broken'))
+        assert task.status == 'failed'
+        assert hyperv_db.active_claim(db.conn, SOURCE, GUID) is None
+
+    def test_a_claim_whose_migration_ended_does_not_block_forever(self, db, wired):
+        """A process that dies between the last write and the release leaves a claim.
+
+        Liveness is decided by the migration's status, not by the claim row, so a restart
+        cannot leave a VM permanently unmigratable.
+        """
+        hyperv_db.create_migration(db.conn, source_cluster=SOURCE, source_vm_guid=GUID,
+                                   migration_id='mig-dead')
+        hyperv_db.claim_source(db.conn, SOURCE, GUID, 'mig-dead')
+        hyperv_db.update_migration(db.conn, 'mig-dead',
+                                   status=hyperv_db.STATUS_INTERRUPTED)
+
+        assert hyperv_db.active_claim(db.conn, SOURCE, GUID) is None
+        assert hyperv_xhm.refuse_hyperv_start(SOURCE, VMID) is None
+
+
+class TestStartingAgainAfterAFailure:
+    def test_a_clean_host_is_not_refused(self, db, wired):
+        assert hyperv_xhm.refuse_hyperv_start(SOURCE, VMID) is None
+
+    def test_a_live_import_refuses_the_next_one(self, db, wired):
+        hyperv_db.create_migration(db.conn, source_cluster=SOURCE, source_vm_guid=GUID,
+                                   migration_id='mig-live')
+        hyperv_db.claim_source(db.conn, SOURCE, GUID, 'mig-live')
+
+        refused = hyperv_xhm.refuse_hyperv_start(SOURCE, VMID)
+        assert refused and 'mig-live' in refused
+
+    def test_leftovers_from_a_failed_import_refuse_the_next_one(self, db, wired):
+        """Otherwise the same disks are copied a second time into a second set of volumes.
+
+        That is the failure the ticket calls "silently duplicated": nothing errors, the
+        storage simply fills with copies whose origin nobody can reconstruct afterwards.
+        """
+        hyperv_db.create_migration(db.conn, source_cluster=SOURCE, source_vm_guid=GUID,
+                                   migration_id='mig-old')
+        hyperv_db.record_created_resource(db.conn, 'mig-old', 'volume',
+                                          'local-lvm:vm-120-disk-0')
+        hyperv_db.update_migration(db.conn, 'mig-old', status=hyperv_db.STATUS_FAILED)
+
+        refused = hyperv_xhm.refuse_hyperv_start(SOURCE, VMID)
+        assert refused and 'mig-old' in refused and 'vm-120-disk-0' in refused
+
+    def test_a_failed_import_that_left_nothing_does_not_refuse(self, db, wired):
+        hyperv_db.create_migration(db.conn, source_cluster=SOURCE, source_vm_guid=GUID,
+                                   migration_id='mig-clean')
+        hyperv_db.update_migration(db.conn, 'mig-clean', status=hyperv_db.STATUS_FAILED)
+
+        assert hyperv_xhm.refuse_hyperv_start(SOURCE, VMID) is None
+
+    def test_a_freed_volume_stops_being_listed_as_a_leftover(self, db, wired, monkeypatch):
+        """A failed conversion frees its volume and starts over on a fresh one.
+
+        If the record kept naming the freed volume, the next start would be refused
+        because of something that is not there, and a cleanup would go looking for it.
+        """
+        source, target, _ = wired
+        failing = FakeNode(convert_exit=1)
+        monkeypatch.setattr(hyperv_xhm, '_open_target_node',
+                            lambda *a: (failing, '/mnt/x.credentials'))
+
+        task = _run(FakeTask(id='mig-retry'))
+        assert task.status == 'failed'
+
+        left = hyperv_db.get_migration(db.conn, 'mig-retry')['created_resources']
+        assert left == [], f'freed volumes are still recorded: {left}'
+        assert hyperv_xhm.refuse_hyperv_start(SOURCE, VMID) is None
+
+
+class TestCleaningUpWhatAFailedImportLeft:
+    """Removing target resources is the one destructive thing this patch can do."""
+
+    def _failed_migration(self, db, target, migration_id='mig-left'):
+        hyperv_db.create_migration(db.conn, source_cluster=SOURCE, source_vm_guid=GUID,
+                                   target_cluster=TARGET, target_node='node-a',
+                                   migration_id=migration_id)
+        hyperv_db.update_migration(db.conn, migration_id, target_vmid=120,
+                                   status=hyperv_db.STATUS_FAILED)
+        hyperv_db.record_created_resource(db.conn, migration_id, 'vm', '120')
+        hyperv_db.record_created_resource(db.conn, migration_id, 'volume',
+                                          'local-lvm:vm-120-disk-0')
+        target.vm_configs = {'120': {'description':
+                                     hyperv_xhm.target_vm_description(migration_id, 'guest-a')}}
+        return migration_id
+
+    @pytest.fixture
+    def ssh(self, monkeypatch):
+        """The node a cleanup frees volumes on, recording what it was asked to run."""
+        node = FakeNode()
+
+        class _Ssh:
+            def close(self):
+                node.closed = True
+
+        import pegaprox.core.xhm as core_xhm
+        monkeypatch.setattr(core_xhm, '_resolve_pve_node_ip', lambda t, n: '127.0.0.1')
+        monkeypatch.setattr(core_xhm, '_connect_ssh', lambda *a, **kw: _Ssh())
+        monkeypatch.setattr(hyperv_xhm, '_Node', lambda ssh: node)
+        return node
+
+    def test_without_confirmation_nothing_is_touched(self, db, wired, ssh):
+        _, target, _ = wired
+        mid = self._failed_migration(db, target)
+
+        result = hyperv_xhm.cleanup_migration(mid, confirmed=False)
+
+        assert result['success'] is False
+        assert target.deleted == []
+        assert hyperv_db.get_migration(db.conn, mid)['created_resources']
+
+    def test_a_running_migration_is_not_cleaned_up_under_its_own_worker(self, db, wired, ssh):
+        _, target, _ = wired
+        mid = self._failed_migration(db, target, 'mig-running')
+        hyperv_db.update_migration(db.conn, mid, status=hyperv_db.STATUS_RUNNING)
+
+        result = hyperv_xhm.cleanup_migration(mid, confirmed=True)
+
+        assert result['success'] is False
+        assert 'still running' in result['error']
+        assert target.deleted == []
+
+    def test_a_second_import_on_the_same_source_blocks_the_cleanup(self, db, wired, ssh):
+        """Deleting target resources while another run writes to that source is how two
+        runs corrupt each other."""
+        _, target, _ = wired
+        mid = self._failed_migration(db, target)
+        hyperv_db.create_migration(db.conn, source_cluster=SOURCE, source_vm_guid=GUID,
+                                   migration_id='mig-other')
+        hyperv_db.claim_source(db.conn, SOURCE, GUID, 'mig-other')
+
+        result = hyperv_xhm.cleanup_migration(mid, confirmed=True)
+
+        assert result['success'] is False
+        assert 'mig-other' in result['error']
+        assert target.deleted == []
+
+    def test_a_confirmed_cleanup_removes_the_vm_and_frees_the_volume(self, db, wired, ssh):
+        _, target, _ = wired
+        mid = self._failed_migration(db, target)
+
+        result = hyperv_xhm.cleanup_migration(mid, confirmed=True)
+
+        assert result['success'] is True, result
+        assert any(url.endswith('/qemu/120') for url in target.deleted)
+        assert any(c.startswith('pvesm free') and 'vm-120-disk-0' in c
+                   for c in ssh.commands)
+        assert hyperv_db.get_migration(db.conn, mid)['created_resources'] == []
+
+    def test_a_vmid_that_now_belongs_to_somebody_else_is_left_alone(self, db, wired, ssh):
+        """A VMID is not ownership. Between a failed import and a cleanup the number can
+        have been handed to a guest that has nothing to do with this migration, and its
+        disks are that guest's disks."""
+        _, target, _ = wired
+        mid = self._failed_migration(db, target)
+        target.vm_configs = {'120': {'description': 'Production database. Do not delete.'}}
+
+        result = hyperv_xhm.cleanup_migration(mid, confirmed=True)
+
+        assert result['success'] is False
+        assert target.deleted == []
+        assert not [c for c in ssh.commands if c.startswith('pvesm free')]
+        assert hyperv_db.get_migration(db.conn, mid)['created_resources']
+
+    def test_a_target_vm_that_is_already_gone_counts_as_removed(self, db, wired, ssh):
+        _, target, _ = wired
+        mid = self._failed_migration(db, target)
+        target.vm_configs = {}
+
+        result = hyperv_xhm.cleanup_migration(mid, confirmed=True)
+
+        assert result['success'] is True, result
+        assert target.deleted == []
+
+    def test_the_source_is_never_part_of_a_cleanup(self, db, wired, ssh):
+        """The rollback for this direction is "start the original again", which only
+        works while the original is still there."""
+        source, target, _ = wired
+        mid = self._failed_migration(db, target)
+        source.calls = []
+        source.stop_vm = lambda *a, **kw: source.calls.append('stop')
+        source.delete_vm = lambda *a, **kw: source.calls.append('delete')
+
+        hyperv_xhm.cleanup_migration(mid, confirmed=True)
+
+        assert source.calls == []
+
+
+# ===========================================================================
+# Cutover: one machine, running once
+# ===========================================================================
+
+class TestNeitherSideIsStartedWhileTheOtherRuns:
+    """The copy carries the original's hostname and MAC, and nothing merges divergence.
+
+    So PegaProx refuses to start either one while it can see the other running — and
+    refuses just as firmly when it cannot see the other at all, because "I could not read
+    it" is not "it is off".
+    """
+
+    def _completed(self, db, migration_id='mig-cut'):
+        hyperv_db.create_migration(db.conn, source_cluster=SOURCE, source_vm_guid=GUID,
+                                   source_vm_name='guest-a', target_cluster=TARGET,
+                                   target_node='node-a', migration_id=migration_id)
+        hyperv_db.update_migration(db.conn, migration_id, target_vmid=120,
+                                   status=hyperv_db.STATUS_COMPLETED)
+        return migration_id
+
+    def _target_with(self, target, mid, status, description=None):
+        if description is None:
+            description = hyperv_xhm.target_vm_description(mid, 'guest-a')
+        target.vm_configs = {'120': {'description': description}}
+        target.vm_status = {'120': {'status': status}}
+
+    @pytest.fixture(autouse=True)
+    def _status_route(self, monkeypatch):
+        """Teach the fake target to answer /status/current, which only this pair reads."""
+        def _api_get(self, url):
+            if url.endswith('/status/current'):
+                vmid = url.rsplit('/qemu/', 1)[-1].split('/')[0]
+                payload = getattr(self, 'vm_status', {}).get(vmid)
+                if payload is None:
+                    return FakeResponse(status_code=404)
+                return FakeResponse(payload={'data': payload})
+            return FakeTarget._api_get_original(self, url)
+
+        if not hasattr(FakeTarget, '_api_get_original'):
+            FakeTarget._api_get_original = FakeTarget._api_get
+        monkeypatch.setattr(FakeTarget, '_api_get', _api_get)
+
+    def test_the_source_is_not_started_while_the_copy_runs(self, db, wired):
+        _, target, _ = wired
+        mid = self._completed(db)
+        self._target_with(target, mid, 'running')
+
+        refused = hyperv_xhm.refuse_source_start(SOURCE, VMID)
+        assert refused and '120' in refused
+
+    def test_the_source_starts_when_the_copy_is_stopped(self, db, wired):
+        _, target, _ = wired
+        mid = self._completed(db)
+        self._target_with(target, mid, 'stopped')
+
+        assert hyperv_xhm.refuse_source_start(SOURCE, VMID) is None
+
+    def test_an_unreadable_copy_blocks_the_source_start(self, db, wired, monkeypatch):
+        """The acceptance criterion names this case on its own: an unknown counter-state
+        blocks, because acting on a guess is how both end up running."""
+        _, target, _ = wired
+        mid = self._completed(db)
+        self._target_with(target, mid, 'running')
+        monkeypatch.setattr(FakeTarget, '_api_get',
+                            lambda self, url: (_ for _ in ()).throw(OSError('no route')))
+
+        refused = hyperv_xhm.refuse_source_start(SOURCE, VMID)
+        assert refused and 'cannot be read' in refused
+
+    def test_a_copy_that_no_longer_exists_does_not_block(self, db, wired):
+        _, target, _ = wired
+        self._completed(db)
+        target.vm_configs = {}
+        target.vm_status = {}
+
+        assert hyperv_xhm.refuse_source_start(SOURCE, VMID) is None
+
+    def test_the_copy_is_not_started_while_the_original_runs(self, db, wired):
+        source, target, _ = wired
+        mid = self._completed(db)
+        self._target_with(target, mid, 'stopped')
+        source.get_vm = lambda guid: {'state': 'Running'}
+
+        refused = hyperv_xhm.refuse_target_start(TARGET, 120)
+        assert refused and 'guest-a' in refused
+
+    def test_the_copy_starts_when_the_original_is_off(self, db, wired):
+        source, target, _ = wired
+        mid = self._completed(db)
+        self._target_with(target, mid, 'stopped')
+        source.get_vm = lambda guid: {'state': 'Off'}
+
+        assert hyperv_xhm.refuse_target_start(TARGET, 120) is None
+
+    def test_a_vmid_that_is_not_this_copy_is_never_blocked(self, db, wired):
+        """A VMID outlives the migration that used it. Blocking an unrelated guest's start
+        forever because of a number would be worse than the collision it guards against."""
+        source, target, _ = wired
+        mid = self._completed(db)
+        self._target_with(target, mid, 'stopped', description='Someone else\'s VM')
+        source.get_vm = lambda guid: {'state': 'Running'}
+
+        assert hyperv_xhm.refuse_target_start(TARGET, 120) is None
+
+    def test_an_unreadable_original_blocks_the_copy_start(self, db, wired):
+        from pegaprox.core.hyperv_errors import HyperVError, KIND_UNREACHABLE
+
+        source, target, _ = wired
+        mid = self._completed(db)
+        self._target_with(target, mid, 'stopped')
+
+        def _raise(guid):
+            raise HyperVError(KIND_UNREACHABLE, 'no connection')
+        source.get_vm = _raise
+
+        refused = hyperv_xhm.refuse_target_start(TARGET, 120)
+        assert refused and 'cannot be read' in refused
+
+
+class TestOptionsThisDirectionRefuses:
+    """Neither is offered in the wizard, so a request carrying one was written by hand."""
+
+    def test_remove_source_cannot_be_switched_on_by_a_direct_request(self, db, wired):
+        refused = hyperv_xhm.refuse_hyperv_start(SOURCE, VMID, {'remove_source': True})
+        assert refused and 'never deletes' in refused
+
+    def test_start_after_cannot_be_switched_on_by_a_direct_request(self, db, wired):
+        refused = hyperv_xhm.refuse_hyperv_start(SOURCE, VMID, {'start_after': True})
+        assert refused and 'not started automatically' in refused
+
+    def test_the_ordinary_request_is_not_refused(self, db, wired):
+        assert hyperv_xhm.refuse_hyperv_start(
+            SOURCE, VMID, {'start_after': False, 'remove_source': False}) is None
+
+    def test_the_runner_reads_neither_option(self, db, wired):
+        """Belt and braces: even if a request got past the route, nothing acts on them."""
+        import inspect
+        source = inspect.getsource(hyperv_xhm._run_hyperv_to_pve)
+        assert 'remove_source' not in source
+        assert 'start_after' not in source
+
+
+# ===========================================================================
+# What a large import costs
+# ===========================================================================
+
+class TestTheProgressReaderIsBounded:
+    """A transfer's size must change its duration and nothing else.
+
+    The data never passes through PegaProx — the target node converts the disk itself and
+    the only thing read here is a progress percentage. That claim is only true while this
+    reader keeps a bounded amount of what it reads, so it is asserted rather than assumed:
+    a reader that appended would hold the whole of a multi-hour conversion's output, and
+    the symptom would be a management server that grows with the disk it is copying.
+    """
+
+    class _Channel:
+        """A paramiko channel that produces a great deal of progress and then exits."""
+
+        def __init__(self, chunks):
+            self._remaining = chunks
+            self.closed = False
+
+        def exit_status_ready(self):
+            return self._remaining <= 0
+
+        def recv_ready(self):
+            return self._remaining > 0
+
+        def recv(self, size):
+            self._remaining -= 1
+            percent = 100.0 * (1 - self._remaining / 200_000)
+            return f'    ({percent:.2f}/100%)\r'.encode()
+
+        def recv_exit_status(self):
+            return 0
+
+        def close(self):
+            self.closed = True
+
+    class _Ssh:
+        def __init__(self, channel):
+            self._channel = channel
+
+        def exec_command(self, command, timeout=None):
+            class _Std:
+                def __init__(self, channel):
+                    self.channel = channel
+
+                def read(self):
+                    return b''
+            return None, _Std(self._channel), _Std(self._channel)
+
+    def test_two_hundred_thousand_progress_reads_keep_one_chunk(self):
+        channel = self._Channel(200_000)
+        node = hyperv_xhm._Node(self._Ssh(channel))
+        seen = []
+
+        exit_code, stdout, _ = node.run_with_progress(
+            'qemu-img convert ...', lambda percent: seen.append(percent), lambda: False)
+
+        assert exit_code == 0
+        assert len(seen) == 200_000, 'progress was dropped rather than reported'
+        # The whole output would be megabytes; what is kept is the last read.
+        assert len(stdout) < 4096, f'the reader accumulated {len(stdout)} characters'
+
+    def test_a_hundred_times_the_progress_costs_no_more_memory(self):
+        """The figure docs/hyperv-transfer.md publishes, asserted rather than observed once.
+
+        Character counts bound what the reader keeps; they say nothing about what it
+        allocates on the way. A reader that built a new list per read would satisfy the
+        test above and still grow with the length of a conversion, so the allocation
+        itself is measured — at two volumes, because the invariant is that the second
+        number is not larger than the first.
+        """
+        import tracemalloc
+
+        def peak_for(reads):
+            channel = self._Channel(reads)
+            node = hyperv_xhm._Node(self._Ssh(channel))
+            tracemalloc.start()
+            try:
+                node.run_with_progress(
+                    'qemu-img convert ...', lambda percent: None, lambda: False)
+                return tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+
+        small = peak_for(2_000)
+        large = peak_for(200_000)
+
+        assert large <= small * 2, (
+            f'the reader peaked at {large} bytes for a hundred times the progress of the '
+            f'{small} bytes it needed for the small run')
+
+    def test_a_cancelled_conversion_stops_reading_and_closes_the_channel(self):
+        channel = self._Channel(200_000)
+        node = hyperv_xhm._Node(self._Ssh(channel))
+
+        exit_code, _, error = node.run_with_progress(
+            'qemu-img convert ...', lambda percent: None, lambda: True)
+
+        assert exit_code == -1
+        assert error == 'cancelled'
+        assert channel.closed, 'a cancelled conversion left its channel open'
+
+
+def _kinds(commands):
+    """Label each command the runner issued, so a count failure says what changed.
+
+    Matching on a prefix is not enough: the share is mounted with a command that begins
+    `mkdir -p … && mount -t cifs …`, so a test that looked for one starting with "mount "
+    would count none and compare zero against zero.
+    """
+    labels = []
+    for command in commands:
+        if 'mount -t cifs' in command:
+            labels.append('mount')
+        elif command.startswith('umount '):
+            labels.append('umount')
+        elif 'qemu-img convert' in command:
+            labels.append('convert')
+        elif command.startswith('pvesm alloc'):
+            labels.append('allocate')
+        elif command.startswith('pvesm path'):
+            labels.append('resolve')
+        elif command.startswith('test -r'):
+            labels.append('probe')
+        elif command.startswith('rm -f'):
+            labels.append('remove-credentials')
+        else:
+            labels.append(f'other: {command[:40]}')
+    return labels
+
+
+class TestWhatOneImportCostsTheHosts:
+    """How much a transfer asks of either end, counted rather than estimated."""
+
+    def test_one_disk_costs_these_seven_calls_and_no_others(self, db, wired):
+        """The figures docs/hyperv-transfer.md publishes, locked where they can drift.
+
+        The test below proves the count does not grow with the disk; this one proves what
+        the count actually is. Without it the document could keep naming seven long after
+        the runner had started issuing nine, and nothing would fail.
+        """
+        source, target, node = wired
+        _run(FakeTask(id='mig-seven'))
+
+        assert _kinds(node.commands) == [
+            'mount', 'probe', 'allocate', 'resolve', 'convert',
+            'umount', 'remove-credentials']
+
+    def test_two_disks_on_one_drive_cost_eleven_calls_and_one_mount(self, db, wired):
+        source, target, node = wired
+        source._detail['disks'] = [
+            dict(source._detail['disks'][0]),
+            {**source._detail['disks'][0], 'path': 'C:\\vm\\b.vhdx'},
+        ]
+        _run(FakeTask(id='mig-eleven'))
+
+        kinds = _kinds(node.commands)
+        assert len(kinds) == 11, f'{len(kinds)} calls for two disks: {kinds}'
+        assert kinds.count('mount') == 1, 'a second disk on the same drive remounted'
+        assert kinds.count('convert') == 2
+
+    def test_the_number_of_remote_calls_does_not_depend_on_the_disk(self, db, wired):
+        """A constant per disk, not one per gigabyte.
+
+        The alternative shape — read a block, write a block, ask again — is what makes a
+        remote import take longer than the copy itself. Here the node is told once what to
+        convert and then only watched, so the call count is a property of the VM rather
+        than of its size.
+        """
+        source, target, node = wired
+        source._detail['disks'][0]['size'] = 42949672960          # 40 GiB
+        _run(FakeTask(id='mig-small'))
+        small = len(node.commands)
+
+        node.commands.clear()
+        source._detail['disks'][0]['size'] = 42949672960 * 100    # 4 TiB
+        _run(FakeTask(id='mig-large'))
+
+        assert len(node.commands) == small, (
+            f'{len(node.commands)} calls for a disk a hundred times the size, against '
+            f'{small} for the small one')
+
+    def test_a_second_disk_costs_a_second_conversion_and_nothing_else(self, db, wired):
+        """The share is mounted per share, not per disk: two disks on one drive is one
+        mount, and the difference between one disk and two is the conversion itself."""
+        source, target, node = wired
+        _run(FakeTask(id='mig-one'))
+        one = len(node.commands)
+        mounts_for_one = _kinds(node.commands).count('mount')
+
+        node.commands.clear()
+        source._detail['disks'] = [
+            dict(source._detail['disks'][0]),
+            {**source._detail['disks'][0], 'path': 'C:\\vm\\b.vhdx'},
+        ]
+        _run(FakeTask(id='mig-two'))
+
+        mounts_for_two = _kinds(node.commands).count('mount')
+        assert mounts_for_one == 1, 'the one-disk run did not mount the share at all'
+        assert mounts_for_two == mounts_for_one, 'a second disk on the same drive remounted'
+        assert len(node.commands) > one
+
+
+class TestTwoSourcesSideBySide:
+    """Several Hyper-V hosts, each connected on its own, must not share a numbering.
+
+    Two hosts whose VMs collided on a synthetic VMID would merge their access-control
+    entries — the quietest possible way to hand somebody another customer's VM.
+    """
+
+    def test_each_host_numbers_its_own_vms(self, db):
+        from pegaprox.core import hyperv_db as store
+
+        first = store.get_vmid(db.conn, 'hv_1', GUID, 'guest-a')
+        second = store.get_vmid(db.conn, 'hv_2', GUID, 'guest-a')
+
+        assert first == store.get_vmid(db.conn, 'hv_1', GUID, 'guest-a')
+        assert store.resolve_vmid(db.conn, 'hv_1', first) == GUID
+        assert store.resolve_vmid(db.conn, 'hv_2', first) in (None, GUID)
+        # The same GUID on two hosts is two VMs as far as this product is concerned, and
+        # each host's number means something only on that host.
+        assert store.resolve_vmid(db.conn, 'hv_2', second) == GUID
+
+    def test_a_migration_of_one_host_does_not_claim_the_other(self, db):
+        from pegaprox.core import hyperv_db as store
+
+        store.create_migration(db.conn, source_cluster='hv_1', source_vm_guid=GUID,
+                               migration_id='mig-host-one')
+        assert store.claim_source(db.conn, 'hv_1', GUID, 'mig-host-one') is None
+
+        store.create_migration(db.conn, source_cluster='hv_2', source_vm_guid=GUID,
+                               migration_id='mig-host-two')
+        assert store.claim_source(db.conn, 'hv_2', GUID, 'mig-host-two') is None

@@ -995,11 +995,23 @@ def main(debug_mode=False):
             manager.start()
             g.cluster_managers[cluster_id] = manager
             print(f"Started XCP-ng manager for pool: {cluster_data['name']}")
+        elif ctype == 'hyperv':
+            from pegaprox.core.hyperv_cluster import register_hyperv_source
+            register_hyperv_source(cluster_id, cluster_data, g.cluster_managers)
+            print(f"Registered Hyper-V source: {cluster_data['name']}")
         else:
             manager = PegaProxManager(cluster_id, config_obj)
             manager.start()
             g.cluster_managers[cluster_id] = manager
             print(f"Started PegaProx manager for cluster: {cluster_data['name']}")
+
+    # Hyper-V patch — a migration row still saying 'running' after a restart describes a
+    # process that no longer exists. Reconcile before anything can read that state.
+    try:
+        from pegaprox.core.hyperv_cluster import sweep_interrupted_migrations
+        sweep_interrupted_migrations()
+    except Exception as e:
+        logging.warning(f"Hyper-V interrupted-migration sweep failed: {e}")
 
     # Start background threads
     start_broadcast_thread()
@@ -1282,6 +1294,17 @@ def _start_console_servers(bind_host, port, ssl_context):
         except Exception as e:
             print(f"ERROR: {name} WebSocket server (port {ws_port}) failed to start: {e}")
             logging.error(f"{name} WebSocket server startup failed: {e}", exc_info=True)
+
+    # Hyper-V patch — the VMConnect console relay, on a port of its own so that its
+    # absence costs that console and nothing else.
+    try:
+        from pegaprox.core.hyperv_console_ws import start_hyperv_console_server
+        if start_hyperv_console_server(port + 3, ssl_cert=(ssl_context or (None, None))[0],
+                                       ssl_key=(ssl_context or (None, None))[1],
+                                       host=console_host):
+            print(f"  ✓ Hyper-V console relay (port {port + 3})")
+    except Exception as e:
+        logging.warning(f"Hyper-V console relay did not start: {e}")
 
     return ssh_proc
 
