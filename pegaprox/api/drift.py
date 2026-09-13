@@ -363,6 +363,18 @@ def _scan_cluster(cluster_id, autobaseline=False):
             for h in alerts_mod._notification_handlers:
                 try: h(payload)
                 except Exception: pass
+            # MK Sep 2026 (#815) — that list is the PLUGIN hook (web-push and whatever
+            # else registered itself); it is not the webhook channels. alerts.py fires
+            # both, this path only ever fired the first, so a drift event reached push
+            # and nothing else no matter how many webhooks were configured — and the
+            # Test button still worked, because it dispatches directly.
+            # Drift has no per-event channel picker the way a metric alert does, so
+            # every enabled channel gets it, which is send_to_channels' own default.
+            try:
+                from pegaprox.utils.webhooks import send_to_channels
+                send_to_channels(payload)
+            except Exception as _we:
+                logging.warning(f"[DRIFT] webhook dispatch failed: {_we}")
         except Exception:
             pass
 
