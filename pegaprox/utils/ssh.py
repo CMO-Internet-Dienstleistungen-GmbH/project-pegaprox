@@ -394,14 +394,51 @@ def _pve_node_exec(pve_mgr, node, cmd, timeout=600, use_controlmaster=True,
     # Cache the resolved IP
     _node_ip_cache[cache_key] = (node_host, time.time())
 
+    # MK Sep 2026 — two things were wrong with the identity used here, and both end the
+    # same way: a failed root login on somebody's hypervisor, repeated on every call.
+    #
+    # 1. The user was hardcoded to 'root'. core/xhm.py has always done
+    #    `getattr(config, 'ssh_user', '') or 'root'`; this path never got the memo, so a
+    #    cluster registered as e.g. backupadmin@pam with a dedicated SSH user was still
+    #    offered root + the WEB password, which cannot work.
+    # 2. Nothing asked whether we hold an SSH credential at all. ssh_diagnose already
+    #    knows — including that config.pass_ holds the TOKEN SECRET under API-token auth
+    #    (#717) — but only the compliance routes consulted it.
+    #
+    # The screendump behind the console tiles runs through here on every poll, so on a
+    # cluster whose port 22 is reachable this produced a steady trickle of failed root
+    # auth attempts. Observed live: two per screenshot, against a node whose own SSH
+    # banner says all activity is logged and unauthorised access will be prosecuted.
+    # Anything watching auth.log reads that as an attack on its own infrastructure, and
+    # a fail2ban ban is IP-wide — it takes :8006 with it, so the API, the console and the
+    # SSE stream go down together for the duration.
     try:
-        rc, out, err = _ssh_exec(node_host, 'root', pve_mgr.config.pass_, cmd,
+        _diag = None
+        try:
+            _diag = pve_mgr.ssh_diagnose(node)
+        except Exception:
+            pass   # older managers without the classifier — behave as before
+        if _diag and _diag[0] == 'SSH_NO_CREDENTIALS':
+            return 1, '', _diag[1]
+
+        _ssh_user = getattr(pve_mgr.config, 'ssh_user', '') or 'root'
+        rc, out, err = _ssh_exec(node_host, _ssh_user, pve_mgr.config.pass_, cmd,
                                   timeout=timeout, use_controlmaster=use_controlmaster)
         # SSH error patterns that indicate the node itself is dead, not the cmd
         looks_like_node_down = (
             rc != 0 and any(s in str(err).lower() for s in (
                 'tcp connect', 'connection refused', 'connection timed out',
                 'no route to host', 'host is down', 'auth failed',
+                # MK Sep 2026 — 'auth failed' never matched anything paramiko says. Its
+                # message is "Authentication (keyboard-interactive) failed." and the
+                # substring 'auth failed' does not occur in it, so the breaker sat idle
+                # through exactly the failures it was added to throttle and we kept
+                # re-offering credentials to sshd on every poll.
+                'authentication failed', 'authentication (',
+                # OpenSSH's own rejection from the subprocess leg. Deliberately the
+                # long form: a bare 'permission denied' is also what a COMMAND says
+                # when it fails on the node, and that must not mark the node dead.
+                'permission denied (publickey',
                 'paramiko exec failed', 'all ssh methods failed',
             ))
         )
