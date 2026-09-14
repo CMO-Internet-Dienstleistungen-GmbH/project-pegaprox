@@ -3913,6 +3913,12 @@ def get_spice_console(cluster_id, node, vm_type, vmid):
 _vm_screenshot_cache = {}          # {f"{cid}:{vmid}": (mono_ts, png_bytes)}
 _vm_screenshot_lock = threading.Lock()
 _VM_SCREENSHOT_TTL = 60.0
+# MK Sep 2026 — a screenshot that fails used to cache nothing, so every tile poll
+# redid the whole SSH-screendump-then-RFB dance. Each attempt holds one slot of the
+# bounded request pool for as long as it takes to time out, and a wall of tiles for
+# guests that can't be grabbed will sit on all of them — which is what starves the
+# console and the SSE stream. Remember the failure too, just for less long.
+_VM_SCREENSHOT_FAIL_TTL = 120.0
 
 
 # NS Jun 2026 — RFB fallback for the console tile. screendump (qm monitor) is the
@@ -3935,22 +3941,41 @@ def _screenshot_via_rfb(mgr, node, vm_type, vmid, max_width=480, timeout=10):
         ssl_ctx.check_hostname = False
         ssl_ctx.verify_mode = _ssl.CERT_NONE
 
-    # login → vncproxy ticket/port (same flow as vnc_poll)
-    login_data = urllib.parse.urlencode({'username': mgr.config.user, 'password': mgr.config.pass_}).encode('utf-8')
-    login_req = urllib.request.Request(f"https://{mgr.auth_host}:{port}/api2/json/access/ticket", data=login_data, method='POST')
-    with urllib.request.urlopen(login_req, context=ssl_ctx, timeout=10) as r:
-        login_result = _json.loads(r.read().decode('utf-8'))
-    pve_ticket = login_result['data']['ticket']
-    csrf_token = login_result['data']['CSRFPreventionToken']
+    # NS Sep 2026 — this used to mint its own ticket with a raw urllib call against
+    # mgr.auth_host. Two things wrong with that. auth_host is the REGISTERED node, which
+    # stops answering the moment a cluster fails over — every other call follows
+    # current_host and keeps working, so screenshots broke on their own and stayed broken.
+    # And a bare urlopen sidesteps the pooled session, so each tile refresh opened fresh
+    # TLS connections to :8006 outside urllib3's pool — the connection churn that took
+    # consoles down in #713.
+    #
+    # mint_console_auth_ticket walks reachable candidates now, and the vncproxy POST goes
+    # through the manager's pooled, already-authenticated session.
+    pve_ticket, csrf_token = mgr.mint_console_auth_ticket(with_csrf=True)
+    if not pve_ticket:
+        # no password on the cluster (API-token-only), or every node refused. Either way
+        # the websocket leg below needs a PVEAuthCookie, so stop here with something the
+        # caller can log instead of burning the timeout on a handshake that cannot work.
+        raise IOError("no PVE session ticket available for this cluster (API-token-only?)")
 
+    # The vncproxy POST must go out as the SAME identity that will open the websocket —
+    # PVE ties the PVEVNC ticket to the requester. On a cluster configured with an API
+    # token the pooled session sends Authorization, PVE honours the token, and the
+    # cookie-authenticated websocket is then a different user: "invalid PVEVNC ticket".
+    # Setting Authorization to None drops it for this one request while keeping the
+    # pooled connection, so we stay inside urllib3's pool.
     vnc_url = f"https://{host}:{port}/api2/json/nodes/{node}/{vm_type}/{vmid}/vncproxy"
-    vnc_req = urllib.request.Request(vnc_url, data=urllib.parse.urlencode({'websocket': '1'}).encode('utf-8'), method='POST')
-    vnc_req.add_header('Cookie', f'PVEAuthCookie={pve_ticket}')
-    vnc_req.add_header('CSRFPreventionToken', csrf_token)
-    with urllib.request.urlopen(vnc_req, context=ssl_ctx, timeout=10) as r:
-        vnc_result = _json.loads(r.read().decode('utf-8'))
-    vnc_ticket = vnc_result['data']['ticket']
-    vnc_port = vnc_result['data']['port']
+    vnc_resp = mgr._create_session().post(
+        vnc_url, data={'websocket': '1'}, timeout=10,
+        headers={'Authorization': None,
+                 'Cookie': f'PVEAuthCookie={pve_ticket}',
+                 'CSRFPreventionToken': csrf_token or ''},
+    )
+    if vnc_resp.status_code != 200:
+        raise IOError(f"vncproxy refused: HTTP {vnc_resp.status_code}")
+    vnc_data = vnc_resp.json().get('data') or {}
+    vnc_ticket = vnc_data['ticket']
+    vnc_port = vnc_data['port']
 
     # optional SSH tunnel for clusters where 8006 isn't directly reachable from us
     tunnel_endpoint = None
@@ -4025,7 +4050,10 @@ def get_vm_screenshot(cluster_id, node, vm_type, vmid):
     if request.args.get('fresh') != '1':
         with _vm_screenshot_lock:
             hit = _vm_screenshot_cache.get(cache_key)
-        if hit and (now - hit[0]) < _VM_SCREENSHOT_TTL:
+        # a remembered failure short-circuits before we touch the cluster at all
+        if hit and hit[1] is None and (now - hit[0]) < _VM_SCREENSHOT_FAIL_TTL:
+            return jsonify({'error': 'screenshot unavailable', 'cached': True}), 502
+        if hit and hit[1] is not None and (now - hit[0]) < _VM_SCREENSHOT_TTL:
             resp = current_app.response_class(hit[1], mimetype='image/png')
             resp.headers['Cache-Control'] = 'private, max-age=60'
             resp.headers['X-Screenshot-Cache'] = 'hit'
@@ -4045,6 +4073,8 @@ def get_vm_screenshot(cluster_id, node, vm_type, vmid):
             png = _screenshot_via_rfb(mgr, node, vm_type, vmid, max_width=480, timeout=10)
         except Exception as e2:
             logging.info(f"[Screenshot] RFB fallback also failed {vm_type}/{vmid}@{node}: {e2}")
+            with _vm_screenshot_lock:
+                _vm_screenshot_cache[cache_key] = (time.monotonic(), None)
             return jsonify({'error': f'screenshot unavailable: {e2}'}), 502
 
     with _vm_screenshot_lock:
