@@ -8,6 +8,7 @@ showed up in push and nowhere else, while the Test button on a channel kept work
 because it dispatches straight to send_to_channel. MK
 """
 import ast
+import io
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -19,6 +20,13 @@ def test_the_dispatcher_is_reachable_from_drift():
     assert callable(webhooks.send_to_channels)
 
 
+def _read(path):
+    """Read a source file and actually close the handle — a bare open() in a test
+    still leaks a descriptor and trips ResourceWarning under -W error."""
+    with io.open(path, encoding='utf-8') as fh:
+        return fh.read()
+
+
 def _calls_send_to_channels(path):
     """True iff the module really CALLS send_to_channels.
 
@@ -26,7 +34,7 @@ def _calls_send_to_channels(path):
     docstring, which is exactly the kind of test that passes while the product is
     broken. Walk the AST and look for the call instead.
     """
-    tree = ast.parse(open(path, encoding='utf-8').read())
+    tree = ast.parse(_read(path))
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             fn = node.func
@@ -56,7 +64,7 @@ def test_the_ast_check_is_not_fooled_by_a_mere_mention(tmp_path):
 def test_dispatch_sits_after_the_handler_loop_in_drift():
     """Order matters only for readability, but a dispatch OUTSIDE the new_events guard
     would fire a webhook on every scan with nothing to report."""
-    src = open('pegaprox/api/drift.py', encoding='utf-8').read()
+    src = _read('pegaprox/api/drift.py')
     guard = src.index('if new_events:')
     dispatch = src.index('send_to_channels')
     ret = src.index("return {\n        'ok': True")
@@ -66,7 +74,7 @@ def test_dispatch_sits_after_the_handler_loop_in_drift():
 def test_no_channel_filter_is_passed():
     """Drift has no per-event channel picker, so every enabled channel must get it.
     Passing an empty list here would silently deliver nothing — the exact bug again."""
-    src = open('pegaprox/api/drift.py', encoding='utf-8').read()
+    src = _read('pegaprox/api/drift.py')
     i = src.index('send_to_channels(')
     call = src[i:i + 60]
     assert 'channel_ids' not in call, f"unexpected channel filter on the drift dispatch: {call!r}"
@@ -82,7 +90,7 @@ def test_send_to_channels_defaults_to_every_enabled_channel():
 
 def test_a_failing_webhook_cannot_break_the_drift_scan():
     """The scan's job is recording drift; notification is best-effort on top of it."""
-    src = open('pegaprox/api/drift.py', encoding='utf-8').read()
+    src = _read('pegaprox/api/drift.py')
     i = src.index('send_to_channels(')
     window = src[max(0, i - 200):i + 200]
     assert 'try:' in window and 'except Exception' in window
