@@ -7,7 +7,7 @@ scanner and the cross-cluster SDN scanner only ever did the first. So a drift ev
 showed up in push and nowhere else, while the Test button on a channel kept working
 because it dispatches straight to send_to_channel. MK
 """
-import importlib
+import ast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -19,14 +19,38 @@ def test_the_dispatcher_is_reachable_from_drift():
     assert callable(webhooks.send_to_channels)
 
 
+def _calls_send_to_channels(path):
+    """True iff the module really CALLS send_to_channels.
+
+    A substring search would be happy with the name appearing in a comment or a
+    docstring, which is exactly the kind of test that passes while the product is
+    broken. Walk the AST and look for the call instead.
+    """
+    tree = ast.parse(open(path, encoding='utf-8').read())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            fn = node.func
+            name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, 'id', None)
+            if name == 'send_to_channels':
+                return True
+    return False
+
+
 def test_drift_calls_the_webhook_dispatcher():
-    src = open('pegaprox/api/drift.py', encoding='utf-8').read()
-    assert 'send_to_channels' in src, "drift never dispatches to webhook channels"
+    assert _calls_send_to_channels('pegaprox/api/drift.py'), \
+        "drift never dispatches to webhook channels"
 
 
 def test_multi_sdn_calls_the_webhook_dispatcher():
-    src = open('pegaprox/api/multi_sdn.py', encoding='utf-8').read()
-    assert 'send_to_channels' in src, "SDN drift never dispatches to webhook channels"
+    assert _calls_send_to_channels('pegaprox/api/multi_sdn.py'), \
+        "SDN drift never dispatches to webhook channels"
+
+
+def test_the_ast_check_is_not_fooled_by_a_mere_mention(tmp_path):
+    """Proves the guard above is worth anything — a comment must not satisfy it."""
+    decoy = tmp_path / 'decoy.py'
+    decoy.write_text("# TODO: call send_to_channels here one day\nx = 'send_to_channels'\n")
+    assert not _calls_send_to_channels(str(decoy))
 
 
 def test_dispatch_sits_after_the_handler_loop_in_drift():
