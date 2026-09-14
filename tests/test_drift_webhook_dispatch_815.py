@@ -61,14 +61,26 @@ def test_the_ast_check_is_not_fooled_by_a_mere_mention(tmp_path):
     assert not _calls_send_to_channels(str(decoy))
 
 
-def test_dispatch_sits_after_the_handler_loop_in_drift():
-    """Order matters only for readability, but a dispatch OUTSIDE the new_events guard
-    would fire a webhook on every scan with nothing to report."""
-    src = _read('pegaprox/api/drift.py')
-    guard = src.index('if new_events:')
-    dispatch = src.index('send_to_channels')
-    ret = src.index("return {\n        'ok': True")
-    assert guard < dispatch < ret, "webhook dispatch escaped the new_events guard"
+def test_dispatch_is_nested_inside_the_new_events_guard():
+    """A dispatch outside `if new_events:` would fire a webhook on every scan with
+    nothing to report — noisy enough that people would turn the channel off again.
+
+    The first version of this compared string offsets, which quietly measured the
+    position of the `import send_to_channels` line rather than the call, because the
+    import comes first in the file. Ask the tree instead.
+    """
+    tree = ast.parse(_read('pegaprox/api/drift.py'))
+    guards = [n for n in ast.walk(tree)
+              if isinstance(n, ast.If)
+              and any(isinstance(x, ast.Name) and x.id == 'new_events'
+                      for x in ast.walk(n.test))]
+    assert guards, "the `if new_events:` guard is gone"
+    inside = any(
+        isinstance(c, ast.Call)
+        and (c.func.attr if isinstance(c.func, ast.Attribute) else getattr(c.func, 'id', None))
+            == 'send_to_channels'
+        for g in guards for c in ast.walk(g))
+    assert inside, "webhook dispatch escaped the new_events guard"
 
 
 def test_no_channel_filter_is_passed():
