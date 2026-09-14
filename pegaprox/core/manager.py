@@ -11272,7 +11272,7 @@ echo "AGENT_INSTALLED_OK"
         except Exception as e:
             return {'success': False, 'error': str(e)}
 
-    def mint_console_auth_ticket(self):
+    def mint_console_auth_ticket(self, with_csrf: bool = False):
         """Mint a FRESH PVE session ticket (PVEAuthCookie) for the console WS proxy.
 
         NS 2026-06-05 (security audit C-1): the cluster-wide PVE ticket must NOT
@@ -11287,29 +11287,73 @@ echo "AGENT_INSTALLED_OK"
         pwd = getattr(self.config, 'pass_', None) or getattr(self.config, 'password', None)
         usr = getattr(self.config, 'user', None) or 'root@pam'
         if not pwd:
-            return None
-        try:
-            import ssl as _ssl
-            import urllib.request as _ur
-            from urllib.parse import urlencode as _ue
-            ctx = _ssl.create_default_context()
-            # NS Jul 2026 (CodeAnt) — gate TLS verify on the per-cluster ssl_verify flag,
-            # matching the VNC/termproxy paths (default off: PVE self-signed).
-            if not getattr(self, '_ssl_verify', False):
-                ctx.check_hostname = False
-                ctx.verify_mode = _ssl.CERT_NONE
-            req = _ur.Request(
-                f"https://{self.auth_host}:{self.api_port}/api2/json/access/ticket",
-                data=_ue({'username': usr, 'password': pwd}).encode('utf-8'),
-                method='POST',
-            )
-            with _ur.urlopen(req, context=ctx, timeout=10) as resp:
-                import json as _json
-                res = _json.loads(resp.read().decode('utf-8'))
-            return res['data']['ticket']
-        except Exception as e:
-            self.logger.warning(f"[CONSOLE] auth-ticket mint failed: {type(e).__name__}")
-            return None
+            return (None, None) if with_csrf else None
+
+        # MK Sep 2026 — this used to hit auth_host and nothing else. auth_host is pinned to
+        # the REGISTERED node on purpose (#740.2: @pam is node-local, so minting against an
+        # arbitrary node answers 401), but "registered" and "alive" are different things. Once
+        # a cluster fails over, `host` follows current_host and every other call keeps working
+        # while this one sits on a dead box until the timeout — so console and the RFB
+        # screenshot fallback break, silently, and stay broken.
+        #
+        # Walk the same candidates connect() does. A REFUSED CONNECTION means "not this node,
+        # try the next"; a 401 means the account genuinely isn't valid and we stop, which keeps
+        # #740.2's behaviour instead of spraying failed logins across the cluster.
+        candidates = []
+        for h in (self.auth_host, self.current_host, self.config.host):
+            if h and h not in candidates:
+                candidates.append(h)
+        for h in (getattr(self.config, 'fallback_hosts', None) or []):
+            if h and h not in candidates:
+                candidates.append(h)
+
+        import ssl as _ssl
+        import urllib.request as _ur
+        import urllib.error as _uerr
+        from urllib.parse import urlencode as _ue
+        import json as _json
+
+        ctx = _ssl.create_default_context()
+        # NS Jul 2026 (CodeAnt) — gate TLS verify on the per-cluster ssl_verify flag,
+        # matching the VNC/termproxy paths (default off: PVE self-signed).
+        if not getattr(self, '_ssl_verify', False):
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
+
+        last = None
+        for idx, host in enumerate(candidates):
+            try:
+                req = _ur.Request(
+                    f"https://{self._bracket_ipv6(host)}:{self.api_port}/api2/json/access/ticket",
+                    data=_ue({'username': usr, 'password': pwd}).encode('utf-8'),
+                    method='POST',
+                )
+                # short per-host budget: a dead node should cost seconds, not the whole
+                # request. Four candidates at 10s each is how a tile poll reached 50s.
+                with _ur.urlopen(req, context=ctx, timeout=6) as resp:
+                    res = _json.loads(resp.read().decode('utf-8'))
+                ticket = res['data']['ticket']
+                if idx:
+                    self.logger.info(f"[CONSOLE] auth-ticket minted on fallback {host} "
+                                     f"(registered host {self.auth_host} did not answer)")
+                if with_csrf:
+                    # PVE binds a vncproxy ticket to whoever asked for it, so the caller that
+                    # POSTs vncproxy has to present THIS cookie — and a cookie-auth POST needs
+                    # the matching CSRF token. Handing back only the ticket is how the
+                    # websocket leg ended up authenticating as somebody else.
+                    return ticket, res['data'].get('CSRFPreventionToken')
+                return ticket
+            except _uerr.HTTPError as he:
+                # the node answered and said no — credentials, not reachability
+                self.logger.warning(f"[CONSOLE] auth-ticket rejected by {host}: HTTP {he.code}")
+                return (None, None) if with_csrf else None
+            except Exception as e:
+                last = e
+                continue
+
+        self.logger.warning(f"[CONSOLE] auth-ticket mint failed on all "
+                            f"{len(candidates)} host(s): {type(last).__name__ if last else 'no candidates'}")
+        return (None, None) if with_csrf else None
 
     def create_privileged_session(self):
         """Return a requests.Session authenticated with a FRESH password-based
