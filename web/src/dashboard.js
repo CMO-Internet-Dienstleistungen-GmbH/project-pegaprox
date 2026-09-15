@@ -8250,6 +8250,10 @@
             const xhmSourceClusterRef = useRef(null);
             const [showHypervEdit, setShowHypervEdit] = useState(false);
             const [hypervForm, setHypervForm] = useState({ ...HYPERV_DEFAULT_CONFIG });
+            // The VM whose orderly shutdown has been offered, and whether it is running.
+            const [hypervShutdownVm, setHypervShutdownVm] = useState(null);
+            const [hypervShuttingDown, setHypervShuttingDown] = useState(false);
+            const [hypervCheckBusy, setHypervCheckBusy] = useState(false);
             const [hypervSaving, setHypervSaving] = useState(false);
 
             // Two views of the one list the server sends. Splitting it here rather than at
@@ -12027,6 +12031,72 @@
                 }
             };
 
+            /**
+             * Shut a source VM down, then open the wizard for it.
+             *
+             * Orderly only — the Hyper-V route offers no power cut, because a guest whose
+             * disks were cut off mid-write is the one state a migration must not start
+             * from. A guest that refuses is reported as refusing, not overruled.
+             */
+            const shutDownAndMigrate = async (hostId, vm) => {
+                setHypervShuttingDown(true);
+                try {
+                    const resp = await authFetch(`${API_URL}/hyperv/${hostId}/vms/${vm.vmid}/shutdown`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ timeout_seconds: 300 }),
+                    });
+                    if (!resp || !resp.ok) {
+                        const err = resp ? await resp.json().catch(() => ({})) : {};
+                        addToast(err.error || (t('hvShutdownFailed') || 'The guest did not shut down'), 'error');
+                        return;
+                    }
+                    addToast(t('hvShutdownDone') || 'The VM is shut down', 'success');
+                    setHypervShutdownVm(null);
+                    // The list is now wrong about this VM, and the shutdown route already
+                    // asked for a fresh read; open the wizard with what the guest is now.
+                    openXhmForSource(hostId, { ...vm, status: 'stopped', hyperv_state: 'Off' });
+                } catch (e) {
+                    addToast((t('hvShutdownFailed') || 'The guest did not shut down') + ': ' + e.message, 'error');
+                } finally {
+                    setHypervShuttingDown(false);
+                }
+            };
+
+            /**
+             * Ask a target node whether it can read this host's disk share, once.
+             *
+             * The answer is the same for every guest on the host, so measuring it here is
+             * what takes the unanswerable per-VM warning out of the migration wizard.
+             */
+            const runHypervTransferCheck = async (hostId, targetCluster, targetNode) => {
+                setHypervCheckBusy(true);
+                try {
+                    const resp = await authFetch(`${API_URL}/hyperv/${hostId}/transfer-check`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ target_cluster: targetCluster, target_node: targetNode }),
+                    });
+                    const body = resp ? await resp.json().catch(() => ({})) : {};
+                    if (resp && resp.ok) {
+                        addToast(body.ok
+                            ? (t('hvTransferCheckPassed') || 'The node can read this host')
+                            : (body.error || t('hvTransferCheckFailed') || 'not reachable'),
+                            body.ok ? 'success' : 'error');
+                        // The result lives on the host, so the host view is what has to be
+                        // re-read — and the migration wizard picks it up from there.
+                        fetchHypervHosts();
+                        fetchHypervHostFacts(hostId);
+                    } else {
+                        addToast(body.error || (t('hvTransferCheckFailed') || 'not reachable'), 'error');
+                    }
+                } catch (e) {
+                    addToast((t('hvTransferCheckFailed') || 'not reachable') + ': ' + e.message, 'error');
+                } finally {
+                    setHypervCheckBusy(false);
+                }
+            };
+
             /** Host facts and the property report, which names what this host does not expose. */
             const fetchHypervHostFacts = async (hostId) => {
                 try {
@@ -12575,6 +12645,27 @@
                 } catch(e) { addToast('Error', e.message, 'error'); }
                 finally { setXhmLoading(false); }
             };
+            // Fork patch #15 — a source VM that is no longer selectable takes its plan with it.
+            //
+            // The picker lists only stopped VMs, but the selection and the plan live in
+            // state and survived the VM falling out of that list. What was on screen then
+            // was a plan for a VM the wizard itself says cannot be migrated, with a Start
+            // button under it — the API refuses it, but only after somebody has walked
+            // through the whole wizard believing otherwise.
+            useEffect(() => {
+                if (!xhmForm.source_vmid || xhmSourceVms.length === 0) return;
+                const chosen = xhmSourceVms.find(v => String(v.vmid) === String(xhmForm.source_vmid));
+                const selectable = chosen && (chosen.status === 'stopped' || chosen.power_state === 'Halted');
+                if (selectable) return;
+                setXhmForm(prev => ({ ...prev, source_vmid: '', acknowledged: [] }));
+                setXhmPlan(null);
+                setHvPreflight(null);
+                addToast(chosen
+                    ? (t('xhmSourceNoLongerStopped') || 'That VM is running again — a migration needs it shut down, so the plan was discarded.')
+                    : (t('xhmSourceGone') || 'That VM is no longer on the source host, so the plan was discarded.'),
+                    'warning');
+            }, [xhmSourceVms, xhmForm.source_vmid]);
+
             // Fork patch #15 — a Hyper-V source answers `/clusters/<id>/resources` from its
             // cached inventory and never reads the host for it, because that route is asked
             // of every manager once a second by the SSE broadcast loop. So the picker asks
@@ -22703,6 +22794,21 @@
                                                 </div>
                                             )}
 
+                                            <HyperVTransferCheck
+                                                check={(hypervHostDetails[selectedHyperV.id] || {}).transfer_check}
+                                                targets={pveClusters.filter(c => c.connected).map(c => ({
+                                                    id: c.id,
+                                                    name: c.name,
+                                                    display_name: c.display_name,
+                                                    nodes: Object.keys(
+                                                        (c.id === selectedCluster?.id ? clusterMetrics
+                                                            : sidebarClusterData[c.id]?.metrics) || {})
+                                                        .filter(n => n !== 'error' && n !== 'offline'),
+                                                }))}
+                                                busy={hypervCheckBusy}
+                                                onRun={(cid, node) => runHypervTransferCheck(selectedHyperV.id, cid, node)}
+                                                t={t} />
+
                                             <HyperVFreshness state={hypervFreshness} t={t} />
 
                                             <div className="rounded-xl bg-proxmox-card border border-proxmox-border overflow-hidden">
@@ -22734,11 +22840,20 @@
                                                                     <td className="px-4 py-2 text-gray-300">{vm.maxcpu || '-'}</td>
                                                                     <td className="px-4 py-2 text-gray-300">{vm.maxmem ? `${Math.round(vm.maxmem / 1048576)} MB` : '-'}</td>
                                                                     <td className="px-4 py-2 text-right">
+                                                                        {/* A running VM cannot be migrated: copying the disks of a
+                                                                            running guest produces an image that is crash-consistent at
+                                                                            best. The wizard refuses it and so does the API, but by then
+                                                                            an operator has already walked through four pickers. Offering
+                                                                            the shutdown here is the shorter honest path. */}
                                                                         <button
-                                                                            onClick={() => openXhmForSource(selectedHyperV.id, vm)}
+                                                                            onClick={() => (vm.status === 'running'
+                                                                                ? setHypervShutdownVm(vm)
+                                                                                : openXhmForSource(selectedHyperV.id, vm))}
                                                                             className="px-3 py-1.5 rounded-lg bg-indigo-500/10 border border-indigo-500/30 text-indigo-300 hover:text-white hover:border-indigo-400 transition-colors text-xs"
                                                                         >
-                                                                            {t('hvMigrateToProxmox') || 'Migrate to Proxmox'}
+                                                                            {vm.status === 'running'
+                                                                                ? (t('hvShutDownAndMigrate') || 'Shut down and migrate')
+                                                                                : (t('hvMigrateToProxmox') || 'Migrate to Proxmox')}
                                                                         </button>
                                                                     </td>
                                                                 </tr>
@@ -23063,7 +23178,23 @@
                                                                 <div className="text-xs font-semibold text-gray-400 mb-2">{t('xhmNetworkMapping') || 'Network Mapping'}</div>
                                                                 {xhmPlan.source.networks.map((net, i) => (
                                                                     <div key={i} className="flex items-center gap-2 mb-1">
-                                                                        <span className="text-xs text-gray-400 w-28 truncate">{net.bridge || net.network || `net${i}`}</span>
+                                                                        {/* Fork patch #15 — two adapters on the same Hyper-V switch
+                                                                            produced two rows reading "Produktion-Vswitch", and nothing
+                                                                            said which was which. The map is keyed by MAC and was always
+                                                                            right; only the label was unreadable. A quarter of the VMs on
+                                                                            this estate have more than one adapter. */}
+                                                                        <span className="text-xs w-44 shrink-0 leading-tight">
+                                                                            <span className="text-gray-400 block truncate"
+                                                                                  title={net.switch_name || net.bridge || ''}>
+                                                                                {net.bridge || net.network || `net${i}`}
+                                                                            </span>
+                                                                            {(net.mac_address || net.name) && (
+                                                                                <span className="text-[10px] text-gray-600 block truncate font-mono"
+                                                                                      title={[net.name, net.mac_address].filter(Boolean).join(' · ')}>
+                                                                                    {hvAdapterLabel(net, i)}
+                                                                                </span>
+                                                                            )}
+                                                                        </span>
                                                                         <span className="text-gray-600">→</span>
                                                                         {hvTargetsProxmox(xhmPlan.direction) ? (
                                                                             <select value={xhmForm.network_map[net.network || net.bridge || String(i)] || ''} onChange={e => setXhmForm({...xhmForm, network_map: {...xhmForm.network_map, [net.network || net.bridge || String(i)]: e.target.value}})} className="flex-1 px-2 py-1 bg-proxmox-dark border border-proxmox-border rounded text-white text-xs">
@@ -23770,6 +23901,46 @@
                         rather than the cluster reconfigure flow: that one exports the
                         Proxmox field set, which carries none of the WinRM settings, so
                         every transport choice silently reverted to its default. */}
+                    {/* Fork patch #15 — a running source VM cannot be migrated, and the
+                        shutdown that makes it migratable happens on a customer's machine.
+                        That is a confirmed action, not a side effect of pressing Migrate. */}
+                    {hypervShutdownVm && selectedHyperV && (
+                        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4"
+                             onClick={() => !hypervShuttingDown && setHypervShutdownVm(null)}>
+                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl max-w-lg w-full p-5"
+                                 onClick={e => e.stopPropagation()}>
+                                <h3 className="text-white font-semibold mb-2">
+                                    {t('hvShutDownAndMigrate') || 'Shut down and migrate'}
+                                </h3>
+                                <p className="text-sm text-gray-400 mb-3">
+                                    {(t('hvShutdownExplain')
+                                      || 'This VM is running. Copying the disks of a running guest produces an image that is crash-consistent at best, so the migration needs it shut down first.')}
+                                </p>
+                                <div className="p-3 rounded-lg bg-proxmox-dark border border-proxmox-border text-sm mb-3">
+                                    <span className="text-white">{hypervShutdownVm.name}</span>
+                                    <span className="text-gray-500"> · {selectedHyperV.name || selectedHyperV.host}</span>
+                                </div>
+                                <p className="text-xs text-gray-500 mb-4">
+                                    {(t('hvShutdownOrderly')
+                                      || 'The guest is asked to shut itself down and is given five minutes. It is never cut off: a guest that refuses stays running and is reported as refusing.')}
+                                </p>
+                                <div className="flex justify-end gap-2">
+                                    <button onClick={() => setHypervShutdownVm(null)} disabled={hypervShuttingDown}
+                                            className="px-4 py-2 rounded-lg bg-proxmox-dark border border-proxmox-border text-gray-300 text-sm disabled:opacity-50">
+                                        {t('cancel') || 'Cancel'}
+                                    </button>
+                                    <button onClick={() => shutDownAndMigrate(selectedHyperV.id, hypervShutdownVm)}
+                                            disabled={hypervShuttingDown}
+                                            className="px-4 py-2 rounded-lg bg-indigo-500 text-white text-sm disabled:opacity-50">
+                                        {hypervShuttingDown
+                                            ? (t('hvShuttingDown') || 'Shutting down…')
+                                            : (t('hvShutDownAndMigrate') || 'Shut down and migrate')}
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
                     {showHypervEdit && selectedHyperV && (
                         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
                             <div className="bg-proxmox-card border border-proxmox-border rounded-2xl w-full max-w-lg shadow-2xl max-h-[90vh] overflow-y-auto">
