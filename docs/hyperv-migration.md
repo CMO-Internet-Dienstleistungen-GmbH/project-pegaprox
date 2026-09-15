@@ -37,6 +37,43 @@ reconfigured to suit a migration tool, and an estate that runs the default HTTP
 listener is registered as it is. The trade-offs of each choice are stated in
 `hyperv-verification.md`, not enforced.
 
+## What the host view shows, and how old it is
+
+Reading a host takes tens of seconds: one WinRM call for the inventory and one
+for the host facts, against a hypervisor with its own load. So the host view
+never waits for that. It shows the inventory PegaProx last read, with the time
+it was read on the line above the table, and the read itself runs in the
+background. When it finishes, the list is replaced without anyone doing
+anything -- the server pushes a notification over the same SSE channel the rest
+of the UI already uses, and the view fetches the new list from the server's
+cache.
+
+Which means three things on screen, and each says which it is:
+
+- *"Reading the host…"* -- nothing is known about this host yet. The table is
+  empty because nothing has been read, not because the host has no VMs.
+- *"As of 14:32"* -- this is what the host said at that time.
+- *"As of 14:32 · reading the host again"* -- that, and a read is in flight.
+
+A read starts when the view is opened and what is stored is older than five
+minutes, when a VM is started or shut down through PegaProx, and whenever the
+refresh button is pressed. Nothing else asks a customer's hypervisor: opening
+the view repeatedly, re-rendering, and every generic PegaProx page that
+enumerates VMs are served from the cache. A host nobody has opened is never
+contacted at all.
+
+If the host stops answering, the rows stay and the banner turns amber with the
+reason and its remedy. That is deliberate: which VMs are on a host is still
+worth knowing while the host is briefly unreachable, and an empty table would
+throw away the only record that it ever had them.
+
+**What is never cached is anything a migration acts on.** The VM detail, the
+disk chains, the power state and the "are these disks safe to read" check are
+read from the host each time they are asked for, and the preflight re-runs
+against the host immediately before a transfer starts. The cache is for
+choosing a VM out of a list; it is not evidence about a disk. See
+`adr/0004-the-hyper-v-inventory-is-served-from-a-cache.md`.
+
 ## The order of a migration
 
 1. **Prepare the guest — but not with drivers.** Nothing has to be installed
