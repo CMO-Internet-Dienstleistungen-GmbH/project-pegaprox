@@ -56,6 +56,10 @@ XenAPI>=23.14.0
 defusedxml>=0.7.1
 
 # === Transitive pins (scanner hygiene; newer versions pulled automatically) ===
-setuptools>=83.0.0
+# MK Sep 2026 — dropped the setuptools floor pin from #608. Since 3.12 ensurepip ships no
+# setuptools, so that line was the only reason it was in the image at all, and it dragged
+# its vendored wheel 0.46.3 in with it (84.0.0 still vendors 0.46.3, so bumping is no fix).
+# Nothing imports setuptools or pkg_resources at runtime; sdists resolve via PEP 517 build
+# isolation. Verified on a pip-only venv: all 53 packages install, setuptools absent after.
 zipp>=3.19.1
 idna>=3.15
