@@ -1944,7 +1944,15 @@
                 if (isOpen && reconfigureConfig) {
                     setConnectionType(reconfigureConfig.cluster_type || 'proxmox');
                     const rc = reconfigureConfig;
-                    if (rc.cluster_type === 'xcpng') {
+                    if (rc.cluster_type === 'hyperv') {
+                        setHyperVConfig(prev => ({ ...prev, name: rc.name || '', host: rc.host || '',
+                            port: rc.port || rc.api_port || 5986, user: rc.user || '', pass: '',
+                            ssl_verification: rc.ssl_verification !== false,
+                            iso_library_paths: (rc.iso_library_paths || []).join('\n'),
+                            smb_share_map: Object.entries(rc.smb_share_map || {})
+                                .map(([drive, share]) => `${drive}=${share}`).join('\n'),
+                            smb_domain: rc.smb_domain || '' }));
+                    } else if (rc.cluster_type === 'xcpng') {
                         setXcpConfig(prev => ({ ...prev, name: rc.name || '', host: rc.host || '', user: rc.user || '', pass: '', ssl_verification: rc.ssl_verification || false, migration_threshold: rc.migration_threshold || 20, check_interval: rc.check_interval || 300, auto_migrate: rc.auto_migrate || false, dry_run: rc.dry_run || false }));
                     } else {
                         // #762 — carry EVERY persisted cluster setting into the reconfigure form, not
@@ -1975,6 +1983,9 @@
                 auto_migrate: false, dry_run: false, cluster_type: 'xcpng',
             });
 
+            // Hyper-V source config (fork patch #15) — shape and parsing live in hyperv.js
+            const [hyperVConfig, setHyperVConfig] = useState({ ...HYPERV_DEFAULT_CONFIG });
+
             // PBS config
             const [pbsConfig, setPbsConfig] = useState({
                 name: '', host: '', port: 8007, user: 'root@pam', password: '',
@@ -1996,6 +2007,7 @@
                 e.preventDefault();
                 if (connectionType === 'proxmox') onSubmit(config);
                 else if (connectionType === 'xcpng') onSubmit({...xcpConfig, cluster_type: 'xcpng'});
+                else if (connectionType === 'hyperv') onSubmit(hvNormaliseConfig(hyperVConfig));
                 else if (connectionType === 'pbs') onAddPBS(pbsConfig);
                 else if (connectionType === 'vmware') onAddVMware(vmwConfig);
             };
@@ -2012,6 +2024,7 @@
                                 {[
                                     { id: 'proxmox', label: 'Proxmox VE', icon: Icons.Server, active: 'bg-orange-500/20 text-orange-400 border-orange-500/40', inactive: 'bg-proxmox-dark text-gray-500 border-transparent hover:text-gray-300 hover:border-proxmox-border' },
                                     { id: 'xcpng', label: 'XCP-ng (TP)', icon: Icons.Cpu, active: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/40', inactive: 'bg-proxmox-dark text-gray-500 border-transparent hover:text-gray-300 hover:border-proxmox-border' },
+                                    { id: 'hyperv', label: 'Hyper-V', icon: Icons.Server, active: 'bg-indigo-500/20 text-indigo-400 border-indigo-500/40', inactive: 'bg-proxmox-dark text-gray-500 border-transparent hover:text-gray-300 hover:border-proxmox-border' },
                                     { id: 'pbs', label: 'PBS', icon: Icons.Shield, active: 'bg-blue-500/20 text-blue-400 border-blue-500/40', inactive: 'bg-proxmox-dark text-gray-500 border-transparent hover:text-gray-300 hover:border-proxmox-border' },
                                     { id: 'vmware', label: 'ESXi', icon: Icons.Cloud, active: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40', inactive: 'bg-proxmox-dark text-gray-500 border-transparent hover:text-gray-300 hover:border-proxmox-border' },
                                 ].map(tab => (
@@ -2036,6 +2049,11 @@
                         )}
 
                         <form onSubmit={handleSubmit} className="p-6 space-y-5">
+                            {/* ===== HYPER-V SOURCE FORM (fork patch #15) ===== */}
+                            {connectionType === 'hyperv' && (
+                                <HyperVSourceForm config={hyperVConfig} setConfig={setHyperVConfig} t={t} />
+                            )}
+
                             {/* ===== PROXMOX VE FORM ===== */}
                             {connectionType === 'proxmox' && (<>
                             <div className="grid grid-cols-2 gap-4">
