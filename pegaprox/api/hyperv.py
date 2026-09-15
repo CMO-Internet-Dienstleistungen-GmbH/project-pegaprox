@@ -188,6 +188,10 @@ def list_hyperv_hosts():
             'iso_library_paths': record['iso_library_paths'],
             'smb_share_map': record['smb_share_map'],
             'smb_domain': record['smb_domain'],
+            'transfer_host': record.get('transfer_host', ''),
+            # What a target node last measured. The host view renders it, and its absence
+            # is why the migration wizard would otherwise ask about disk access per VM.
+            'transfer_check': record.get('transfer_check') or {},
             # Never the password, not even its length.
             'has_password': bool(record['pass']),
             'connected': bool(manager and manager.is_connected),
@@ -328,6 +332,57 @@ def get_hyperv_host(cluster_id):
     if entry.get('facts'):
         body['facts'] = entry['facts']
     return jsonify(body)
+
+
+@bp.route('/api/hyperv/<cluster_id>/transfer-check', methods=['POST'])
+@require_auth(perms=['hyperv.config'])
+def check_hyperv_transfer(cluster_id):
+    """Ask a target node whether it can read this host's disk share, and remember.
+
+    A host fact, measured once: cifs-utils on the node, a route to TCP 445, and an account
+    the share lets read. The preflight used to put the same unanswerable question in front
+    of every VM and ask for a confirmation it could not inform. Now it reports what this
+    found, with the date it found it.
+
+    Read-only throughout — mount, list, unmount. `hyperv.config` rather than a view
+    permission because it opens a connection from a Proxmox node to a customer's host
+    using the stored credentials, which is a configuration act, not a look.
+    """
+    from pegaprox.core import hyperv_db, hyperv_transfer_check
+    from pegaprox.core.db import get_db
+    from pegaprox.core.hyperv_xhm import open_target_node_session
+
+    mgr, err = _hyperv_host(cluster_id)
+    if err:
+        return err
+
+    data = request.json or {}
+    target_cluster = (data.get('target_cluster') or '').strip()
+    target_node = (data.get('target_node') or '').strip()
+    if not target_cluster or not target_node:
+        return jsonify({'error': 'target_cluster and target_node are required — the check '
+                                 'measures what one specific node can reach.'}), 400
+
+    ok, denied = check_cluster_access(target_cluster)
+    if not ok:
+        return denied
+    target = cluster_managers.get(target_cluster)
+    if target is None or getattr(target, 'cluster_type', 'proxmox') != 'proxmox':
+        return jsonify({'error': 'The target has to be a Proxmox cluster.'}), 400
+
+    result = hyperv_transfer_check.run_check(
+        mgr, target, target_node,
+        lambda: open_target_node_session(target, target_node))
+
+    try:
+        hyperv_db.save_transfer_check(get_db().conn, cluster_id, result)
+    except Exception as exc:                                     # noqa: BLE001
+        logger.warning('Could not store the transfer check for %s: %s', _sl(cluster_id), exc)
+
+    log_audit(_acting_user(), 'hyperv.transfer.check',
+              f'Checked SMB access to {_sl(mgr.name)} from node {_sl(target_node)}: '
+              f'{"ok" if result.get("ok") else "failed"}')
+    return jsonify(result)
 
 
 @bp.route('/api/hyperv/<cluster_id>/isos', methods=['GET'])
@@ -575,6 +630,9 @@ def hyperv_vm_preflight(cluster_id, vmid):
         # confirm, rather than an OK that was never earned or a blocker on a VM that is
         # otherwise ready. A runner never sets this and stays blocked without the proof.
         'source_access_probed': False,
+        # The host-wide measurement, so this route answers the file-access question the
+        # same way the plan does instead of asking for a confirmation beside it.
+        'host_transfer_check': getattr(mgr, 'transfer_check', None) or None,
         'reachable_paths': {},
     }
 
