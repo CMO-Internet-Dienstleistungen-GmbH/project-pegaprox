@@ -864,6 +864,13 @@
         }
 
         function ConfigModal({ vm, clusterId, allClusters = [], dashboardAuthFetch, onClose, addToast, isCorporate = false, initialTab = 'general' }) {
+            // Fork patch #15 — a Hyper-V guest is a migration source, not a machine this
+            // product manages. Its hardware is shown so the operator can see what a
+            // migration has to reproduce; changing it would address a Proxmox API the host
+            // does not have. Read-only is enforced on the form as a whole rather than field
+            // by field, so a field added later cannot quietly become editable here.
+            const isReadOnlySource = typeof hvType === 'function'
+                && hvType((allClusters || []).find(c => c.id === clusterId)) === 'hyperv';
             const { t } = useTranslation();
             const { getAuthHeaders, haReadOnly, haStandby } = useAuth();
             // LW Nov 2026 - the guest view reads its config again once this dialog is gone
@@ -1043,7 +1050,7 @@
             // (a Proxmox VE cluster only: the restart rules are those of qemu-server)
             const { isCorpRedesigned } = useLayout();
             const crVcCluster = allClusters.find(c => c.id === clusterId);
-            const crVc = isCorpRedesigned && isQemu && !['xcpng', 'esxi'].includes(crVcCluster?.cluster_type);
+            const crVc = isCorpRedesigned && isQemu && !['xcpng', 'esxi'].includes(crVcCluster?.cluster_type) && !isReadOnlySource;
             // LW Nov 2026 - the redesign's edits of network devices, saved from the review with the classic request
             const [crNets, setCrNets] = useState({});
             const crv = useCrVc({ on: crVc, vm, clusterId, authFetch, config, changes, nets: crNets });
@@ -2249,6 +2256,7 @@
             };
 
             const handleSave = async () => {
+                if (isReadOnlySource) return false;
                 if (Object.keys(changes).length === 0) return false;
 
                 // Validate VM name format (DNS-compatible)
@@ -3058,7 +3066,7 @@
                                     {hasChanges && !crVc && (
                                         <span className="corp-unsaved-pill">{t('unsavedChanges') || 'Unsaved Changes'}</span>
                                     )}
-                                    {hasChanges && !haReadOnly && (crVc ? null :
+                                    {hasChanges && !haReadOnly && !isReadOnlySource && (crVc ? null :
                                         <button
                                             onClick={handleSave}
                                             disabled={saving}
@@ -3140,6 +3148,13 @@
 
                         {/* Content */}
                         <div className={isCorporate ? 'corp-vm-modal-body' : 'flex-1 overflow-y-auto p-6'}>
+                            {isReadOnlySource && (
+                                <div className="mb-4 rounded-lg border border-proxmox-border bg-proxmox-dark px-3 py-2
+                                                text-xs text-gray-400">
+                                    {t('hvSourceReadOnly')
+                                        || 'This is a migration source. Its hardware is shown as it is on the Hyper-V host and cannot be changed from here.'}
+                                </div>
+                            )}
                             {loading ? (
                                 isCorporate ? (
                                     <div className="corp-vm-modal-state">
@@ -3184,7 +3199,7 @@
                             ) : config ? (
                                 // #625 v2 - a standby shows the configuration and changes none of
                                 // it: every tab but History renders its controls disabled
-                                <fieldset disabled={lockedTab} className="contents" data-ha-locked={lockedTab ? '' : undefined}>
+                                <fieldset disabled={lockedTab || isReadOnlySource} className="contents" data-ha-locked={lockedTab ? '' : undefined}>
                                     {/* General Tab */}
                                     {activeTab === 'general' && (crVc ? (
                                         <CrVcGeneral t={t} vm={vm} config={config} changes={changes} rows={crv.rows}
@@ -6571,7 +6586,8 @@
                                 </button>
                                 {!haReadOnly && <button
                                     onClick={handleSave}
-                                    disabled={!hasChanges || saving}
+                                    disabled={!hasChanges || saving || isReadOnlySource}
+                                    hidden={isReadOnlySource}
                                     className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange rounded-lg text-white font-medium hover:bg-orange-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                                 >
                                     {saving ? (
