@@ -535,3 +535,43 @@ def test_the_driver_risk_is_answered_when_the_migration_installs_them():
     #: both end with the VM on a different controller than the operator asked for.
     assert 'no signature the loader accepts' in finding.detail
     assert 'not Windows' in finding.detail
+
+class TestTheVlanFinding:
+    """A VLAN is shown before the run, because an adapter on the wrong one looks healthy."""
+
+    def _nic(self, **kw):
+        base = {'name': 'Network Adapter', 'mac_address': '00155D000001',
+                'switch_name': 'External'}
+        base.update(kw)
+        return base
+
+    def test_an_adapter_with_a_source_vlan_is_reported_as_tagged(self):
+        finding = pf.check_vlan_mapping(
+            [self._nic(vlan_mode='Access', vlan_id=22)], {})
+        assert finding.severity == 'ok'
+        assert '22' in finding.detail
+
+    def test_a_trunk_adapter_warns_and_names_itself(self):
+        """It carries several ids, so none of them can be carried over."""
+        finding = pf.check_vlan_mapping(
+            [self._nic(name='LAN', vlan_mode='Trunk')], {})
+        assert finding.severity == 'warning'
+        assert 'LAN' in finding.detail
+        assert 'Trunk' in finding.detail
+
+    def test_an_adapter_that_would_arrive_untagged_warns(self):
+        """Untagged is not neutral: it lands on the target bridge's native VLAN."""
+        finding = pf.check_vlan_mapping(
+            [self._nic(name='LAN')], {'00155D000001': 0})
+        assert finding.severity == 'warning'
+        assert 'LAN' in finding.detail
+
+    def test_the_operator_choice_is_what_the_report_answers_for(self):
+        """The report has to describe the migration the wizard would start, not the source."""
+        finding = pf.check_vlan_mapping(
+            [self._nic(vlan_mode='Access', vlan_id=22)], {'00155D000001': 99})
+        assert finding.severity == 'ok'
+        assert '99' in finding.detail
+
+    def test_a_vm_without_adapters_is_not_a_finding(self):
+        assert pf.check_vlan_mapping([], {}).severity == 'ok'

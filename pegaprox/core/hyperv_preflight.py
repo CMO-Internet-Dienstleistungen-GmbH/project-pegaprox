@@ -302,6 +302,58 @@ def check_network_mapping(adapters: list[dict], mapping: dict) -> Finding:
                    f'All {len(adapters)} network adapter(s) are mapped to a target network.')
 
 
+def check_vlan_mapping(adapters: list[dict], vlan_map: dict | None = None) -> Finding:
+    """Say which VLAN each adapter will arrive on, and name the ones that get none.
+
+    A VLAN is not something a migration may quietly get wrong: an adapter on the wrong
+    one is reachable by the wrong people, and the guest looks healthy either way. So the
+    answer is shown before the run rather than discovered after it.
+
+    An adapter whose Hyper-V mode carries more than one id -- `Trunk`, or the private-VLAN
+    role `Isolated` -- has no single number to carry over. It arrives untagged and is
+    named here, because a trunk port put on one guessed VLAN looks like it worked.
+    """
+    from pegaprox.core.hyperv_xhm import vlan_for_adapter, VLAN_MODE_ACCESS
+
+    if not adapters:
+        return Finding('vlan_mapping', OK, 'The VM has no network adapters.')
+
+    vlan_map = vlan_map or {}
+    multi_mode = []
+    untagged = []
+    tagged = []
+    for adapter in adapters:
+        label = adapter.get('name') or adapter.get('mac_address') or '<unnamed adapter>'
+        mode = (adapter.get('vlan_mode') or '').strip()
+        key = _adapter_key(adapter)
+        chosen = vlan_map.get(key) if key in vlan_map else vlan_for_adapter(adapter)
+        try:
+            vlan = int(chosen)
+        except (TypeError, ValueError):
+            vlan = 0
+        if mode and mode not in (VLAN_MODE_ACCESS, 'Untagged'):
+            multi_mode.append(f'{label} ({mode})')
+        elif vlan:
+            tagged.append(f'{label} -> VLAN {vlan}')
+        else:
+            untagged.append(label)
+
+    if multi_mode:
+        return Finding('vlan_mapping', WARNING,
+                       f'{len(multi_mode)} adapter(s) carry more than one VLAN on the source.',
+                       ', '.join(multi_mode) + '. A trunk or isolated adapter has no single '
+                       'VLAN id, so it arrives on the target bridge without a tag. Set the '
+                       'target up by hand if the guest needs those VLANs.')
+    if untagged:
+        return Finding('vlan_mapping', WARNING,
+                       f'{len(untagged)} adapter(s) will arrive without a VLAN tag.',
+                       'Untagged: ' + ', '.join(untagged) + '. They land on whatever the '
+                       "target bridge's native VLAN is, which is not necessarily the "
+                       'network the source was on.')
+    return Finding('vlan_mapping', OK,
+                   f'All {len(adapters)} adapter(s) have a VLAN.', ', '.join(tagged))
+
+
 def check_firmware(generation: int | None) -> Finding:
     """Generation decides the target machine type and firmware."""
     if generation not in GENERATION_FIRMWARE:
@@ -454,6 +506,8 @@ def run_preflight(vm: dict, target: dict, options: dict | None = None) -> Prefli
 
     report.add(check_network_mapping(vm.get('network_adapters') or [],
                                      options.get('network_map') or {}))
+    report.add(check_vlan_mapping(vm.get('network_adapters') or [],
+                                  options.get('vlan_map') or {}))
     report.add(check_secure_boot(vm.get('secure_boot_enabled'), vm.get('generation')))
     report.add(check_vtpm(vm.get('vtpm_enabled')))
     report.add(check_bitlocker(vm.get('bitlocker_state'), vm.get('vtpm_enabled')))
