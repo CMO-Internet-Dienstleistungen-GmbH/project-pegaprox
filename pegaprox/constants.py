@@ -194,3 +194,11 @@ PREDICTIVE_ENGINE_TAG = 'pega-wma-v2'
 # threshold where pointer motion reads as steady, and costs only more timed-out wakeups
 # (~100/s per OPEN CONSOLE — a human-bounded number, unrelated to how many guests exist).
 VNC_PVE_RECV_SLICE = float(os.environ.get('PEGAPROX_VNC_RECV_SLICE', '0.01'))
+
+# MK Sep 2026 (#647) — how long to keep asking where a guest ended up after an HA
+# migrate task reported failure. `ha-manager migrate` returns once the CRM has the
+# request, not once the guest has moved, so an immediate look-up answers "still on the
+# source" for a migration that is about to succeed. 90s covers the reported gap with
+# room to spare; a real failure pays it once, on a path that is already the exception.
+HA_MIGRATE_SETTLE_SECONDS = float(os.environ.get('PEGAPROX_HA_MIGRATE_SETTLE', '90'))
+HA_MIGRATE_SETTLE_POLL = float(os.environ.get('PEGAPROX_HA_MIGRATE_SETTLE_POLL', '3'))
