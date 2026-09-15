@@ -26,6 +26,13 @@ source's file share read-only and runs `qemu-img convert` itself, so the
 management server is irrelevant to the transfer's speed and to its failure
 modes.
 
+How PegaProx reaches the host -- HTTP or HTTPS, which authentication provider,
+whether the payload over HTTP is sealed -- is configured per host and follows
+what the host already offers. The product sets no minimum: a source is never
+reconfigured to suit a migration tool, and an estate that runs the default HTTP
+listener is registered as it is. The trade-offs of each choice are stated in
+`hyperv-verification.md`, not enforced.
+
 ## The order of a migration
 
 1. **Prepare the guest — but not with drivers.** Nothing has to be installed
