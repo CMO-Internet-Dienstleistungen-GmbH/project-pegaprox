@@ -37,6 +37,7 @@ class FakeConfig:
         self.pass_ = kw.get('pass_', SECRET)
         self.smb_share_map = kw.get('smb_share_map', {})
         self.smb_domain = kw.get('smb_domain', '')
+        self.transfer_host = kw.get('transfer_host', '')
         self.ssh_user = kw.get('ssh_user', 'root')
         self.ssh_key = ''
         self.ssh_port = 22
@@ -52,6 +53,12 @@ class FakeSource:
         self._detail = detail
         self._safe = safe
         self.manager = self
+
+    @property
+    def transfer_address(self):
+        # The same fallback the real manager has: a host with no separate transfer path
+        # is mounted at its management address.
+        return (getattr(self.config, 'transfer_host', '') or '').strip() or self.config.host
 
     def guid_for(self, vmid):
         return GUID if int(vmid) == VMID else None
@@ -1308,6 +1315,43 @@ def _kinds(commands):
         else:
             labels.append(f'other: {command[:40]}')
     return labels
+
+
+class TestTheTransferTakesTheAddressItWasGiven:
+    """Which address the target node mounts the share from.
+
+    Management reaches a Hyper-V host over whatever interface its admin address is on,
+    and on this estate that is 1 GbE while a separate 10 GbE segment carries backups and
+    migrations. The transfer has to be able to take the second one. Naming the address is
+    how that happens — the node picks the interface from its route to it — so there is no
+    interface setting anywhere, and an interface name on the PegaProx side would say
+    nothing about which way the node routes.
+    """
+
+    def test_without_one_the_management_address_is_used(self, db, wired):
+        source, target, node = wired
+        _run(FakeTask())
+        mounts = [c for c in node.commands if 'mount -t cifs' in c]
+        assert mounts, 'nothing was mounted'
+        assert f'//{source.config.host}/' in mounts[0]
+
+    def test_with_one_the_transfer_address_is_used(self, db, wired):
+        source, target, node = wired
+        source.config.transfer_host = 'source-host-fast.invalid'
+        _run(FakeTask())
+        mounts = [c for c in node.commands if 'mount -t cifs' in c]
+        assert mounts, 'nothing was mounted'
+        assert '//source-host-fast.invalid/' in mounts[0]
+        # And not the management one — otherwise the setting reads as applied while the
+        # copy still crawls down the admin interface.
+        assert f'//{source.config.host}/' not in mounts[0]
+
+    def test_a_blank_setting_is_not_a_host_called_nothing(self, db, wired):
+        source, target, node = wired
+        source.config.transfer_host = '   '
+        _run(FakeTask())
+        mounts = [c for c in node.commands if 'mount -t cifs' in c]
+        assert f'//{source.config.host}/' in mounts[0]
 
 
 class TestWhatOneImportCostsTheHosts:

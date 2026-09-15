@@ -75,6 +75,18 @@ class HyperVConfig:
         self.smb_share_map = data.get('smb_share_map') or {}
         self.smb_domain = data.get('smb_domain', '')
 
+        # Where the target node mounts the share, when that is not where PegaProx reaches
+        # WinRM. Management usually runs over an admin interface; the transfer should take
+        # whichever path is fast, and on this estate that is a separate 10 GbE segment the
+        # backups already use. Empty means "the same address", which is what every host
+        # registered before this setting did (fork issue #15).
+        #
+        # Naming the address is how the interface gets chosen: the node's routing table
+        # decides which link carries traffic to it. There is deliberately no interface
+        # picker -- an interface name on this side would say nothing about which way the
+        # node routes.
+        self.transfer_host = (data.get('transfer_host') or '').strip()
+
         # Read by the cluster list and the balancer without a getattr guard. A Hyper-V host
         # is never balanced and never a migration target, so every one of these is off.
         self.migration_threshold = 0
@@ -163,6 +175,37 @@ class HyperVClusterManager:
     @property
     def name(self) -> str:
         return self.config.name
+
+    @property
+    def transfer_check(self) -> dict:
+        """What a target node last found when it tried to read this host's share.
+
+        Read from the database rather than held in memory: it is a measurement about the
+        host and it has to survive a restart, or the preflight goes back to asking a
+        question it cannot answer.
+        """
+        from pegaprox.core import hyperv_db
+        from pegaprox.core.db import get_db
+        try:
+            record = hyperv_db.load_host(get_db().conn, get_db()._decrypt, self.id)
+            return (record or {}).get('transfer_check') or {}
+        except Exception:                                    # noqa: BLE001
+            logger.debug('Could not read the transfer check of %s', self.id, exc_info=True)
+            return {}
+
+    @property
+    def transfer_address(self) -> str:
+        """The address the target node mounts the disk share from.
+
+        Falls back to the management address, which is what a host without a separate
+        transfer path has. One place answers this so the mount and the preflight cannot
+        disagree about which host is being talked to.
+
+        Stripped here rather than only on the way in: a field holding spaces is truthy,
+        and `//   /C$` is a mount against a host named after a blank. The constructor
+        strips too, but this is the value everything downstream actually uses.
+        """
+        return (self.config.transfer_host or '').strip() or self.config.host
 
     @property
     def is_connected(self) -> bool:
