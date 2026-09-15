@@ -307,6 +307,10 @@ class XHMigrationTask:
                 'start_after': self.start_after,
                 'remove_source': self.remove_source,
                 'network_map': self.network_map,
+                # What the VM was built as. It is a choice the operator made in the wizard
+                # and it decides what the guest wakes up on, so reading a finished
+                # migration should not require guessing which way the box was ticked.
+                'hardware': self.config.get('hardware') or '',
             },
         }
 

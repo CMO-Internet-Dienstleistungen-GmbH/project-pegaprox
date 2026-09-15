@@ -122,6 +122,9 @@ def xhm_plan():
         result = plan_esxi_to_pve(source_cluster, source_vmid, target_cluster)
     elif src_type == 'esxi' and tgt_type == 'xcpng':
         result = plan_esxi_to_xcpng(source_cluster, source_vmid, target_cluster)
+    elif src_type == 'hyperv':
+        from pegaprox.core.hyperv_xhm import plan_hyperv_to_pve
+        result = plan_hyperv_to_pve(source_cluster, source_vmid, target_cluster)
     elif src_type == 'xcpng' and tgt_type == 'proxmox':
         result = plan_xcpng_to_pve(source_cluster, source_vmid, target_cluster)
     elif tgt_type == 'xcpng':
@@ -215,6 +218,8 @@ def xhm_start():
         direction = 'esxi_to_pve'
     elif src_type == 'esxi' and tgt_type == 'xcpng':
         direction = 'esxi_to_xcpng'
+    elif src_type == 'hyperv' and tgt_type == 'proxmox':
+        direction = 'hyperv_to_pve'
     elif src_type == 'xcpng' and tgt_type == 'proxmox':
         direction = 'xcpng_to_pve'
     elif src_type != 'xcpng' and tgt_type == 'xcpng':
@@ -222,16 +227,24 @@ def xhm_start():
     else:
         return jsonify({'error': 'Invalid cluster combination for cross-hypervisor migration'}), 400
 
-    if direction in ('xcpng_to_pve', 'esxi_to_pve') and not data.get('target_node'):
+    if direction in ('xcpng_to_pve', 'esxi_to_pve', 'hyperv_to_pve') and not data.get('target_node'):
         return jsonify({'error': 'target_node is required for migration to Proxmox'}), 400
     # MK Nov 2026 - a node of the Proxmox VE side goes into the API paths the task calls there
     # (the new guest and its config on the target, the config reads on the source). An XCP-ng
     # host keeps its free name, it is never part of a path
     for _key, _pve in (('source_node', direction == 'pve_to_xcpng'),
-                       ('target_node', direction in ('xcpng_to_pve', 'esxi_to_pve'))):
+                       ('target_node', direction in ('xcpng_to_pve', 'esxi_to_pve', 'hyperv_to_pve'))):
         _v = data.get(_key)
         if _pve and _v not in (None, '') and not (isinstance(_v, str) and validate_hostname(_v)):
             return jsonify({'error': 'Invalid node name'}), 400
+
+    # CMO fork patch #15: one import at a time per Hyper-V source, and none at all while
+    # a failed one's leftovers are still on the target.
+    if direction == 'hyperv_to_pve':
+        from pegaprox.core.hyperv_xhm import refuse_hyperv_start
+        refused = refuse_hyperv_start(data['source_cluster'], vmid_int, data)
+        if refused:
+            return jsonify({'error': refused}), 409
 
     # MK Oct 2026 - the copy is a new guest on the target, the size of its source. It counts
     # for the tenant quota unless it only moves between two clusters the tenant has
@@ -277,6 +290,9 @@ def xhm_start():
         'esxi_to_pve': _run_esxi_to_pve,
         'esxi_to_xcpng': _run_esxi_to_xcpng,
     }
+    if direction == 'hyperv_to_pve':
+        from pegaprox.core.hyperv_xhm import _run_hyperv_to_pve
+        _runners['hyperv_to_pve'] = _run_hyperv_to_pve
     runner = _runners.get(direction)
     if not runner:
         return jsonify({'error': f'No runner for direction {direction}'}), 400
