@@ -1,0 +1,110 @@
+"""An HA migrate that reported failure was judged before the guest had moved (#647).
+
+`ha-manager migrate` exits once the CRM has accepted the request, not once the guest
+has relocated. The recovery check — "the task failed, but did it move anyway?" — ran
+the instant the task returned, so it read the guest still sitting on its source node
+and declared a failed evacuation for a migration that then completed fine.
+
+From the report: migration started 09:24:06.904, task failed 09:24:10.957. Four
+seconds. The operator saw "Failed to evacuate" on a host that had in fact drained,
+and that had been happening on roughly half the hosts of every rolling update. MK
+"""
+import time
+
+import pytest
+
+from pegaprox.constants import HA_MIGRATE_SETTLE_SECONDS, HA_MIGRATE_SETTLE_POLL
+
+
+def test_the_settle_window_outlasts_the_reported_gap():
+    """Four seconds in the report; anything near that is not a window at all."""
+    assert HA_MIGRATE_SETTLE_SECONDS >= 30
+    assert HA_MIGRATE_SETTLE_POLL <= 5
+    assert HA_MIGRATE_SETTLE_SECONDS / HA_MIGRATE_SETTLE_POLL >= 5, "too few looks to matter"
+
+
+def test_both_are_tunable_from_the_environment(monkeypatch):
+    """A cluster with a slower CRM must be able to widen this without a patch."""
+    import importlib
+    monkeypatch.setenv('PEGAPROX_HA_MIGRATE_SETTLE', '210')
+    monkeypatch.setenv('PEGAPROX_HA_MIGRATE_SETTLE_POLL', '7')
+    import pegaprox.constants as c
+    importlib.reload(c)
+    try:
+        assert c.HA_MIGRATE_SETTLE_SECONDS == 210
+        assert c.HA_MIGRATE_SETTLE_POLL == 7
+    finally:
+        monkeypatch.delenv('PEGAPROX_HA_MIGRATE_SETTLE', raising=False)
+        monkeypatch.delenv('PEGAPROX_HA_MIGRATE_SETTLE_POLL', raising=False)
+        importlib.reload(c)
+
+
+def _settle(seen_nodes, source, deadline_s, poll_s, now):
+    """The loop as written in manager.py, lifted so it can be driven deterministically."""
+    actual = None
+    deadline = now() + deadline_s
+    while True:
+        actual = seen_nodes.pop(0) if seen_nodes else actual
+        if actual and actual != source:
+            break
+        if now() >= deadline:
+            break
+        time.sleep(poll_s)
+    return actual
+
+
+def test_a_guest_that_moves_late_is_still_counted_as_evacuated(monkeypatch):
+    monkeypatch.setattr(time, 'sleep', lambda *_: None)
+    clock = {'t': 0.0}
+    def now():
+        clock['t'] += 3
+        return clock['t']
+    # still on pve3 for three looks, then the CRM finishes and it shows up on pve2
+    got = _settle(['pve3', 'pve3', 'pve3', 'pve2'], 'pve3', 90, 3, now)
+    assert got == 'pve2'
+
+
+def test_a_guest_that_never_moves_is_still_a_failure(monkeypatch):
+    """The window must not turn genuine failures into successes."""
+    monkeypatch.setattr(time, 'sleep', lambda *_: None)
+    clock = {'t': 0.0}
+    def now():
+        clock['t'] += 10
+        return clock['t']
+    got = _settle(['pve3'] * 50, 'pve3', 90, 3, now)
+    assert got == 'pve3', "a guest that stayed put must not be reported as evacuated"
+
+
+def test_the_loop_terminates_even_if_the_lookup_keeps_failing(monkeypatch):
+    """A cluster that stops answering must not hang the evacuation forever."""
+    monkeypatch.setattr(time, 'sleep', lambda *_: None)
+    clock = {'t': 0.0}
+    def now():
+        clock['t'] += 10
+        return clock['t']
+    got = _settle([], 'pve3', 90, 3, now)   # lookup never yields anything
+    assert got is None
+
+
+def test_the_recovery_path_is_wired_into_the_evacuation():
+    """Guards the call site: the settle loop has to sit in the task-failed branch,
+    not somewhere the happy path reaches."""
+    import ast, io
+    src = io.open('pegaprox/core/manager.py', encoding='utf-8').read()
+    tree = ast.parse(src)
+
+    # the function holding the recovery log line — find it by the message, not by
+    # string offsets. (An index() on the constant name finds the IMPORT first, which
+    # is how the first version of this test passed for the wrong reason.)
+    def _mentions(node, text):
+        return any(isinstance(n, ast.Constant) and isinstance(n.value, str) and text in n.value
+                   for n in ast.walk(node))
+
+    owners = [n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef)
+              and _mentions(n, 'Migration task reported failure')]
+    assert owners, "the recovery branch is gone"
+    fn = owners[0]
+    names = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)}
+    assert 'HA_MIGRATE_SETTLE_SECONDS' in names, \
+        f"the settle window is not used inside {fn.name} — the check is immediate again"

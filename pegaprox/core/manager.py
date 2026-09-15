@@ -41,7 +41,8 @@ class _NoHostnameCheckAdapter(HTTPAdapter):
         kwargs['ssl_context'] = ctx
         return super().init_poolmanager(*args, **kwargs)
 
-from pegaprox.constants import SSH_MAX_CONCURRENT, LOG_DIR
+from pegaprox.constants import (SSH_MAX_CONCURRENT, LOG_DIR,
+                               HA_MIGRATE_SETTLE_SECONDS, HA_MIGRATE_SETTLE_POLL)
 from pegaprox import globals as _g
 from pegaprox.globals import (
     cluster_managers, _ssh_active_connections,
@@ -3258,12 +3259,33 @@ class PegaProxManager:
                         # Before declaring failure, verify the VM is still on the source node —
                         # if it's moved anywhere else, the evacuation goal is met even if the
                         # specific task we kicked off didn't land on its chosen target.
-                        try:
-                            current_vms = self.get_vm_resources()
-                            post = next((v for v in current_vms if v.get('vmid') == vmid), None)
-                            actual_node = post.get('node') if post else None
-                        except Exception as _e:
-                            actual_node = None
+                        # MK Sep 2026 (#647) — the look-up above used to happen once, the
+                        # instant the task reported failure, and that is too early to mean
+                        # anything. `ha-manager migrate` exits as soon as the CRM has taken
+                        # the request; the guest moves seconds later. Reported case: migration
+                        # started 09:24:06.904, task failed 09:24:10.957 — four seconds, on a
+                        # move that had not begun. We looked, saw the guest still on its source
+                        # node, called it a failed evacuation, and it migrated fine right after.
+                        # /cluster/resources is itself refreshed on a cycle, so even a completed
+                        # move can read stale for a moment.
+                        #
+                        # So give it a window. A genuine failure costs the extra wait once, on a
+                        # path that is already the exception; a false one used to be reported to
+                        # the operator as a broken evacuation on a host that had in fact drained.
+                        actual_node = None
+                        _deadline = time.time() + HA_MIGRATE_SETTLE_SECONDS
+                        while True:
+                            try:
+                                current_vms = self.get_vm_resources()
+                                post = next((v for v in current_vms if v.get('vmid') == vmid), None)
+                                actual_node = post.get('node') if post else None
+                            except Exception:
+                                actual_node = None
+                            if actual_node and actual_node != source_node:
+                                break
+                            if time.time() >= _deadline:
+                                break
+                            time.sleep(HA_MIGRATE_SETTLE_POLL)
                         if actual_node and actual_node != source_node:
                             self.logger.info(
                                 f"[OK] Migration task reported failure, but {vm.get('name', 'unnamed')} "
