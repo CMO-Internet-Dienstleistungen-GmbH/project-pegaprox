@@ -378,7 +378,7 @@ class TestTheTransferCheckSurvivesTheRightThings:
         # This is the address the check actually mounted from.
         self._saved(db)
         hyperv_db.save_transfer_check(db.conn, 'h1', {'ok': True, 'node': 'pve-1'})
-        record = self._saved(db, transfer_host='10.0.0.9')
+        record = self._saved(db, transfer_host='hv-fast.invalid')
         assert record['transfer_check'] == {}
 
     def test_a_new_account_discards_it(self, db):
