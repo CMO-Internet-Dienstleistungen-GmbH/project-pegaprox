@@ -422,7 +422,21 @@ def _pve_node_exec(pve_mgr, node, cmd, timeout=600, use_controlmaster=True,
             return 1, '', _diag[1]
 
         _ssh_user = getattr(pve_mgr.config, 'ssh_user', '') or 'root'
-        rc, out, err = _ssh_exec(node_host, _ssh_user, pve_mgr.config.pass_, cmd,
+        # The diagnosis above still lets the worst case through: it only says "no
+        # credentials" when there is NEITHER a key NOR a usable password, so a cluster
+        # with an SSH key stored that authenticates with an API token comes back clean.
+        # _ssh_exec is password-only (M3 passes look_for_keys=False, the sshpass leg asks
+        # for keyboard-interactive,password), so the key is never reached and config.pass_
+        # goes to sshd in its place — on a token cluster that is the token secret, and
+        # every method in _ssh_exec tries it in turn. Key + API token is the setup we
+        # recommend, so that is the config generating the most failed root logins.
+        _ssh_pass = '' if getattr(pve_mgr, '_using_api_token', False) \
+            else (getattr(pve_mgr.config, 'pass_', '') or '')
+        if not _ssh_pass:
+            return 1, '', (f"no SSH password stored for this cluster — node commands on "
+                           f"'{node}' authenticate by password, and a stored SSH key is "
+                           f"not usable on this path")
+        rc, out, err = _ssh_exec(node_host, _ssh_user, _ssh_pass, cmd,
                                   timeout=timeout, use_controlmaster=use_controlmaster)
         # SSH error patterns that indicate the node itself is dead, not the cmd
         looks_like_node_down = (
