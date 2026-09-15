@@ -26,6 +26,10 @@ source's file share read-only and runs `qemu-img convert` itself, so the
 management server is irrelevant to the transfer's speed and to its failure
 modes.
 
+What the target node has to have for any of this to work -- the one package
+nobody installs for you, the tools PVE already brings, and the one package that
+must never be installed on a node -- is in `hyperv-target-node-requirements.md`.
+
 How PegaProx reaches the host -- HTTP or HTTPS, which authentication provider,
 whether the payload over HTTP is sealed -- is configured per host and follows
 what the host already offers. The product sets no minimum: a source is never
