@@ -95,6 +95,53 @@ file, not the product — `shutdown /s /t 240 /f` cut the first-logon device ins
 short on this version, where 2016, 2022 and 2025 survived it. Rebuilt with
 `shutdown /s /t 900` and no `/f`, the image installs, shuts down and boots normally.
 
+## Fast Startup, and what is and is not proven about it
+
+Windows 8 and Server 2012 and everything after them can end a shutdown by writing the
+kernel session to `hiberfil.sys` instead of ending it. The volume is then hibernated from
+any other system's point of view, and a guest that starts from it resumes that session
+rather than booting. Resuming it against a different chipset, timer and controller is not
+something Windows supports, so every import clears it: the copied volume is mounted with
+`ntfsfix` and `-o remove_hiberfile` before anything else touches it.
+
+Both halves of the import do this — the one that installs VirtIO drivers and, since fork
+issue #15, the one that does not. The compatible controller does not make the question go
+away: it decides whether the loader can *read* the disk, not what a resumed kernel then
+finds attached to it.
+
+**Defaults, not measurements.** Hibernation is off by default on Windows Server (2012
+through 2025) and on by default on Windows 10 and 11, and `powercfg /h` can have changed
+either. Nothing here has read the setting on the guests in any particular estate.
+
+### What `tests/hyperv_testbed/verify_hibernation_clear.sh` proves
+
+Fifteen assertions against real `ntfs-3g`, on a volume carrying a `hiberfil.sys` with the
+signature ntfs-3g decides from:
+
+| Question | Answer |
+|---|---|
+| Is the hibernated state real? | Yes — `ntfsfix` says `Windows is hibernated, refused to mount` and exits 1; a plain `-o rw` mount silently falls back to read-only |
+| Is `hiberfil.sys` gone afterwards? | Yes |
+| Is anything else changed? | No — sha256 over every remaining file is identical, and the file count is unchanged |
+| Is the filesystem sound afterwards? | Yes — `ntfsfix -n` clean, still mountable |
+| A guest that was not hibernated? | Byte-identical; no `hiberfil.sys` is created |
+| A Linux guest's ext4? | Never selected, byte-identical |
+
+The run also shows why the option is not optional: without it the volume mounts read-only,
+and the injection's own read-write check fails the run.
+
+### What it does not prove
+
+**That a guest which was hibernated boots after the file is cleared.** That needs Windows
+and a screen. The four rows above were booted from images that had been shut down
+normally, so the matrix does not cover this case for any version. It is the one open
+question on this behaviour, and it is the same question the driver path has carried since
+it started using the option.
+
+When a guest is found in that state the import now says so in the migration log, naming
+that the saved session was discarded — so a boot that then looks different has something
+to be read against.
+
 ## Version-specific points that still need a boot to settle
 
 **Server 2016 and 2019 with an old patch level.** A guest that has not been updated in a
