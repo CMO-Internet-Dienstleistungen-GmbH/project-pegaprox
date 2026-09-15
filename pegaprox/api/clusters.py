@@ -214,7 +214,7 @@ def add_cluster():
         db.update_cluster(cluster_id, {'cluster_type': cluster_type})
 
     # Audit log
-    type_label = 'XCP-ng' if cluster_type == 'xcpng' else 'Proxmox'
+    type_label = {'xcpng': 'XCP-ng'}.get(cluster_type, 'Proxmox')
     log_audit(request.session['user'], 'cluster.added', f"Added {type_label} cluster: {data.get('name')} ({data.get('host')})")
 
     result = {'id': cluster_id, 'message': 'Cluster added successfully'}
