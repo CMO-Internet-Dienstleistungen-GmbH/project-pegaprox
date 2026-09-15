@@ -582,3 +582,50 @@ class TestTheVlanFinding:
 
     def test_a_vm_without_adapters_is_not_a_finding(self):
         assert pf.check_vlan_mapping([], {}).severity == 'ok'
+
+
+class TestTheHostWideTransportCheck:
+    """Whether a target node can read the host is a host fact, measured once.
+
+    Before this, the preflight asked it per VM, could not answer it, and produced a
+    warning to confirm per VM. On 159 guests that is 159 confirmations of one question,
+    and the twenty-first says nothing the first did not.
+    """
+
+    def test_a_successful_check_replaces_the_confirmation_with_a_dated_fact(self):
+        finding = pf.check_source_file_access(
+            {}, probed=False,
+            host_check={'ok': True, 'at_text': '2026-09-15 20:40', 'node': 'pve-1',
+                        'shares': ['VMS$']})
+        assert finding.severity == pf.OK
+        assert '2026-09-15 20:40' in finding.summary
+        assert 'pve-1' in finding.detail and 'VMS$' in finding.detail
+
+    def test_a_failed_check_is_a_blocker_not_a_risk_to_accept(self):
+        # A host nothing can read is a host nothing can be migrated from. Offering that as
+        # a checkbox would let somebody tick their way to a run that cannot move a byte.
+        finding = pf.check_source_file_access(
+            {}, probed=False,
+            host_check={'ok': False, 'at_text': 'just now', 'node': 'pve-1',
+                        'error': 'this node has no CIFS support.'})
+        assert finding.severity == pf.BLOCKING
+        assert 'CIFS' in finding.detail
+
+    def test_without_a_check_it_is_still_the_unknown_to_confirm(self):
+        finding = pf.check_source_file_access({}, probed=False, host_check=None)
+        assert finding.severity == pf.WARNING
+        assert finding.check in pf._ACKNOWLEDGEABLE_CHECKS
+
+    def test_a_real_probe_still_decides(self):
+        # The host check says the share is reachable; this VM's own file is not. The
+        # per-disk probe is the one that runs on the way to an irreversible copy.
+        finding = pf.check_source_file_access(
+            {'C:\\vm\\a.vhdx': False},
+            host_check={'ok': True, 'at_text': 'earlier', 'node': 'pve-1'})
+        assert finding.severity == pf.BLOCKING
+
+    def test_a_successful_check_does_not_hide_a_missing_probe_in_a_run(self):
+        # `probed` defaults to True for a runner, and an empty result then still blocks
+        # however good the host check was.
+        finding = pf.check_source_file_access({}, host_check={'ok': True, 'at_text': 'x'})
+        assert finding.severity == pf.BLOCKING
