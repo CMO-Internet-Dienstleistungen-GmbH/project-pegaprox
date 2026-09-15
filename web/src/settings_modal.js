@@ -5969,6 +5969,12 @@
                                                 <span className="text-sm text-gray-300">{t('enableSsl')}</span>
                                             </label>
                                         </div>
+                                        {/* LW Sep 2026 (#638) - the label reads like a master switch for TLS and
+                                            isn't one: since the fail-closed work HTTPS is served either way, and
+                                            unchecking this only means "no certificate of my own". Someone read the
+                                            code expecting the off position to do something and filed a bug about
+                                            it, which is fair — a toggle shouldn't need the source to understand. */}
+                                        <p className="text-xs text-gray-500 -mt-2">{t('sslAlwaysOnNote') || 'HTTPS is always on. This switch only controls whether your own certificate is used.'}</p>
                                         
                                         {serverSettings.ssl_enabled && (
                                             <div className="space-y-4 pt-2">
