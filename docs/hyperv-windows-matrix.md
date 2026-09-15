@@ -40,6 +40,26 @@ because the first one had to be rebuilt (see below). They are still comparable, 
 what the first column records for that row is a signature the loader refuses, which is a
 property of the driver file and not of the image it is written into.
 
+### Reproduced by the testbed, 2026-09-15
+
+Every row below was produced by one command against a pristine snapshot, with the
+product's own `v2p._inject_virtio_drivers` and the commit under test verified present on
+the machine that ran it. Nothing was typed by hand and nothing was a copy of the product.
+
+| Windows version | Build | Injection | Screen after 7 minutes |
+|---|---|---|---|
+| Server 2016 | 14393 | `INJECTION_OK` | **login screen** (`LogonUI.exe`) |
+| Server 2022 | 20348 | `INJECTION_OK` | **login screen** (`LogonUI.exe`) |
+| Server 2025 | 26100 | `INJECTION_OK` | **login screen** (`LogonUI.exe`) |
+| Server 2012 R2 | 9600 | refused: `BOOT_SIGNATURE_MISSING viostor`, `vioscsi` | left on SATA, as designed |
+
+2012 R2 is the documented case, not a regression: virtio-win stopped having its drivers
+signed through Microsoft, the product checks that before registering anything, and a guest
+in that situation keeps the controller it arrived on rather than one it cannot boot from.
+See *Server 2012 R2 is a different case* below.
+
+### The earlier hand-run rounds
+
 | Windows version | Build | Before the DriverDatabase fix | After it |
 |---|---|---|---|
 | Server 2012 R2 | 9600 | boot manager, `viostor.sys`, `0xc0000428` | **login screen after 1 min**, with the driver ISO named below |

@@ -446,15 +446,40 @@ def check_virtio_drivers(driver_state: str | None, controller: str,
                    'VirtIO afterwards.')
 
 
-def check_source_file_access(reachable_paths: dict, probed: bool = True) -> Finding:
+def check_source_file_access(reachable_paths: dict, probed: bool = True,
+                             host_check: dict | None = None) -> Finding:
     """Every disk file has to be readable before anything else is worth doing.
 
     `probed` separates "checked and failed" from "not checked yet". A runner never passes
     it, so an empty result on the way to an irreversible copy still blocks. Only a caller
     that knows no transport is configured — the preflight preview, before the file share
-    is set up — may set it False, and then the answer is an explicit unknown somebody has
-    to confirm rather than a silent OK.
+    is set up — may set it False, and then the answer is an explicit unknown.
+
+    `host_check` is what a real mount from a target node last found. Whether cifs-utils is
+    installed, whether TCP 445 is open and whether the account may read the share is a
+    property of the host and the network, not of the VM being looked at — the same answer
+    for every guest on it. Once that has been measured, this stops being a question
+    somebody confirms per VM and becomes a fact with a timestamp. It never turns a real
+    failure into an OK: the per-disk probe below still decides, and a host check that
+    FAILED is reported as a blocker rather than as an unknown.
     """
+    if not reachable_paths and not probed and host_check:
+        when = host_check.get('at_text') or 'earlier'
+        if host_check.get('ok'):
+            shares = ', '.join(host_check.get('shares') or []) or 'the configured share'
+            return Finding('source_access', OK,
+                           f'A target node read this host over SMB ({when}).',
+                           f'{host_check.get("node") or "The target node"} mounted {shares} '
+                           'read-only and listed it, so cifs-utils, the route to TCP 445 and '
+                           "the account's read access are all in place. The disks of this "
+                           'particular VM are still probed individually before anything is '
+                           'copied.')
+        return Finding('source_access', BLOCKING,
+                       f'A target node could not read this host over SMB ({when}).',
+                       (host_check.get('error') or 'The mount failed.') + ' Until this is '
+                       'fixed no migration from this host can move a byte, so it is a host '
+                       'problem to solve once rather than a risk to accept per VM.')
+
     if not reachable_paths and not probed:
         # The flag only speaks for an empty result. A caller that handed over findings has
         # probed, whatever it claims, and a real failure must never be downgraded by it.
@@ -528,7 +553,8 @@ def run_preflight(vm: dict, target: dict, options: dict | None = None) -> Prefli
                                     options.get('controller') or DEFAULT_TARGET_CONTROLLER,
                                     bool(options.get('drivers_injected'))))
     report.add(check_source_file_access(options.get('reachable_paths') or {},
-                                       probed=options.get('source_access_probed', True)))
+                                       probed=options.get('source_access_probed', True),
+                                       host_check=options.get('host_transfer_check')))
     return report
 
 

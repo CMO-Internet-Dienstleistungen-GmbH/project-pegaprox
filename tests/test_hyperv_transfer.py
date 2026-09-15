@@ -163,3 +163,126 @@ class TestReadingProgress:
         else, which reads as a transfer that restarted."""
         assert transfer.parse_progress('qemu-img: warning: something') is None
         assert transfer.parse_progress('') is None
+
+
+# ===========================================================================
+# The host-wide transport check
+# ===========================================================================
+
+class FakeNode:
+    """A target node that records what it was asked to run."""
+
+    def __init__(self, fail_on=None, rc=1, err=''):
+        self.commands = []
+        self.stdin = []
+        self._fail_on = fail_on
+        self._rc = rc
+        self._err = err
+        self.closed = False
+
+    def run(self, command, stdin_data=None):
+        self.commands.append(command)
+        if stdin_data is not None:
+            self.stdin.append(stdin_data)
+        if self._fail_on and self._fail_on in command:
+            return self._rc, '', self._err
+        return 0, '', ''
+
+    def close(self):
+        self.closed = True
+
+
+class FakeCheckConfig:
+    user = 'CORP\\svc-migrate'
+    pass_ = 'fixture-' + 'not-a-real-credential'
+    smb_domain = ''
+    smb_share_map = {}
+    host = 'hv-admin.invalid'
+    transfer_host = ''
+
+
+class FakeCheckSource:
+    def __init__(self, **config):
+        self.config = FakeCheckConfig()
+        for key, value in config.items():
+            setattr(self.config, key, value)
+
+    @property
+    def transfer_address(self):
+        return (self.config.transfer_host or '').strip() or self.config.host
+
+
+def _check(source=None, node=None):
+    from pegaprox.core import hyperv_transfer_check
+    node = node or FakeNode()
+    result = hyperv_transfer_check.run_check(
+        source or FakeCheckSource(), object(), 'pve-1', lambda: node)
+    return result, node
+
+
+class TestWhichSharesAreProbed:
+    def test_the_configured_map_is_what_a_migration_would_mount(self):
+        from pegaprox.core import hyperv_transfer_check
+        source = FakeCheckSource(smb_share_map={'C': 'VMS$', 'D': 'VMS$', 'E': 'BACKUP$'})
+        # Deduplicated: two drives commonly map to one share, and mounting it twice would
+        # measure the same thing twice and report two failures for one problem.
+        assert hyperv_transfer_check.shares_to_probe(source) == ['BACKUP$', 'VMS$']
+
+    def test_without_a_map_the_administrative_share_stands_in(self):
+        from pegaprox.core import hyperv_transfer_check
+        assert hyperv_transfer_check.shares_to_probe(FakeCheckSource()) == ['C$']
+
+
+class TestWhatTheCheckDoes:
+    def test_it_mounts_read_only_lists_and_unmounts(self):
+        result, node = _check()
+        assert result['ok'] is True
+        mounts = [c for c in node.commands if 'mount -t cifs' in c]
+        assert len(mounts) == 1
+        assert ',ro,' in mounts[0] or mounts[0].count("'ro,") or 'ro,' in mounts[0]
+        assert any(c.startswith('ls -1 ') for c in node.commands), 'the share was never read'
+        assert any('umount' in c for c in node.commands), 'the share was left mounted'
+
+    def test_the_password_never_reaches_a_command_line(self):
+        # argv is readable in `ps` by anyone on the node.
+        result, node = _check()
+        assert FakeCheckConfig.pass_ not in ' '.join(node.commands)
+        assert any(FakeCheckConfig.pass_ in blob for blob in node.stdin), \
+            'the credentials were not sent over stdin at all'
+
+    def test_it_uses_the_transfer_address_when_there_is_one(self):
+        source = FakeCheckSource(transfer_host='hv-fast.invalid')
+        result, node = _check(source)
+        assert result['host'] == 'hv-fast.invalid'
+        assert any('//hv-fast.invalid/' in c for c in node.commands)
+
+    def test_a_node_without_cifs_is_named_as_the_node_s_problem(self):
+        node = FakeNode(fail_on='mount -t cifs', err='mount: unknown filesystem type cifs')
+        result, _ = _check(node=node)
+        assert result['ok'] is False
+        assert 'cifs-utils' in result['error']
+        assert 'Hyper-V side' in result['error']
+
+    def test_a_refused_account_is_named_as_the_host_s_problem(self):
+        node = FakeNode(fail_on='mount -t cifs', err='mount error(13): Permission denied')
+        result, _ = _check(node=node)
+        assert 'may read this share' in result['error']
+
+    def test_a_share_that_mounts_but_cannot_be_listed_is_still_a_failure(self):
+        # The two are different facts, and only the second is what a transfer needs.
+        node = FakeNode(fail_on='ls -1 ', err='Permission denied')
+        result, _ = _check(node=node)
+        assert result['ok'] is False
+        assert 'could not be listed' in result['error']
+
+    def test_the_session_is_closed_and_nothing_is_left_mounted_on_failure(self):
+        node = FakeNode(fail_on='mount -t cifs', err='boom')
+        _check(node=node)
+        assert node.closed, 'the SSH session was left open'
+        assert any('umount' in c for c in node.commands), 'cleanup did not run'
+
+    def test_the_record_says_when_and_from_where(self):
+        result, _ = _check()
+        assert result['node'] == 'pve-1'
+        assert result['at'] > 0 and result['at_text']
+        assert result['shares'] == ['C$']

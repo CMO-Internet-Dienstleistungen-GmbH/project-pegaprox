@@ -332,3 +332,72 @@ class TestASchemaFromAnEarlierBuild:
         hyperv_db.ensure_schema(conn.cursor())
         columns = [row[1] for row in conn.execute('PRAGMA table_info(hyperv_hosts)').fetchall()]
         assert 'id' in columns
+
+
+class TestTheTransferCheckSurvivesTheRightThings:
+    """A measurement about a host, and what saving the form does to it.
+
+    `save_host` writes the whole row with INSERT OR REPLACE, so a column it does not name
+    goes back to its default. The check was silently erased every time somebody pressed
+    Save — found by the local UI harness, not by a unit test, which is why there is one now.
+    """
+
+    @staticmethod
+    def _host(db, **overrides):
+        data = {'name': 'src', 'host': 'hv.invalid', 'user': 'CORP\\svc', 'pass': 'p',
+                'port': 5985, 'use_ssl': False, 'auth': 'negotiate',
+                'encrypt_messages': True, 'ssl_verification': True,
+                'iso_library_paths': [], 'smb_share_map': {}, 'smb_domain': '',
+                'transfer_host': ''}
+        data.update(overrides)
+        return data
+
+    def _saved(self, db, host_id='h1', **overrides):
+        hyperv_db.save_host(db.conn, db._encrypt, host_id, self._host(db, **overrides))
+        return hyperv_db.load_host(db.conn, db._decrypt, host_id)
+
+    def test_a_plain_edit_keeps_it(self, db):
+        self._saved(db)
+        hyperv_db.save_transfer_check(db.conn, 'h1', {'ok': True, 'node': 'pve-1'})
+        # The same settings again, with no new password: nothing about the path changed.
+        record = self._saved(db, name='renamed', **{'pass': ''})
+        assert record['transfer_check'].get('ok') is True
+
+    def test_a_new_address_discards_it(self, db):
+        self._saved(db)
+        hyperv_db.save_transfer_check(db.conn, 'h1', {'ok': True, 'node': 'pve-1'})
+        record = self._saved(db, host='hv-other.invalid', **{'pass': ''})
+        assert record['transfer_check'] == {}
+
+    def test_a_new_transfer_address_discards_it(self, db):
+        # This is the address the check actually mounted from.
+        self._saved(db)
+        hyperv_db.save_transfer_check(db.conn, 'h1', {'ok': True, 'node': 'pve-1'})
+        record = self._saved(db, transfer_host='10.0.0.9', **{'pass': ''})
+        assert record['transfer_check'] == {}
+
+    def test_a_new_account_discards_it(self, db):
+        self._saved(db)
+        hyperv_db.save_transfer_check(db.conn, 'h1', {'ok': True, 'node': 'pve-1'})
+        record = self._saved(db, user='CORP\\other', **{'pass': ''})
+        assert record['transfer_check'] == {}
+
+    def test_a_new_password_discards_it(self, db):
+        # Whether the share lets the account read is exactly what the check measured.
+        self._saved(db)
+        hyperv_db.save_transfer_check(db.conn, 'h1', {'ok': True, 'node': 'pve-1'})
+        record = self._saved(db, **{'pass': 'different'})
+        assert record['transfer_check'] == {}
+
+    def test_a_new_share_map_discards_it(self, db):
+        self._saved(db)
+        hyperv_db.save_transfer_check(db.conn, 'h1', {'ok': True, 'node': 'pve-1'})
+        record = self._saved(db, smb_share_map={'C': 'VMS$'}, **{'pass': ''})
+        assert record['transfer_check'] == {}
+
+    def test_recording_one_does_not_touch_the_password(self, db):
+        # The two are written by different calls on purpose; a measurement must not be able
+        # to rewrite a credential.
+        self._saved(db)
+        hyperv_db.save_transfer_check(db.conn, 'h1', {'ok': True})
+        assert hyperv_db.load_host(db.conn, db._decrypt, 'h1')['pass'] == 'p'

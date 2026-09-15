@@ -223,6 +223,10 @@ def plan_hyperv_to_pve(source_cluster_id, source_vmid, target_cluster_id) -> dic
         # The plan is rendered before the operator has ticked anything, so it describes
         # the default: the compatible controller, and therefore no injection.
         {'network_map': {}, 'source_access_probed': False,
+         # What a target node last measured about this host. Turns the file-access finding
+         # from a question nobody can answer here into a dated fact -- or into a blocker,
+         # when the measurement failed.
+         'host_transfer_check': getattr(source, 'transfer_check', None) or None,
          'controller': DEFAULT_CONTROLLER,
          'drivers_injected': DEFAULT_HARDWARE == 'virtio'})
 
@@ -1036,6 +1040,26 @@ def _next_target_vmid(target):
         raise TransferError('Proxmox did not hand out a VMID for the new VM.')
 
 
+def open_target_node_session(target, node_name, ssh_user=None):
+    """An SSH session to a Proxmox node, in the shape the transfer uses.
+
+    Split out of `_open_target_node` so the host-wide transfer check reaches a node the
+    same way a migration does. A check that used a different connection would be measuring
+    a path no migration takes.
+    """
+    from pegaprox.core.xhm import _connect_ssh, _resolve_pve_node_ip
+
+    node_ip = _resolve_pve_node_ip(target, node_name)
+    if not node_ip:
+        raise TransferError(f'Cannot resolve an address for Proxmox node {node_name}.')
+    ssh = _connect_ssh(node_ip,
+                       ssh_user or getattr(target.config, 'ssh_user', '') or 'root',
+                       getattr(target.config, 'pass_', ''),
+                       key_path=getattr(target.config, 'ssh_key', ''),
+                       port=int(getattr(target.config, 'ssh_port', 22) or 22))
+    return _Node(ssh, ssh_user or getattr(target.config, 'ssh_user', '') or 'root')
+
+
 def _open_target_node(task, source, target):
     """Connect to the target node and put the share credentials on it, readable by nobody.
 
@@ -1096,10 +1120,11 @@ def _mounted_path_for(task, node, source, credentials_path, mounts, share_map, d
     if point is None:
         point = hyperv_transfer.mount_point_for(f'{task.id}-{_share_slug(share)}')
         exit_code, _, err = node.run(
-            hyperv_transfer.mount_command(source.config.host, share, point, credentials_path))
+            hyperv_transfer.mount_command(source.transfer_address, share, point,
+                                          credentials_path))
         if exit_code != 0:
             raise TransferError(
-                f'Could not mount //{source.config.host}/{share} on {task.target_node}: '
+                f'Could not mount //{source.transfer_address}/{share} on {task.target_node}: '
                 f'{err.strip()[:200]}. The node needs cifs-utils, network access to the '
                 f'Hyper-V host, and an account that may read that share.')
         mounts[share] = point
