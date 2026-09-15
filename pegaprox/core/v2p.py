@@ -2393,6 +2393,10 @@ def _inject_virtio_drivers(pve_mgr, task):
         "{F750E6C3-38EE-11D1-85E5-00C04FC295EE}\"\n"
         "mkdir -p \"$INF_DEST\" \"$CAT_DEST\" 2>/dev/null||true\n"
         "COPIED=0\n"
+        # The INF that ships beside the driver carries its registry values; keep the
+        # directory it was taken from so the hivex step below can read them. Empty
+        # under `set -u` when a driver was skipped. (#823)
+        "VIOSTOR_SRC=\"\"; VIOSCSI_SRC=\"\"\n"
         "for D in $DRIVERS; do "
         "SRC=\"\"; "
         "for SUB in \"$PRIMARY\" $FALLBACKS; do "
@@ -2405,6 +2409,10 @@ def _inject_virtio_drivers(pve_mgr, task):
         "  cp -f \"$SRC\"/*.cat \"$CAT_DEST/\" 2>/dev/null||true; "
         "  COPIED=$((COPIED+1)); "
         "  echo \"COPIED $D ($SRC)\"; "
+        "  case \"$D\" in "
+        "    viostor) VIOSTOR_SRC=\"$SRC\" ;; "
+        "    vioscsi) VIOSCSI_SRC=\"$SRC\" ;; "
+        "  esac; "
         "else "
         "  echo \"COPY_FAILED $D (mount RO?)\"; "
         "fi; "
@@ -2415,7 +2423,7 @@ def _inject_virtio_drivers(pve_mgr, task):
         # NS Apr 2026 — using python3-hivex (well-supported on Debian/Proxmox) instead of
         # hivexregedit which Debian's libhivex-bin doesn't ship.
         "SYSTEM_HIVE=\"$WIN_MNT/$WDIR/System32/config/SYSTEM\"\n"
-        "python3 - \"$SYSTEM_HIVE\" << 'PYEOF' || { echo 'HIVEX_MERGE_FAILED'; exit 9; }\n"
+        "python3 - \"$SYSTEM_HIVE\" \"${VIOSTOR_SRC:-}\" \"${VIOSCSI_SRC:-}\" << 'PYEOF' || { echo 'HIVEX_MERGE_FAILED'; exit 9; }\n"
         "import sys, hivex\n"
         "from hivex.hive_types import REG_DWORD, REG_SZ, REG_EXPAND_SZ\n"
         "h = hivex.Hivex(sys.argv[1], write=True)\n"
@@ -2450,6 +2458,72 @@ def _inject_virtio_drivers(pve_mgr, task):
         "services = navigate(cs, ['Services'])\n"
         "control = navigate(cs, ['Control'])\n"
         "cdb = navigate(control, ['CriticalDeviceDatabase'])\n"
+        # The driver's own INF is the source for these values: HKR,"Parameters",...
+        # in the same directory the .sys was taken from. Read at injection time, so a
+        # virtio-win release that changes one does not need this file changed with it.
+        # A field can be a %token% resolved from the INF's own [Strings] section, so both
+        # the flags and the value are expanded before they are read as numbers. The type is
+        # matched against FLG_ADDREG_TYPE_MASK (0xFFFF0001) rather than against the DWORD
+        # encoding alone -- 0x000B0001 is QWORD and shares its low bit, and writing that
+        # back as a DWORD would override the fallback with a truncated value. The
+        # per-driver pair below stays the fallback: an ISO layout that ships no INF
+        # next to the .sys must not turn into no value at all. (#823)
+        "_INF_DIR = {'viostor': sys.argv[2] if len(sys.argv) > 2 else '',\n"
+        "            'vioscsi': sys.argv[3] if len(sys.argv) > 3 else ''}\n"
+        "def _inf_text(path):\n"
+        "    raw = open(path, 'rb').read()\n"
+        "    if raw[:2] in (b'\\xff\\xfe', b'\\xfe\\xff'):\n"
+        "        return raw.decode('utf-16', 'replace')\n"
+        "    return raw.decode('utf-8', 'replace')\n"
+        "def _inf_strings(text):\n"
+        "    out = {}\n"
+        "    in_strings = False\n"
+        "    for line in text.splitlines():\n"
+        "        line = line.split(';', 1)[0].strip()\n"
+        "        if line.startswith('['):\n"
+        "            in_strings = line.lower().startswith('[strings')\n"
+        "            continue\n"
+        "        if not in_strings or '=' not in line:\n"
+        "            continue\n"
+        "        k, v = line.split('=', 1)\n"
+        "        out[k.strip().lower()] = v.strip().strip('\"').strip()\n"
+        "    return out\n"
+        "def _expand(tok, strings):\n"
+        "    if len(tok) > 2 and tok.startswith('%') and tok.endswith('%'):\n"
+        "        return strings.get(tok[1:-1].lower(), tok)\n"
+        "    return tok\n"
+        "def inf_parameters(svc, defaults):\n"
+        "    out = dict(defaults)\n"
+        "    canon = {k.lower(): k for k in out}\n"
+        "    strings = {}\n"
+        "    read = {}\n"
+        "    text = ''\n"
+        "    _dir = _INF_DIR.get(svc)\n"
+        "    if _dir:\n"
+        "        try:\n"
+        "            text = _inf_text(os.path.join(_dir, svc + '.inf'))\n"
+        "            strings = _inf_strings(text)\n"
+        "        except OSError:\n"
+        "            pass\n"
+        "    for line in text.splitlines():\n"
+        "        line = line.split(';', 1)[0].strip()\n"
+        "        if not line.lower().startswith('hkr'):\n"
+        "            continue\n"
+        "        f = [p.strip().strip('\"').strip() for p in line.split(',')]\n"
+        "        if len(f) < 5 or f[1].lower() != 'parameters':\n"
+        "            continue\n"
+        "        name = canon.get(f[2].lower())\n"
+        "        if name is None:\n"
+        "            continue\n"
+        "        try:\n"
+        "            if int(_expand(f[3], strings), 0) & 0xFFFF0001 != 0x00010001:\n"
+        "                continue\n"
+        "            read[name] = int(_expand(f[4], strings), 0)\n"
+        "        except ValueError:\n"
+        "            continue\n"
+        "    out.update(read)\n"
+        "    print(f'INF {svc} read={read} using={out}')\n"
+        "    return out\n"
         # The fourth field is Parameters\BusType, and it is not the same for both
         # drivers. viostor.inf writes 0x00000001; every vioscsi.inf the virtio-win ISO
         # ships writes 0x0000000A -- all thirteen variants, 2k8 through 2k25. Writing 1
@@ -2467,9 +2541,12 @@ def _inject_virtio_drivers(pve_mgr, task):
         "    set_dword(svc_node, 'ErrorControl', 1)\n"
         "    set_dword(svc_node, 'Tag', tag)\n"
         "    params = navigate(svc_node, ['Parameters'])\n"
-        "    set_dword(params, 'BusType', bus_type)\n"
-        # Both INFs set this one next to BusType and the injection never wrote it.
-        "    set_dword(params, 'DmaRemappingCompatible', 0)\n"
+        # Both INFs set DmaRemappingCompatible next to BusType; the injection wrote
+        # neither per driver before.
+        "    _p = inf_parameters(svc, {'BusType': bus_type,\n"
+        "                              'DmaRemappingCompatible': 0})\n"
+        "    set_dword(params, 'BusType', _p['BusType'])\n"
+        "    set_dword(params, 'DmaRemappingCompatible', _p['DmaRemappingCompatible'])\n"
         "    pnp = navigate(params, ['PnpInterface'])\n"
         "    set_dword(pnp, '5', 1)\n"
         "GUID = '{4D36E97B-E325-11CE-BFC1-08002BE10318}'\n"
@@ -2614,8 +2691,8 @@ def _inject_virtio_drivers(pve_mgr, task):
     # Surface the interesting lines — keep the log compact.
     # Most markers are once-per-run; COPIED/SKIP/COPY_FAILED are per-driver
     # so we log all of them (otherwise we'd hide which drivers actually staged).
-    _multi = ('COPIED ', 'SKIP ', 'COPY_FAILED ')
-    for marker in ['WIN_PART=', 'WDIR=', 'VER_NAME=', 'VER_BUILD=', 'SUBDIR_PRIMARY=', 'SUBDIR_FALLBACKS=', 'SUBDIR=', 'COPIED ', 'SKIP ', 'COPY_FAILED ', 'MSI_STAGED ', 'MSI_MISSING', 'SVC_REGISTERED', 'SVC_FAILED', 'INJECTION_OK']:
+    _multi = ('COPIED ', 'SKIP ', 'COPY_FAILED ', 'INF ')
+    for marker in ['WIN_PART=', 'WDIR=', 'VER_NAME=', 'VER_BUILD=', 'SUBDIR_PRIMARY=', 'SUBDIR_FALLBACKS=', 'SUBDIR=', 'COPIED ', 'SKIP ', 'COPY_FAILED ', 'INF ', 'MSI_STAGED ', 'MSI_MISSING', 'SVC_REGISTERED', 'SVC_FAILED', 'INJECTION_OK']:
         for line in out_str.splitlines():
             if marker in line:
                 task.log(f"[VirtIO] {line.strip()}")

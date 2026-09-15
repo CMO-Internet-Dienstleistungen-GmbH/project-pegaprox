@@ -266,3 +266,207 @@ def test_the_block_drivers_entries_are_left_alone(written, key):
 def test_the_registry_program_is_valid_python(node_script):
     """It is assembled from string literals and runs on a customer's hypervisor."""
     compile(_registry_program(node_script), '<injection>', 'exec')
+
+
+# ── the values come out of the INF that ships beside the driver ──────────────
+#
+# Marcus Kellermann on #823: hard-coding what the vendor writes is correct until the
+# vendor changes it. The INF is in the directory the .sys was copied from, so read it
+# there and keep the per-driver pair as the fallback.
+
+# What virtio-win actually ships, trimmed to the lines that matter.
+_VIOSCSI_INF = """\
+; vioscsi.inf
+[Version]
+Signature="$WINDOWS NT$"
+Class=SCSIAdapter
+
+[vioscsi_RegistryAddReg]
+HKR,"Parameters\\PnpInterface","5",0x00010001,0x00000001
+HKR, "Parameters", "BusType", 0x00010001, 0x0000000A
+HKR, "Parameters", "DmaRemappingCompatible", 0x00010001, 0
+"""
+
+_VIOSTOR_INF = """\
+; viostor.inf
+[viostor_RegistryAddReg]
+HKR, "Parameters", "BusType", 0x00010001, 0x00000001
+HKR, "Parameters", "DmaRemappingCompatible", 0x00010001, 0
+"""
+
+
+@pytest.fixture
+def inf_dir(tmp_path):
+    d = tmp_path / 'iso' / 'amd64'
+    d.mkdir(parents=True)
+    return d
+
+
+def _with_infs(node_script, tmp_path, monkeypatch, inf_dir):
+    return _run_registry_program(node_script, tmp_path, monkeypatch,
+                                 argv_extra=(str(inf_dir), str(inf_dir)))
+
+
+def test_the_values_are_read_from_the_shipped_inf(node_script, tmp_path, monkeypatch,
+                                                  inf_dir):
+    (inf_dir / 'vioscsi.inf').write_text(_VIOSCSI_INF)
+    (inf_dir / 'viostor.inf').write_text(_VIOSTOR_INF)
+
+    hive = _with_infs(node_script, tmp_path, monkeypatch, inf_dir)
+    assert hive.dword(_PARAMS.format('vioscsi'), 'BusType') == 0x0A
+    assert hive.dword(_PARAMS.format('viostor'), 'BusType') == 0x01
+
+
+def test_a_changed_inf_changes_what_is_written(node_script, tmp_path, monkeypatch,
+                                               inf_dir):
+    """The point of reading it: a virtio-win release that moves the value moves with it,
+    without this file being edited. A value no ISO ships, so only the INF can produce it.
+    """
+    (inf_dir / 'vioscsi.inf').write_text(
+        _VIOSCSI_INF.replace('0x0000000A', '0x0000000C'))
+
+    hive = _with_infs(node_script, tmp_path, monkeypatch, inf_dir)
+    assert hive.dword(_PARAMS.format('vioscsi'), 'BusType') == 0x0C
+
+
+def test_the_second_value_is_read_the_same_way(node_script, tmp_path, monkeypatch,
+                                               inf_dir):
+    (inf_dir / 'vioscsi.inf').write_text(
+        _VIOSCSI_INF.replace('"DmaRemappingCompatible", 0x00010001, 0',
+                             '"DmaRemappingCompatible", 0x00010001, 1'))
+
+    hive = _with_infs(node_script, tmp_path, monkeypatch, inf_dir)
+    assert hive.dword(_PARAMS.format('vioscsi'), 'DmaRemappingCompatible') == 1
+
+
+def test_a_utf16_inf_is_read_too(node_script, tmp_path, monkeypatch, inf_dir):
+    """INF files are shipped in both encodings; a mojibake read would silently fall back."""
+    (inf_dir / 'vioscsi.inf').write_bytes(
+        _VIOSCSI_INF.replace('0x0000000A', '0x0000000C').encode('utf-16'))
+
+    hive = _with_infs(node_script, tmp_path, monkeypatch, inf_dir)
+    assert hive.dword(_PARAMS.format('vioscsi'), 'BusType') == 0x0C
+
+
+def test_a_missing_inf_leaves_the_built_in_value(node_script, tmp_path, monkeypatch,
+                                                 inf_dir):
+    """An ISO layout with no INF next to the .sys must not turn into no value at all."""
+    hive = _with_infs(node_script, tmp_path, monkeypatch, inf_dir)
+    assert hive.dword(_PARAMS.format('vioscsi'), 'BusType') == 0x0A
+    assert hive.dword(_PARAMS.format('viostor'), 'BusType') == 0x01
+    assert hive.dword(_PARAMS.format('vioscsi'), 'DmaRemappingCompatible') == 0
+
+
+def test_a_node_that_reports_no_directory_at_all_still_writes_the_values(written):
+    """The injection passes two more arguments now; an older shell that passes none, or a
+    driver that was skipped, has to keep working."""
+    assert written.dword(_PARAMS.format('vioscsi'), 'BusType') == 0x0A
+
+
+@pytest.mark.parametrize('line', [
+    'HKR, "Parameters", "BusType", 0x00000000, 0x0000000C',   # not a DWORD write
+    'HKR, "Parameters\\Other", "BusType", 0x00010001, 0x0C',  # a different subkey
+    'HKLM, "Parameters", "BusType", 0x00010001, 0x0C',        # not HKR
+    '; HKR, "Parameters", "BusType", 0x00010001, 0x0C',       # commented out
+    'HKR, "Parameters", "BusType", 0x00010001, notanumber',
+])
+def test_a_line_that_does_not_write_this_dword_is_ignored(node_script, tmp_path,
+                                                          monkeypatch, inf_dir, line):
+    (inf_dir / 'vioscsi.inf').write_text(_VIOSCSI_INF + line + '\n')
+
+    hive = _with_infs(node_script, tmp_path, monkeypatch, inf_dir)
+    assert hive.dword(_PARAMS.format('vioscsi'), 'BusType') == 0x0A
+
+
+def test_an_unreadable_inf_does_not_abort_the_injection(node_script, tmp_path,
+                                                        monkeypatch, inf_dir):
+    """A directory where a file is expected raises on open; the hive still gets written."""
+    (inf_dir / 'vioscsi.inf').mkdir()
+
+    hive = _with_infs(node_script, tmp_path, monkeypatch, inf_dir)
+    assert hive.dword(_PARAMS.format('vioscsi'), 'BusType') == 0x0A
+
+
+def test_the_injection_hands_the_node_both_directories(node_script):
+    """Read from the ISO the .sys came from, not from the guest's INF directory: the
+    copy into the guest is best-effort and its spelling differs between Windows versions.
+    """
+    assert 'VIOSTOR_SRC="$SRC"' in node_script
+    assert 'VIOSCSI_SRC="$SRC"' in node_script
+    assert '"$SYSTEM_HIVE" "${VIOSTOR_SRC:-}" "${VIOSCSI_SRC:-}"' in node_script
+
+
+def test_no_directory_means_no_file_is_opened_at_all(node_script, tmp_path, monkeypatch):
+    """A driver that was skipped hands over an empty string. Joining that with the file
+    name gives a *relative* path, which would read whatever happens to sit in the node
+    script's working directory."""
+    stray = tmp_path / 'cwd'
+    stray.mkdir()
+    (stray / 'vioscsi.inf').write_text(
+        _VIOSCSI_INF.replace('0x0000000A', '0x0000000C'))
+    monkeypatch.chdir(stray)
+
+    hive = _run_registry_program(node_script, tmp_path, monkeypatch, argv_extra=('', ''))
+    assert hive.dword(_PARAMS.format('vioscsi'), 'BusType') == 0x0A
+
+
+# ── the INF's own [Strings] section ──────────────────────────────────────────
+#
+# Both of these came out of a Codex review of the two commits above.
+
+_INF_WITH_STRINGS = """\
+[vioscsi_RegistryAddReg]
+HKR, "Parameters", "BusType", %REG_DWORD%, %BusTypeValue%
+HKR, "Parameters", "DmaRemappingCompatible", %REG_DWORD%, 0
+
+[Strings]
+REG_DWORD      = 0x00010001
+BusTypeValue   = "0x0000000C"
+"""
+
+
+def test_a_symbolic_flag_and_value_are_resolved(node_script, tmp_path, monkeypatch,
+                                                inf_dir):
+    """An INF may spell either field as a %token% defined in its own [Strings] section.
+    Read as text those raise, the fallback wins, and the INF is silently not being used --
+    which is the whole point of reading it."""
+    (inf_dir / 'vioscsi.inf').write_text(_INF_WITH_STRINGS)
+
+    hive = _with_infs(node_script, tmp_path, monkeypatch, inf_dir)
+    assert hive.dword(_PARAMS.format('vioscsi'), 'BusType') == 0x0C
+
+
+def test_a_localised_strings_section_is_read_as_well(node_script, tmp_path, monkeypatch,
+                                                     inf_dir):
+    (inf_dir / 'vioscsi.inf').write_text(
+        _INF_WITH_STRINGS.replace('[Strings]', '[Strings.0409]'))
+
+    hive = _with_infs(node_script, tmp_path, monkeypatch, inf_dir)
+    assert hive.dword(_PARAMS.format('vioscsi'), 'BusType') == 0x0C
+
+
+def test_a_token_no_strings_section_defines_is_not_guessed_at(node_script, tmp_path,
+                                                              monkeypatch, inf_dir):
+    (inf_dir / 'vioscsi.inf').write_text(
+        _INF_WITH_STRINGS.split('[Strings]')[0])
+
+    hive = _with_infs(node_script, tmp_path, monkeypatch, inf_dir)
+    assert hive.dword(_PARAMS.format('vioscsi'), 'BusType') == 0x0A
+
+
+@pytest.mark.parametrize('flags,name', [
+    ('0x000B0001', 'QWORD'),          # FLG_ADDREG_TYPE_QWORD -- shares the low bit
+    ('0x00020001', 'NONE'),           # FLG_ADDREG_TYPE_NONE  -- likewise
+])
+def test_another_type_that_shares_the_dwords_low_bit_is_not_written_as_a_dword(
+        node_script, tmp_path, monkeypatch, inf_dir, flags, name):
+    """0x00010001 is the DWORD encoding, not the type mask. Matching on it alone lets a
+    QWORD entry through, and it would be written back truncated to four bytes -- replacing
+    a correct fallback with a value the INF never asked to be a DWORD."""
+    (inf_dir / 'vioscsi.inf').write_text(
+        _VIOSCSI_INF.replace('"BusType", 0x00010001, 0x0000000A',
+                             f'"BusType", {flags}, 0x0000000C'))
+
+    hive = _with_infs(node_script, tmp_path, monkeypatch, inf_dir)
+    assert hive.dword(_PARAMS.format('vioscsi'), 'BusType') == 0x0A, \
+        f'a {name} entry was adopted as a DWORD'
