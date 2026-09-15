@@ -2450,10 +2450,15 @@ def _inject_virtio_drivers(pve_mgr, task):
         "services = navigate(cs, ['Services'])\n"
         "control = navigate(cs, ['Control'])\n"
         "cdb = navigate(control, ['CriticalDeviceDatabase'])\n"
+        # The fourth field is Parameters\BusType, and it is not the same for both
+        # drivers. viostor.inf writes 0x00000001; every vioscsi.inf the virtio-win ISO
+        # ships writes 0x0000000A -- all thirteen variants, 2k8 through 2k25. Writing 1
+        # for vioscsi stops a guest whose boot disk moved to virtio-scsi-single at
+        # INACCESSIBLE_BOOT_DEVICE, before usermode. (#823)
         "_svcs = []\n"
-        "if have_viostor: _svcs.append(('viostor', 0x58, 'system32\\\\drivers\\\\viostor.sys'))\n"
-        "if have_vioscsi: _svcs.append(('vioscsi', 0x59, 'system32\\\\drivers\\\\vioscsi.sys'))\n"
-        "for svc, tag, img in _svcs:\n"
+        "if have_viostor: _svcs.append(('viostor', 0x58, 'system32\\\\drivers\\\\viostor.sys', 0x01))\n"
+        "if have_vioscsi: _svcs.append(('vioscsi', 0x59, 'system32\\\\drivers\\\\vioscsi.sys', 0x0A))\n"
+        "for svc, tag, img, bus_type in _svcs:\n"
         "    svc_node = navigate(services, [svc])\n"
         "    set_expand_sz(svc_node, 'ImagePath', img)\n"
         "    set_dword(svc_node, 'Type', 1)\n"
@@ -2462,7 +2467,9 @@ def _inject_virtio_drivers(pve_mgr, task):
         "    set_dword(svc_node, 'ErrorControl', 1)\n"
         "    set_dword(svc_node, 'Tag', tag)\n"
         "    params = navigate(svc_node, ['Parameters'])\n"
-        "    set_dword(params, 'BusType', 1)\n"
+        "    set_dword(params, 'BusType', bus_type)\n"
+        # Both INFs set this one next to BusType and the injection never wrote it.
+        "    set_dword(params, 'DmaRemappingCompatible', 0)\n"
         "    pnp = navigate(params, ['PnpInterface'])\n"
         "    set_dword(pnp, '5', 1)\n"
         "GUID = '{4D36E97B-E325-11CE-BFC1-08002BE10318}'\n"
@@ -2471,9 +2478,15 @@ def _inject_virtio_drivers(pve_mgr, task):
         "    _pci += [('pci#ven_1af4&dev_1001', 'viostor'),\n"
         "             ('pci#ven_1af4&dev_1001&subsys_00021af4&rev_00', 'viostor')]\n"
         "if have_vioscsi:\n"
+        # vioscsi.inf names exactly two devices: DEV_1004 (transitional) and DEV_1048
+        # (modern). DEV_1041 is VirtIO *network* -- it is what netkvm.inf matches -- and
+        # it stood here in place of the modern SCSI id, so a guest presented the modern
+        # device found no entry at all. Which of the two a guest sees depends on the
+        # machine type the target VM was built with. (#823)
         "    _pci += [('pci#ven_1af4&dev_1004', 'vioscsi'),\n"
         "             ('pci#ven_1af4&dev_1004&subsys_00081af4', 'vioscsi'),\n"
-        "             ('pci#ven_1af4&dev_1041', 'vioscsi')]\n"
+        "             ('pci#ven_1af4&dev_1048', 'vioscsi'),\n"
+        "             ('pci#ven_1af4&dev_1048&subsys_11001af4&rev_01', 'vioscsi')]\n"
         "for pci_id, svc in _pci:\n"
         "    cd = navigate(cdb, [pci_id])\n"
         "    set_sz(cd, 'ClassGUID', GUID)\n"
