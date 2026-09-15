@@ -2425,7 +2425,8 @@ def _inject_virtio_drivers(pve_mgr, task):
         "SYSTEM_HIVE=\"$WIN_MNT/$WDIR/System32/config/SYSTEM\"\n"
         "python3 - \"$SYSTEM_HIVE\" \"${VIOSTOR_SRC:-}\" \"${VIOSCSI_SRC:-}\" << 'PYEOF' || { echo 'HIVEX_MERGE_FAILED'; exit 9; }\n"
         "import sys, hivex\n"
-        "from hivex.hive_types import REG_DWORD, REG_SZ, REG_EXPAND_SZ\n"
+        "from hivex.hive_types import (REG_BINARY, REG_DWORD, REG_EXPAND_SZ,\n"
+        "                              REG_MULTI_SZ, REG_SZ)\n"
         "h = hivex.Hivex(sys.argv[1], write=True)\n"
         "def navigate(parent, parts):\n"
         "    n = parent\n"
@@ -2444,11 +2445,17 @@ def _inject_virtio_drivers(pve_mgr, task):
         "def set_expand_sz(node, key, val):\n"
         "    h.node_set_value(node, {'key': key, 't': REG_EXPAND_SZ,\n"
         "        'value': (val + '\\u0000').encode('utf-16-le')})\n"
+        "def set_binary(node, key, val):\n"
+        "    h.node_set_value(node, {'key': key, 't': REG_BINARY, 'value': val})\n"
+        "def set_multi_sz(node, key, values):\n"
+        "    raw = ''.join(v + '\\u0000' for v in values) + '\\u0000'\n"
+        "    h.node_set_value(node, {'key': key, 't': REG_MULTI_SZ,\n"
+        "        'value': raw.encode('utf-16-le')})\n"
         # NS May 2026 — only register drivers whose .sys actually got copied.
         # Setting Start=0 for a missing miniport bricks Windows boot
         # (BSOD INACCESSIBLE_BOOT_DEVICE before usermode), so we skip any
         # service whose backing file isn't present on the target FS.
-        "import os\n"
+        "import os, struct\n"
         "drv_root = os.path.dirname(sys.argv[1]) + '/../drivers'\n"
         "have_viostor = os.path.exists(drv_root + '/viostor.sys')\n"
         "have_vioscsi = os.path.exists(drv_root + '/vioscsi.sys')\n"
@@ -2475,6 +2482,20 @@ def _inject_virtio_drivers(pve_mgr, task):
         "    if raw[:2] in (b'\\xff\\xfe', b'\\xfe\\xff'):\n"
         "        return raw.decode('utf-16', 'replace')\n"
         "    return raw.decode('utf-8', 'replace')\n"
+        "def pe_arch(path):\n"
+        "    \"\"\"amd64 / x86 / arm64 from the PE header, or '' when it cannot be read.\"\"\"\n"
+        "    try:\n"
+        "        with open(path, 'rb') as fh:\n"
+        "            head = fh.read(0x400)\n"
+        "        if head[:2] != b'MZ':\n"
+        "            return ''\n"
+        "        pe = struct.unpack_from('<I', head, 0x3C)[0]\n"
+        "        if head[pe:pe + 2] != b'PE':\n"
+        "            return ''\n"
+        "        machine = struct.unpack_from('<H', head, pe + 4)[0]\n"
+        "    except Exception:\n"
+        "        return ''\n"
+        "    return {0x8664: 'amd64', 0x014C: 'x86', 0xAA64: 'arm64'}.get(machine, '')\n"
         "def _inf_strings(text):\n"
         "    out = {}\n"
         "    in_strings = False\n"
@@ -2550,6 +2571,18 @@ def _inject_virtio_drivers(pve_mgr, task):
         "    pnp = navigate(params, ['PnpInterface'])\n"
         "    set_dword(pnp, '5', 1)\n"
         "GUID = '{4D36E97B-E325-11CE-BFC1-08002BE10318}'\n"
+        # The same GUID as sixteen raw bytes, which is how the driver database stores it.
+        "GUID_BYTES = bytes.fromhex('7be9364d25e3ce11bfc108002be10318')\n"
+        # Per driver, the hardware it supports, in the spelling Windows itself keeps in
+        # DriverDatabase\DeviceIds. The transitional device answers with REV_00 and the
+        # modern one with REV_01, and a guest may present either depending on the machine
+        # type it was built with. Separate from the _pci list below, which is the legacy
+        # CriticalDeviceDatabase and keeps its own spelling.
+        "_devices = {}\n"
+        "if have_viostor:\n"
+        "    _devices['viostor'] = ['VEN_1AF4&DEV_1001&REV_00', 'VEN_1AF4&DEV_1042&REV_01']\n"
+        "if have_vioscsi:\n"
+        "    _devices['vioscsi'] = ['VEN_1AF4&DEV_1004&REV_00', 'VEN_1AF4&DEV_1048&REV_01']\n"
         "_pci = []\n"
         "if have_viostor:\n"
         "    _pci += [('pci#ven_1af4&dev_1001', 'viostor'),\n"
@@ -2568,6 +2601,55 @@ def _inject_virtio_drivers(pve_mgr, task):
         "    cd = navigate(cdb, [pci_id])\n"
         "    set_sz(cd, 'ClassGUID', GUID)\n"
         "    set_sz(cd, 'Service', svc)\n"
+        # Windows 8 and Server 2012 and everything after them do not read the
+        # CriticalDeviceDatabase any more. They bind a boot device through
+        # HKLM\SYSTEM\DriverDatabase, so a guest whose disk driver is registered only the
+        # old way loads the driver and then cannot attach it to the controller it has just
+        # booted from -- which the kernel reports as INACCESSIBLE_BOOT_DEVICE. Measured on
+        # freshly installed Server 2016, 2022 and 2025, each with the service entry, the
+        # driver file and the CriticalDeviceDatabase all correct: all three opened the
+        # recovery environment, and all three reach the login screen once this is written.
+        # The database is written in the shape libguestfs writes it, which is the
+        # implementation this was read off (mlcustomize/inject_virtio_win.ml).
+        #
+        # The old entries stay: a guest without a DriverDatabase branch -- Windows 7 and
+        # Server 2008 R2 -- still needs them, and on a newer guest they are simply unread.
+        "ddb = h.node_get_child(root, 'DriverDatabase')\n"
+        "if ddb is None:\n"
+        "    print('HIVEX no DriverDatabase - pre-Windows 8 guest, CriticalDeviceDatabase only')\n"
+        "else:\n"
+        # The package is named after this product, not after the driver, so it cannot
+        # collide with one the guest already has. A Server 2025 image was found carrying a
+        # virtio catalogue of its own, and an entry under the driver's real INF name would
+        # replace whatever that belongs to with something assembled here. libguestfs does
+        # the same for the same reason. The architecture is read out of the PE header of
+        # the driver actually being registered, not off the directory it came from: that
+        # directory is empty for a driver whose .sys was already in the guest and was not
+        # copied again this run, and defaulting to amd64 there would relabel an existing
+        # x86 package. The file has to be present for the driver to be registered at all.
+        "    for svc, pci_ids in _devices.items():\n"
+        "        arch = pe_arch(drv_root + '/' + svc + '.sys') or 'amd64'\n"
+        "        inf = 'pegaprox_' + svc + '.inf'\n"
+        "        label = inf + '_' + arch + '_0000000000000000'\n"
+        "        config = svc + '_conf'\n"
+        "        inf_files = navigate(ddb, ['DriverInfFiles', inf])\n"
+        "        set_multi_sz(inf_files, '', [label])\n"
+        "        set_sz(inf_files, 'Active', label)\n"
+        "        set_multi_sz(inf_files, 'Configurations', [config])\n"
+        "        package = navigate(ddb, ['DriverPackages', label])\n"
+        # Windows-Kernel-Pnp on Windows 10 and Server 2016 refuses a package without this.
+        "        set_binary(package, 'Version',\n"
+        "                   b'\\x00\\xff\\x09\\x00\\x00\\x00\\x00\\x00'\n"
+        "                   + GUID_BYTES + bytes(24))\n"
+        "        configuration = navigate(package, ['Configurations', config])\n"
+        "        set_dword(configuration, 'ConfigFlags', 0)\n"
+        "        set_sz(configuration, 'Service', svc)\n"
+        "        for pci_id in pci_ids:\n"
+        "            set_binary(navigate(ddb, ['DeviceIds', 'PCI', pci_id]), inf,\n"
+        "                       b'\\x01\\xff\\x00\\x00')\n"
+        "            set_sz(navigate(package, ['Descriptors', 'PCI', pci_id]),\n"
+        "                   'Configuration', config)\n"
+        "        print('DriverDatabase ' + svc + ': ' + ', '.join(pci_ids))\n"
         "h.commit(None)\n"
         "print('hivex commit OK')\n"
         "PYEOF\n"
@@ -2691,8 +2773,8 @@ def _inject_virtio_drivers(pve_mgr, task):
     # Surface the interesting lines — keep the log compact.
     # Most markers are once-per-run; COPIED/SKIP/COPY_FAILED are per-driver
     # so we log all of them (otherwise we'd hide which drivers actually staged).
-    _multi = ('COPIED ', 'SKIP ', 'COPY_FAILED ', 'INF ')
-    for marker in ['WIN_PART=', 'WDIR=', 'VER_NAME=', 'VER_BUILD=', 'SUBDIR_PRIMARY=', 'SUBDIR_FALLBACKS=', 'SUBDIR=', 'COPIED ', 'SKIP ', 'COPY_FAILED ', 'INF ', 'MSI_STAGED ', 'MSI_MISSING', 'SVC_REGISTERED', 'SVC_FAILED', 'INJECTION_OK']:
+    _multi = ('COPIED ', 'SKIP ', 'COPY_FAILED ', 'INF ', 'DriverDatabase ')
+    for marker in ['WIN_PART=', 'WDIR=', 'VER_NAME=', 'VER_BUILD=', 'SUBDIR_PRIMARY=', 'SUBDIR_FALLBACKS=', 'SUBDIR=', 'COPIED ', 'SKIP ', 'COPY_FAILED ', 'INF ', 'DriverDatabase ', 'MSI_STAGED ', 'MSI_MISSING', 'SVC_REGISTERED', 'SVC_FAILED', 'INJECTION_OK']:
         for line in out_str.splitlines():
             if marker in line:
                 task.log(f"[VirtIO] {line.strip()}")
