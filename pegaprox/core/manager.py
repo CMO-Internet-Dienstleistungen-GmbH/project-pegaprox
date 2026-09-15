@@ -281,6 +281,22 @@ def _ssh_auth_hint(stderr):
                     "— add an authorized SSH key for this cluster; the password/token only "
                     "covers the PVE API, not SSH")
         return "SSH password rejected — check the node credentials or add an SSH key"
+    # MK Sep 2026 — sudo, not ssh. For a non-root cluster user every node command goes
+    # through `sudo -n bash` (see _wrap_with_sudo), so a node that logs us in perfectly
+    # still answers nothing when that user has no passwordless sudo. Without a branch
+    # here the hint machinery stayed silent and the caller's only error string blamed
+    # the SSH connection, which the operator can see working in their own sshd log.
+    if 'sudo:' in low or 'sudoers' in low:
+        if 'password is required' in low or 'askpass' in low or 'no tty' in low:
+            return ("SSH works, sudo does not: the cluster SSH user needs passwordless "
+                    "sudo on the node (NOPASSWD), because non-root cluster users run "
+                    "node commands through `sudo -n bash`")
+        if 'not in the sudoers' in low:
+            return ("SSH works, but this cluster's user is not in sudoers on the node — "
+                    "node-level checks need root there")
+        if 'command not found' in low:
+            return "SSH works, but sudo is not installed on the node"
+        return "SSH works, sudo refused the command — see the node's sudoers configuration"
     return None
 
 
@@ -6645,11 +6661,27 @@ echo "AGENT_INSTALLED_OK"
         
         return result
     
+    def _last_ssh_stderr(self, host):
+        """stderr of the most recent failed SSH attempt against this host, or ''.
+
+        MK Sep 2026 — kept so a caller can tell an auth failure from a sudo refusal
+        after the fact. Bounded to the last message per host; this is a diagnostic
+        crumb, not a log.
+        """
+        return self.__dict__.get('_ssh_last_stderr', {}).get(host, '')
+
     def _note_ssh_auth_hint(self, host, stderr):
         """#717: surface an actionable SSH-auth hint ONCE per host, at INFO level so it
         shows without DEBUG. The per-command sites only DEBUG the raw stderr; this lifts
         the conclusion ('add an SSH key' / 'host key changed') into normal logs where a
         user staring at a compliance 502 will actually see it."""
+        # Keep the raw text around for _ssh_node_output_ex — the hint is deduplicated
+        # per host below, but a caller asking "why did this command come back empty"
+        # needs the reason every time, not only the first.
+        store = self.__dict__.setdefault('_ssh_last_stderr', {})
+        store[host] = (stderr or '')[-2000:]
+        if len(store) > 512:          # estate-sized clusters: don't let this grow forever
+            store.pop(next(iter(store)), None)
         hint = _ssh_auth_hint(stderr)
         if not hint:
             return
@@ -15395,30 +15427,58 @@ echo "AGENT_INSTALLED_OK"
         and fails with Permission denied. The base64 path preserves the full command
         intact and hands it to a root bash.
         """
+        out, _ = self._ssh_node_output_ex(node_name, cmd, timeout=timeout)
+        return out
+
+    def _ssh_node_output_ex(self, node_name, cmd, timeout=60):
+        """Same as _ssh_node_output, but also says WHY when there is no output.
+
+        MK Sep 2026 — every failure in here used to collapse into a bare None, and the
+        callers each had one error string to show for it, usually naming SSH. That is
+        wrong for the most common case on a non-root cluster user: the login succeeds
+        and `sudo -n bash` is what gets refused, so the operator reads "SSH connection
+        failed" next to an sshd log showing an accepted password and a clean session.
+
+        Returns (stdout, reason) where reason is None on success and otherwise a short
+        human-readable sentence.
+        """
         node_ip = self._get_node_ip(node_name)
         if not node_ip:
-            return None
+            return None, f"no reachable IP resolved for node '{node_name}'"
 
         ssh_user = (self.config.user or 'root').split('@')[0]
         # Sudo wrap is handled inside the _ssh_run_command_* helpers so we don't
         # double-wrap when the call chain goes through multiple layers.
 
+        # Drop anything an earlier call left behind for this host: a timeout never
+        # records stderr, and reporting the previous run's reason for it would be a
+        # confidently wrong diagnosis, which is worse than the vague one we had.
+        self.__dict__.setdefault('_ssh_last_stderr', {}).pop(node_ip, None)
+        last_err = ''
         ssh_key = getattr(self.config, 'ssh_key', '')
         if ssh_key:
             out = self._ssh_run_command_with_key_output(node_ip, ssh_user, cmd, ssh_key, timeout=timeout)
             if out is not None:
-                return out
+                return out, None
+            last_err = self._last_ssh_stderr(node_ip) or last_err
 
         out = self._ssh_run_command_output(node_ip, ssh_user, cmd, timeout=timeout)
         if out is not None:
-            return out
+            return out, None
+        last_err = self._last_ssh_stderr(node_ip) or last_err
 
         if self.config.pass_:
             out = self._ssh_run_command_with_password_output(node_ip, ssh_user, cmd, self.config.pass_, timeout=timeout)
             if out is not None:
-                return out
+                return out, None
+            last_err = self._last_ssh_stderr(node_ip) or last_err
 
-        return None
+        hint = _ssh_auth_hint(last_err)
+        if hint:
+            # _ssh_auth_hint has no idea who we connected as; name them here.
+            hint = hint.replace('the cluster SSH user', f"'{ssh_user}'")
+            return None, hint
+        return None, "SSH connection failed"
 
     def scan_node_packages(self, node_name):
         """Scan node for CVEs and outdated packages via SSH.
@@ -15435,22 +15495,32 @@ echo "AGENT_INSTALLED_OK"
             "echo '---DEBSECAN---' && "
             "if test -x /usr/bin/debsecan || command -v debsecan >/dev/null 2>&1; then "
             "  SUITE=$(lsb_release -cs 2>/dev/null || grep VERSION_CODENAME /etc/os-release 2>/dev/null | cut -d= -f2 || echo bookworm); "
-            "  RESULT=$(debsecan --suite $SUITE --only-fixed 2>/dev/null | head -500); "
-            "  if [ -z \"$RESULT\" ] && [ \"$SUITE\" = \"trixie\" ]; then "
-            "    RESULT=$(debsecan --suite bookworm --only-fixed 2>/dev/null | head -500); "
-            "  fi; "
-            "  if [ -z \"$RESULT\" ]; then "
-            "    RESULT=$(debsecan --suite $SUITE 2>/dev/null | head -500); "
-            "  fi; "
-            "  if [ -z \"$RESULT\" ]; then echo 'NO_RESULTS'; else echo \"$RESULT\"; fi; "
+            "  echo \"SUITE=$SUITE\"; "
+            # Actionable first: CVEs with a fix available for THIS suite. A short list,
+            # so the cap is generous — silently dropping something a node could patch
+            # today is the one truncation that actually costs somebody.
+            "  FULL=$(debsecan --suite $SUITE --only-fixed 2>/dev/null); "
+            "  MODE=fixed; "
+            "  if [ -z \"$FULL\" ]; then "
+            "    FULL=$(debsecan --suite $SUITE 2>/dev/null); MODE=all; CAP=500; "
+            "  else CAP=4000; fi; "
+            "  echo \"MODE=$MODE\"; "
+            "  if [ -n \"$FULL\" ]; then "
+            "    TOTAL=$(printf '%s\\n' \"$FULL\" | grep -c '^CVE-\\|^TEMP-'); "
+            "    echo \"TOTAL=$TOTAL\"; "
+            "    if [ \"$TOTAL\" -gt \"$CAP\" ]; then echo \"TRUNCATED=$CAP\"; fi; "
+            "    printf '%s\\n' \"$FULL\" | head -$CAP; "
+            "  else echo 'NO_RESULTS'; fi; "
             "else echo 'NOT_INSTALLED'; fi ; "
             "echo '---UPDATES---' && apt-get -s dist-upgrade 2>/dev/null | grep '^Inst' ; "
             "echo '---END---'"
         )
 
-        output = self._ssh_node_output(node_name, scan_cmd, timeout=120)
+        output, reason = self._ssh_node_output_ex(node_name, scan_cmd, timeout=120)
         if not output:
-            return {'error': 'SSH connection failed', 'node': node_name}
+            # Was 'SSH connection failed' for every cause there is, including the common
+            # one where SSH worked perfectly and sudo said no.
+            return {'error': reason or 'SSH connection failed', 'node': node_name}
 
         result = {
             'node': node_name,
@@ -15461,6 +15531,13 @@ echo "AGENT_INSTALLED_OK"
             'cves': [],           # real CVE entries from debsecan
             'packages': [],       # pending updates from apt
             'cve_count': 0,
+            # MK Sep 2026 — say which suite the numbers were computed against, whether
+            # they are the actionable (fixed) set or the informational one, and whether
+            # the list was cut. Reported Sep 2026: the old block fell back to bookworm
+            # on a trixie node, so a fully patched PVE 9 box was shown five CVEs from a
+            # distro it isn't running, and head -500 dropped the rest of a 1000-entry
+            # list without a word.
+            'suite': '', 'cve_mode': '', 'cve_total': 0, 'cve_truncated': False,
             'security_count': 0, 'total_count': 0
         }
 
@@ -15485,6 +15562,18 @@ echo "AGENT_INSTALLED_OK"
             elif section == 'DEBSECAN':
                 if line == 'NOT_INSTALLED':
                     result['debsecan_available'] = False
+                elif line.startswith('SUITE='):
+                    result['suite'] = line.split('=', 1)[1].strip()
+                elif line.startswith('MODE='):
+                    result['cve_mode'] = line.split('=', 1)[1].strip()
+                    result['debsecan_available'] = True
+                elif line.startswith('TOTAL='):
+                    try:
+                        result['cve_total'] = int(line.split('=', 1)[1].strip())
+                    except ValueError:
+                        pass
+                elif line.startswith('TRUNCATED='):
+                    result['cve_truncated'] = True
                 elif line.startswith('CVE-'):
                     result['debsecan_available'] = True
                     # default format: "CVE-2024-1234 package urgency (status info)"
