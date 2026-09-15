@@ -26,7 +26,7 @@ from datetime import datetime
 from pegaprox.core import hyperv_db
 from pegaprox.core.hyperv import HyperVManager
 from pegaprox.core.hyperv_client import (
-    DEFAULT_WINRM_HTTPS_PORT, HyperVConnection, PsrpHyperVClient,
+    DEFAULT_AUTH_METHOD, HyperVConnection, PsrpHyperVClient, default_winrm_port,
 )
 from pegaprox.core.hyperv_errors import (
     HyperVError, KIND_MISSING_FEATURE, KIND_OK, KIND_UNKNOWN, remedy,
@@ -60,7 +60,11 @@ class HyperVConfig:
         # The shared cluster table stores a port under `api_port`; a freshly submitted form
         # sends `port`. Reading both is what keeps the WinRM port from silently reverting to
         # the default on the first restart after a host was configured on a custom one.
-        self.port = int(data.get('port') or data.get('api_port') or DEFAULT_WINRM_HTTPS_PORT)
+        self.use_ssl = bool(data.get('use_ssl', False))
+        self.port = int(data.get('port') or data.get('api_port')
+                        or default_winrm_port(self.use_ssl))
+        self.auth = data.get('auth') or DEFAULT_AUTH_METHOD
+        self.encrypt_messages = bool(data.get('encrypt_messages', True))
         self.ssl_verification = bool(data.get('ssl_verification', True))
         self.iso_library_paths = data.get('iso_library_paths') or []
 
@@ -169,6 +173,9 @@ class HyperVClusterManager:
             username=self.config.user,
             password=self.config.pass_,
             port=self.config.port,
+            use_ssl=self.config.use_ssl,
+            auth=self.config.auth,
+            encrypt_messages=self.config.encrypt_messages,
             verify_certificate=self.config.ssl_verification,
         )
         return HyperVManager(self.id, PsrpHyperVClient(connection), host=self.config.host)
