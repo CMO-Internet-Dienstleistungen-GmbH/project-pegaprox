@@ -13,6 +13,8 @@
 # Survival: a migration source that is down must show as disconnected, never prevent the
 # cluster list from rendering.
 
+import time
+
 import pytest
 
 from pegaprox.core import hyperv_cluster
@@ -401,6 +403,70 @@ class TestWhatBootDoes:
         assert 'hyperv-a' in managers
         assert managers['hyperv-a'].is_connected is False
         assert 'No route to host' in managers['hyperv-a'].connection_error
+
+    def test_start_up_does_not_wait_for_a_host_that_is_slow_to_answer(self, db):
+        """The registry is filled before any host is reached.
+
+        `load_hyperv_sources` runs before the web server binds its port, so a connection
+        attempt on this path costs the whole product its availability: two hosts that did
+        not answer once kept PegaProx unreachable for half a minute after a restart. The
+        gate below stands in for a host that accepts the connection and then says nothing.
+        The sibling test above covers the same promise for the route that adds a host; this
+        one covers start-up, which is where it was actually broken.
+        """
+        import threading
+
+        from pegaprox.core import hyperv_db
+
+        released = threading.Event()
+
+        class SlowManager(FakeManager):
+            def host_facts(self):
+                # Bounded, so a regression fails the assertion below instead of hanging
+                # the suite: synchronous code would return here connected.
+                released.wait(timeout=10)
+                return super().host_facts()
+
+        hyperv_db.save_host(db.conn, db._encrypt, 'hyperv-slow',
+                            {'name': 'slow', 'host': 'probe-host.example', 'user': 'svc',
+                             'pass': 'fixture-' + 'not-a-real-credential'})
+        managers = {}
+        original = hyperv_cluster.HyperVClusterManager._build_manager
+        hyperv_cluster.HyperVClusterManager._build_manager = lambda self: SlowManager()
+        try:
+            count = hyperv_cluster.load_hyperv_sources(managers)
+
+            assert count == 1
+            assert 'hyperv-slow' in managers, 'the route must find the source immediately'
+            assert managers['hyperv-slow'].is_connected is False, \
+                'start-up waited for the host instead of letting it connect in the background'
+        finally:
+            released.set()
+            hyperv_cluster.HyperVClusterManager._build_manager = original
+
+    def test_the_background_connection_still_records_what_the_host_said(self, db):
+        """Not waiting must not mean not knowing: the state has to arrive on its own."""
+        from pegaprox.core import hyperv_db
+
+        hyperv_db.save_host(db.conn, db._encrypt, 'hyperv-dead',
+                            {'name': 'dead', 'host': 'probe-host.example', 'user': 'svc',
+                             'pass': 'fixture-' + 'not-a-real-credential'})
+        managers = {}
+        original = hyperv_cluster.HyperVClusterManager._build_manager
+        failing = FakeManager(raises=HyperVError('No route to host', kind='unreachable'))
+        hyperv_cluster.HyperVClusterManager._build_manager = lambda self: failing
+        try:
+            hyperv_cluster.load_hyperv_sources(managers)
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if managers['hyperv-dead'].connection_error:
+                    break
+                time.sleep(0.01)
+        finally:
+            hyperv_cluster.HyperVClusterManager._build_manager = original
+
+        assert managers['hyperv-dead'].is_connected is False
+        assert 'No route to host' in managers['hyperv-dead'].connection_error
 
     def test_a_custom_winrm_port_survives_the_shared_cluster_table(self, db):
         """That table has no `port` column and rounds a port through `api_port`.
