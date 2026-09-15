@@ -11991,9 +11991,17 @@
                     }
                     addToast(t('hvShutdownDone') || 'The VM is shut down', 'success');
                     setHypervShutdownVm(null);
-                    // The list is now wrong about this VM, and the shutdown route already
-                    // asked for a fresh read; open the wizard with what the guest is now.
-                    openXhmForSource(hostId, { ...vm, status: 'stopped', hyperv_state: 'Off' });
+                    const stopped = { ...vm, status: 'stopped', hyperv_state: 'Off' };
+                    // Seed the wizard's own list before opening it. That list is only
+                    // refetched when the SOURCE CLUSTER changes, so on the second use for
+                    // one host it still holds this VM as running — and the effect that
+                    // discards a plan for a VM that is no longer selectable would fire
+                    // immediately, on the VM that was just shut down for exactly this.
+                    setXhmSourceVms(prev => {
+                        const rest = prev.filter(v => String(v.vmid) !== String(vm.vmid));
+                        return prev.length ? [...rest, stopped] : prev;
+                    });
+                    openXhmForSource(hostId, stopped);
                 } catch (e) {
                     addToast((t('hvShutdownFailed') || 'The guest did not shut down') + ': ' + e.message, 'error');
                 } finally {
@@ -22675,12 +22683,16 @@
                                                     id: c.id,
                                                     name: c.name,
                                                     display_name: c.display_name,
+                                                    // Empty for a cluster nobody opened this
+                                                    // session; the panel then fetches it rather
+                                                    // than leaving the button dead with no reason.
                                                     nodes: Object.keys(
                                                         (c.id === selectedCluster?.id ? clusterMetrics
                                                             : sidebarClusterData[c.id]?.metrics) || {})
                                                         .filter(n => n !== 'error' && n !== 'offline'),
                                                 }))}
                                                 busy={hypervCheckBusy}
+                                                onNeedNodes={cid => fetchSidebarClusterData(cid)}
                                                 onRun={(cid, node) => runHypervTransferCheck(selectedHyperV.id, cid, node)}
                                                 t={t} />
 

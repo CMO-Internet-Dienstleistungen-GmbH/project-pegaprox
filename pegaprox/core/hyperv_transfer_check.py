@@ -104,7 +104,11 @@ def run_check(source, target, node_name, open_node) -> dict:
                                    'not allowed to read it.')
                 return result
 
-            node.run(hyperv_transfer.unmount_command(_MOUNT_POINT, _CREDENTIALS))
+            # Unmount WITHOUT the credentials path: `unmount_command` also removes the
+            # file, and the next share in the loop would then mount without one and be
+            # reported as an account the host refused. Any host with a real share map has
+            # more than one, so this was the normal case.
+            node.run(hyperv_transfer.unmount_command(_MOUNT_POINT, ''))
         result['ok'] = True
         return result
     except Exception as exc:                                     # noqa: BLE001
@@ -139,13 +143,18 @@ def _explain(message: str, host: str, share: str, node: str) -> str:
             or ('not found' in lowered and 'mount.cifs' in lowered)):
         return prefix + ('this node has no CIFS support. Install cifs-utils on it; nothing '
                          'on the Hyper-V side is wrong.')
-    if 'permission denied' in lowered or 'access denied' in lowered or '13' in lowered:
-        return prefix + ('the host refused the account. Check that the registered Hyper-V '
-                         'account may read this share, and that an administrative share '
-                         'has a local administrator behind it.')
+    # Order and shape both matter: `'13' in lowered` also matches `mount error(113): No
+    # route to host`, which reported an unreachable transfer address as a refused account
+    # — the most likely failure of the separate-transfer-address feature, explained as the
+    # one thing it is not.
     if 'no route' in lowered or 'unreachable' in lowered or 'timed out' in lowered:
         return prefix + (f'{node} cannot reach {host} on TCP 445. If a separate transfer '
                          'address is configured, that is the one being used here.')
+    if ('permission denied' in lowered or 'access denied' in lowered
+            or 'error(13)' in lowered or '(13)' in lowered):
+        return prefix + ('the host refused the account. Check that the registered Hyper-V '
+                         'account may read this share, and that an administrative share '
+                         'has a local administrator behind it.')
     if 'not found' in lowered or 'bad network name' in lowered:
         return prefix + ('the host has no share by that name. Either create it, or name '
                          "the right one in this host's share map.")

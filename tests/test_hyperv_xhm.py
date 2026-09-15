@@ -574,6 +574,16 @@ class TestTheTargetVm:
         assert efi, 'no EFI variable store was created'
         assert 'pre-enrolled-keys=0' in efi[0]
 
+    def test_a_secure_boot_state_the_host_did_not_report_enrols_nothing(self, db, wired):
+        """None is not False. A Generation 2 guest whose state could not be read must not
+        be handed keys under a loader that might be unsigned — nor an empty store passed
+        off as "it had none"; the preflight warns about that case separately."""
+        source, target, _ = wired
+        source._detail = _detail(generation=2, secure_boot_enabled=None)
+        _run(FakeTask())
+        efi = [data['efidisk0'] for _, data in target.posts if 'efidisk0' in data]
+        assert efi and 'pre-enrolled-keys=0' in efi[0]
+
     def test_the_mac_address_comes_across(self, db, wired):
         """Licence bindings, DHCP reservations and firewall rules are written against it.
         A new MAC turns a migration into a new machine for all of them."""
@@ -1616,6 +1626,29 @@ class TestAnImportThatInstallsNoDrivers:
         hyperv_xhm._inject_drivers_if_asked(self._task('virtio'), FakeTarget(), 120,
                                             volumes, {'generation': 2})
         assert seen['clear_only'] is False
+
+    def test_a_linux_guest_is_not_searched_for_a_windows_hibernation_file(self, monkeypatch):
+        """It has none, there is no NTFS to look in, and the run would install ntfs-3g on
+        the node for nothing and end with NO_WINDOWS_DIR logged as a failed preparation."""
+        called = []
+        monkeypatch.setattr('pegaprox.core.v2p._inject_virtio_drivers',
+                            lambda *a, **kw: called.append(kw) or True)
+        hyperv_xhm._inject_drivers_if_asked(
+            self._task('compatible'), FakeTarget(), 120, [],
+            {'generation': 2, 'ostype': 'l26'})
+        assert called == [], 'a Linux guest was mounted looking for Windows'
+
+    def test_a_guest_that_could_be_windows_still_is(self, monkeypatch):
+        called = []
+        monkeypatch.setattr('pegaprox.core.v2p._inject_virtio_drivers',
+                            lambda *a, **kw: called.append(kw) or True)
+        for detail in ({'generation': 2}, {'ostype': 'win11'},
+                       {'generation': 1, 'secure_boot_enabled': True},
+                       {'generation': 1, 'vtpm_enabled': True}):
+            called.clear()
+            hyperv_xhm._inject_drivers_if_asked(
+                self._task('compatible'), FakeTarget(), 120, [], detail)
+            assert called, f'skipped a guest that could be Windows: {detail}'
 
     def test_a_node_that_cannot_be_reached_does_not_fail_the_migration(self, monkeypatch):
         """The disks are already copied. Discarding a finished transfer over a
