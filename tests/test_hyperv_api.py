@@ -1064,3 +1064,69 @@ class TestThePostImportButtonsActOnTheTargetNotTheSource:
             method = api.anon().get if path == 'post-import' else api.anon().post
             response = method(f'/api/hyperv/{HOST}/migrations/{mid}/{path}')
             assert response.status_code == 401, path
+
+
+class TestRegisteringAHost:
+    """The transport is the operator's to choose. The API stores what was chosen, hands it
+    back without the password, and refuses only what pypsrp could not act on at all."""
+
+    class _Adapter:
+        is_connected = True
+        connection_error = ''
+
+    def _connect_that_accepts(self, monkeypatch):
+        from pegaprox.core import hyperv_cluster
+        monkeypatch.setattr(hyperv_cluster, 'connect_hyperv_source',
+                            lambda host_id, data: (self._Adapter(), None))
+        monkeypatch.setattr(hyperv_cluster, 'register_hyperv_source',
+                            lambda host_id, record, managers: None)
+
+    def test_an_http_host_with_basic_auth_is_stored_as_configured(self, api, seed, monkeypatch):
+        self._connect_that_accepts(monkeypatch)
+        admin = seed.user('root', role='admin')
+
+        created = api.as_user(admin).post('/api/hyperv/hosts', json={
+            'name': 'plain', 'host': 'hyperv.example', 'user': 'svc',
+            'pass': 'fixture-' + 'not-a-real-credential',
+            'use_ssl': False, 'auth': 'basic', 'encrypt_messages': False,
+        })
+        assert created.status_code == 201, created.get_data(as_text=True)[:400]
+
+        listed = api.as_user(admin).get('/api/hyperv/hosts').get_json()['hosts']
+        row = next(h for h in listed if h['id'] == created.get_json()['id'])
+        assert row['use_ssl'] is False
+        assert row['port'] == 5985
+        assert row['auth'] == 'basic'
+        assert row['encrypt_messages'] is False
+        assert row['has_password'] is True
+        assert 'pass' not in row
+
+    def test_an_https_host_without_a_port_lands_on_5986(self, api, seed, monkeypatch):
+        self._connect_that_accepts(monkeypatch)
+        admin = seed.user('root', role='admin')
+
+        created = api.as_user(admin).post('/api/hyperv/hosts', json={
+            'name': 'tls', 'host': 'hyperv.example', 'user': 'svc',
+            'pass': 'fixture-' + 'not-a-real-credential', 'use_ssl': True,
+        })
+        assert created.status_code == 201, created.get_data(as_text=True)[:400]
+        listed = api.as_user(admin).get('/api/hyperv/hosts').get_json()['hosts']
+        row = next(h for h in listed if h['id'] == created.get_json()['id'])
+        assert row['use_ssl'] is True
+        assert row['port'] == 5986
+
+    def test_an_unknown_authentication_method_is_refused_before_the_host_is_touched(
+            self, api, seed, monkeypatch):
+        from pegaprox.core import hyperv_cluster
+
+        def must_not_connect(host_id, data):
+            raise AssertionError('the connection test ran for a request that was invalid')
+
+        monkeypatch.setattr(hyperv_cluster, 'connect_hyperv_source', must_not_connect)
+        admin = seed.user('root', role='admin')
+
+        response = api.as_user(admin).post('/api/hyperv/hosts', json={
+            'name': 'x', 'host': 'hyperv.example', 'user': 'svc', 'pass': 'x', 'auth': 'digest',
+        })
+        assert response.status_code == 400
+        assert 'negotiate' in response.get_json()['error']

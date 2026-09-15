@@ -137,7 +137,71 @@ def test_missing_rights_on_disks_is_reported_next_to_a_working_vm_inventory(monk
 def test_password_is_never_taken_from_argv():
     args = probe.parse_args(['--host', 'h', '--user', 'u'])
     assert not hasattr(args, 'password')
-    assert args.port == 5986
+
+
+def test_the_port_follows_the_transport_unless_given():
+    assert probe.parse_args(['--host', 'h', '--user', 'u']).port == 5985
+    assert probe.parse_args(['--host', 'h', '--user', 'u', '--ssl']).port == 5986
+    assert probe.parse_args(['--host', 'h', '--user', 'u', '--ssl', '--port', '15986']).port == 15986
+
+
+def test_the_default_authentication_is_negotiate_and_unknown_ones_are_refused(capsys):
+    assert probe.parse_args(['--host', 'h', '--user', 'u']).auth == 'negotiate'
+    with __import__('pytest').raises(SystemExit):
+        probe.parse_args(['--host', 'h', '--user', 'u', '--auth', 'digest'])
+
+
+def test_the_probe_hands_pypsrp_the_same_transport_the_product_would(monkeypatch):
+    """The probe exists to explain a failing product connection, so it has to connect
+    the same way: same transport, same provider, same encryption rule."""
+    import sys
+    import types
+    seen = {}
+
+    class FakeWSMan:
+        def __init__(self, server, **kwargs):
+            seen.update(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class FakeRunspacePool:
+        def __init__(self, wsman):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class FakePowerShell:
+        had_errors = False
+
+        def __init__(self, pool):
+            pass
+
+        def add_script(self, script):
+            pass
+
+        def invoke(self):
+            return ['{"ok": true}']
+
+    monkeypatch.setitem(sys.modules, 'pypsrp', types.ModuleType('pypsrp'))
+    monkeypatch.setitem(sys.modules, 'pypsrp.wsman', type('M', (), {'WSMan': FakeWSMan}))
+    monkeypatch.setitem(sys.modules, 'pypsrp.powershell',
+                        type('M', (), {'RunspacePool': FakeRunspacePool, 'PowerShell': FakePowerShell}))
+
+    instance = probe.HyperVProbe(host='h', user='u', password='p', port=5985, verify=True,
+                                 use_ssl=False, auth='basic', encrypt_messages=True)
+    assert instance._run_script('Get-VM') == {'ok': True}
+    assert seen['ssl'] is False
+    assert seen['auth'] == 'basic'
+    assert seen['encryption'] == 'never'
+    assert seen['port'] == 5985
 
 
 def test_missing_password_without_a_tty_fails_loudly(monkeypatch):

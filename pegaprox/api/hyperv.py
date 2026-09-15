@@ -148,6 +148,22 @@ def _acting_user():
 # /api/vmware, which does the same job for an ESXi host.
 # =============================================================================
 
+def _unsupported_auth(data: dict):
+    """A 400 naming the accepted methods when the submitted one is not among them.
+
+    Checked here rather than left to the connection test, because pypsrp would report an
+    unknown provider as a client-side ValueError and the operator would read that as the
+    host refusing them.
+    """
+    from pegaprox.core.hyperv_client import SUPPORTED_AUTH_METHODS
+
+    method = data.get('auth')
+    if method and method not in SUPPORTED_AUTH_METHODS:
+        return jsonify({'error': f'Unsupported WinRM authentication method "{_sl(method)}". '
+                                 f'Expected one of: {", ".join(SUPPORTED_AUTH_METHODS)}'}), 400
+    return None
+
+
 @bp.route('/api/hyperv/hosts', methods=['GET'])
 @require_auth(perms=['hyperv.view'])
 def list_hyperv_hosts():
@@ -165,6 +181,9 @@ def list_hyperv_hosts():
             'host': record['host'],
             'user': record['user'],
             'port': record['port'],
+            'use_ssl': record['use_ssl'],
+            'auth': record['auth'],
+            'encrypt_messages': record['encrypt_messages'],
             'ssl_verification': record['ssl_verification'],
             'iso_library_paths': record['iso_library_paths'],
             'smb_share_map': record['smb_share_map'],
@@ -193,6 +212,9 @@ def create_hyperv_host():
     data = request.json or {}
     if not data.get('host'):
         return jsonify({'error': 'A host address is required'}), 400
+    auth_error = _unsupported_auth(data)
+    if auth_error:
+        return auth_error
 
     host_id = uuid.uuid4().hex[:8]
     manager, hv_error = connect_hyperv_source(host_id, data)
@@ -224,6 +246,9 @@ def update_hyperv_host(host_id):
     data = {**existing, **(request.json or {})}
     if not (request.json or {}).get('pass'):
         data['pass'] = existing['pass']
+    auth_error = _unsupported_auth(data)
+    if auth_error:
+        return auth_error
 
     manager, hv_error = connect_hyperv_source(host_id, data)
     if hv_error:

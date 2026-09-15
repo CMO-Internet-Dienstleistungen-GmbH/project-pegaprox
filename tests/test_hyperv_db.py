@@ -270,6 +270,63 @@ class TestASchemaFromAnEarlierBuild:
         assert conn.execute('SELECT name FROM hyperv_hosts WHERE id = ?',
                             ('h1',)).fetchone()['name'] == 'source'
 
+    def test_a_host_registered_before_the_transport_setting_stays_on_https(self, conn):
+        """Until this column existed the transport was fixed: HTTPS with NTLM. A row from
+        then was reached that way whatever its port, so the migration must say so
+        explicitly -- the column default is HTTP, and a source silently switching to a
+        listener it never used would fail on the first restart after the upgrade."""
+        conn.execute('DROP TABLE IF EXISTS hyperv_hosts')
+        conn.execute('''
+            CREATE TABLE hyperv_hosts (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, host TEXT NOT NULL,
+                username TEXT NOT NULL DEFAULT '', pass_encrypted TEXT DEFAULT '',
+                winrm_port INTEGER DEFAULT 5986, verify_certificate INTEGER DEFAULT 1,
+                iso_library_paths TEXT DEFAULT '[]', smb_share_map TEXT DEFAULT '{}',
+                smb_domain TEXT DEFAULT '', enabled INTEGER DEFAULT 1,
+                created_at REAL NOT NULL, updated_at REAL NOT NULL)
+        ''')
+        conn.execute("INSERT INTO hyperv_hosts (id, name, host, winrm_port, created_at, updated_at) "
+                     "VALUES ('h1', 'default-port', 'hv.invalid', 5986, 0, 0)")
+        conn.execute("INSERT INTO hyperv_hosts (id, name, host, winrm_port, created_at, updated_at) "
+                     "VALUES ('h2', 'custom-port', 'hv2.invalid', 15986, 0, 0)")
+        conn.commit()
+
+        hyperv_db.ensure_schema(conn.cursor())
+        conn.commit()
+
+        for host_id in ('h1', 'h2'):
+            record = hyperv_db.load_host(conn, lambda value: value, host_id)
+            assert record['use_ssl'] is True, host_id
+            assert record['auth'] == 'ntlm', host_id
+            assert record['encrypt_messages'] is True, host_id
+        assert hyperv_db.load_host(conn, lambda value: value, 'h2')['port'] == 15986
+
+    def test_a_host_registered_after_the_transport_setting_gets_the_http_default(self, conn):
+        hyperv_db.ensure_schema(conn.cursor())
+        hyperv_db.save_host(conn, lambda value: value, 'h3',
+                            {'name': 'new', 'host': 'hv3.invalid', 'user': 'svc'})
+        record = hyperv_db.load_host(conn, lambda value: value, 'h3')
+        assert record['use_ssl'] is False
+        assert record['port'] == 5985
+        assert record['auth'] == 'negotiate'
+        assert record['encrypt_messages'] is True
+
+    def test_the_transport_settings_survive_a_round_trip(self, conn):
+        hyperv_db.ensure_schema(conn.cursor())
+        hyperv_db.save_host(conn, lambda value: value, 'h4', {
+            'name': 'plain', 'host': 'hv4.invalid', 'user': 'svc',
+            'use_ssl': False, 'auth': 'basic', 'encrypt_messages': False,
+        })
+        record = hyperv_db.load_host(conn, lambda value: value, 'h4')
+        assert (record['use_ssl'], record['auth'], record['encrypt_messages']) == (False, 'basic', False)
+
+        hyperv_db.save_host(conn, lambda value: value, 'h5', {
+            'name': 'tls', 'host': 'hv5.invalid', 'user': 'svc', 'use_ssl': True,
+        })
+        record = hyperv_db.load_host(conn, lambda value: value, 'h5')
+        assert record['use_ssl'] is True
+        assert record['port'] == 5986
+
     def test_a_current_schema_is_left_alone(self, conn):
         hyperv_db.ensure_schema(conn.cursor())
         hyperv_db.ensure_schema(conn.cursor())

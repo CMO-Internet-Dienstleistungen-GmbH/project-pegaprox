@@ -42,6 +42,12 @@ REDACTION_PLACEHOLDER = "***"
 # no would be worse than no probe. The repository root is added to the path so this script
 # still runs from a checkout without PegaProx being installed.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+from pegaprox.core.hyperv_client import (  # noqa: E402
+    DEFAULT_AUTH_METHOD,
+    SUPPORTED_AUTH_METHODS,
+    default_winrm_port,
+    wsman_encryption_for,
+)
 from pegaprox.core.hyperv_errors import (  # noqa: E402
     KIND_OK, KIND_UNREACHABLE, KIND_TIMEOUT, KIND_CERTIFICATE, KIND_AUTHENTICATION,
     KIND_AUTHORIZATION, KIND_MISSING_FEATURE, KIND_CLIENT_DEPENDENCY, KIND_UNKNOWN,
@@ -238,12 +244,26 @@ def _as_list(parsed: Any) -> list[dict]:
 class HyperVProbe:
     """Runs the read-only probe sequence over PowerShell Remoting."""
 
-    def __init__(self, host: str, user: str, password: str, port: int, verify: bool) -> None:
+    def __init__(
+        self,
+        host: str,
+        user: str,
+        password: str,
+        port: int,
+        verify: bool,
+        *,
+        use_ssl: bool = False,
+        auth: str = DEFAULT_AUTH_METHOD,
+        encrypt_messages: bool = True,
+    ) -> None:
         self._host = host
         self._user = user
         self._password = password
         self._port = port
         self._verify = verify
+        self._use_ssl = use_ssl
+        self._auth = auth
+        self._encrypt_messages = encrypt_messages
 
     def _run_script(self, script: str) -> Any:
         from pypsrp.powershell import PowerShell, RunspacePool
@@ -254,8 +274,10 @@ class HyperVProbe:
             port=self._port,
             username=self._user,
             password=self._password,
-            ssl=True,
-            auth="ntlm",
+            ssl=self._use_ssl,
+            auth=self._auth,
+            # The same rule the product applies, imported so the probe cannot drift from it.
+            encryption=wsman_encryption_for(self._use_ssl, self._auth, self._encrypt_messages),
             cert_validation=self._verify,
         )
         with wsman, RunspacePool(wsman) as pool:
@@ -320,15 +342,40 @@ def read_password(redact: Redactor) -> str:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--host", required=True, help="Hyper-V host name that matches its WinRM certificate")
+    parser.add_argument("--host", required=True, help="Hyper-V host name or address (with --ssl: the name its certificate carries)")
     parser.add_argument("--user", required=True, help="Account in 'Hyper-V Administrators' and 'Remote Management Users'")
-    parser.add_argument("--port", type=int, default=5986, help="WinRM HTTPS port (default: 5986)")
+    parser.add_argument(
+        "--ssl",
+        action="store_true",
+        help="Use the WinRM HTTPS listener. Without it the probe uses HTTP, the listener Windows creates by default.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="WinRM port. Default follows the transport: 5985 over HTTP, 5986 with --ssl.",
+    )
+    parser.add_argument(
+        "--auth",
+        choices=SUPPORTED_AUTH_METHODS,
+        default=DEFAULT_AUTH_METHOD,
+        help=f"WinRM authentication provider (default: {DEFAULT_AUTH_METHOD})",
+    )
+    parser.add_argument(
+        "--no-message-encryption",
+        action="store_true",
+        help="Over HTTP, send the payload in clear instead of sealing it with the session key. "
+             "Implied by --auth basic, which has no session key.",
+    )
     parser.add_argument(
         "--insecure-skip-verify",
         action="store_true",
-        help="Skip certificate validation. Use only to prove that trust is the failing part.",
+        help="Skip certificate validation (HTTPS only). Use only to prove that trust is the failing part.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.port is None:
+        args.port = default_winrm_port(args.ssl)
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -348,6 +395,9 @@ def main(argv: list[str] | None = None) -> int:
         password=password,
         port=args.port,
         verify=not args.insecure_skip_verify,
+        use_ssl=args.ssl,
+        auth=args.auth,
+        encrypt_messages=not args.no_message_encryption,
     )
     results = probe.run()
     print(render(results, redact))

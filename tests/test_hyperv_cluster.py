@@ -416,6 +416,46 @@ class TestWhatBootDoes:
                                                       manager=FakeManager())
         assert cluster.config.port == 15986
 
+    def test_a_host_without_a_port_defaults_to_the_http_listener(self, db):
+        """The listener Windows creates by default is HTTP on 5985; an estate that never
+        set up a certificate has nothing else to offer, and the default follows that."""
+        config = {**CONFIG}
+        config.pop('port')
+        cluster = hyperv_cluster.HyperVClusterManager('hyperv-a', config, manager=FakeManager())
+        assert cluster.config.use_ssl is False
+        assert cluster.config.port == 5985
+        assert cluster.config.auth == 'negotiate'
+        assert cluster.config.encrypt_messages is True
+
+    def test_choosing_https_without_a_port_defaults_to_5986(self, db):
+        config = {**CONFIG, 'use_ssl': True}
+        config.pop('port')
+        cluster = hyperv_cluster.HyperVClusterManager('hyperv-a', config, manager=FakeManager())
+        assert cluster.config.port == 5986
+
+    def test_the_transport_settings_reach_the_connection(self, db, monkeypatch):
+        """What the operator configured is what pypsrp gets, without this layer deciding
+        that a transport is not good enough for it."""
+        captured = {}
+
+        def fake_client(connection):
+            captured['connection'] = connection
+            return FakeManager()
+
+        monkeypatch.setattr(hyperv_cluster, 'PsrpHyperVClient', fake_client)
+        monkeypatch.setattr(hyperv_cluster, 'HyperVManager', lambda *a, **kw: FakeManager())
+
+        config = {**CONFIG, 'use_ssl': False, 'auth': 'basic', 'encrypt_messages': False,
+                  'port': 5985}
+        cluster = hyperv_cluster.HyperVClusterManager('hyperv-a', config)
+        cluster._build_manager()
+
+        connection = captured['connection']
+        assert connection.use_ssl is False
+        assert connection.port == 5985
+        assert connection.auth == 'basic'
+        assert connection.encrypt_messages is False
+
     def test_the_iso_library_survives_a_round_trip(self, db):
         """A source is stored in a table of its own, with a column for everything it has.
 
