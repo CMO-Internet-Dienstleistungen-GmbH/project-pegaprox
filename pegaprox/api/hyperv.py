@@ -542,6 +542,7 @@ def hyperv_vm_preflight(cluster_id, vmid):
 
     options = {
         'network_map': data.get('network_map') or {},
+        'vlan_map': data.get('vlan_map') or {},
         'controller': target_hardware(data)['controller'],
         # Whether the migration will write the drivers in. Read from the same function, so
         # the box the operator ticked and the risk the list names cannot disagree.

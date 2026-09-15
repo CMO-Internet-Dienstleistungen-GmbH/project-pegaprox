@@ -13,6 +13,8 @@ import threading
 
 import pytest
 
+from pegaprox.core import hyperv_xhm
+
 from pegaprox.core import hyperv_db, hyperv_xhm
 from pegaprox.core.hyperv_transfer import TransferError
 
@@ -561,6 +563,95 @@ class TestTheTargetVm:
         _run(FakeTask())
         assert 'macaddr=00:15:5d:00:00:01' in self._created(target)['net0']
         assert '00155D000001' not in self._created(target)['net0']
+
+    def test_the_source_vlan_is_carried_to_the_target(self, db, wired):
+        """A VLAN is not something a migration may quietly get wrong.
+
+        An adapter that arrives on the wrong VLAN is reachable by the wrong people, and
+        the guest looks healthy either way -- so the id the source reports is what the
+        target gets, not a default.
+        """
+        source, target, _ = wired
+        source._detail['network_adapters'] = [{'name': 'Network Adapter',
+                                               'mac_address': '00155D000001',
+                                               'mac_address_colons': '00:15:5d:00:00:01',
+                                               'switch_name': 'External',
+                                               'vlan_mode': 'Access', 'vlan_id': 22}]
+        _run(FakeTask())
+        assert 'tag=22' in self._created(target)['net0']
+
+    def test_an_adapter_without_a_vlan_gets_the_configured_default(self, db, wired):
+        """Hyper-V leaves an adapter untagged whenever the switch port does the tagging.
+
+        "No VLAN on the source" therefore usually means "the operator knows which one",
+        not "untagged" -- so the fallback applies instead of putting the guest on whatever
+        the target bridge's native VLAN happens to be.
+        """
+        source, target, _ = wired
+        source._detail['network_adapters'] = [{'name': 'Network Adapter',
+                                               'mac_address': '00155D000001',
+                                               'mac_address_colons': '00:15:5d:00:00:01',
+                                               'switch_name': 'External'}]
+        _run(FakeTask())
+        assert f'tag={hyperv_xhm.DEFAULT_IMPORT_VLAN}' in self._created(target)['net0']
+
+    def test_the_operator_choice_beats_both(self, db, wired):
+        """The wizard's field is the last word: it is what the person actually saw."""
+        source, target, _ = wired
+        source._detail['network_adapters'] = [{'name': 'Network Adapter',
+                                               'mac_address': '00155D000001',
+                                               'mac_address_colons': '00:15:5d:00:00:01',
+                                               'switch_name': 'External',
+                                               'vlan_mode': 'Access', 'vlan_id': 22}]
+        _run(FakeTask(config={'vlan_map': {'00155D000001': 99}}))
+        assert 'tag=99' in self._created(target)['net0']
+        assert 'tag=22' not in self._created(target)['net0']
+
+    def test_an_emptied_vlan_field_means_no_tag_rather_than_the_default(self, db, wired):
+        """Clearing the box is a decision, so it must not fall back to the default.
+
+        Only an adapter the operator never touched falls through to the source's value.
+        """
+        source, target, _ = wired
+        source._detail['network_adapters'] = [{'name': 'Network Adapter',
+                                               'mac_address': '00155D000001',
+                                               'mac_address_colons': '00:15:5d:00:00:01',
+                                               'switch_name': 'External',
+                                               'vlan_mode': 'Access', 'vlan_id': 22}]
+        _run(FakeTask(config={'vlan_map': {'00155D000001': ''}}))
+        assert 'tag=' not in self._created(target)['net0']
+
+    def test_a_trunk_adapter_arrives_untagged_rather_than_on_a_guessed_vlan(self, db, wired):
+        """A trunk carries several ids, so there is no single one to carry over.
+
+        Putting it on one guessed VLAN would look like it worked, which is the failure
+        this avoids; the preflight names the adapter instead.
+        """
+        source, target, _ = wired
+        source._detail['network_adapters'] = [{'name': 'Network Adapter',
+                                               'mac_address': '00155D000001',
+                                               'mac_address_colons': '00:15:5d:00:00:01',
+                                               'switch_name': 'External',
+                                               'vlan_mode': 'Trunk', 'vlan_id': 0}]
+        _run(FakeTask())
+        assert 'tag=' not in self._created(target)['net0']
+
+    def test_every_adapter_gets_its_own_bridge_and_vlan(self, db, wired):
+        """Multi-NIC is the common case in a real estate, not the exception."""
+        source, target, _ = wired
+        source._detail['network_adapters'] = [
+            {'name': 'LAN', 'mac_address': '00155D000001',
+             'mac_address_colons': '00:15:5d:00:00:01', 'switch_name': 'External',
+             'vlan_mode': 'Access', 'vlan_id': 22},
+            {'name': 'DMZ', 'mac_address': '00155D000002',
+             'mac_address_colons': '00:15:5d:00:00:02', 'switch_name': 'DMZ',
+             'vlan_mode': 'Access', 'vlan_id': 33},
+        ]
+        _run(FakeTask(), network_map={'00155D000001': 'vmbr0', '00155D000002': 'vmbr1'})
+        created = self._created(target)
+        assert 'bridge=vmbr0' in created['net0'] and 'tag=22' in created['net0']
+        assert 'bridge=vmbr1' in created['net1'] and 'tag=33' in created['net1']
+        assert '00:15:5d:00:00:02' in created['net1']
 
     def test_an_adapter_that_has_never_had_a_mac_gets_one_from_the_target(self, db, wired):
         """A VM that has never started reports all zeroes, which is not an address.
