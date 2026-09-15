@@ -415,6 +415,19 @@ if [ "$PREV_N" -gt 0 ]; then
             warn "$FORK_REMOTE/$INTEGRATION_BRANCH differs — force-pushing it back to $PREV_TAG"
             git -C "$REPO_ROOT" push --force-with-lease "$FORK_REMOTE" "$INTEGRATION_BRANCH"
         fi
+        # The tag is counted from local tags, so `sync` followed by `publish`
+        # lands here with the revision already built but never pushed: the
+        # branch would be healed onto a tag nobody else can see, and the run
+        # would report it as the published one. What is deployed and rolled
+        # back to is the tag, so ask the remote rather than assuming.
+        if ! git -C "$REPO_ROOT" ls-remote --exit-code --tags "$FORK_REMOTE" "refs/tags/$PREV_TAG" >/dev/null 2>&1; then
+            if [ "$DO_PUSH" -eq 1 ]; then
+                warn "$PREV_TAG exists only locally — pushing it"
+                git -C "$REPO_ROOT" push "$FORK_REMOTE" "$PREV_TAG"
+            else
+                warn "$PREV_TAG exists only locally — run publish to push it"
+            fi
+        fi
         log "RESULT: up-to-date release=$RELEASE_TAG tag=$PREV_TAG"
         exit 0
     fi
