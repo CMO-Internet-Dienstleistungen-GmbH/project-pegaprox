@@ -1549,7 +1549,12 @@
         }
 
         // LW: Feb 2026 - Corporate VM Detail View (experimental)
-        function CorporateVmDetailView({ vm, clusterId, onAction, onOpenConsole, onOpenSpice, onOpenConfig, onBack, onMigrate, onClone, onForceStop, onDelete, onCrossClusterMigrate, showCrossCluster, actionLoading, onShowMetrics, addToast }) {
+        function CorporateVmDetailView({ vm, clusterId, clusters, onAction, onOpenConsole, onOpenSpice, onOpenConfig, onBack, onMigrate, onClone, onForceStop, onDelete, onCrossClusterMigrate, onHypervMigrate, showCrossCluster, actionLoading, onShowMetrics, addToast }) {
+            // Fork patch #15 — a Hyper-V guest is moved to Proxmox, not between Proxmox
+            // nodes. It gets one entry here in place of the ones below, which address an
+            // API its host does not have.
+            const isHypervSource = typeof hvType === 'function'
+                && hvType((clusters || []).find(c => c.id === clusterId)) === 'hyperv';
             const { t } = useTranslation();
             const { getAuthHeaders } = useAuth();
             const [activeDetailTab, setActiveDetailTab] = useState('summary');
@@ -1964,7 +1969,12 @@
                                                 <Icons.BarChart className="w-3.5 h-3.5" /> {t('performanceMetrics')}
                                             </button>
                                         )}
-                                        <button onClick={() => { onMigrate(vm); setShowActionsMenu(false); }} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: 'var(--corp-text-secondary)'}}>
+                                        {isHypervSource && onHypervMigrate && (
+                                            <button onClick={() => { onHypervMigrate(vm); setShowActionsMenu(false); }} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: 'var(--corp-text-secondary)'}}>
+                                                <Icons.FolderInput className="w-3.5 h-3.5" /> {t('hvMigrateToProxmox') || 'Migrate to Proxmox'}
+                                            </button>
+                                        )}
+                                        <button onClick={() => { onMigrate(vm); setShowActionsMenu(false); }} style={{color: 'var(--corp-text-secondary)', display: isHypervSource ? 'none' : undefined}} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2">
                                             <Icons.ArrowRight className="w-3.5 h-3.5" /> {t('migrate')}
                                         </button>
                                         {showCrossCluster && (
@@ -1972,7 +1982,7 @@
                                                 <Icons.Globe className="w-3.5 h-3.5" /> {t('crossClusterMigrate')}
                                             </button>
                                         )}
-                                        <button onClick={() => { onClone(vm); setShowActionsMenu(false); }} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: 'var(--corp-text-secondary)'}}>
+                                        <button onClick={() => { onClone(vm); setShowActionsMenu(false); }} style={{color: 'var(--corp-text-secondary)', display: isHypervSource ? 'none' : undefined}} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2">
                                             <Icons.Copy className="w-3.5 h-3.5" /> {t('clone')}
                                         </button>
                                         {isRunning && isQemu && (
@@ -1999,7 +2009,7 @@
                                             </button>
                                         )}
                                         <div className="my-1" style={{borderTop: '1px solid var(--corp-border-medium)'}}></div>
-                                        <button onClick={() => { onDelete(vm); setShowActionsMenu(false); }} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: '#f54f47'}}>
+                                        <button onClick={() => { onDelete(vm); setShowActionsMenu(false); }} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: '#f54f47', display: isHypervSource ? 'none' : undefined}}>
                                             <Icons.Trash className="w-3.5 h-3.5" /> {t('delete')}
                                         </button>
                                     </div>
