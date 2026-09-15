@@ -8223,6 +8223,30 @@
             const [vmwareSortBy, setVmwareSortBy] = useState('name');
             const [editingVMware, setEditingVMware] = useState(null);
 
+            // Fork patch #15 — a Hyper-V host is a migration source, not a cluster, so it
+            // gets its own sidebar section and its own view rather than a cluster row
+            // (docs/adr/0001). It stays in the `clusters` array because the
+            // cross-hypervisor wizard builds its source list from exactly that array;
+            // only the sidebar's cluster loops filter it out.
+            const [selectedHyperV, setSelectedHyperV] = useState(null);
+            const [hypervHostDetails, setHypervHostDetails] = useState({});
+            const [hypervVms, setHypervVms] = useState([]);
+            const [hypervLoading, setHypervLoading] = useState(false);
+            const [hypervHostFacts, setHypervHostFacts] = useState(null);
+            const [showHypervEdit, setShowHypervEdit] = useState(false);
+            const [hypervForm, setHypervForm] = useState({ ...HYPERV_DEFAULT_CONFIG });
+            const [hypervSaving, setHypervSaving] = useState(false);
+
+            // Two views of the one list the server sends. Splitting it here rather than at
+            // the endpoint is deliberate: the cross-hypervisor wizard builds its source
+            // picker from the whole `clusters` array, and so do the guards that decide
+            // which actions a Hyper-V guest may be offered. Filter it server-side and the
+            // migration loses both its sources and its entry point.
+            const pveClusters = useMemo(() => clusters.filter(c => hvType(c) !== 'hyperv'), [clusters]);
+            const hypervHosts = useMemo(() => clusters
+                .filter(c => hvType(c) === 'hyperv')
+                .map(c => ({ ...c, ...(hypervHostDetails[c.id] || {}) })), [clusters, hypervHostDetails]);
+
             // LW: Mar 2026 - Cross-Hypervisor Migration (XHM) state
             const [sidebarXHM, setSidebarXHM] = useState(false);
             const [sidebarMultiSdn, setSidebarMultiSdn] = useState(false); // #612 — Multi-Cluster EVPN view
@@ -8303,7 +8327,7 @@
             };
 
             // NS: auto-clear topology/xhm sidebar when navigating to something else
-            useEffect(() => { if (selectedCluster || selectedPBS || selectedVMware || selectedGroup) { setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); } }, [selectedCluster, selectedPBS, selectedVMware, selectedGroup]);
+            useEffect(() => { if (selectedCluster || selectedPBS || selectedVMware || selectedGroup || selectedHyperV) { setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); } }, [selectedCluster, selectedPBS, selectedVMware, selectedGroup, selectedHyperV]);
 
             // track selected XHM migration in ref for SSE updates
             useEffect(() => { xhmSelectedMigrationRef.current = xhmSelectedMigration; }, [xhmSelectedMigration]);
@@ -11893,6 +11917,140 @@
                 } catch (e) { addToast(t('deleteError') + ': ' + e.message, 'error'); }
             };
             
+            // ───────────────────────────────────────────────
+            // Hyper-V migration sources (fork patch #15)
+            // ───────────────────────────────────────────────
+
+            /**
+             * The registered hosts with their WinRM settings.
+             *
+             * The sidebar could be drawn from the `clusters` array alone, but the edit form
+             * needs the transport, the ISO library and the share map, and only this route
+             * returns them. Keyed by id and merged over the cluster row so a host that is
+             * in one and not yet the other still renders.
+             */
+            const fetchHypervHosts = async () => {
+                try {
+                    const resp = await authFetch(`${API_URL}/hyperv/hosts`);
+                    if (resp && resp.ok) {
+                        const data = await resp.json();
+                        const byId = {};
+                        (data.hosts || []).forEach(h => { byId[h.id] = h; });
+                        setHypervHostDetails(byId);
+                    }
+                } catch (e) { console.warn('Hyper-V host fetch error:', e); }
+            };
+
+            /** The VMs on one host, over the Hyper-V route rather than the cluster one. */
+            const fetchHypervVms = async (hostId) => {
+                setHypervLoading(true);
+                try {
+                    const resp = await authFetch(`${API_URL}/hyperv/${hostId}/vms`);
+                    if (resp && resp.ok) {
+                        const data = await resp.json();
+                        setHypervVms(data.vms || []);
+                    } else {
+                        setHypervVms([]);
+                    }
+                } catch (e) {
+                    setHypervVms([]);
+                } finally {
+                    setHypervLoading(false);
+                }
+            };
+
+            /** Host facts and the property report, which names what this host does not expose. */
+            const fetchHypervHostFacts = async (hostId) => {
+                try {
+                    const resp = await authFetch(`${API_URL}/hyperv/${hostId}/host`);
+                    setHypervHostFacts(resp && resp.ok ? await resp.json() : null);
+                } catch (e) { setHypervHostFacts(null); }
+            };
+
+            /**
+             * Unregister a host.
+             *
+             * Deliberately not `handleDeleteCluster`: that route deletes from the cluster
+             * table, which a migration source has no row in, so the host survived the
+             * delete and came back on the next restart. It also runs the Proxmox clean-up
+             * (API-token revocation, known_hosts pruning), none of which applies to WinRM.
+             */
+            const handleDeleteHyperV = async (hostId) => {
+                if (!window.confirm(t('hvDeleteHostConfirm')
+                                    || 'Remove this Hyper-V migration source? The host itself is not touched.')) return;
+                try {
+                    const resp = await authFetch(`${API_URL}/hyperv/hosts/${hostId}`, { method: 'DELETE' });
+                    if (resp && resp.ok) {
+                        addToast(t('hvHostDeleted') || 'Hyper-V source removed', 'success');
+                        if (selectedHyperV?.id === hostId) setSelectedHyperV(null);
+                        await fetchClusters();
+                        fetchHypervHosts();
+                    } else {
+                        const err = resp ? await resp.json().catch(() => ({})) : {};
+                        addToast(`${t('deleteError') || 'Delete error'}: ${err.error || ''}`, 'error');
+                    }
+                } catch (e) { addToast((t('deleteError') || 'Delete error') + ': ' + e.message, 'error'); }
+            };
+
+            /** Fill the registration form from what the host route returned. */
+            const openHypervEdit = (host) => {
+                setHypervForm({
+                    ...HYPERV_DEFAULT_CONFIG,
+                    // Marks the form as an edit: the stored password stays unless one is typed.
+                    editing: true,
+                    name: host.name || '',
+                    host: host.host || '',
+                    user: host.user || '',
+                    pass: '',
+                    port: host.port || hvDefaultPort(host.use_ssl === true),
+                    use_ssl: host.use_ssl === true,
+                    auth: host.auth || 'negotiate',
+                    encrypt_messages: host.encrypt_messages !== false,
+                    ssl_verification: host.ssl_verification !== false,
+                    iso_library_paths: (host.iso_library_paths || []).join('\n'),
+                    smb_share_map: Object.entries(host.smb_share_map || {})
+                        .map(([drive, share]) => `${drive}=${share}`).join('\n'),
+                    smb_domain: host.smb_domain || '',
+                });
+                setShowHypervEdit(true);
+            };
+
+            /**
+             * Save the edited source.
+             *
+             * An empty password field keeps the stored one, which is what the route does
+             * with it — the form never echoes a credential back to show it again.
+             */
+            const handleUpdateHyperV = async (hostId, form) => {
+                setHypervSaving(true);
+                try {
+                    const body = hvNormaliseConfig(form);
+                    if (!body.pass) delete body.pass;
+                    const resp = await authFetch(`${API_URL}/hyperv/hosts/${hostId}`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body),
+                    });
+                    if (resp && resp.ok) {
+                        addToast(t('hvHostUpdated') || 'Hyper-V source updated', 'success');
+                        setShowHypervEdit(false);
+                        await fetchClusters();
+                        await fetchHypervHosts();
+                        if (selectedHyperV?.id === hostId) {
+                            fetchHypervVms(hostId);
+                            fetchHypervHostFacts(hostId);
+                        }
+                    } else {
+                        const err = resp ? await resp.json().catch(() => ({})) : {};
+                        addToast(`${t('updateFailed') || 'Update failed'}: ${err.error || ''}`, 'error');
+                    }
+                } catch (e) {
+                    addToast((t('updateFailed') || 'Update failed') + ': ' + e.message, 'error');
+                } finally {
+                    setHypervSaving(false);
+                }
+            };
+
             const handleTestVMware = async (config) => {
                 setVmwareTestLoading(true);
                 setVmwareTestResult(null);
@@ -11933,6 +12091,27 @@
                     return () => { clearInterval(interval); clearInterval(clInterval); };
                 }
             }, [selectedVMware?.id]);
+
+            // Fork patch #15 — the registered Hyper-V sources, for the sidebar and the edit
+            // form. Slow poll only: a host is read when somebody asks, so nothing here may
+            // put a standing load on a customer's hypervisor.
+            useEffect(() => {
+                fetchHypervHosts();
+                const hvInterval = setInterval(fetchHypervHosts, 120000);
+                return () => clearInterval(hvInterval);
+            }, []);
+
+            // Read the selected host once. No interval: the VM list is what the operator
+            // asked for, and the refresh button is how they ask again.
+            useEffect(() => {
+                if (selectedHyperV?.id) {
+                    fetchHypervVms(selectedHyperV.id);
+                    fetchHypervHostFacts(selectedHyperV.id);
+                } else {
+                    setHypervVms([]);
+                    setHypervHostFacts(null);
+                }
+            }, [selectedHyperV?.id]);
             
             // Watch VM detail via SSE (replaces 10s polling)
             useEffect(() => {
@@ -12221,6 +12400,7 @@
                 setSelectedCluster(null);
                 setSelectedPBS(null);
                 setSelectedVMware(null);
+                setSelectedHyperV(null);
                 setSelectedGroup(null);
                 setSidebarTopology(false);
                 setSidebarWorldmap(false);
@@ -12507,7 +12687,11 @@
                         }
                         
                         // fetch status for all clusters (overview)
-                        const connectedClusters = data.filter(c => c.connected);
+                        // Fork patch #15 — a migration source is not part of the datacenter
+                        // rollup and has no Proxmox status route; asking anyway put a
+                        // standing WinRM load on a customer's hypervisor for numbers no
+                        // view shows.
+                        const connectedClusters = data.filter(c => c.connected && hvType(c) !== 'hyperv');
                         const allGuests = [];
                         
                         // NS #594 — this used to be a serial await-loop: one slow cluster
@@ -14531,14 +14715,26 @@
                             const tpl = t('nodesOfflineNamed') || '{count} node(s) offline: {names}';
                             alertMessages.push(fmt(tpl, { count: offlineAlerts.length, names: truncateNames(names) }));
                         }
-                        const disconnected = clusters.filter(c => c.connected === false);
+                        const disconnected = pveClusters.filter(c => c.connected === false);
                         if (disconnected.length > 0) {
                             const names = disconnected.map(c => c.name || c.id).filter(Boolean);
                             const tpl = t('clustersDisconnectedNamed') || '{count} cluster(s) disconnected: {names}';
                             alertMessages.push(fmt(tpl, { count: disconnected.length, names: truncateNames(names) }));
                         }
+                        // Fork patch #15 — said separately, because a migration source that
+                        // cannot be reached is a different problem from a cluster that is
+                        // down, and calling it a cluster sends somebody looking in the
+                        // wrong place. Saying nothing at all would hide it until the next
+                        // migration failed.
+                        const hvDisconnected = hypervHosts.filter(h => h.connected === false);
+                        if (hvDisconnected.length > 0) {
+                            const names = hvDisconnected.map(h => h.name || h.host || h.id).filter(Boolean);
+                            const tpl = t('hvSourcesDisconnectedNamed')
+                                || '{count} Hyper-V source(s) unreachable: {names}';
+                            alertMessages.push(fmt(tpl, { count: hvDisconnected.length, names: truncateNames(names) }));
+                        }
                         // #609 phase 2 — clusters with degraded in-band hardware (from the cached rollup)
-                        const hwDegraded = clusters.filter(c => {
+                        const hwDegraded = pveClusters.filter(c => {
                             const h = allClusterMetrics[c.id]?.data?.hardware?.health;
                             return h === 'warning' || h === 'critical';
                         });
@@ -14691,17 +14887,17 @@
                                         <div className="space-y-3">
                                             {/* MK: overview button, LW: compact for corporate */}
                                             <button
-                                                onClick={() => { setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); }}
+                                                onClick={() => { setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedHyperV(null); setSelectedGroup(null); setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); }}
                                                 className={`w-full flex items-center ${
                                                     isCorporate
                                                         ? 'gap-1.5 pl-1 pr-2 py-0.5 text-[13px] leading-5'
                                                         : `gap-3 px-3 py-2.5 rounded-xl transition-all ${
-                                                            !selectedCluster && !selectedPBS && !selectedVMware && !selectedGroup && !sidebarXHM
+                                                            !selectedCluster && !selectedPBS && !selectedVMware && !selectedHyperV && !selectedGroup && !sidebarXHM
                                                                 ? 'bg-gradient-to-r from-proxmox-orange/20 to-orange-600/10 border border-proxmox-orange/30 text-white'
                                                                 : 'bg-proxmox-card border border-proxmox-border hover:border-proxmox-orange/30 text-gray-300 hover:text-white'
                                                           }`
                                                 }`}
-                                                style={isCorporate ? (!selectedCluster && !selectedPBS && !selectedVMware && !selectedGroup && !sidebarTopology && !sidebarXHM ? {background: 'rgba(73,175,217,0.10)', borderLeft: '2px solid var(--corp-accent)', color: 'var(--color-text)'} : {color: 'var(--corp-text-secondary)'}) : undefined}
+                                                style={isCorporate ? (!selectedCluster && !selectedPBS && !selectedVMware && !selectedHyperV && !selectedGroup && !sidebarTopology && !sidebarXHM ? {background: 'rgba(73,175,217,0.10)', borderLeft: '2px solid var(--corp-accent)', color: 'var(--color-text)'} : {color: 'var(--corp-text-secondary)'}) : undefined}
                                                 onMouseEnter={isCorporate ? (e) => { if (selectedCluster || selectedPBS || selectedVMware || selectedGroup || sidebarTopology || sidebarXHM) { e.currentTarget.style.background = 'var(--color-hover)'; e.currentTarget.style.color = 'var(--color-text)'; }} : undefined}
                                                 onMouseLeave={isCorporate ? (e) => { if (selectedCluster || selectedPBS || selectedVMware || selectedGroup || sidebarTopology || sidebarXHM) { e.currentTarget.style.background = ''; e.currentTarget.style.color = 'var(--corp-text-secondary)'; }} : undefined}
                                             >
@@ -14709,7 +14905,7 @@
                                                     <Icons.Database className="w-4 h-4 flex-shrink-0" style={{color: 'var(--corp-accent)'}} />
                                                 ) : (
                                                     <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
-                                                        !selectedCluster && !selectedPBS && !selectedVMware && !selectedGroup && !sidebarXHM ? 'bg-proxmox-orange/20' : 'bg-proxmox-dark'
+                                                        !selectedCluster && !selectedPBS && !selectedVMware && !selectedHyperV && !selectedGroup && !sidebarXHM ? 'bg-proxmox-orange/20' : 'bg-proxmox-dark'
                                                     }`}>
                                                         <Icons.Grid className="w-4 h-4" />
                                                     </div>
@@ -14722,7 +14918,7 @@
                                                         </div>
                                                     )}
                                                 </span>
-                                                {!isCorporate && !selectedCluster && !selectedPBS && !selectedVMware && !selectedGroup && !sidebarXHM && (
+                                                {!isCorporate && !selectedCluster && !selectedPBS && !selectedVMware && !selectedHyperV && !selectedGroup && !sidebarXHM && (
                                                     <div className="w-2 h-2 rounded-full bg-proxmox-orange" />
                                                 )}
                                             </button>
@@ -14829,7 +15025,7 @@
 
                                             {/* Grouped Clusters */}
                                             {clusterGroups.map(group => {
-                                                const groupClusters = clusters.filter(c => c.group_id === group.id);
+                                                const groupClusters = pveClusters.filter(c => c.group_id === group.id);
                                                 if (groupClusters.length === 0) return null;
 
                                                 const isCollapsed = collapsedGroups[group.id];
@@ -14849,7 +15045,7 @@
                                                             </button>
                                                             {/* MK: clicking the folder name opens group overlay */}
                                                             <button
-                                                                onClick={() => { setSelectedGroup(group); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); }}
+                                                                onClick={() => { setSelectedGroup(group); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedHyperV(null); }}
                                                                 className={`flex items-center gap-2 flex-1 text-left ${selectedGroup?.id === group.id ? 'text-white' : 'text-gray-300 hover:text-white'}`}
                                                             >
                                                                 <Icons.Folder className="w-4 h-4" style={{ color: group.color || '#E86F2D' }} />
@@ -14898,7 +15094,7 @@
                                             
                                             {/* Ungrouped Clusters */}
                                             {(() => {
-                                                const ungroupedClusters = clusters.filter(c => !c.group_id || !clusterGroups.find(g => g.id === c.group_id));
+                                                const ungroupedClusters = pveClusters.filter(c => !c.group_id || !clusterGroups.find(g => g.id === c.group_id));
                                                 if (ungroupedClusters.length === 0) return null;
                                                 
                                                 return (
@@ -14959,7 +15155,7 @@
                                             {pbsServers.filter(pbs => !selectedCluster || !pbs.linked_clusters?.length || pbs.linked_clusters.includes(selectedCluster.id)).map(pbs => (
                                                 <button
                                                     key={pbs.id}
-                                                    onClick={() => { setSelectedPBS(pbs); setSelectedCluster(null); setSelectedVMware(null); setPbsActiveTab('dashboard'); setPbsSelectedStore(null); }}
+                                                    onClick={() => { setSelectedPBS(pbs); setSelectedCluster(null); setSelectedVMware(null); setSelectedHyperV(null); setPbsActiveTab('dashboard'); setPbsSelectedStore(null); }}
                                                     className={isCorporate
                                                         ? 'w-full flex items-center gap-1.5 pl-3 pr-2 py-0.5 text-[13px] leading-5'
                                                         : `w-full flex items-center gap-3 px-3 py-2 rounded-xl transition-all ${
@@ -15017,7 +15213,7 @@
                                                 return (
                                                 <button
                                                     key={vmw.id}
-                                                    onClick={() => { setSelectedVMware(vmw); setSelectedCluster(null); setSelectedPBS(null); setVmwareActiveTab('vms'); setVmwareSelectedVm(null); }}
+                                                    onClick={() => { setSelectedVMware(vmw); setSelectedCluster(null); setSelectedPBS(null); setSelectedHyperV(null); setVmwareActiveTab('vms'); setVmwareSelectedVm(null); }}
                                                     className={isCorporate
                                                         ? 'w-full flex items-center gap-1.5 pl-3 pr-2 py-0.5 text-[13px] leading-5'
                                                         : `w-full flex items-center gap-3 px-3 py-2 rounded-xl transition-all ${
@@ -15174,6 +15370,59 @@
                                             <Icons.Cloud className="w-4 h-4" />
                                             <span>{t('addEsxiServer')}</span>
                                         </button>
+                                    </div>
+                                )}
+
+                                {/* Fork patch #15 — Hyper-V migration sources.
+                                    Their own section, like ESXi above: a source is read and
+                                    migrated from, never managed, so it carries none of a
+                                    cluster's settings and must not sit among the clusters
+                                    offering them (docs/adr/0001). */}
+                                {hypervHosts.length > 0 && (
+                                    <div className="mt-4 pt-4 border-t border-proxmox-border">
+                                        <div className="flex items-center justify-between px-1 mb-2">
+                                            <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">Hyper-V</h2>
+                                            {isAdmin && (
+                                                <button onClick={() => { setAddClusterType('hyperv'); setShowAddModal(true); }} className="p-1 text-gray-500 hover:text-indigo-400 rounded transition-colors" title={t('hvAddHost') || 'Add a Hyper-V source'}>
+                                                    <Icons.Plus className="w-4 h-4" />
+                                                </button>
+                                            )}
+                                        </div>
+                                        <div className="space-y-1.5">
+                                            {hypervHosts.map(host => {
+                                                const hvSelected = selectedHyperV?.id === host.id && !selectedCluster && !selectedPBS && !selectedVMware;
+                                                return (
+                                                <button
+                                                    key={host.id}
+                                                    onClick={() => { setSelectedHyperV(host); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); }}
+                                                    className={isCorporate
+                                                        ? 'w-full flex items-center gap-1.5 pl-3 pr-2 py-0.5 text-[13px] leading-5'
+                                                        : `w-full flex items-center gap-3 px-3 py-2 rounded-xl transition-all ${
+                                                            hvSelected
+                                                                ? 'bg-gradient-to-r from-indigo-500/20 to-indigo-600/10 border border-indigo-500/30 text-white'
+                                                                : 'bg-proxmox-card border border-proxmox-border hover:border-indigo-500/30 text-gray-300 hover:text-white'
+                                                          }`
+                                                    }
+                                                    style={isCorporate ? (hvSelected ? {background: 'rgba(73,175,217,0.10)', borderLeft: '2px solid var(--corp-accent)', color: 'var(--color-text)'} : {color: 'var(--corp-text-secondary)'}) : undefined}
+                                                    onMouseEnter={isCorporate ? (e) => { if (!hvSelected) { e.currentTarget.style.background = 'var(--color-hover)'; e.currentTarget.style.color = 'var(--color-text)'; }} : undefined}
+                                                    onMouseLeave={isCorporate ? (e) => { if (!hvSelected) { e.currentTarget.style.background = ''; e.currentTarget.style.color = 'var(--corp-text-secondary)'; }} : undefined}
+                                                >
+                                                    {isCorporate ? (
+                                                        <Icons.Server className="w-4 h-4 flex-shrink-0" style={{color: 'var(--corp-accent)'}} />
+                                                    ) : (
+                                                        <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${hvSelected ? 'bg-indigo-500/20' : 'bg-proxmox-dark'}`}>
+                                                            <Icons.Server className="w-4 h-4 text-indigo-400" />
+                                                        </div>
+                                                    )}
+                                                    <div className="flex-1 text-left min-w-0">
+                                                        <div className={`${isCorporate ? 'text-[13px]' : 'text-sm'} font-medium truncate`}>{host.display_name || host.name || host.host}</div>
+                                                        {!isCorporate && <div className="text-xs text-gray-500 truncate">{host.host}</div>}
+                                                    </div>
+                                                    <div className="w-1.5 h-1.5 rounded-full shrink-0" style={{background: host.connected !== false ? 'var(--color-success)' : 'var(--color-error)'}} />
+                                                </button>
+                                                );
+                                            })}
+                                        </div>
                                     </div>
                                 )}
 
@@ -22251,6 +22500,141 @@
                                             </div>
                                         )}
                                     </div>
+                                ) : selectedHyperV ? (
+                                    /* Fork patch #15 — the Hyper-V migration source view.
+                                       A source is read, prepared and migrated from, so this
+                                       shows what it has and offers the one action that
+                                       applies to a VM on it. Everything a cluster view
+                                       offers — balancing, HA, creating a guest — is absent
+                                       because none of it exists here (docs/adr/0001). */
+                                    <div className={isCorporate ? 'space-y-4' : 'space-y-6'}>
+                                        <div className={`flex items-center justify-between ${isCorporate ? 'px-4 py-3 border-b' : ''}`} style={isCorporate ? {borderColor: 'var(--corp-border-medium)', background: 'var(--corp-header-bg)'} : {}}>
+                                            <div className="flex items-center gap-4">
+                                                {isCorporate ? (
+                                                    <Icons.Server className="w-5 h-5 flex-shrink-0" style={{color: 'var(--corp-accent)'}} />
+                                                ) : (
+                                                    <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-indigo-500/20 to-indigo-600/10 border border-indigo-500/30 flex items-center justify-center">
+                                                        <Icons.Server className="w-6 h-6 text-indigo-400" />
+                                                    </div>
+                                                )}
+                                                <div>
+                                                    <h1 className={isCorporate ? 'text-[15px] font-medium' : 'text-2xl font-bold'} style={{color: '#e9ecef'}}>{selectedHyperV.name || selectedHyperV.host}</h1>
+                                                    <div className={`flex items-center gap-3 ${isCorporate ? 'text-[12px]' : 'text-sm'}`} style={{color: '#adbbc4'}}>
+                                                        <span>{selectedHyperV.host}:{selectedHyperV.port || 5985}</span>
+                                                        <span>•</span>
+                                                        <span>{selectedHyperV.use_ssl ? 'HTTPS' : 'HTTP'} / {selectedHyperV.auth || 'negotiate'}</span>
+                                                        <span>•</span>
+                                                        <span>{hypervVms.length} VMs</span>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            <div className={isCorporate ? 'corp-toolbar flex items-center gap-1' : 'flex items-center gap-2'}>
+                                                {isAdmin && (
+                                                    <>
+                                                        <button onClick={() => openHypervEdit(selectedHyperV)} title={t('edit') || 'Edit'} className={isCorporate ? '' : 'px-3 py-2 rounded-lg bg-proxmox-card border border-proxmox-border text-gray-400 hover:text-white text-sm'}>
+                                                            <Icons.Settings className="w-4 h-4" />
+                                                        </button>
+                                                        <button onClick={() => handleDeleteHyperV(selectedHyperV.id)} title={t('delete') || 'Remove'} className={isCorporate ? '' : 'px-3 py-2 rounded-lg bg-proxmox-card border border-proxmox-border text-red-400 hover:text-red-300 text-sm'}>
+                                                            <Icons.Trash className="w-4 h-4" />
+                                                        </button>
+                                                    </>
+                                                )}
+                                                <button onClick={() => { fetchHypervVms(selectedHyperV.id); fetchHypervHostFacts(selectedHyperV.id); }} title={t('refresh') || 'Refresh'} className={isCorporate ? '' : 'px-3 py-2 rounded-lg bg-proxmox-card border border-proxmox-border text-gray-400 hover:text-white text-sm'}>
+                                                    <Icons.RefreshCw className={`w-4 h-4 ${hypervLoading ? 'animate-spin' : ''}`} />
+                                                </button>
+                                            </div>
+                                        </div>
+
+                                        <div className={isCorporate ? 'px-4 space-y-4' : 'space-y-4'}>
+                                            <div className="p-3 rounded-lg border border-indigo-500/25 bg-indigo-500/5 text-xs text-indigo-300/90">
+                                                {t('hvSourceOnly') || 'A Hyper-V host is a migration source only. PegaProx reads it, prepares a VM for migration, and moves that VM to Proxmox. It never manages the host.'}
+                                            </div>
+
+                                            {selectedHyperV.connected === false && (
+                                                <div className="p-3 rounded-lg border border-red-500/30 bg-red-500/10 text-sm text-red-300">
+                                                    {selectedHyperV.connection_error || t('hvNotConnected') || 'Not connected to this host.'}
+                                                </div>
+                                            )}
+
+                                            {/* The host says which of the properties PegaProx reads it does not
+                                                expose. An absent one reads as null, which would quietly make a VM
+                                                look like it had no generation and no checkpoints — so it is shown
+                                                rather than logged. */}
+                                            {hypervHostFacts && hypervHostFacts.properties && hypervHostFacts.properties.complete === false && (
+                                                <div className="p-3 rounded-lg border border-amber-500/30 bg-amber-500/10 text-xs text-amber-200">
+                                                    {t('hvIncompleteProperties') || 'This host does not report every property PegaProx reads. Values it does not report are shown as unknown rather than guessed:'}
+                                                    {' '}
+                                                    <span className="font-mono">{Object.keys(hypervHostFacts.properties.missing || {}).join(', ')}</span>
+                                                </div>
+                                            )}
+
+                                            {hypervHostFacts && hypervHostFacts.facts && (
+                                                <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                                                    {[
+                                                        [t('hvOperatingSystem') || 'Operating system', hypervHostFacts.facts.os_caption],
+                                                        ['PowerShell', hypervHostFacts.facts.powershell_version],
+                                                        [t('hvLogicalProcessors') || 'Logical processors', hypervHostFacts.facts.logical_processors],
+                                                        [t('hvMemory') || 'Memory', hypervHostFacts.facts.memory_gb ? `${hypervHostFacts.facts.memory_gb} GB` : null],
+                                                    ].filter(([, value]) => value !== null && value !== undefined && value !== '').map(([label, value]) => (
+                                                        <div key={label} className="p-3 rounded-lg bg-proxmox-card border border-proxmox-border">
+                                                            <div className="text-xs text-gray-500">{label}</div>
+                                                            <div className="text-sm text-white truncate">{value}</div>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            )}
+
+                                            <div className="rounded-xl bg-proxmox-card border border-proxmox-border overflow-hidden">
+                                                <div className="px-4 py-3 border-b border-proxmox-border text-sm font-medium text-gray-300">
+                                                    {t('vms') || 'VMs'}
+                                                </div>
+                                                <div className="overflow-x-auto">
+                                                    <table className="w-full text-sm">
+                                                        <thead>
+                                                            <tr className="text-left text-xs text-gray-500">
+                                                                <th className="px-4 py-2 font-medium">{t('name') || 'Name'}</th>
+                                                                <th className="px-4 py-2 font-medium">{t('status') || 'Status'}</th>
+                                                                <th className="px-4 py-2 font-medium">{t('hvGeneration') || 'Generation'}</th>
+                                                                <th className="px-4 py-2 font-medium">{t('cpu') || 'CPU'}</th>
+                                                                <th className="px-4 py-2 font-medium">{t('memory') || 'RAM'}</th>
+                                                                <th className="px-4 py-2" />
+                                                            </tr>
+                                                        </thead>
+                                                        <tbody>
+                                                            {hypervVms.map(vm => (
+                                                                <tr key={vm.vmid} className="border-t border-proxmox-border/60">
+                                                                    <td className="px-4 py-2 text-white">{vm.name}</td>
+                                                                    <td className="px-4 py-2">
+                                                                        <span className={vm.status === 'running' ? 'text-green-400' : 'text-gray-400'}>
+                                                                            {vm.hyperv_state || vm.status}
+                                                                        </span>
+                                                                    </td>
+                                                                    <td className="px-4 py-2 text-gray-300">{vm.generation ?? '-'}</td>
+                                                                    <td className="px-4 py-2 text-gray-300">{vm.maxcpu || '-'}</td>
+                                                                    <td className="px-4 py-2 text-gray-300">{vm.maxmem ? `${Math.round(vm.maxmem / 1048576)} MB` : '-'}</td>
+                                                                    <td className="px-4 py-2 text-right">
+                                                                        <button
+                                                                            onClick={() => openXhmForSource(selectedHyperV.id, vm)}
+                                                                            className="px-3 py-1.5 rounded-lg bg-indigo-500/10 border border-indigo-500/30 text-indigo-300 hover:text-white hover:border-indigo-400 transition-colors text-xs"
+                                                                        >
+                                                                            {t('hvMigrateToProxmox') || 'Migrate to Proxmox'}
+                                                                        </button>
+                                                                    </td>
+                                                                </tr>
+                                                            ))}
+                                                            {hypervVms.length === 0 && (
+                                                                <tr>
+                                                                    <td colSpan="6" className="px-4 py-8 text-center text-gray-600 text-sm">
+                                                                        {hypervLoading ? (t('loading') || 'Loading...') : (t('hvNoVms') || 'No VMs on this host')}
+                                                                    </td>
+                                                                </tr>
+                                                            )}
+                                                        </tbody>
+                                                    </table>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
                                 ) : selectedGroup ? (
                                     // LW: Feb 2026 - folder overlay for group
                                     <GroupOverview
@@ -22750,7 +23134,7 @@
                                     </div>
                                 ) : (
                                     <AllClustersOverview
-                                        clusters={clusters}
+                                        clusters={pveClusters}
                                         allMetrics={allClusterMetrics}
                                         clusterGroups={clusterGroups}
                                         topGuests={topGuests}
@@ -23225,6 +23609,37 @@
                     )}
 
                     {/* Add/Edit VMware Server Modal */}
+                    {/* Fork patch #15 — editing a registered Hyper-V source. Its own modal
+                        rather than the cluster reconfigure flow: that one exports the
+                        Proxmox field set, which carries none of the WinRM settings, so
+                        every transport choice silently reverted to its default. */}
+                    {showHypervEdit && selectedHyperV && (
+                        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+                            <div className="bg-proxmox-card border border-proxmox-border rounded-2xl w-full max-w-lg shadow-2xl max-h-[90vh] overflow-y-auto">
+                                <div className="p-6 border-b border-proxmox-border flex items-center justify-between">
+                                    <h2 className="text-lg font-bold text-white">{t('hvEditHost') || 'Edit Hyper-V source'}</h2>
+                                    <button onClick={() => setShowHypervEdit(false)} className="p-1 text-gray-500 hover:text-white rounded"><Icons.X className="w-5 h-5" /></button>
+                                </div>
+                                <form onSubmit={(e) => { e.preventDefault(); handleUpdateHyperV(selectedHyperV.id, hypervForm); }}>
+                                    <div className="p-6 space-y-4">
+                                        <HyperVSourceForm config={hypervForm} setConfig={setHypervForm} t={t} />
+                                        <p className="text-xs text-gray-500">
+                                            {t('hvPasswordKept') || 'Leave the password empty to keep the stored one.'}
+                                        </p>
+                                    </div>
+                                    <div className="p-6 border-t border-proxmox-border flex items-center justify-end gap-3">
+                                        <button type="button" onClick={() => setShowHypervEdit(false)} className="px-4 py-2 rounded-lg bg-proxmox-dark border border-proxmox-border text-gray-300 hover:text-white text-sm">
+                                            {t('cancel') || 'Cancel'}
+                                        </button>
+                                        <button type="submit" disabled={hypervSaving} className="px-4 py-2 rounded-lg bg-proxmox-orange text-white text-sm disabled:opacity-50">
+                                            {hypervSaving ? (t('saving') || 'Saving...') : (t('save') || 'Save')}
+                                        </button>
+                                    </div>
+                                </form>
+                            </div>
+                        </div>
+                    )}
+
                     {showAddVMware && (
                         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
                             <div className="bg-proxmox-card border border-proxmox-border rounded-2xl w-full max-w-lg shadow-2xl">
