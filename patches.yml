@@ -113,9 +113,13 @@ patches:
   # Snapshot mutations in the Corporate VM detail discarded the JSON error
   # returned by the server. Keep the existing generic text only as a fallback
   # when the response is missing or cannot be parsed.
+  # Taken upstream into `Testing` as our own commit, but v1.1.1 predates that,
+  # so the fix is not in the release we build on and the patch still has to be
+  # applied. The branch is rebased onto the release tag, which is what makes
+  # its commit set this patch alone; `base` stays the branch it was offered to.
   - name: snapshot-error-toasts
     branch: fix/snapshot-error-toasts
-    base: Testing
+    base: main
     kind: fix
     upstream_pr:
     summary: 'Snapshot action toasts show the error returned by the server'
