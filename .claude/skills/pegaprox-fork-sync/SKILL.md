@@ -25,6 +25,14 @@ release plus the ordered patch set in `patches.yml`.
 - `base` names the upstream branch the patch branch is actually based on. After
   rebasing a patch from `main` to `Testing`, update `base` in the same automation
   change; otherwise unrelated upstream commits enter the patch range.
+- **Every patch branch sits on the current upstream release tag, and every sync
+  rebases all of them onto it first.** The rebuild starts from that tag, so a
+  branch left on an older commit contributes a patch range that no longer
+  matches what is being built, and the branches drift apart until one of them
+  conflicts for a reason nobody can place. Rebase onto the release tag, never
+  onto `main`: `main` runs ahead of the newest release, and a branch carrying
+  commits the release does not have is refused by the foreign-commit check —
+  correctly, because those commits are not the patch.
 - `commit_message` is required and follows
   `<type>(<area>): <what changed>`. It describes the whole patch and is the
   stable subject of its squash commit on `cmo/main`.
@@ -39,6 +47,9 @@ release plus the ordered patch set in `patches.yml`.
 
 1. Finish and verify the patch on its feature branch first. Never edit
    `cmo/main` directly and never delete a patch branch after integration.
+1. Rebase every branch in `patches.yml` onto the current upstream release tag
+   and push them before rebuilding. The script reads `<remote>/<branch>`, so an
+   unpushed rebase is invisible to it and the build silently uses the old base.
 2. Commit `patches.yml`, script and documentation changes atomically on
    `cmo/automation` before rebuilding.
 3. Use `./scripts/run.sh sync` for a local rebuild or
@@ -48,6 +59,12 @@ release plus the ordered patch set in `patches.yml`.
    `commit_message`, rebuilds `web/index.html`, runs the full suite, moves
    `cmo/main`, and creates the next local tag. With `publish`, it then
    force-pushes the rebuilt branch and pushes the immutable tag.
+5. The revision number is derived from the highest existing tag for this
+   release, so **deleting tags before a build makes the counter fall back** and
+   the next build hands an old number to a newer state. If a damaged tag has to
+   go, note the number the build should get, delete the tag afterwards, and set
+   the tag by hand when the counter would be wrong. A gap in the sequence is
+   honest; a number that means two different trees is not.
 
 ## Conflicts and Generated Output
 

@@ -133,6 +133,12 @@ what each release costs. These hold for every entry in `patches.yml`:
   and let the sync rebuild the bundle.
 - **One patch, one concern, one branch.** Otherwise the sync cannot retire it
   on its own when upstream absorbs half of it.
+- **Based on the current upstream release tag, and rebased onto the new one at
+  every release** — all of them, in the same pass, before the rebuild runs. The
+  rebuild starts from that tag; a branch left behind on an older commit is
+  replayed from a base that no longer exists in what is being built. Not onto
+  `main`: it runs ahead of the release, and commits the release does not have
+  are not part of the patch.
 - **Leave `.github/workflows/` alone.** A `fix/*` branch goes upstream as a
   pull request, and a diff touching CI config will not be accepted. What the
   fork needs differently is a repository setting, not a commit.
