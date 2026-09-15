@@ -151,3 +151,26 @@ def test_the_recovery_path_is_wired_into_the_evacuation():
     names = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)}
     assert 'HA_MIGRATE_SETTLE_SECONDS' in names, \
         f"the settle window is not used inside {fn.name} — the check is immediate again"
+
+
+@pytest.mark.parametrize('raw', ['nan', 'NaN', 'inf', '-inf', 'Infinity'])
+def test_a_non_finite_value_cannot_hang_the_settle_loop(monkeypatch, raw):
+    """float() accepts all of these. NaN is the dangerous one: every comparison against
+    it is False, so it walks through a `val < lo or val > hi` range check untouched, and
+    `time.time() + nan` is nan — which makes the loop's `time.time() >= deadline` false
+    forever. The evacuation would never return and would poll the cluster until the
+    process died, in the very change meant to poll more patiently."""
+    import math
+    c = _reload_with(monkeypatch, PEGAPROX_HA_MIGRATE_SETTLE=raw,
+                     PEGAPROX_HA_MIGRATE_SETTLE_POLL=raw)
+    assert math.isfinite(c.HA_MIGRATE_SETTLE_SECONDS)
+    assert math.isfinite(c.HA_MIGRATE_SETTLE_POLL)
+    assert c.HA_MIGRATE_SETTLE_POLL >= 0.5
+
+
+def test_a_nan_window_would_have_produced_an_endless_deadline():
+    """Pins why the guard above exists, so nobody removes it as paranoia."""
+    import math, time
+    deadline = time.time() + float('nan')
+    assert math.isnan(deadline)
+    assert not (time.time() >= deadline), "the loop's only exit would never fire"
