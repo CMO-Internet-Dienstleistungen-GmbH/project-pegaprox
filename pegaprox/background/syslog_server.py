@@ -8,7 +8,6 @@ Original PR by gyptazy, adapted to fit PegaProx architecture.
 import os
 import time
 import logging
-import sqlite3  # kept for type re-exports
 import threading
 from datetime import datetime
 
@@ -217,7 +216,10 @@ def _init_fts(cur):
                 FROM logs
             """)
         return True
-    except sqlite3.OperationalError as exc:
+    # dbcrypto's, not sqlite3's — _open_db() goes through dbcrypto.connect() and the
+    # sqlcipher3 build raises its own OperationalError, so the sqlite3 one matched
+    # nothing and this fallback couldn't fall back on the installs that have SQLCipher.
+    except dbcrypto.OperationalError as exc:
         logging.info(f"[Syslog] FTS disabled for syslog DB: {exc}")
         return False
 
