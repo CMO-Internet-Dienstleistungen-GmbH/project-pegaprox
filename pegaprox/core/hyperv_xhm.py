@@ -96,6 +96,58 @@ def target_hardware(config) -> dict:
 # rather than a silently truncated VM.
 MAX_NETWORK_ADAPTERS = 8
 
+#: The VLAN an imported adapter lands on when the source names none. Hyper-V leaves an
+#: adapter untagged far more often than the network it sits on is actually untagged: the
+#: tagging is done by the physical switch port, which the guest cannot see. Importing such
+#: an adapter with no tag puts it on the target bridge's native VLAN, which is a different
+#: network. The value is an operator setting; this is only the fallback when none is saved.
+DEFAULT_IMPORT_VLAN = 1006
+
+#: Hyper-V VLAN modes. Only `Access` carries a single id that a Proxmox `tag=` can express.
+#: `Trunk` passes several, `Isolated` is a private-VLAN role; neither has one number, so
+#: neither is guessed at -- the preflight says so and the adapter arrives untagged.
+VLAN_MODE_ACCESS = 'Access'
+_SINGLE_VLAN_MODES = (VLAN_MODE_ACCESS, 'Untagged', '')
+
+
+def default_import_vlan() -> int | None:
+    """The configured fallback VLAN, or None when the operator turned it off.
+
+    Read per call rather than cached: a migration is rare and an operator who changes this
+    expects the next run to use it, not the next restart.
+    """
+    try:
+        from pegaprox.api.helpers import load_server_settings
+        raw = (load_server_settings() or {}).get('hyperv_default_vlan', DEFAULT_IMPORT_VLAN)
+    except Exception:                                        # noqa: BLE001
+        raw = DEFAULT_IMPORT_VLAN
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_IMPORT_VLAN
+    # 0 is how the setting says "leave imports untagged"; VLAN ids stop at 4094.
+    return value if 1 <= value <= 4094 else None
+
+
+def vlan_for_adapter(nic: dict) -> int | None:
+    """The VLAN id an adapter should arrive on, or None to leave it untagged.
+
+    The source wins when it names one. A mode that carries more than one id names none,
+    so it falls through to untagged rather than to the default -- putting a trunk port on
+    a single guessed VLAN is worse than leaving it off, because it looks like it worked.
+    """
+    mode = (nic.get('vlan_mode') or '').strip()
+    if mode and mode not in _SINGLE_VLAN_MODES:
+        return None
+    raw = nic.get('vlan_id')
+    try:
+        source_vlan = int(raw)
+    except (TypeError, ValueError):
+        source_vlan = 0
+    if 1 <= source_vlan <= 4094:
+        return source_vlan
+    return default_import_vlan()
+
 # The transfer is one qemu-img run per disk with no resume, so the retry budget is small:
 # a second attempt covers a dropped SSH connection, a third is already evidence that
 # something is wrong rather than unlucky.
@@ -205,6 +257,12 @@ def plan_hyperv_to_pve(source_cluster_id, source_vmid, target_cluster_id) -> dic
                 'switch_name': nic.get('switch_name'),
                 'network': nic.get('mac_address') or nic.get('name') or '',
                 'bridge': nic.get('switch_name') or nic.get('name') or '',
+                # What the source says, and what this adapter would arrive on if nobody
+                # touches the field. The wizard shows the mode so an operator can see why
+                # a trunk adapter's VLAN box is empty rather than wondering.
+                'vlan_id': nic.get('vlan_id'),
+                'vlan_mode': nic.get('vlan_mode'),
+                'vlan_suggested': vlan_for_adapter(nic),
             } for nic in (data.get('network_adapters') or [])],
             'generation': generation,
             'bios': GENERATION_BIOS.get(generation or 0, 'seabios'),
@@ -1420,6 +1478,9 @@ def _create_target_vm(task, target, new_vmid, detail):
     }
 
     network_map = task.network_map or {}
+    # Read off the request rather than the shared task object: `vlan_map` is this fork's
+    # field, and the task class belongs to upstream.
+    vlan_map = (task.config or {}).get('vlan_map') or {}
     for index, nic in enumerate((detail.get('network_adapters') or [])[:MAX_NETWORK_ADAPTERS]):
         key = nic.get('mac_address') or nic.get('name') or ''
         bridge = network_map.get(key)
@@ -1448,8 +1509,25 @@ def _create_target_vm(task, target, new_vmid, detail):
         # guest that was imported without VirtIO drivers has no driver either, so a
         # compatible disk controller with a VirtIO network card would still leave the guest
         # without a network until somebody installed drivers it cannot download.
+        # The VLAN the operator confirmed in the wizard, falling back to what the source
+        # reported. An empty entry is a decision too -- it means "no tag" -- so only a
+        # missing key falls through to the source's own value.
+        if key in vlan_map:
+            chosen = vlan_map.get(key)
+        else:
+            chosen = vlan_for_adapter(nic)
+        try:
+            vlan = int(chosen)
+        except (TypeError, ValueError):
+            vlan = 0
+        if vlan and not 1 <= vlan <= 4094:
+            task.log(f'Adapter {key or index}: VLAN {vlan} is out of range; leaving it untagged')
+            vlan = 0
         create[f'net{index}'] = (f'{hardware["nic_model"]},bridge={bridge}'
-                                 + (f',macaddr={mac}' if mac else ''))
+                                 + (f',macaddr={mac}' if mac else '')
+                                 + (f',tag={vlan}' if vlan else ''))
+        task.log(f'Adapter {key or index} -> {bridge}'
+                 + (f' VLAN {vlan}' if vlan else ' untagged'))
 
     try:
         response = target._api_post(

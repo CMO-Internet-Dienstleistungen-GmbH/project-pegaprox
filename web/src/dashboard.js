@@ -8258,7 +8258,7 @@
             const [xhmForm, setXhmForm] = useState({
                 source_cluster: '', source_node: '', source_vmid: '',
                 target_cluster: '', target_node: '', target_storage: '',
-                network_map: {}, start_after: true, remove_source: false,
+                network_map: {}, vlan_map: {}, start_after: true, remove_source: false,
                 // Fork patch #15 — on by default: prepare the guest for VirtIO during the
                 // migration (inject the drivers, create the VM on VirtIO hardware) rather
                 // than importing on compatible hardware and converting by hand afterwards.
@@ -12414,7 +12414,7 @@
                     source_vmid: String(vm.vmid),
                     source_node: vm.node || '',
                     target_cluster: '', target_node: '', target_storage: '',
-                    network_map: {}, acknowledged: [],
+                    network_map: {}, vlan_map: {}, acknowledged: [],
                 }));
             };
 
@@ -12528,7 +12528,7 @@
                 // this guest needs a VirtIO driver, and without this the list goes on
                 // saying "sata controller" while the box above it says VirtIO.
                 xhmForm.prepare_virtio,
-                JSON.stringify(xhmForm.network_map)]);
+                JSON.stringify(xhmForm.network_map), JSON.stringify(xhmForm.vlan_map)]);
 
             // poll XHM migrations when sidebar is open
             useEffect(() => {
@@ -22954,6 +22954,36 @@
                                                                                 {(xhmPlan.targets[0]?.networks || []).map(n => <option key={n.uuid || n.name} value={n.name}>{n.name} ({n.bridge})</option>)}
                                                                             </select>
                                                                         )}
+                                                                        {/* Fork patch #15 — the VLAN, per adapter, next to the bridge it goes on.
+                                                                            Hyper-V leaves an adapter untagged whenever the physical switch port
+                                                                            does the tagging, so an empty source VLAN usually means "the operator
+                                                                            knows which one", not "untagged" — hence a prefilled default rather
+                                                                            than a blank. A trunk adapter carries several ids and gets none:
+                                                                            putting it on one guessed VLAN would look like it worked. */}
+                                                                        {hvIsHyperVPlan(xhmPlan) && hvTargetsProxmox(xhmPlan.direction) && (() => {
+                                                                            const vkey = net.network || net.bridge || String(i);
+                                                                            const trunk = !!net.vlan_mode && !['Access', 'Untagged'].includes(net.vlan_mode);
+                                                                            const vlanValue = xhmForm.vlan_map[vkey] !== undefined
+                                                                                ? xhmForm.vlan_map[vkey]
+                                                                                : (trunk ? '' : (net.vlan_suggested ?? ''));
+                                                                            return (
+                                                                                <div className="flex items-center gap-1">
+                                                                                    <span className="text-xs text-gray-500">VLAN</span>
+                                                                                    <input type="number" min="0" max="4094" value={vlanValue}
+                                                                                        disabled={trunk}
+                                                                                        title={trunk
+                                                                                            ? (t('hvVlanTrunkHint') || 'This adapter carries more than one VLAN on the source and arrives without a tag.')
+                                                                                            : (t('hvVlanHint') || 'Empty or 0 means the adapter arrives without a VLAN tag.')}
+                                                                                        onChange={e => setXhmForm({...xhmForm, vlan_map: {...xhmForm.vlan_map, [vkey]: e.target.value}})}
+                                                                                        className={`w-20 px-2 py-1 bg-proxmox-dark border border-proxmox-border rounded text-white text-xs ${trunk ? 'opacity-50' : ''}`} />
+                                                                                    {net.vlan_id ? (
+                                                                                        <span className="text-[10px] text-gray-600 whitespace-nowrap">{t('hvVlanFromSource') || 'from source'}</span>
+                                                                                    ) : trunk ? (
+                                                                                        <span className="text-[10px] text-amber-500/80 whitespace-nowrap">{net.vlan_mode}</span>
+                                                                                    ) : null}
+                                                                                </div>
+                                                                            );
+                                                                        })()}
                                                                     </div>
                                                                 ))}
                                                             </div>
