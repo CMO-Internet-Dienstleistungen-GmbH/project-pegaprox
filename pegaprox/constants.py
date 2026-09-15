@@ -62,6 +62,7 @@ LOG_DIR = 'logs'
 #   PEGAPROX_FILE_LOG_LEVEL   — level for the per-cluster logs/<id>.log handler
 #   PEGAPROX_DISABLE_FILE_LOG — '1'/'true' to skip attaching the FileHandler
 import logging as _logging
+import math as _math
 def _parse_log_level(s: str, default):
     if not isinstance(s, str) or not s.strip():
         return default
@@ -217,6 +218,15 @@ def _bounded_float_env(name, default, lo, hi):
         val = float(raw)
     except (TypeError, ValueError):
         _logging.warning(f"[config] {name}={raw!r} is not a number — using {default}")
+        return default
+    # float('nan') parses happily, and every comparison against NaN is False — so it
+    # walks straight through the range check below and comes out the other side intact.
+    # A NaN settle window makes `time.time() + val` NaN too, which makes the loop's
+    # `time.time() >= deadline` false forever: the evacuation never returns and polls
+    # the cluster until the process dies. That check clamps inf and -inf fine on its own;
+    # NaN is the one it cannot see, so this takes all three and says so in the log.
+    if not _math.isfinite(val):
+        _logging.warning(f"[config] {name}={raw!r} is not a finite number — using {default}")
         return default
     if val < lo or val > hi:
         clamped = min(max(val, lo), hi)
