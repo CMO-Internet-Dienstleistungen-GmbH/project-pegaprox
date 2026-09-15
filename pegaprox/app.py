@@ -982,6 +982,18 @@ def main(debug_mode=False):
         print("  is done.")
         print("=" * 50 + "\n")
 
+    # Hyper-V patch (#15) — before the loop below reads it. An earlier build of this patch
+    # registered a Hyper-V host as a cluster, and an upgraded instance still carries it
+    # there beside its own table. The loop would build a PegaProxManager for it, whose poll
+    # thread then logs in to a Proxmox API that does not exist, forever.
+    try:
+        from pegaprox.core.hyperv_cluster import migrate_hyperv_out_of_cluster_config
+        moved = migrate_hyperv_out_of_cluster_config()
+        if moved:
+            print(f"Moved {moved} Hyper-V host(s) out of the cluster configuration")
+    except Exception as e:
+        logging.warning(f"Could not migrate Hyper-V sources out of the cluster config: {e}")
+
     # Load existing configuration
     config = load_config()
 
@@ -995,11 +1007,30 @@ def main(debug_mode=False):
             manager.start()
             g.cluster_managers[cluster_id] = manager
             print(f"Started XCP-ng manager for pool: {cluster_data['name']}")
+        elif ctype not in ('proxmox', ''):
+            # Hyper-V patch (#15) — anything but a Proxmox cluster handled above must not
+            # become a PegaProxManager. That manager polls a Proxmox API and balances a
+            # Proxmox cluster; given something else it fails every cycle and, with the zero
+            # interval such an entry carries, does so as fast as the failure returns.
+            # Whatever put this here is a defect, and the entry is left alone so it stays
+            # visible rather than being silently adopted.
+            logging.warning(
+                "Cluster %s has cluster_type %r, which has no manager. It is not started; "
+                "a Proxmox manager would poll an API it does not have.",
+                cluster_id, ctype)
         else:
             manager = PegaProxManager(cluster_id, config_obj)
             manager.start()
             g.cluster_managers[cluster_id] = manager
             print(f"Started PegaProx manager for cluster: {cluster_data['name']}")
+
+    # Hyper-V patch — a migration row still saying 'running' after a restart describes a
+    # process that no longer exists. Reconcile before anything can read that state.
+    try:
+        from pegaprox.core.hyperv_cluster import sweep_interrupted_migrations
+        sweep_interrupted_migrations()
+    except Exception as e:
+        logging.warning(f"Hyper-V interrupted-migration sweep failed: {e}")
 
     # Start background threads
     start_broadcast_thread()
@@ -1009,6 +1040,17 @@ def main(debug_mode=False):
         load_pbs_servers()
     except Exception as e:
         logging.warning(f"Failed to load PBS servers at startup: {e}")
+
+    # Hyper-V patch (#15) — a migration source, not a cluster: read from its own table and
+    # placed only into the manager registry, exactly like the ESXi hosts below. Nothing of
+    # this reaches load_config(), so no Hyper-V host appears in the cluster list.
+    try:
+        from pegaprox.core.hyperv_cluster import load_hyperv_sources
+        count = load_hyperv_sources(g.cluster_managers)
+        if count:
+            print(f"Registered {count} Hyper-V migration source(s)")
+    except Exception as e:
+        logging.warning(f"Failed to load Hyper-V sources at startup: {e}")
 
     try:
         load_vmware_servers()
