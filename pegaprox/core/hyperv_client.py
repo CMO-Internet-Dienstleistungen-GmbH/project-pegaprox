@@ -1,9 +1,9 @@
 """Transport to a Hyper-V host: PowerShell Remoting over WinRM, and nothing else.
 
 PegaProx runs on Linux, so a Hyper-V host is reached the way any non-Windows client
-reaches one — PSRP over WSMan/HTTPS, authenticated with NTLM. This module owns that
-conversation and hands everything above it parsed data, so no layer above has to know
-that pypsrp, requests or WSMan exist.
+reaches one — PSRP over WSMan, on whichever listener and with whichever authentication
+provider the host is set up for. This module owns that conversation and hands everything
+above it parsed data, so no layer above has to know that pypsrp, requests or WSMan exist.
 
 Two rules shape the interface:
 
@@ -30,9 +30,25 @@ from pegaprox.core.hyperv_errors import HyperVError, KIND_MISSING_FEATURE, KIND_
 
 logger = logging.getLogger(__name__)
 
-# The WinRM HTTPS listener. The plaintext listener on 5985 is never used: an NTLM exchange
-# and everything after it would be readable on the wire.
+# The two WinRM listeners. Which one a host offers is the host's configuration, and the
+# product follows it: `winrm quickconfig` creates only the HTTP listener, so that is the
+# default, and an HTTPS listener exists only where somebody set one up with a certificate.
+DEFAULT_WINRM_HTTP_PORT = 5985
 DEFAULT_WINRM_HTTPS_PORT = 5986
+
+# The authentication providers pypsrp accepts for a username/password login. `negotiate`
+# picks Kerberos where the client has a ticket and falls back to NTLM, which is what a
+# standalone host without a domain join ends up with. Kerberos needs the optional gssapi
+# libraries; absent, pypsrp reports that as a client dependency rather than an auth error.
+SUPPORTED_AUTH_METHODS = ('negotiate', 'ntlm', 'basic', 'kerberos')
+DEFAULT_AUTH_METHOD = 'negotiate'
+
+# What pypsrp's `encryption` argument may be set to. Over TLS the transport carries the
+# protection and `auto` adds nothing; over HTTP `auto` seals the SOAP body with the NTLM or
+# Kerberos session key, and `never` sends it in clear. Basic authentication has no session
+# key to seal with, so basic over HTTP is only possible with `never`.
+_ENCRYPTION_AUTO = 'auto'
+_ENCRYPTION_NEVER = 'never'
 
 # How long the host may spend on one cmdlet, and how long this side waits for the answer.
 # The read timeout must exceed the operation timeout, or this side gives up while the host
@@ -62,15 +78,37 @@ class HyperVConnection:
     host: str
     username: str
     password: str = field(repr=False)
-    port: int = DEFAULT_WINRM_HTTPS_PORT
+    # None means "the default listener for the chosen transport"; resolved once below so
+    # every reader sees a number and nobody repeats the transport-to-port rule.
+    port: int | None = None
+    use_ssl: bool = False
+    auth: str = DEFAULT_AUTH_METHOD
+    encrypt_messages: bool = True
     verify_certificate: bool = True
     operation_timeout: int = DEFAULT_OPERATION_TIMEOUT_SECONDS
+
+    def __post_init__(self) -> None:
+        if self.auth not in SUPPORTED_AUTH_METHODS:
+            raise ValueError(
+                f'Unsupported WinRM authentication method {self.auth!r}; '
+                f'expected one of {", ".join(SUPPORTED_AUTH_METHODS)}')
+        if self.port is None:
+            # The dataclass is frozen, so the resolved default is written the one way a
+            # frozen dataclass permits.
+            object.__setattr__(self, 'port', default_winrm_port(self.use_ssl))
 
     def __repr__(self) -> str:
         # Explicit rather than relying on field(repr=False) alone, so the intent survives
         # somebody adding a second secret field later.
         return (f'HyperVConnection(host={self.host!r}, username={self.username!r}, '
-                f'port={self.port}, verify_certificate={self.verify_certificate})')
+                f'port={self.port}, use_ssl={self.use_ssl}, auth={self.auth!r}, '
+                f'encrypt_messages={self.encrypt_messages}, '
+                f'verify_certificate={self.verify_certificate})')
+
+    @property
+    def wsman_encryption(self) -> str:
+        """The `encryption` value pypsrp needs for this connection."""
+        return wsman_encryption_for(self.use_ssl, self.auth, self.encrypt_messages)
 
     @property
     def read_timeout(self) -> int:
@@ -84,6 +122,27 @@ class HyperVConnection:
         and an error message is quoted into issues; the password because it is a secret.
         """
         return [v for v in (self.password, self.host, self.username) if v and len(v) > 1]
+
+
+def default_winrm_port(use_ssl: bool) -> int:
+    """The listener port a transport uses unless the operator says otherwise."""
+    return DEFAULT_WINRM_HTTPS_PORT if use_ssl else DEFAULT_WINRM_HTTP_PORT
+
+
+def wsman_encryption_for(use_ssl: bool, auth: str, encrypt_messages: bool) -> str:
+    """Translate the operator's choice into pypsrp's `encryption` argument.
+
+    Over TLS the answer is always `auto`: the transport protects the body and pypsrp
+    would reject `always` for basic auth anyway. Over HTTP the operator decides, except
+    that basic authentication cannot seal anything and therefore forces `never` — pypsrp
+    raises otherwise, and a host that only offers basic over HTTP is a host somebody
+    chose to run that way, not an error for this side to report.
+    """
+    if use_ssl:
+        return _ENCRYPTION_AUTO
+    if auth == 'basic' or not encrypt_messages:
+        return _ENCRYPTION_NEVER
+    return _ENCRYPTION_AUTO
 
 
 def redact(text: str, secrets: list[str]) -> str:
@@ -135,7 +194,11 @@ def assert_read_only(script: str) -> None:
 
 
 class PsrpHyperVClient(HyperVPowerShellClient):
-    """PowerShell Remoting over WinRM HTTPS, via pypsrp.
+    """PowerShell Remoting over WinRM, via pypsrp.
+
+    HTTP or HTTPS, and which authentication provider, is the connection's business: the
+    host's listener configuration is a given, and this client follows it rather than
+    demanding one.
 
     One runspace pool is opened per client and reused, because opening one costs a full
     WSMan handshake and an inventory walk runs several scripts in a row. The pool is
@@ -175,8 +238,9 @@ class PsrpHyperVClient(HyperVPowerShellClient):
                 port=conn.port,
                 username=conn.username,
                 password=conn.password,
-                ssl=True,
-                auth='ntlm',
+                ssl=conn.use_ssl,
+                auth=conn.auth,
+                encryption=conn.wsman_encryption,
                 cert_validation=conn.verify_certificate,
                 operation_timeout=conn.operation_timeout,
                 read_timeout=conn.read_timeout,
