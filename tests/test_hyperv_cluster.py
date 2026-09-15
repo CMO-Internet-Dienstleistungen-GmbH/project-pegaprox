@@ -468,6 +468,33 @@ class TestWhatBootDoes:
         assert managers['hyperv-dead'].is_connected is False
         assert 'No route to host' in managers['hyperv-dead'].connection_error
 
+    def test_saving_the_cluster_configuration_leaves_a_migration_source_out_of_it(self, db):
+        """A source shares the registry with the clusters; it must not share their table.
+
+        Start-up builds a PegaProxManager for every entry in the cluster configuration, so
+        a Hyper-V host written there comes back as a poll thread logging in to a Proxmox
+        API it does not have -- the failure `migrate_hyperv_out_of_cluster_config` exists
+        to clean up after. `save_config` runs on any cluster edit, so without the guard
+        that cleanup is undone between two restarts.
+        """
+        from pegaprox.core import config as config_mod
+        from pegaprox.globals import cluster_managers
+
+        written = []
+        original_save = db.save_cluster
+        db.save_cluster = lambda cid, data: written.append(cid)
+
+        source = hyperv_cluster.HyperVClusterManager('hyperv-a', CONFIG, manager=FakeManager())
+        cluster_managers['hyperv-a'] = source
+        try:
+            config_mod.save_config()
+        finally:
+            cluster_managers.pop('hyperv-a', None)
+            db.save_cluster = original_save
+
+        assert 'hyperv-a' not in written, \
+            'the migration source was written into the cluster configuration'
+
     def test_a_custom_winrm_port_survives_the_shared_cluster_table(self, db):
         """That table has no `port` column and rounds a port through `api_port`.
 
