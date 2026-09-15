@@ -85,6 +85,9 @@ def _hyperv_manager(api, *, vms=None, detail=None, iso_paths=('C:\\iso',)):
     fake.is_connected = True
     fake.connection_error = ''
     fake.property_report = {'complete': True, 'missing': []}
+    # No measurement unless a case makes one: a MagicMock here is truthy, and the
+    # file-access finding would read it as "a target node checked this host".
+    fake.transfer_check = {}
     # A plain dict, not the MagicMock a bare attribute would produce: these travel through
     # jsonify, and a mock there fails the request for a reason that has nothing to do with
     # what the case is testing.
@@ -120,6 +123,7 @@ def _hyperv_manager(api, *, vms=None, detail=None, iso_paths=('C:\\iso',)):
     '/api/hyperv/hosts/<host_id>',
     '/api/hyperv/<cluster_id>/migrations',
     '/api/hyperv/<cluster_id>/migrations/<migration_id>/cleanup',
+    '/api/hyperv/<cluster_id>/transfer-check',
 ])
 def test_the_route_is_registered(api, rule):
     """A blueprint that is written but never registered fails silently at runtime."""
@@ -143,6 +147,9 @@ def test_no_hyperv_route_can_change_the_source_beyond_preparing_it(api):
         ('/api/hyperv/<cluster_id>/vms/<int:vmid>/checkpoints', 'DELETE'),
         ('/api/hyperv/<cluster_id>/vms/<int:vmid>/iso', 'POST'),
         ('/api/hyperv/<cluster_id>/vms/<int:vmid>/iso', 'DELETE'),
+        # Reads the host's own share from a target node and unmounts again. A POST because
+        # it measures against a node the caller names, not because it writes anything.
+        ('/api/hyperv/<cluster_id>/transfer-check', 'POST'),
         # A preflight is a read that needs a body. It changes nothing on either side.
         ('/api/hyperv/<cluster_id>/vms/<int:vmid>/preflight', 'POST'),
         # The one destructive route, and it points the other way: it removes what a failed

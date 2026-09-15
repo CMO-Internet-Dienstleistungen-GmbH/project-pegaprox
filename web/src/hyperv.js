@@ -80,6 +80,26 @@
             return plan?.direction === 'hyperv_to_pve';
         }
 
+        /**
+         * What tells two adapters on the same virtual switch apart.
+         *
+         * The switch name does not: Hyper-V lets any number of adapters hang on one, and
+         * on this estate that is the normal case. The MAC does, and it is also the key the
+         * network map is written under — so the row now shows the thing the mapping is
+         * actually made against. An adapter Hyper-V has never started reports all zeroes;
+         * that is not an identity, so the position is used instead.
+         */
+        function hvAdapterLabel(adapter, index) {
+            const mac = (adapter?.mac_address || '').replace(/[^0-9a-fA-F]/g, '');
+            const unset = mac === '' || /^0+$/.test(mac);
+            const pretty = unset ? '' : (mac.match(/.{2}/g) || []).join(':').toLowerCase();
+            const name = adapter?.name && adapter.name !== 'Network Adapter' ? adapter.name : '';
+            if (pretty && name) return `${name} · ${pretty}`;
+            if (pretty) return pretty;
+            if (name) return name;
+            return `adapter ${index + 1}`;
+        }
+
         function hvBytesToGiB(bytes) {
             const n = Number(bytes);
             return !n || !isFinite(n) ? '0' : (n / (1024 ** 3)).toFixed(1);
@@ -295,6 +315,87 @@
         }
 
         // ───────────────────────────────────────────────
+        // Whether a target node can read this host at all
+        // ───────────────────────────────────────────────
+
+        /**
+         * The host-wide SMB check, and the button that runs it.
+         *
+         * Whether cifs-utils is installed on the node, whether TCP 445 is open and whether
+         * the account may read the share is one answer for every guest on the host. The
+         * preflight used to put that question in front of every VM and ask somebody to
+         * confirm an answer it did not have; 159 guests meant 159 confirmations of one
+         * thing. Measured once here instead, with the date it was measured on.
+         */
+        function HyperVTransferCheck({ check, targets, busy, onRun, t }) {
+            const say = hvTranslator(t);
+            const [cluster, setCluster] = React.useState('');
+            const [node, setNode] = React.useState('');
+
+            const nodes = (targets || []).find(c => c.id === cluster)?.nodes || [];
+            const ok = check && check.ok;
+            const measured = check && check.at_text;
+
+            const box = ok ? 'border-green-500/30 bg-green-500/5'
+                : measured ? 'border-red-500/30 bg-red-500/5'
+                    : 'border-proxmox-border bg-proxmox-dark/40';
+
+            return (
+                <div className={`rounded-lg border p-3 space-y-2 ${box}`}>
+                    <div className="flex items-center justify-between gap-3">
+                        <div className="text-xs font-semibold text-gray-300">
+                            {say('hvTransferCheck', 'Disk access from a target node')}
+                        </div>
+                        {measured && (
+                            <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
+                                ok ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
+                                {ok ? say('hvTransferCheckOk', 'reachable')
+                                    : say('hvTransferCheckFailed', 'not reachable')}
+                            </span>
+                        )}
+                    </div>
+
+                    {measured ? (
+                        <div className="text-[11px] text-gray-400">
+                            {ok
+                                ? `${check.node} → //${check.host}/${(check.shares || []).join(', ')} · ${check.at_text}`
+                                : check.error}
+                        </div>
+                    ) : (
+                        <div className="text-[11px] text-gray-500">
+                            {say('hvTransferCheckNever', 'Not measured yet. Until it is, every VM on '
+                                 + 'this host asks you to confirm that the disks might not be readable.')}
+                        </div>
+                    )}
+
+                    <div className="flex items-center gap-2">
+                        <select value={cluster} onChange={e => { setCluster(e.target.value); setNode(''); }}
+                            className="flex-1 px-2 py-1 bg-proxmox-dark border border-proxmox-border rounded text-white text-xs">
+                            <option value="">{say('hvTransferCheckCluster', 'Target cluster…')}</option>
+                            {(targets || []).map(c => (
+                                <option key={c.id} value={c.id}>{c.display_name || c.name}</option>
+                            ))}
+                        </select>
+                        <select value={node} onChange={e => setNode(e.target.value)} disabled={!cluster}
+                            className="flex-1 px-2 py-1 bg-proxmox-dark border border-proxmox-border rounded text-white text-xs disabled:opacity-50">
+                            <option value="">{say('hvTransferCheckNode', 'Node…')}</option>
+                            {nodes.map(n => <option key={n} value={n}>{n}</option>)}
+                        </select>
+                        <button onClick={() => onRun(cluster, node)} disabled={!cluster || !node || busy}
+                            className="px-3 py-1 rounded bg-indigo-500/10 border border-indigo-500/30 text-indigo-300 hover:text-white text-xs disabled:opacity-40">
+                            {busy ? say('hvTransferChecking', 'Checking…') : say('hvTransferCheckRun', 'Check')}
+                        </button>
+                    </div>
+                    <p className="text-[10px] text-gray-600">
+                        {say('hvTransferCheckHint', 'Mounts the share read-only from that node, lists '
+                             + 'it and unmounts. Nothing is written, and the disks of a particular VM '
+                             + 'are still checked individually before anything is copied.')}
+                    </p>
+                </div>
+            );
+        }
+
+        // ───────────────────────────────────────────────
         // How old what is on screen is
         // ───────────────────────────────────────────────
 
@@ -382,6 +483,7 @@
             name: '', host: '', port: 5985, user: '', pass: '',
             use_ssl: false, auth: 'negotiate', encrypt_messages: true,
             ssl_verification: true, iso_library_paths: '', smb_share_map: '', smb_domain: '',
+            transfer_host: '',
             cluster_type: 'hyperv',
         };
 
@@ -418,6 +520,7 @@
             return {
                 ...form,
                 cluster_type: 'hyperv',
+                transfer_host: (form.transfer_host || '').trim(),
                 use_ssl: !!form.use_ssl,
                 encrypt_messages: form.encrypt_messages !== false,
                 port: parseInt(form.port, 10) || hvDefaultPort(form.use_ssl),
@@ -465,9 +568,22 @@
                                 onChange={e => field('host', e.target.value)}
                                 placeholder="hyperv.example.com" />
                             <p className="mt-1 text-xs text-gray-500">
-                                {say('hvHostHint', 'Name or address. The target node reaches the disk '
-                                     + 'share under this name too; with HTTPS it has to match the '
-                                     + 'certificate.')}
+                                {say('hvHostHint', 'Name or address, for WinRM. With HTTPS it has '
+                                     + 'to match the certificate.')}
+                            </p>
+                        </div>
+                        <div>
+                            <label className={label}>{say('hvTransferHost', 'Address for the data transfer')}</label>
+                            <input type="text" className={input} value={config.transfer_host || ''}
+                                onChange={e => field('transfer_host', e.target.value)}
+                                placeholder={config.host || 'same as above'} />
+                            <p className="mt-1 text-xs text-gray-500">
+                                {say('hvTransferHostHint', 'Where the target node mounts the disk '
+                                     + 'share. Leave empty to use the address above. Management '
+                                     + 'often runs over an interface that is slower than the one a '
+                                     + 'transfer should take — naming the fast address here is what '
+                                     + 'puts the copy on it, because the node picks the interface '
+                                     + 'from its route to this address.')}
                             </p>
                         </div>
                     </div>

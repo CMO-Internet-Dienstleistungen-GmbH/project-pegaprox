@@ -154,6 +154,14 @@ def ensure_schema(cursor) -> None:
     if host_columns and 'encrypt_messages' not in host_columns:
         cursor.execute('ALTER TABLE hyperv_hosts ADD COLUMN encrypt_messages INTEGER DEFAULT 1')
         logger.info('Added encrypt_messages column to hyperv_hosts')
+    # Empty is the honest default here, and it means "the same address as WinRM" -- which
+    # is what every host registered before this column did.
+    if host_columns and 'transfer_host' not in host_columns:
+        cursor.execute("ALTER TABLE hyperv_hosts ADD COLUMN transfer_host TEXT DEFAULT ''")
+        logger.info('Added transfer_host column to hyperv_hosts')
+    if host_columns and 'transfer_check' not in host_columns:
+        cursor.execute("ALTER TABLE hyperv_hosts ADD COLUMN transfer_check TEXT DEFAULT '{}'")
+        logger.info('Added transfer_check column to hyperv_hosts')
 
     # The shared cluster table has a fixed set of columns and drops anything it does not
     # know, so a Hyper-V-only setting saved there would be silently gone after the next
@@ -191,6 +199,17 @@ def ensure_schema(cursor) -> None:
             iso_library_paths TEXT DEFAULT '[]',
             smb_share_map TEXT DEFAULT '{}',
             smb_domain TEXT DEFAULT '',
+            -- Where the target node reaches the disk share, when that is not where
+            -- PegaProx reaches WinRM. Empty means the same address. See issue #15:
+            -- management runs over an admin interface that is often 1 GbE, while the
+            -- transfer should take the 10 GbE path the backups already use.
+            transfer_host TEXT DEFAULT '',
+            -- What a real mount from a target node last found. A host fact, not a VM fact:
+            -- whether cifs-utils is installed, whether TCP 445 is reachable and whether the
+            -- account may read the share is the same answer for all 159 guests. Asking it
+            -- per VM, and asking somebody to confirm the answer per VM, is what made the
+            -- wizard's longest warning the one it repeated most (issue #15).
+            transfer_check TEXT DEFAULT '{}',
             enabled INTEGER DEFAULT 1,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
@@ -586,6 +605,18 @@ def _row_to_dict(row) -> dict:
 # The registered hosts
 # ---------------------------------------------------------------------------
 
+def save_transfer_check(conn, host_id: str, result: dict) -> None:
+    """Record what a real mount from a target node found.
+
+    Written on its own rather than through save_host: that one persists a form somebody
+    filled in, and a measurement is not a setting. Keeping them apart also means saving
+    the form cannot silently discard a check, and a check cannot rewrite a password.
+    """
+    conn.execute('UPDATE hyperv_hosts SET transfer_check = ?, updated_at = ? WHERE id = ?',
+                 (json.dumps(result or {}), time.time(), host_id))
+    conn.commit()
+
+
 def save_host(conn, encrypt, host_id: str, data: dict) -> None:
     """Write one host. `encrypt` is the database's own encryption callable.
 
@@ -595,7 +626,8 @@ def save_host(conn, encrypt, host_id: str, data: dict) -> None:
     password back has to do.
     """
     existing = conn.execute(
-        'SELECT pass_encrypted, created_at FROM hyperv_hosts WHERE id = ?',
+        'SELECT pass_encrypted, created_at, transfer_check, host, transfer_host, username, '
+        'smb_share_map, smb_domain FROM hyperv_hosts WHERE id = ?',
         (host_id,)).fetchone()
 
     password = data.get('pass') or data.get('pass_') or ''
@@ -606,14 +638,34 @@ def save_host(conn, encrypt, host_id: str, data: dict) -> None:
     else:
         stored = ''
 
+    # INSERT OR REPLACE writes the whole row, so a column left out of the statement goes
+    # back to its default — and the measured transfer check would be silently erased every
+    # time somebody saved the form. Carried forward here, but only while it still describes
+    # what it measured: a host reached at a different address, by a different account or
+    # through a different share is a host nothing has checked yet, and keeping a green
+    # result over that would be worse than having none.
+    transfer_check = '{}'
+    if existing:
+        moved = (
+            (data.get('host') or '') != (existing['host'] or '')
+            or (data.get('transfer_host') or '').strip() != (existing['transfer_host'] or '')
+            or (data.get('user') or '') != (existing['username'] or '')
+            or json.dumps(dict(data.get('smb_share_map') or {})) != (existing['smb_share_map'] or '{}')
+            or (data.get('smb_domain') or '') != (existing['smb_domain'] or '')
+            or bool(password)
+        )
+        if not moved:
+            transfer_check = existing['transfer_check'] or '{}'
+
     use_ssl = bool(data.get('use_ssl', False))
     now = time.time()
     conn.execute(
         'INSERT OR REPLACE INTO hyperv_hosts '
         '(id, name, host, username, pass_encrypted, winrm_port, use_ssl, auth, '
         ' encrypt_messages, verify_certificate, '
-        ' iso_library_paths, smb_share_map, smb_domain, enabled, created_at, updated_at) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        ' iso_library_paths, smb_share_map, smb_domain, transfer_host, transfer_check, '
+        ' enabled, created_at, updated_at) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         (host_id,
          data.get('name') or data.get('host') or 'Hyper-V host',
          data.get('host') or '',
@@ -627,6 +679,8 @@ def save_host(conn, encrypt, host_id: str, data: dict) -> None:
          json.dumps(list(data.get('iso_library_paths') or [])),
          json.dumps(dict(data.get('smb_share_map') or {})),
          data.get('smb_domain') or '',
+         (data.get('transfer_host') or '').strip(),
+         transfer_check,
          1 if data.get('enabled', True) else 0,
          existing['created_at'] if existing else now,
          now))
@@ -674,6 +728,10 @@ def _host_row(row, decrypt) -> dict:
                                           'ISO library'),
         'smb_share_map': _decode_json(row['smb_share_map'], {}, row['id'], 'share map'),
         'smb_domain': row['smb_domain'] or '',
+        'transfer_host': (row['transfer_host'] if 'transfer_host' in row.keys() else '') or '',
+        'transfer_check': _decode_json(
+            row['transfer_check'] if 'transfer_check' in row.keys() else '{}', {},
+            row['id'], 'transfer check'),
         'enabled': bool(row['enabled']),
     }
 
