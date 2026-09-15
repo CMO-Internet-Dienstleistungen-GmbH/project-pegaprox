@@ -221,21 +221,39 @@ while IFS=$'\x1f' read -r name branch base pr summary kind requested_by commit_m
     if ! git -C "$REPO_ROOT" rev-parse --verify --quiet "$FORK_REMOTE/$branch" >/dev/null; then
         die "$name: branch $FORK_REMOTE/$branch not found"
     fi
-    merge_base="$(git -C "$REPO_ROOT" merge-base "upstream/$base" "$FORK_REMOTE/$branch")" \
-        || die "$name: no merge base between upstream/$base and $FORK_REMOTE/$branch"
+    # The patch is measured against the release tag we are building on, never
+    # against an upstream branch. A branch keeps moving under us: once the
+    # maintainer took one of our commits into `Testing`, the set computed from
+    # `upstream/Testing` went empty and the patch was skipped as "done" while
+    # the release it was being built onto did not contain the fix at all. A tag
+    # cannot move, so the same question gets the same answer on every rebuild.
+    merge_base="$(git -C "$REPO_ROOT" merge-base "$RELEASE_SHA" "$FORK_REMOTE/$branch")" \
+        || die "$name: no merge base between $RELEASE_TAG and $FORK_REMOTE/$branch"
 
     commits="$(git -C "$REPO_ROOT" rev-list --reverse "$merge_base..$FORK_REMOTE/$branch")"
     if [ -z "$commits" ] && [ "$kind" = internal ]; then
         # An internal patch is meant to stay forever. Empty means the branch is
         # wrong, not that the work is done -- dropping it silently would remove
         # a feature from the fork and nobody would notice until it was missed.
-        die "$name: internal patch has no commits beyond upstream/$base — check the branch"
+        die "$name: internal patch has no commits beyond $RELEASE_TAG — check the branch"
     fi
     if [ -z "$commits" ]; then
-        warn "  no commits on $branch beyond upstream/$base — skipped"
-        SKIPPED_LIST="${SKIPPED_LIST}${name} (no commits beyond upstream/${base})"$'\n'
+        ok "  every commit is already in $RELEASE_TAG — dropping this patch"
+        SKIPPED_LIST="${SKIPPED_LIST}${name} (already contained in ${RELEASE_TAG})"$'\n'
         N_SKIPPED=$((N_SKIPPED + 1))
         continue
+    fi
+
+    # Measuring from the release tag means a branch that still sits on an older
+    # upstream state carries upstream's own commits between that state and its
+    # own work. Those are reachable from the branch but are not this patch, and
+    # squashing them in under the patch's name would put unreviewed upstream
+    # work into the fork wearing our label. Name them and stop; the fix is to
+    # rebase the branch onto the release, which is what a release does anyway.
+    n_total="$(git -C "$REPO_ROOT" rev-list --count "$merge_base..$FORK_REMOTE/$branch")"
+    n_ours="$(git -C "$REPO_ROOT" rev-list --count "$merge_base..$FORK_REMOTE/$branch" --not "upstream/$base")"
+    if [ "$n_total" != "$n_ours" ]; then
+        die "$name: $((n_total - n_ours)) of $n_total commits on $branch are already in upstream/$base and are not part of this patch — rebase $branch onto $RELEASE_TAG"
     fi
 
     # Has the release already got this work? `git cherry` compares patch-ids,

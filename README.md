@@ -176,8 +176,20 @@ the fork, so neither drop heuristic may touch it, and a branch with no commits
 is an error rather than a silent skip. An unknown value stops the run: a typo
 must not quietly turn a permanent patch back into a droppable one.
 
-The commits taken are `merge-base(upstream/<base>, origin/<branch>)..<branch>`,
-so rebasing the fix branch onto a newer upstream is transparent here.
+The commits taken are `merge-base(<release tag>, origin/<branch>)..<branch>` —
+measured against the release being built, never against an upstream branch. An
+upstream branch moves: when the maintainer took one of our commits into
+`Testing`, the set measured from `upstream/Testing` went empty and the patch
+was skipped as "done" while the release did not contain the fix. A tag cannot
+move, so a rebuild asks the same question and gets the same answer.
+
+`base` names the upstream branch the work was offered to, and the run uses it
+to tell this patch's commits from upstream's own: a branch still sitting on an
+older upstream state also reaches the commits made there in the meantime, and
+squashing those in under the patch's name would put unreviewed upstream work
+into the fork wearing our label. The run stops and names them instead. Rebase
+the branch onto the release tag, which is what a release does to every patch
+branch anyway.
 
 `commit_message` is the stable subject of the patch's one squash commit on
 `cmo/main`. It follows `<type>(<area>): <what changed>` and describes the whole

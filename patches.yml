@@ -20,8 +20,13 @@ fork:
 # Our patches, applied in this order on top of the upstream release tag.
 #
 #   branch       a branch in the fork holding the commits
-#   base         the upstream branch that branch was built on; the commits taken
-#                are `merge-base(base, branch)..branch`
+#   base         the upstream branch the work was offered to. The commits taken
+#                are `merge-base(<release tag>, branch)..branch` -- measured
+#                against the release being built, because an upstream branch
+#                moves under us and a tag does not. `base` is what the run
+#                compares against to tell this patch's commits from upstream's
+#                own; commits the branch reaches that upstream/<base> already
+#                has stop the run instead of being squashed in under our name.
 #   upstream_pr  the pull request upstream; when it is merged, the patch is
 #                dropped from the set instead of applied (the fix is in the
 #                release by then). Leave empty if there is no PR yet.
