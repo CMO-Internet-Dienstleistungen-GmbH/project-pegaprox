@@ -238,22 +238,60 @@ while IFS=$'\x1f' read -r name branch base pr summary kind requested_by commit_m
         die "$name: internal patch has no commits beyond $RELEASE_TAG — check the branch"
     fi
     if [ -z "$commits" ]; then
-        ok "  every commit is already in $RELEASE_TAG — dropping this patch"
-        SKIPPED_LIST="${SKIPPED_LIST}${name} (already contained in ${RELEASE_TAG})"$'\n'
+        # The branch is an ancestor of the release: the work is in there. Said
+        # as a warning rather than a success, because a branch that was reset
+        # or force-pushed onto an upstream commit looks exactly like this, and
+        # a patch leaving the fork should never do so on a green line.
+        warn "  $branch is contained in $RELEASE_TAG — dropped (check the branch if that is a surprise)"
+        SKIPPED_LIST="${SKIPPED_LIST}${name} (contained in ${RELEASE_TAG})"$'\n'
         N_SKIPPED=$((N_SKIPPED + 1))
         continue
     fi
 
-    # Measuring from the release tag means a branch that still sits on an older
-    # upstream state carries upstream's own commits between that state and its
-    # own work. Those are reachable from the branch but are not this patch, and
-    # squashing them in under the patch's name would put unreviewed upstream
-    # work into the fork wearing our label. Name them and stop; the fix is to
-    # rebase the branch onto the release, which is what a release does anyway.
-    n_total="$(git -C "$REPO_ROOT" rev-list --count "$merge_base..$FORK_REMOTE/$branch")"
-    n_ours="$(git -C "$REPO_ROOT" rev-list --count "$merge_base..$FORK_REMOTE/$branch" --not "upstream/$base")"
-    if [ "$n_total" != "$n_ours" ]; then
-        die "$name: $((n_total - n_ours)) of $n_total commits on $branch are already in upstream/$base and are not part of this patch — rebase $branch onto $RELEASE_TAG"
+    # A branch that sits on the release needs no check: everything above the
+    # tag is this patch by construction. One that does not also reaches the
+    # commits upstream made in between, and squashing those onto cmo/main under
+    # the patch's name would put unreviewed upstream work into the fork wearing
+    # our label -- which is how a tenants feature and two security commits came
+    # within one run of being labelled as our snapshot-toast fix.
+    #
+    # Reachability from either upstream branch is the test, not from the one
+    # `base` names: when the maintainer merges our pull request without
+    # rebasing, our commit keeps its sha and lands in `Testing` while `base`
+    # may well say `main`. Asking only about `base` would look straight past
+    # the case this exists for.
+    #
+    # Our own commit, once taken upstream that way, is caught here too, and
+    # the answer is the same one the message gives: rebase onto the release.
+    # That gives the commit a new identity, upstream's own commits fall out of
+    # the range, and what is left is the patch.
+    if [ "$merge_base" != "$RELEASE_SHA" ]; then
+        # The release lives on `main` and work is staged in `Testing`, so those
+        # two answer the question for every patch; `base` is added for the case
+        # where an entry names a third branch, and is validated by being asked.
+        upstream_refs="upstream/main upstream/Testing"
+        case " $upstream_refs " in
+            *" upstream/$base "*) ;;
+            *) upstream_refs="$upstream_refs upstream/$base" ;;
+        esac
+        for ref in $upstream_refs; do
+            git -C "$REPO_ROOT" rev-parse --verify --quiet "$ref" >/dev/null \
+                || die "$name: $ref is missing — fetch upstream, or fix this entry's base"
+        done
+        foreign=""
+        while read -r sha; do
+            [ -n "$sha" ] || continue
+            for ref in $upstream_refs; do
+                if git -C "$REPO_ROOT" merge-base --is-ancestor "$sha" "$ref"; then
+                    foreign="${foreign}$(git -C "$REPO_ROOT" log -1 --format='    %h %s' "$sha")"$'\n'
+                    break
+                fi
+            done
+        done <<< "$commits"
+        if [ -n "$foreign" ]; then
+            die "$name: $branch reaches commits upstream already has. They are not this patch and must not be squashed into it under its name. Rebase $branch onto $RELEASE_TAG, then run again.
+$foreign"
+        fi
     fi
 
     # Has the release already got this work? `git cherry` compares patch-ids,

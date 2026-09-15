@@ -183,13 +183,21 @@ upstream branch moves: when the maintainer took one of our commits into
 was skipped as "done" while the release did not contain the fix. A tag cannot
 move, so a rebuild asks the same question and gets the same answer.
 
-`base` names the upstream branch the work was offered to, and the run uses it
-to tell this patch's commits from upstream's own: a branch still sitting on an
-older upstream state also reaches the commits made there in the meantime, and
-squashing those in under the patch's name would put unreviewed upstream work
-into the fork wearing our label. The run stops and names them instead. Rebase
-the branch onto the release tag, which is what a release does to every patch
-branch anyway.
+A branch that sits on the release needs nothing further: everything above the
+tag is that patch by construction. One that does not also reaches the commits
+upstream made in between, and squashing those in under the patch's name would
+put unreviewed upstream work into the fork wearing our label. So the run asks
+of every commit it is about to take whether upstream already has it — against
+`main`, `Testing`, and whatever `base` names — and stops, listing them, if any
+does. Rebase the branch onto the release tag, which is what a release does to
+every patch branch anyway.
+
+Asking only about `base` would miss the case this exists for: when the
+maintainer merges our pull request without rebasing it, our commit keeps its
+sha and appears in `Testing` while `base` may say `main`. That also means our
+own commit is caught by this check once upstream has taken it, and the answer
+is the same — the rebase gives it a new identity, upstream's commits drop out
+of the range, and what remains is the patch.
 
 `commit_message` is the stable subject of the patch's one squash commit on
 `cmo/main`. It follows `<type>(<area>): <what changed>` and describes the whole
