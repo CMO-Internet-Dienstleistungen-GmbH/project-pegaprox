@@ -629,3 +629,25 @@ class TestTheHostWideTransportCheck:
         # however good the host check was.
         finding = pf.check_source_file_access({}, host_check={'ok': True, 'at_text': 'x'})
         assert finding.severity == pf.BLOCKING
+
+
+class TestAnUnreportedSecureBootState:
+    """None is not False, and the difference decides whether a guest boots.
+
+    Hyper-V returns nothing for Secure Boot on hosts that do not expose the property, and
+    the import does not enrol keys under a guest it cannot read. Reporting that as "not
+    enabled on this VM" would hide the one case where the operator has to act.
+    """
+
+    def test_it_is_a_warning_not_a_silent_ok(self):
+        finding = pf.check_secure_boot(None, generation=2)
+        assert finding.severity == pf.WARNING
+        assert 'did not report' in finding.summary
+
+    def test_off_is_still_a_plain_ok(self):
+        assert pf.check_secure_boot(False, generation=2).severity == pf.OK
+
+    def test_on_is_still_reproduced(self):
+        finding = pf.check_secure_boot(True, generation=2)
+        assert finding.severity == pf.OK
+        assert 'enrolled' in finding.detail
