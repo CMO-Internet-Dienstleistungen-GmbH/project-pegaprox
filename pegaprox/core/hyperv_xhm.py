@@ -1007,7 +1007,13 @@ def _preflight_gate(task, source, target, detail, guid):
          # The share is mounted and each file probed further down, before anything is
          # allocated. Claiming it was probed here would be a claim about a mount that does
          # not exist yet.
-         'source_access_probed': False})
+         'source_access_probed': False,
+         # The same host measurement the plan and the preflight route are answered with.
+         # Leaving it out here does not make the gate stricter, it makes it inconsistent:
+         # the UI renders no checkbox for a finding that came back OK, so nothing can be
+         # acknowledged, and this gate would then refuse the migration for a missing
+         # confirmation of something it had just been told was fine.
+         'host_transfer_check': getattr(source, 'transfer_check', None) or None})
 
     allowed, why = hyperv_preflight.may_start(report, task.config.get('acknowledged') or [])
     if not allowed:
@@ -1256,6 +1262,29 @@ def _is_unset_mac(mac: str) -> bool:
     return not set(mac.replace(':', '').replace('-', '')) - {'0'}
 
 
+def _guest_might_be_windows(detail) -> bool:
+    """Whether this guest could have a Windows hibernation file on it.
+
+    Deliberately generous: nothing on this side can see inside a guest, so the question is
+    "could it" rather than "is it". A Generation 2 Hyper-V VM runs a UEFI-capable OS and
+    Secure Boot state is a Windows-shaped fact; an operator who said `ostype: win*` has
+    said it outright. Wrong in the permissive direction costs one mount that finds no
+    Windows directory; wrong in the strict direction leaves a Windows guest resuming a
+    saved session on hardware it was not saved on.
+    """
+    ostype = str((detail or {}).get('ostype') or '').lower()
+    if ostype.startswith('win') or ostype in ('wxp', 'w2k', 'w2k3', 'w2k8'):
+        return True
+    if ostype and not ostype.startswith('win'):
+        # Explicitly something else — 'l26', 'other', 'solaris'.
+        return False
+    # Nothing said. Secure Boot and a vTPM are Windows-shaped; so is Generation 2 in this
+    # estate. None of them proves it, and none of them has to.
+    return bool((detail or {}).get('secure_boot_enabled')
+                or (detail or {}).get('vtpm_enabled')
+                or (detail or {}).get('generation') == 2)
+
+
 def _clear_hibernation(task, target, new_vmid):
     """Drop a Fast Startup hibernation file from the imported disk, and say so.
 
@@ -1318,7 +1347,12 @@ def _inject_drivers_if_asked(task, target, new_vmid, volumes, detail):
         # change that: it decides whether the loader can READ the disk, not what the
         # resumed kernel then finds attached to it. Clearing the file costs a cold boot and
         # nothing else. Measured in tests/hyperv_testbed/verify_hibernation_clear.sh.
-        _clear_hibernation(task, target, new_vmid)
+        #
+        # Only for a guest that could have one. A Linux guest has no hibernation file and
+        # no NTFS to look in, so the run would install ntfs-3g on the node for nothing and
+        # end with NO_WINDOWS_DIR logged as a failed preparation.
+        if _guest_might_be_windows(detail):
+            _clear_hibernation(task, target, new_vmid)
         return None
 
     class _InjectionView:
@@ -1671,7 +1705,12 @@ def _attach_disks(task, target, new_vmid, volumes, detail):
         # A guest that had Secure Boot OFF must NOT get them: its bootloader or a driver may
         # be unsigned, and enrolling keys would stop it booting at all. So this is read from
         # the source rather than chosen (fork issue #15).
-        pre_enrolled = 1 if detail.get('secure_boot_enabled') else 0
+        # `is True`, not truthiness: the property reads None when the host does not expose
+        # it, and a Generation 2 guest whose state could not be read must not be handed an
+        # empty store as though Secure Boot had been off. The preflight reports that case
+        # separately; here the safe direction is not to enrol keys under a guest whose
+        # loader might be unsigned.
+        pre_enrolled = 1 if detail.get('secure_boot_enabled') is True else 0
         extra['efidisk0'] = (f'{task.target_storage}:1,efitype=4m,'
                              f'pre-enrolled-keys={pre_enrolled}')
         task.log('UEFI variable store created '

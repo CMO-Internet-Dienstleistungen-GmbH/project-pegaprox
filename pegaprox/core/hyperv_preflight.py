@@ -376,8 +376,17 @@ def check_secure_boot(secure_boot_enabled: bool | None, generation: int | None) 
     did before. What is NOT carried across is a custom or third-party template, because
     nothing here can read which certificates it contained.
     """
-    if generation == 1 or not secure_boot_enabled:
+    if generation == 1 or secure_boot_enabled is False:
         return Finding('secure_boot', OK, 'Secure Boot is not enabled on this VM.')
+    if secure_boot_enabled is None:
+        # The host did not report it. Saying "not enabled" would be a guess, and the import
+        # does not enrol keys under a guest it cannot read — so a guest that DID need
+        # Secure Boot arrives without it and may refuse to boot.
+        return Finding('secure_boot', WARNING, 'This host did not report the Secure Boot state.',
+                       'The imported VM gets a UEFI variable store with no keys enrolled, '
+                       'because enrolling them under a guest whose loader might be unsigned '
+                       'would stop it booting at all. If this guest was using Secure Boot, '
+                       'enrol the keys on the target afterwards.')
     return Finding('secure_boot', OK, 'Secure Boot is enabled and is reproduced on the target.',
                    "The imported VM gets a UEFI variable store with Microsoft's keys already "
                    'enrolled, which is what the standard Hyper-V template holds. A guest that '

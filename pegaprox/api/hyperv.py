@@ -248,6 +248,11 @@ def update_hyperv_host(host_id):
         return jsonify({'error': 'Hyper-V host not found'}), 404
 
     data = {**existing, **(request.json or {})}
+    # Whether a password was actually typed. The stored one is filled in below so the
+    # connection test can run, which makes `pass` truthy either way — and the measured
+    # transfer check must only be discarded when the credential really changed. Read here
+    # rather than guessed in the database layer, which cannot tell the two apart.
+    data['_password_submitted'] = bool((request.json or {}).get('pass'))
     if not (request.json or {}).get('pass'):
         data['pass'] = existing['pass']
     auth_error = _unsupported_auth(data)

@@ -649,10 +649,18 @@ def save_host(conn, encrypt, host_id: str, data: dict) -> None:
         moved = (
             (data.get('host') or '') != (existing['host'] or '')
             or (data.get('transfer_host') or '').strip() != (existing['transfer_host'] or '')
-            or (data.get('user') or '') != (existing['username'] or '')
-            or json.dumps(dict(data.get('smb_share_map') or {})) != (existing['smb_share_map'] or '{}')
+            or (data.get('user') or data.get('username') or '') != (existing['username'] or '')
+            or (dict(data.get('smb_share_map') or {})
+                != _decode_json(existing['smb_share_map'] or '{}', {}, host_id, 'share map'))
             or (data.get('smb_domain') or '') != (existing['smb_domain'] or '')
-            or bool(password)
+            # A NEW password invalidates the measurement; the stored one being carried
+            # forward does not. `update_hyperv_host` fills `pass` from the existing record
+            # when the form left it blank, so `password` is truthy on every edit and
+            # testing it alone discarded the check on a rename. The ciphertext cannot tell
+            # them apart either — Fernet is not deterministic, so re-encrypting the same
+            # password produces a different string every time. The caller is the only one
+            # that knows, so the caller says so.
+            or bool(data.get('_password_submitted', password))
         )
         if not moved:
             transfer_check = existing['transfer_check'] or '{}'
