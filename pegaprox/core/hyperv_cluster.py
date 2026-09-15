@@ -21,6 +21,7 @@ is the host, and reports the absent features as absent.
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime
 
 from pegaprox.core import hyperv_db
@@ -934,21 +935,47 @@ def load_hyperv_sources(managers: dict) -> int:
     overview are built from. This mirrors how an ESXi host becomes XHM-capable in app.py
     without becoming a cluster.
 
-    Registration never waits for a host. One that is switched off, unreachable or holding
-    an expired certificate has to appear as disconnected so the operator can see and fix
-    it; blocking here would add one connection timeout per unreachable host to start-up.
+    Registration never waits for a host, and this is the whole point of the background
+    thread below. A host that is switched off or answering slowly costs a full WinRM
+    connect timeout, and start-up calls this before the web server binds its port: two
+    unreachable hosts once kept the entire product unreachable for half a minute after a
+    restart. The managers are in the registry before this returns, so every route can
+    already find them; each one reports itself as disconnected until its connection
+    attempt finishes, which is exactly what an operator needs to see.
+
+    The attempts run one after another in a single thread rather than one thread per
+    host, so a dozen dead hosts cost a dozen sequential timeouts on a thread nobody is
+    waiting for, instead of a dozen simultaneous WinRM handshakes.
     """
     from pegaprox.core.db import get_db
 
     db = get_db()
-    registered = 0
+    pending = []
     for record in hyperv_db.load_hosts(db.conn, db._decrypt):
         manager = HyperVClusterManager(record['id'], record)
         managers[record['id']] = manager
-        manager.start()
-        registered += 1
+        pending.append(manager)
         logger.info('Registered Hyper-V source %s', record['id'])
-    return registered
+
+    if pending:
+        threading.Thread(target=_connect_in_background, args=(pending,),
+                         name='hyperv-connect', daemon=True).start()
+    return len(pending)
+
+
+def _connect_in_background(managers: list) -> None:
+    """Reach each registered source once, off the start-up path.
+
+    Every failure is already recorded on the manager it belongs to, so nothing here has
+    to be raised: a host that refuses is a host the operator sees as disconnected, not a
+    product that failed to start.
+    """
+    for manager in managers:
+        try:
+            manager.start()
+        except Exception:                                    # noqa: BLE001
+            logger.exception('Connecting to Hyper-V source %s failed unexpectedly',
+                             manager.id)
 
 
 def register_hyperv_source(host_id: str, record: dict, managers: dict) -> HyperVClusterManager:
