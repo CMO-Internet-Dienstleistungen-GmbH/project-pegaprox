@@ -202,10 +202,14 @@ class TestFirmware:
 
 
 class TestWindowsRisks:
-    def test_secure_boot_warns_and_needs_confirming(self):
+    def test_secure_boot_is_reproduced_rather_than_confirmed_away(self):
+        # The import asks for an OVMF variable store with Microsoft's keys already
+        # enrolled whenever the source had Secure Boot on, so this is no longer a risk
+        # somebody accepts by name - it is a setting that is carried across.
         finding = pf.check_secure_boot(True, generation=2)
-        assert finding.severity == pf.WARNING
-        assert finding.check in pf._ACKNOWLEDGEABLE_CHECKS
+        assert finding.severity == pf.OK
+        assert finding.check not in pf._ACKNOWLEDGEABLE_CHECKS
+        assert 'enrolled' in (finding.detail or '')
 
     def test_secure_boot_on_a_generation_1_vm_is_not_a_thing(self):
         assert pf.check_secure_boot(True, generation=1).severity == pf.OK
@@ -319,9 +323,12 @@ class TestTheGate:
     def test_the_report_lists_exactly_which_confirmations_are_missing(self):
         report = pf.run_preflight(_vm(vtpm_enabled=True, secure_boot_enabled=True),
                                   _target(), _options())
-        missing = pf.unacknowledged(report, acknowledged=['vtpm'])
-        assert 'secure_boot' in missing
-        assert 'vtpm' not in missing
+        missing = pf.unacknowledged(report, acknowledged=[])
+        assert 'vtpm' in missing
+        assert pf.unacknowledged(report, acknowledged=['vtpm']) == \
+            [c for c in missing if c != 'vtpm']
+        # Secure Boot is reproduced on the target, so it never asks for a confirmation.
+        assert 'secure_boot' not in missing
 
 
 class TestSerialisation:

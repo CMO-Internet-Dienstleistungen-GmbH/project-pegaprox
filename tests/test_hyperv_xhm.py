@@ -545,6 +545,28 @@ class TestTheTargetVm:
         _run(FakeTask())
         assert any('efidisk0' in data for _, data in target.posts)
 
+    def test_a_secure_boot_guest_gets_the_keys_it_was_booting_with(self, db, wired):
+        """Proxmox ships an OVMF store with Microsoft's certificates enrolled, which is the
+        same set the standard Hyper-V template holds. Handing such a guest an empty store
+        means Secure Boot is simply off on the target — a different machine to anything
+        that measures it."""
+        source, target, _ = wired
+        source._detail = _detail(generation=2, secure_boot_enabled=True)
+        _run(FakeTask())
+        efi = [data['efidisk0'] for _, data in target.posts if 'efidisk0' in data]
+        assert efi, 'no EFI variable store was created'
+        assert 'pre-enrolled-keys=1' in efi[0]
+
+    def test_a_guest_without_secure_boot_does_not_get_keys_enrolled(self, db, wired):
+        """Enrolling keys under a guest that was booting without Secure Boot can stop it
+        booting at all: its loader or one of its drivers may be unsigned."""
+        source, target, _ = wired
+        source._detail = _detail(generation=2, secure_boot_enabled=False)
+        _run(FakeTask())
+        efi = [data['efidisk0'] for _, data in target.posts if 'efidisk0' in data]
+        assert efi, 'no EFI variable store was created'
+        assert 'pre-enrolled-keys=0' in efi[0]
+
     def test_the_mac_address_comes_across(self, db, wired):
         """Licence bindings, DHCP reservations and firewall rules are written against it.
         A new MAC turns a migration into a new machine for all of them."""
@@ -1500,6 +1522,68 @@ class TestAConfiguredSshKeyIsActuallyUsed:
         from pegaprox.core import xhm as core_xhm
         assert core_xhm._key_file_for('') == (None, False)
         assert core_xhm._key_file_for('not a key at all') == (None, False)
+
+
+class TestAnImportThatInstallsNoDrivers:
+    """The compatible path still has to make the disk bootable on a new platform.
+
+    A guest that shut down with Fast Startup left a saved kernel session behind. Resuming
+    it against a different chipset and timer is not supported by Windows, and the
+    compatible controller does not change that — it decides whether the loader can read
+    the disk, not what the resumed kernel finds attached to it. What the bytes survive is
+    measured in tests/hyperv_testbed/verify_hibernation_clear.sh.
+    """
+
+    @staticmethod
+    def _task(hardware):
+        task = FakeTask()
+        task.config = {'hardware': hardware}
+        task.target_node = 'node-a'
+        task.target_storage = 'vmstorage'
+        return task
+
+    def test_the_hibernation_file_is_cleared_when_no_drivers_are_installed(self, monkeypatch):
+        seen = {}
+
+        def fake_injection(_target, view, node_exec=None, clear_hibernation_only=False):
+            seen['clear_only'] = clear_hibernation_only
+            seen['drivers_flag'] = getattr(view, 'install_virtio_drivers', None)
+            return True
+
+        monkeypatch.setattr('pegaprox.core.v2p._inject_virtio_drivers', fake_injection)
+        task = self._task('compatible')
+        note = hyperv_xhm._inject_drivers_if_asked(task, FakeTarget(), 120, [],
+                                                   {'generation': 2})
+        assert note is None
+        assert seen['clear_only'] is True
+        assert seen['drivers_flag'] is False, 'the clean run must not ask for drivers'
+
+    def test_the_driver_run_does_not_ask_for_the_hibernation_only_mode(self, monkeypatch):
+        seen = {}
+
+        def fake_injection(_target, view, node_exec=None, clear_hibernation_only=False):
+            seen['clear_only'] = clear_hibernation_only
+            view.log('COPIED vioscsi')
+            return True
+
+        monkeypatch.setattr('pegaprox.core.v2p._inject_virtio_drivers', fake_injection)
+        volumes = [{'index': 0, 'controller': hyperv_xhm.VIRTIO_CONTROLLER,
+                    'volume': 'vmstorage:vm-120-disk-0'}]
+        hyperv_xhm._inject_drivers_if_asked(self._task('virtio'), FakeTarget(), 120,
+                                            volumes, {'generation': 2})
+        assert seen['clear_only'] is False
+
+    def test_a_node_that_cannot_be_reached_does_not_fail_the_migration(self, monkeypatch):
+        """The disks are already copied. Discarding a finished transfer over a
+        preparation step would throw away the expensive half of the run."""
+        def boom(*_a, **_kw):
+            raise RuntimeError('no route to the node')
+
+        monkeypatch.setattr('pegaprox.core.v2p._inject_virtio_drivers', boom)
+        task = self._task('compatible')
+        assert hyperv_xhm._inject_drivers_if_asked(task, FakeTarget(), 120, [],
+                                                   {'generation': 2}) is None
+        assert any('hibernation' in str(line).lower() for line in task.log_lines)
 
 
 class TestAGuestWhoseDriverTheLoaderRefuses:
