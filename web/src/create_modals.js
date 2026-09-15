@@ -1978,7 +1978,10 @@
                     const rc = reconfigureConfig;
                     if (rc.cluster_type === 'hyperv') {
                         setHyperVConfig(prev => ({ ...prev, name: rc.name || '', host: rc.host || '',
-                            port: rc.port || rc.api_port || 5986, user: rc.user || '', pass: '',
+                            use_ssl: rc.use_ssl === true, auth: rc.auth || 'negotiate',
+                            encrypt_messages: rc.encrypt_messages !== false,
+                            port: rc.port || rc.api_port || hvDefaultPort(rc.use_ssl === true),
+                            user: rc.user || '', pass: '',
                             ssl_verification: rc.ssl_verification !== false,
                             iso_library_paths: (rc.iso_library_paths || []).join('\n'),
                             smb_share_map: Object.entries(rc.smb_share_map || {})
