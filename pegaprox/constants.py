@@ -200,5 +200,30 @@ VNC_PVE_RECV_SLICE = float(os.environ.get('PEGAPROX_VNC_RECV_SLICE', '0.01'))
 # request, not once the guest has moved, so an immediate look-up answers "still on the
 # source" for a migration that is about to succeed. 90s covers the reported gap with
 # room to spare; a real failure pays it once, on a path that is already the exception.
-HA_MIGRATE_SETTLE_SECONDS = float(os.environ.get('PEGAPROX_HA_MIGRATE_SETTLE', '90'))
-HA_MIGRATE_SETTLE_POLL = float(os.environ.get('PEGAPROX_HA_MIGRATE_SETTLE_POLL', '3'))
+def _bounded_float_env(name, default, lo, hi):
+    """Read a float from the environment without letting a typo take the app down.
+
+    MK Sep 2026 — a bare float(os.environ.get(...)) raises at IMPORT time, so
+    PEGAPROX_HA_MIGRATE_SETTLE=90s (or an empty value from a half-written unit file)
+    stops PegaProx from starting at all rather than doing something sensible. And the
+    poll interval is slept on inside a loop: a 0 there turns a 90-second settle window
+    into ninety seconds of hammering /cluster/resources as fast as the API answers.
+    Fall back on garbage, clamp on out-of-range, say so either way.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == '':
+        return default
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        _logging.warning(f"[config] {name}={raw!r} is not a number — using {default}")
+        return default
+    if val < lo or val > hi:
+        clamped = min(max(val, lo), hi)
+        _logging.warning(f"[config] {name}={val} outside {lo}..{hi} — using {clamped}")
+        return clamped
+    return val
+
+
+HA_MIGRATE_SETTLE_SECONDS = _bounded_float_env('PEGAPROX_HA_MIGRATE_SETTLE', 90.0, 0.0, 3600.0)
+HA_MIGRATE_SETTLE_POLL = _bounded_float_env('PEGAPROX_HA_MIGRATE_SETTLE_POLL', 3.0, 0.5, 60.0)

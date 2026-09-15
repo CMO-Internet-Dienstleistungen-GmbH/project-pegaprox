@@ -23,20 +23,63 @@ def test_the_settle_window_outlasts_the_reported_gap():
     assert HA_MIGRATE_SETTLE_SECONDS / HA_MIGRATE_SETTLE_POLL >= 5, "too few looks to matter"
 
 
-def test_both_are_tunable_from_the_environment(monkeypatch):
-    """A cluster with a slower CRM must be able to widen this without a patch."""
+def _reload_with(monkeypatch, **env):
     import importlib
-    monkeypatch.setenv('PEGAPROX_HA_MIGRATE_SETTLE', '210')
-    monkeypatch.setenv('PEGAPROX_HA_MIGRATE_SETTLE_POLL', '7')
+    import pegaprox.constants as c
+    for k in ('PEGAPROX_HA_MIGRATE_SETTLE', 'PEGAPROX_HA_MIGRATE_SETTLE_POLL'):
+        monkeypatch.delenv(k, raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    importlib.reload(c)
+    return c
+
+
+@pytest.fixture(autouse=True)
+def _restore_constants():
+    yield
+    import importlib
     import pegaprox.constants as c
     importlib.reload(c)
-    try:
-        assert c.HA_MIGRATE_SETTLE_SECONDS == 210
-        assert c.HA_MIGRATE_SETTLE_POLL == 7
-    finally:
-        monkeypatch.delenv('PEGAPROX_HA_MIGRATE_SETTLE', raising=False)
-        monkeypatch.delenv('PEGAPROX_HA_MIGRATE_SETTLE_POLL', raising=False)
-        importlib.reload(c)
+
+
+def test_both_are_tunable_from_the_environment(monkeypatch):
+    """A cluster with a slower CRM must be able to widen this without a patch."""
+    c = _reload_with(monkeypatch, PEGAPROX_HA_MIGRATE_SETTLE='210',
+                     PEGAPROX_HA_MIGRATE_SETTLE_POLL='7')
+    assert c.HA_MIGRATE_SETTLE_SECONDS == 210
+    assert c.HA_MIGRATE_SETTLE_POLL == 7
+
+
+def test_a_typo_does_not_stop_the_service_from_starting(monkeypatch):
+    """These are read at import time. A bare float() would raise there, so
+    PEGAPROX_HA_MIGRATE_SETTLE=90s wouldn't misconfigure the settle window — it would
+    stop PegaProx booting at all, which is a poor trade for a stray unit."""
+    c = _reload_with(monkeypatch, PEGAPROX_HA_MIGRATE_SETTLE='90s')
+    assert c.HA_MIGRATE_SETTLE_SECONDS == 90.0
+
+
+def test_an_empty_value_falls_back(monkeypatch):
+    """Half-written unit files and `Environment=VAR=` both produce this."""
+    c = _reload_with(monkeypatch, PEGAPROX_HA_MIGRATE_SETTLE='')
+    assert c.HA_MIGRATE_SETTLE_SECONDS == 90.0
+
+
+def test_a_zero_poll_cannot_become_a_busy_loop(monkeypatch):
+    """The poll is slept on inside the settle loop. A 0 there would turn a 90-second
+    window into 90 seconds of asking /cluster/resources as fast as it answers."""
+    c = _reload_with(monkeypatch, PEGAPROX_HA_MIGRATE_SETTLE_POLL='0')
+    assert c.HA_MIGRATE_SETTLE_POLL >= 0.5
+
+
+def test_a_negative_poll_is_clamped_too(monkeypatch):
+    c = _reload_with(monkeypatch, PEGAPROX_HA_MIGRATE_SETTLE_POLL='-5')
+    assert c.HA_MIGRATE_SETTLE_POLL >= 0.5
+
+
+def test_an_absurd_window_is_capped(monkeypatch):
+    """Nobody meant to hold an evacuation open for eleven days."""
+    c = _reload_with(monkeypatch, PEGAPROX_HA_MIGRATE_SETTLE='999999')
+    assert c.HA_MIGRATE_SETTLE_SECONDS <= 3600
 
 
 def _settle(seen_nodes, source, deadline_s, poll_s, now):
