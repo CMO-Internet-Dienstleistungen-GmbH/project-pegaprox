@@ -443,7 +443,7 @@
 
                     <div>
                         <label className={label}>{t('password') || 'Password'}</label>
-                        <input type="password" required className={input} value={config.pass}
+                        <input type="password" required={!config.editing} className={input} value={config.pass}
                             onChange={e => field('pass', e.target.value)} />
                     </div>
 
