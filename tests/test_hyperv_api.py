@@ -47,6 +47,36 @@ def _vm_detail(vmid=VM_A):
     }
 
 
+@pytest.fixture(autouse=True)
+def _forget_the_cached_inventory(monkeypatch):
+    """An empty, non-reading inventory cache per case.
+
+    Two things are off by default. The cache is process-global and every case here uses
+    one host id, so a case that seeded rows for HOST would hand them to the next one --
+    which is how a passing suite hides a route that never reads anything. And the
+    background read is stubbed out: under gevent a patched Thread.start() waits on the
+    started event, so a mocked read finishes inside the request and nothing about the
+    asynchronous contract would actually be tested. A case that wants rows says so, by
+    calling `_read_inventory`.
+    """
+    from pegaprox.core import hyperv_inventory
+    hyperv_inventory.reset()
+    monkeypatch.setattr(hyperv_inventory, '_spawn', lambda host_id, mgr, generation: None)
+    yield
+    hyperv_inventory.reset()
+
+
+def _read_inventory(fake, host_id=HOST):
+    """Fill the cache the way the background reader does, without a thread.
+
+    The routes answer from `hyperv_inventory`; a test that wants rows out of them has to
+    say that the host was read at some point, and doing it here keeps every case free of
+    thread timing.
+    """
+    from pegaprox.core import hyperv_inventory
+    return hyperv_inventory.read_now(host_id, fake)
+
+
 def _hyperv_manager(api, *, vms=None, detail=None, iso_paths=('C:\\iso',)):
     """A fake Hyper-V host registered under HOST, with the reads a route performs stubbed."""
     fake = api.make_fake_manager(cluster_id=HOST, cluster_type='hyperv')
@@ -55,6 +85,11 @@ def _hyperv_manager(api, *, vms=None, detail=None, iso_paths=('C:\\iso',)):
     fake.is_connected = True
     fake.connection_error = ''
     fake.property_report = {'complete': True, 'missing': []}
+    # A plain dict, not the MagicMock a bare attribute would produce: these travel through
+    # jsonify, and a mock there fails the request for a reason that has nothing to do with
+    # what the case is testing.
+    fake.manager.host_facts.return_value = {'os_caption': 'Windows Server 2022',
+                                            'powershell_version': '5.1.20348.2849'}
     fake.config.iso_library_paths = list(iso_paths)
     fake.get_vms.return_value = vms if vms is not None else [
         _vm_row(VM_A, GUID_A, 'guest-a'), _vm_row(VM_B, GUID_B, 'guest-b')]
@@ -169,17 +204,19 @@ def test_a_vm_acl_grant_does_not_open_the_neighbouring_vm(api, seed):
 
 def test_the_vm_list_shows_only_the_vms_the_caller_may_see(api, seed):
     """Reaching a host through one VM must not hand back its inventory."""
-    _hyperv_manager(api)
+    fake = _hyperv_manager(api)
     seed.tenant('other', clusters=[])
     user = seed.user('scoped', role='user', tenant_id='other')
     seed.vm_acl(HOST, VM_A, ['scoped'])
 
+    _read_inventory(fake)
     body = api.as_user(user).get(f'/api/hyperv/{HOST}/vms').get_json()
     assert [vm['vmid'] for vm in body['vms']] == [VM_A]
 
 
 def test_an_admin_sees_every_vm(api, seed):
-    _hyperv_manager(api)
+    fake = _hyperv_manager(api)
+    _read_inventory(fake)
     admin = seed.user('root', role='admin')
     body = api.as_user(admin).get(f'/api/hyperv/{HOST}/vms').get_json()
     assert [vm['vmid'] for vm in body['vms']] == [VM_A, VM_B]
@@ -238,29 +275,62 @@ def test_a_vmid_this_host_never_issued_is_a_404(api, seed):
 # How a failure on the host reaches the caller
 # ===========================================================================
 
-@pytest.mark.parametrize('kind,status', [
-    (KIND_UNREACHABLE, 502),
-    (KIND_AUTHORIZATION, 502),
-    (KIND_TIMEOUT, 504),
-    (KIND_CLIENT_DEPENDENCY, 503),
+@pytest.mark.parametrize('kind', [
+    KIND_UNREACHABLE, KIND_AUTHORIZATION, KIND_TIMEOUT, KIND_CLIENT_DEPENDENCY,
 ])
-def test_a_source_failure_keeps_its_classification(api, seed, kind, status):
-    """Four causes, four answers.
+def test_a_source_failure_keeps_its_classification(api, seed, kind):
+    """Four causes, four answers — reported beside the list rather than in place of it.
 
-    They share a status family on purpose — none of them is the caller's own
-    authorization, and a 401 or 403 here would tell a browser its session had expired.
-    What separates them is `kind` and the remedy that comes with it, which is what an
-    operator acts on.
+    The list route answers from the cached inventory, so a host that stops answering is
+    not a failed request: the rows that are on screen are still what the host said, and
+    the read that could not replace them is what failed. `refresh_error` carries the same
+    `kind` and `remedy` the synchronous routes return, which is what an operator acts on.
     """
     fake = _hyperv_manager(api)
     fake.get_vms.side_effect = HyperVError('the host said no', kind=kind)
+    _read_inventory(fake)
     admin = seed.user('root', role='admin')
 
     response = api.as_user(admin).get(f'/api/hyperv/{HOST}/vms')
-    assert response.status_code == status
+    assert response.status_code == 200
     body = response.get_json()
-    assert body['kind'] == kind
-    assert body['remedy']
+    assert body['refresh_error']['kind'] == kind
+    assert body['refresh_error']['remedy']
+    assert body['refresh_error']['message'] == 'the host said no'
+
+
+def test_a_host_that_stops_answering_keeps_showing_what_it_last_said(api, seed):
+    """Rows with a visible age beat an empty table.
+
+    Somebody preparing a migration needs to know which VMs are on a host even while the
+    host is briefly unreachable. Dropping the list would also drop the only evidence that
+    the host ever had them.
+    """
+    fake = _hyperv_manager(api)
+    _read_inventory(fake)
+    fake.get_vms.side_effect = HyperVError('gone', kind=KIND_UNREACHABLE)
+    _read_inventory(fake)
+    admin = seed.user('root', role='admin')
+
+    body = api.as_user(admin).get(f'/api/hyperv/{HOST}/vms').get_json()
+    assert [vm['vmid'] for vm in body['vms']] == [VM_A, VM_B]
+    assert body['cached'] is True
+    assert body['refresh_error']['kind'] == KIND_UNREACHABLE
+
+
+def test_a_host_nobody_has_read_yet_answers_empty_rather_than_waiting(api, seed):
+    """The first view of a host renders; it does not sit on a WinRM read for a minute.
+
+    This is the whole reason the cache exists. The answer says there is nothing known
+    yet and that a read is running, and the view says so instead of showing an empty
+    table that reads as "this host has no VMs".
+    """
+    _hyperv_manager(api)
+    admin = seed.user('root', role='admin')
+
+    body = api.as_user(admin).get(f'/api/hyperv/{HOST}/vms').get_json()
+    assert body['cached'] is False
+    assert body['refreshing'] is True
 
 
 def test_a_disconnected_host_still_answers_its_own_status(api, seed):

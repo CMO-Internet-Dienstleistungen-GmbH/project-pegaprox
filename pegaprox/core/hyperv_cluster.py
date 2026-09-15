@@ -471,8 +471,15 @@ class HyperVClusterManager:
         Deliberately without CPU, memory or storage figures. Producing them would mean
         polling a customer's hypervisor on every page load for numbers a migration never
         uses, and inventing zeroes would draw a graph that says the host is idle.
+
+        The VM tally comes from the cached inventory for the same reason the figures are
+        absent: this is reached from a page somebody opened for an unrelated cluster, and
+        a count is not worth tens of seconds of a customer's hypervisor. A host nobody has
+        opened counts zero until it is read, which is what `0 VMs` beside a host that was
+        never contacted honestly means.
         """
-        vms = self.get_vms()
+        from pegaprox.core import hyperv_inventory
+        vms = hyperv_inventory.cached_vms(self.id)
         nodes = self.get_nodes()
         online = len([node for node in nodes if node.get('status') == 'online'])
         running = len([vm for vm in vms if vm.get('status') == 'running'])
@@ -668,13 +675,21 @@ class HyperVClusterManager:
             kind=KIND_MISSING_FEATURE)
 
     def get_vm_resources(self, max_age: float = 0.0) -> list[dict]:
-        """The VM list, under the name the resource endpoints use.
+        """The VM list, under the name the resource endpoints use — from the cache only.
 
-        `max_age` is accepted and ignored: nothing is cached, so every answer is already
-        as fresh as the parameter could ask for. The parameter exists because callers pass
-        it positionally.
+        This is the question PegaProx's generic, cluster-shaped machinery asks: the SSE
+        broadcast loop asks it of every watched manager once a second, and a dozen REST
+        pages ask it in passing. Answering it from the host would mean one WinRM inventory
+        per second per Hyper-V source for as long as an all-access client is connected,
+        which is exactly the standing load on a customer's hypervisor this patch exists to
+        avoid. So it answers with what `hyperv_inventory` last heard, and an empty list
+        until somebody opens the host view and starts a read.
+
+        `max_age` is accepted and ignored: the cache's own freshness rules decide, and no
+        caller here is in a position to insist on a read that costs tens of seconds.
         """
-        return self.get_vms()
+        from pegaprox.core import hyperv_inventory
+        return hyperv_inventory.cached_vms(self.id)
 
     def get_vm_disks_for_export(self, vmid) -> dict:
         """The inventory read the migration planner performs.
