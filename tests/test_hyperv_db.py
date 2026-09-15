@@ -352,47 +352,52 @@ class TestTheTransferCheckSurvivesTheRightThings:
         data.update(overrides)
         return data
 
-    def _saved(self, db, host_id='h1', **overrides):
-        hyperv_db.save_host(db.conn, db._encrypt, host_id, self._host(db, **overrides))
+    def _saved(self, db, host_id='h1', password_submitted=False, **overrides):
+        # Mirrors what `update_hyperv_host` sends: the stored password is always filled in
+        # so the connection test can run, and `_password_submitted` says whether anybody
+        # actually typed one.
+        data = self._host(db, **overrides)
+        data['_password_submitted'] = password_submitted
+        hyperv_db.save_host(db.conn, db._encrypt, host_id, data)
         return hyperv_db.load_host(db.conn, db._decrypt, host_id)
 
     def test_a_plain_edit_keeps_it(self, db):
         self._saved(db)
         hyperv_db.save_transfer_check(db.conn, 'h1', {'ok': True, 'node': 'pve-1'})
         # The same settings again, with no new password: nothing about the path changed.
-        record = self._saved(db, name='renamed', **{'pass': ''})
+        record = self._saved(db, name='renamed')
         assert record['transfer_check'].get('ok') is True
 
     def test_a_new_address_discards_it(self, db):
         self._saved(db)
         hyperv_db.save_transfer_check(db.conn, 'h1', {'ok': True, 'node': 'pve-1'})
-        record = self._saved(db, host='hv-other.invalid', **{'pass': ''})
+        record = self._saved(db, host='hv-other.invalid')
         assert record['transfer_check'] == {}
 
     def test_a_new_transfer_address_discards_it(self, db):
         # This is the address the check actually mounted from.
         self._saved(db)
         hyperv_db.save_transfer_check(db.conn, 'h1', {'ok': True, 'node': 'pve-1'})
-        record = self._saved(db, transfer_host='10.0.0.9', **{'pass': ''})
+        record = self._saved(db, transfer_host='10.0.0.9')
         assert record['transfer_check'] == {}
 
     def test_a_new_account_discards_it(self, db):
         self._saved(db)
         hyperv_db.save_transfer_check(db.conn, 'h1', {'ok': True, 'node': 'pve-1'})
-        record = self._saved(db, user='CORP\\other', **{'pass': ''})
+        record = self._saved(db, user='CORP\\other')
         assert record['transfer_check'] == {}
 
     def test_a_new_password_discards_it(self, db):
         # Whether the share lets the account read is exactly what the check measured.
         self._saved(db)
         hyperv_db.save_transfer_check(db.conn, 'h1', {'ok': True, 'node': 'pve-1'})
-        record = self._saved(db, **{'pass': 'different'})
+        record = self._saved(db, password_submitted=True, **{'pass': 'different'})
         assert record['transfer_check'] == {}
 
     def test_a_new_share_map_discards_it(self, db):
         self._saved(db)
         hyperv_db.save_transfer_check(db.conn, 'h1', {'ok': True, 'node': 'pve-1'})
-        record = self._saved(db, smb_share_map={'C': 'VMS$'}, **{'pass': ''})
+        record = self._saved(db, smb_share_map={'C': 'VMS$'})
         assert record['transfer_check'] == {}
 
     def test_recording_one_does_not_touch_the_password(self, db):
@@ -401,3 +406,27 @@ class TestTheTransferCheckSurvivesTheRightThings:
         self._saved(db)
         hyperv_db.save_transfer_check(db.conn, 'h1', {'ok': True})
         assert hyperv_db.load_host(db.conn, db._decrypt, 'h1')['pass'] == 'p'
+
+    def test_an_edit_that_carries_the_stored_password_forward_keeps_it(self, db):
+        # The API fills `pass` from the existing record when the form left it blank, so a
+        # plain rename arrives here WITH a password and used to discard the measurement.
+        self._saved(db)
+        hyperv_db.save_transfer_check(db.conn, 'h1', {'ok': True, 'node': 'pve-1'})
+        record = self._saved(db, name='renamed')          # same password, as the PUT sends it
+        assert record['transfer_check'].get('ok') is True
+
+    def test_a_share_map_in_a_different_key_order_is_not_a_change(self, db):
+        self._saved(db, smb_share_map={'C': 'VMS$', 'E': 'BACKUP$'})
+        hyperv_db.save_transfer_check(db.conn, 'h1', {'ok': True})
+        record = self._saved(db, smb_share_map={'E': 'BACKUP$', 'C': 'VMS$'})
+        assert record['transfer_check'].get('ok') is True
+
+    def test_username_under_its_other_key_is_not_a_change(self, db):
+        self._saved(db)
+        hyperv_db.save_transfer_check(db.conn, 'h1', {'ok': True})
+        data = self._host(db)
+        data.pop('user')
+        data['username'] = 'CORP\\svc'
+        data['_password_submitted'] = False
+        hyperv_db.save_host(db.conn, db._encrypt, 'h1', data)
+        assert hyperv_db.load_host(db.conn, db._decrypt, 'h1')['transfer_check'].get('ok') is True
