@@ -327,12 +327,17 @@
          * confirm an answer it did not have; 159 guests meant 159 confirmations of one
          * thing. Measured once here instead, with the date it was measured on.
          */
-        function HyperVTransferCheck({ check, targets, busy, onRun, t }) {
+        function HyperVTransferCheck({ check, targets, busy, onRun, onNeedNodes, t }) {
             const say = hvTranslator(t);
             const [cluster, setCluster] = React.useState('');
             const [node, setNode] = React.useState('');
 
             const nodes = (targets || []).find(c => c.id === cluster)?.nodes || [];
+            // A cluster nobody opened this session has no node list yet, and the picker
+            // would sit empty with the button dead and nothing saying why.
+            React.useEffect(() => {
+                if (cluster && nodes.length === 0 && onNeedNodes) onNeedNodes(cluster);
+            }, [cluster, nodes.length]);
             const ok = check && check.ok;
             const measured = check && check.at_text;
 
@@ -378,7 +383,9 @@
                         </select>
                         <select value={node} onChange={e => setNode(e.target.value)} disabled={!cluster}
                             className="flex-1 px-2 py-1 bg-proxmox-dark border border-proxmox-border rounded text-white text-xs disabled:opacity-50">
-                            <option value="">{say('hvTransferCheckNode', 'Node…')}</option>
+                            <option value="">{cluster && nodes.length === 0
+                                ? say('hvTransferCheckLoadingNodes', 'Loading nodes…')
+                                : say('hvTransferCheckNode', 'Node…')}</option>
                             {nodes.map(n => <option key={n} value={n}>{n}</option>)}
                         </select>
                         <button onClick={() => onRun(cluster, node)} disabled={!cluster || !node || busy}

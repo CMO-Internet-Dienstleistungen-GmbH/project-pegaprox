@@ -281,6 +281,31 @@ class TestWhatTheCheckDoes:
         assert node.closed, 'the SSH session was left open'
         assert any('umount' in c for c in node.commands), 'cleanup did not run'
 
+    def test_every_mapped_share_is_probed_not_just_the_first(self):
+        # unmount_command also removes the credentials file, so unmounting share #1 with
+        # it left share #2 mounting without one — reported as "the host refused the
+        # account". Any host with a real share map has more than one.
+        source = FakeCheckSource(smb_share_map={'C': 'VMS$', 'E': 'BACKUP$'})
+        result, node = _check(source)
+        assert result['ok'] is True, result['error']
+        mounts = [c for c in node.commands if 'mount -t cifs' in c]
+        assert len(mounts) == 2, f'only {len(mounts)} share(s) were probed'
+        assert any('/VMS$' in c for c in mounts) and any('/BACKUP$' in c for c in mounts)
+
+    def test_an_unreachable_address_is_not_called_a_refused_account(self):
+        # mount.cifs says `error(113): No route to host`, and matching a bare '13' read
+        # that as errno 13. It is the most likely failure of a separate transfer address.
+        node = FakeNode(fail_on='mount -t cifs',
+                        err='mount error(113): No route to host')
+        result, _ = _check(node=node)
+        assert 'TCP 445' in result['error']
+        assert 'refused the account' not in result['error']
+
+    def test_a_genuinely_refused_account_still_says_so(self):
+        node = FakeNode(fail_on='mount -t cifs', err='mount error(13): Permission denied')
+        result, _ = _check(node=node)
+        assert 'may read this share' in result['error']
+
     def test_the_record_says_when_and_from_where(self):
         result, _ = _check()
         assert result['node'] == 'pve-1'
