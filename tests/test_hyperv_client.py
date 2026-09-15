@@ -75,8 +75,95 @@ class TestTimeouts:
         conn = _conn(operation_timeout=900)
         assert conn.read_timeout > conn.operation_timeout
 
-    def test_the_default_port_is_the_https_listener(self):
-        assert _conn().port == 5986
+
+
+class TestTransport:
+    """The host's listener configuration is a given; the connection follows it.
+
+    Which listener a host offers, which authentication it accepts and whether it seals
+    the payload over HTTP is decided on the host, and these tests pin the translation
+    of that configuration into what pypsrp is handed. The one rule this side adds is
+    pypsrp's own: basic authentication over HTTP has no session key, so it can only
+    travel in clear.
+    """
+
+    def test_the_default_listener_is_http_on_5985(self):
+        assert _conn().port == 5985
+        assert _conn().use_ssl is False
+
+    def test_choosing_https_moves_the_default_port_to_5986(self):
+        assert _conn(use_ssl=True).port == 5986
+
+    def test_a_port_the_operator_set_is_kept_whatever_the_transport(self):
+        assert _conn(use_ssl=True, port=15986).port == 15986
+        assert _conn(use_ssl=False, port=15985).port == 15985
+
+    def test_the_default_authentication_is_negotiate(self):
+        assert _conn().auth == 'negotiate'
+
+    def test_an_unknown_authentication_method_is_refused_at_construction(self):
+        with pytest.raises(ValueError) as caught:
+            _conn(auth='digest')
+        assert 'negotiate' in str(caught.value)
+
+    @pytest.mark.parametrize('use_ssl, auth, encrypt, expected', [
+        (False, 'negotiate', True, 'auto'),
+        (False, 'ntlm', True, 'auto'),
+        (False, 'kerberos', True, 'auto'),
+        (False, 'negotiate', False, 'never'),
+        (False, 'basic', True, 'never'),
+        (False, 'basic', False, 'never'),
+        (True, 'negotiate', True, 'auto'),
+        (True, 'negotiate', False, 'auto'),
+        (True, 'basic', True, 'auto'),
+        (True, 'basic', False, 'auto'),
+    ])
+    def test_the_encryption_argument_follows_transport_auth_and_choice(
+            self, use_ssl, auth, encrypt, expected):
+        conn = _conn(use_ssl=use_ssl, auth=auth, encrypt_messages=encrypt)
+        assert conn.wsman_encryption == expected
+
+    def test_the_repr_says_how_the_host_is_reached_and_still_hides_the_password(self):
+        text = repr(_conn(use_ssl=False, auth='basic', encrypt_messages=False))
+        assert 'use_ssl=False' in text
+        assert "auth='basic'" in text
+        assert 'encrypt_messages=False' in text
+        assert FAKE_PASSWORD not in text
+
+    def test_pypsrp_is_handed_exactly_the_configured_transport(self, monkeypatch):
+        """The settings must reach WSMan unchanged; a hard-coded ssl=True here is how the
+        product refused every host in an estate that only runs the HTTP listener."""
+        import types
+        seen = {}
+
+        class FakeWSMan:
+            def __init__(self, server, **kwargs):
+                seen['server'] = server
+                seen.update(kwargs)
+
+        class FakeRunspacePool:
+            def __init__(self, wsman):
+                self.wsman = wsman
+
+            def open(self):
+                pass
+
+        monkeypatch.setitem(sys.modules, 'pypsrp', types.ModuleType('pypsrp'))
+        monkeypatch.setitem(sys.modules, 'pypsrp.wsman', type('M', (), {'WSMan': FakeWSMan}))
+        monkeypatch.setitem(sys.modules, 'pypsrp.powershell',
+                            type('M', (), {'RunspacePool': FakeRunspacePool}))
+
+        client = hc.PsrpHyperVClient(_conn(use_ssl=False, auth='basic', encrypt_messages=True,
+                                           verify_certificate=False))
+        client._ensure_pool()
+
+        assert seen['server'] == FAKE_HOST
+        assert seen['port'] == 5985
+        assert seen['ssl'] is False
+        assert seen['auth'] == 'basic'
+        assert seen['encryption'] == 'never'
+        assert seen['cert_validation'] is False
+        assert seen['password'] == FAKE_PASSWORD
 
 
 class TestReadOnlyGuard:

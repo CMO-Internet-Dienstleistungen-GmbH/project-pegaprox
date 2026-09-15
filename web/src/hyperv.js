@@ -295,10 +295,28 @@
         // ───────────────────────────────────────────────
 
         const HYPERV_DEFAULT_CONFIG = {
-            name: '', host: '', port: 5986, user: '', pass: '',
+            name: '', host: '', port: 5985, user: '', pass: '',
+            use_ssl: false, auth: 'negotiate', encrypt_messages: true,
             ssl_verification: true, iso_library_paths: '', smb_share_map: '', smb_domain: '',
             cluster_type: 'hyperv',
         };
+
+        // The listener Windows creates by default answers on 5985; an HTTPS listener on 5986
+        // exists only where somebody set one up with a certificate. The form follows the
+        // transport so an operator who changes one does not have to remember the other.
+        const HYPERV_WINRM_PORTS = { http: 5985, https: 5986 };
+        function hvDefaultPort(useSsl) {
+            return useSsl ? HYPERV_WINRM_PORTS.https : HYPERV_WINRM_PORTS.http;
+        }
+
+        // What pypsrp accepts for a username/password login. The labels are not translated:
+        // they are protocol names.
+        const HYPERV_AUTH_METHODS = [
+            { value: 'negotiate', label: 'Negotiate (Kerberos, then NTLM)' },
+            { value: 'ntlm', label: 'NTLM' },
+            { value: 'basic', label: 'Basic' },
+            { value: 'kerberos', label: 'Kerberos' },
+        ];
 
         /**
          * Turn the two free-text fields into what the API stores.
@@ -316,7 +334,9 @@
             return {
                 ...form,
                 cluster_type: 'hyperv',
-                port: parseInt(form.port, 10) || 5986,
+                use_ssl: !!form.use_ssl,
+                encrypt_messages: form.encrypt_messages !== false,
+                port: parseInt(form.port, 10) || hvDefaultPort(form.use_ssl),
                 iso_library_paths: (form.iso_library_paths || '')
                     .split('\n').map(s => s.trim()).filter(Boolean),
                 smb_share_map: shareMap,
@@ -329,6 +349,17 @@
             const input = 'w-full px-4 py-2.5 bg-proxmox-dark border border-proxmox-border rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-proxmox-orange transition-colors';
             const label = 'block text-sm font-medium text-gray-300 mb-2';
 
+            // A port the operator never touched follows the transport; one they typed stays.
+            const setTransport = (useSsl) => {
+                const current = parseInt(config.port, 10);
+                const portFollows = !current || current === hvDefaultPort(!useSsl);
+                setConfig({ ...config, use_ssl: useSsl,
+                            port: portFollows ? hvDefaultPort(useSsl) : config.port });
+            };
+            // Basic authentication has no session key, so over HTTP there is nothing to seal
+            // the payload with. The choice is shown as unavailable rather than silently ignored.
+            const basicOverHttp = !config.use_ssl && config.auth === 'basic';
+
             return (
                 <>
                     <div className="p-3 rounded-lg border border-indigo-500/25 bg-indigo-500/5 text-xs text-indigo-300/90">
@@ -337,7 +368,7 @@
                              + 'to Proxmox. It never manages the host.')}
                     </div>
 
-                    <div className="grid grid-cols-2 gap-4">
+                    <div className="space-y-4">
                         <div>
                             <label className={label}>{t('clusterName') || 'Name'}</label>
                             <input type="text" required className={input} value={config.name}
@@ -350,22 +381,52 @@
                                 onChange={e => field('host', e.target.value)}
                                 placeholder="hyperv.example.com" />
                             <p className="mt-1 text-xs text-gray-500">
-                                {say('hvHostHint', 'The name the certificate is issued for. The '
-                                     + 'target node reaches the disk share under this name too.')}
+                                {say('hvHostHint', 'Name or address. The target node reaches the disk '
+                                     + 'share under this name too; with HTTPS it has to match the '
+                                     + 'certificate.')}
                             </p>
                         </div>
                     </div>
 
-                    <div className="grid grid-cols-2 gap-4">
+                    <div className="space-y-4">
+                        <div>
+                            <label className={label}>{say('hvTransport', 'Transport')}</label>
+                            <select className={input} value={config.use_ssl ? 'https' : 'http'}
+                                onChange={e => setTransport(e.target.value === 'https')}>
+                                <option value="http">
+                                    {say('hvTransportHttp', 'HTTP (5985)')}
+                                </option>
+                                <option value="https">
+                                    {say('hvTransportHttps', 'HTTPS (5986)')}
+                                </option>
+                            </select>
+                            <p className="mt-1 text-xs text-gray-500">
+                                {say('hvTransportHint', 'Whatever the host is set up for: HTTP is the '
+                                     + 'listener Windows creates by default, HTTPS needs a listener '
+                                     + 'certificate. HTTP does not authenticate the host to PegaProx; '
+                                     + 'whether that is acceptable depends on the network between the two.')}
+                            </p>
+                        </div>
                         <div>
                             <label className={label}>{say('hvWinrmPort', 'WinRM port')}</label>
                             <input type="number" min="1" max="65535" className={input} value={config.port}
-                                onChange={e => field('port', e.target.value)} placeholder="5986" />
+                                onChange={e => field('port', e.target.value)}
+                                placeholder={String(hvDefaultPort(config.use_ssl))} />
                             <p className="mt-1 text-xs text-gray-500">
-                                {say('hvWinrmPortHint', 'HTTPS only. The plaintext listener on '
-                                     + '5985 is never used, because an NTLM exchange and everything '
-                                     + 'after it would be readable on the wire.')}
+                                {say('hvWinrmPortHint', 'Follows the transport until you set it yourself.')}
                             </p>
+                        </div>
+                    </div>
+
+                    <div className="space-y-4">
+                        <div>
+                            <label className={label}>{say('hvAuthMethod', 'Authentication')}</label>
+                            <select className={input} value={config.auth}
+                                onChange={e => field('auth', e.target.value)}>
+                                {HYPERV_AUTH_METHODS.map(method => (
+                                    <option key={method.value} value={method.value}>{method.label}</option>
+                                ))}
+                            </select>
                         </div>
                         <div>
                             <label className={label}>{t('username') || 'Username'}</label>
@@ -386,16 +447,34 @@
                             onChange={e => field('pass', e.target.value)} />
                     </div>
 
-                    <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
-                        <input type="checkbox" checked={config.ssl_verification}
-                            onChange={e => field('ssl_verification', e.target.checked)}
-                            className="rounded border-gray-600" />
-                        {say('hvVerifyCertificate', "Verify the host's certificate")}
-                        <span className="text-xs text-gray-500">
-                            {say('hvVerifyCertificateHint', '(turning this off means the connection '
-                                 + 'can be read and changed in transit)')}
-                        </span>
-                    </label>
+                    {config.use_ssl ? (
+                        <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                            <input type="checkbox" checked={config.ssl_verification}
+                                onChange={e => field('ssl_verification', e.target.checked)}
+                                className="rounded border-gray-600" />
+                            {say('hvVerifyCertificate', "Verify the host's certificate")}
+                            <span className="text-xs text-gray-500">
+                                {say('hvVerifyCertificateHint', '(turning this off means the connection '
+                                     + 'can be read and changed in transit)')}
+                            </span>
+                        </label>
+                    ) : (
+                        <label className={'flex items-center gap-2 text-sm text-gray-300 '
+                                          + (basicOverHttp ? 'opacity-60' : 'cursor-pointer')}>
+                            <input type="checkbox" checked={config.encrypt_messages && !basicOverHttp}
+                                disabled={basicOverHttp}
+                                onChange={e => field('encrypt_messages', e.target.checked)}
+                                className="rounded border-gray-600" />
+                            <span className="whitespace-nowrap">{say('hvEncryptMessages', 'Encrypt the payload')}</span>
+                            <span className="text-xs text-gray-500">
+                                {basicOverHttp
+                                    ? say('hvBasicNeedsPlain', '(Basic has no session key to encrypt '
+                                          + 'with; the payload travels in clear)')
+                                    : say('hvEncryptMessagesHint', '(sealed with the NTLM or Kerberos '
+                                          + 'session key; turned off, the payload travels in clear)')}
+                            </span>
+                        </label>
+                    )}
 
                     <div>
                         <label className={label}>{say('hvIsoLibrary', 'ISO library paths')}</label>

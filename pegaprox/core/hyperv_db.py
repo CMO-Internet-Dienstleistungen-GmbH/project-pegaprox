@@ -39,6 +39,7 @@ import uuid
 # that actually ships. Measured: the guard against two migrations of one VM let the raw
 # error through instead of naming the migration that already holds the source.
 from pegaprox.core.dbcrypto import IntegrityError
+from pegaprox.core.hyperv_client import DEFAULT_AUTH_METHOD, default_winrm_port
 
 logger = logging.getLogger(__name__)
 
@@ -52,9 +53,6 @@ _FIRST_SYNTHETIC_VMID = 100
 _ALLOCATION_ATTEMPTS = 8
 
 # Terminal states. A migration in any other state was interrupted rather than finished.
-#: The WinRM HTTPS port, and the default a host is registered on.
-DEFAULT_WINRM_HTTPS_PORT = 5986
-
 STATUS_RUNNING = 'running'
 STATUS_COMPLETED = 'completed'
 STATUS_FAILED = 'failed'
@@ -139,6 +137,24 @@ def ensure_schema(cursor) -> None:
         cursor.execute('ALTER TABLE hyperv_hosts RENAME COLUMN host_id TO id')
         logger.info('Renamed hyperv_hosts.host_id to id')
 
+    # The transport used to be fixed: HTTPS, NTLM, message encryption left to pypsrp. A
+    # host registered before these columns existed was therefore reached over HTTPS
+    # whatever its port, so the rows that are already there get use_ssl=1 rather than the
+    # column default -- otherwise every existing source would silently switch to HTTP on
+    # the first restart after the upgrade and fail against a listener it never used.
+    if host_columns and 'use_ssl' not in host_columns:
+        cursor.execute('ALTER TABLE hyperv_hosts ADD COLUMN use_ssl INTEGER DEFAULT 0')
+        cursor.execute('UPDATE hyperv_hosts SET use_ssl = 1')
+        logger.info('Added use_ssl column to hyperv_hosts; existing hosts keep HTTPS')
+    if host_columns and 'auth' not in host_columns:
+        cursor.execute("ALTER TABLE hyperv_hosts ADD COLUMN auth TEXT DEFAULT 'negotiate'")
+        # Same reasoning: those rows authenticated with NTLM, so they keep doing that.
+        cursor.execute("UPDATE hyperv_hosts SET auth = 'ntlm'")
+        logger.info('Added auth column to hyperv_hosts; existing hosts keep NTLM')
+    if host_columns and 'encrypt_messages' not in host_columns:
+        cursor.execute('ALTER TABLE hyperv_hosts ADD COLUMN encrypt_messages INTEGER DEFAULT 1')
+        logger.info('Added encrypt_messages column to hyperv_hosts')
+
     # The shared cluster table has a fixed set of columns and drops anything it does not
     # know, so a Hyper-V-only setting saved there would be silently gone after the next
     # restart. These live here instead, where this patch owns the schema and upstream is
@@ -167,7 +183,10 @@ def ensure_schema(cursor) -> None:
             host TEXT NOT NULL,
             username TEXT NOT NULL DEFAULT '',
             pass_encrypted TEXT DEFAULT '',
-            winrm_port INTEGER DEFAULT 5986,
+            winrm_port INTEGER DEFAULT 5985,
+            use_ssl INTEGER DEFAULT 0,
+            auth TEXT DEFAULT 'negotiate',
+            encrypt_messages INTEGER DEFAULT 1,
             verify_certificate INTEGER DEFAULT 1,
             iso_library_paths TEXT DEFAULT '[]',
             smb_share_map TEXT DEFAULT '{}',
@@ -587,18 +606,23 @@ def save_host(conn, encrypt, host_id: str, data: dict) -> None:
     else:
         stored = ''
 
+    use_ssl = bool(data.get('use_ssl', False))
     now = time.time()
     conn.execute(
         'INSERT OR REPLACE INTO hyperv_hosts '
-        '(id, name, host, username, pass_encrypted, winrm_port, verify_certificate, '
+        '(id, name, host, username, pass_encrypted, winrm_port, use_ssl, auth, '
+        ' encrypt_messages, verify_certificate, '
         ' iso_library_paths, smb_share_map, smb_domain, enabled, created_at, updated_at) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         (host_id,
          data.get('name') or data.get('host') or 'Hyper-V host',
          data.get('host') or '',
          data.get('user') or data.get('username') or '',
          stored,
-         int(data.get('port') or DEFAULT_WINRM_HTTPS_PORT),
+         int(data.get('port') or default_winrm_port(use_ssl)),
+         1 if use_ssl else 0,
+         data.get('auth') or DEFAULT_AUTH_METHOD,
+         1 if data.get('encrypt_messages', True) else 0,
          1 if data.get('ssl_verification', True) else 0,
          json.dumps(list(data.get('iso_library_paths') or [])),
          json.dumps(dict(data.get('smb_share_map') or {})),
@@ -641,7 +665,10 @@ def _host_row(row, decrypt) -> dict:
         'host': row['host'],
         'user': row['username'],
         'pass': password,
-        'port': row['winrm_port'] or DEFAULT_WINRM_HTTPS_PORT,
+        'port': row['winrm_port'] or default_winrm_port(bool(row['use_ssl'])),
+        'use_ssl': bool(row['use_ssl']),
+        'auth': row['auth'] or DEFAULT_AUTH_METHOD,
+        'encrypt_messages': bool(row['encrypt_messages']),
         'ssl_verification': bool(row['verify_certificate']),
         'iso_library_paths': _decode_json(row['iso_library_paths'], [], row['id'],
                                           'ISO library'),
