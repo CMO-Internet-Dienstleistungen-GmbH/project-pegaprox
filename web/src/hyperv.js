@@ -224,6 +224,10 @@
                             target_node: form.target_node || '',
                             target_storage: form.target_storage || '',
                             network_map: form.network_map || {},
+                            // The VLAN per adapter, so the report answers for the networks
+                            // the migration would actually build rather than for the
+                            // source's own values.
+                            vlan_map: form.vlan_map || {},
                             // The hardware the migration would build. Without it the route
                             // falls back to its default and the driver check answers for a
                             // machine the wizard is not about to create, so the list can
