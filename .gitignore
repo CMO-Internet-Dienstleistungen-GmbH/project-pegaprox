@@ -6,3 +6,4 @@ patches.*.yml
 .venv/
 __pycache__/
 config
+.keys/
