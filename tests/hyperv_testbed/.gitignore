@@ -1,0 +1,6 @@
+# Disk images are build output: large, binary, and rebuildable with make_fixtures.sh.
+fixtures/
+
+# Exported copies of the product's own scripts, written by export_scripts.py so PowerShell
+# can execute them. The source of truth is pegaprox/core/hyperv_scripts.py.
+ps_fixtures/_scripts/
