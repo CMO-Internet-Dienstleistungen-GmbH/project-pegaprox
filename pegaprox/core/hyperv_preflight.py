@@ -133,7 +133,7 @@ class PreflightReport:
 
 # Warnings that are not merely informational: the epic requires an explicit confirmation
 # before a migration carrying one of these may start.
-_ACKNOWLEDGEABLE_CHECKS = frozenset({'secure_boot', 'vtpm', 'bitlocker', 'virtio_drivers',
+_ACKNOWLEDGEABLE_CHECKS = frozenset({'vtpm', 'bitlocker', 'virtio_drivers',
                                      'power_state', 'merge_state', 'source_access',
                                      'automatic_start', 'orderly_shutdown'})
 
@@ -367,13 +367,22 @@ def check_firmware(generation: int | None) -> Finding:
 
 
 def check_secure_boot(secure_boot_enabled: bool | None, generation: int | None) -> Finding:
-    """Secure Boot does not carry across as-is and may stop the guest booting."""
+    """Secure Boot is reproduced on the target, and says how.
+
+    Proxmox ships an OVMF variable store with Microsoft's certificates already enrolled,
+    and the import asks for it whenever the source had Secure Boot on
+    (`efidisk0=...,pre-enrolled-keys=1`). That is the same set of keys the Hyper-V
+    "Microsoft Windows" template holds, so a Windows guest boots with Secure Boot on as it
+    did before. What is NOT carried across is a custom or third-party template, because
+    nothing here can read which certificates it contained.
+    """
     if generation == 1 or not secure_boot_enabled:
         return Finding('secure_boot', OK, 'Secure Boot is not enabled on this VM.')
-    return Finding('secure_boot', WARNING, 'Secure Boot is enabled on the source VM.',
-                   "The Hyper-V Secure Boot template does not transfer to Proxmox. The imported "
-                   'VM gets UEFI without a pre-enrolled template, and a guest that requires '
-                   'Secure Boot may refuse to boot until it is configured on the target.')
+    return Finding('secure_boot', OK, 'Secure Boot is enabled and is reproduced on the target.',
+                   "The imported VM gets a UEFI variable store with Microsoft's keys already "
+                   'enrolled, which is what the standard Hyper-V template holds. A guest that '
+                   'was booting under a custom Secure Boot template will need its own '
+                   'certificates enrolled on the target, because they cannot be read from here.')
 
 
 def check_vtpm(vtpm_enabled: bool | None) -> Finding:
