@@ -31,7 +31,7 @@ from pegaprox.utils.audit import log_audit
 from pegaprox.utils.rbac import user_can_access_vm
 from pegaprox.utils.sanitization import sanitize_log_message as _sl
 from pegaprox.api.helpers import check_cluster_access, caller_is_scoped
-from pegaprox.core import hyperv_preflight
+from pegaprox.core import hyperv_inventory, hyperv_preflight
 from pegaprox.core.hyperv_errors import (
     HyperVError, KIND_AUTHENTICATION, KIND_AUTHORIZATION, KIND_CERTIFICATE,
     KIND_CLIENT_DEPENDENCY, KIND_MISSING_FEATURE, KIND_REFUSED, KIND_TIMEOUT,
@@ -257,6 +257,9 @@ def update_hyperv_host(host_id):
     hyperv_db.save_host(db.conn, db._encrypt, host_id, data)
     register_hyperv_source(host_id, hyperv_db.load_host(db.conn, db._decrypt, host_id),
                            cluster_managers)
+    # A host reached under new settings may be a different host. What the old settings
+    # returned is dropped rather than shown with a fresh timestamp on the next read.
+    hyperv_inventory.invalidate(host_id)
     log_audit(_acting_user(), 'hyperv.host.update',
               f'Updated Hyper-V migration source {_sl(data.get("name") or host_id)}')
     return jsonify({'success': True})
@@ -285,6 +288,7 @@ def delete_hyperv_host(host_id):
             logging.warning('Hyper-V source %s did not stop cleanly', host_id)
 
     hyperv_db.delete_host(db.conn, host_id)
+    hyperv_inventory.invalidate(host_id)
     log_audit(_acting_user(), 'hyperv.host.delete',
               f'Removed Hyper-V migration source {_sl(host_id)}')
     return jsonify({'success': True})
@@ -300,26 +304,29 @@ def get_hyperv_host(cluster_id):
     was renamed or is absent on an older host reads as null instead of raising — and a
     VM would then look like it had no generation and no checkpoints. Naming the missing
     properties here is what turns that into something an operator can see.
+
+    Facts and property report come from the same background read as the VM list, for the
+    same reason: connecting to a host that does not answer costs a full WinRM timeout,
+    and the page that shows this must not spend it before it renders.
     """
     mgr, err = _hyperv_host(cluster_id)
     if err:
         return err
 
-    connected = mgr.is_connected or mgr.connect()
+    hyperv_inventory.request_refresh(cluster_id, mgr, force=_wants_forced_refresh())
+    entry, freshness = hyperv_inventory.answer(cluster_id)
     body = {
         'id': mgr.id,
         'name': mgr.name,
-        'connected': connected,
+        'connected': mgr.is_connected,
         'connection_error': mgr.connection_error,
-        'properties': mgr.property_report,
+        # The report the last read brought back; falling back to the manager's own covers
+        # the window before the first read has finished.
+        'properties': entry.get('properties') or mgr.property_report,
+        **freshness,
     }
-    if not connected:
-        return jsonify(body), 200
-
-    try:
-        body['facts'] = mgr.manager.host_facts()
-    except HyperVError as exc:
-        return _error_response(exc)
+    if entry.get('facts'):
+        body['facts'] = entry['facts']
     return jsonify(body)
 
 
@@ -353,27 +360,43 @@ def list_hyperv_isos(cluster_id):
 # VM reads
 # =============================================================================
 
+def _wants_forced_refresh() -> bool:
+    """Whether the caller asked for the host to be read again rather than recalled.
+
+    A person pressing the refresh button is a reason to spend a minute of a customer's
+    hypervisor; a component re-rendering is not. Only the button sets this.
+    """
+    return str(request.args.get('refresh', '')).lower() in ('1', 'true', 'yes')
+
+
 @bp.route('/api/hyperv/<cluster_id>/vms', methods=['GET'])
 @require_auth(perms=['hyperv.vm.view'])
 def list_hyperv_vms(cluster_id):
-    """Every VM on the host the caller is allowed to see.
+    """Every VM on the host the caller is allowed to see, as last read.
+
+    The answer comes from `hyperv_inventory` and therefore comes back immediately, with
+    the age of what it contains. Reading a host takes tens of seconds, so doing it inside
+    this request meant the view showing the previous host's VMs for that whole time; the
+    read now runs in the background and announces itself over SSE (frame
+    `hyperv_inventory`), and this route is what the client then asks again.
 
     The list is filtered per VM rather than gated only at the host, because reaching a
-    host through a single VM-ACL entry must not hand back the whole inventory.
+    host through a single VM-ACL entry must not hand back the whole inventory. That
+    filter is why the SSE frame carries no VMs: it would have to be repeated there.
     """
     mgr, err = _hyperv_host(cluster_id)
     if err:
         return err
 
-    try:
-        vms = mgr.get_vms()
-    except HyperVError as exc:
-        return _error_response(exc)
-
+    hyperv_inventory.request_refresh(cluster_id, mgr, force=_wants_forced_refresh())
+    # One snapshot for both halves of the answer. The authorization loop below yields
+    # under gevent, so reading the list and its age separately can pair the rows from
+    # before a background read with the timestamp from after it.
+    entry, freshness = hyperv_inventory.answer(cluster_id)
     user = build_authz_user(request.session.get('user', ''), request.session)
-    visible = [vm for vm in vms
+    visible = [vm for vm in (entry.get('vms') or [])
                if user_can_access_vm(user, cluster_id, vm['vmid'], 'vm.view', _GUEST_TYPE)]
-    return jsonify({'vms': visible})
+    return jsonify({'vms': visible, **freshness})
 
 
 @bp.route('/api/hyperv/<cluster_id>/vms/<int:vmid>', methods=['GET'])
@@ -595,6 +618,10 @@ def start_hyperv_vm(cluster_id, vmid):
 
     log_audit(_acting_user(), 'hyperv.vm.start',
               f'Started Hyper-V VM {vmid} on host {_sl(mgr.name)}')
+    # The cached inventory now says this VM is off. A person who just started it is a
+    # reason to spend a read on the host; a re-render is not, which is why this is the
+    # forced variant and the list route's is not.
+    hyperv_inventory.request_refresh(cluster_id, mgr, force=True)
     return jsonify(result)
 
 
@@ -634,6 +661,7 @@ def shutdown_hyperv_vm(cluster_id, vmid):
 
     log_audit(_acting_user(), 'hyperv.vm.shutdown',
               f'Requested guest shutdown of Hyper-V VM {vmid} on host {_sl(mgr.name)}')
+    hyperv_inventory.request_refresh(cluster_id, mgr, force=True)
     return jsonify(result)
 
 

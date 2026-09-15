@@ -24,6 +24,15 @@ from pegaprox.core.hyperv_errors import HyperVError, KIND_AUTHORIZATION
 GUID_1 = '11111111-1111-1111-1111-111111111111'
 GUID_2 = '22222222-2222-2222-2222-222222222222'
 
+
+@pytest.fixture(autouse=True)
+def _forget_the_cached_inventory():
+    """The inventory cache is process-global, and this file shares host ids with others."""
+    from pegaprox.core import hyperv_inventory
+    hyperv_inventory.reset()
+    yield
+    hyperv_inventory.reset()
+
 CONFIG = {'name': 'Hyper-V site A', 'host': 'probe-host.example', 'user': 'probe-account',
           'pass': 'fixture-' + 'not-a-real-credential', 'port': 5986}
 
@@ -38,6 +47,7 @@ class FakeManager:
         self._properties = properties or {'complete': True, 'missing': {}, 'inspected_vm': 'x'}
         self._raises = raises
         self.closed = False
+        self.list_vms_calls = 0
 
     def host_facts(self):
         if self._raises:
@@ -48,6 +58,7 @@ class FakeManager:
         return self._properties
 
     def list_vms(self):
+        self.list_vms_calls += 1
         return self._vms
 
     def get_vm(self, guid):
@@ -156,11 +167,22 @@ class TestTheInventoryOverviewRow:
         assert nodes == {'online': 1, 'offline': 0, 'total': 1}
 
     def test_the_guest_counts_sit_where_every_other_cluster_puts_them(self, db):
+        from pegaprox.core import hyperv_inventory
+
         cluster = _cluster(db, FakeManager(vms=[
             _summary(GUID_1, state='Running'), _summary(GUID_2, 'second', state='Off')]))
+        # The counts come from the cached inventory: this page is opened for an unrelated
+        # cluster and may not spend tens of seconds of a customer's hypervisor on a tally.
+        hyperv_inventory.read_now(cluster.id, cluster)
         guests = cluster.datacenter_status()['guests']
         assert guests['vms'] == {'running': 1, 'stopped': 1, 'total': 2}
         assert guests['containers']['total'] == 0
+
+    def test_a_host_nobody_has_read_counts_nothing_rather_than_reading_it(self, db):
+        manager = FakeManager(vms=[_summary(GUID_1, state='Running')])
+        cluster = _cluster(db, manager)
+        assert cluster.datacenter_status()['guests']['vms']['total'] == 0
+        assert manager.list_vms_calls == 0
 
     def test_a_disconnected_host_counts_its_node_as_offline(self, db):
         cluster = _cluster(db, FakeManager(raises=HyperVError('down', kind='unreachable')))
@@ -280,8 +302,22 @@ class TestTheQuestionsPegaproxAsks:
     def test_get_vm_resources_accepts_the_positional_max_age_callers_pass(self, db):
         # A known trap: callers pass max_age positionally, and a manager without the
         # parameter raises a TypeError far from here.
+        from pegaprox.core import hyperv_inventory
+
         cluster = _cluster(db, FakeManager(vms=[_summary(GUID_1)]))
+        hyperv_inventory.read_now(cluster.id, cluster)
+        assert len(cluster.get_vm_resources(0.0)) == 1
         assert cluster.get_vm_resources(0.0) == cluster.get_vm_resources()
+
+    def test_the_generic_resource_question_never_reaches_the_host(self, db):
+        # Asked of every manager once a second by the SSE broadcast loop. Answering it
+        # from the host was one full WinRM inventory per second per source.
+        manager = FakeManager(vms=[_summary(GUID_1)])
+        cluster = _cluster(db, manager)
+        before = manager.list_vms_calls
+        assert cluster.get_vm_resources() == []
+        assert cluster.datacenter_status()['guests']['vms']['total'] == 0
+        assert manager.list_vms_calls == before
 
     def test_the_config_never_prints_the_password(self, db):
         config = _cluster(db).config
