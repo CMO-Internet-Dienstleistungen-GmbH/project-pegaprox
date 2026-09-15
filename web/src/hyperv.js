@@ -295,6 +295,86 @@
         }
 
         // ───────────────────────────────────────────────
+        // How old what is on screen is
+        // ───────────────────────────────────────────────
+
+        /**
+         * One line saying where the VM list came from and whether it is being replaced.
+         *
+         * PegaProx answers the Hyper-V routes from the inventory it last read, because
+         * reading a full host over WinRM takes tens of seconds and no view may wait that
+         * long. That makes the answer fast and sometimes old, and a table that does not
+         * say which of the two it is, is worse than a slow one: somebody decides to
+         * migrate a VM from rows that describe last quarter of an hour.
+         *
+         * Four states, and each of them is a different sentence:
+         *   nothing known yet, a read running   — an empty table with a reason
+         *   something known, a read running     — the age, and that it is being replaced
+         *   something known, nothing running    — the age alone
+         *   the last read failed                — the age, and why it has not moved
+         */
+        function HyperVFreshness({ state, t }) {
+            if (!state) return null;
+            const say = hvTranslator(t);
+            const spinner = (
+                <span className="w-3 h-3 rounded-full border-2 border-current border-t-transparent
+                                 animate-spin shrink-0 opacity-70" />
+            );
+
+            if (state.error) {
+                return (
+                    <div className="flex items-start gap-2 p-3 rounded-lg border border-amber-500/30
+                                    bg-amber-500/10 text-xs text-amber-200">
+                        <div>
+                            <div>{say('hvInventoryReadFailed',
+                                      'The last read of this host failed. What is shown is the '
+                                      + 'last state it reported:')}{' '}{state.error.message}</div>
+                            {state.error.remedy && (
+                                <div className="mt-0.5 text-amber-200/70">{state.error.remedy}</div>
+                            )}
+                            {state.cached && (
+                                <div className="mt-0.5 text-amber-200/70">
+                                    {hvAsOf(state, say)}
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                );
+            }
+
+            if (!state.cached) {
+                return (
+                    <div className="flex items-center gap-2 p-3 rounded-lg border border-indigo-500/25
+                                    bg-indigo-500/5 text-xs text-indigo-300/90">
+                        {state.refreshing && spinner}
+                        {state.refreshing
+                            ? say('hvInventoryReading',
+                                  'Reading the host. On a host with many VMs this takes a while; '
+                                  + 'the list appears here as soon as it arrives.')
+                            : say('hvInventoryUnknown', 'This host has not been read yet.')}
+                    </div>
+                );
+            }
+
+            return (
+                <div className="flex items-center gap-2 text-[11px] text-gray-500">
+                    {state.refreshing && spinner}
+                    <span>{hvAsOf(state, say)}</span>
+                    {state.refreshing && (
+                        <span>· {say('hvInventoryUpdating', 'reading the host again')}</span>
+                    )}
+                </div>
+            );
+        }
+
+        /** "As of <clock time>", in the viewer's locale. `fetched_at` is epoch seconds. */
+        function hvAsOf(state, say) {
+            const at = Number(state.fetchedAt);
+            if (!at || !isFinite(at)) return say('hvInventoryAsOfUnknown', 'Age unknown');
+            return `${say('hvInventoryAsOf', 'As of')} ${new Date(at * 1000).toLocaleTimeString()}`;
+        }
+
+        // ───────────────────────────────────────────────
         // Registering a host
         // ───────────────────────────────────────────────
 
