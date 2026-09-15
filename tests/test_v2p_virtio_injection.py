@@ -402,3 +402,57 @@ def test_no_storage_driver_registered_is_not_a_success(resolved_node):
 
     assert v2p._inject_virtio_drivers(_Manager(), task) is False
     assert any('no way to reach its disk' in line for line in task.lines)
+
+
+class TestTheHibernationOnlyModeReachesItsOwnWork:
+    """The script that mode generates, read rather than assumed.
+
+    Every other test here monkeypatches `_inject_virtio_drivers` away, so nothing looked
+    at what it builds — and it mounted the driver ISO unconditionally. `$ISO` is empty in
+    this mode, so the run exited 3 with ISO_MOUNT_FAILED before reaching the two lines the
+    mode exists for. Shipped that way it would have been a no-op with a success-shaped log.
+    """
+
+    @staticmethod
+    def _script(clear_hibernation_only):
+        from unittest.mock import MagicMock
+        from pegaprox.core import v2p
+
+        captured = {}
+
+        def node_exec(_mgr, _node, command, timeout=600, **_kw):
+            if 'CLEAN_ONLY=' in command:
+                captured['script'] = command
+            if 'pvesm path' in command:
+                return 0, '/dev/zvol/vmstorage/vm-120-disk-0', ''
+            if 'pvesm status' in command:
+                return 0, 'zfspool', ''
+            return 0, '', ''
+
+        task = MagicMock()
+        task.proxmox_vmid, task.target_node = 120, 'node-a'
+        task.target_storage, task.virtio_iso_path = 'vmstorage', ''
+        task.install_virtio_drivers = not clear_hibernation_only
+        mgr = MagicMock()
+        mgr.host, mgr.api_port = '127.0.0.1', 8006
+        mgr._api_get.return_value = MagicMock(
+            status_code=200, json=lambda: {'data': {'status': 'stopped'}})
+        v2p._inject_virtio_drivers(mgr, task, node_exec=node_exec,
+                                   clear_hibernation_only=clear_hibernation_only)
+        return captured.get('script', '')
+
+    def test_the_iso_mount_is_skipped_without_an_iso(self):
+        script = self._script(True)
+        assert 'CLEAN_ONLY=1' in script
+        assert 'if [ "$CLEAN_ONLY" != 1 ]' in script, \
+            'the ISO mount is unconditional and this mode dies on it'
+
+    def test_it_still_reaches_the_two_lines_it_exists_for(self):
+        script = self._script(True)
+        assert script.index('ntfsfix') < script.index('HIBERNATION_CLEARED')
+        assert script.index('remove_hiberfile') < script.index('HIBERNATION_CLEARED')
+
+    def test_the_driver_path_still_mounts_its_iso(self):
+        script = self._script(False)
+        assert 'CLEAN_ONLY=0' in script
+        assert 'mount -o ro,loop' in script

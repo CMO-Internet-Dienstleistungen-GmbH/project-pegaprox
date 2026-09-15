@@ -2293,7 +2293,12 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
         "  rm -rf \"$TMP\"; "
         "}\n"
         "trap cleanup EXIT\n"
-        "mount -o ro,loop \"$ISO\" \"$ISO_MNT\" || { echo 'ISO_MOUNT_FAILED'; exit 3; }\n"
+        # Fork issue #15 — the hibernation half has no ISO and needs none. Without this
+        # guard it mounts the empty string, exits 3, and never reaches the ntfsfix and
+        # remove_hiberfile two blocks down that are the entire point of that mode.
+        "if [ \"$CLEAN_ONLY\" != 1 ]; then\n"
+        "  mount -o ro,loop \"$ISO\" \"$ISO_MNT\" || { echo 'ISO_MOUNT_FAILED'; exit 3; }\n"
+        "fi\n"
         # ── Expose target disk as a partitioned block device (BLK) ──
         "BLK=\"\"\n"
         "case \"$STYPE\" in\n"
