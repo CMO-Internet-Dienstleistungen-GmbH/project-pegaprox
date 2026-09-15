@@ -8211,6 +8211,21 @@
             const [hypervVms, setHypervVms] = useState([]);
             const [hypervLoading, setHypervLoading] = useState(false);
             const [hypervHostFacts, setHypervHostFacts] = useState(null);
+            // How old what is on screen is, and whether the server is reading the host
+            // right now. The server answers from its own cache, so a response can be
+            // instant and still describe a host as it was ten minutes ago -- saying which
+            // of the two it is, is the whole point of the banner this feeds.
+            const [hypervFreshness, setHypervFreshness] = useState(null);
+            // The host the view is currently asking about. Every Hyper-V response is
+            // checked against it before it is written: a read of a host that takes tens of
+            // seconds can land after the operator has moved on, and writing it then puts
+            // one host's VMs under another host's name.
+            const hypervRequestRef = useRef(null);
+            // For the SSE callback, whose closure predates the current selection.
+            const selectedHyperVRef = useRef(null);
+            // The source the migration wizard's VM picker is currently showing, for the
+            // same callback: its list is filled from the same background read.
+            const xhmSourceClusterRef = useRef(null);
             const [showHypervEdit, setShowHypervEdit] = useState(false);
             const [hypervForm, setHypervForm] = useState({ ...HYPERV_DEFAULT_CONFIG });
             const [hypervSaving, setHypervSaving] = useState(false);
@@ -8674,6 +8689,7 @@
                 selectedClusterRef.current = selectedCluster;
             }, [selectedCluster]);
             
+            useEffect(() => { selectedHyperVRef.current = selectedHyperV; }, [selectedHyperV]);
             useEffect(() => { expandedSidebarClustersRef.current = expandedSidebarClusters; }, [expandedSidebarClusters]);
             useEffect(() => { sidebarClusterDataRef.current = sidebarClusterData; }, [sidebarClusterData]);
             useEffect(() => { selectedVMwareRef.current = selectedVMware; }, [selectedVMware]);
@@ -10729,6 +10745,11 @@
                         // NS: send initial cluster filter so backend doesn't blast all events
                         const activeClusters = new Set();
                         if (selectedClusterRef.current) activeClusters.add(selectedClusterRef.current.id);
+                        // Fork patch #15 — a Hyper-V source is a manager like any other, so
+                        // its inventory frame is scoped to its id. Without it in the
+                        // subscription the frame is delivered to all-access clients only,
+                        // and everyone else falls back to the poll.
+                        if (selectedHyperVRef.current) activeClusters.add(selectedHyperVRef.current.id);
                         Object.entries(expandedSidebarClustersRef.current || {}).forEach(([cid, exp]) => { if (exp) activeClusters.add(cid); });
                         if (activeClusters.size > 0) sseUrl += `&clusters=${[...activeClusters].join(',')}`;
                     } else {
@@ -11078,6 +11099,30 @@
                                     if (xhmSelectedMigrationRef.current === m.id) {
                                         setXhmMigrationDetail(prev => prev ? {...prev, ...m} : m);
                                     }
+                                }
+                            } else if (data.type === 'hyperv_inventory') {
+                                // Fork patch #15 — the server finished reading a Hyper-V host
+                                // in the background. The frame deliberately carries no VMs:
+                                // the REST route filters that list per VM for the account
+                                // asking, and repeating the decision here would be a second
+                                // copy of an access-control rule. So this asks the route
+                                // again, which is now a cache hit and returns at once.
+                                //
+                                // Last in the chain on purpose. Every fork patch that adds a
+                                // frame type inserts an `else if`, and two of them landing on
+                                // the same line is a conflict at every release rebuild for a
+                                // change that has nothing to do with either. The order of
+                                // these branches is irrelevant — they test distinct values.
+                                const hvHostId = data.data?.host_id || data.cluster_id;
+                                if (!hvHostId) return;
+                                if (selectedHyperVRef.current?.id === hvHostId) {
+                                    fetchHypervVms(hvHostId);
+                                    fetchHypervHostFacts(hvHostId);
+                                }
+                                // The migration wizard's source picker is filled from the
+                                // same read, and it is open without the host being selected.
+                                if (xhmSourceClusterRef.current === hvHostId) {
+                                    fetchXhmSourceVms(hvHostId, true);
                                 }
                             } else if (data.type === 'xhm_migration_log') {
                                 const m = data.data;
@@ -11879,21 +11924,44 @@
                 } catch (e) { console.warn('Hyper-V host fetch error:', e); }
             };
 
-            /** The VMs on one host, over the Hyper-V route rather than the cluster one. */
-            const fetchHypervVms = async (hostId) => {
+            /**
+             * The VMs on one host, over the Hyper-V route rather than the cluster one.
+             *
+             * The server answers from the inventory it last read, so this returns at once
+             * and says how old that answer is. `force` is the refresh button: it is what
+             * asks a customer's hypervisor to be read again, and nothing that merely
+             * renders may set it.
+             */
+            const fetchHypervVms = async (hostId, { force = false } = {}) => {
                 setHypervLoading(true);
                 try {
-                    const resp = await authFetch(`${API_URL}/hyperv/${hostId}/vms`);
-                    if (resp && resp.ok) {
-                        const data = await resp.json();
-                        setHypervVms(data.vms || []);
-                    } else {
-                        setHypervVms([]);
+                    const resp = await authFetch(
+                        `${API_URL}/hyperv/${hostId}/vms${force ? '?refresh=1' : ''}`);
+                    const data = resp && resp.ok ? await resp.json() : null;
+                    // The selection moved on while this was in flight. The answer is about
+                    // a host nobody is looking at any more, and writing it is the stale
+                    // data this whole path exists to remove.
+                    if (hypervRequestRef.current !== hostId) return;
+                    // A request that did not come back says nothing about the host. Keeping
+                    // what is on screen -- including the banner and the "a read is running"
+                    // flag the poll depends on -- is the difference between one proxy hiccup
+                    // and a view that claims for good that the host has no VMs.
+                    if (!data) {
+                        console.warn('Hyper-V VM list request failed, keeping what is shown');
+                        return;
                     }
+                    setHypervVms(data.vms || []);
+                    setHypervFreshness({
+                        cached: !!data.cached,
+                        fetchedAt: data.fetched_at || null,
+                        ageSeconds: data.age_seconds,
+                        refreshing: !!data.refreshing,
+                        error: data.refresh_error || null,
+                    });
                 } catch (e) {
-                    setHypervVms([]);
+                    console.warn('Hyper-V VM list request failed:', e);
                 } finally {
-                    setHypervLoading(false);
+                    if (hypervRequestRef.current === hostId) setHypervLoading(false);
                 }
             };
 
@@ -11901,8 +11969,12 @@
             const fetchHypervHostFacts = async (hostId) => {
                 try {
                     const resp = await authFetch(`${API_URL}/hyperv/${hostId}/host`);
-                    setHypervHostFacts(resp && resp.ok ? await resp.json() : null);
-                } catch (e) { setHypervHostFacts(null); }
+                    const body = resp && resp.ok ? await resp.json() : null;
+                    if (hypervRequestRef.current !== hostId || !body) return;
+                    setHypervHostFacts(body);
+                } catch (e) {
+                    console.warn('Hyper-V host facts request failed:', e);
+                }
             };
 
             /**
@@ -12039,17 +12111,43 @@
                 return () => clearInterval(hvInterval);
             }, []);
 
-            // Read the selected host once. No interval: the VM list is what the operator
-            // asked for, and the refresh button is how they ask again.
+            // Read the selected host once. No standing interval: the VM list is what the
+            // operator asked for, and the refresh button is how they ask again.
+            //
+            // The clearing is not tidiness. Everything below belongs to the host that was
+            // selected a moment ago, and leaving it up while the next host is fetched shows
+            // one host's VMs, generations and memory figures under another host's name --
+            // for as long as the answer takes, which against Hyper-V is tens of seconds.
             useEffect(() => {
-                if (selectedHyperV?.id) {
-                    fetchHypervVms(selectedHyperV.id);
-                    fetchHypervHostFacts(selectedHyperV.id);
-                } else {
-                    setHypervVms([]);
-                    setHypervHostFacts(null);
+                const hostId = selectedHyperV?.id || null;
+                hypervRequestRef.current = hostId;
+                setHypervVms([]);
+                setHypervHostFacts(null);
+                setHypervFreshness(null);
+                if (!hostId) {
+                    setHypervLoading(false);
+                    return;
                 }
+                fetchHypervVms(hostId);
+                fetchHypervHostFacts(hostId);
             }, [selectedHyperV?.id]);
+
+            // While the server is reading the host, ask again every few seconds.
+            //
+            // The `hyperv_inventory` SSE frame is what normally ends the wait; this covers
+            // the cases where it cannot arrive -- a subscription that does not include this
+            // host, a proxy that drops the stream, SSE unavailable entirely. It only ever reads
+            // the server's cache: without `refresh` no request starts a read, so a poll
+            // that runs longer than expected costs the Hyper-V host nothing.
+            useEffect(() => {
+                const hostId = selectedHyperV?.id;
+                if (!hostId || !hypervFreshness?.refreshing) return;
+                const id = setInterval(() => {
+                    fetchHypervVms(hostId);
+                    fetchHypervHostFacts(hostId);
+                }, 5000);
+                return () => clearInterval(id);
+            }, [selectedHyperV?.id, hypervFreshness?.refreshing]);
             
             // Watch VM detail via SSE (replaces 10s polling)
             useEffect(() => {
@@ -12415,20 +12513,36 @@
                 } catch(e) { addToast('Error', e.message, 'error'); }
                 finally { setXhmLoading(false); }
             };
+            // Fork patch #15 — a Hyper-V source answers `/clusters/<id>/resources` from its
+            // cached inventory and never reads the host for it, because that route is asked
+            // of every manager once a second by the SSE broadcast loop. So the picker asks
+            // the Hyper-V route instead: it is one of the two that may start a read, which
+            // is what fills this list on a host nobody has opened yet.
+            // `hyperv` is passed rather than derived, so the SSE callback -- whose closure
+            // predates the loaded cluster list -- cannot mis-route the request.
+            const fetchXhmSourceVms = useCallback(async (cid, hyperv) => {
+                try {
+                    const resp = await authFetch(
+                        `${API_URL}/${hyperv ? `hyperv/${cid}/vms` : `clusters/${cid}/resources`}`);
+                    if (!resp?.ok) return;
+                    const data = await resp.json();
+                    const rows = hyperv ? (data.vms || [])
+                        : (Array.isArray(data) ? data : data.data || []);
+                    setXhmSourceVms(rows.filter(
+                        r => r.type === 'qemu' || r.vmtype === 'qemu' || r.type === 'vm'));
+                } catch (e) {}
+            }, [authFetch]);
+
             // fetch source VMs when source cluster changes
             useEffect(() => {
                 if (!xhmForm.source_cluster) { setXhmSourceVms([]); return; }
                 const cid = xhmForm.source_cluster;
+                // The previous source's VMs are not this source's. Same reason as the host
+                // view: a picker that keeps them offers a VM that is not on the chosen host.
+                setXhmSourceVms([]);
+                xhmSourceClusterRef.current = cid;
                 (async () => {
-                    try {
-                        const resp = await authFetch(`${API_URL}/clusters/${cid}/resources`);
-                        if (resp?.ok) {
-                            const data = await resp.json();
-                            const vms = (Array.isArray(data) ? data : data.data || [])
-                                .filter(r => r.type === 'qemu' || r.vmtype === 'qemu' || r.type === 'vm');
-                            setXhmSourceVms(vms);
-                        }
-                    } catch(e) {}
+                    await fetchXhmSourceVms(cid, hvType(clusters.find(c => c.id === cid)) === 'hyperv');
                     // also ensure metrics are loaded for node dropdown
                     if (!sidebarClusterData[cid]?.metrics && cid !== selectedCluster?.id) {
                         fetchSidebarClusterData(cid);
@@ -12930,13 +13044,15 @@
             // NS: Mar 2026 - update SSE subscription when sidebar clusters change
             // 300ms debounce to batch rapid toggles
             const sseSubTimer = useRef(null);
-            const updateSseSubscription = useCallback((expanded, selCluster) => {
+            const updateSseSubscription = useCallback((expanded, selCluster, selHyperV) => {
                 if (sseSubTimer.current) clearTimeout(sseSubTimer.current);
                 sseSubTimer.current = setTimeout(() => {
                     const cid = sseClientIdRef.current;
                     if (!cid) return;
                     const active = new Set();
                     if (selCluster?.id) active.add(selCluster.id);
+                    // Fork patch #15 — see the connect path above.
+                    if (selHyperV?.id) active.add(selHyperV.id);
                     Object.entries(expanded || {}).forEach(([k, v]) => { if (v) active.add(k); });
                     const clusters = active.size > 0 ? [...active] : null;
                     authFetch(`${API_URL}/sse/subscribe`, {
@@ -12948,8 +13064,8 @@
             }, []);
             useEffect(() => {
                 if (!sseClientIdRef.current) return;
-                updateSseSubscription(expandedSidebarClusters, selectedCluster);
-            }, [expandedSidebarClusters, selectedCluster?.id]);
+                updateSseSubscription(expandedSidebarClusters, selectedCluster, selectedHyperV);
+            }, [expandedSidebarClusters, selectedCluster?.id, selectedHyperV?.id]);
 
             const fetchMigrationLogs = async (clusterId) => {
                 try {
@@ -22414,8 +22530,11 @@
                                                         </button>
                                                     </>
                                                 )}
-                                                <button onClick={() => { fetchHypervVms(selectedHyperV.id); fetchHypervHostFacts(selectedHyperV.id); }} title={t('refresh') || 'Refresh'} className={isCorporate ? '' : 'px-3 py-2 rounded-lg bg-proxmox-card border border-proxmox-border text-gray-400 hover:text-white text-sm'}>
-                                                    <Icons.RefreshCw className={`w-4 h-4 ${hypervLoading ? 'animate-spin' : ''}`} />
+                                                {/* The only caller that passes `force`. Everything else reads
+                                                    what the server already has; this is a person deciding a
+                                                    minute of a customer's hypervisor is worth spending. */}
+                                                <button onClick={() => { fetchHypervVms(selectedHyperV.id, { force: true }); fetchHypervHostFacts(selectedHyperV.id); }} title={t('refresh') || 'Refresh'} className={isCorporate ? '' : 'px-3 py-2 rounded-lg bg-proxmox-card border border-proxmox-border text-gray-400 hover:text-white text-sm'}>
+                                                    <Icons.RefreshCw className={`w-4 h-4 ${(hypervLoading || hypervFreshness?.refreshing) ? 'animate-spin' : ''}`} />
                                                 </button>
                                             </div>
                                         </div>
@@ -22459,6 +22578,8 @@
                                                 </div>
                                             )}
 
+                                            <HyperVFreshness state={hypervFreshness} t={t} />
+
                                             <div className="rounded-xl bg-proxmox-card border border-proxmox-border overflow-hidden">
                                                 <div className="px-4 py-3 border-b border-proxmox-border text-sm font-medium text-gray-300">
                                                     {t('vms') || 'VMs'}
@@ -22500,7 +22621,13 @@
                                                             {hypervVms.length === 0 && (
                                                                 <tr>
                                                                     <td colSpan="6" className="px-4 py-8 text-center text-gray-600 text-sm">
-                                                                        {hypervLoading ? (t('loading') || 'Loading...') : (t('hvNoVms') || 'No VMs on this host')}
+                                                                        {/* An empty table has two meanings now, and the banner above
+                                                                            carries the first one. Saying "no VMs" while the host is
+                                                                            still being read is the same lie as leaving the previous
+                                                                            host's rows up. */}
+                                                                        {(hypervLoading || hypervFreshness?.refreshing)
+                                                                            ? (t('loading') || 'Loading...')
+                                                                            : (t('hvNoVms') || 'No VMs on this host')}
                                                                     </td>
                                                                 </tr>
                                                             )}
