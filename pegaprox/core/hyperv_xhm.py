@@ -1231,6 +1231,43 @@ def _is_unset_mac(mac: str) -> bool:
     return not set(mac.replace(':', '').replace('-', '')) - {'0'}
 
 
+def _clear_hibernation(task, target, new_vmid):
+    """Drop a Fast Startup hibernation file from the imported disk, and say so.
+
+    Only for the import that installs no drivers; the driver injection does the same thing
+    on its way in. Never fails the run: a guest that cannot be prepared this way is still a
+    guest whose disks were copied correctly, and the operator is told rather than having
+    the migration discarded underneath them.
+    """
+    from pegaprox.core import v2p
+
+    class _CleanView:
+        """The handful of attributes the hibernation half reads. Deliberately not the
+        injection's own view: that one carries driver bookkeeping this run has no use for,
+        and sharing it would suggest drivers are somewhere in play."""
+
+        install_virtio_drivers = False
+        virtio_iso_path = ''
+
+        def __init__(self, inner, vmid):
+            self.proxmox_vmid = vmid
+            self.target_node = inner.target_node
+            self.target_storage = inner.target_storage
+            self.config = inner.config or {}
+            self._inner = inner
+
+        def log(self, message):
+            self._inner.log(str(message))
+
+    try:
+        with _node_session(task, target) as run_on_node:
+            v2p._inject_virtio_drivers(target, _CleanView(task, new_vmid),
+                                       node_exec=run_on_node,
+                                       clear_hibernation_only=True)
+    except Exception as exc:                                   # noqa: BLE001
+        task.log(f'Could not check the imported disk for a hibernation file: {exc}')
+
+
 def _inject_drivers_if_asked(task, target, new_vmid, volumes, detail):
     """Run the product's own offline driver injection on the freshly imported disk.
 
@@ -1246,10 +1283,18 @@ def _inject_drivers_if_asked(task, target, new_vmid, volumes, detail):
 
     Returns None when there is nothing to report, or a line for the log.
     """
-    if target_hardware(task.config)['hardware'] != 'virtio':
-        return None
-
     from pegaprox.core import v2p
+
+    if target_hardware(task.config)['hardware'] != 'virtio':
+        # No drivers wanted — but the disk still has to be made bootable on a platform the
+        # guest was not shut down on. A guest that shut down with Fast Startup left a saved
+        # kernel session behind, and resuming it against a different chipset, timer and
+        # controller is not something Windows supports. The compatible controller does not
+        # change that: it decides whether the loader can READ the disk, not what the
+        # resumed kernel then finds attached to it. Clearing the file costs a cold boot and
+        # nothing else. Measured in tests/hyperv_testbed/verify_hibernation_clear.sh.
+        _clear_hibernation(task, target, new_vmid)
+        return None
 
     class _InjectionView:
         """What v2p's injection reads, filled from a Hyper-V migration."""
@@ -1592,7 +1637,21 @@ def _attach_disks(task, target, new_vmid, volumes, detail):
     if GENERATION_BIOS.get(detail.get('generation')) == 'ovmf':
         # A Generation 2 guest boots UEFI and needs somewhere to keep its variables. Without
         # this the VM starts into the firmware shell and looks like a failed conversion.
-        extra['efidisk0'] = f'{task.target_storage}:1,efitype=4m,pre-enrolled-keys=0'
+        #
+        # The keys follow the source. Proxmox ships an OVMF variable store with Microsoft's
+        # certificates already enrolled, which is exactly what a guest that booted under
+        # Hyper-V's "Microsoft Windows" Secure Boot template needs; handing such a guest an
+        # empty store means Secure Boot is simply off on the target, and anything measuring
+        # it -- a policy, an attestation, BitLocker's own checks -- sees a different machine.
+        # A guest that had Secure Boot OFF must NOT get them: its bootloader or a driver may
+        # be unsigned, and enrolling keys would stop it booting at all. So this is read from
+        # the source rather than chosen (fork issue #15).
+        pre_enrolled = 1 if detail.get('secure_boot_enabled') else 0
+        extra['efidisk0'] = (f'{task.target_storage}:1,efitype=4m,'
+                             f'pre-enrolled-keys={pre_enrolled}')
+        task.log('UEFI variable store created '
+                 + ('with Microsoft keys pre-enrolled, because the source had Secure Boot on'
+                    if pre_enrolled else 'without pre-enrolled keys, as on the source'))
     if extra:
         try:
             response = target._api_post(

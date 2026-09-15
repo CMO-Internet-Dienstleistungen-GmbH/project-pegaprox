@@ -2121,7 +2121,7 @@ def _detect_windows_driver_subdir(version_str, build_str):
     return 'w11/amd64'
 
 
-def _inject_virtio_drivers(pve_mgr, task, node_exec=None):
+def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only=False):
     """Offline-inject VirtIO drivers into the boot disk's Windows install.
 
     Touches only the first attached disk (assumed boot). Returns True on success.
@@ -2135,8 +2135,16 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None):
     A caller that already holds a working connection passes it here rather than leaving
     the injection to fail silently. Default unchanged, so the VMware direction is
     untouched.
+
+    `clear_hibernation_only` runs the first half alone: resolve the disk, find the Windows
+    volume, ntfsfix it and mount with `remove_hiberfile`, then stop. That is what clears a
+    Fast Startup hybrid shutdown, and it is needed on any import that changes the platform
+    under the guest — not only on one that also installs drivers. Without it a guest that
+    shut down hybrid resumes its saved kernel session on hardware that is not the hardware
+    it was saved on. The driver half needs virtio-win.iso and hivex; this half needs
+    neither, so both are skipped for it. (Fork issue #15.)
     """
-    if not getattr(task, 'install_virtio_drivers', False):
+    if not clear_hibernation_only and not getattr(task, 'install_virtio_drivers', False):
         return False
     run_on_node = node_exec or _pve_node_exec
 
@@ -2163,28 +2171,33 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None):
     # libhivex-bin for hivexsh, which the version probe below shells out to.
     # ceph-common (for `rbd map`) only installed on-demand inside the script
     # when STYPE=rbd, since most clusters don't use Ceph.
-    #
-    # MK Sep 2026 — this list used to carry qemu-utils and the probe used to require
-    # qemu-nbd. On PVE that package conflicts with pve-qemu-kvm, so apt proposes to
-    # remove it and takes proxmox-ve with it; pve-apt-hook aborts the whole run, which
-    # is the only reason nodes survived this and also why python3-hivex and ntfs-3g
-    # never got installed either. The #520 preflight 1700 lines up already tells
-    # operators not to do exactly this — that fix never reached this call site. PVE
-    # ships qemu-nbd via pve-qemu-kvm anyway, and the one branch that needs it checks
-    # for it itself (file-based storage, below), so neither belongs here.
-    #
-    # hivexsh went the other way: used, never installed, and its failure swallowed by
-    # 2>/dev/null — so VER_BUILD came back empty, the build table matched nothing and
-    # every guest silently got the w11 driver variant with INJECTION_OK on top.
-    rc, _, _ = run_on_node(pve_mgr, node,
-        "python3 -c 'import hivex' 2>/dev/null && command -v ntfs-3g >/dev/null "
-        "&& command -v ntfsfix >/dev/null",
-        timeout=10)
+    # qemu-nbd is deliberately absent from both the probe and the install list.
+    # On PVE it ships with pve-qemu-kvm; the package that would carry it on plain
+    # Debian is qemu-utils, and that one conflicts with pve-qemu-kvm — apt answers
+    # the conflict by offering to remove proxmox-ve, pve-apt-hook aborts the whole
+    # run, and python3-hivex and ntfs-3g are then not installed either. Measured on
+    # PVE 9.2: the injection reported `apt install failed` with an empty message and
+    # the node was one confirmation away from losing proxmox-ve. The same reasoning
+    # already stands in the qemu-img preflight above (#520). qemu-nbd is needed for
+    # file-based storages only, and the script reports it missing where it needs it.
+    # hivexsh comes from libhivex-bin. The script below reads the guest's Windows
+    # version with it, and a node without it does not fail -- VER_NAME and VER_BUILD
+    # come back empty, the build table finds no match, and every guest is treated as
+    # the w11/amd64 default. Measured on a Windows Server 2022 guest: build 20348 with
+    # hivexsh present, nothing without it, so the drivers copied in were the wrong
+    # variant while the log said the injection had succeeded.
+    _probe = ("command -v ntfs-3g >/dev/null && command -v ntfsfix >/dev/null"
+              if clear_hibernation_only else
+              "python3 -c 'import hivex' 2>/dev/null && command -v ntfs-3g >/dev/null "
+              "&& command -v ntfsfix >/dev/null")
+    _packages = ('ntfs-3g' if clear_hibernation_only
+                 else 'python3-hivex ntfs-3g libhivex-bin')
+    rc, _, _ = run_on_node(pve_mgr, node, _probe, timeout=10)
     if rc != 0:
-        task.log("[VirtIO] Installing python3-hivex / ntfs-3g / libhivex-bin (one-time)...")
+        task.log(f"[VirtIO] Installing {_packages} (one-time)...")
         rc_apt, out_apt, _ = run_on_node(pve_mgr, node,
             "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "
-            "python3-hivex ntfs-3g libhivex-bin 2>&1 | tail -25",
+            f"{_packages} 2>&1 | tail -25",
             timeout=180)
         if rc_apt != 0:
             # tail -5 used to cut the reason off — an apt refusal on PVE is several
@@ -2193,24 +2206,28 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None):
             task.log(f"[VirtIO] ✗ apt install failed: {str(out_apt or '').strip()[-600:]}")
             return False
 
-    # hivexsh is checked separately and is NOT fatal. It only feeds the version probe,
-    # and the script falls back to a driver variant without it — which for a Windows 11
-    # guest is even the right one. Making it a hard requirement would abort migrations
-    # on air-gapped nodes that worked before. Try to fetch it, then let the script say
-    # NO_HIVEXSH and pick a fallback if it is still missing.
-    rc_hv, _, _ = run_on_node(pve_mgr, node, "command -v hivexsh >/dev/null", timeout=10)
-    if rc_hv != 0:
-        task.log("[VirtIO] hivexsh missing — installing libhivex-bin for the version probe...")
-        rc_hv2, out_hv, _ = run_on_node(pve_mgr, node,
-            "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "
-            "libhivex-bin 2>&1 | tail -25",
-            timeout=180)
-        if rc_hv2 != 0:
-            task.log("[VirtIO] ! libhivex-bin not installed — the guest's Windows build "
-                     "can't be read, so the driver variant is a guess: "
-                     f"{str(out_hv or '').strip()[-300:]}")
+    # hivexsh is checked separately and is NOT fatal, and skipped entirely to clear a
+    # hibernation file — that path never reads the guest's Windows version. It only
+    # feeds the version probe otherwise, and the script falls back to a driver variant
+    # without it — which for a Windows 11 guest is even the right one. Making it a hard
+    # requirement would abort migrations on air-gapped nodes that worked before. Try to
+    # fetch it, then let the script say NO_HIVEXSH and pick a fallback if still missing.
+    if not clear_hibernation_only:
+        rc_hv, _, _ = run_on_node(pve_mgr, node, "command -v hivexsh >/dev/null", timeout=10)
+        if rc_hv != 0:
+            task.log("[VirtIO] hivexsh missing — installing libhivex-bin for the version probe...")
+            rc_hv2, out_hv, _ = run_on_node(pve_mgr, node,
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "
+                "libhivex-bin 2>&1 | tail -25",
+                timeout=180)
+            if rc_hv2 != 0:
+                task.log("[VirtIO] ! libhivex-bin not installed — the guest's Windows build "
+                         "can't be read, so the driver variant is a guess: "
+                         f"{str(out_hv or '').strip()[-300:]}")
 
-    # 2) Locate ISO. User-set path wins.
+    # 2) Locate ISO. User-set path wins. Not needed to clear a hibernation file, and a
+    # node without the ISO must not fail that.
+    iso_path = ''
     iso_candidates = []
     if getattr(task, 'virtio_iso_path', ''):
         iso_candidates.append(task.virtio_iso_path)
@@ -2219,17 +2236,17 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None):
         f"/mnt/pve/{task.target_storage}/template/iso/virtio-win.iso",
         "/var/lib/pegaprox/virtio-win.iso",
     ]
-    iso_path = None
-    for p in iso_candidates:
+    for p in ([] if clear_hibernation_only else iso_candidates):
         rc, _, _ = run_on_node(pve_mgr, node, f"test -f {shlex.quote(p)}", timeout=5)
         if rc == 0:
             iso_path = p
             break
-    if not iso_path:
+    if not iso_path and not clear_hibernation_only:
         task.log("[VirtIO] ⚠ virtio-win.iso not found — skipping. Searched: " + ", ".join(iso_candidates))
         task.log("[VirtIO]   Hint: drop virtio-win.iso into /var/lib/vz/template/iso/ or set virtio_iso_path")
         return False
-    task.log(f"[VirtIO] ISO: {iso_path}")
+    task.log(f"[VirtIO] ISO: {iso_path}" if iso_path
+             else "[VirtIO] Clearing a Fast Startup hibernation file; no ISO needed.")
 
     # 3) Build a single shell script — easier to follow + we get one rc back.
     # NS Apr 2026 — storage-type-aware: lvm/iSCSI/zfs are already block devices,
@@ -2258,6 +2275,9 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None):
         f"STYPE={shlex.quote(storage_type)}\n"
         f"ISO={shlex.quote(iso_path)}\n"
         f"DRIVERS=\"{drivers_arg}\"\n"
+        # Fork issue #15 — 1 stops after the Windows volume is mounted, which is all that
+        # is needed to clear a Fast Startup hibernation file.
+        f"CLEAN_ONLY={1 if clear_hibernation_only else 0}\n"
         "TMP=$(mktemp -d /tmp/v2p-virtio-XXXXXX)\n"
         "ISO_MNT=\"$TMP/iso\"; WIN_MNT=\"$TMP/win\"; mkdir -p \"$ISO_MNT\" \"$WIN_MNT\"\n"
         "LOOP=\"\"; NBD=\"\"; RBD=\"\"\n"
@@ -2342,11 +2362,21 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None):
         # ntfsfix clears the journal + dirty bit so ntfs-3g will RW-mount.
         # Safe here: VM is offline, Windows recovers on next boot anyway.
         "ntfsfix \"$WIN_PART\" >/tmp/ntfsfix.log 2>&1 || echo \"ntfsfix exit=$?\"\n"
+        # Fork issue #15 — ntfsfix names hibernation explicitly ("Windows is hibernated,
+        # refused to mount"), and the mount below then silently discards it. A saved kernel
+        # session is a guest's state; throwing it away is right here, but doing it without
+        # telling anybody is not.
+        "grep -qi 'hibernated' /tmp/ntfsfix.log && echo 'GUEST_WAS_HIBERNATED'\n"
         "mount -t ntfs-3g -o rw,recover,remove_hiberfile \"$WIN_PART\" \"$WIN_MNT\" || "
         "{ echo 'NTFS_MOUNT_FAILED'; cat /tmp/ntfsfix.log; exit 6; }\n"
         # Sanity check that we actually got RW
         "touch \"$WIN_MNT/.pegaprox-rw-test\" 2>/dev/null && rm -f \"$WIN_MNT/.pegaprox-rw-test\" || "
         "{ echo 'NTFS_NOT_RW'; exit 6; }\n"
+        # Fork issue #15 — the hibernation half stops here. The mount above carried
+        # `remove_hiberfile`, so by this line the saved kernel session is already gone and
+        # the guest will boot cold on whatever hardware it now has. The trap unwinds the
+        # mount and the loop device on the way out.
+        "[ \"$CLEAN_ONLY\" = 1 ] && { echo 'HIBERNATION_CLEARED'; exit 0; }\n"
         # Find Windows directory (case-sensitive on ntfs-3g)
         "WDIR=\"\"; for d in Windows WINDOWS windows; do "
         "[ -d \"$WIN_MNT/$d/System32/config\" ] && { WDIR=\"$d\"; break; }; "
@@ -2758,6 +2788,12 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None):
                 if marker not in _multi:
                     break
 
+    if 'GUEST_WAS_HIBERNATED' in out_str:
+        task.log('[VirtIO] The guest was hibernated or had shut down with Fast Startup. '
+                 'Its saved session has been discarded, so it will boot cold on the target '
+                 '— which is the only way it can come up on hardware it was not saved on. '
+                 'Anything that was open in that session is gone.')
+
     #: The caller needs to tell this apart from any other failure: the files are staged and
     #: correct, and the remedy is a different driver release rather than a retry.
     unsignable = sorted({line.strip().split()[-1] for line in out_str.splitlines()
@@ -2788,6 +2824,13 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None):
         task.log("[VirtIO] ✗ Neither storage driver was registered, so the VM has no way to "
                  "reach its disk on VirtIO hardware. The driver ISO has no usable variant "
                  "for this guest's Windows version.")
+        return False
+
+    if clear_hibernation_only:
+        if rc == 0 and 'HIBERNATION_CLEARED' in out_str:
+            task.log('[VirtIO] ✓ Windows volume prepared; no drivers were installed.')
+            return True
+        task.log(f"[VirtIO] ✗ Could not prepare the Windows volume: rc={rc} {out_str[-300:]}")
         return False
 
     if rc == 0 and 'INJECTION_OK' in out_str:
