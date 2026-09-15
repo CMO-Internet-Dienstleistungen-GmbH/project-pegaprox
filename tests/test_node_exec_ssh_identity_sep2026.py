@@ -133,3 +133,50 @@ def test_a_command_that_is_merely_denied_does_not_mark_the_node_dead(monkeypatch
     mgr = _Mgr()
     ssh_mod._pve_node_exec(mgr, 'n1', 'true')
     assert mgr.failures == [], f"{err!r} wrongly marked the node unreachable"
+
+
+def test_an_api_token_cluster_with_an_ssh_key_is_still_never_offered_the_secret(monkeypatch):
+    """The hole the first round left open. ssh_diagnose answers "no credentials" only
+    when there is neither a key nor a usable password, so key + API token comes back
+    clean — but _ssh_exec cannot use a key, so config.pass_ (the TOKEN SECRET) went to
+    sshd in its place, through every auth method it owns, on every screendump poll."""
+    called = []
+    monkeypatch.setattr(ssh_mod, '_ssh_exec',
+                        lambda *a, **k: called.append(1) or (0, 'ok', ''))
+    mgr = _Mgr(ssh_key='-----BEGIN OPENSSH PRIVATE KEY-----', pass_='pve-token-secret')
+    mgr._using_api_token = True
+    rc, out, err = ssh_mod._pve_node_exec(mgr, 'n1', 'true')
+    assert rc == 1
+    assert not called, "handed the API token secret to sshd as a password"
+    assert 'password' in err.lower()
+
+
+def test_a_key_only_cluster_is_not_attempted_either(monkeypatch):
+    """Same shape without the token: a key is stored, no password. This path is
+    password-only, so trying is a guaranteed-failed root login, not a fallback."""
+    called = []
+    monkeypatch.setattr(ssh_mod, '_ssh_exec',
+                        lambda *a, **k: called.append(1) or (0, 'ok', ''))
+    mgr = _Mgr(ssh_key='-----BEGIN OPENSSH PRIVATE KEY-----', pass_='')
+    rc, out, err = ssh_mod._pve_node_exec(mgr, 'n1', 'true')
+    assert rc == 1 and not called
+
+
+def test_a_real_password_still_goes_through_even_with_a_key_present(monkeypatch):
+    """The guard must not turn into "a key is stored, so give up" — a cluster with both
+    still authenticates by password here, and that is the normal case."""
+    seen = {}
+    monkeypatch.setattr(ssh_mod, '_ssh_exec',
+                        lambda host, user, pwd, cmd, **k: seen.update(pwd=pwd) or (0, 'ok', ''))
+    mgr = _Mgr(ssh_key='-----BEGIN OPENSSH PRIVATE KEY-----', pass_='realpw')
+    rc, out, err = ssh_mod._pve_node_exec(mgr, 'n1', 'true')
+    assert rc == 0 and seen['pwd'] == 'realpw'
+
+
+def test_the_secret_never_reaches_the_error_text(monkeypatch):
+    """Whatever we refuse to send must not leak into a message the UI renders."""
+    monkeypatch.setattr(ssh_mod, '_ssh_exec', lambda *a, **k: (0, 'ok', ''))
+    mgr = _Mgr(ssh_key='k', pass_='pve-token-secret')
+    mgr._using_api_token = True
+    _, _, err = ssh_mod._pve_node_exec(mgr, 'n1', 'true')
+    assert 'pve-token-secret' not in err
