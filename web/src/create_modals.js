@@ -1932,6 +1932,25 @@
         // Add Cluster Modal
         // LW: Wizard for adding new Proxmox clusters
         // Defaults are pretty sensible, most users just need host + credentials
+        // What an empty form holds. Named, because "open fresh" and "create" have to agree
+        // on it: when they were two inline literals, only one of them existed and the
+        // dialog opened with the previous host's data in it.
+        const PROXMOX_DEFAULT_CONFIG = {
+            name: '', host: '', api_port: 8006, node_ui_suffix: '', user: 'root@pam', pass: '',
+            ssl_verification: false, migration_threshold: 20, migration_tolerance: 10, check_interval: 300,
+            auto_migrate: false, balance_containers: false, balance_local_disks: false,
+            dry_run: false, ssh_key: '',
+            predictive_balancing: false, predictive_threshold: 75,
+            balance_cpu_weight: 1.0, balance_mem_weight: 1.0, balance_io_weight: 0.0,
+            cpu_baseline: null,
+        };
+
+        const XCPNG_DEFAULT_CONFIG = {
+            name: '', host: '', user: 'root', pass: '',
+            ssl_verification: false, migration_threshold: 20, check_interval: 300,
+            auto_migrate: false, dry_run: false, cluster_type: 'xcpng',
+        };
+
         function AddClusterModal({ isOpen, onClose, onSubmit, onAddPBS, onAddVMware, loading, error, initialType = 'proxmox', reconfigureConfig = null }) {
             const { t } = useTranslation();
             const { isCorporate } = useLayout();
@@ -1940,6 +1959,19 @@
             // Sync with initialType when modal opens with different type
             useEffect(() => {
                 if (isOpen) setConnectionType(initialType);
+                // Fork patch #15 — a form that opens fresh opens EMPTY.
+                //
+                // This dialog stays mounted; `isOpen` only hides it. Nothing reset the
+                // fields, so whatever was typed last time was still in them the next time
+                // it opened — and after a Re-configure that is another host's name, address
+                // and account, one Save away from being registered a second time. Reset
+                // first, then let the reconfigure branch below fill what it means to fill.
+                if (isOpen && !reconfigureConfig) {
+                    setConfig({ ...PROXMOX_DEFAULT_CONFIG });
+                    setXcpConfig({ ...XCPNG_DEFAULT_CONFIG });
+                    setHyperVConfig({ ...HYPERV_DEFAULT_CONFIG });
+                    setShowSshSettings(false);
+                }
                 // #256: pre-fill config for re-configure
                 if (isOpen && reconfigureConfig) {
                     setConnectionType(reconfigureConfig.cluster_type || 'proxmox');
@@ -1954,7 +1986,8 @@
                             iso_library_paths: (rc.iso_library_paths || []).join('\n'),
                             smb_share_map: Object.entries(rc.smb_share_map || {})
                                 .map(([drive, share]) => `${drive}=${share}`).join('\n'),
-                            smb_domain: rc.smb_domain || '' }));
+                            smb_domain: rc.smb_domain || '',
+                            transfer_host: rc.transfer_host || '' }));
                     } else if (rc.cluster_type === 'xcpng') {
                         setXcpConfig(prev => ({ ...prev, name: rc.name || '', host: rc.host || '', user: rc.user || '', pass: '', ssl_verification: rc.ssl_verification || false, migration_threshold: rc.migration_threshold || 20, check_interval: rc.check_interval || 300, auto_migrate: rc.auto_migrate || false, dry_run: rc.dry_run || false }));
                     } else {
@@ -1968,23 +2001,11 @@
             }, [isOpen, initialType, reconfigureConfig]);
             
             // Proxmox config
-            const [config, setConfig] = useState({
-                name: '', host: '', api_port: 8006, node_ui_suffix: '', user: 'root@pam', pass: '',
-                ssl_verification: false, migration_threshold: 20, migration_tolerance: 10, check_interval: 300,
-                auto_migrate: false, balance_containers: false, balance_local_disks: false,
-                dry_run: false, ssh_key: '',
-                predictive_balancing: false, predictive_threshold: 75,
-                balance_cpu_weight: 1.0, balance_mem_weight: 1.0, balance_io_weight: 0.0,
-                cpu_baseline: null,
-            });
+            const [config, setConfig] = useState({ ...PROXMOX_DEFAULT_CONFIG });
             const [showSshSettings, setShowSshSettings] = useState(false);
 
             // XCP-ng config
-            const [xcpConfig, setXcpConfig] = useState({
-                name: '', host: '', user: 'root', pass: '',
-                ssl_verification: false, migration_threshold: 20, check_interval: 300,
-                auto_migrate: false, dry_run: false, cluster_type: 'xcpng',
-            });
+            const [xcpConfig, setXcpConfig] = useState({ ...XCPNG_DEFAULT_CONFIG });
 
             // Hyper-V source config (fork patch #15) — shape and parsing live in hyperv.js
             const [hyperVConfig, setHyperVConfig] = useState({ ...HYPERV_DEFAULT_CONFIG });
