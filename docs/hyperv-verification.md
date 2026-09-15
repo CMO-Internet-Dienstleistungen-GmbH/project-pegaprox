@@ -43,9 +43,17 @@ Remoting, not through a Windows-only management API.
 | Choice | Value | Why |
 |---|---|---|
 | Library | `pypsrp` 0.9.1 (released 2026-03-16, requires Python >= 3.10) | Pure-Python PSRP and WSMan client; no Windows or system library needed on the PegaProx side |
-| Transport | WSMan over HTTPS, port 5986 | The plaintext listener is not used at all |
-| Authentication | NTLM via `pyspnego` | Works for standalone hosts without a domain join or Kerberos realm on the Linux side |
-| Certificate handling | Validated against the system trust store | Skipping validation is a diagnostic flag, never a configuration |
+| Transport | WSMan over HTTP (port 5985) or HTTPS (port 5986), per host | The host's listener configuration is a given. `winrm quickconfig` creates only the HTTP listener, so HTTP is the default; HTTPS is offered where somebody set up a listener with a certificate |
+| Authentication | Negotiate, NTLM, Basic or Kerberos via `pyspnego`, per host | Negotiate is the default: Kerberos where the client holds a ticket, NTLM otherwise, which is what a standalone host without a domain join ends up with. Kerberos needs the optional gssapi libraries on the PegaProx side |
+| Payload over HTTP | Sealed with the NTLM/Kerberos session key (pypsrp `encryption=auto`), or in clear if the operator turns that off | Basic authentication has no session key, so Basic over HTTP always travels in clear -- the client applies that rule so the operator does not meet it as a pypsrp error |
+| Certificate handling (HTTPS) | Validated against the system trust store by default; can be switched off per host | Switching it off is offered because an estate with self-signed listener certificates is a real estate, not a misconfiguration to refuse |
+
+The transport is the operator's decision, recorded per host and not judged by the
+product. What it costs is stated so the decision is an informed one: over HTTP
+the host is not authenticated to PegaProx, so a machine on the path could answer
+in its place; with payload encryption off, or with Basic authentication, the
+session content is readable on the wire. A management network shared only by the
+hosts concerned is a common reason to accept both.
 
 `pypsrp` depends on `cryptography >= 3.1`, `pyspnego >= 0.7.0` and
 `requests >= 2.27.0`. The PegaProx pin of `cryptography >= 50.0.0, < 52`
@@ -60,12 +68,14 @@ These are the host-side conditions the probe checks. They follow the vendor
 documentation for remote Hyper-V management and have not yet been confirmed
 against a live host.
 
-- **WinRM HTTPS listener on 5986**, reachable from the PegaProx machine.
-- **A listener certificate whose subject matches the name PegaProx connects
-  with.** Connecting by address when the certificate names the host is a
-  trust failure, and the probe reports it as one.
-- **The issuing CA present in the PegaProx machine's trust store.** This is
-  the most common first failure and is deliberately not worked around.
+- **A WinRM listener reachable from the PegaProx machine**: HTTP on 5985 (the
+  one `winrm quickconfig` creates) or HTTPS on 5986.
+- **The authentication provider the host accepts** enabled on its WinRM service.
+  Negotiate/NTLM is on by default; Basic is off by default on Windows and, over
+  HTTP, additionally needs `AllowUnencrypted` on the service side.
+- **For HTTPS only: a listener certificate whose subject matches the name
+  PegaProx connects with**, and its issuing CA in the PegaProx machine's trust
+  store -- or certificate verification switched off for that host.
 - **The account in both the local `Hyper-V Administrators` group and the local
   `Remote Management Users` group.** The first grants Hyper-V operations, the
   second grants WinRM access. Either one alone fails, and the two fail
@@ -144,18 +154,20 @@ sends the operator somewhere different:
 
 | Reported kind | What it means | Where to look |
 |---|---|---|
-| `unreachable` | No WSMan endpoint answered | Listener, port 5986, firewall |
+| `unreachable` | No WSMan endpoint answered | Listener, the configured port (5985 for HTTP, 5986 for HTTPS), firewall |
 | `timeout` | The endpoint accepted the connection and then stayed silent | The WSMan operation timeout, and how long the cmdlet takes on the host |
-| `certificate` | The endpoint answered, its certificate was not trusted | CA in the client trust store, or the listener certificate's subject |
-| `authentication` | Trust is fine, the credentials were rejected | Account, password, NTLM accepted by WinRM |
+| `certificate` | The endpoint answered, its certificate was not trusted (HTTPS only) | CA in the client trust store, or the listener certificate's subject |
+| `authentication` | Trust is fine, the credentials were rejected | Account, password, the configured provider enabled on the host's WinRM service |
 | `authorization` | The account is known but not permitted | The two group memberships |
 | `missing_feature` | The account is permitted, the cmdlet is absent | Hyper-V role and module on the host |
 | `client_dependency` | The probe never left the PegaProx machine | `pypsrp` missing in the local environment |
 | `unknown` | Nothing matched | The raw message, printed verbatim |
 
-`--insecure-skip-verify` exists to prove that certificate trust is the failing
-part, by making the same call succeed without validation. It is a diagnostic
-step in this document and never a configuration in the product.
+The probe connects the way the product would: HTTP by default, `--ssl` for the
+HTTPS listener, `--auth` for the provider, `--no-message-encryption` to send the
+payload in clear over HTTP, and the port following the transport unless `--port`
+is given. `--insecure-skip-verify` proves that certificate trust is the failing
+part of an HTTPS connection, by making the same call succeed without validation.
 
 ### Evidence without a host
 
