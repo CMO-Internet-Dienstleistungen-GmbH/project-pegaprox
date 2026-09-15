@@ -13,6 +13,7 @@ when the behaviour is lost, not when a comment is reworded.
 """
 import os
 import sys
+import uuid
 
 import pytest
 
@@ -133,8 +134,28 @@ class _FakeHive:
         assert kind in (_REG_SZ, _REG_EXPAND_SZ)
         return raw.decode('utf-16-le').rstrip('\x00')
 
+    def multi_string(self, path, key):
+        """Decoded strictly: a REG_MULTI_SZ terminates every element and then itself.
+        Dropping empty components would read unterminated data back as if it were fine."""
+        n = self.node(path)
+        assert n is not None, f'no such key: {path}'
+        kind, raw = n.values[key]
+        assert kind == _REG_MULTI_SZ, f'{path}\\{key} is not a REG_MULTI_SZ'
+        text = raw.decode('utf-16-le')
+        assert text.endswith('\x00'), f'{path}\\{key} is not terminated'
+        parts = text[:-1].split('\x00')
+        assert parts and parts[-1] == '', f'{path}\\{key}: last element not terminated'
+        return parts[:-1]
 
-_REG_DWORD, _REG_SZ, _REG_EXPAND_SZ = 4, 1, 2
+    def binary(self, path, key):
+        n = self.node(path)
+        assert n is not None, f'no such key: {path}'
+        kind, raw = n.values[key]
+        assert kind == _REG_BINARY, f'{path}\\{key} is not a REG_BINARY'
+        return raw
+
+
+_REG_BINARY, _REG_SZ, _REG_EXPAND_SZ, _REG_MULTI_SZ, _REG_DWORD = 3, 1, 2, 7, 4
 
 
 class _FakeHivexModule:
@@ -142,12 +163,27 @@ class _FakeHivexModule:
 
 
 class _FakeHiveTypes:
+    REG_BINARY = _REG_BINARY
     REG_DWORD = _REG_DWORD
     REG_SZ = _REG_SZ
     REG_EXPAND_SZ = _REG_EXPAND_SZ
+    REG_MULTI_SZ = _REG_MULTI_SZ
 
 
-def _windows_tree(tmp_path, drivers=('viostor.sys', 'vioscsi.sys')):
+_MACHINE = {'amd64': 0x8664, 'x86': 0x014C, 'arm64': 0xAA64}
+
+
+def _pe_stub(arch='amd64'):
+    """Just enough of a PE file for the architecture to be read out of it."""
+    head = bytearray(0x100)
+    head[0:2] = b'MZ'
+    head[0x3C:0x40] = (0x80).to_bytes(4, 'little')
+    head[0x80:0x84] = b'PE\x00\x00'
+    head[0x84:0x86] = _MACHINE[arch].to_bytes(2, 'little')
+    return bytes(head)
+
+
+def _windows_tree(tmp_path, drivers=('viostor.sys', 'vioscsi.sys'), arch='amd64'):
     """The part of the mounted guest filesystem the program looks at."""
     config = tmp_path / 'Windows' / 'System32' / 'config'
     config.mkdir(parents=True)
@@ -156,18 +192,23 @@ def _windows_tree(tmp_path, drivers=('viostor.sys', 'vioscsi.sys')):
     drv = tmp_path / 'Windows' / 'System32' / 'drivers'
     drv.mkdir(parents=True)
     for name in drivers:
-        (drv / name).write_bytes(b'')
+        (drv / name).write_bytes(_pe_stub(arch))
     return hive
 
 
 def _run_registry_program(script, tmp_path, monkeypatch, argv_extra=(),
-                          drivers=('viostor.sys', 'vioscsi.sys')):
-    hive_path = _windows_tree(tmp_path, drivers)
+                          drivers=('viostor.sys', 'vioscsi.sys'),
+                          driver_database=False, arch='amd64'):
+    hive_path = _windows_tree(tmp_path, drivers, arch)
     hives = []
 
     class _Recording(_FakeHive):
         def __init__(self, path, write=False):
             super().__init__(path, write)
+            if driver_database:
+                # A Windows 8 or newer guest has this branch; older ones do not, and the
+                # program has to tell the two apart by looking.
+                self.node_add_child(self._root, 'DriverDatabase')
             hives.append(self)
 
     monkeypatch.setitem(sys.modules, 'hivex',
@@ -470,3 +511,173 @@ def test_another_type_that_shares_the_dwords_low_bit_is_not_written_as_a_dword(
     hive = _with_infs(node_script, tmp_path, monkeypatch, inf_dir)
     assert hive.dword(_PARAMS.format('vioscsi'), 'BusType') == 0x0A, \
         f'a {name} entry was adopted as a DWORD'
+
+
+# ── the database Windows 8 and newer actually read ───────────────────────────
+#
+# The CriticalDeviceDatabase above is not read by Windows 8, Server 2012 or anything after
+# them. They bind a boot device through HKLM\SYSTEM\DriverDatabase, so a driver registered
+# only the old way is loaded and then cannot be attached to the controller the machine just
+# booted from -- INACCESSIBLE_BOOT_DEVICE, with everything the old way writes correct.
+
+_DDB = 'DriverDatabase'
+_INF = {'viostor': 'pegaprox_viostor.inf', 'vioscsi': 'pegaprox_vioscsi.inf'}
+
+
+@pytest.fixture
+def modern_guest(node_script, tmp_path, monkeypatch):
+    """A guest whose hive already has the DriverDatabase branch."""
+    return _run_registry_program(node_script, tmp_path, monkeypatch,
+                                 driver_database=True)
+
+
+@pytest.mark.parametrize('driver', ['viostor', 'vioscsi'])
+def test_the_driver_is_registered_in_the_driver_database(modern_guest, driver):
+    label = f'{_INF[driver]}_amd64_0000000000000000'
+    assert modern_guest.string(f'{_DDB}\\DriverInfFiles\\{_INF[driver]}',
+                               'Active') == label
+    assert modern_guest.multi_string(f'{_DDB}\\DriverInfFiles\\{_INF[driver]}',
+                                     '') == [label]
+    assert modern_guest.string(
+        f'{_DDB}\\DriverPackages\\{label}\\Configurations\\{driver}_conf',
+        'Service') == driver
+
+
+@pytest.mark.parametrize('driver,device', [
+    ('viostor', 'VEN_1AF4&DEV_1001&REV_00'),   # transitional block
+    ('viostor', 'VEN_1AF4&DEV_1042&REV_01'),   # modern block
+    ('vioscsi', 'VEN_1AF4&DEV_1004&REV_00'),   # transitional SCSI
+    ('vioscsi', 'VEN_1AF4&DEV_1048&REV_01'),   # modern SCSI
+])
+def test_both_the_transitional_and_the_modern_device_are_bound(modern_guest, driver,
+                                                               device):
+    """Which of the two a guest is given depends on the machine type the VM was built with,
+    so registering only one leaves the other unbound. The value is asserted byte for byte:
+    Windows reads it, and 'some bytes are there' is not the same claim."""
+    assert modern_guest.binary(f'{_DDB}\\DeviceIds\\PCI\\{device}',
+                               _INF[driver]) == b'\x01\xff\x00\x00'
+    label = f'{_INF[driver]}_amd64_0000000000000000'
+    assert modern_guest.string(
+        f'{_DDB}\\DriverPackages\\{label}\\Descriptors\\PCI\\{device}',
+        'Configuration') == f'{driver}_conf'
+
+
+# The class GUID as Windows stores it: the first three fields little-endian, the rest as
+# written. `uuid.UUID(...).bytes_le` produces exactly this, and is used here rather than
+# the literal from the source so that a transposition in either one shows up.
+_CLASS_GUID_BYTES = uuid.UUID('4D36E97B-E325-11CE-BFC1-08002BE10318').bytes_le
+_VERSION_BLOB = bytes.fromhex('00ff090000000000') + _CLASS_GUID_BYTES + bytes(24)
+
+
+@pytest.mark.parametrize('driver', ['viostor', 'vioscsi'])
+def test_the_package_carries_the_version_blob_pnp_insists_on(modern_guest, driver):
+    """Windows-Kernel-Pnp on Windows 10 and Server 2016 refuses a package without it, and
+    it is a fixed layout: an eight-byte header, the class GUID at offset 8, then padding."""
+    label = f'{_INF[driver]}_amd64_0000000000000000'
+    blob = modern_guest.binary(f'{_DDB}\\DriverPackages\\{label}', 'Version')
+    assert blob == _VERSION_BLOB
+    assert blob[8:24] == _CLASS_GUID_BYTES, 'the class GUID is not at offset 8'
+
+
+@pytest.mark.parametrize('driver', ['viostor', 'vioscsi'])
+def test_the_configuration_the_package_points_at_is_written(modern_guest, driver):
+    """DriverInfFiles names the configuration, DriverPackages has to contain it. Naming one
+    that is not there leaves the package without anything to bind."""
+    label = f'{_INF[driver]}_amd64_0000000000000000'
+    config = f'{driver}_conf'
+    assert modern_guest.multi_string(f'{_DDB}\\DriverInfFiles\\{_INF[driver]}',
+                                     'Configurations') == [config]
+    node = f'{_DDB}\\DriverPackages\\{label}\\Configurations\\{config}'
+    assert modern_guest.dword(node, 'ConfigFlags') == 0
+    assert modern_guest.string(node, 'Service') == driver
+
+
+@pytest.mark.parametrize('driver', ['viostor', 'vioscsi'])
+def test_the_package_does_not_take_a_name_the_guest_may_already_use(modern_guest, driver):
+    """An entry under the driver's real INF name would replace whatever a virtio package
+    already in the guest belongs to with something assembled here -- and Server 2025 images
+    were found carrying one."""
+    assert modern_guest.node(f'{_DDB}\\DriverInfFiles\\{driver}.inf') is None
+    assert _INF[driver].startswith('pegaprox_')
+
+
+@pytest.mark.parametrize('arch', ['amd64', 'x86'])
+def test_the_architecture_comes_from_the_driver_being_registered(node_script, tmp_path,
+                                                                 monkeypatch, arch):
+    """Off the PE header of the .sys, not off the ISO directory it came from. That
+    directory is empty for a driver whose file was already in the guest and was not copied
+    again this run, and defaulting to amd64 there would relabel an existing x86 package."""
+    hive = _run_registry_program(node_script, tmp_path, monkeypatch,
+                                 driver_database=True, arch=arch)
+    assert hive.string(f'{_DDB}\\DriverInfFiles\\{_INF["vioscsi"]}',
+                       'Active').endswith(f'_{arch}_0000000000000000')
+
+
+def test_an_x86_driver_keeps_its_architecture_when_no_source_directory_is_known(
+        node_script, tmp_path, monkeypatch):
+    """The case that made this worth reading off the file: nothing was copied for this
+    driver this run, so the injection knows no ISO directory for it."""
+    hive = _run_registry_program(node_script, tmp_path, monkeypatch, argv_extra=('', ''),
+                                 driver_database=True, arch='x86')
+    assert hive.string(f'{_DDB}\\DriverInfFiles\\{_INF["vioscsi"]}',
+                       'Active').endswith('_x86_0000000000000000')
+
+
+def test_an_unreadable_driver_file_falls_back_rather_than_failing(node_script, tmp_path,
+                                                                  monkeypatch):
+    hive_path = _windows_tree(tmp_path)
+    (hive_path.parent.parent / 'drivers' / 'vioscsi.sys').write_bytes(b'not a PE file')
+    hives = []
+
+    class _Recording(_FakeHive):
+        def __init__(self, path, write=False):
+            super().__init__(path, write)
+            self.node_add_child(self._root, 'DriverDatabase')
+            hives.append(self)
+
+    monkeypatch.setitem(sys.modules, 'hivex',
+                        type('m', (), {'Hivex': _Recording, 'hive_types': _FakeHiveTypes})())
+    monkeypatch.setitem(sys.modules, 'hivex.hive_types', _FakeHiveTypes)
+    monkeypatch.setattr(sys, 'argv', ['-', str(hive_path)])
+    exec(compile(_registry_program(node_script), '<injection>', 'exec'),
+         {'__name__': '__main__'})
+
+    assert hives[0].string(f'{_DDB}\\DriverInfFiles\\{_INF["vioscsi"]}',
+                           'Active').endswith('_amd64_0000000000000000')
+
+
+# ── the old guests, and the old entries ──────────────────────────────────────
+
+def test_a_guest_without_the_branch_is_left_alone(written):
+    """Windows 7 and Server 2008 R2 have no DriverDatabase. Creating one there would be
+    writing a structure that version does not read, into a hive that has to keep booting."""
+    assert written.node(_DDB) is None
+    assert written.committed
+
+
+@pytest.mark.parametrize('driver,key', [
+    ('viostor', 'pci#ven_1af4&dev_1001'),
+    ('vioscsi', 'pci#ven_1af4&dev_1004'),
+    ('vioscsi', 'pci#ven_1af4&dev_1048'),
+])
+def test_the_old_entries_stay_on_a_modern_guest_too(modern_guest, driver, key):
+    """They are simply unread there, and they are what a Windows 7 guest still needs. The
+    new database replaces nothing."""
+    assert modern_guest.string(f'{_CDB}\\{key}', 'Service') == driver
+
+
+@pytest.mark.parametrize('driver', ['viostor', 'vioscsi'])
+def test_the_service_entry_is_written_on_a_modern_guest_as_well(modern_guest, driver):
+    """The driver database says which package binds the device; the service entry is still
+    what loads the driver."""
+    assert modern_guest.dword(f'ControlSet001\\Services\\{driver}', 'Start') == 0
+    assert modern_guest.dword(_PARAMS.format('vioscsi'), 'BusType') == 0x0A
+
+
+def test_a_driver_that_never_arrived_gets_no_database_entry_either(node_script, tmp_path,
+                                                                   monkeypatch):
+    hive = _run_registry_program(node_script, tmp_path, monkeypatch,
+                                 drivers=('viostor.sys',), driver_database=True)
+    assert hive.node(f'{_DDB}\\DriverInfFiles\\{_INF["viostor"]}') is not None
+    assert hive.node(f'{_DDB}\\DriverInfFiles\\{_INF["vioscsi"]}') is None
+    assert hive.node(f'{_DDB}\\DeviceIds\\PCI\\VEN_1AF4&DEV_1048&REV_01') is None
