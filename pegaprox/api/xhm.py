@@ -3,6 +3,7 @@
 Endpoints for Proxmox <-> XCP-ng <-> ESXi migration.
 """
 
+import logging
 import threading
 import uuid
 from datetime import datetime, timedelta
@@ -264,14 +265,62 @@ def _xhm_reachable(t):
 @bp.route('/api/xhm/migrations', methods=['GET'])
 @require_auth(perms=['vm.migrate'])
 def xhm_list():
-    return jsonify([t.to_dict() for t in _xhm_migrations.values() if _xhm_reachable(t)])
+    live = [t.to_dict() for t in _xhm_migrations.values() if _xhm_reachable(t)]
+    # Fork patch #15 — plus the Hyper-V migrations only the database still knows.
+    return jsonify(live + _recorded_hyperv_migrations({m.get('id') for m in live}))
 
 
 @bp.route('/api/xhm/migrations/<mid>', methods=['GET'])
 @require_auth(perms=['vm.migrate'])
 def xhm_detail(mid):
     if mid not in _xhm_migrations:
+        # Fork patch #15 — a restart empties the registry; the database does not.
+        recorded = _one_recorded_hyperv_migration(mid)
+        if recorded is not None:
+            return jsonify(recorded)
         return jsonify({'error': 'Migration not found'}), 404
     if not _xhm_reachable(_xhm_migrations[mid]):
         return jsonify({'error': 'Migration not found'}), 404
     return jsonify(_xhm_migrations[mid].to_dict())
+
+
+# Fork patch #15 — the migration list is built from a dict in this process, and a restart
+# empties it. The check that refuses to start the same VM again reads the database, which
+# does not. Between the two, an operator saw nothing and could start nothing: without a
+# row there is no "clean up target" and no way to dismiss the entry, while the refusal
+# went on naming resources. These two helpers are the bridge; the logic is in the fork's
+# own module so this file keeps one call each.
+def _recorded_hyperv_migrations(already_listed):
+    from pegaprox.core.hyperv_xhm import recorded_migrations
+
+    try:
+        rows = recorded_migrations(already_listed)
+    except Exception:
+        logging.warning('Could not read recorded Hyper-V migrations', exc_info=True)
+        return []
+    # Same access rule as a live one: whoever may not see the source VM may not see its
+    # migration either.
+    return [row for row in rows if _recorded_reachable(row)]
+
+
+def _one_recorded_hyperv_migration(mid):
+    for row in _recorded_hyperv_migrations(()):
+        if row.get('id') == mid:
+            return row
+    return None
+
+
+def _recorded_reachable(row):
+    """Whether the caller may see this recorded migration.
+
+    A recorded row carries the source VM's GUID where a live task carries a VMID, so the
+    per-VM check cannot be asked in the same way. The cluster-level check is asked
+    instead, which is the same gate the Hyper-V routes use.
+    """
+    try:
+        from pegaprox.api.helpers import check_cluster_access
+
+        allowed, _ = check_cluster_access(row.get('source_cluster') or '')
+        return bool(allowed)
+    except Exception:
+        return False
