@@ -145,9 +145,32 @@ issue #15, the one that does not. The compatible controller does not make the qu
 away: it decides whether the loader can *read* the disk, not what a resumed kernel then
 finds attached to it.
 
-**Defaults, not measurements.** Hibernation is off by default on Windows Server (2012
-through 2025) and on by default on Windows 10 and 11, and `powercfg /h` can have changed
-either. Nothing here has read the setting on the guests in any particular estate.
+### Does Windows Server have Fast Startup at all?
+
+Yes, and it is off by default. Read out of a guest with `powercfg /a` on Windows Server
+2016 (build 14393), on an untouched installation and then again after enabling
+hibernation:
+
+| | `Hibernate` | `Fast Startup` |
+|---|---|---|
+| untouched | not available — *"Hibernation has not been enabled."* | not available — *"Hibernation is not available."* |
+| after `powercfg /hibernate on` | **available** | **available** |
+
+So the mechanism is present on Server; it is simply invisible while hibernation is off,
+and the reason `powercfg` gives for Fast Startup being unavailable is the hibernation
+setting, not the edition. On Windows 10 and 11 hibernation is on by default, which is why
+Fast Startup is the normal state there and the exception here.
+
+**What that means for a migration source.** A Windows Server guest arrives with no
+`hiberfil.sys` unless somebody enabled hibernation on it. And a Hyper-V host's own
+`AutomaticStopAction: Save` is a different thing entirely: it writes the saved state
+*beside* the VHDX, where `remove_hiberfile` neither looks nor needs to.
+
+**A hibernated volume cannot be inspected without changing it.** Every tool that reads one
+alters it: a mount clears the logfile even with `-o ro,force`, `ntfsfix -n` reports nothing
+about hibernation, and `ntfsls` and `ntfscat` refuse the volume outright with *"Volume is
+scheduled for check"*. Only `ntfsfix` without `-n` names the state — *"Windows is
+hibernated, refused to mount."* — which is exactly what the import reads it from.
 
 ### What `tests/hyperv_testbed/verify_hibernation_clear.sh` proves
 
@@ -166,17 +189,34 @@ signature ntfs-3g decides from:
 The run also shows why the option is not optional: without it the volume mounts read-only,
 and the injection's own read-write check fails the run.
 
-### What it does not prove
+### What a hibernated guest does, 2026-09-16
 
-**That a guest which was hibernated boots after the file is cleared.** That needs Windows
-and a screen. The four rows above were booted from images that had been shut down
-normally, so the matrix does not cover this case for any version. It is the one open
-question on this behaviour, and it is the same question the driver path has carried since
-it started using the option.
+A Windows Server 2016 image was made to hibernate itself and the compatible import path was
+run against it. The state is real: `hiberfil.sys` is 4 294 422 528 bytes, begins with
+`HIBR`, and a read-write mount answers *"Windows is hibernated, refused to mount."*
 
-When a guest is found in that state the import now says so in the migration log, naming
-that the saved session was discarded — so a boot that then looks different has something
-to be read against.
+What the product said, running `v2p._inject_virtio_drivers(..., clear_hibernation_only=True)`
+against that volume:
+
+```
+[VirtIO] WIN_PART=/dev/loop1p2
+[VirtIO] The guest was hibernated or had shut down with Fast Startup. Its saved session
+         has been discarded, so it will boot cold on the target — which is the only way it
+         can come up on hardware it was not saved on. Anything that was open in that
+         session is gone.
+[VirtIO] ✓ Windows volume prepared; no drivers were installed.
+RESULT ok=True
+```
+
+So the compatible path finds a hibernated volume, says so in the words an operator reads,
+and clears it. That is the half of `ADR 0005` that was open about detection and reporting.
+
+**Still not photographed: the boot afterwards.** The screens for both paths are not taken
+yet, so "and then it boots" remains the one unproven step — for the driver path as well.
+Producing the state at all took three findings that live in the testbed's own notes: Proxmox
+starts every guest with S4 disabled, so a guest cannot hibernate until `args` says
+otherwise; `powercfg`'s output does not survive a redirect from a service; and any probe of
+the volume taken before the import destroys the state the import is supposed to find.
 
 ## Version-specific points that still need a boot to settle
 
