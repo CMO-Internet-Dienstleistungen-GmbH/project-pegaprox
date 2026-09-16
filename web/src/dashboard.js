@@ -6966,7 +6966,7 @@
                                     return (
                                         <div key={fw.id} className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 flex flex-col gap-2">
                                             <div className="flex items-start justify-between gap-2">
-                                                <p className="text-xs text-gray-400 leading-tight">{fw.name}</p>
+                                                <p className="text-xs text-gray-400 leading-4">{fw.name}</p>
                                                 {fw.informational && (
                                                     <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-300 border border-blue-500/30" title={fw.note || ''}>info</span>
                                                 )}
@@ -6974,7 +6974,7 @@
                                             <p className={`text-3xl font-bold ${scoreColor(s.score)}`}>{s.score == null ? '—' : `${s.score}%`}</p>
                                             <p className="text-xs text-gray-500">{s.passed}/{s.total} {t('controls') || 'controls'}</p>
                                             {fw.note && (
-                                                <p className="text-[10px] text-yellow-400/80 leading-tight" title={fw.note}>⚠ {fw.note.slice(0, 80)}{fw.note.length > 80 ? '…' : ''}</p>
+                                                <p className="text-[10px] text-yellow-400/80 leading-4" title={fw.note}>⚠ {fw.note.slice(0, 80)}{fw.note.length > 80 ? '…' : ''}</p>
                                             )}
                                             <button
                                                 onClick={() => downloadFrameworkReport(fw)}
@@ -7009,7 +7009,7 @@
                                     next to each node and nothing else, which reads as broken rather
                                     than as unconfigured. */}
                                 {clusterErr && (
-                                    <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/5 p-4">
+                                    <div className="mb-4 rounded-lg border border-yellow-500/30 bg-yellow-500/10 p-4">
                                         <div className="flex items-start gap-3">
                                             <Icons.AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
                                             <div className="min-w-0">
@@ -15680,7 +15680,7 @@
                                         <div className="flex items-center justify-between px-1 mb-2">
                                             <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">Hyper-V</h2>
                                             {isAdmin && (
-                                                <button onClick={() => { setAddClusterType('hyperv'); setShowAddModal(true); }} className="p-1 text-gray-500 hover:text-indigo-400 rounded transition-colors" title={t('hvAddHost') || 'Add a Hyper-V source'}>
+                                                <button onClick={() => { setAddClusterType('hyperv'); setShowAddModal(true); }} className="p-1 text-gray-500 hover:text-purple-400 rounded transition-colors" title={t('hvAddHost') || 'Add a Hyper-V source'}>
                                                     <Icons.Plus className="w-4 h-4" />
                                                 </button>
                                             )}
@@ -15696,7 +15696,7 @@
                                                         ? 'w-full flex items-center gap-1.5 pl-3 pr-2 py-0.5 text-[13px] leading-5'
                                                         : `w-full flex items-center gap-3 px-3 py-2 rounded-xl transition-all ${
                                                             hvSelected
-                                                                ? 'bg-gradient-to-r from-indigo-500/20 to-indigo-600/10 border border-indigo-500/30 text-white'
+                                                                ? 'bg-gradient-to-r from-purple-500/20 to-purple-500/20 border border-indigo-500/30 text-white'
                                                                 : 'bg-proxmox-card border border-proxmox-border hover:border-indigo-500/30 text-gray-300 hover:text-white'
                                                           }`
                                                     }
@@ -17165,7 +17165,7 @@
                                                                     {t('activeAlerts') || 'Active Alerts'} <span className="text-xs text-gray-500">({activeAlerts.length})</span>
                                                                 </div>
                                                                 {activeAlerts.map(a => (
-                                                                    <div key={a.id} className={`flex items-center justify-between p-3 rounded-lg border ${a.acked_at ? 'bg-proxmox-darker border-proxmox-darker opacity-70' : 'bg-amber-500/10 border-amber-500/30'}`}>
+                                                                    <div key={a.id} className={`flex items-center justify-between p-3 rounded-lg border ${a.acked_at ? 'bg-proxmox-darker border-proxmox-darker opacity-70' : 'bg-yellow-500/10 border-yellow-500/30'}`}>
                                                                         <div className="flex items-center gap-3 min-w-0">
                                                                             <span className={`px-1.5 py-0.5 text-[10px] rounded uppercase font-mono shrink-0 ${
                                                                                 a.severity === 'critical' ? 'bg-red-500/20 text-red-400' :
@@ -17656,7 +17656,7 @@
                                                                         </div>
                                                                         <div className="flex-1 min-w-0">
                                                                             <div className="flex items-center gap-2 flex-wrap">
-                                                                                <span className={`text-xs font-mono px-1.5 py-0.5 rounded ${source === 'cis' ? 'text-blue-400 bg-blue-500/10' : source === 'lynis' ? 'text-purple-400 bg-purple-500/10' : source === 'pega' ? 'text-orange-400 bg-orange-500/10' : 'text-amber-400 bg-amber-500/10'}`}>{source === 'cis' ? 'CIS' : source === 'lynis' ? 'Lynis' : source === 'pega' ? 'PegaProx' : 'STIG'} {info.ref}</span>
+                                                                                <span className={`text-xs font-mono px-1.5 py-0.5 rounded ${source === 'cis' ? 'text-blue-400 bg-blue-500/10' : source === 'lynis' ? 'text-purple-400 bg-purple-500/10' : source === 'pega' ? 'text-orange-400 bg-orange-500/10' : 'text-amber-400 bg-yellow-500/10'}`}>{source === 'cis' ? 'CIS' : source === 'lynis' ? 'Lynis' : source === 'pega' ? 'PegaProx' : 'STIG'} {info.ref}</span>
                                                                                 <span className="text-sm font-medium text-white">{info.title}</span>
                                                                                 {applied && <span className="text-xs bg-green-500/20 text-green-400 px-2 py-0.5 rounded">{t('applied') || 'Applied'}</span>}
                                                                                 {applied && info.reboot && <span className="text-xs bg-orange-500/20 text-orange-400 px-2 py-0.5 rounded font-semibold">{t('rebootRequired') || 'Reboot required'}</span>}
@@ -17666,11 +17666,11 @@
                                                                             <p className="text-xs text-gray-600 mt-0.5">{t('pveImpact') || 'PVE Impact'}: {info.impact}</p>
                                                                             {/* MK #16745: umask 027 leaks into login-shell tooling (community LXC scripts -> /etc 750 -> no DNS); flag it + point at the rollback. */}
                                                                             {id === 'default_umask' && (
-                                                                                <p className="text-[11px] text-yellow-400/80 mt-1 leading-tight">⚠ {t('cmUmaskToolingNote')}</p>
+                                                                                <p className="text-[11px] text-yellow-400/80 mt-1 leading-4">⚠ {t('cmUmaskToolingNote')}</p>
                                                                             )}
                                                                             {/* MK #16745: this cluster is reached by password with no key -> sshd_hardening (prohibit-password) would cut off PegaProx's OWN root SSH, and the rollback needs SSH too. Warn before apply. */}
                                                                             {id === 'sshd_hardening' && selectedCluster && selectedCluster.has_ssh_key === false && !applied && (
-                                                                                <p className="text-[11px] text-red-400/90 mt-1 leading-tight">⚠ {t('cmSshdRootLockoutNote')}</p>
+                                                                                <p className="text-[11px] text-red-400/90 mt-1 leading-4">⚠ {t('cmSshdRootLockoutNote')}</p>
                                                                             )}
                                                                             {/* LW: configurable DNS for backup_dns control */}
                                                                             {id === 'backup_dns' && !applied && (
@@ -22202,7 +22202,7 @@
                                                                     <div className="flex items-start gap-2">
                                                                         <span className="text-amber-300 text-base leading-none mt-0.5">⚠</span>
                                                                         <div className="flex-1 min-w-0">
-                                                                            <p className="text-xs text-amber-200 font-semibold mb-1">
+                                                                            <p className="text-xs text-amber-400 font-semibold mb-1">
                                                                                 {t('virtioPreInstallWarnTitle') || 'Treiber besser VOR der Migration installieren'}
                                                                             </p>
                                                                             <p className="text-xs text-amber-100/90 leading-snug">
@@ -22667,7 +22667,7 @@
                                                                         )}
                                                                         {/* #562 — cutover gate: commit / cancel the switchover */}
                                                                         {isAwaiting && (
-                                                                            <div className="mt-3 p-3 rounded-lg bg-amber-500/10 border border-amber-500/30" onClick={e => e.stopPropagation()}>
+                                                                            <div className="mt-3 p-3 rounded-lg bg-yellow-500/10 border border-yellow-500/30" onClick={e => e.stopPropagation()}>
                                                                                 <div className="flex items-start gap-2 text-xs text-amber-300 mb-2">
                                                                                     <Icons.AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
                                                                                     <span>{t('awaitingCutoverBanner') || 'Disks are staged and the source VM is still running. Commit the switchover when you are ready to take the brief downtime.'}</span>
@@ -22773,7 +22773,7 @@
                                                 {isCorporate ? (
                                                     <Icons.Server className="w-5 h-5 flex-shrink-0" style={{color: 'var(--corp-accent)'}} />
                                                 ) : (
-                                                    <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-indigo-500/20 to-indigo-600/10 border border-indigo-500/30 flex items-center justify-center">
+                                                    <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-purple-500/20 to-purple-500/20 border border-indigo-500/30 flex items-center justify-center">
                                                         <Icons.Server className="w-6 h-6 text-indigo-400" />
                                                     </div>
                                                 )}
@@ -22809,7 +22809,7 @@
                                         </div>
 
                                         <div className={isCorporate ? 'px-4 space-y-4' : 'space-y-4'}>
-                                            <div className="p-3 rounded-lg border border-indigo-500/25 bg-indigo-500/5 text-xs text-indigo-300/90">
+                                            <div className="p-3 rounded-lg border border-purple-500/30 bg-purple-500/10 text-xs text-indigo-400">
                                                 {t('hvSourceOnly') || 'A Hyper-V host is a migration source only. PegaProx reads it, prepares a VM for migration, and moves that VM to Proxmox. It never manages the host.'}
                                             </div>
 
@@ -22824,7 +22824,7 @@
                                                 look like it had no generation and no checkpoints — so it is shown
                                                 rather than logged. */}
                                             {hypervHostFacts && hypervHostFacts.properties && hypervHostFacts.properties.complete === false && (
-                                                <div className="p-3 rounded-lg border border-amber-500/30 bg-amber-500/10 text-xs text-amber-200">
+                                                <div className="p-3 rounded-lg border border-yellow-500/30 bg-yellow-500/10 text-xs text-amber-400">
                                                     {t('hvIncompleteProperties') || 'This host does not report every property PegaProx reads. Values it does not report are shown as unknown rather than guessed:'}
                                                     {' '}
                                                     <span className="font-mono">{Object.keys(hypervHostFacts.properties.missing || {}).join(', ')}</span>
@@ -22887,7 +22887,7 @@
                                                         <tbody>
                                                             {hypervVms.map(vm => (
                                                                 <tr key={vm.vmid}
-                                                                    className={`border-t border-proxmox-border/60${
+                                                                    className={`border-t border-proxmox-border${
                                                                         highlightedVm?.vmid === vm.vmid ? ' bg-indigo-500/10' : ''}`}>
                                                                     <td className="px-4 py-2 text-white">{vm.name}</td>
                                                                     <td className="px-4 py-2">
@@ -22908,7 +22908,7 @@
                                                                             onClick={() => (vm.status === 'running'
                                                                                 ? setHypervShutdownVm(vm)
                                                                                 : openXhmForSource(selectedHyperV.id, vm))}
-                                                                            className="px-3 py-1.5 rounded-lg bg-indigo-500/10 border border-indigo-500/30 text-indigo-300 hover:text-white hover:border-indigo-400 transition-colors text-xs"
+                                                                            className="px-3 py-1.5 rounded-lg bg-indigo-500/10 border border-indigo-500/30 text-indigo-400 hover:text-white hover:border-purple-500/50 transition-colors text-xs"
                                                                         >
                                                                             {vm.status === 'running'
                                                                                 ? (t('hvShutDownAndMigrate') || 'Shut down and migrate')
@@ -23069,7 +23069,7 @@
                                                     </div>
                                                 </div>
 
-                                                <div className="bg-amber-500/5 border border-amber-500/20 rounded-lg p-3 mb-4">
+                                                <div className="bg-yellow-500/10 border border-amber-500/20 rounded-lg p-3 mb-4">
                                                     <div className="text-xs text-amber-400/80">{t('xhmOfflineOnly') || 'VM must be stopped (offline migration)'}</div>
                                                 </div>
 
@@ -23156,7 +23156,7 @@
                                                 )}
 
                                                 {/* Analyze button */}
-                                                <button onClick={fetchXhmPlan} disabled={xhmLoading || !xhmForm.source_cluster || !xhmForm.source_vmid || !xhmForm.target_cluster || (hvNeedsSourceNode(clusters.find(c => c.id === xhmForm.source_cluster)) && !xhmForm.source_node)} className="w-full py-2.5 rounded-lg bg-purple-500 text-white font-medium hover:bg-purple-600 disabled:opacity-50 text-sm mb-4">
+                                                <button onClick={fetchXhmPlan} disabled={xhmLoading || !xhmForm.source_cluster || !xhmForm.source_vmid || !xhmForm.target_cluster || (hvNeedsSourceNode(clusters.find(c => c.id === xhmForm.source_cluster)) && !xhmForm.source_node)} className="w-full py-2.5 rounded-lg bg-purple-500 text-white font-medium hover:bg-purple-700 disabled:opacity-50 text-sm mb-4">
                                                     {xhmLoading ? 'Analyzing...' : (t('xhmAnalyze') || 'Analyze VM')}
                                                 </button>
 
@@ -23257,7 +23257,7 @@
                                                                                onChange={e => setXhmForm({...xhmForm, target_name: e.target.value})}
                                                                                className={`${field} ${nameOk ? '' : 'border-red-500'}`} />
                                                                         {d.source_name && d.source_name !== d.name && (
-                                                                            <div className="text-[10px] text-amber-500/90 mt-0.5">
+                                                                            <div className="text-[10px] text-amber-400 mt-0.5">
                                                                                 {(t('hvNameAdjusted') || 'Hyper-V calls it {src}; Proxmox validates a VM name as a DNS name.').replace('{src}', d.source_name)}
                                                                             </div>
                                                                         )}
@@ -23380,7 +23380,7 @@
                                                                             none yet, which is the honest version of an empty line.
                                                                             A quarter of the VMs on this estate have more than one
                                                                             adapter. */}
-                                                                        <span className="text-xs w-44 shrink-0 leading-tight">
+                                                                        <span className="text-xs w-44 shrink-0 leading-4">
                                                                             <span className="text-gray-400 block truncate"
                                                                                   title={net.switch_name || net.bridge || ''}>
                                                                                 {net.bridge || net.switch_name || `net${i}`}
@@ -23432,7 +23432,7 @@
                                                                                     {net.vlan_id ? (
                                                                                         <span className="text-[10px] text-gray-600 whitespace-nowrap">{t('hvVlanFromSource') || 'from source'}</span>
                                                                                     ) : trunk ? (
-                                                                                        <span className="text-[10px] text-amber-500/80 whitespace-nowrap">{net.vlan_mode}</span>
+                                                                                        <span className="text-[10px] text-amber-400 whitespace-nowrap">{net.vlan_mode}</span>
                                                                                     ) : null}
                                                                                 </div>
                                                                             );
@@ -23486,7 +23486,7 @@
                                                                             <div className="text-[10px] text-gray-600">{t('hvVirtioIsoNeedsNode') || 'Choose a target node to see the ISOs it has.'}</div>
                                                                         )}
                                                                         {xhmForm.target_node && (hvIsos?.isos || []).length === 0 && (
-                                                                            <div className="text-[10px] text-amber-500/90">{t('hvVirtioIsoNone') || 'This node has no VirtIO driver ISO. Fetch one below.'}</div>
+                                                                            <div className="text-[10px] text-amber-400">{t('hvVirtioIsoNone') || 'This node has no VirtIO driver ISO. Fetch one below.'}</div>
                                                                         )}
                                                                         {/* The node downloads it, not this browser. */}
                                                                         {xhmForm.target_node && (hvIsos?.available_releases || []).map(rel => {
@@ -23497,7 +23497,7 @@
                                                                                 <div key={rel.release} className="flex items-center gap-2">
                                                                                     <button onClick={() => hvDownloadIso(rel.release, storage)}
                                                                                             disabled={hvIsoBusy}
-                                                                                            className="text-[10px] px-2 py-0.5 rounded bg-purple-500/10 border border-purple-500/30 text-purple-300 hover:text-white disabled:opacity-50">
+                                                                                            className="text-[10px] px-2 py-0.5 rounded bg-purple-500/10 border border-purple-500/30 text-purple-400 hover:text-white disabled:opacity-50">
                                                                                         {(t('hvVirtioIsoFetch') || 'Fetch {release} onto {storage}')
                                                                                             .replace('{release}', rel.release).replace('{storage}', storage)}
                                                                                     </button>
@@ -23557,7 +23557,7 @@
                                                             />
                                                         )}
 
-                                                        <button onClick={startXhmMigration} disabled={xhmLoading || !xhmForm.target_storage || (hvTargetsProxmox(xhmPlan?.direction) && !xhmForm.target_node) || !hvMayStart(xhmPlan, xhmForm.acknowledged, hvPreflight) || (hvIsHyperVPlan(xhmPlan) && !hvIsPveName(xhmForm.target_name || xhmPlan?.target_defaults?.name || '')) || (hvIsHyperVPlan(xhmPlan) && (hvPreflight?.vmids_with_volumes || []).includes(Number(xhmForm.target_vmid)))} className="w-full py-2.5 rounded-lg bg-purple-500 text-white font-medium hover:bg-purple-600 disabled:opacity-50 text-sm">
+                                                        <button onClick={startXhmMigration} disabled={xhmLoading || !xhmForm.target_storage || (hvTargetsProxmox(xhmPlan?.direction) && !xhmForm.target_node) || !hvMayStart(xhmPlan, xhmForm.acknowledged, hvPreflight) || (hvIsHyperVPlan(xhmPlan) && !hvIsPveName(xhmForm.target_name || xhmPlan?.target_defaults?.name || '')) || (hvIsHyperVPlan(xhmPlan) && (hvPreflight?.vmids_with_volumes || []).includes(Number(xhmForm.target_vmid)))} className="w-full py-2.5 rounded-lg bg-purple-500 text-white font-medium hover:bg-purple-700 disabled:opacity-50 text-sm">
                                                             {xhmLoading ? 'Starting...' : (t('xhmStartMigration') || 'Start Migration')}
                                                         </button>
                                                     </div>
@@ -23586,7 +23586,7 @@
                                                                         <div className="flex items-center gap-3">
                                                                             <div className={`w-2.5 h-2.5 rounded-full ${isActive ? 'bg-purple-400 animate-pulse' : m.status === 'completed' ? 'bg-green-400' : m.status === 'failed' ? 'bg-red-400' : 'bg-gray-500'}`} />
                                                                             <span className="text-sm font-medium text-white">{m.vm_name || m.source_vmid}</span>
-                                                                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300 font-medium">{dirLabel}</span>
+                                                                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-400 font-medium">{dirLabel}</span>
                                                                             <span className="text-xs px-1.5 py-0.5 rounded bg-proxmox-dark text-gray-400">{phaseLabel[m.phase] || m.phase}</span>
                                                                         </div>
                                                                         <span className={`px-2 py-0.5 rounded text-xs font-semibold ${m.status === 'completed' ? 'bg-green-500/20 text-green-400' : m.status === 'failed' ? 'bg-red-500/20 text-red-400' : 'bg-purple-500/20 text-purple-400'}`}>{m.status}</span>
@@ -23610,7 +23610,7 @@
                                                                             release rebuild. */}
                                                                         {m.status === 'failed' && m.direction === 'hyperv_to_pve' && (
                                                                             <button onClick={e => { e.stopPropagation(); askHypervCleanup(m); }}
-                                                                                    className="px-2 py-0.5 rounded bg-red-500/10 border border-red-500/30 text-red-300 hover:text-white hover:border-red-400">
+                                                                                    className="px-2 py-0.5 rounded bg-red-500/10 border border-red-500/30 text-red-300 hover:text-white hover:border-red-500/30">
                                                                                 {t('hvCleanupLeftovers') || 'Clean up target'}
                                                                             </button>
                                                                         )}
@@ -24240,7 +24240,7 @@
                                     </button>
                                     <button onClick={() => shutDownAndMigrate(selectedHyperV.id, hypervShutdownVm)}
                                             disabled={hypervShuttingDown}
-                                            className="px-4 py-2 rounded-lg bg-indigo-500 text-white text-sm disabled:opacity-50">
+                                            className="px-4 py-2 rounded-lg bg-indigo-500/10 text-white text-sm disabled:opacity-50">
                                         {hypervShuttingDown
                                             ? (t('hvShuttingDown') || 'Shutting down…')
                                             : (t('hvShutDownAndMigrate') || 'Shut down and migrate')}

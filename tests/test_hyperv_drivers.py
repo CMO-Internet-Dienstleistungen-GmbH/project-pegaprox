@@ -94,3 +94,31 @@ class TestTheCatalogue:
             assert drivers.release_of(entry['filename']) == release
             assert entry['url'].startswith('https://')
             assert entry['url'].endswith(entry['filename'])
+
+
+class TestTheIsoNameCannotRunCommands:
+    """The refusal quotes the ISO's own name back at the reader, and that name is not
+    ours: it is whatever a file on the node's storage is called. The script printing it
+    runs as root on a Proxmox node, so a name containing `$(...)` inside a double-quoted
+    shell string would be executed by whoever can upload an ISO."""
+
+    def test_a_name_that_looks_like_a_command_stays_text(self, tmp_path):
+        import subprocess
+        marker = tmp_path / 'executed'
+        evil = f'vm-pool:iso/virtio-win-$(touch {marker})-0.1.262.iso'
+
+        snippet = drivers.guard_snippet(evil)
+        result = subprocess.run(['bash', '-c', f'VER_BUILD=9600\n{snippet}\nexit 0'],
+                                capture_output=True, text=True)
+
+        assert result.returncode == drivers.REFUSED_EXIT_CODE
+        assert not marker.exists(), 'the ISO name was executed by the shell'
+        assert '$(touch' in result.stdout, 'the name should be reported verbatim'
+
+    def test_a_name_full_of_quotes_does_not_break_the_script(self):
+        import subprocess
+        snippet = drivers.guard_snippet("vm-pool:iso/it's \"quoted\"; rm -rf /tmp/x.iso")
+        result = subprocess.run(['bash', '-c', f'VER_BUILD=9600\n{snippet}\nexit 0'],
+                                capture_output=True, text=True)
+        assert result.returncode == drivers.REFUSED_EXIT_CODE
+        assert 'rm -rf' in result.stdout
