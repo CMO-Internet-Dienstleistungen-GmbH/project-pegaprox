@@ -474,6 +474,13 @@ def _run_hyperv_to_pve(task):
             _fail(task, migration_id, blocked)
             return
 
+        # Before anything is created or copied: if the operator picked a release the node
+        # does not have, it is fetched now. A download that fails here costs nothing.
+        download_failed = _fetch_driver_iso(task, target)
+        if download_failed:
+            _fail(task, migration_id, download_failed)
+            return
+
         new_vmid = _choose_target_vmid(task, target)
         task.target_vmid = new_vmid
         _update_migration_row(migration_id, target_vmid=new_vmid)
@@ -1241,6 +1248,94 @@ def open_target_node_session(target, node_name, ssh_user=None):
     return _Node(ssh, ssh_user or getattr(target.config, 'ssh_user', '') or 'root')
 
 
+#: How long the run waits for a node to finish downloading a driver ISO. A 500 MB file
+#: over a customer's uplink is minutes, not seconds, and the alternative to waiting is a
+#: migration that converts the disks and then finds no drivers.
+_ISO_DOWNLOAD_TIMEOUT = 45 * 60
+
+
+def wants_iso_download(task) -> str:
+    """The release the operator asked the node to fetch, or '' when they chose a file.
+
+    The wizard writes `fetch:<release>` into the same field that otherwise carries a
+    volid. One field, because it is one decision — which drivers this guest gets — and
+    whether the file happens to be on the node already is not the operator's problem.
+    """
+    chosen = ((task.config or {}).get('virtio_iso_path') or '').strip()
+    return chosen[len('fetch:'):] if chosen.startswith('fetch:') else ''
+
+
+def _fetch_driver_iso(task, target):
+    """Have the node download the chosen release before anything else happens.
+
+    Runs in the planning phase, before a byte of disk is copied: a download that fails is
+    a migration that has not started yet, rather than one that converted 100 GiB and then
+    had nothing to inject.
+    """
+    from pegaprox.core import hyperv_drivers
+    from pegaprox.core.hyperv_postimport import download_release, iso_storages
+
+    release = wants_iso_download(task)
+    if not release:
+        return None
+
+    entry = hyperv_drivers.catalogue_entry(release)
+    if not entry:
+        return f'{release} is not a driver release this product knows how to fetch.'
+
+    storage = ((task.config or {}).get('virtio_iso_storage') or 'auto').strip()
+    if storage in ('', 'auto'):
+        available = iso_storages(target, task.target_node)
+        if not available:
+            return (f'{task.target_node} has no active storage that takes ISOs, so the '
+                    f'driver ISO cannot be downloaded there.')
+        storage = available[0]['storage']
+
+    volid = f"{storage}:iso/{entry['filename']}"
+    if _iso_exists(target, task.target_node, volid):
+        task.log(f'{entry["filename"]} is already on {storage}; not downloading it again')
+        task.config['virtio_iso_path'] = volid
+        return None
+
+    task.log(f'Downloading virtio-win {release} onto {storage} — the node fetches it, '
+             f'which is why this happens before the disks are touched')
+    try:
+        upid = download_release(target, task.target_node, storage, release)
+    except Exception as exc:                                   # noqa: BLE001
+        return f'The node could not start the download: {exc}'
+
+    if isinstance(upid, str) and upid.startswith('UPID:'):
+        if not target._wait_for_task(task.target_node, upid,
+                                     timeout=_ISO_DOWNLOAD_TIMEOUT):
+            return (f'The driver ISO did not finish downloading within '
+                    f'{_ISO_DOWNLOAD_TIMEOUT // 60} minutes ({upid}).')
+
+    if not _iso_exists(target, task.target_node, volid):
+        return (f'The download reported success but {volid} is not on the storage. '
+                f'Nothing was migrated.')
+
+    task.log(f'Downloaded {entry["filename"]} to {storage}')
+    # From here on the run behaves as though the file had been chosen from the list.
+    task.config['virtio_iso_path'] = volid
+    return None
+
+
+def _iso_exists(target, node, volid) -> bool:
+    """Is this exact volid on the node's storage?"""
+    storage = volid.split(':', 1)[0]
+    try:
+        response = target._api_get(
+            f'https://{target.host}:{target.api_port}'
+            f'/api2/json/nodes/{node}/storage/{storage}/content?content=iso')
+        if response.status_code != 200:
+            return False
+        return any((item.get('volid') or '') == volid
+                   for item in (response.json().get('data') or []))
+    except Exception:
+        logger.debug('Could not list ISOs on %s/%s', node, storage, exc_info=True)
+        return False
+
+
 def _open_target_node(task, source, target):
     """Connect to the target node and put the share credentials on it, readable by nobody.
 
@@ -1772,11 +1867,11 @@ def target_defaults(detail, source_vmid, next_vmid=None, images=None) -> dict:
         'cores': detail.get('cpu_count') or 1,
         'sockets': 1,
         'memory_mb': detail.get('memory_mb') or 1024,
-        # Nothing on this side can see inside the guest, so the honest suggestion is
-        # 'other'. It is a field rather than a default because it decides which timers and
-        # devices Proxmox gives the VM, and a Windows guest on 'other' runs measurably
-        # worse without anything looking wrong.
-        'ostype': 'other',
+        # The guest that was actually found on the disk. It decides which timers and
+        # devices Proxmox gives the VM, and a Windows guest left on 'other' runs
+        # measurably worse with nothing about it looking wrong. Still a field: a disk
+        # nobody could read leaves it at 'other', and that is a suggestion, not a verdict.
+        'ostype': ostype_for(images),
         'bios': GENERATION_BIOS.get(generation, 'seabios'),
         'machine': GENERATION_MACHINE.get(generation, DEFAULT_MACHINE),
         'generation': generation,
@@ -1792,11 +1887,92 @@ def target_defaults(detail, source_vmid, next_vmid=None, images=None) -> dict:
         'efi_pre_enrolled_keys': detail.get('secure_boot_enabled') is True,
         'needs_efi': GENERATION_BIOS.get(generation) == 'ovmf',
         'secure_boot_enabled': detail.get('secure_boot_enabled'),
-        # Every disk, so the wizard can offer the boot choice by name rather than by index.
-        'disks': [{'index': i, 'label': d.get('label') or d.get('key') or f'disk-{i}',
-                   'path': d.get('path') or '', 'size': d.get('capacity_bytes') or 0}
-                  for i, d in enumerate(detail.get('disks') or [])],
+        # Every disk, so the wizard can offer the boot choice by something a person can
+        # tell apart. `size` is what the normalised detail calls it — reading
+        # `capacity_bytes` here is what made every entry read "0 GiB".
+        'disks': _target_disk_choices(detail, images),
     }
+
+
+#: Windows version to the `ostype` Proxmox files it under. Read from the image's own
+#: `Version` — `6.3.9600.1` or `10.0.20348.2340` — because that is where the answer is:
+#: the major/minor pair separates the pre-Windows-10 releases cleanly, one entry each.
+#:
+#: `10.0` is the exception, and not a small one: Windows 10, Windows 11 and every Server
+#: from 2016 to 2025 all report it. Only the build tells them apart, and Proxmox groups
+#: them differently than the version does — `win10` covers Windows 10, Server 2016 and
+#: Server 2019, `win11` covers Windows 11, Server 2022 and Server 2025.
+_OSTYPE_BY_VERSION = {
+    (6, 0): 'w2k8',    # Vista / Server 2008
+    (6, 1): 'win7',    # Windows 7 / Server 2008 R2
+    (6, 2): 'win8',    # Windows 8 / Server 2012
+    (6, 3): 'win8',    # Windows 8.1 / Server 2012 R2 — Proxmox has no separate win8.1
+    (5, 2): 'w2k3',    # Server 2003
+    (5, 1): 'wxp',     # Windows XP
+}
+
+#: Inside 10.0, the build where Proxmox switches from `win10` to `win11`. Server 2022 is
+#: 20348 and belongs to the `win11` group despite being below the Windows 11 build.
+_WIN11_FROM_BUILD = 20348
+
+
+def ostype_for(images=None) -> str:
+    """The Proxmox `ostype` for the guest found on these disks, or 'other'.
+
+    'other' is what a disk nobody could read leaves behind, and it is also right for a
+    Linux guest — the two are not distinguished here, and neither is guessed at.
+    """
+    disk = hyperv_preflight.windows_disk(images or [])
+    if not disk:
+        return 'other'
+
+    parts = str(disk.get('version') or '').split('.')
+    try:
+        major, minor = int(parts[0]), int(parts[1])
+    except (IndexError, ValueError):
+        return 'other'
+
+    if (major, minor) != (10, 0):
+        return _OSTYPE_BY_VERSION.get((major, minor), 'other')
+
+    try:
+        build = int(parts[2]) if len(parts) > 2 else int(disk.get('build') or 0)
+    except (TypeError, ValueError):
+        build = 0
+    if not build:
+        # 10.0 without a build could be anything from Server 2016 to Server 2025. The
+        # older grouping is the safer half of the guess: its timers and devices work on a
+        # newer guest, while a missing one does not.
+        return 'win10'
+    return 'win11' if build >= _WIN11_FROM_BUILD else 'win10'
+
+
+def _target_disk_choices(detail, images=None):
+    """The disks, as the wizard has to render them in a dropdown.
+
+    A list of "disk-0" tells nobody which one to boot from. The file name does, the size
+    does, and — where the disks were read — so does the one that carries a Windows.
+    """
+    by_path = {img.get('path'): img for img in (images or []) if img.get('path')}
+    choices = []
+    for index, disk in enumerate(detail.get('disks') or []):
+        path = disk.get('path') or ''
+        image = by_path.get(path) or {}
+        size = disk.get('size') or image.get('size') or 0
+        controller = disk.get('controller_type') or ''
+        location = disk.get('controller_location')
+        where = f'{controller} {disk.get("controller_number")}:{location}' \
+            if controller and location is not None else ''
+        choices.append({
+            'index': index,
+            'label': path.rsplit('\\', 1)[-1] or f'disk-{index}',
+            'path': path,
+            'size': size,
+            'controller': where,
+            # What makes the choice obvious rather than a guess.
+            'windows': bool(image.get('windows')),
+        })
+    return choices
 
 
 def _suggested_boot_index(detail, images=None):
