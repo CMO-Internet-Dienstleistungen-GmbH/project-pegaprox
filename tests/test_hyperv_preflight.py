@@ -746,7 +746,7 @@ def _image(**overrides):
     """One disk as `Get-WindowsImage` and `Get-VHD` describe it, normalised."""
     image = {'path': 'S:\\vm\\a.vhdx', 'windows': True, 'build': 20348,
              'version': '10.0.20348.2582', 'architecture': 'x64', 'edition_id': 'ServerStandard',
-             'installation_type': 'Server', 'registry_readable': True, 'attached': False,
+             'installation_type': 'Server', 'attached': False,
              'vhd_type': 'Dynamic', 'parent_path': '', 'system_root': 'Windows',
              'windows_error': ''}
     image.update(overrides)
@@ -756,7 +756,10 @@ def _image(**overrides):
 def _inspection(**volume_overrides):
     volume = {'file_system': 'NTFS', 'size': 99 * 1024 ** 3, 'free': 80 * 1024 ** 3,
               'windows': True, 'hibernated': False, 'hiberfil_size': 0,
-              'page_file': True, 'dirty': False}
+              'page_file': True, 'dirty': False, 'hive_readable': True,
+              'product_name': 'Windows Server 2022 Standard', 'edition_id': 'ServerStandard',
+              'installation_type': 'Server', 'build': '20348', 'revision': '2582',
+              'display_version': '21H2'}
     volume.update(volume_overrides)
     return {'inspected': True, 'error': '', 'state': 'Off',
             'disks': [{'path': 'S:\\vm\\a.vhdx', 'mounted': True, 'error': '',
@@ -787,13 +790,15 @@ class TestWhatTheDisksSayAboutTheGuest:
         images = [_image(path='data.vhdx', windows=False), _image(path='system.vhdx')]
         assert pf.windows_disk(images)['path'] == 'system.vhdx'
 
-    def test_a_registry_that_cannot_be_read_warns_before_the_copy(self):
-        # The version comes from the image header, the edition from the guest's SOFTWARE
-        # hive. One without the other means the hive could not be read — and that is the
-        # hive the driver injection edits, where it fails after the disks are converted.
-        finding = pf.check_guest_registry([_image(registry_readable=False)])
-        assert finding.severity == pf.WARNING
-        assert 'SOFTWARE hive' in finding.detail
+    def test_an_empty_edition_is_not_evidence_of_an_unreadable_hive(self):
+        # This used to warn. Measured on exactly such a disk — DISM reported the version
+        # and no edition — `reg load` succeeded and every value was there, so the warning
+        # named a cause that did not exist.
+        finding = pf.check_guest_registry(
+            _inspection(hive_readable=True, product_name='Windows Server 2022 Standard',
+                        build='20348', revision='2582', installation_type='Server'))
+        assert finding.severity == pf.OK
+        assert 'Windows Server 2022 Standard' in finding.summary
 
     def test_a_disk_attached_elsewhere_blocks(self):
         finding = pf.check_disk_in_use([_image(attached=True)])
@@ -908,3 +913,28 @@ class TestTheOstypeFollowsTheGuest:
         assert ostype_for([]) == 'other'
         assert ostype_for([_image(windows=False)]) == 'other'
         assert self._ostype('') == 'other'
+
+
+class TestTheRegistryIsOpenedRatherThanInferred:
+    """A hive Windows' own offline loader refuses is one hivex will refuse too — and that
+    is the only version of this warning that stands up. The measured case that used to
+    trigger it (DISM reporting a version and no edition) opens fine."""
+
+    def test_a_hive_that_will_not_load_warns(self):
+        finding = pf.check_guest_registry(_inspection(hive_readable=False))
+        assert finding.severity == pf.WARNING
+        assert 'hivex' in finding.detail
+
+    def test_a_hive_that_loads_reports_what_is_in_it(self):
+        finding = pf.check_guest_registry(_inspection())
+        assert finding.severity == pf.OK
+        assert 'build 20348.2582' in finding.summary
+        assert 'Server' in finding.detail
+
+    def test_nothing_is_opened_when_no_drivers_are_injected(self):
+        finding = pf.check_guest_registry(_inspection(hive_readable=False), injecting=False)
+        assert finding.severity == pf.OK
+
+    def test_a_volume_without_windows_is_not_a_finding(self):
+        finding = pf.check_guest_registry(_inspection(windows=False, hive_readable=None))
+        assert finding.severity == pf.OK
