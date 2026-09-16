@@ -89,15 +89,33 @@
          * actually made against. An adapter Hyper-V has never started reports all zeroes;
          * that is not an identity, so the position is used instead.
          */
-        function hvAdapterLabel(adapter, index) {
+        // The MAC of one adapter, colon-separated, or '' when the source has not assigned
+        // one yet. Hyper-V reports all zeroes until a VM with a dynamic MAC has started
+        // once, and zeroes are the absence of an address rather than an address.
+        function hvAdapterMac(adapter) {
             const mac = (adapter?.mac_address || '').replace(/[^0-9a-fA-F]/g, '');
-            const unset = mac === '' || /^0+$/.test(mac);
-            const pretty = unset ? '' : (mac.match(/.{2}/g) || []).join(':').toLowerCase();
+            if (mac.length !== 12 || /^0+$/.test(mac)) return '';
+            return (mac.match(/.{2}/g) || []).join(':').toLowerCase();
+        }
+
+        // How one adapter is labelled in the wizard. The position comes first and always,
+        // because everything else can be identical between two adapters on the same VM:
+        // they hang on the same switch, they are both called "Network Adapter" in whatever
+        // language the host speaks, and neither has a MAC until the VM has run once. Two
+        // rows that read the same are two rows nobody can map correctly.
+        function hvAdapterLabel(adapter, index, t) {
+            const mac = hvAdapterMac(adapter);
             const name = adapter?.name && adapter.name !== 'Network Adapter' ? adapter.name : '';
-            if (pretty && name) return `${name} · ${pretty}`;
-            if (pretty) return pretty;
-            if (name) return name;
-            return `adapter ${index + 1}`;
+            const detail = mac || (t ? (t('hvNoMacYet') || 'no MAC yet') : 'no MAC yet');
+            return `#${index + 1} · ${name ? name + ' · ' : ''}${detail}`;
+        }
+
+        // The key a network map entry is stored under. It has to match what the backend
+        // computes in `hyperv_preflight.adapter_key`, or the wizard writes under one key
+        // and the preflight reads another — which looks like every adapter being unmapped
+        // and blocks the migration with the form correctly filled in.
+        function hvAdapterKey(adapter, index) {
+            return adapter?.network || `adapter${index + 1}`;
         }
 
         function hvBytesToGiB(bytes) {

@@ -259,15 +259,18 @@ def plan_hyperv_to_pve(source_cluster_id, source_vmid, target_cluster_id) -> dic
                 'name': nic.get('name'),
                 'mac_address': nic.get('mac_address'),
                 'switch_name': nic.get('switch_name'),
-                'network': nic.get('mac_address') or nic.get('name') or '',
+                'network': hyperv_preflight.adapter_key(nic, i),
                 'bridge': nic.get('switch_name') or nic.get('name') or '',
+                # The row's own label, so two adapters that are called the same thing and
+                # have no MAC yet are still two rows an operator can tell apart.
+                'label': hyperv_preflight.adapter_label(nic, i),
                 # What the source says, and what this adapter would arrive on if nobody
                 # touches the field. The wizard shows the mode so an operator can see why
                 # a trunk adapter's VLAN box is empty rather than wondering.
                 'vlan_id': nic.get('vlan_id'),
                 'vlan_mode': nic.get('vlan_mode'),
                 'vlan_suggested': vlan_for_adapter(nic),
-            } for nic in (data.get('network_adapters') or [])],
+            } for i, nic in enumerate(data.get('network_adapters') or [])],
             'generation': generation,
             'bios': GENERATION_BIOS.get(generation or 0, 'seabios'),
             'machine': GENERATION_MACHINE.get(generation or 0, DEFAULT_MACHINE),
@@ -1253,13 +1256,10 @@ def _free_volume(node, volume):
         logger.warning('Could not free the partial volume %s', volume, exc_info=True)
 
 
-def _is_unset_mac(mac: str) -> bool:
-    """Is this the all-zero MAC Hyper-V reports for an adapter that has never been used?
-
-    Hyper-V assigns a dynamic MAC when the VM first starts. Until then the adapter reports
-    zeroes, and passing those on is refused by the target rather than ignored.
-    """
-    return not set(mac.replace(':', '').replace('-', '')) - {'0'}
+#: Kept here as the name this module already used; the implementation moved next to
+#: `adapter_key`, which needs the same question answered to decide whether a MAC can
+#: identify an adapter at all.
+_is_unset_mac = hyperv_preflight.is_unset_mac
 
 
 def _guest_might_be_windows(detail) -> bool:
@@ -1586,7 +1586,7 @@ def _create_target_vm(task, target, new_vmid, detail):
     # field, and the task class belongs to upstream.
     vlan_map = (task.config or {}).get('vlan_map') or {}
     for index, nic in enumerate((detail.get('network_adapters') or [])[:MAX_NETWORK_ADAPTERS]):
-        key = nic.get('mac_address') or nic.get('name') or ''
+        key = hyperv_preflight.adapter_key(nic, index)
         bridge = network_map.get(key)
         if not bridge:
             # Preflight blocks an unmapped adapter, so reaching this means the map changed
