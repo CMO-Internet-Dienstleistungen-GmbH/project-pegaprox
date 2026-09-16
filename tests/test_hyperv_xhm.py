@@ -2106,3 +2106,72 @@ class TestAFailedRunSaysWhatItLeftBehind:
         hyperv_xhm._fail(task, 'mig1', 'Preflight refused')
 
         assert any('nothing to clean up' in line for line in task.log_lines)
+
+
+class TestARecordIsNotTheTarget:
+    """A failed migration records what it left behind, and the next start is blocked until
+    somebody deals with it. But the obvious way to deal with it is the Proxmox interface —
+    and that leaves this database untouched. The block then names a volume that exists
+    nowhere, and no amount of tidying up clears it."""
+
+    def _migration(self, resources):
+        return {'migration_id': 'd106cc56', 'target_cluster': TARGET,
+                'target_node': 'node-a', 'created_resources': resources}
+
+    def _target_holding(self, volids, monkeypatch, vm_configs=None):
+        target = FakeTarget()
+        target.vm_configs = vm_configs
+        original = target._api_get
+
+        def _api_get(url):
+            if 'content=images' in url:
+                return FakeResponse(payload={'data': [{'volid': v} for v in volids]})
+            return original(url)
+
+        target._api_get = _api_get
+        monkeypatch.setitem(hyperv_xhm.cluster_managers, TARGET, target)
+        return target
+
+    def test_a_volume_that_was_removed_by_hand_stops_blocking(self, monkeypatch):
+        forgotten = []
+        monkeypatch.setattr(hyperv_xhm.hyperv_db, 'forget_created_resource',
+                            lambda conn, mid, kind, ident: forgotten.append((kind, ident)))
+        monkeypatch.setattr(hyperv_xhm, '_conn', lambda: None)
+        self._target_holding(['vm-pool:vm-9003-cloudinit'], monkeypatch)
+
+        migration = self._migration([{'kind': 'volume', 'id': 'vm-pool:vm-100-disk-0'}])
+        assert hyperv_xhm._leftovers_that_still_exist(migration) == []
+        # and the record is cleared, so the next check does not ask again
+        assert forgotten == [('volume', 'vm-pool:vm-100-disk-0')]
+
+    def test_a_volume_that_is_still_there_keeps_blocking(self, monkeypatch):
+        monkeypatch.setattr(hyperv_xhm, '_conn', lambda: None)
+        self._target_holding(['vm-pool:vm-100-disk-0'], monkeypatch)
+
+        migration = self._migration([{'kind': 'volume', 'id': 'vm-pool:vm-100-disk-0'}])
+        assert len(hyperv_xhm._leftovers_that_still_exist(migration)) == 1
+
+    def test_a_cluster_that_cannot_be_asked_keeps_its_leftovers(self, monkeypatch):
+        # Not knowing is a reason to hold the block: starting again over a disk that is
+        # still there copies it twice.
+        monkeypatch.setitem(hyperv_xhm.cluster_managers, TARGET, None)
+        migration = self._migration([{'kind': 'volume', 'id': 'vm-pool:vm-100-disk-0'}])
+        assert len(hyperv_xhm._leftovers_that_still_exist(migration)) == 1
+
+    def test_a_vmid_that_now_belongs_to_somebody_else_is_not_our_leftover(self, monkeypatch):
+        monkeypatch.setattr(hyperv_xhm.hyperv_db, 'forget_created_resource',
+                            lambda *a: None)
+        monkeypatch.setattr(hyperv_xhm, '_conn', lambda: None)
+        self._target_holding([], monkeypatch,
+                             vm_configs={'100': {'description': 'somebody else'}})
+
+        migration = self._migration([{'kind': 'vm', 'id': '100'}])
+        assert hyperv_xhm._leftovers_that_still_exist(migration) == []
+
+    def test_a_vm_still_carrying_our_mark_keeps_blocking(self, monkeypatch):
+        monkeypatch.setattr(hyperv_xhm, '_conn', lambda: None)
+        mark = hyperv_xhm.target_vm_description('d106cc56', 'guest-a')
+        self._target_holding([], monkeypatch, vm_configs={'100': {'description': mark}})
+
+        migration = self._migration([{'kind': 'vm', 'id': '100'}])
+        assert len(hyperv_xhm._leftovers_that_still_exist(migration)) == 1

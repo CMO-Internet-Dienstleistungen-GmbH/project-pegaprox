@@ -164,7 +164,7 @@ Hyper-V host, read-only, against a stopped VM.
 |---|---|---|
 | Guest's Windows version | `Get-WindowsImage` on the VHDX, no mount, 1–3 s per disk | The wrong driver release, which Windows does not report — it just does not load the driver |
 | Which disk carries Windows | the same call, per disk | A boot entry pointing at a data disk |
-| Registry readable | `EditionId` present while `Version` is | The driver injection failing on a hive it cannot open, after the copy |
+| Registry opens | `reg load` on the guest's SOFTWARE hive, read-only | The driver injection failing on a hive it cannot open, after the copy — and it answers with the guest's real product name and patch level |
 | Disk attached elsewhere | `Get-VHD`'s `Attached` | Copying a disk something else is writing to |
 | **Hibernation / Fast Startup** | read-only `Mount-VHD`, then `hiberfil.sys` | A saved session that cannot be resumed on different hardware, discarded without anybody being told |
 | File system clean | `fsutil dirty query`, **exit code** not text | An unclean volume carried onto the target, and hivex refusing its transaction logs |
@@ -177,6 +177,14 @@ reads the same files and changes nothing on the host. The unmount runs in a
 `finally` on every path, and the result reports `Attached` afterwards — a disk
 left attached is a VM that cannot start, and the preflight blocks on it rather
 than letting it pass unnoticed.
+
+The registry is **opened**, not inferred from. An earlier version of this check read an
+empty `EditionId` from `Get-WindowsImage` as "the hive is unreadable" and warned that the
+injection would fail. Measured on exactly such a disk, that was wrong: `reg load`
+succeeded and every value was there, including the edition DISM had not reported — and
+with a newer patch level than DISM claimed (`UBR 2582` against `SPBuild 2340`). A hive
+that Windows' own offline loader refuses is the only case that says anything about hivex,
+which is stricter still.
 
 `fsutil`'s answer is read from its exit code because the sentence is localised:
 a German host says "ist NICHT fehlerhaft", and a comparison against English text

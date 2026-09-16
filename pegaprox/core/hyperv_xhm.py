@@ -685,7 +685,7 @@ def refuse_hyperv_start(source_cluster_id, source_vmid, options=None):
             if migration['status'] not in (hyperv_db.STATUS_FAILED,
                                            hyperv_db.STATUS_INTERRUPTED):
                 continue
-            leftovers = migration.get('created_resources') or []
+            leftovers = _leftovers_that_still_exist(migration)
             if leftovers:
                 what = ', '.join(f'{r.get("kind")} {r.get("id")}' for r in leftovers[:4])
                 return (f'Migration {migration["migration_id"]} failed and left '
@@ -703,6 +703,91 @@ def refuse_hyperv_start(source_cluster_id, source_vmid, options=None):
 # What the two sides call a machine that is running. Hyper-V says 'Running', Proxmox says
 # 'running', and anything else — 'Off', 'stopped', 'paused', 'Saved' — is not running.
 _RUNNING = 'running'
+
+
+def _leftovers_that_still_exist(migration) -> list:
+    """The recorded leftovers of one migration, minus the ones that are already gone.
+
+    A record is not the target. Somebody who removes a leftover disk in the Proxmox
+    interface — the obvious way to do it — used to stay blocked by a note in this
+    database, with a message naming a volume that no longer exists anywhere. So the record
+    is checked against the cluster, and what has gone is forgotten here too.
+
+    A cluster that cannot be asked keeps its leftovers: not knowing is a reason to hold
+    the block, because starting again over a disk that is still there copies it twice.
+    """
+    recorded = migration.get('created_resources') or []
+    if not recorded:
+        return []
+
+    target = cluster_managers.get(migration.get('target_cluster'))
+    if not target or not getattr(target, 'is_connected', False):
+        return recorded
+
+    node = migration.get('target_node') or ''
+    still_there, gone = [], []
+    for entry in recorded:
+        kind, identifier = entry.get('kind'), entry.get('id')
+        try:
+            if kind == 'volume':
+                present = _volume_exists(target, node, identifier)
+            elif kind == 'vm':
+                present = _vm_still_ours(target, migration, identifier)
+            else:
+                present = True
+        except Exception:
+            logger.debug('Could not verify %s %s of migration %s', kind, identifier,
+                         migration.get('migration_id'), exc_info=True)
+            present = True
+        (still_there if present else gone).append(entry)
+
+    for entry in gone:
+        try:
+            hyperv_db.forget_created_resource(_conn(), migration['migration_id'],
+                                              entry.get('kind'), entry.get('id'))
+            logger.info('[XHM] %s %s of migration %s is gone from the target; forgetting it',
+                        entry.get('kind'), entry.get('id'), migration['migration_id'])
+        except Exception:
+            logger.warning('Could not forget %s %s', entry.get('kind'), entry.get('id'),
+                           exc_info=True)
+    return still_there
+
+
+def _vm_still_ours(target, migration, vmid) -> bool:
+    """Is that VM still there and still this migration's?
+
+    Deliberately not `_is_our_target_vm`, which answers False when it could not ask at
+    all. Here that difference decides whether a record is deleted, and "I could not
+    reach the cluster" must never be read as "it is gone".
+    """
+    node = migration.get('target_node') or ''
+    response = target._api_get(
+        f'https://{target.host}:{target.api_port}'
+        f'/api2/json/nodes/{node}/qemu/{vmid}/config')
+    if response.status_code == 404:
+        return False
+    if response.status_code != 200:
+        return True
+    description = (response.json().get('data') or {}).get('description', '')
+    # A VMID that now carries somebody else's guest is not this migration's leftover
+    # either — the number was reused, and blocking on it would be blocking on a stranger.
+    return _describes_migration(description, migration['migration_id'])
+
+
+def _volume_exists(target, node, volid) -> bool:
+    """Is this volume still on the storage it was allocated on?"""
+    if not volid or ':' not in str(volid):
+        return True
+    storage = str(volid).split(':', 1)[0]
+    response = target._api_get(
+        f'https://{target.host}:{target.api_port}'
+        f'/api2/json/nodes/{node}/storage/{storage}/content?content=images')
+    if response.status_code != 200:
+        # Asked and not answered. Treated as still there, for the same reason a cluster
+        # that cannot be reached keeps its leftovers.
+        return True
+    return any((item.get('volid') or '') == volid
+               for item in (response.json().get('data') or []))
 
 
 def refuse_source_start(source_cluster_id, source_vmid):
