@@ -2175,3 +2175,85 @@ class TestARecordIsNotTheTarget:
 
         migration = self._migration([{'kind': 'vm', 'id': '100'}])
         assert len(hyperv_xhm._leftovers_that_still_exist(migration)) == 1
+
+
+class TestARecordThatOutlivesTheProcess:
+    """The migration list is a dict in this process; a restart empties it. The check that
+    refuses to start the same VM again reads the database, which does not. Between the
+    two an operator saw nothing and could start nothing — no row means no cleanup button
+    and no way to dismiss the entry, while the refusal went on naming resources."""
+
+    def _row(self, **overrides):
+        row = {'migration_id': 'd106cc56', 'source_cluster': SOURCE, 'source_vm_guid': GUID,
+               'source_vm_name': 'TestMig_CLONE', 'target_cluster': TARGET,
+               'target_node': 'node-a', 'target_storage': 'vm-pool', 'target_vmid': 100,
+               'phase': 'creating', 'status': 'failed', 'progress': 78,
+               'error': 'Creating the target VM failed', 'created_resources': [],
+               'disk_progress': {}, 'started_at': 1.0, 'completed_at': 2.0}
+        row.update(overrides)
+        return row
+
+    def test_what_the_database_remembers_is_offered_to_the_list(self, monkeypatch):
+        monkeypatch.setattr(hyperv_xhm.hyperv_db, 'list_migrations',
+                            lambda conn, limit: [self._row()])
+        monkeypatch.setattr(hyperv_xhm, '_conn', lambda: None)
+
+        rows = hyperv_xhm.recorded_migrations(already_listed=())
+
+        assert len(rows) == 1
+        assert rows[0]['id'] == 'd106cc56'
+        assert rows[0]['vm_name'] == 'TestMig_CLONE'
+        assert rows[0]['status'] == 'failed'
+        # Said plainly, so the interface can show it for what it is.
+        assert rows[0]['recorded'] is True
+        # The timeline and the log lived in the process and are gone.
+        assert rows[0]['phase_times'] == {} and rows[0]['log_lines'] == []
+
+    def test_a_migration_the_process_still_holds_is_not_duplicated(self, monkeypatch):
+        monkeypatch.setattr(hyperv_xhm.hyperv_db, 'list_migrations',
+                            lambda conn, limit: [self._row()])
+        monkeypatch.setattr(hyperv_xhm, '_conn', lambda: None)
+
+        assert hyperv_xhm.recorded_migrations(already_listed={'d106cc56'}) == []
+
+    def test_a_record_with_nothing_left_on_the_target_can_be_forgotten(self, monkeypatch):
+        deleted = []
+        monkeypatch.setattr(hyperv_xhm.hyperv_db, 'get_migration',
+                            lambda conn, mid: self._row())
+        monkeypatch.setattr(hyperv_xhm.hyperv_db, 'delete_migration',
+                            lambda conn, mid: deleted.append(mid))
+        monkeypatch.setattr(hyperv_xhm, '_conn', lambda: None)
+
+        assert hyperv_xhm.forget_recorded_migration('d106cc56')['forgotten'] is True
+        assert deleted == ['d106cc56']
+
+    def test_a_record_still_holding_the_target_is_kept(self, monkeypatch):
+        monkeypatch.setattr(
+            hyperv_xhm.hyperv_db, 'get_migration',
+            lambda conn, mid: self._row(
+                created_resources=[{'kind': 'volume', 'id': 'vm-pool:vm-100-disk-0'}]))
+        monkeypatch.setattr(hyperv_xhm, '_conn', lambda: None)
+        # The cluster is not reachable in this test, which is exactly the case where a
+        # leftover keeps its benefit of the doubt.
+        monkeypatch.setitem(hyperv_xhm.cluster_managers, TARGET, None)
+
+        answer = hyperv_xhm.forget_recorded_migration('d106cc56')
+
+        assert answer['forgotten'] is False
+        assert 'copying the same disks' in answer['error']
+
+    def test_a_running_migration_is_not_taken_off_the_record(self, monkeypatch):
+        monkeypatch.setattr(hyperv_xhm.hyperv_db, 'get_migration',
+                            lambda conn, mid: self._row(status=hyperv_xhm.hyperv_db.STATUS_RUNNING))
+        monkeypatch.setattr(hyperv_xhm, '_conn', lambda: None)
+
+        answer = hyperv_xhm.forget_recorded_migration('d106cc56')
+
+        assert answer['forgotten'] is False
+        assert 'still running' in answer['error']
+
+    def test_forgetting_something_that_is_not_there_is_a_success(self, monkeypatch):
+        monkeypatch.setattr(hyperv_xhm.hyperv_db, 'get_migration', lambda conn, mid: None)
+        monkeypatch.setattr(hyperv_xhm, '_conn', lambda: None)
+
+        assert hyperv_xhm.forget_recorded_migration('gone')['forgotten'] is True
