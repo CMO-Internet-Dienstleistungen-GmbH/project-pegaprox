@@ -130,6 +130,86 @@ def normalise_checkpoint(raw: dict) -> dict:
     }
 
 
+#: `Get-WindowsImage` answers with 9 for x64 and 0 for x86 — the PROCESSOR_ARCHITECTURE
+#: values, not a string. Spelled out here so nothing downstream compares magic numbers.
+_ARCHITECTURES = {0: 'x86', 5: 'arm', 9: 'x64', 12: 'arm64'}
+
+
+def normalise_disk_inspection(raw: dict) -> dict:
+    """What the inspection found, in this product's vocabulary.
+
+    `dirty` is derived from the exit code rather than the sentence: `fsutil` answers in
+    the host's language, and matching English text reads every German host as clean.
+    """
+    disks = []
+    for entry in (raw.get('Disks') or []):
+        volumes = []
+        for vol in (entry.get('Volumes') or []):
+            exit_code = vol.get('DirtyExit')
+            volumes.append({
+                'file_system': vol.get('FileSystem') or '',
+                'label': vol.get('Label') or '',
+                'size': int(vol.get('Size') or 0),
+                'free': int(vol.get('Free') or 0),
+                'windows': bool(vol.get('Windows')),
+                'hibernated': bool(vol.get('Hiberfil')),
+                'hiberfil_size': int(vol.get('HiberfilSize') or 0),
+                'page_file': bool(vol.get('PageFile')),
+                # None where it could not be asked, which is not the same as clean.
+                'dirty': None if exit_code is None else bool(exit_code),
+            })
+        disks.append({
+            'path': entry.get('Path') or '',
+            'mounted': bool(entry.get('Mounted')),
+            'error': entry.get('Error') or '',
+            'attached_after': entry.get('AttachedAfter'),
+            'volumes': volumes,
+        })
+    return {
+        'state': raw.get('State') or '',
+        'inspected': bool(raw.get('Inspected')),
+        'error': raw.get('Error') or '',
+        'disks': disks,
+    }
+
+
+def normalise_image_facts(raw: dict) -> dict:
+    """One disk's image facts, in this product's vocabulary.
+
+    `registry_readable` is the finding that is not in any single field: the version comes
+    from the image header and the edition from the guest's SOFTWARE hive, so a disk that
+    answers with one and not the other has a hive that could not be read in full. That is
+    the same hive the driver injection edits, and it fails there — after the copy.
+    """
+    windows = bool(raw.get('Windows'))
+    build = int(raw.get('Build') or 0)
+    edition = (raw.get('EditionId') or '').strip()
+    install_type = (raw.get('InstallationType') or '').strip()
+    return {
+        'path': raw.get('Path') or '',
+        'controller_type': raw.get('ControllerType') or '',
+        'controller_number': raw.get('ControllerNumber'),
+        'controller_location': raw.get('ControllerLocation'),
+        'exists': bool(raw.get('Exists')),
+        'attached': raw.get('Attached'),
+        'vhd_type': raw.get('VhdType') or '',
+        'parent_path': raw.get('ParentPath') or '',
+        'size': int(raw.get('Size') or 0),
+        'file_size': int(raw.get('FileSize') or 0),
+        'windows': windows,
+        'windows_error': raw.get('WindowsError') or '',
+        'build': build,
+        'version': raw.get('Version') or '',
+        'revision': raw.get('SPBuild') or '',
+        'architecture': _ARCHITECTURES.get(raw.get('Architecture'), raw.get('Architecture')),
+        'edition_id': edition,
+        'installation_type': install_type,
+        'system_root': raw.get('SystemRoot') or '',
+        'registry_readable': bool(windows and (edition or install_type)),
+        'seconds': raw.get('Seconds'),
+    }
+
+
 def normalise_vm_detail(raw: dict) -> dict:
     """A whole VM, in the shape preflight and the migration planner consume.
 
@@ -287,6 +367,37 @@ class HyperVManager:
         if not raw:
             raise HyperVError(f'The host returned nothing for VM {vm_guid}.', kind='unknown')
         return normalise_vm_detail(raw)
+
+    def get_guest_image_facts(self, vm_guid: str) -> list[dict]:
+        """What each of this VM's disks says about the guest, without starting it.
+
+        The only way to know a stopped guest's Windows version. The integration services
+        report it over KVP and those items exist only while the VM runs — measured on a
+        Server 2022 host: complete while running, empty three seconds after the guest
+        finished shutting down. A migration requires a stopped VM, so the host has
+        forgotten by the time the wizard asks. `Get-WindowsImage` reads it off the disk
+        instead, in place, without mounting or attaching anything.
+
+        Costs two to three seconds per disk. A disk with no Windows on it comes back as
+        `windows: False` with the reason, which is an answer and not an error — and it
+        says that about *that disk*, never about the guest.
+        """
+        raw = self._client.run_json(scripts.VM_IMAGE_FACTS, VmId=vm_guid) or []
+        return [normalise_image_facts(row) for row in raw]
+
+    def inspect_disks(self, vm_guid: str) -> dict:
+        """Look inside this VM's disks for what makes a migration fail late.
+
+        Mounts each disk read-only on the host, reads what cannot be seen from outside —
+        a hibernation file, an unclean file system, whether a Windows is there at all —
+        and releases it again. Only for a stopped VM: a running one is already writing to
+        those disks.
+
+        Six seconds for a 100 GiB disk with three volumes. `attached_after` is reported
+        per disk, because the one way this can hurt is by not letting go.
+        """
+        raw = self._client.run_json(scripts.VM_DISK_INSPECTION, VmId=vm_guid) or {}
+        return normalise_disk_inspection(raw)
 
     def get_vm_state(self, vm_guid: str) -> dict:
         """The cheapest question there is, asked again right before disks are read.

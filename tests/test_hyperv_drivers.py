@@ -44,22 +44,43 @@ class TestServer2012R2MayOnlyHave0_1_189:
         reason = drivers.refuse_iso(9600, 'local:iso/virtio-win.iso')
         assert 'virtio-win-0.1.189.iso' in reason
 
-    def test_a_guest_with_no_rule_takes_anything(self):
+    def test_a_current_guest_takes_a_current_release(self):
         assert drivers.refuse_iso(20348, 'local:iso/virtio-win-0.1.262.iso') is None
-        assert drivers.refuse_iso(None, 'local:iso/virtio-win.iso') is None
+        assert drivers.refuse_iso(20348, 'local:iso/virtio-win.iso') is None
+
+    def test_the_legacy_release_is_refused_for_everything_else(self):
+        # 0.1.189 has no 2k22, w11 or 2k25 directory at all, so a modern guest given it
+        # ends up with no storage driver registered — after the copy.
+        reason = drivers.refuse_iso(20348, 'local:iso/virtio-win-0.1.189.iso')
+        assert reason and 'only for Windows Server 2012 R2' in reason
+
+    def test_a_guest_that_names_no_build_is_refused_whatever_the_iso(self):
+        # The subdirectory is chosen from the build number, and without one the script
+        # falls through to the newest variant. Handing Windows 11 drivers to a guest
+        # nobody could identify is the failure this prevents, not a default.
+        for iso in ('local:iso/virtio-win-0.1.189.iso', 'local:iso/virtio-win-0.1.302.iso'):
+            assert drivers.refuse_iso(None, iso)
 
 
 class TestTheGuardRunsOnTheNode:
     """The build number is only known on the node, inside the script that mounted the
     volume. Whether a release satisfies a build is known here, before anything runs."""
 
-    def test_a_fitting_iso_adds_nothing_to_the_script(self):
-        assert drivers.guard_snippet('local:iso/virtio-win-0.1.189.iso') == ''
+    def test_a_fitting_iso_still_guards_the_unreadable_case(self):
+        # Nothing about the build is refused for this ISO, but a guest that reports no
+        # build at all is refused whatever was chosen.
+        snippet = drivers.guard_snippet('local:iso/virtio-win-0.1.189.iso')
+        assert "''|*[!0-9]*)" in snippet
+        assert f'-eq {drivers.LEGACY_BUILD}' not in snippet
+
+    def test_the_legacy_iso_is_stopped_for_a_modern_guest(self):
+        snippet = drivers.guard_snippet('local:iso/virtio-win-0.1.189.iso')
+        assert f'-ne {drivers.LEGACY_BUILD}' in snippet
 
     def test_a_wrong_iso_stops_the_script_before_it_copies(self):
         snippet = drivers.guard_snippet('local:iso/virtio-win-0.1.262.iso')
         assert 'case "$VER_BUILD" in' in snippet
-        assert '9600)' in snippet
+        assert f'-eq {drivers.LEGACY_BUILD}' in snippet
         assert f'exit {drivers.REFUSED_EXIT_CODE}' in snippet
 
     def test_the_snippet_is_valid_shell(self):
@@ -122,3 +143,36 @@ class TestTheIsoNameCannotRunCommands:
                                 capture_output=True, text=True)
         assert result.returncode == drivers.REFUSED_EXIT_CODE
         assert 'rm -rf' in result.stdout
+
+
+class TestWhichIsoTheWizardPreselects:
+    """The wizard offers what the server would accept, so an operator does not pick a file
+    the preflight then blocks."""
+
+    ON_NODE = [
+        {'volid': 'vm-pool:iso/gparted-live-1.7.0-8-amd64.iso', 'release': None},
+        {'volid': 'vm-pool:iso/virtio-win-0.1.189.iso', 'release': '0.1.189'},
+        {'volid': 'vm-pool:iso/virtio-win-0.1.262.iso', 'release': '0.1.262'},
+    ]
+
+    def test_server_2012_r2_gets_the_legacy_release(self):
+        assert drivers.preferred_iso(9600, self.ON_NODE) == 'vm-pool:iso/virtio-win-0.1.189.iso'
+
+    def test_a_current_guest_gets_the_newest_and_never_the_legacy_one(self):
+        assert drivers.preferred_iso(20348, self.ON_NODE) == 'vm-pool:iso/virtio-win-0.1.262.iso'
+
+    def test_a_current_guest_with_only_the_legacy_iso_gets_nothing(self):
+        only_legacy = [self.ON_NODE[1]]
+        assert drivers.preferred_iso(20348, only_legacy) is None
+
+    def test_an_iso_whose_name_states_no_release_is_never_preselected(self):
+        assert drivers.preferred_iso(20348, [self.ON_NODE[0]]) is None
+
+    def test_what_to_fetch_when_nothing_fits(self):
+        assert drivers.release_to_fetch(9600) == drivers.LEGACY_RELEASE
+        assert drivers.release_to_fetch(20348) == drivers.newest_release(drivers.CATALOGUE)
+        assert drivers.release_to_fetch(None) is None
+
+    def test_releases_sort_by_number_not_by_text(self):
+        # '0.1.9' must not outrank '0.1.302' the way string comparison would have it.
+        assert drivers.newest_release(['0.1.9', '0.1.302']) == '0.1.302'

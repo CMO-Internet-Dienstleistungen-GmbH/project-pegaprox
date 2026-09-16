@@ -237,6 +237,184 @@ $items = @(@(Get-VMHardDiskDrive -VM $vm) | Where-Object { $_ } | ForEach-Object
 ConvertTo-Json -Depth 6 -Compress -InputObject @($items)
 '''
 
+#: What the disks of one VM say about the guest on them, without starting it.
+#:
+#: `Get-WindowsImage` reads a VHDX in place — no mount, no attach, nothing written. It is
+#: the only way to know a stopped guest's Windows version: the integration services report
+#: that over KVP, and those items exist only while the VM runs (measured 2026-09-16: full
+#: while running, empty three seconds after the guest finished shutting down). A migration
+#: requires a stopped VM, so at the moment the wizard needs the answer, the host no longer
+#: has it — but the disk still does.
+#:
+#: Costs about two to three seconds per disk on a 100 GiB VHDX. Asked once, when the plan
+#: is built, rather than on every preflight refresh.
+#:
+#: Errors are per disk and never raise: a data disk with no Windows on it is an ordinary
+#: answer, not a failure, and must not be read as "this guest is not Windows" either —
+#: only the disk it was asked about.
+VM_IMAGE_FACTS = r"""
+param([Parameter(Mandatory=$true)][string]$VmId)
+
+$vm = Get-VM -Id $VmId -ErrorAction Stop
+$items = @(@(Get-VMHardDiskDrive -VM $vm) | Where-Object { $_ } | ForEach-Object {
+    $path = $_.Path
+    $row = [ordered]@{
+        Path            = $path
+        ControllerType  = "$($_.ControllerType)"
+        ControllerNumber = $_.ControllerNumber
+        ControllerLocation = $_.ControllerLocation
+        Exists          = $false
+        Attached        = $null
+        VhdType         = ''
+        ParentPath      = ''
+        Size            = 0
+        FileSize        = 0
+        Windows         = $false
+        WindowsError    = ''
+        Build           = 0
+        Version         = ''
+        SPBuild         = ''
+        Architecture    = $null
+        EditionId       = ''
+        InstallationType = ''
+        SystemRoot      = ''
+        Seconds         = 0
+    }
+    if (Test-Path -LiteralPath $path) {
+        $row.Exists = $true
+        try {
+            $vhd = Get-VHD -Path $path -ErrorAction Stop
+            $row.Attached   = [bool]$vhd.Attached
+            $row.VhdType    = "$($vhd.VhdType)"
+            $row.ParentPath = "$($vhd.ParentPath)"
+            $row.Size       = [int64]$vhd.Size
+            $row.FileSize   = [int64]$vhd.FileSize
+        } catch { }
+
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        try {
+            # Index 1 is the installed system on a virtual disk; a VHDX carries no second
+            # image the way an install WIM does.
+            $img = Get-WindowsImage -ImagePath $path -Index 1 -ErrorAction Stop
+            $row.Windows          = $true
+            $row.Build            = [int]$img.Build
+            $row.Version          = "$($img.Version)"
+            $row.SPBuild          = "$($img.SPBuild)"
+            $row.Architecture     = $img.Architecture
+            # Kept for what their absence says, not for their contents: these two come
+            # out of the guest's SOFTWARE hive and can be empty while the version fields
+            # are filled. That is the same hive the driver injection writes into later,
+            # and it fails there with "Operation not supported" — after the copy.
+            $row.EditionId        = "$($img.EditionId)"
+            $row.InstallationType = "$($img.InstallationType)"
+            $row.SystemRoot       = "$($img.SystemRoot)"
+        } catch {
+            $row.WindowsError = $_.Exception.Message.Split([Environment]::NewLine)[0]
+        }
+        $sw.Stop()
+        $row.Seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+    }
+    [pscustomobject]$row
+})
+ConvertTo-Json -Depth 4 -Compress -InputObject @($items)
+"""
+
+#: What the inside of a stopped VM's disks says about whether it can be migrated.
+#:
+#: Everything that makes a migration fail late lives in the file system and is invisible
+#: from outside the disk: a guest that hibernated, whose saved session cannot survive a
+#: change of chipset and controller; a file system nobody dismounted cleanly; a volume
+#: that carries no Windows where one was expected.
+#:
+#: Mounting is the only way in, so the shape of this script is decided by one thing: the
+#: host must give the disk back. A VHDX left attached is a VM that cannot start. Hence
+#: `-ReadOnly`, hence the `finally`, and hence the `Attached` reading afterwards that says
+#: whether the release worked.
+#:
+#: No drive letters are assigned — the volumes are reached through their own GUID paths
+#: (`\\?\Volume{...}`), which reads the same files and changes nothing on the host.
+#: Measured 2026-09-16: six seconds for a 100 GiB disk with three volumes.
+VM_DISK_INSPECTION = r"""
+param([Parameter(Mandatory=$true)][string]$VmId)
+
+$ErrorActionPreference = 'Continue'
+$vm = Get-VM -Id $VmId -ErrorAction Stop
+$fsutil = Join-Path $env:SystemRoot 'System32\fsutil.exe'
+$result = [ordered]@{
+    State = "$($vm.State)"; Inspected = $false; Error = ''; Disks = @()
+}
+if ($vm.State -ne 'Off') {
+    # A running VM writes to these disks. Mounting them on the host as well is not a
+    # measurement, it is a second writer.
+    $result.Error = "The VM is $($vm.State); its disks are only inspected while it is off."
+    [pscustomobject]$result | ConvertTo-Json -Depth 6 -Compress
+    return
+}
+
+foreach ($d in @(Get-VMHardDiskDrive -VM $vm)) {
+    $entry = [ordered]@{
+        Path = $d.Path; Mounted = $false; Error = ''; AttachedAfter = $null; Volumes = @()
+    }
+    try {
+        if ((Get-VHD -Path $d.Path -ErrorAction Stop).Attached) {
+            $entry.Error = 'The disk is already attached to something; not inspected.'
+            $result.Disks += [pscustomobject]$entry
+            continue
+        }
+    } catch {
+        $entry.Error = $_.Exception.Message.Split([Environment]::NewLine)[0]
+        $result.Disks += [pscustomobject]$entry
+        continue
+    }
+
+    try {
+        $mounted = Mount-VHD -Path $d.Path -ReadOnly -Passthru -ErrorAction Stop
+        $entry.Mounted = $true
+        Start-Sleep -Seconds 2
+        foreach ($vol in ($mounted | Get-Disk | Get-Partition | Get-Volume)) {
+            $root = if ($vol.DriveLetter) { "$($vol.DriveLetter):" } else { "$($vol.Path)".TrimEnd('\') }
+            $row = [ordered]@{
+                FileSystem = "$($vol.FileSystem)"
+                Label      = "$($vol.FileSystemLabel)"
+                Size       = [int64]$vol.Size
+                Free       = [int64]$vol.SizeRemaining
+                Windows    = $false
+                Hiberfil   = $false
+                HiberfilSize = 0
+                PageFile   = $false
+                DirtyExit  = $null
+            }
+            if ($root) {
+                $row.Windows = Test-Path -LiteralPath "$root\Windows\System32\config\SOFTWARE"
+                $hib = "$root\hiberfil.sys"
+                if (Test-Path -LiteralPath $hib) {
+                    $row.Hiberfil = $true
+                    try { $row.HiberfilSize = [int64](Get-Item -Force -LiteralPath $hib).Length } catch { }
+                }
+                $row.PageFile = Test-Path -LiteralPath "$root\pagefile.sys"
+                if (Test-Path $fsutil) {
+                    # The exit code, not the sentence: the text is localised, and a
+                    # comparison against an English phrase reads every German host as
+                    # clean. Measured: 0 on a volume that is not dirty.
+                    $null = & $fsutil dirty query $root 2>&1
+                    $row.DirtyExit = $LASTEXITCODE
+                }
+            }
+            $entry.Volumes += [pscustomobject]$row
+        }
+    } catch {
+        $entry.Error = $_.Exception.Message.Split([Environment]::NewLine)[0]
+    } finally {
+        # Always, on every path. A disk left attached is a VM that cannot start.
+        try { Dismount-VHD -Path $d.Path -ErrorAction Stop } catch { }
+        try { $entry.AttachedAfter = [bool](Get-VHD -Path $d.Path -ErrorAction Stop).Attached } catch { }
+    }
+    $result.Disks += [pscustomobject]$entry
+}
+$result.Inspected = $true
+[pscustomobject]$result | ConvertTo-Json -Depth 6 -Compress
+"""
+
 #: Just the state and checkpoint count of one VM. The cheapest possible question, asked
 #: right before disks are read, so a VM started by somebody else in the meantime is caught.
 VM_STATE = r'''
@@ -374,6 +552,8 @@ READ_ONLY_SCRIPTS = {
     'HOST_FACTS': HOST_FACTS,
     'VM_INVENTORY': VM_INVENTORY,
     'VM_DETAIL': VM_DETAIL,
+    'VM_IMAGE_FACTS': VM_IMAGE_FACTS,
+    'VM_DISK_INSPECTION': VM_DISK_INSPECTION,
     'VM_DISK_CHAIN': VM_DISK_CHAIN,
     'VM_STATE': VM_STATE,
     'VM_MERGE_STATE': VM_MERGE_STATE,

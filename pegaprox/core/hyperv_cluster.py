@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from datetime import datetime
 
 from pegaprox.core import hyperv_db
@@ -154,6 +155,11 @@ class HyperVClusterManager:
 
         self.running = False
         self.connection_error = ''
+        # What each VM's disks say about the guest on them, keyed by VM GUID. Read from
+        # the host on demand and kept briefly: an installed operating system on a stopped
+        # VM does not change while somebody fills in a wizard, and the read costs seconds
+        # per disk on a customer's machine.
+        self._image_facts = {}
         # When this host was last read. The cluster list renders it without a guard, and a
         # Hyper-V host is only read on demand, so it stays None until something asks.
         self.last_run = None
@@ -354,6 +360,39 @@ class HyperVClusterManager:
         detail = self.manager.get_vm(guid)
         detail['vmid'] = int(vmid)
         return detail
+
+    #: How long one VM's image facts stay usable. They describe an installed operating
+    #: system on a stopped VM, which does not change while a wizard is open — and reading
+    #: them costs two to three seconds per disk on the customer's host, which a preflight
+    #: refreshed on every dropdown change must not spend again.
+    _IMAGE_FACTS_MAX_AGE = 300
+
+    def guest_image_facts(self, vmid, max_age: float | None = None) -> list[dict]:
+        """What this VM's disks say about the guest, read without starting it.
+
+        Cached per VM. `max_age=0` forces a fresh read, which is what the runner does
+        immediately before it copies anything: between the wizard and the button somebody
+        can attach a disk, and that is the one fact here that goes stale in a way that
+        matters.
+        """
+        guid = self.guid_for(vmid)
+        if not guid:
+            return []
+        age = self._IMAGE_FACTS_MAX_AGE if max_age is None else max_age
+        cached = self._image_facts.get(guid)
+        if cached and age and (time.time() - cached['read_at']) < age:
+            return cached['facts']
+        facts = self.manager.get_guest_image_facts(guid)
+        self._image_facts[guid] = {'facts': facts, 'read_at': time.time()}
+        return facts
+
+    def inspect_disks(self, vmid) -> dict:
+        """What is inside this VM's disks. Read-only, and only while the VM is off."""
+        guid = self.guid_for(vmid)
+        if not guid:
+            return {'inspected': False, 'error': f'No Hyper-V VM is known here as {vmid}.',
+                    'disks': []}
+        return self.manager.inspect_disks(guid)
 
     def get_vm_config(self, node=None, vmid=None, vm_type='qemu') -> dict:
         """One VM for the shared VM dialog, in the shape and envelope it reads.

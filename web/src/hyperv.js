@@ -153,6 +153,63 @@
         const HV_SCSIHW = ['virtio-scsi-single', 'virtio-scsi-pci', 'lsi', 'lsi53c810',
                            'megasas', 'pvscsi'];
 
+        // The virtio-win release a guest may be driven by, mirrored from
+        // `hyperv_drivers` so the wizard preselects what the server would accept.
+        //
+        // Windows Server 2012 R2 is build 9600 and takes 0.1.189 and nothing else: later
+        // releases are signed in a way it does not accept, and the driver is then simply
+        // not loaded — the VM stops at 0xc0000428. The rule runs the other way too:
+        // 0.1.189 has no 2k22, w11 or 2k25 directory at all, so a current guest given it
+        // ends up with no storage driver.
+        const HV_LEGACY_BUILD = 9600;
+        const HV_LEGACY_RELEASE = '0.1.189';
+
+        function hvReleaseKey(release) {
+            return String(release || '').split('.').map(n => parseInt(n, 10) || 0);
+        }
+
+        function hvNewerRelease(a, b) {
+            const ka = hvReleaseKey(a), kb = hvReleaseKey(b);
+            for (let i = 0; i < Math.max(ka.length, kb.length); i++) {
+                if ((ka[i] || 0) !== (kb[i] || 0)) return (ka[i] || 0) > (kb[i] || 0) ? a : b;
+            }
+            return a;
+        }
+
+        // Which ISO already on the node fits this guest, or null when none does.
+        function hvIsoForBuild(build, isos) {
+            const usable = (isos || []).filter(i => i.release);
+            if (!build) return null;
+            if (Number(build) === HV_LEGACY_BUILD) {
+                return usable.find(i => i.release === HV_LEGACY_RELEASE) || null;
+            }
+            const modern = usable.filter(i => i.release !== HV_LEGACY_RELEASE);
+            if (!modern.length) return null;
+            return modern.reduce((best, i) =>
+                hvNewerRelease(i.release, best.release) === i.release ? i : best);
+        }
+
+        // And which release should be offered for download when nothing fits.
+        function hvReleaseToFetch(build, releases) {
+            if (!build) return null;
+            if (Number(build) === HV_LEGACY_BUILD) return HV_LEGACY_RELEASE;
+            const modern = (releases || []).map(r => r.release)
+                .filter(r => r && r !== HV_LEGACY_RELEASE);
+            if (!modern.length) return null;
+            return modern.reduce((best, r) => hvNewerRelease(r, best) === r ? r : best);
+        }
+
+        // The guest's Windows build, read off the disk that carries it.
+        function hvGuestBuild(plan) {
+            const disk = (plan?.guest_images || []).find(i => i.windows);
+            return disk ? disk.build : null;
+        }
+
+        function hvGuestVersion(plan) {
+            const disk = (plan?.guest_images || []).find(i => i.windows);
+            return disk ? disk.version : '';
+        }
+
         // ───────────────────────────────────────────────
         // Preflight
         // ───────────────────────────────────────────────
