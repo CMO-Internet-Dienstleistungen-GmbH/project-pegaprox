@@ -251,6 +251,51 @@ def xhm_list():
     return jsonify([t.to_dict() for t in _xhm_migrations.values() if _xhm_reachable(t)])
 
 
+@bp.route('/api/xhm/migrations', methods=['DELETE'])
+@require_auth(perms=['vm.migrate'])
+def xhm_dismiss_finished():
+    """Take every finished migration off the list. Running ones are left alone.
+
+    The list is where an operator reads what happened, and the log of the one they picked
+    is rendered under it. An entry they have already read and acted on is in the way of
+    the next one, and nothing in the product could put it away — it left on a timer, six
+    hours later.
+
+    This removes a record of a run that is over. It removes nothing on either hypervisor:
+    no VM, no disk, no volume. What a failed run left behind on the target is a separate
+    question with its own answer, and dropping the entry here does not touch it.
+    """
+    removed = []
+    with _xhm_lock:
+        for mid, task in list(_xhm_migrations.items()):
+            if task.status == 'running' or not _xhm_reachable(task):
+                continue
+            del _xhm_migrations[mid]
+            removed.append(mid)
+    return jsonify({'removed': removed, 'count': len(removed)})
+
+
+@bp.route('/api/xhm/migrations/<mid>', methods=['DELETE'])
+@require_auth(perms=['vm.migrate'])
+def xhm_dismiss(mid):
+    """Take one finished migration off the list.
+
+    A running migration is refused rather than ignored: dropping its record would leave a
+    transfer writing to a target with nothing on screen saying so.
+    """
+    if mid not in _xhm_migrations or not _xhm_reachable(_xhm_migrations[mid]):
+        return jsonify({'error': 'Migration not found'}), 404
+    with _xhm_lock:
+        task = _xhm_migrations.get(mid)
+        if task is None:
+            return jsonify({'error': 'Migration not found'}), 404
+        if task.status == 'running':
+            return jsonify({'error': 'This migration is still running. Cancel it first, or '
+                                     'wait for it to finish.'}), 409
+        del _xhm_migrations[mid]
+    return jsonify({'removed': [mid], 'count': 1})
+
+
 @bp.route('/api/xhm/migrations/<mid>', methods=['GET'])
 @require_auth(perms=['vm.migrate'])
 def xhm_detail(mid):

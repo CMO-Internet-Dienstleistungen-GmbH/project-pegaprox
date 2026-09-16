@@ -12224,6 +12224,25 @@
                 } catch(e) { addToast('Error', e.message, 'error'); }
                 finally { setXhmLoading(false); }
             };
+            // Take one finished migration off the list, or all of them. It removes the
+            // record of a run that is over and nothing else — no VM, no disk, on either
+            // side. An operator who has read a failure should be able to put it away;
+            // leaving it there means scrolling past it to reach the next one's log.
+            const dismissXhmMigrations = async (mid) => {
+                const url = mid ? `${API_URL}/xhm/migrations/${mid}` : `${API_URL}/xhm/migrations?finished=1`;
+                try {
+                    const resp = await authFetch(url, { method: 'DELETE' });
+                    if (resp?.ok) {
+                        if (mid && xhmSelectedMigration === mid) setXhmSelectedMigration(null);
+                        if (!mid) setXhmSelectedMigration(null);
+                        fetchXhmMigrations();
+                    } else {
+                        const err = await resp?.json().catch(() => ({}));
+                        addToast('Error', err.error || 'Could not dismiss the migration', 'error');
+                    }
+                } catch(e) { addToast('Error', e.message, 'error'); }
+            };
+
             const startXhmMigration = async () => {
                 setXhmLoading(true);
                 try {
@@ -22410,13 +22429,36 @@
                                                     <h3 className="text-sm font-semibold text-gray-400 uppercase flex items-center gap-2">
                                                         <Icons.FolderInput className="w-4 h-4 text-purple-400" /> Migrations ({xhmMigrations.length})
                                                     </h3>
-                                                    <button onClick={fetchXhmMigrations} className="text-xs text-gray-500 hover:text-white"><Icons.RefreshCw className="w-3.5 h-3.5" /></button>
+                                                    <div className="flex items-center gap-3">
+                                                        {xhmMigrations.some(m => m.status !== 'running') && (
+                                                            <button onClick={() => dismissXhmMigrations()}
+                                                                    title={t('xhmDismissFinishedHint') || 'Remove every finished migration from this list. Running ones stay.'}
+                                                                    className="text-xs text-gray-500 hover:text-white">
+                                                                {t('xhmDismissFinished') || 'Clear finished'}
+                                                            </button>
+                                                        )}
+                                                        <button onClick={fetchXhmMigrations} className="text-xs text-gray-500 hover:text-white"><Icons.RefreshCw className="w-3.5 h-3.5" /></button>
+                                                    </div>
                                                 </div>
                                                 {xhmMigrations.length > 0 ? (
-                                                    <div className="divide-y divide-proxmox-border/50">
+                                                    // Bounded on purpose. The log of the
+                                                    // selected migration is rendered below
+                                                    // this panel, so an unbounded list puts
+                                                    // the reason a migration failed one
+                                                    // screenful further down for every entry
+                                                    // that happens to be above it.
+                                                    <div className="divide-y divide-proxmox-border/50 max-h-[26rem] overflow-y-auto">
                                                         {xhmMigrations.map(m => {
                                                             const isActive = m.status === 'running';
                                                             const phases = ['planning','transfer','creating','attaching','completed'];
+                                                            // A failed run still leaves an end time on the phase it died in —
+                                                            // that is what "the phase is over" means — and the timeline read
+                                                            // that as "the phase passed". A transfer that could not convert a
+                                                            // single byte was shown with a tick beside it. The last phase that
+                                                            // was reached is where it broke.
+                                                            const brokeAt = m.status === 'failed'
+                                                                ? phases.filter(ph => (m.phase_times || {})[ph]).pop()
+                                                                : null;
                                                             const phaseLabel = {planning:'Planning', transfer:'Transfer', creating:'Creating', attaching:'Attaching', completed:'Done', failed:'Failed'};
                                                             const dirLabel = m.direction === 'xcpng_to_pve' ? 'XCP→PVE' : 'PVE→XCP';
                                                             return (
@@ -22429,7 +22471,15 @@
                                                                             <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300 font-medium">{dirLabel}</span>
                                                                             <span className="text-xs px-1.5 py-0.5 rounded bg-proxmox-dark text-gray-400">{phaseLabel[m.phase] || m.phase}</span>
                                                                         </div>
-                                                                        <span className={`px-2 py-0.5 rounded text-xs font-semibold ${m.status === 'completed' ? 'bg-green-500/20 text-green-400' : m.status === 'failed' ? 'bg-red-500/20 text-red-400' : 'bg-purple-500/20 text-purple-400'}`}>{m.status}</span>
+                                                                        <div className="flex items-center gap-2">
+                                                                            <span className={`px-2 py-0.5 rounded text-xs font-semibold ${m.status === 'completed' ? 'bg-green-500/20 text-green-400' : m.status === 'failed' ? 'bg-red-500/20 text-red-400' : 'bg-purple-500/20 text-purple-400'}`}>{m.status}</span>
+                                                                            {m.status !== 'running' && (
+                                                                                <button onClick={e => { e.stopPropagation(); dismissXhmMigrations(m.id); }}
+                                                                                        title={t('xhmDismissOneHint') || 'Remove this entry from the list. It removes nothing on either side.'}
+                                                                                        aria-label="Dismiss"
+                                                                                        className="text-gray-600 hover:text-white text-sm leading-none px-1">×</button>
+                                                                            )}
+                                                                        </div>
                                                                     </div>
                                                                     <div className="flex items-center gap-3 mb-1">
                                                                         <div className="flex-1 h-1.5 bg-proxmox-dark rounded-full overflow-hidden">
@@ -22446,11 +22496,14 @@
                                                                     {m.phase_times && Object.keys(m.phase_times).length > 0 && (
                                                                         <div className="flex items-center gap-0.5 mt-2">
                                                                             {phases.map((ph, idx) => {
-                                                                                const pt = m.phase_times[ph]; const isCur = m.phase === ph; const isDone = pt && pt.end;
+                                                                                const pt = m.phase_times[ph];
+                                                                                const broke = ph === brokeAt;
+                                                                                const isCur = m.phase === ph && !broke;
+                                                                                const isDone = pt && pt.end && !broke;
                                                                                 return (<React.Fragment key={ph}>
-                                                                                    {idx > 0 && <div className={`flex-1 h-px ${isDone ? 'bg-purple-500' : isCur ? 'bg-purple-500/40' : 'bg-proxmox-border'}`} />}
-                                                                                    <div title={`${ph}${pt?.duration ? ` (${pt.duration}s)` : ''}`} className={`w-5 h-5 rounded-full flex items-center justify-center text-[8px] font-bold border ${isDone ? 'bg-purple-500/20 border-purple-500 text-purple-400' : isCur ? 'bg-purple-500/20 border-purple-400 text-purple-400 animate-pulse' : 'bg-proxmox-dark border-proxmox-border text-gray-600'}`}>
-                                                                                        {isDone ? '✓' : idx+1}
+                                                                                    {idx > 0 && <div className={`flex-1 h-px ${isDone ? 'bg-purple-500' : broke ? 'bg-red-500/60' : isCur ? 'bg-purple-500/40' : 'bg-proxmox-border'}`} />}
+                                                                                    <div title={broke ? `${ph} — failed here` : `${ph}${pt?.duration ? ` (${pt.duration}s)` : ''}`} className={`w-5 h-5 rounded-full flex items-center justify-center text-[8px] font-bold border ${broke ? 'bg-red-500/20 border-red-500 text-red-400' : isDone ? 'bg-purple-500/20 border-purple-500 text-purple-400' : isCur ? 'bg-purple-500/20 border-purple-400 text-purple-400 animate-pulse' : 'bg-proxmox-dark border-proxmox-border text-gray-600'}`}>
+                                                                                        {broke ? '✕' : isDone ? '✓' : idx+1}
                                                                                     </div>
                                                                                 </React.Fragment>);
                                                                             })}
