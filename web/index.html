@@ -7892,7 +7892,14 @@ const fetchXhmMigrations=async()=>{try{const resp=await authFetch(`${API_URL}/xh
 // were never shown.
 setXhmForm(prev=>({...prev,acknowledged:[]}));}else{const err=await resp?.json().catch(()=>({}));addToast('Error',err.error||'Failed to get plan','error');}}catch(e){addToast('Error',e.message,'error');}finally{setXhmLoading(false);}};const startXhmMigration=async()=>{setXhmLoading(true);try{const body={...xhmForm};// target_hardware() on the server reads `hardware`; the checkbox is the
 // wizard's word for the same decision.
-body.hardware=xhmForm.prepare_virtio?'virtio':'compatible';if(xhmPlan?.source?.name)body.vm_name=xhmPlan.source.name;const resp=await authFetch(`${API_URL}/xhm/migrate`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(resp?.ok){const data=await resp.json();addToast('Migration Started',`ID: ${data.migration_id}`,'success');setXhmPlan(null);fetchXhmMigrations();}else{const err=await resp?.json().catch(()=>({}));addToast('Error',err.error||'Migration failed to start','error');}}catch(e){addToast('Error',e.message,'error');}finally{setXhmLoading(false);}};// Fork patch #15 — a source VM that is no longer selectable takes its plan with it.
+body.hardware=xhmForm.prepare_virtio?'virtio':'compatible';// Fork patch #15 — an option this direction refuses must not be sent
+// just because the form still carries its default. A Hyper-V plan
+// hides both checkboxes and explains in prose that the VM is not
+// started and the source is left alone; `start_after` nevertheless
+// defaulted to true, so the API refused every single Hyper-V migration
+// — quoting the reason for a box nobody had ticked and nobody could
+// untick. The wizard sends what it offers.
+if(typeof hvIsHyperVPlan==='function'&&hvIsHyperVPlan(xhmPlan)){body.start_after=false;body.remove_source=false;}if(xhmPlan?.source?.name)body.vm_name=xhmPlan.source.name;const resp=await authFetch(`${API_URL}/xhm/migrate`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(resp?.ok){const data=await resp.json();addToast('Migration Started',`ID: ${data.migration_id}`,'success');setXhmPlan(null);fetchXhmMigrations();}else{const err=await resp?.json().catch(()=>({}));addToast('Error',err.error||'Migration failed to start','error');}}catch(e){addToast('Error',e.message,'error');}finally{setXhmLoading(false);}};// Fork patch #15 — a source VM that is no longer selectable takes its plan with it.
 //
 // The picker lists only stopped VMs, but the selection and the plan live in
 // state and survived the VM falling out of that list. What was on screen then

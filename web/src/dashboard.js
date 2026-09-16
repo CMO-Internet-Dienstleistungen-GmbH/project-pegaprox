@@ -12654,6 +12654,17 @@
                     // target_hardware() on the server reads `hardware`; the checkbox is the
                     // wizard's word for the same decision.
                     body.hardware = xhmForm.prepare_virtio ? 'virtio' : 'compatible';
+                    // Fork patch #15 — an option this direction refuses must not be sent
+                    // just because the form still carries its default. A Hyper-V plan
+                    // hides both checkboxes and explains in prose that the VM is not
+                    // started and the source is left alone; `start_after` nevertheless
+                    // defaulted to true, so the API refused every single Hyper-V migration
+                    // — quoting the reason for a box nobody had ticked and nobody could
+                    // untick. The wizard sends what it offers.
+                    if (typeof hvIsHyperVPlan === 'function' && hvIsHyperVPlan(xhmPlan)) {
+                        body.start_after = false;
+                        body.remove_source = false;
+                    }
                     if (xhmPlan?.source?.name) body.vm_name = xhmPlan.source.name;
                     const resp = await authFetch(`${API_URL}/xhm/migrate`, {
                         method: 'POST', headers: {'Content-Type':'application/json'},
