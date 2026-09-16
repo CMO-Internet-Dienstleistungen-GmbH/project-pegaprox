@@ -8318,7 +8318,7 @@ const nodes=new Set();xhmSourceVms.forEach(v=>{if(v.node)nodes.add(v.node);});no
 // the reason a migration failed one
 // screenful further down for every entry
 // that happens to be above it.
-React.createElement("div",{className:"divide-y divide-proxmox-border/50 max-h-[26rem] overflow-y-auto"},xhmMigrations.map(m=>{const isActive=m.status==='running';const phases=['planning','transfer','creating','attaching','completed'];// A failed run still leaves an end time on the phase it died in —
+React.createElement("div",{className:"divide-y divide-proxmox-border/50 max-h-96 overflow-y-auto"},xhmMigrations.map(m=>{const isActive=m.status==='running';const phases=['planning','transfer','creating','attaching','completed'];// A failed run still leaves an end time on the phase it died in —
 // that is what "the phase is over" means — and the timeline read
 // that as "the phase passed". A transfer that could not convert a
 // single byte was shown with a tick beside it. The last phase that
