@@ -87,14 +87,49 @@ is RBD.
 
 ## The VirtIO driver ISO
 
-Driver injection needs `virtio-win.iso` reachable on the node. PegaProx looks
-for it, in order, at a path configured for the run, then
-`/var/lib/vz/template/iso/virtio-win.iso`, then the same file on the target
-storage. Any ISO storage `pvesm` knows works; the file name has to contain
-`virtio-win` or `virtio_win`.
-
 Injection is opt-in. A migration without it produces a VM that needs its
 controller and network card set to hardware Windows already has drivers for.
+
+**Which release is used is chosen in the wizard, per migration.** The node
+usually holds more than one ISO, and which one a guest may be given is not a
+matter of taste:
+
+| Guest | Release | Why |
+|---|---|---|
+| Windows Server 2012 R2, Windows 8.1 (build 9600) | **0.1.189, nothing newer** | From 0.1.221 the drivers are self-signed, and a self-signed boot-start driver cannot load on x64 at all. 0.1.189's `2k12R2/amd64` drivers chain to Microsoft Code Verification Root. |
+| Everything still in support | current stable | — |
+
+The rule is enforced, not documented at: the injection reads the guest's build
+number out of its registry before it copies anything, and refuses to write
+drivers from a release that build may not have (`core/hyperv_drivers.py`). The
+VM then stays on the hardware it was imported on and boots; nothing on the
+volume is changed. The failure this prevents is silent — Windows does not report
+a rejected signature, it simply does not load the driver, and the machine stops
+at `0xc0000428` naming `viostor.sys`.
+
+### Getting the ISO onto the node
+
+The node fetches it itself. In the wizard, a release the node does not have is
+offered with a **Fetch** button next to it; PegaProx asks Proxmox' own
+`download-url` API to pull it onto an ISO storage. The file never passes through
+PegaProx or the browser, which is what makes it workable for a ~700 MB ISO on a
+cluster that is nowhere near the operator.
+
+Requirements for that to work:
+
+- **An active storage with `iso` content** on the target node. Any one `pvesm`
+  knows; the first is offered.
+- **The node reaches `fedorapeople.org` on TCP 443.** Certificates are verified
+  and that is not configurable — there is no publisher checksum for these files
+  (the `CHECKSUM` beside the stable build covers the RPMs, and the archive
+  directories carry none at all, checked 2026-09-16), so TLS is the only thing
+  standing between the node and whatever answers that name.
+- A node without internet access is given the file by hand, as before. Any ISO
+  storage works and the file name has to contain `virtio-win` or `virtio_win` —
+  **with the release in it**, because a file called `virtio-win.iso` states
+  nothing about which release it is, and that is exactly the question a 2012 R2
+  guest turns on. Such a file is offered in the list marked as unidentified and
+  is refused for a guest that has a release requirement.
 
 ## Network
 
@@ -104,8 +139,18 @@ controller and network card set to hardware Windows already has drivers for.
   firewall rules.
 - **The node's own SSH port from PegaProx**, port 22 unless the cluster is
   registered otherwise.
+- **`fedorapeople.org` on TCP 443**, only if the node is to fetch driver ISOs
+  itself. Nothing else in a migration needs outbound internet access.
 
 ## Space
+
+A VMID is only free when the target storage holds no disks under it either.
+`cluster/nextid` reads VM configs, so a number whose guest is gone but whose
+volumes are still there reads as free — and allocating into it fails at
+`rbd create: File exists` after the conversion has already run, or, on a storage
+that would allow it, writes into a volume somebody is keeping on purpose. The
+import checks the storage contents as well and skips such a number; a VMID typed
+into the wizard is refused rather than quietly replaced.
 
 The target volume is allocated with `pvesm alloc` at the disk's **provisioned**
 size, not the used size, and written as raw. A thin-provisioned VHDX therefore

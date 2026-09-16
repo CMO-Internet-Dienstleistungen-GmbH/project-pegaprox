@@ -1982,3 +1982,127 @@ def test_no_default_anywhere_deletes_the_source():
         web = fh.read()
     assert 'remove_source: true' not in web
     assert 'remove_source:true' not in web
+
+
+class TestTheTargetValuesAreChosenNotAssumed:
+    """Every value the import writes into the target VM is a field, prefilled from the
+    source. A silent default is a decision nobody saw being made — and the name was the
+    one that cost a 100 GiB conversion, because Proxmox refuses an underscore only when
+    it creates the VM, which happens after the disks are converted."""
+
+    def test_the_defaults_come_from_the_source(self):
+        defaults = hyperv_xhm.target_defaults(_detail(), VMID, next_vmid=131)
+
+        assert defaults['name'] == 'guest-a'
+        assert defaults['vmid'] == 131
+        assert defaults['cores'] == 4
+        assert defaults['memory_mb'] == 8192
+        assert defaults['bios'] == 'ovmf'
+        assert defaults['machine'] == 'q35'
+        assert defaults['scsihw'] == hyperv_xhm.DEFAULT_SCSIHW
+        assert defaults['needs_efi'] is True
+
+    def test_a_source_name_proxmox_refuses_is_offered_as_one_it_accepts(self):
+        defaults = hyperv_xhm.target_defaults(_detail(name='TestMig_CLONE'), VMID)
+        assert defaults['name'] == 'TestMig-CLONE'
+        assert defaults['source_name'] == 'TestMig_CLONE'
+
+    def test_the_operators_own_values_reach_the_create_call(self):
+        target = FakeTarget()
+        task = FakeTask(config={'target_name': 'renamed-01', 'cores': 2, 'sockets': 2,
+                                'memory_mb': 4096, 'ostype': 'win2k12r2',
+                                'scsihw': 'lsi', 'bios': 'seabios', 'machine': 'pc'})
+        task.vm_name = 'guest-a'
+
+        assert hyperv_xhm._create_target_vm(task, target, 130, _detail()) is True
+
+        _, created = target.posts[0]
+        assert created['name'] == 'renamed-01'
+        assert (created['cores'], created['sockets'], created['memory']) == (2, 2, 4096)
+        assert created['ostype'] == 'win2k12r2'
+        assert created['scsihw'] == 'lsi'
+        assert (created['bios'], created['machine']) == ('seabios', 'pc')
+
+    def test_without_a_typed_name_the_source_name_is_made_acceptable(self):
+        target = FakeTarget()
+        task = FakeTask()
+        task.vm_name = 'TestMig_CLONE'
+
+        assert hyperv_xhm._create_target_vm(task, target, 130, _detail()) is True
+
+        _, created = target.posts[0]
+        assert created['name'] == 'TestMig-CLONE'
+
+
+class TestAFreeVmidIsOneWithNoDisksEither:
+    """`cluster/nextid` reads VM configs. A number whose guest is gone but whose disks are
+    still on the storage reads as free — and allocating into it either fails at
+    `rbd create: File exists` after the conversion, or writes into a volume somebody is
+    keeping on purpose. A disk retained for legal reasons outlives its VM."""
+
+    def _target_with_volumes(self, vmids, next_id=100):
+        target = FakeTarget(next_id=next_id)
+        original = target._api_get
+
+        def _api_get(url):
+            if 'content=images' in url:
+                return FakeResponse(payload={'data': [
+                    {'volid': f'vm-pool:vm-{v}-disk-0', 'vmid': v} for v in vmids]})
+            if '/nextid?vmid=' in url:
+                wanted = int(url.rsplit('=', 1)[-1])
+                return FakeResponse(payload={'data': wanted})
+            return original(url)
+
+        target._api_get = _api_get
+        return target
+
+    def test_a_vmid_whose_disks_are_still_there_is_skipped(self):
+        target = self._target_with_volumes([100], next_id=100)
+        task = FakeTask()
+
+        assert hyperv_xhm._choose_target_vmid(task, target) == 101
+        assert any('still holds disks' in line for line in task.log_lines)
+
+    def test_a_typed_vmid_with_leftover_disks_is_refused_not_replaced(self):
+        target = self._target_with_volumes([100])
+        task = FakeTask(config={'target_vmid': 100})
+
+        with pytest.raises(hyperv_xhm.TransferError) as refused:
+            hyperv_xhm._choose_target_vmid(task, target)
+
+        assert 'still holds disks' in str(refused.value)
+
+    def test_an_untouched_storage_hands_out_the_next_id(self):
+        target = self._target_with_volumes([], next_id=120)
+        assert hyperv_xhm._choose_target_vmid(FakeTask(), target) == 120
+
+
+class TestAFailedRunSaysWhatItLeftBehind:
+    """Nothing is rolled back automatically — that decision belongs to whoever is watching
+    the migration, because an orphaned disk can be one that is deliberately kept. What the
+    run owes them is the list: an unattached volume carries no name in the interface."""
+
+    def test_the_log_names_every_resource_and_removes_none(self, monkeypatch):
+        task = FakeTask()
+        monkeypatch.setattr(hyperv_xhm.hyperv_db, 'get_migration',
+                            lambda conn, mid: {'created_resources': [
+                                {'kind': 'volume', 'id': 'vm-pool:vm-100-disk-0',
+                                 'note': 'for disk-0'}]})
+        monkeypatch.setattr(hyperv_xhm, '_conn', lambda: None)
+        monkeypatch.setattr(hyperv_xhm, '_update_migration_row', lambda *a, **k: None)
+
+        hyperv_xhm._fail(task, 'mig1', 'Creating the target VM failed')
+
+        assert any('vm-pool:vm-100-disk-0' in line for line in task.log_lines)
+        assert any('Clean up target' in line for line in task.log_lines)
+
+    def test_a_run_that_created_nothing_says_so(self, monkeypatch):
+        task = FakeTask()
+        monkeypatch.setattr(hyperv_xhm.hyperv_db, 'get_migration',
+                            lambda conn, mid: {'created_resources': []})
+        monkeypatch.setattr(hyperv_xhm, '_conn', lambda: None)
+        monkeypatch.setattr(hyperv_xhm, '_update_migration_row', lambda *a, **k: None)
+
+        hyperv_xhm._fail(task, 'mig1', 'Preflight refused')
+
+        assert any('nothing to clean up' in line for line in task.log_lines)
