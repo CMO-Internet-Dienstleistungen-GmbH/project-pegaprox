@@ -8304,7 +8304,7 @@
                 // Which driver ISO the injection reads. Not a default any more: an
                 // out-of-support Windows accepts a narrower set of signatures, and a
                 // driver it rejects is not loaded — the VM stops at 0xc0000428 instead.
-                virtio_iso_path: ''
+                virtio_iso_path: '', virtio_iso_storage: 'auto'
             });
             // Fork patch #15 — what the target node has, and what it could fetch.
             const [hvIsos, setHvIsos] = useState(null);
@@ -12759,6 +12759,12 @@
                         body.remove_source = false;
                     }
                     if (xhmPlan?.source?.name) body.vm_name = xhmPlan.source.name;
+                    // A "fetch:" entry is a download that has not happened yet, not a
+                    // path. Sending it would have the injection look for a file called
+                    // "fetch:0.1.189" on the node.
+                    if (String(body.virtio_iso_path || '').startsWith('fetch:')) {
+                        body.virtio_iso_path = '';
+                    }
                     const resp = await authFetch(`${API_URL}/xhm/migrate`, {
                         method: 'POST', headers: {'Content-Type':'application/json'},
                         body: JSON.stringify(body)
@@ -12891,6 +12897,23 @@
                 return () => { dropped = true; };
             }, [xhmPlan, xhmForm.target_cluster, xhmForm.target_node, hvIsoBusy]);
 
+            // Fork patch #15 — preselect the ISO that fits the guest on the disk: the
+            // legacy release for Server 2012 R2, the newest present for anything else,
+            // and the download entry when the node has nothing suitable. Only while the
+            // field is untouched, so a deliberate choice is never overwritten.
+            useEffect(() => {
+                if (!hvIsHyperVPlan(xhmPlan) || !hvIsos || xhmForm.virtio_iso_path) return;
+                const build = hvGuestBuild(xhmPlan);
+                if (!build) return;
+                const fitting = hvIsoForBuild(build, hvIsos.isos);
+                if (fitting) {
+                    setXhmForm(prev => ({...prev, virtio_iso_path: fitting.volid}));
+                    return;
+                }
+                const fetchable = hvReleaseToFetch(build, hvIsos.available_releases);
+                if (fetchable) setXhmForm(prev => ({...prev, virtio_iso_path: `fetch:${fetchable}`}));
+            }, [xhmPlan, hvIsos]);
+
             // Fork patch #15 — have the node fetch a release it does not have. Proxmox
             // downloads it itself, so a 700 MB ISO never travels through this browser.
             const hvDownloadIso = async (release, storage) => {
@@ -12904,8 +12927,11 @@
                     const data = await resp?.json().catch(() => ({}));
                     if (resp?.ok) {
                         addToast(t('hvIsoDownloading') || 'Downloading on the node',
-                                 `virtio-win ${release} → ${storage}. ${t('hvIsoDownloadingHint') || 'It appears in this list when the node has finished.'}`,
+                                 `virtio-win ${release} → ${data.storage || storage}. ${t('hvIsoDownloadingHint') || 'It appears in this list when the node has finished.'}`,
                                  'success');
+                        // Clear the placeholder so the refreshed list can preselect the
+                        // file itself once the node has it.
+                        setXhmForm(prev => ({...prev, virtio_iso_path: ''}));
                     } else {
                         addToast('Error', data.error || 'Could not start the download', 'error');
                     }
@@ -23587,58 +23613,83 @@
                                                                            className="rounded border-gray-600" />
                                                                     {t('hvPrepareVirtio') || 'Install VirtIO drivers and create on VirtIO hardware'}
                                                                 </label>
-                                                                {/* Fork patch #15 — which driver ISO. Not a default: the import
-                                                                    used to take the first file called virtio-win.iso it found on
-                                                                    the node, whatever release it was. An out-of-support Windows
-                                                                    accepts a narrower set of signatures than a current one, and a
-                                                                    driver it rejects is not reported — it is simply not loaded,
-                                                                    and the VM stops at 0xc0000428 naming viostor.sys. Windows
-                                                                    Server 2012 R2 must be driven by virtio-win 0.1.189. */}
-                                                                {xhmForm.prepare_virtio && (
+                                                                {/* Fork patch #15 — which driver ISO, chosen rather than found.
+                                                                    The import used to take the first file called virtio-win.iso
+                                                                    on the node, whatever release it was. Windows Server 2012 R2
+                                                                    accepts only 0.1.189 — later releases are signed in a way it
+                                                                    rejects, and the driver is then not loaded at all: the VM
+                                                                    stops at 0xc0000428 naming viostor.sys, with nothing
+                                                                    reporting a rejected signature. And 0.1.189 has no directory
+                                                                    for anything newer, so the rule runs both ways.
+
+                                                                    The list carries every ISO the node has, not only the driver
+                                                                    ones, plus an entry per release the node could fetch for
+                                                                    itself. Preselected is what fits the guest on the disk. */}
+                                                                {xhmForm.prepare_virtio && (() => {
+                                                                    const build = hvGuestBuild(xhmPlan);
+                                                                    const version = hvGuestVersion(xhmPlan);
+                                                                    const fetchable = (hvIsos?.available_releases || []);
+                                                                    const missing = fetchable.filter(rel =>
+                                                                        !(hvIsos?.isos || []).some(i => i.release === rel.release));
+                                                                    const storages = hvIsos?.storages || [];
+                                                                    return (
                                                                     <div className="pl-5 space-y-1">
                                                                         <label className="text-[10px] text-gray-500 block">{t('hvVirtioIso') || 'Driver ISO'}</label>
                                                                         <select value={xhmForm.virtio_iso_path}
                                                                                 onChange={e => setXhmForm({...xhmForm, virtio_iso_path: e.target.value})}
                                                                                 className="w-full px-2 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-white text-xs">
-                                                                            <option value="">{t('hvVirtioIsoPick') || 'Select a driver ISO…'}</option>
+                                                                            <option value="">{t('hvVirtioIsoPick') || 'Please choose…'}</option>
                                                                             {(hvIsos?.isos || []).map(iso => (
                                                                                 <option key={iso.volid} value={iso.volid}>
-                                                                                    {iso.volid}{iso.release ? ` — ${iso.release}` : ` — ${t('hvVirtioIsoNoRelease') || 'release not in the file name'}`}
+                                                                                    {iso.name}{iso.release ? '' : ` — ${t('hvVirtioIsoNoRelease') || 'release not in the file name'}`}
+                                                                                </option>
+                                                                            ))}
+                                                                            {missing.map(rel => (
+                                                                                <option key={`fetch:${rel.release}`} value={`fetch:${rel.release}`}>
+                                                                                    {(t('hvVirtioIsoFetch') || 'Download {file}…').replace('{file}', rel.filename)}
                                                                                 </option>
                                                                             ))}
                                                                         </select>
+                                                                        {version && (
+                                                                            <div className="text-[10px] text-gray-600">
+                                                                                {(t('hvGuestIs') || 'Guest: Windows {version} (build {build})')
+                                                                                    .replace('{version}', version).replace('{build}', build ?? '?')}
+                                                                            </div>
+                                                                        )}
                                                                         {!xhmForm.target_node && (
                                                                             <div className="text-[10px] text-gray-600">{t('hvVirtioIsoNeedsNode') || 'Choose a target node to see the ISOs it has.'}</div>
                                                                         )}
-                                                                        {xhmForm.target_node && (hvIsos?.isos || []).length === 0 && (
-                                                                            <div className="text-[10px] text-amber-400">{t('hvVirtioIsoNone') || 'This node has no VirtIO driver ISO. Fetch one below.'}</div>
+                                                                        {/* Where a download would land. "auto" is the storage that
+                                                                            already holds the most ISOs — where an operator keeps
+                                                                            them — and it stays a field because a node with two
+                                                                            ISO storages is a choice somebody may want to make. */}
+                                                                        {String(xhmForm.virtio_iso_path).startsWith('fetch:') && (
+                                                                            <div className="flex items-center gap-2">
+                                                                                <span className="text-[10px] text-gray-500">{t('hvIsoStorage') || 'Storage'}</span>
+                                                                                <select value={xhmForm.virtio_iso_storage || 'auto'}
+                                                                                        onChange={e => setXhmForm({...xhmForm, virtio_iso_storage: e.target.value})}
+                                                                                        className="px-2 py-1 bg-proxmox-dark border border-proxmox-border rounded text-white text-xs">
+                                                                                    <option value="auto">
+                                                                                        {(t('hvIsoStorageAuto') || 'auto ({storage})')
+                                                                                            .replace('{storage}', hvIsos?.default_storage || '?')}
+                                                                                    </option>
+                                                                                    {storages.map(st => (
+                                                                                        <option key={st.storage} value={st.storage}>
+                                                                                            {st.storage} ({st.isos} ISOs)
+                                                                                        </option>
+                                                                                    ))}
+                                                                                </select>
+                                                                                <button onClick={() => hvDownloadIso(
+                                                                                            String(xhmForm.virtio_iso_path).slice(6),
+                                                                                            xhmForm.virtio_iso_storage || 'auto')}
+                                                                                        disabled={hvIsoBusy}
+                                                                                        className="text-[10px] px-2 py-0.5 rounded bg-purple-500/10 border border-purple-500/30 text-purple-400 hover:text-white disabled:opacity-50">
+                                                                                    {hvIsoBusy ? (t('loading') || 'Working…') : (t('hvIsoStartDownload') || 'Start download')}
+                                                                                </button>
+                                                                            </div>
                                                                         )}
-                                                                        {/* The node downloads it, not this browser. */}
-                                                                        {xhmForm.target_node && (hvIsos?.available_releases || []).map(rel => {
-                                                                            const have = (hvIsos?.isos || []).some(iso => iso.release === rel.release);
-                                                                            const storage = (hvIsos?.iso_storages || [])[0];
-                                                                            if (have || !storage) return null;
-                                                                            return (
-                                                                                <div key={rel.release} className="flex items-center gap-2">
-                                                                                    <button onClick={() => hvDownloadIso(rel.release, storage)}
-                                                                                            disabled={hvIsoBusy}
-                                                                                            className="text-[10px] px-2 py-0.5 rounded bg-purple-500/10 border border-purple-500/30 text-purple-400 hover:text-white disabled:opacity-50">
-                                                                                        {(t('hvVirtioIsoFetch') || 'Fetch {release} onto {storage}')
-                                                                                            .replace('{release}', rel.release).replace('{storage}', storage)}
-                                                                                    </button>
-                                                                                    <span className="text-[10px] text-gray-600">{rel.note}</span>
-                                                                                </div>
-                                                                            );
-                                                                        })}
-                                                                    </div>
-                                                                )}
-                                                                {/* Fork patch #15 — a choice, not a rule. Leaving the copy
-                                                                    off is the safe answer and stays the default, but it is
-                                                                    not the right one for every migration: a window where the
-                                                                    source has just been shut down for good is exactly when
-                                                                    starting the copy straight away is what somebody wants.
-                                                                    This used to be a sentence of prose over a hidden
-                                                                    checkbox whose default made every migration fail. */}
+                                                                    </div>);
+                                                                })()}
                                                                 <label className="flex items-center gap-1.5 text-xs text-gray-400 cursor-pointer"
                                                                        title={t('hvStartAfterHint')
                                                                            || 'The copy carries the original\'s hostname and MAC. The Hyper-V source is left in place as the rollback, so make sure nobody starts it again while the copy runs.'}>

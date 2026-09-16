@@ -2230,21 +2230,33 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
     # node without the ISO must not fail that.
     iso_path = ''
     iso_candidates = []
-    if getattr(task, 'virtio_iso_path', ''):
-        iso_candidates.append(task.virtio_iso_path)
-    iso_candidates += [
-        "/var/lib/vz/template/iso/virtio-win.iso",
-        f"/mnt/pve/{task.target_storage}/template/iso/virtio-win.iso",
-        "/var/lib/pegaprox/virtio-win.iso",
-    ]
+    chosen_iso = getattr(task, 'virtio_iso_path', '')
+    if chosen_iso:
+        # Fork issue #15 — an ISO that was chosen is the only one used. Falling back to
+        # whatever else is lying on the node defeats the choice: which release a guest may
+        # be given is a decision (Server 2012 R2 takes 0.1.189 and nothing else), and
+        # silently substituting a different file is how the wrong drivers get installed
+        # with nothing reporting it.
+        iso_candidates.append(chosen_iso)
+    else:
+        iso_candidates += [
+            "/var/lib/vz/template/iso/virtio-win.iso",
+            f"/mnt/pve/{task.target_storage}/template/iso/virtio-win.iso",
+            "/var/lib/pegaprox/virtio-win.iso",
+        ]
     for p in ([] if clear_hibernation_only else iso_candidates):
         rc, _, _ = run_on_node(pve_mgr, node, f"test -f {shlex.quote(p)}", timeout=5)
         if rc == 0:
             iso_path = p
             break
     if not iso_path and not clear_hibernation_only:
-        task.log("[VirtIO] ⚠ virtio-win.iso not found — skipping. Searched: " + ", ".join(iso_candidates))
-        task.log("[VirtIO]   Hint: drop virtio-win.iso into /var/lib/vz/template/iso/ or set virtio_iso_path")
+        if chosen_iso:
+            task.log(f"[VirtIO] ✗ The chosen driver ISO is not on the node: {chosen_iso}")
+            task.log("[VirtIO]   No other ISO is used in its place — which release this "
+                     "guest may be given is a decision, not a search.")
+        else:
+            task.log("[VirtIO] ⚠ virtio-win.iso not found — skipping. Searched: " + ", ".join(iso_candidates))
+            task.log("[VirtIO]   Hint: drop virtio-win.iso into /var/lib/vz/template/iso/ or set virtio_iso_path")
         return False
     task.log(f"[VirtIO] ISO: {iso_path}" if iso_path
              else "[VirtIO] Clearing a Fast Startup hibernation file; no ISO needed.")
@@ -2416,8 +2428,8 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
         # ship Server 2025 vioscsi only under 2k25/, w11/ might be missing it.
         # Try multiple subdirs per driver; first hit wins.
         "case \"$VER_BUILD\" in\n"
-        "  26100|26200|26300|26400|26500) PRIMARY=\"2k25/amd64\"; FALLBACKS=\"w11/amd64\" ;;\n"
-        "  20348)                          PRIMARY=\"2k22/amd64\"; FALLBACKS=\"w11/amd64\" ;;\n"
+        "  26100|26200|26300|26400|26500) PRIMARY=\"2k25/amd64\"; FALLBACKS=\"2k22/amd64 w11/amd64\" ;;\n"
+        "  20348)                          PRIMARY=\"2k22/amd64\"; FALLBACKS=\"w11/amd64 2k19/amd64\" ;;\n"
         "  17763)                          PRIMARY=\"2k19/amd64\"; FALLBACKS=\"w10/amd64\" ;;\n"
         "  14393)                          PRIMARY=\"2k16/amd64\"; FALLBACKS=\"w10/amd64\" ;;\n"
         "  9600)                           PRIMARY=\"2k12R2/amd64\"; FALLBACKS=\"w8.1/amd64\" ;;\n"

@@ -146,6 +146,7 @@ class PreflightReport:
 # Warnings that are not merely informational: the epic requires an explicit confirmation
 # before a migration carrying one of these may start.
 _ACKNOWLEDGEABLE_CHECKS = frozenset({'vtpm', 'bitlocker', 'virtio_drivers',
+                                     'guest_hibernated', 'guest_filesystem',
                                      'power_state', 'merge_state', 'source_access',
                                      'automatic_start', 'orderly_shutdown',
                                      # A guest that arrives under a new MAC is a new
@@ -616,6 +617,23 @@ def run_preflight(vm: dict, target: dict, options: dict | None = None) -> Prefli
     report.add(check_firmware(vm.get('generation')))
     report.add(check_target_name(vm.get('name'), options.get('target_name')))
 
+    # What the disks say about the guest, read on the Hyper-V host without starting it.
+    # Absent when the caller could not ask; each check says so rather than passing.
+    images = options.get('guest_images')
+    injecting = bool(options.get('drivers_injected'))
+    report.add(check_guest_windows(images, injecting))
+    report.add(check_driver_release(images, options.get('virtio_iso'), injecting))
+    report.add(check_guest_registry(images, injecting))
+    report.add(check_guest_architecture(images, injecting))
+    report.add(check_disk_in_use(images))
+
+    # What is inside the disks. Everything here is invisible from outside them and every
+    # one of these findings is a migration that fails late — after the copy, on the target.
+    inspection = options.get('disk_inspection')
+    report.add(check_guest_hibernated(inspection))
+    report.add(check_guest_filesystem(inspection))
+    report.add(check_inspection_released_the_disks(inspection))
+
     disks = vm.get('disks') or []
     if not disks:
         report.add(Finding('disk_type', BLOCKING, 'The VM has no virtual disks to migrate.',
@@ -695,6 +713,251 @@ def pve_name_for(name: str | None, fallback: str) -> str:
             labels.append(cleaned)
     candidate = '.'.join(labels)[:255].strip('.-')
     return candidate if is_valid_pve_name(candidate) else fallback
+
+
+def windows_disk(images: list[dict] | None) -> dict | None:
+    """The disk carrying the guest's Windows, or None when no disk does.
+
+    The first one wins. A second Windows on another disk is an old copy far more often
+    than it is the system that boots, and picking the later one would move the boot entry
+    to a system nobody asked for.
+    """
+    for image in images or []:
+        if image.get('windows'):
+            return image
+    return None
+
+
+def check_guest_windows(images: list[dict] | None, injecting: bool = True) -> Finding:
+    """Which Windows is on this VM, read off the disk without starting it.
+
+    Not a formality: the answer decides which virtio-win release may be injected, and an
+    out-of-support Windows refuses drivers from a newer one *silently* — the boot manager
+    then stops at 0xc0000428 and the migration reads as a failed conversion.
+    """
+    if not images:
+        # Nothing was read. That is only worth a warning where the answer decides
+        # something: an import that injects no drivers does not care which Windows this
+        # is, and a warning there is noise somebody learns to click past.
+        if not injecting:
+            return Finding('guest_windows', OK,
+                           'The guest\'s Windows version was not read, and nothing here '
+                           'depends on it.')
+        return Finding('guest_windows', WARNING,
+                       'The disks of this VM could not be examined.',
+                       'Without the guest\'s Windows version the driver release cannot be '
+                       'checked before the copy runs — only afterwards, on the node.')
+
+    disk = windows_disk(images)
+    if disk is None:
+        reasons = {i.get('windows_error', '') for i in images if i.get('windows_error')}
+        detail = '; '.join(sorted(r for r in reasons if r))[:300]
+        return Finding('guest_windows', WARNING,
+                       'No Windows installation was found on any of this VM\'s disks.',
+                       (f'{detail} ' if detail else '')
+                       + 'This is the expected answer for a Linux guest, and it is also '
+                         'what a disk nobody could read looks like — the two are not '
+                         'distinguished here. Driver injection has nothing to act on '
+                         'either way.')
+
+    version = disk.get('version') or f"build {disk.get('build')}"
+    return Finding('guest_windows', OK,
+                   f'The guest is Windows {version} ({disk.get("architecture") or "?"}).',
+                   f'Read from {disk.get("path")} without starting the VM.')
+
+
+def check_driver_release(images: list[dict] | None, iso: str | None,
+                         injecting: bool = True) -> Finding:
+    """May the chosen driver ISO be given to this guest?
+
+    Asked here rather than on the node, because here it is still free. The same rule runs
+    again during the injection — but by then the disks have been converted, and a refusal
+    at that point has already cost the copy.
+    """
+    from pegaprox.core import hyperv_drivers
+
+    if not injecting:
+        return Finding('driver_release', OK,
+                       'No drivers are being injected, so no release has to match.')
+
+    disk = windows_disk(images)
+    if disk is None:
+        return Finding('driver_release', WARNING,
+                       'Which driver release this guest needs cannot be decided.',
+                       'No Windows was found on its disks, so the check that normally '
+                       'runs here is skipped. The injection refuses on the node if the '
+                       'release turns out to be wrong — after the copy.')
+
+    if not iso:
+        required = hyperv_drivers.required_release(disk.get('build'))
+        if required:
+            return Finding('driver_release', BLOCKING,
+                           f'This guest needs virtio-win {required}, and no driver ISO '
+                           f'has been chosen.',
+                           f'Windows {disk.get("version")} does not accept the signatures '
+                           f'of later releases: the driver is not loaded and the VM stops '
+                           f'at 0xc0000428. Choose {required} in the wizard, or import '
+                           f'without driver injection.')
+        return Finding('driver_release', WARNING, 'No driver ISO has been chosen.',
+                       'The injection looks for one on the node and fails if it finds '
+                       'none.')
+
+    refusal = hyperv_drivers.refuse_iso(disk.get('build'), iso)
+    if refusal:
+        return Finding('driver_release', BLOCKING,
+                       f'This driver ISO may not be used for this guest.', refusal)
+
+    release = hyperv_drivers.release_of(iso)
+    return Finding('driver_release', OK,
+                   f'virtio-win {release} may be used for Windows {disk.get("version")}.'
+                   if release else 'The chosen driver ISO carries no release in its name.',
+                   f'Checked against build {disk.get("build")}.')
+
+
+def check_guest_registry(images: list[dict] | None, injecting: bool = True) -> Finding:
+    """Can the guest's SOFTWARE hive be read at all?
+
+    The image header answers the version; the edition comes out of the guest's registry.
+    A disk that gives one and not the other has a hive that could not be read in full —
+    and that is the hive the driver injection writes into, where it fails with "Operation
+    not supported". That failure normally appears after the disks have been converted.
+    """
+    disk = windows_disk(images)
+    if disk is None or not injecting:
+        return Finding('guest_registry', OK,
+                       'Nothing is written into the guest, so its registry is not read.')
+    if disk.get('registry_readable'):
+        return Finding('guest_registry', OK,
+                       'The guest\'s registry can be read.',
+                       f'Edition {disk.get("edition_id") or "unnamed"}, '
+                       f'{disk.get("installation_type") or "type unnamed"}.')
+    return Finding('guest_registry', WARNING,
+                   'The guest\'s registry could not be read in full.',
+                   'The disk reports its Windows version but not its edition, which comes '
+                   'out of the SOFTWARE hive. The driver injection edits that same hive '
+                   'and will most likely refuse it. A guest whose file system was not shut '
+                   'down cleanly looks exactly like this — check that it was powered off '
+                   'rather than saved or killed.')
+
+
+def inspected_volumes(inspection: dict | None) -> list[dict]:
+    """Every volume the inspection saw, across all disks."""
+    return [vol for disk in ((inspection or {}).get('disks') or [])
+            for vol in (disk.get('volumes') or [])]
+
+
+def check_guest_hibernated(inspection: dict | None) -> Finding:
+    """Did this guest hibernate, or shut down with Fast Startup?
+
+    Both leave a saved kernel session in `hiberfil.sys`, and a session saved on one
+    machine cannot be resumed on another: the target has a different chipset, a different
+    timer and a different disk controller. The import discards the file, which costs the
+    guest a cold boot and everything that was open in that session.
+
+    Worth confirming rather than blocking, because discarding it is usually exactly what
+    somebody wants — but not something to find out about afterwards.
+    """
+    volumes = inspected_volumes(inspection)
+    if not volumes:
+        return Finding('guest_hibernated', OK,
+                       'The disks were not inspected for a hibernation file.')
+
+    hibernated = [v for v in volumes if v.get('hibernated')]
+    if not hibernated:
+        return Finding('guest_hibernated', OK,
+                       'No hibernation file; this guest was shut down, not saved.')
+
+    largest = max(hibernated, key=lambda v: v.get('hiberfil_size') or 0)
+    size = _gib(largest.get('hiberfil_size') or 0)
+    return Finding('guest_hibernated', WARNING,
+                   f'This guest is hibernated or shut down with Fast Startup '
+                   f'({size} in hiberfil.sys).',
+                   'A saved session belongs to the machine it was saved on and cannot be '
+                   'resumed on the target — different chipset, timer and disk controller. '
+                   'The import clears the file so the guest boots cold; anything that was '
+                   'open in that session is gone. To keep it, start the VM on Hyper-V, '
+                   'shut it down properly (shutdown /s /t 0, not "hibernate" and not a '
+                   'hybrid shutdown) and migrate afterwards.')
+
+
+def check_guest_filesystem(inspection: dict | None) -> Finding:
+    """Was every volume dismounted cleanly?
+
+    A dirty NTFS is one Windows intends to check on its next boot. Copying it copies the
+    condition, and the driver injection then edits registry hives with unreplayed
+    transaction logs — which hivex refuses outright with "Operation not supported".
+    """
+    volumes = inspected_volumes(inspection)
+    if not volumes:
+        return Finding('guest_filesystem', OK, 'The file systems were not inspected.')
+
+    dirty = [v for v in volumes if v.get('dirty')]
+    if not dirty:
+        unknown = [v for v in volumes if v.get('dirty') is None]
+        if unknown and len(unknown) == len(volumes):
+            return Finding('guest_filesystem', WARNING,
+                           'Whether the file systems are clean could not be determined.',
+                           'fsutil did not answer on the host, so the volumes were not '
+                           'checked either way.')
+        return Finding('guest_filesystem', OK, 'Every volume was dismounted cleanly.')
+
+    return Finding('guest_filesystem', WARNING,
+                   f'{len(dirty)} volume(s) are marked dirty.',
+                   'Windows intends to check them on its next boot. The copy carries that '
+                   'condition over, and the driver injection edits registry hives whose '
+                   'transaction logs were never replayed — which it refuses. Boot the '
+                   'guest once on Hyper-V, let it finish its check and shut it down '
+                   'cleanly.')
+
+
+def check_inspection_released_the_disks(inspection: dict | None) -> Finding:
+    """Did the host let go of every disk it looked into?
+
+    The inspection mounts each disk read-only and unmounts it again. If one stayed
+    attached, the source VM cannot start — which is both a problem of its own and the end
+    of the rollback story for this migration.
+    """
+    stuck = [d for d in ((inspection or {}).get('disks') or []) if d.get('attached_after')]
+    if not stuck:
+        return Finding('disk_released', OK, 'Every inspected disk was released again.')
+    names = ', '.join(d.get('path', '?') for d in stuck)
+    return Finding('disk_released', BLOCKING,
+                   f'{len(stuck)} disk(s) are still attached to the Hyper-V host after '
+                   f'being inspected.',
+                   f'{names}. The source VM cannot start while they are, so neither the '
+                   f'migration nor the rollback can proceed. Detach them on the host '
+                   f'(Dismount-VHD) before trying again.')
+
+
+def check_disk_in_use(images: list[dict] | None) -> Finding:
+    """Is one of these disks attached somewhere while we are about to copy it?
+
+    A VHDX that is attached is being written to by something. Copying it produces a file
+    that is correct nowhere in particular, and nothing about the result shows it.
+    """
+    busy = [i for i in (images or []) if i.get('attached')]
+    if not busy:
+        return Finding('disk_in_use', OK, 'No disk of this VM is attached anywhere.')
+    names = ', '.join(i.get('path', '?') for i in busy)
+    return Finding('disk_in_use', BLOCKING,
+                   f'{len(busy)} disk(s) of this VM are attached to something right now.',
+                   f'{names}. A disk that is attached is being written to — mounted on '
+                   f'the host, or held by another VM. Copying it yields an image that is '
+                   f'consistent with nothing.')
+
+
+def check_guest_architecture(images: list[dict] | None, injecting: bool = True) -> Finding:
+    """Does this guest match the drivers the injection copies?"""
+    disk = windows_disk(images)
+    if disk is None or not injecting:
+        return Finding('guest_architecture', OK, 'No drivers are being injected.')
+    architecture = disk.get('architecture')
+    if architecture in (None, '', 'x64'):
+        return Finding('guest_architecture', OK, 'The guest is 64-bit.')
+    return Finding('guest_architecture', WARNING,
+                   f'The guest is {architecture}, and the injection copies amd64 drivers.',
+                   'A 32-bit Windows will not load them. Import on the compatible '
+                   'controller and install the matching drivers inside the guest.')
 
 
 def check_target_name(source_name: str | None, chosen_name: str | None = None) -> Finding:
