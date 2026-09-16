@@ -131,6 +131,23 @@ class TestTheCommands:
         assert '-f vhdx' in command
         assert '-O raw' in command
 
+    def test_the_target_is_written_into_and_not_created(self):
+        """`pvesm alloc` already made the volume; qemu-img must not try to make it again.
+
+        On a file or a block device it would just write into what is there, so this was
+        invisible for as long as nobody migrated onto Ceph. There the target is an `rbd:`
+        URL, qemu-img creates the image behind it, and RBD answers
+        `error rbd create: File exists` — the same way on every retry, because nothing
+        about it is transient. Reported from a real migration onto a Ceph pool, three
+        identical failures in twenty-two seconds.
+        """
+        command = transfer.convert_command(
+            '/mnt/x/a.vhdx',
+            'rbd:vm-pool/vm-100-disk-0:conf=/etc/pve/ceph.conf:id=admin')
+        assert ' -n ' in command, (
+            'without -n the conversion re-creates a volume that already exists, which '
+            'Ceph refuses outright')
+
     def test_a_path_with_a_space_or_a_quote_reaches_the_shell_as_one_word(self):
         """Counting quotes proves nothing; splitting the command the way a shell would
         proves the file name arrives as a single argument and unchanged."""
