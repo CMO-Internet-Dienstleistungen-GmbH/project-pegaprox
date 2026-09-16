@@ -67,6 +67,11 @@ COMPATIBLE_CONTROLLER = 'sata'
 COMPATIBLE_NIC_MODEL = 'e1000'
 VIRTIO_CONTROLLER = 'scsi'
 VIRTIO_NIC_MODEL = 'virtio'
+#: The SCSI controller model the target VM is created with. A field in the wizard rather
+#: than a fact, because it is one of the settings an operator changes for a guest whose
+#: drivers are older than the model.
+DEFAULT_SCSIHW = 'virtio-scsi-single'
+
 DEFAULT_CONTROLLER = COMPATIBLE_CONTROLLER
 DEFAULT_HARDWARE = 'compatible'
 
@@ -95,6 +100,11 @@ def target_hardware(config) -> dict:
 # Proxmox refuses more than this many of either, and a source with more needs a decision
 # rather than a silently truncated VM.
 MAX_NETWORK_ADAPTERS = 8
+
+#: How far past a rejected VMID the run looks for a free one before giving up. Large
+#: enough for a storage holding a row of kept disks, small enough that a misconfigured
+#: target fails instead of walking the whole id space.
+_VMID_SEARCH_RANGE = 200
 
 #: The VLAN an imported adapter lands on when the source names none. Hyper-V leaves an
 #: adapter untagged far more often than the network it sits on is actually untagged: the
@@ -281,6 +291,10 @@ def plan_hyperv_to_pve(source_cluster_id, source_vmid, target_cluster_id) -> dic
             'hyperv_guid': data.get('hyperv_guid'),
         },
         'targets': _get_pve_targets(target),
+        # Fork issue #15 — every value the import would write into the target, prefilled
+        # from the source. The wizard renders one field per entry: what the migration is
+        # about to do has to be visible before it runs, not reconstructed from the result.
+        'target_defaults': target_defaults(detail, source_vmid, _plan_next_vmid(target)),
         'preflight': report.to_dict(),
         # Deliberately not an estimate in seconds. The other directions derive one from a
         # fixed bytes-per-second figure, which is a guess presented as a number; this
@@ -432,7 +446,7 @@ def _run_hyperv_to_pve(task):
             _fail(task, migration_id, blocked)
             return
 
-        new_vmid = _next_target_vmid(target)
+        new_vmid = _choose_target_vmid(task, target)
         task.target_vmid = new_vmid
         _update_migration_row(migration_id, target_vmid=new_vmid)
         task.log(f"Target VMID: {new_vmid}")
@@ -1019,6 +1033,10 @@ def _preflight_gate(task, source, target, detail, guid):
         detail,
         {'available_bytes': available},
         {'network_map': task.network_map or {},
+         # The name this run is about to create the VM under. Checking it here is the
+         # difference between a refusal in the wizard and one that arrives after the disks
+         # have been converted, which is where Proxmox itself raises it.
+         'target_name': chosen_target_name(task),
          'controller': target_hardware(task.config)['controller'],
          'drivers_injected': target_hardware(task.config)['hardware'] == 'virtio',
          # The share is mounted and each file probed further down, before anything is
@@ -1053,11 +1071,96 @@ def _target_free_bytes(target, node, storage):
         return None
 
 
-def _next_target_vmid(target):
+def vmids_with_volumes(target, node, storage) -> set:
+    """VMIDs that already own something on this storage, VM or not.
+
+    `cluster/nextid` reads VM configs, so an id whose guest is gone but whose disks are
+    still there counts as free. Allocating into it then fails at `rbd create: File exists`
+    after the conversion has run — or, on a storage that would let it through, writes into
+    a volume somebody kept on purpose. A disk retained for legal reasons outlives its VM,
+    and nothing about the number says so.
+    """
+    taken = set()
     try:
         response = target._api_get(
-            f'https://{target.host}:{target.api_port}/api2/json/cluster/nextid')
-        return int(response.json().get('data'))
+            f'https://{target.host}:{target.api_port}'
+            f'/api2/json/nodes/{node}/storage/{storage}/content?content=images')
+        if response.status_code != 200:
+            logger.warning('Could not list %s on %s: %s', storage, node,
+                           response.text[:160])
+            return taken
+        for item in (response.json().get('data') or []):
+            vmid = item.get('vmid')
+            if vmid is not None:
+                taken.add(int(vmid))
+    except Exception:
+        logger.warning('Could not list the target storage contents', exc_info=True)
+    return taken
+
+
+def _next_free_id(target, after=None):
+    """The next VMID Proxmox considers free, optionally starting past a given one."""
+    url = f'https://{target.host}:{target.api_port}/api2/json/cluster/nextid'
+    response = target._api_get(url)
+    candidate = int(response.json().get('data'))
+    if after is None or candidate > after:
+        return candidate
+    # nextid always answers with the same number until something takes it, so walking past
+    # an id this run rejected means asking whether each following one is free.
+    probe = after + 1
+    while probe < after + _VMID_SEARCH_RANGE:
+        check = target._api_get(f'{url}?vmid={probe}')
+        if check.status_code == 200:
+            return probe
+        probe += 1
+    raise TransferError(f'No free VMID found between {after + 1} and '
+                        f'{after + _VMID_SEARCH_RANGE}.')
+
+
+def _plan_next_vmid(target):
+    """A VMID to prefill the wizard with. Never a reservation — the run asks again."""
+    try:
+        return _next_free_id(target)
+    except Exception:
+        logger.debug('Could not prefill a VMID for the plan', exc_info=True)
+        return None
+
+
+def _choose_target_vmid(task, target):
+    """The VMID the import will use, and the reason when it refuses one.
+
+    An id the operator typed is used or refused, never silently replaced: they chose it,
+    and a different VM turning up under a different number is not what they asked for.
+    """
+    taken = vmids_with_volumes(target, task.target_node, task.target_storage)
+    wanted = (task.config or {}).get('target_vmid')
+    if wanted not in (None, ''):
+        try:
+            vmid = int(wanted)
+        except (TypeError, ValueError):
+            raise TransferError(f'{wanted!r} is not a VMID.')
+        check = target._api_get(f'https://{target.host}:{target.api_port}'
+                                f'/api2/json/cluster/nextid?vmid={vmid}')
+        if check.status_code != 200:
+            raise TransferError(f'VMID {vmid} is already in use on the target cluster.')
+        if vmid in taken:
+            raise TransferError(
+                f'VMID {vmid} has no VM, but {task.target_storage} still holds disks '
+                f'under that number. They are not this migration\'s to overwrite — pick '
+                f'another VMID, or remove them deliberately first.')
+        return vmid
+
+    try:
+        vmid = _next_free_id(target)
+        # Skipping rather than failing: without an id the operator chose, the next free
+        # number is a means to an end, and the one after it is just as good.
+        while vmid in taken:
+            task.log(f'VMID {vmid} is free but {task.target_storage} still holds disks '
+                     f'under it; taking the next one')
+            vmid = _next_free_id(target, after=vmid)
+        return vmid
+    except TransferError:
+        raise
     except Exception:
         logger.warning('Could not ask Proxmox for the next free VMID', exc_info=True)
         raise TransferError('Proxmox did not hand out a VMID for the new VM.')
@@ -1336,6 +1439,20 @@ def _clear_hibernation(task, target, new_vmid):
         task.log(f'Could not check the imported disk for a hibernation file: {exc}')
 
 
+def _resolve_iso_path(task, run_on_node, chosen):
+    """Turn a storage volid into the path the node opens. A path is passed through."""
+    text = (chosen or '').strip()
+    if not text or text.startswith('/'):
+        return text
+    exit_code, out, err = run_on_node(None, task.target_node,
+                                      f'pvesm path {shlex.quote(text)}', timeout=30)
+    path = str(out or '').strip().splitlines()[-1] if out else ''
+    if exit_code == 0 and path.startswith('/'):
+        return path
+    task.log(f'Could not resolve {text} on the node: {(err or "").strip()[:160]}')
+    return ''
+
+
 def _inject_drivers_if_asked(task, target, new_vmid, volumes, detail):
     """Run the product's own offline driver injection on the freshly imported disk.
 
@@ -1395,6 +1512,11 @@ def _inject_drivers_if_asked(task, target, new_vmid, volumes, detail):
             text = str(message)
             if 'BOOT_SIGNATURE_MISSING vioscsi' in text:
                 self.refused_for_signature = True
+            # The release guard refused before anything was written. Same consequence as a
+            # missing signature — the guest has no VirtIO storage driver — so the VM has to
+            # go back to hardware it can boot on, and the same flag carries it there.
+            if 'REFUSED_DRIVER_RELEASE' in text:
+                self.refused_for_signature = True
             if 'NO_WINDOWS_DIR' in text:
                 self.guest_is_not_windows = True
             self._inner.log(text)
@@ -1402,6 +1524,12 @@ def _inject_drivers_if_asked(task, target, new_vmid, volumes, detail):
     view = _InjectionView(task, new_vmid)
     try:
         with _node_session(task, target) as run_on_node:
+            # The wizard offers the ISOs the node can see, and a storage lists them by
+            # volid. The injection wants a path, so the volid is resolved here rather than
+            # asking an operator to type one — `local:iso/virtio-win-0.1.189.iso` is what
+            # they picked, `/var/lib/vz/template/iso/...` is what the node opens.
+            view.virtio_iso_path = _resolve_iso_path(task, run_on_node,
+                                                     view.virtio_iso_path)
             ok = v2p._inject_virtio_drivers(target, view, node_exec=run_on_node)
     except Exception as exc:                                   # noqa: BLE001
         # The migration itself succeeded; the drivers are a preparation for the switch that
@@ -1564,6 +1692,91 @@ def _current_nic_settings(target, task, new_vmid):
             if name.startswith('net') and name[3:].isdigit()
             and isinstance(value, str) and value.startswith(f'{VIRTIO_NIC_MODEL}=')}
 
+#: Every value the target VM is created with that the operator can decide instead.
+#: The source's own value is the suggestion, never the silent answer: the wizard renders
+#: one field per entry and sends back what is in it. What is not listed here is derived
+#: from something that was decided (the machine type follows the firmware) or is not a
+#: choice at all (the description carries the migration's id).
+TARGET_FIELDS = ('name', 'vmid', 'cores', 'sockets', 'memory_mb', 'ostype', 'bios',
+                 'machine')
+
+
+def target_defaults(detail, source_vmid, next_vmid=None) -> dict:
+    """What the wizard prefills the target fields with.
+
+    Read off the source wherever the source has an answer. The two that it does not have
+    are the name — Hyper-V allows characters Proxmox refuses — and the OS type, which
+    nothing outside the guest can see.
+    """
+    generation = detail.get('generation')
+    name = detail.get('name') or ''
+    return {
+        'name': hyperv_preflight.pve_name_for(name, f'hyperv-{source_vmid}'),
+        'source_name': name,
+        'vmid': next_vmid,
+        'cores': detail.get('cpu_count') or 1,
+        'sockets': 1,
+        'memory_mb': detail.get('memory_mb') or 1024,
+        # Nothing on this side can see inside the guest, so the honest suggestion is
+        # 'other'. It is a field rather than a default because it decides which timers and
+        # devices Proxmox gives the VM, and a Windows guest on 'other' runs measurably
+        # worse without anything looking wrong.
+        'ostype': 'other',
+        'bios': GENERATION_BIOS.get(generation, 'seabios'),
+        'machine': GENERATION_MACHINE.get(generation, DEFAULT_MACHINE),
+        'generation': generation,
+        'scsihw': DEFAULT_SCSIHW,
+        # Which disk the guest's loader is on. The source's own boot order answers it when
+        # Hyper-V reports one; otherwise the first disk, which is the same one in every
+        # ordinary case and wrong in a way nothing about the result shows.
+        'boot_disk': _suggested_boot_index(detail),
+        # Only a Generation 2 guest has a variable store at all. Pre-enrolling Microsoft's
+        # keys is right for a guest that had Secure Boot on and stops one that had it off
+        # from booting, so it follows the source — and `is True`, because "the host did not
+        # say" must not read as "it was off".
+        'efi_pre_enrolled_keys': detail.get('secure_boot_enabled') is True,
+        'needs_efi': GENERATION_BIOS.get(generation) == 'ovmf',
+        'secure_boot_enabled': detail.get('secure_boot_enabled'),
+        # Every disk, so the wizard can offer the boot choice by name rather than by index.
+        'disks': [{'index': i, 'label': d.get('label') or d.get('key') or f'disk-{i}',
+                   'path': d.get('path') or '', 'size': d.get('capacity_bytes') or 0}
+                  for i, d in enumerate(detail.get('disks') or [])],
+    }
+
+
+def _suggested_boot_index(detail):
+    """The source disk index the guest most likely boots from, or None."""
+    order = detail.get('boot_disk_order') or []
+    disks = detail.get('disks') or []
+    for index in order:
+        if 0 <= index < len(disks):
+            return index
+    return 0 if disks else None
+
+
+def chosen_target_name(task) -> str:
+    """The name the target VM is created under.
+
+    An operator's own spelling wins untouched — including when Proxmox would refuse it,
+    which preflight blocks on rather than quietly correcting. Otherwise the source name,
+    made acceptable to the target.
+    """
+    typed = ((task.config or {}).get('target_name') or '').strip()
+    if typed:
+        return typed
+    return hyperv_preflight.pve_name_for(task.vm_name, f'hyperv-{task.source_vmid}')
+
+
+def _chosen_int(task, field, fallback, minimum=1):
+    """One numeric target field, as the operator set it or as the source suggested."""
+    raw = (task.config or {}).get(field)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return fallback
+    return value if value >= minimum else fallback
+
+
 def _create_target_vm(task, target, new_vmid, detail):
     """Create the VM shell. Returns True, or a reason."""
     generation = detail.get('generation')
@@ -1572,23 +1785,25 @@ def _create_target_vm(task, target, new_vmid, detail):
         # Defaulting to generation 1 would build a BIOS machine for a UEFI guest, which
         # boots into a firmware shell and reads as a failed conversion.
         return f'The source reports VM generation {generation!r}, which has no target mapping'
-    bios = GENERATION_BIOS[generation]
-    machine = GENERATION_MACHINE[generation]
+    # The firmware pair is the source's generation unless somebody chose otherwise. Both
+    # move together: a machine type that does not match the firmware boots into a shell.
+    bios = (task.config or {}).get('bios') or GENERATION_BIOS[generation]
+    machine = (task.config or {}).get('machine') or GENERATION_MACHINE[generation]
     hardware = target_hardware(task.config)
 
     create = {
         'vmid': new_vmid,
-        'name': task.vm_name or f'hyperv-{task.source_vmid}',
-        'memory': detail.get('memory_mb') or 1024,
-        'cores': detail.get('cpu_count') or 1,
-        'sockets': 1,
-        # Nothing on this side can see inside the guest, so the honest default is 'other'.
-        # Guessing Windows would set timers and devices for an operating system that may not
-        # be there, and the wizard asks for this anyway.
+        'name': chosen_target_name(task),
+        'memory': _chosen_int(task, 'memory_mb', detail.get('memory_mb') or 1024, minimum=16),
+        'cores': _chosen_int(task, 'cores', detail.get('cpu_count') or 1),
+        'sockets': _chosen_int(task, 'sockets', 1),
+        # Nothing on this side can see inside the guest, so the suggestion is 'other' and
+        # the wizard offers the field. Guessing Windows would set timers and devices for an
+        # operating system that may not be there.
         'ostype': task.config.get('ostype') or 'other',
         'bios': bios,
         'machine': machine,
-        'scsihw': 'virtio-scsi-single',
+        'scsihw': (task.config or {}).get('scsihw') or DEFAULT_SCSIHW,
         # Who made this, and under which migration. A cleanup reads it back before it
         # deletes anything: a VMID says nothing about ownership, and the number can have
         # been taken by somebody else's guest since this run failed.
@@ -1704,9 +1919,10 @@ def _attach_disks(task, target, new_vmid, volumes, detail):
             task.log(f'Could not attach {name}: {exc}')
 
     extra = {}
-    boot_disk = _boot_disk_name(attached, detail)
+    boot_disk = _boot_disk_name(attached, detail, (task.config or {}).get('boot_disk'))
     if boot_disk:
         extra['boot'] = f'order={boot_disk}'
+        task.log(f'Booting from {boot_disk}')
     if GENERATION_BIOS.get(detail.get('generation')) == 'ovmf':
         # A Generation 2 guest boots UEFI and needs somewhere to keep its variables. Without
         # this the VM starts into the firmware shell and looks like a failed conversion.
@@ -1724,7 +1940,13 @@ def _attach_disks(task, target, new_vmid, volumes, detail):
         # empty store as though Secure Boot had been off. The preflight reports that case
         # separately; here the safe direction is not to enrol keys under a guest whose
         # loader might be unsigned.
-        pre_enrolled = 1 if detail.get('secure_boot_enabled') is True else 0
+        # The wizard shows this as a field, prefilled from the source. `is True` remains
+        # the fallback: a host that did not answer must not read as "Secure Boot was off".
+        chosen = (task.config or {}).get('efi_pre_enrolled_keys')
+        if chosen is None:
+            pre_enrolled = 1 if detail.get('secure_boot_enabled') is True else 0
+        else:
+            pre_enrolled = 1 if chosen else 0
         extra['efidisk0'] = (f'{task.target_storage}:1,efitype=4m,'
                              f'pre-enrolled-keys={pre_enrolled}')
         task.log('UEFI variable store created '
@@ -1744,7 +1966,7 @@ def _attach_disks(task, target, new_vmid, volumes, detail):
     return failed
 
 
-def _boot_disk_name(attached, detail):
+def _boot_disk_name(attached, detail, chosen_index=None):
     """Which attached disk the VM should boot from.
 
     The source's own boot order decides where it can. Hyper-V lists the boot entries of a
@@ -1756,6 +1978,15 @@ def _boot_disk_name(attached, detail):
     if not attached:
         return None
     by_index = {index: name for index, name in attached}
+    # What the operator chose in the wizard, when they chose. Only a disk that actually
+    # attached can be booted from, so an answer naming one that did not falls through to
+    # the source's order rather than producing an unbootable `boot: order=`.
+    try:
+        wanted = int(chosen_index)
+    except (TypeError, ValueError):
+        wanted = None
+    if wanted in by_index:
+        return by_index[wanted]
     for index in (detail.get('boot_disk_order') or []):
         if index in by_index:
             return by_index[index]
@@ -1809,6 +2040,36 @@ def _finish(task, migration_id, new_vmid):
 
 
 def _fail(task, migration_id, reason):
+    """End the run, and say what it left standing on the target.
+
+    Nothing is removed here. What a failed import created — a VM, a converted volume —
+    stays until somebody looks at it and decides, because the alternative is a rollback
+    deleting a disk that was being kept on purpose. What this does owe the operator is the
+    list: an orphaned volume carries no name in the interface, and an import that says only
+    "failed" leaves them to find it by hand.
+    """
     task.set_phase('failed', reason)
+    _report_leftovers(task, migration_id)
     _update_migration_row(migration_id, status=hyperv_db.STATUS_FAILED, error=str(reason)[:500],
                      completed_at=time.time())
+
+
+def _report_leftovers(task, migration_id):
+    """Log what this run created and did not undo. Never raises: it runs on the way out."""
+    if not migration_id:
+        return
+    try:
+        migration = hyperv_db.get_migration(_conn(), migration_id)
+        resources = (migration or {}).get('created_resources') or []
+    except Exception:
+        logger.debug('[XHM:%s] could not read what the run created', task.id, exc_info=True)
+        return
+    if not resources:
+        task.log('Nothing was created on the target; there is nothing to clean up.')
+        return
+    task.log(f'Left on the target ({len(resources)}), nothing was removed:')
+    for entry in resources:
+        note = f" — {entry.get('note')}" if entry.get('note') else ''
+        task.log(f"  {entry.get('kind')} {entry.get('id')}{note}")
+    task.log('Use "Clean up target" on this migration to remove them, or leave them and '
+             'start the next attempt on a different VMID.')

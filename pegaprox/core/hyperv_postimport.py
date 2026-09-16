@@ -191,6 +191,45 @@ def find_virtio_isos(target, node):
     return sorted(found, key=lambda entry: entry['volid'], reverse=True)
 
 
+def iso_storages(target, node):
+    """Storages on this node that ISOs may be written to."""
+    response = target._api_get(
+        f'https://{target.host}:{target.api_port}/api2/json/nodes/{node}/storage')
+    if response.status_code != 200:
+        return []
+    return [s.get('storage') for s in (response.json().get('data') or [])
+            if 'iso' in (s.get('content') or '') and s.get('active')]
+
+
+def download_release(target, node, storage, release):
+    """Have the node fetch one virtio-win release onto a storage.
+
+    Proxmox downloads it itself — `download-url` runs on the node, so the file never
+    travels through this process or the operator's browser, and a 700 MB ISO does not
+    cross a workstation to reach a cluster that is next to the source.
+
+    Returns the task id. The caller polls it; this does not wait, because a download over
+    a customer's uplink outlives any request timeout worth setting.
+    """
+    from pegaprox.core import hyperv_drivers
+
+    entry = hyperv_drivers.CATALOGUE.get(release)
+    if not entry:
+        raise ValueError(f'{release} is not a release this product knows how to fetch.')
+
+    response = target._api_post(
+        f'https://{target.host}:{target.api_port}'
+        f'/api2/json/nodes/{node}/storage/{storage}/download-url',
+        data={'content': 'iso', 'filename': entry['filename'], 'url': entry['url'],
+              # The publisher offers no checksum for these files, so the certificate is
+              # the only thing standing between the node and whatever answers that name.
+              # Turning verification off because a download failed would remove it.
+              'verify-certificates': 1})
+    if response.status_code not in (200, 201):
+        raise RuntimeError(f'Proxmox refused the download: {response.text[:200]}')
+    return (response.json() or {}).get('data')
+
+
 @_as_result
 def describe_driver_state(migration_id):
     """What is true about this VM's drivers, with the two facts kept apart.

@@ -416,6 +416,112 @@ def list_hyperv_isos(cluster_id):
         return _error_response(exc)
 
 
+@bp.route('/api/hyperv/target-virtio-isos', methods=['GET'])
+@require_auth(perms=['hyperv.vm.media'])
+def list_target_virtio_isos():
+    """The VirtIO driver ISOs a Proxmox node can see, for the migration wizard to offer.
+
+    Which release is used is a decision, not a lookup: an out-of-support Windows accepts a
+    narrower set of signatures, and the node usually holds more than one ISO. The wizard
+    therefore shows the list and what each entry would mean, instead of the run picking the
+    first file whose name happens to match.
+    """
+    cluster_id = (request.args.get('cluster') or '').strip()
+    node = (request.args.get('node') or '').strip()
+    if not cluster_id or not node:
+        return jsonify({'error': 'cluster and node are required'}), 400
+
+    ok, denied = check_cluster_access(cluster_id)
+    if not ok:
+        return denied
+
+    target = cluster_managers.get(cluster_id)
+    if target is None:
+        return jsonify({'error': 'Target cluster not found'}), 404
+    if not getattr(target, 'is_connected', False):
+        return jsonify({'error': 'Target cluster is not connected'}), 409
+
+    from pegaprox.core import hyperv_drivers
+    from pegaprox.core.hyperv_postimport import find_virtio_isos
+
+    try:
+        found = find_virtio_isos(target, node)
+    except Exception as exc:                                   # noqa: BLE001
+        logger.warning('Could not list VirtIO ISOs on %s', node, exc_info=True)
+        return jsonify({'error': f'Could not list the ISOs on {node}: {exc}'}), 502
+
+    return jsonify({
+        'node': node,
+        'isos': [{
+            'volid': entry['volid'],
+            'storage': entry['storage'],
+            'size': entry.get('size'),
+            # What the file name says it is. Nothing opens the ISO to check, and an entry
+            # that names no release is offered with that stated rather than assumed.
+            'release': hyperv_drivers.release_of(entry['volid']),
+        } for entry in found],
+        # So the wizard can say which guests need which release without holding a second
+        # copy of the rule.
+        'required_releases': hyperv_drivers.REQUIRED_RELEASE,
+        # What the node could fetch for itself, for the releases it does not have yet.
+        'available_releases': [
+            {'release': release, 'note': entry['note'], 'filename': entry['filename']}
+            for release, entry in sorted(hyperv_drivers.CATALOGUE.items())],
+        'iso_storages': _iso_storages_or_empty(target, node),
+    })
+
+
+def _iso_storages_or_empty(target, node):
+    from pegaprox.core.hyperv_postimport import iso_storages
+    try:
+        return iso_storages(target, node)
+    except Exception:
+        logger.debug('Could not list ISO storages on %s', node, exc_info=True)
+        return []
+
+
+@bp.route('/api/hyperv/target-virtio-isos/download', methods=['POST'])
+@require_auth(perms=['hyperv.vm.media'])
+def download_target_virtio_iso():
+    """Have a Proxmox node fetch a virtio-win release onto one of its ISO storages.
+
+    The node downloads it. Nothing passes through this process or the browser, which is
+    what makes it usable for a 700 MB file on a cluster that is not next to the operator.
+    The answer is the Proxmox task id; the wizard follows it like any other node task.
+    """
+    data = request.get_json(silent=True) or {}
+    cluster_id = (data.get('cluster') or '').strip()
+    node = (data.get('node') or '').strip()
+    storage = (data.get('storage') or '').strip()
+    release = (data.get('release') or '').strip()
+    if not all((cluster_id, node, storage, release)):
+        return jsonify({'error': 'cluster, node, storage and release are required'}), 400
+
+    ok, denied = check_cluster_access(cluster_id)
+    if not ok:
+        return denied
+
+    target = cluster_managers.get(cluster_id)
+    if target is None:
+        return jsonify({'error': 'Target cluster not found'}), 404
+    if not getattr(target, 'is_connected', False):
+        return jsonify({'error': 'Target cluster is not connected'}), 409
+
+    from pegaprox.core.hyperv_postimport import download_release
+
+    try:
+        upid = download_release(target, node, storage, release)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    except Exception as exc:                                   # noqa: BLE001
+        logger.warning('Could not start the virtio-win download on %s', node, exc_info=True)
+        return jsonify({'error': str(exc)}), 502
+
+    log_audit(_acting_user(), 'hyperv.virtio_iso.download',
+              f'{release} onto {storage} on {node}')
+    return jsonify({'task': upid, 'release': release, 'storage': storage, 'node': node})
+
+
 # =============================================================================
 # VM reads
 # =============================================================================
@@ -639,12 +745,29 @@ def hyperv_vm_preflight(cluster_id, vmid):
         # same way the plan does instead of asking for a confirmation beside it.
         'host_transfer_check': getattr(mgr, 'transfer_check', None) or None,
         'reachable_paths': {},
+        # The name the target VM would be created under, so the wizard's own field is what
+        # gets checked rather than a value nobody can see. Proxmox validates a VM name as a
+        # DNS name and refuses an underscore -- from the create call, which happens after
+        # the disks have been converted.
+        'target_name': (data.get('target_name') or '').strip(),
     }
 
     report = hyperv_preflight.run_preflight(vm, target, options)
     body = report.to_dict()
     body['vmid'] = vmid
     body['direction'] = 'hyperv_to_pve'
+    # Which VMIDs the chosen storage already holds disks for. `cluster/nextid` reads VM
+    # configs only, so a number whose guest is gone reads as free while its disks are still
+    # there -- and allocating into it either fails after the conversion or writes into
+    # something that was kept on purpose.
+    if target_mgr is not None and data.get('target_node') and data.get('target_storage'):
+        from pegaprox.core.hyperv_xhm import vmids_with_volumes
+        try:
+            body['vmids_with_volumes'] = sorted(vmids_with_volumes(
+                target_mgr, data.get('target_node'), data.get('target_storage')))
+        except Exception:
+            logger.debug('Could not list VMIDs with volumes on the target storage',
+                         exc_info=True)
     return jsonify(body)
 
 

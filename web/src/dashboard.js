@@ -8270,8 +8270,23 @@
                 // Fork patch #15 — preflight warnings a person has confirmed. The API
                 // refuses to start a migration with an unconfirmed one, so this travels
                 // with the request rather than only gating the button.
-                acknowledged: []
+                acknowledged: [],
+                // Fork patch #15 — every value the import writes into the target VM.
+                // They are filled from the plan the moment it arrives and are editable
+                // from then on: what the migration is about to do has to be visible
+                // before it runs. An empty string means "the plan's suggestion", which is
+                // what the field shows; the request carries whatever stands in it.
+                target_name: '', target_vmid: '', cores: '', sockets: '', memory_mb: '',
+                ostype: '', bios: '', machine: '', scsihw: '', boot_disk: '',
+                efi_pre_enrolled_keys: null,
+                // Which driver ISO the injection reads. Not a default any more: an
+                // out-of-support Windows accepts a narrower set of signatures, and a
+                // driver it rejects is not loaded — the VM stops at 0xc0000428 instead.
+                virtio_iso_path: ''
             });
+            // Fork patch #15 — what the target node has, and what it could fetch.
+            const [hvIsos, setHvIsos] = useState(null);
+            const [hvIsoBusy, setHvIsoBusy] = useState(false);
             // Fork patch #15 — the Hyper-V preflight re-asked with the target choices in
             // hand. hvRefreshPreflight says why the plan's own verdict is not enough.
             const [hvPreflight, setHvPreflight] = useState(null);
@@ -12636,8 +12651,27 @@
                         // migration; here the source stays, so an unasked start puts the
                         // original's hostname and MAC on the network a second time.
                         const isHyperV = typeof hvIsHyperVPlan === 'function' && hvIsHyperVPlan(data);
+                        // Fork patch #15 — the target fields start on what the source says
+                        // and stay editable. Prefilled rather than defaulted: the value is
+                        // on screen, so a migration that would rename, resize or re-number
+                        // the guest says so before it runs instead of afterwards.
+                        const d = (isHyperV && data.target_defaults) || {};
                         setXhmForm(prev => ({...prev, acknowledged: [],
-                                             ...(isHyperV ? { start_after: false } : {})}));
+                                             ...(isHyperV ? { start_after: false } : {}),
+                                             ...(isHyperV ? {
+                                                 target_name: d.name || '',
+                                                 target_vmid: d.vmid ?? '',
+                                                 cores: d.cores ?? '',
+                                                 sockets: d.sockets ?? '',
+                                                 memory_mb: d.memory_mb ?? '',
+                                                 ostype: d.ostype || 'other',
+                                                 bios: d.bios || '',
+                                                 machine: d.machine || '',
+                                                 scsihw: d.scsihw || '',
+                                                 boot_disk: d.boot_disk ?? '',
+                                                 efi_pre_enrolled_keys: !!d.efi_pre_enrolled_keys,
+                                                 virtio_iso_path: ''
+                                             } : {})}));
                     } else {
                         const err = await resp?.json().catch(() => ({}));
                         addToast('Error', err.error || 'Failed to get plan', 'error');
@@ -12763,11 +12797,59 @@
                     .finally(() => { if (!dropped) setHvPreflightBusy(false); });
                 return () => { dropped = true; };
             }, [xhmPlan, xhmForm.target_node, xhmForm.target_storage,
+                // The name is checked by the preflight, because Proxmox validates it as a
+                // DNS name and says so only when it creates the VM — which happens after
+                // the disks have been converted.
+                xhmForm.target_name,
                 // The hardware choice belongs here too: one of the checks answers whether
                 // this guest needs a VirtIO driver, and without this the list goes on
                 // saying "sata controller" while the box above it says VirtIO.
                 xhmForm.prepare_virtio,
                 JSON.stringify(xhmForm.network_map), JSON.stringify(xhmForm.vlan_map)]);
+
+            // Fork patch #15 — which driver ISOs the chosen target node can see. Asked
+            // per node rather than at plan time: the ISO lives on a storage, and which
+            // storages exist is a property of the node the operator has just picked.
+            useEffect(() => {
+                if (!hvIsHyperVPlan(xhmPlan) || !xhmForm.target_cluster || !xhmForm.target_node) {
+                    setHvIsos(null);
+                    return;
+                }
+                let dropped = false;
+                (async () => {
+                    try {
+                        const resp = await authFetch(
+                            `${API_URL}/hyperv/target-virtio-isos`
+                            + `?cluster=${encodeURIComponent(xhmForm.target_cluster)}`
+                            + `&node=${encodeURIComponent(xhmForm.target_node)}`);
+                        const data = await resp?.json().catch(() => null);
+                        if (!dropped && resp?.ok) setHvIsos(data);
+                    } catch(e) { /* the field says the list could not be read */ }
+                })();
+                return () => { dropped = true; };
+            }, [xhmPlan, xhmForm.target_cluster, xhmForm.target_node, hvIsoBusy]);
+
+            // Fork patch #15 — have the node fetch a release it does not have. Proxmox
+            // downloads it itself, so a 700 MB ISO never travels through this browser.
+            const hvDownloadIso = async (release, storage) => {
+                setHvIsoBusy(true);
+                try {
+                    const resp = await authFetch(`${API_URL}/hyperv/target-virtio-isos/download`, {
+                        method: 'POST', headers: {'Content-Type':'application/json'},
+                        body: JSON.stringify({ cluster: xhmForm.target_cluster,
+                                               node: xhmForm.target_node,
+                                               storage, release })});
+                    const data = await resp?.json().catch(() => ({}));
+                    if (resp?.ok) {
+                        addToast(t('hvIsoDownloading') || 'Downloading on the node',
+                                 `virtio-win ${release} → ${storage}. ${t('hvIsoDownloadingHint') || 'It appears in this list when the node has finished.'}`,
+                                 'success');
+                    } else {
+                        addToast('Error', data.error || 'Could not start the download', 'error');
+                    }
+                } catch(e) { addToast('Error', e.message, 'error'); }
+                finally { setHvIsoBusy(false); }
+            };
 
             // poll XHM migrations when sidebar is open
             useEffect(() => {
@@ -23149,6 +23231,137 @@
                                                             </div>
                                                         )}
 
+                                                        {/* Fork patch #15 — the target VM, as fields rather than as
+                                                            defaults. Every one of these used to be decided silently:
+                                                            the name was taken from the source and refused by Proxmox
+                                                            after the disks had been converted, the VMID came from
+                                                            cluster/nextid which does not know about orphaned disks,
+                                                            and the OS type was always "other". They are filled from
+                                                            the source and stay editable — the point is to see what
+                                                            the migration will do, and to change it on purpose. */}
+                                                        {hvIsHyperVPlan(xhmPlan) && xhmPlan.target_defaults && (() => {
+                                                            const d = xhmPlan.target_defaults;
+                                                            const nameOk = hvIsPveName(xhmForm.target_name || d.name || '');
+                                                            const takenIds = hvPreflight?.vmids_with_volumes || [];
+                                                            const vmidTaken = takenIds.includes(Number(xhmForm.target_vmid));
+                                                            const field = 'w-full px-2 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-white text-xs';
+                                                            return (
+                                                            <div className="space-y-2 border border-proxmox-border rounded-lg p-3">
+                                                                <div className="text-xs font-semibold text-gray-400">
+                                                                    {t('hvTargetVm') || 'Target VM'}
+                                                                </div>
+                                                                <div className="grid grid-cols-2 gap-2">
+                                                                    <div className="col-span-2">
+                                                                        <label className="text-[10px] text-gray-500 block mb-0.5">{t('hvTargetName') || 'Name'}</label>
+                                                                        <input type="text" value={xhmForm.target_name}
+                                                                               onChange={e => setXhmForm({...xhmForm, target_name: e.target.value})}
+                                                                               className={`${field} ${nameOk ? '' : 'border-red-500'}`} />
+                                                                        {d.source_name && d.source_name !== d.name && (
+                                                                            <div className="text-[10px] text-amber-500/90 mt-0.5">
+                                                                                {(t('hvNameAdjusted') || 'Hyper-V calls it {src}; Proxmox validates a VM name as a DNS name.').replace('{src}', d.source_name)}
+                                                                            </div>
+                                                                        )}
+                                                                        {!nameOk && (
+                                                                            <div className="text-[10px] text-red-400 mt-0.5">
+                                                                                {t('hvNameInvalid') || 'Letters, digits and hyphens only; must start and end alphanumeric. Proxmox refuses anything else.'}
+                                                                            </div>
+                                                                        )}
+                                                                    </div>
+                                                                    <div>
+                                                                        <label className="text-[10px] text-gray-500 block mb-0.5">VMID</label>
+                                                                        <input type="number" value={xhmForm.target_vmid}
+                                                                               onChange={e => setXhmForm({...xhmForm, target_vmid: e.target.value})}
+                                                                               className={`${field} ${vmidTaken ? 'border-red-500' : ''}`} />
+                                                                        {vmidTaken && (
+                                                                            <div className="text-[10px] text-red-400 mt-0.5">
+                                                                                {t('hvVmidHasDisks') || 'This storage still holds disks under that VMID. They are not this migration\'s to overwrite.'}
+                                                                            </div>
+                                                                        )}
+                                                                    </div>
+                                                                    <div>
+                                                                        <label className="text-[10px] text-gray-500 block mb-0.5">{t('hvOsType') || 'OS type'}</label>
+                                                                        <select value={xhmForm.ostype}
+                                                                                onChange={e => setXhmForm({...xhmForm, ostype: e.target.value})}
+                                                                                className={field}>
+                                                                            {HV_OSTYPES.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                                                                        </select>
+                                                                    </div>
+                                                                    <div>
+                                                                        <label className="text-[10px] text-gray-500 block mb-0.5">{t('hvCores') || 'Cores'}</label>
+                                                                        <input type="number" min="1" value={xhmForm.cores}
+                                                                               onChange={e => setXhmForm({...xhmForm, cores: e.target.value})} className={field} />
+                                                                    </div>
+                                                                    <div>
+                                                                        <label className="text-[10px] text-gray-500 block mb-0.5">{t('hvSockets') || 'Sockets'}</label>
+                                                                        <input type="number" min="1" value={xhmForm.sockets}
+                                                                               onChange={e => setXhmForm({...xhmForm, sockets: e.target.value})} className={field} />
+                                                                    </div>
+                                                                    <div className="col-span-2">
+                                                                        <label className="text-[10px] text-gray-500 block mb-0.5">{t('hvMemory') || 'Memory (MiB)'}</label>
+                                                                        <input type="number" min="16" step="16" value={xhmForm.memory_mb}
+                                                                               onChange={e => setXhmForm({...xhmForm, memory_mb: e.target.value})} className={field} />
+                                                                    </div>
+                                                                    <div>
+                                                                        <label className="text-[10px] text-gray-500 block mb-0.5">{t('hvFirmware') || 'Firmware'}</label>
+                                                                        {/* Both move together: a machine type that does not match the
+                                                                            firmware boots into a shell. */}
+                                                                        <select value={xhmForm.bios}
+                                                                                onChange={e => setXhmForm({...xhmForm, bios: e.target.value,
+                                                                                                           machine: e.target.value === 'ovmf' ? 'q35' : 'pc'})}
+                                                                                className={field}>
+                                                                            <option value="seabios">SeaBIOS (Gen 1)</option>
+                                                                            <option value="ovmf">OVMF / UEFI (Gen 2)</option>
+                                                                        </select>
+                                                                        <div className="text-[10px] text-gray-600 mt-0.5">
+                                                                            {(t('hvFromGeneration') || 'Source: generation {gen}').replace('{gen}', d.generation ?? '?')}
+                                                                        </div>
+                                                                    </div>
+                                                                    <div>
+                                                                        <label className="text-[10px] text-gray-500 block mb-0.5">{t('hvMachine') || 'Machine'}</label>
+                                                                        <select value={xhmForm.machine}
+                                                                                onChange={e => setXhmForm({...xhmForm, machine: e.target.value})}
+                                                                                className={field}>
+                                                                            <option value="pc">pc (i440fx)</option>
+                                                                            <option value="q35">q35</option>
+                                                                        </select>
+                                                                    </div>
+                                                                    <div>
+                                                                        <label className="text-[10px] text-gray-500 block mb-0.5">{t('hvScsiHw') || 'SCSI controller'}</label>
+                                                                        <select value={xhmForm.scsihw}
+                                                                                onChange={e => setXhmForm({...xhmForm, scsihw: e.target.value})}
+                                                                                className={field}>
+                                                                            {HV_SCSIHW.map(o => <option key={o} value={o}>{o}</option>)}
+                                                                        </select>
+                                                                    </div>
+                                                                    <div>
+                                                                        <label className="text-[10px] text-gray-500 block mb-0.5">{t('hvBootDisk') || 'Boot disk'}</label>
+                                                                        <select value={xhmForm.boot_disk}
+                                                                                onChange={e => setXhmForm({...xhmForm, boot_disk: e.target.value})}
+                                                                                className={field}>
+                                                                            {(d.disks || []).map(disk => (
+                                                                                <option key={disk.index} value={disk.index}>
+                                                                                    {disk.label} ({hvBytesToGiB(disk.size)} GiB)
+                                                                                </option>
+                                                                            ))}
+                                                                        </select>
+                                                                    </div>
+                                                                </div>
+                                                                {d.needs_efi && (
+                                                                    <label className="flex items-center gap-1.5 text-xs text-gray-400 cursor-pointer"
+                                                                           title={t('hvEfiKeysHint') || 'A guest that had Secure Boot on needs Microsoft\'s keys in its variable store. A guest that had it off must not get them — its loader may be unsigned and would stop booting.'}>
+                                                                        <input type="checkbox" checked={!!xhmForm.efi_pre_enrolled_keys}
+                                                                               onChange={e => setXhmForm({...xhmForm, efi_pre_enrolled_keys: e.target.checked})}
+                                                                               className="rounded border-gray-600" />
+                                                                        {t('hvEfiKeys') || 'Pre-enrol Microsoft keys in the UEFI variable store'}
+                                                                        <span className="text-[10px] text-gray-600">
+                                                                            ({(t('hvSourceSecureBoot') || 'source: {state}').replace('{state}',
+                                                                                d.secure_boot_enabled === true ? 'on' : d.secure_boot_enabled === false ? 'off' : 'unknown')})
+                                                                        </span>
+                                                                    </label>
+                                                                )}
+                                                            </div>);
+                                                        })()}
+
                                                         {/* Network mapping */}
                                                         {(xhmPlan.source.networks || []).length > 0 && (
                                                             <div>
@@ -23249,6 +23462,51 @@
                                                                            className="rounded border-gray-600" />
                                                                     {t('hvPrepareVirtio') || 'Install VirtIO drivers and create on VirtIO hardware'}
                                                                 </label>
+                                                                {/* Fork patch #15 — which driver ISO. Not a default: the import
+                                                                    used to take the first file called virtio-win.iso it found on
+                                                                    the node, whatever release it was. An out-of-support Windows
+                                                                    accepts a narrower set of signatures than a current one, and a
+                                                                    driver it rejects is not reported — it is simply not loaded,
+                                                                    and the VM stops at 0xc0000428 naming viostor.sys. Windows
+                                                                    Server 2012 R2 must be driven by virtio-win 0.1.189. */}
+                                                                {xhmForm.prepare_virtio && (
+                                                                    <div className="pl-5 space-y-1">
+                                                                        <label className="text-[10px] text-gray-500 block">{t('hvVirtioIso') || 'Driver ISO'}</label>
+                                                                        <select value={xhmForm.virtio_iso_path}
+                                                                                onChange={e => setXhmForm({...xhmForm, virtio_iso_path: e.target.value})}
+                                                                                className="w-full px-2 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-white text-xs">
+                                                                            <option value="">{t('hvVirtioIsoPick') || 'Select a driver ISO…'}</option>
+                                                                            {(hvIsos?.isos || []).map(iso => (
+                                                                                <option key={iso.volid} value={iso.volid}>
+                                                                                    {iso.volid}{iso.release ? ` — ${iso.release}` : ` — ${t('hvVirtioIsoNoRelease') || 'release not in the file name'}`}
+                                                                                </option>
+                                                                            ))}
+                                                                        </select>
+                                                                        {!xhmForm.target_node && (
+                                                                            <div className="text-[10px] text-gray-600">{t('hvVirtioIsoNeedsNode') || 'Choose a target node to see the ISOs it has.'}</div>
+                                                                        )}
+                                                                        {xhmForm.target_node && (hvIsos?.isos || []).length === 0 && (
+                                                                            <div className="text-[10px] text-amber-500/90">{t('hvVirtioIsoNone') || 'This node has no VirtIO driver ISO. Fetch one below.'}</div>
+                                                                        )}
+                                                                        {/* The node downloads it, not this browser. */}
+                                                                        {xhmForm.target_node && (hvIsos?.available_releases || []).map(rel => {
+                                                                            const have = (hvIsos?.isos || []).some(iso => iso.release === rel.release);
+                                                                            const storage = (hvIsos?.iso_storages || [])[0];
+                                                                            if (have || !storage) return null;
+                                                                            return (
+                                                                                <div key={rel.release} className="flex items-center gap-2">
+                                                                                    <button onClick={() => hvDownloadIso(rel.release, storage)}
+                                                                                            disabled={hvIsoBusy}
+                                                                                            className="text-[10px] px-2 py-0.5 rounded bg-purple-500/10 border border-purple-500/30 text-purple-300 hover:text-white disabled:opacity-50">
+                                                                                        {(t('hvVirtioIsoFetch') || 'Fetch {release} onto {storage}')
+                                                                                            .replace('{release}', rel.release).replace('{storage}', storage)}
+                                                                                    </button>
+                                                                                    <span className="text-[10px] text-gray-600">{rel.note}</span>
+                                                                                </div>
+                                                                            );
+                                                                        })}
+                                                                    </div>
+                                                                )}
                                                                 {/* Fork patch #15 — a choice, not a rule. Leaving the copy
                                                                     off is the safe answer and stays the default, but it is
                                                                     not the right one for every migration: a window where the
@@ -23299,7 +23557,7 @@
                                                             />
                                                         )}
 
-                                                        <button onClick={startXhmMigration} disabled={xhmLoading || !xhmForm.target_storage || (hvTargetsProxmox(xhmPlan?.direction) && !xhmForm.target_node) || !hvMayStart(xhmPlan, xhmForm.acknowledged, hvPreflight)} className="w-full py-2.5 rounded-lg bg-purple-500 text-white font-medium hover:bg-purple-600 disabled:opacity-50 text-sm">
+                                                        <button onClick={startXhmMigration} disabled={xhmLoading || !xhmForm.target_storage || (hvTargetsProxmox(xhmPlan?.direction) && !xhmForm.target_node) || !hvMayStart(xhmPlan, xhmForm.acknowledged, hvPreflight) || (hvIsHyperVPlan(xhmPlan) && !hvIsPveName(xhmForm.target_name || xhmPlan?.target_defaults?.name || '')) || (hvIsHyperVPlan(xhmPlan) && (hvPreflight?.vmids_with_volumes || []).includes(Number(xhmForm.target_vmid)))} className="w-full py-2.5 rounded-lg bg-purple-500 text-white font-medium hover:bg-purple-600 disabled:opacity-50 text-sm">
                                                             {xhmLoading ? 'Starting...' : (t('xhmStartMigration') || 'Start Migration')}
                                                         </button>
                                                     </div>
