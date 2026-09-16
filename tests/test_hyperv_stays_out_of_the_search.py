@@ -89,15 +89,13 @@ def test_the_summary_does_not_enumerate_a_hyperv_host_either(api, seed, monkeypa
 # The wizard sends what it offers
 # ===========================================================================
 
-def test_the_wizard_does_not_send_an_option_this_direction_refuses():
-    """A Hyper-V plan hides `start_after` and `remove_source` — and must not send them.
+def test_the_wizard_does_not_send_the_option_this_direction_refuses():
+    """A Hyper-V plan offers no "remove source" — and must not send one either.
 
-    `refuse_hyperv_start` rejects a request carrying either, because starting an imported
-    VM before somebody has stopped the original puts the same hostname and MAC on the
-    network twice. The wizard explains that in prose and shows no checkbox. But the form
-    kept its defaults, and `start_after` defaults to true — so every Hyper-V migration was
-    refused by the API, quoting the reason for a box nobody had ticked and nobody could
-    untick.
+    Deleting the source is the whole rollback, so this direction refuses it outright. The
+    form still carries the shared default, and an option the operator was never shown must
+    not travel with the request: that is exactly how `start_after` used to make every
+    Hyper-V migration fail, quoting the reason for a box nobody could untick.
 
     Read out of the source: the submit handler lives in a component this suite cannot
     mount, and the alternative is no guard at all on a fault that made the feature
@@ -113,15 +111,14 @@ def test_the_wizard_does_not_send_an_option_this_direction_refuses():
     handler = source[start:source.index('const resp = await authFetch', start)]
 
     assert 'hvIsHyperVPlan(xhmPlan)' in handler, (
-        'the submit no longer distinguishes a Hyper-V plan, so it sends the options that '
+        'the submit no longer distinguishes a Hyper-V plan, so it sends the option that '
         'direction refuses')
-    assert 'body.start_after = false' in handler
     assert 'body.remove_source = false' in handler
 
 
-def test_the_server_still_refuses_those_options_when_it_is_asked_for_them():
+def test_the_server_still_refuses_deleting_the_source():
     """The guard above is convenience; this is the one that must not be removed."""
     from pegaprox.core import hyperv_xhm
 
-    assert hyperv_xhm.refuse_hyperv_start('hv_1', 1, {'start_after': True})
     assert hyperv_xhm.refuse_hyperv_start('hv_1', 1, {'remove_source': True})
+    assert hyperv_xhm.refuse_hyperv_start('hv_1', 1, {'start_after': True}) is None

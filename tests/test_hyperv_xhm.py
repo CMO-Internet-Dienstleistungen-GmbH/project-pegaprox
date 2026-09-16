@@ -1174,26 +1174,55 @@ class TestNeitherSideIsStartedWhileTheOtherRuns:
 
 
 class TestOptionsThisDirectionRefuses:
-    """Neither is offered in the wizard, so a request carrying one was written by hand."""
+    """One is still refused; the other became a choice, and the difference is the point."""
 
     def test_remove_source_cannot_be_switched_on_by_a_direct_request(self, db, wired):
+        """Deleting the source removes the rollback, and no confirmation restores it."""
         refused = hyperv_xhm.refuse_hyperv_start(SOURCE, VMID, {'remove_source': True})
         assert refused and 'never deletes' in refused
 
-    def test_start_after_cannot_be_switched_on_by_a_direct_request(self, db, wired):
-        refused = hyperv_xhm.refuse_hyperv_start(SOURCE, VMID, {'start_after': True})
-        assert refused and 'not started automatically' in refused
+    def test_starting_the_copy_is_allowed_and_is_the_operator_s_call(self, db, wired):
+        """It used to be refused outright, which is why no migration could be started.
+
+        The wizard hid the checkbox and kept its default of true, so every request carried
+        an option the operator had never seen and could not clear. Refusing a real risk is
+        not the same as deciding it for somebody: a maintenance window where the source has
+        just been shut down for good is exactly when starting the copy is what is wanted.
+        """
+        assert hyperv_xhm.refuse_hyperv_start(SOURCE, VMID, {'start_after': True}) is None
 
     def test_the_ordinary_request_is_not_refused(self, db, wired):
         assert hyperv_xhm.refuse_hyperv_start(
             SOURCE, VMID, {'start_after': False, 'remove_source': False}) is None
 
-    def test_the_runner_reads_neither_option(self, db, wired):
-        """Belt and braces: even if a request got past the route, nothing acts on them."""
+    def test_the_runner_never_deletes_the_source(self, db, wired):
+        """Belt and braces: even if a request got past the route, nothing acts on it."""
         import inspect
         source = inspect.getsource(hyperv_xhm._run_hyperv_to_pve)
         assert 'remove_source' not in source
-        assert 'start_after' not in source
+
+
+class TestStartingTheImportedVm:
+    """Off unless asked for, and asked for means asked for."""
+
+    def test_nothing_is_started_when_nobody_asked(self, db, wired):
+        _, target, _ = wired
+        _run(FakeTask())
+        assert not [url for url, _ in target.posts if url.endswith('/status/start')]
+
+    def test_the_vm_is_started_when_the_request_says_so(self, db, wired):
+        _, target, _ = wired
+        _run(FakeTask(config={'start_after': True}))
+        started = [url for url, _ in target.posts if url.endswith('/status/start')]
+        assert started, 'the migration was asked to start the VM and did not'
+
+    def test_a_start_that_fails_does_not_fail_the_migration(self, db, wired, monkeypatch):
+        """The VM exists and is correct; starting it is one click on the target."""
+        _, target, _ = wired
+        monkeypatch.setattr(hyperv_xhm, '_start_target',
+                            lambda task, vmid: task.log('boom'))
+        task = _run(FakeTask(config={'start_after': True}))
+        assert task.phase == 'completed'
 
 
 # ===========================================================================
@@ -1930,3 +1959,26 @@ class TestTheMacArrivesUnchanged:
                     if url.endswith('/qemu'))['net0']
         assert 'macaddr' not in net0
         assert 'bridge=vmbr1' in net0
+
+
+def test_no_default_anywhere_deletes_the_source():
+    """The one option that cannot be taken back must never arrive by omission.
+
+    `start_after` defaulting to true is what made every Hyper-V migration fail, and it was
+    recoverable — nothing had happened yet. A `remove_source` that arrived the same way
+    would delete the rollback of a migration nobody asked to be irreversible.
+    """
+    import inspect
+    import os
+
+    from pegaprox.core import xhm
+
+    task_source = inspect.getsource(xhm.XHMigrationTask.__init__)
+    assert "self.config.get('remove_source', False)" in task_source, (
+        'the shared task no longer defaults remove_source to off')
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(repo, 'web', 'src', 'dashboard.js'), encoding='utf-8') as fh:
+        web = fh.read()
+    assert 'remove_source: true' not in web
+    assert 'remove_source:true' not in web
