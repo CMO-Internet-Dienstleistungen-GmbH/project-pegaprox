@@ -180,3 +180,29 @@ def test_the_secret_never_reaches_the_error_text(monkeypatch):
     mgr._using_api_token = True
     _, _, err = ssh_mod._pve_node_exec(mgr, 'n1', 'true')
     assert 'pve-token-secret' not in err
+
+
+def test_the_refusal_names_the_reason_it_actually_checked(monkeypatch):
+    """CodeAnt (daily scan, 16.09) flagged this line. The first version said "a stored SSH
+    key is not usable on this path" in every case — but the branch is also reached with no
+    credential at all, when ssh_diagnose raised and never got to say so itself. Asserting a
+    key that isn't there sends the operator looking for the wrong thing."""
+    monkeypatch.setattr(ssh_mod, '_ssh_exec', lambda *a, **k: (0, 'ok', ''))
+
+    class _Boom(_Mgr):
+        def ssh_diagnose(self, node): raise RuntimeError('classifier missing')
+
+    bare = _Boom(pass_='', ssh_key='')
+    _, _, err = ssh_mod._pve_node_exec(bare, 'n1', 'true')
+    assert 'no SSH password is stored' in err
+    assert 'ssh key' not in err.lower(), f"claims a key that was never configured: {err}"
+
+    keyed = _Boom(pass_='', ssh_key='-----BEGIN OPENSSH PRIVATE KEY-----')
+    _, _, err = ssh_mod._pve_node_exec(keyed, 'n1', 'true')
+    assert 'ssh key' in err.lower() and 'password only' in err.lower()
+
+    tok = _Mgr(pass_='pve-token-secret', ssh_key='k')
+    tok._using_api_token = True
+    _, _, err = ssh_mod._pve_node_exec(tok, 'n1', 'true')
+    assert 'api token' in err.lower()
+    assert 'pve-token-secret' not in err

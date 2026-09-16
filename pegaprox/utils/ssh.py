@@ -430,12 +430,20 @@ def _pve_node_exec(pve_mgr, node, cmd, timeout=600, use_controlmaster=True,
         # goes to sshd in its place — on a token cluster that is the token secret, and
         # every method in _ssh_exec tries it in turn. Key + API token is the setup we
         # recommend, so that is the config generating the most failed root logins.
-        _ssh_pass = '' if getattr(pve_mgr, '_using_api_token', False) \
-            else (getattr(pve_mgr.config, 'pass_', '') or '')
+        _token_auth = bool(getattr(pve_mgr, '_using_api_token', False))
+        _ssh_pass = '' if _token_auth else (getattr(pve_mgr.config, 'pass_', '') or '')
         if not _ssh_pass:
-            return 1, '', (f"no SSH password stored for this cluster — node commands on "
-                           f"'{node}' authenticate by password, and a stored SSH key is "
-                           f"not usable on this path")
+            # Say which of the three it actually is. The first version of this asserted a
+            # stored key in every case, but the branch is also reached on a cluster with no
+            # credential at all — whenever ssh_diagnose raised and its own message never
+            # got the chance to say so.
+            _why = ("this cluster authenticates with an API token, and the stored secret is "
+                    "that token, not an SSH password") if _token_auth else \
+                   "no SSH password is stored for this cluster"
+            if getattr(pve_mgr.config, 'ssh_key', ''):
+                _why += (" — the stored SSH key cannot help here, this path authenticates "
+                         "by password only")
+            return 1, '', f"cannot run node commands on '{node}': {_why}"
         rc, out, err = _ssh_exec(node_host, _ssh_user, _ssh_pass, cmd,
                                   timeout=timeout, use_controlmaster=use_controlmaster)
         # SSH error patterns that indicate the node itself is dead, not the cmd
