@@ -19,6 +19,7 @@ from pegaprox.globals import cluster_managers, vmware_managers, _v2p_migrations
 from pegaprox.utils.ssh import _ssh_exec, _pve_node_exec
 from pegaprox.utils.realtime import broadcast_sse
 from pegaprox.utils.audit import log_audit
+from pegaprox.core import hyperv_drivers
 
 
 class V2PCutoverCancelled(Exception):
@@ -2405,6 +2406,12 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
         ")\n"
         "echo \"VER_NAME=$VER_NAME\"\n"
         "echo \"VER_BUILD=$VER_BUILD\"\n"
+        # Fork issue #15 — an out-of-support Windows accepts a narrower set of driver
+        # signatures than a current one, and a driver it rejects is not reported: it is
+        # simply not loaded, and the VM stops at 0xc0000428 naming viostor.sys. Which
+        # release a build may be driven by is decided in hyperv_drivers; this renders the
+        # refusal for the ISO that was actually chosen, and is empty whenever it fits.
+        + hyperv_drivers.guard_snippet(iso_path) +
         # NS May 2026 (#222) — pick subdir from actual VER_BUILD; some isos
         # ship Server 2025 vioscsi only under 2k25/, w11/ might be missing it.
         # Try multiple subdirs per driver; first hit wins.
@@ -2801,6 +2808,16 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
                  'Its saved session has been discarded, so it will boot cold on the target '
                  '— which is the only way it can come up on hardware it was not saved on. '
                  'Anything that was open in that session is gone.')
+
+    # Fork issue #15 — the guard above stopped before a single file was copied, because
+    # this guest's Windows version may not be given the release that was chosen. Nothing
+    # was changed on the volume; the remedy is a different ISO, and the line says which.
+    for line in out_str.splitlines():
+        if 'REFUSED_DRIVER_RELEASE=' in line:
+            task.log('[VirtIO] ✗ ' + line.split('REFUSED_DRIVER_RELEASE=', 1)[1].strip())
+            task.log('[VirtIO]   No drivers were written; the VM stays on the hardware it '
+                     'was imported on and boots.')
+            return False
 
     #: The caller needs to tell this apart from any other failure: the files are staged and
     #: correct, and the remedy is a different driver release rather than a retry.
