@@ -651,3 +651,40 @@ class TestAnUnreportedSecureBootState:
         finding = pf.check_secure_boot(True, generation=2)
         assert finding.severity == pf.OK
         assert 'enrolled' in finding.detail
+
+
+# ===========================================================================
+# The address the rest of the network knows the guest by
+# ===========================================================================
+
+class TestTheMacSurvivesTheMigration:
+    """A guest that comes up with a different MAC is a different machine to the network.
+
+    DHCP reservations, static leases, port security, licence bindings and firewall rules
+    are written against it. Nothing about a migration's own result shows that they stopped
+    matching, which is why this is a question asked before the transfer rather than a
+    surprise after it.
+    """
+
+    def test_an_assigned_dynamic_mac_is_not_a_problem(self):
+        """Dynamic means Hyper-V chose it, not that it is temporary."""
+        adapters = [{'name': 'Network Adapter', 'mac_address': '00155D000001',
+                     'dynamic_mac': True}]
+
+        finding = pf.check_mac_addresses(adapters)
+
+        assert finding.severity == pf.OK
+
+    def test_an_adapter_that_never_had_one_is_named_and_confirmed(self):
+        adapters = [{'name': 'Network Adapter', 'mac_address': '00155D000001'},
+                    {'name': 'Network Adapter', 'mac_address': '000000000000'}]
+
+        finding = pf.check_mac_addresses(adapters)
+
+        assert finding.severity == pf.WARNING
+        assert '#2' in finding.detail, 'the operator cannot tell which adapter it means'
+        assert '#1' not in finding.detail, 'the adapter that has an address is not at risk'
+        assert 'mac_addresses' in pf._ACKNOWLEDGEABLE_CHECKS
+
+    def test_a_vm_without_adapters_is_not_warned_about(self):
+        assert pf.check_mac_addresses([]).severity == pf.OK

@@ -23087,24 +23087,29 @@
                                                                     <div key={i} className="flex items-center gap-2 mb-1">
                                                                         {/* Fork patch #15 — two adapters on the same Hyper-V switch
                                                                             produced two rows reading "Produktion-Vswitch", and nothing
-                                                                            said which was which. The map is keyed by MAC and was always
-                                                                            right; only the label was unreadable. A quarter of the VMs on
-                                                                            this estate have more than one adapter. */}
+                                                                            said which was which. Worse, they shared one entry in the
+                                                                            map: the key was the MAC or the adapter's name, and an
+                                                                            adapter that has never run has no MAC while every adapter is
+                                                                            called "Network Adapter". Changing one dropdown changed the
+                                                                            other, and the run put both cards on whatever survived. The
+                                                                            key is the adapter's own identity now, and the second line
+                                                                            always carries its position and its MAC — or says there is
+                                                                            none yet, which is the honest version of an empty line.
+                                                                            A quarter of the VMs on this estate have more than one
+                                                                            adapter. */}
                                                                         <span className="text-xs w-44 shrink-0 leading-tight">
                                                                             <span className="text-gray-400 block truncate"
                                                                                   title={net.switch_name || net.bridge || ''}>
-                                                                                {net.bridge || net.network || `net${i}`}
+                                                                                {net.bridge || net.switch_name || `net${i}`}
                                                                             </span>
-                                                                            {(net.mac_address || net.name) && (
-                                                                                <span className="text-[10px] text-gray-600 block truncate font-mono"
-                                                                                      title={[net.name, net.mac_address].filter(Boolean).join(' · ')}>
-                                                                                    {hvAdapterLabel(net, i)}
-                                                                                </span>
-                                                                            )}
+                                                                            <span className="text-[10px] text-gray-600 block truncate font-mono"
+                                                                                  title={[net.name, net.mac_address].filter(Boolean).join(' · ')}>
+                                                                                {hvAdapterLabel(net, i, t)}
+                                                                            </span>
                                                                         </span>
                                                                         <span className="text-gray-600">→</span>
                                                                         {hvTargetsProxmox(xhmPlan.direction) ? (
-                                                                            <select value={xhmForm.network_map[net.network || net.bridge || String(i)] || ''} onChange={e => setXhmForm({...xhmForm, network_map: {...xhmForm.network_map, [net.network || net.bridge || String(i)]: e.target.value}})} className="flex-1 px-2 py-1 bg-proxmox-dark border border-proxmox-border rounded text-white text-xs">
+                                                                            <select value={xhmForm.network_map[hvAdapterKey(net, i)] || ''} onChange={e => setXhmForm({...xhmForm, network_map: {...xhmForm.network_map, [hvAdapterKey(net, i)]: e.target.value}})} className="flex-1 px-2 py-1 bg-proxmox-dark border border-proxmox-border rounded text-white text-xs">
                                                                                 {/* A Hyper-V import maps every adapter explicitly and blocks until it does,
                                                                                     so naming a bridge here would show a choice that was never made - the
                                                                                     value is empty, and the list below says so in the same breath. The
@@ -23126,7 +23131,7 @@
                                                                             than a blank. A trunk adapter carries several ids and gets none:
                                                                             putting it on one guessed VLAN would look like it worked. */}
                                                                         {hvIsHyperVPlan(xhmPlan) && hvTargetsProxmox(xhmPlan.direction) && (() => {
-                                                                            const vkey = net.network || net.bridge || String(i);
+                                                                            const vkey = hvAdapterKey(net, i);
                                                                             const trunk = !!net.vlan_mode && !['Access', 'Untagged'].includes(net.vlan_mode);
                                                                             const vlanValue = xhmForm.vlan_map[vkey] !== undefined
                                                                                 ? xhmForm.vlan_map[vkey]
