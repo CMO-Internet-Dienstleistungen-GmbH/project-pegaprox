@@ -9,6 +9,37 @@ hardware combinations are actually proven is in `docs/hyperv-compatibility.md`.
 
 Nothing here names a real host, account, network or customer.
 
+## What survives, and where it is
+
+A migration's record lives in `config/pegaprox.db`, table `hyperv_migrations` — one row
+per migration, kept after the run ends. The list in the interface is built from a dict in
+the process and is emptied by a restart; the table is what the list falls back to, and
+what the refusal to start the same VM twice reads.
+
+| Column | |
+|---|---|
+| `migration_id`, `source_cluster`, `source_vm_guid`, `source_vm_name` | which VM, from where |
+| `target_cluster`, `target_node`, `target_storage`, `target_vmid` | where it went |
+| `status`, `phase`, `progress`, `error` | how it ended, and why not |
+| `log_lines` | the run's own log, JSON, last 500 lines |
+| `created_resources` | what it left on the target, JSON — the reason a record outlives its run |
+| `disk_progress`, `post_import` | JSON |
+| `started_at`, `updated_at`, `completed_at` | Unix time |
+
+The phase timeline is **not** kept: it lived in the process. For a record read back after
+a restart, the status is the verdict.
+
+Taking the data out, without PegaProx:
+
+```bash
+sqlite3 -header -csv config/pegaprox.db \
+  "SELECT * FROM hyperv_migrations ORDER BY started_at" > migrations.csv
+```
+
+Removing it again: an entry can be dismissed in the interface once nothing of it is left
+on the target, and `DELETE FROM hyperv_migrations WHERE completed_at < …` does it on the
+database. The refusal reads the same table, so gone is gone.
+
 ## What this direction is
 
 A Hyper-V host is registered like any other cluster and appears in the sidebar,
