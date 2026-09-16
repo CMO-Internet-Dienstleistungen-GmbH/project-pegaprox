@@ -1344,6 +1344,23 @@ def get_password_policy():
         'expiry_days': settings.get('password_expiry_days', 0)
     })
 
+def _read_hyperv_default_vlan(raw):
+    """Validate the fallback VLAN for Hyper-V imports. Returns (value, error).
+
+    Fork patch #15. Hyper-V leaves an adapter untagged whenever the physical switch port
+    does the tagging, so an adapter with no VLAN on the source usually means "the operator
+    knows which one", not "untagged". This is the value the migration wizard prefills in
+    that case; 0 turns the fallback off and lets such an adapter arrive untagged.
+    """
+    try:
+        vlan = int(raw or 0)
+    except (TypeError, ValueError):
+        return None, 'hyperv_default_vlan must be a number'
+    if vlan and not 1 <= vlan <= 4094:
+        return None, 'hyperv_default_vlan must be 0, or between 1 and 4094'
+    return vlan, None
+
+
 @bp.route('/api/settings/server', methods=['POST'])
 @require_auth(perms=['admin.settings'])
 def update_server_settings():
@@ -1371,6 +1388,12 @@ def update_server_settings():
                 if settings.get('port') != new_port:
                     restart_required = True
                 settings['port'] = new_port
+            # Fork patch #15 — see _read_hyperv_default_vlan.
+            if 'hyperv_default_vlan' in data:
+                vlan, error = _read_hyperv_default_vlan(data['hyperv_default_vlan'])
+                if error:
+                    return jsonify({'error': error}), 400
+                settings['hyperv_default_vlan'] = vlan
             if 'http_redirect_port' in data:
                 new_http_port = int(data['http_redirect_port'])
                 if settings.get('http_redirect_port') != new_http_port:
@@ -1727,6 +1750,14 @@ def update_server_settings():
             
         else:
             # form-data (for file uploads)
+            # Fork patch #15 — the settings page posts form-data, so the Hyper-V default
+            # VLAN has to be read here too. Same helper as the JSON branch above: two
+            # readings of one setting is how they end up disagreeing.
+            if 'hyperv_default_vlan' in request.form:
+                vlan, error = _read_hyperv_default_vlan(request.form.get('hyperv_default_vlan'))
+                if error:
+                    return jsonify({'error': error}), 400
+                settings['hyperv_default_vlan'] = vlan
             domain = request.form.get('domain', '')
             port = request.form.get('port', '5000')
             http_redirect_port = request.form.get('http_redirect_port', '0')
