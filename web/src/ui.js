@@ -304,7 +304,7 @@
                     <img
                         src={user.avatar_url}
                         alt={`${user?.display_name || user?.username || 'User'} avatar`}
-                        className={`${classes} object-cover border border-proxmox-border/60`}
+                        className={`${classes} object-cover border border-proxmox-border`}
                     />
                 );
             }
