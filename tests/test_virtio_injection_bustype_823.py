@@ -4,6 +4,8 @@ Reported against 1.1.1: `Parameters\\BusType` was written as 1 for both viostor 
 vioscsi, and the CriticalDeviceDatabase named DEV_1041 -- VirtIO network -- as the
 modern VirtIO SCSI device. A Windows guest whose boot disk was moved to
 `virtio-scsi-single` afterwards stopped with INACCESSIBLE_BOOT_DEVICE before usermode.
+Neither storage driver had its modern device id there: viostor listed only the
+transitional DEV_1001, so the same gap was open for a plain virtio-blk disk.
 The values come out of the vendor INFs: viostor.inf writes 0x00000001,
 vioscsi.inf writes 0x0000000A, and both write DmaRemappingCompatible.
 
@@ -289,6 +291,18 @@ def test_the_transitional_device_is_still_bound(written):
     assert written.string(f'{_CDB}\\pci#ven_1af4&dev_1004', 'Service') == 'vioscsi'
 
 
+def test_the_modern_block_device_is_bound_to_the_block_driver(written):
+    """Type 2 is block, so the modern id is 1042. viostor had the same gap vioscsi had:
+    only the transitional device was listed, and a guest given the modern one found no
+    entry at all."""
+    assert written.string(f'{_CDB}\\pci#ven_1af4&dev_1042', 'Service') == 'viostor'
+
+
+def test_the_modern_block_device_is_bound_in_its_subsystem_form_as_well(written):
+    key = f'{_CDB}\\pci#ven_1af4&dev_1042&subsys_11001af4&rev_01'
+    assert written.string(key, 'Service') == 'viostor'
+
+
 def test_the_network_device_is_not_claimed_by_the_scsi_driver(written):
     """1041 is type 1, VirtIO network -- it is what netkvm.inf matches."""
     assert written.node(f'{_CDB}\\pci#ven_1af4&dev_1041') is None
@@ -298,7 +312,8 @@ def test_the_network_device_is_not_claimed_by_the_scsi_driver(written):
     'pci#ven_1af4&dev_1001',
     'pci#ven_1af4&dev_1001&subsys_00021af4&rev_00',
 ])
-def test_the_block_drivers_entries_are_left_alone(written, key):
+def test_the_block_drivers_existing_entries_are_left_alone(written, key):
+    """The transitional pair was right; adding the modern one may not cost it."""
     assert written.string(f'{_CDB}\\{key}', 'Service') == 'viostor'
 
 
@@ -657,12 +672,15 @@ def test_a_guest_without_the_branch_is_left_alone(written):
 
 @pytest.mark.parametrize('driver,key', [
     ('viostor', 'pci#ven_1af4&dev_1001'),
+    ('viostor', 'pci#ven_1af4&dev_1042'),
     ('vioscsi', 'pci#ven_1af4&dev_1004'),
     ('vioscsi', 'pci#ven_1af4&dev_1048'),
 ])
-def test_the_old_entries_stay_on_a_modern_guest_too(modern_guest, driver, key):
-    """They are simply unread there, and they are what a Windows 7 guest still needs. The
-    new database replaces nothing."""
+def test_the_legacy_database_is_written_on_a_modern_guest_too(modern_guest, driver, key):
+    """The CriticalDeviceDatabase is unread on a modern guest and is what a Windows 7 guest
+    still needs, so all four entries are written there regardless -- the ones that were
+    already right and the two modern ids added beside them. The new database replaces
+    nothing."""
     assert modern_guest.string(f'{_CDB}\\{key}', 'Service') == driver
 
 

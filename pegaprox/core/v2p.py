@@ -2585,8 +2585,16 @@ def _inject_virtio_drivers(pve_mgr, task):
         "    _devices['vioscsi'] = ['VEN_1AF4&DEV_1004&REV_00', 'VEN_1AF4&DEV_1048&REV_01']\n"
         "_pci = []\n"
         "if have_viostor:\n"
+        # viostor.inf names two devices in the same two shapes vioscsi.inf does:
+        # DEV_1001 (transitional) and DEV_1042 (modern block), each with and without its
+        # subsystem form. Only the transitional pair stood here, so a guest presented the
+        # modern block device found no entry -- the same gap as the SCSI one, on the
+        # driver a plain virtio-blk disk is served by. Not reported on #823, which names
+        # only the SCSI driver.
         "    _pci += [('pci#ven_1af4&dev_1001', 'viostor'),\n"
-        "             ('pci#ven_1af4&dev_1001&subsys_00021af4&rev_00', 'viostor')]\n"
+        "             ('pci#ven_1af4&dev_1001&subsys_00021af4&rev_00', 'viostor'),\n"
+        "             ('pci#ven_1af4&dev_1042', 'viostor'),\n"
+        "             ('pci#ven_1af4&dev_1042&subsys_11001af4&rev_01', 'viostor')]\n"
         "if have_vioscsi:\n"
         # vioscsi.inf names exactly two devices: DEV_1004 (transitional) and DEV_1048
         # (modern). DEV_1041 is VirtIO *network* -- it is what netkvm.inf matches -- and
