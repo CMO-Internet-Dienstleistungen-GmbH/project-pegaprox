@@ -572,17 +572,31 @@ def _forget_volume(migration_id, volume):
         logger.warning('Could not forget the freed volume %s', volume, exc_info=True)
 
 
-# Options the other directions accept and this one does not. Neither is offered in the
-# wizard, so a request carrying them was written by hand — and both are ways of losing the
-# thing that makes this direction recoverable.
+# The one option this direction still refuses, and it is not a default that got in the
+# way: deleting the source removes the entire rollback. A failed import has nothing to go
+# back to, and no amount of confirming makes that recoverable.
+#
+# `start_after` used to be here too and should not have been. Starting the copy is a real
+# risk — it carries the original's hostname and MAC — but it is the operator's call, not
+# the product's, and refusing it outright meant the wizard sent an option it did not offer
+# and every migration was rejected. It is a choice now, off by default, and the preflight
+# says what it means when it is on.
 _REFUSED_OPTIONS = {
     'remove_source': 'This direction never deletes the Hyper-V source. The surviving '
                      'original is the entire rollback: without it a failed import has '
                      'nothing to go back to.',
-    'start_after': 'An imported VM is not started automatically. It carries the original\'s '
-                   'hostname and MAC, so starting it before somebody has stopped the '
-                   'original puts the same machine on the network twice.',
 }
+
+
+def wants_start_after(task) -> bool:
+    """Did the request ask for the imported VM to be started?
+
+    Read off the request rather than the shared task object, which defaults it to True for
+    the other directions. This one defaults to off: the copy carries the original's
+    hostname and MAC, so coming up unasked is the failure the whole direction is arranged
+    to avoid.
+    """
+    return bool((getattr(task, 'config', None) or {}).get('start_after'))
 
 
 def refuse_hyperv_start(source_cluster_id, source_vmid, options=None):
@@ -1748,8 +1762,34 @@ def _boot_disk_name(attached, detail):
     return by_index[min(by_index)]
 
 
+def _start_target(task, new_vmid):
+    """Start the imported VM, because the request asked for it.
+
+    A failure here does not fail the migration: the VM exists and is correct, and starting
+    it is one click on the target. Losing a finished import over its last step would throw
+    away the expensive half of the run for the cheap half.
+    """
+    target = cluster_managers.get(task.target_cluster)
+    if target is None:
+        task.log(f'VMID {new_vmid} was not started: the target cluster is not connected.')
+        return
+    try:
+        response = target._api_post(
+            f'https://{target.host}:{target.api_port}'
+            f'/api2/json/nodes/{task.target_node}/qemu/{new_vmid}/status/start', data={})
+    except Exception as exc:                                     # noqa: BLE001
+        task.log(f'VMID {new_vmid} could not be started: {exc}. Start it on the target.')
+        return
+    if response.status_code not in (200, 201):
+        task.log(f'VMID {new_vmid} could not be started: {response.text[:200]}')
+        return
+    task.log(f'VMID {new_vmid} was started, as the migration asked for. The Hyper-V source '
+             f'is still there and still carries the same hostname and MAC — do not start '
+             f'it as well.')
+
+
 def _finish(task, migration_id, new_vmid):
-    """Complete, and say plainly what was deliberately not done.
+    """Complete, and say plainly what was and was not done.
 
     The source is left exactly as it was found — running or off, with its disks untouched.
     That is what makes the rollback for this migration "start the original again", and it
@@ -1759,6 +1799,11 @@ def _finish(task, migration_id, new_vmid):
     task.set_phase('completed')
     _update_migration_row(migration_id, phase='completed', status=hyperv_db.STATUS_COMPLETED,
                      progress=100, completed_at=time.time())
+    if wants_start_after(task):
+        task.log(f'Migration complete. The Hyper-V source is untouched; starting VMID '
+                 f'{new_vmid} on {task.target_node}.')
+        _start_target(task, new_vmid)
+        return
     task.log(f'Migration complete. The Hyper-V source is untouched; VMID {new_vmid} on '
              f'{task.target_node} has not been started.')
 
