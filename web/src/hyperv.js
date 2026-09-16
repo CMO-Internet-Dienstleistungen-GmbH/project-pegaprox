@@ -159,7 +159,7 @@
 
         const HV_SEVERITY_STYLE = {
             blocking: { dot: 'bg-red-400', text: 'text-red-400', box: 'border-red-500/30 bg-red-500/5' },
-            warning: { dot: 'bg-amber-400', text: 'text-amber-400', box: 'border-amber-500/30 bg-amber-500/5' },
+            warning: { dot: 'bg-amber-400', text: 'text-amber-400', box: 'border-yellow-500/30 bg-yellow-500/10' },
             ok: { dot: 'bg-green-400', text: 'text-green-400', box: 'border-proxmox-border bg-proxmox-dark/40' },
         };
 
@@ -437,7 +437,7 @@
                             {nodes.map(n => <option key={n} value={n}>{n}</option>)}
                         </select>
                         <button onClick={() => onRun(cluster, node)} disabled={!cluster || !node || busy}
-                            className="px-3 py-1 rounded bg-indigo-500/10 border border-indigo-500/30 text-indigo-300 hover:text-white text-xs disabled:opacity-40">
+                            className="px-3 py-1 rounded bg-indigo-500/10 border border-indigo-500/30 text-indigo-400 hover:text-white text-xs disabled:opacity-40">
                             {busy ? say('hvTransferChecking', 'Checking…') : say('hvTransferCheckRun', 'Check')}
                         </button>
                     </div>
@@ -473,23 +473,23 @@
             if (!state) return null;
             const say = hvTranslator(t);
             const spinner = (
-                <span className="w-3 h-3 rounded-full border-2 border-current border-t-transparent
+                <span className="w-3 h-3 rounded-full border-2 border-gray-600 border-t-transparent
                                  animate-spin shrink-0 opacity-70" />
             );
 
             if (state.error) {
                 return (
-                    <div className="flex items-start gap-2 p-3 rounded-lg border border-amber-500/30
-                                    bg-amber-500/10 text-xs text-amber-200">
+                    <div className="flex items-start gap-2 p-3 rounded-lg border border-yellow-500/30
+                                    bg-yellow-500/10 text-xs text-amber-400">
                         <div>
                             <div>{say('hvInventoryReadFailed',
                                       'The last read of this host failed. What is shown is the '
                                       + 'last state it reported:')}{' '}{state.error.message}</div>
                             {state.error.remedy && (
-                                <div className="mt-0.5 text-amber-200/70">{state.error.remedy}</div>
+                                <div className="mt-0.5 text-amber-400">{state.error.remedy}</div>
                             )}
                             {state.cached && (
-                                <div className="mt-0.5 text-amber-200/70">
+                                <div className="mt-0.5 text-amber-400">
                                     {hvAsOf(state, say)}
                                 </div>
                             )}
@@ -500,8 +500,8 @@
 
             if (!state.cached) {
                 return (
-                    <div className="flex items-center gap-2 p-3 rounded-lg border border-indigo-500/25
-                                    bg-indigo-500/5 text-xs text-indigo-300/90">
+                    <div className="flex items-center gap-2 p-3 rounded-lg border border-purple-500/30
+                                    bg-purple-500/10 text-xs text-indigo-400">
                         {state.refreshing && spinner}
                         {state.refreshing
                             ? say('hvInventoryReading',
@@ -604,7 +604,7 @@
 
             return (
                 <>
-                    <div className="p-3 rounded-lg border border-indigo-500/25 bg-indigo-500/5 text-xs text-indigo-300/90">
+                    <div className="p-3 rounded-lg border border-purple-500/30 bg-purple-500/10 text-xs text-indigo-400">
                         {say('hvSourceOnly', 'A Hyper-V host is a migration source only. '
                              + 'PegaProx reads it, prepares a VM for migration, and moves that VM '
                              + 'to Proxmox. It never manages the host.')}
