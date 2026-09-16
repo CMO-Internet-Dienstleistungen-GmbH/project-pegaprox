@@ -9593,6 +9593,24 @@
             // LW: Mar 2026 - navigate directly to VM detail instead of just selecting cluster
             const navigateToResult = (result) => {
                 const cluster = clusters.find(c => c.id === result.cluster_id);
+                // A Hyper-V host is a migration source, not a cluster (ADR 1). Handing one
+                // to setSelectedCluster renders the whole cluster view over it — create VM,
+                // snapshots, storage, HA — for a host that has none of them, and this is
+                // the one place a search could still put it there. Its own view is where
+                // the hit belongs: the only thing to do with such a VM is migrate it, and
+                // that is the button on its row.
+                if (cluster && typeof hvType === 'function' && hvType(cluster) === 'hyperv') {
+                    setSelectedHyperV(cluster);
+                    setSelectedCluster(null);
+                    setSelectedPBS(null);
+                    setSelectedVMware(null);
+                    setSelectedGroup(null);
+                    setHighlightedVm({ vmid: result.vmid, node: result.node });
+                    setTimeout(() => setHighlightedVm(null), 3000);
+                    setShowGlobalSearch(false);
+                    setGlobalSearchQuery('');
+                    return;
+                }
                 if (cluster) {
                     setSelectedCluster(cluster);
                     if (result.type === 'vm' || result.type === 'ct' || result.type === 'qemu' || result.type === 'lxc') {
@@ -22841,7 +22859,9 @@
                                                         </thead>
                                                         <tbody>
                                                             {hypervVms.map(vm => (
-                                                                <tr key={vm.vmid} className="border-t border-proxmox-border/60">
+                                                                <tr key={vm.vmid}
+                                                                    className={`border-t border-proxmox-border/60${
+                                                                        highlightedVm?.vmid === vm.vmid ? ' bg-indigo-500/10' : ''}`}>
                                                                     <td className="px-4 py-2 text-white">{vm.name}</td>
                                                                     <td className="px-4 py-2">
                                                                         <span className={vm.status === 'running' ? 'text-green-400' : 'text-gray-400'}>
