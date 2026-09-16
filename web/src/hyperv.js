@@ -205,9 +205,21 @@
             return disk ? disk.build : null;
         }
 
+        // What the guest calls itself. The registry knows the product name and the exact
+        // patch level — "Windows Server 2022 Standard, build 20348.2582" — while the
+        // image header only has a version number, and on one measured disk an older one
+        // at that. So the registry answers where it could be opened, and the version
+        // number is what is left when it could not.
         function hvGuestVersion(plan) {
+            const volume = ((plan?.disk_inspection?.disks || [])
+                .flatMap(d => d.volumes || [])
+                .find(v => v.windows && v.hive_readable && v.product_name));
+            if (volume) {
+                const revision = volume.revision ? `.${volume.revision}` : '';
+                return `${volume.product_name} (Build ${volume.build}${revision})`;
+            }
             const disk = (plan?.guest_images || []).find(i => i.windows);
-            return disk ? disk.version : '';
+            return disk ? `Windows ${disk.version}` : '';
         }
 
         // ───────────────────────────────────────────────
