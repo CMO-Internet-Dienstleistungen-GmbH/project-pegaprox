@@ -8277,6 +8277,10 @@
             const [xhmForm, setXhmForm] = useState({
                 source_cluster: '', source_node: '', source_vmid: '',
                 target_cluster: '', target_node: '', target_storage: '',
+                // `start_after` is the shared wizard's default and stays true for the
+                // directions that have always offered it. A Hyper-V plan sets it off when
+                // the plan is loaded — see the effect below — because there the copy comes
+                // up carrying the original's hostname and MAC.
                 network_map: {}, vlan_map: {}, start_after: true, remove_source: false,
                 // Fork patch #15 — on by default: prepare the guest for VirtIO during the
                 // migration (inject the drivers, create the VM on VirtIO hardware) rather
@@ -12639,7 +12643,15 @@
                         // A confirmation belongs to the plan it was given for. Carrying one
                         // across to a different VM would let somebody accept a risk they
                         // were never shown.
-                        setXhmForm(prev => ({...prev, acknowledged: []}));
+                        //
+                        // Fork patch #15 — and the safe answer for starting the copy is the
+                        // one this direction begins with. The shared form defaults it to
+                        // true, which is right where the source is taken away by the same
+                        // migration; here the source stays, so an unasked start puts the
+                        // original's hostname and MAC on the network a second time.
+                        const isHyperV = typeof hvIsHyperVPlan === 'function' && hvIsHyperVPlan(data);
+                        setXhmForm(prev => ({...prev, acknowledged: [],
+                                             ...(isHyperV ? { start_after: false } : {})}));
                     } else {
                         const err = await resp?.json().catch(() => ({}));
                         addToast('Error', err.error || 'Failed to get plan', 'error');
@@ -12662,7 +12674,6 @@
                     // — quoting the reason for a box nobody had ticked and nobody could
                     // untick. The wizard sends what it offers.
                     if (typeof hvIsHyperVPlan === 'function' && hvIsHyperVPlan(xhmPlan)) {
-                        body.start_after = false;
                         body.remove_source = false;
                     }
                     if (xhmPlan?.source?.name) body.vm_name = xhmPlan.source.name;
@@ -23315,9 +23326,24 @@
                                                                            className="rounded border-gray-600" />
                                                                     {t('hvPrepareVirtio') || 'Install VirtIO drivers and create on VirtIO hardware'}
                                                                 </label>
+                                                                {/* Fork patch #15 — a choice, not a rule. Leaving the copy
+                                                                    off is the safe answer and stays the default, but it is
+                                                                    not the right one for every migration: a window where the
+                                                                    source has just been shut down for good is exactly when
+                                                                    starting the copy straight away is what somebody wants.
+                                                                    This used to be a sentence of prose over a hidden
+                                                                    checkbox whose default made every migration fail. */}
+                                                                <label className="flex items-center gap-1.5 text-xs text-gray-400 cursor-pointer"
+                                                                       title={t('hvStartAfterHint')
+                                                                           || 'The copy carries the original\'s hostname and MAC. The Hyper-V source is left in place as the rollback, so make sure nobody starts it again while the copy runs.'}>
+                                                                    <input type="checkbox" checked={!!xhmForm.start_after}
+                                                                           onChange={e => setXhmForm({...xhmForm, start_after: e.target.checked})}
+                                                                           className="rounded border-gray-600" />
+                                                                    {t('hvStartAfter') || 'Start the imported VM when the migration finishes'}
+                                                                </label>
                                                                 <div className="text-xs text-gray-500">
-                                                                    {t('hvNotStartedSourceUntouched')
-                                                                        || 'The new VM is not started automatically, and the Hyper-V source is left untouched.'}
+                                                                    {t('hvSourceUntouched')
+                                                                        || 'The Hyper-V source is left untouched either way.'}
                                                                 </div>
                                                             </div>
                                                         ) : (
