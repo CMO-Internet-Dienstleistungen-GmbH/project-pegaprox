@@ -296,14 +296,22 @@ def xhm_dismiss_finished():
     no VM, no disk, no volume. What a failed run left behind on the target is a separate
     question with its own answer, and dropping the entry here does not touch it.
     """
-    removed = []
+    removed, kept = [], []
     with _xhm_lock:
         for mid, task in list(_xhm_migrations.items()):
             if task.status == 'running' or not _xhm_reachable(task):
                 continue
             del _xhm_migrations[mid]
             removed.append(mid)
-    return jsonify({'removed': removed, 'count': len(removed)})
+
+    # A migration can also be recorded somewhere that outlives this process, and then the
+    # entry comes back on the next page load unless that record goes too. Whoever keeps
+    # such a record decides whether it may: one that still has something standing on the
+    # target says no, because it is what stops the next attempt copying the same disks.
+    for mid, why in _forget_recorded(None):
+        (removed if why is None else kept).append(mid if why is None else {'id': mid, 'reason': why})
+
+    return jsonify({'removed': removed, 'count': len(removed), 'kept': kept})
 
 
 @bp.route('/api/xhm/migrations/<mid>', methods=['DELETE'])
@@ -324,7 +332,39 @@ def xhm_dismiss(mid):
             return jsonify({'error': 'This migration is still running. Cancel it first, or '
                                      'wait for it to finish.'}), 409
         del _xhm_migrations[mid]
+
+    for _, why in _forget_recorded(mid):
+        if why is not None:
+            # The in-memory entry is gone either way; saying nothing here would let it
+            # reappear on the next load with no explanation.
+            return jsonify({'removed': [mid], 'count': 1, 'kept': [{'id': mid, 'reason': why}]})
     return jsonify({'removed': [mid], 'count': 1})
+
+
+def _forget_recorded(mid):
+    """Ask whoever keeps durable migration records to drop one, or all finished ones.
+
+    Yields `(migration_id, reason_it_stayed)` — `None` as the reason means it went. A
+    product without such records answers with nothing at all, which is why this is written
+    as an optional import rather than a dependency.
+    """
+    try:
+        from pegaprox.core.hyperv_xhm import forget_recorded_migration, recorded_migrations
+    except ImportError:
+        return
+
+    targets = [mid] if mid else [row.get('id') for row in recorded_migrations(())
+                                 if row.get('status') != 'running']
+    for target in targets:
+        if not target:
+            continue
+        try:
+            answer = forget_recorded_migration(target)
+        except Exception:
+            logging.warning('Could not forget the record of migration %s', target,
+                            exc_info=True)
+            continue
+        yield target, (None if answer.get('forgotten') else answer.get('error'))
 
 
 @bp.route('/api/xhm/migrations/<mid>', methods=['GET'])

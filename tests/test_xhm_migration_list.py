@@ -98,3 +98,67 @@ def test_the_list_cannot_push_the_log_off_the_screen():
     start = source.index('{xhmMigrations.length > 0 ? (')
     assert 'overflow-y-auto' in source[start:start + 900], (
         'the list is unbounded again; the log of the selected migration is below it')
+
+
+class TestDismissingReachesADurableRecord:
+    """The list is built from a dict in this process, but a migration can also be recorded
+    somewhere that survives a restart. Dropping only the in-memory entry makes the row
+    come back on the next page load, with no explanation."""
+
+    def test_a_product_without_durable_records_is_unaffected(self, monkeypatch):
+        # The import is optional on purpose: this patch must work on its own.
+        import builtins
+        real_import = builtins.__import__
+
+        def no_hyperv(name, *args, **kwargs):
+            if name == 'pegaprox.core.hyperv_xhm':
+                raise ImportError('not part of this build')
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, '__import__', no_hyperv)
+        from pegaprox.api import xhm
+
+        assert list(xhm._forget_recorded('mig1')) == []
+
+    def test_a_record_that_still_holds_something_is_reported_not_dropped(self, monkeypatch):
+        # The module is injected rather than imported: this patch ships without it, which
+        # is the whole reason the import is optional.
+        from pegaprox.api import xhm
+
+        _install_fake_record_keeper(monkeypatch,
+                                   lambda mid: {'forgotten': False,
+                                                'error': 'still has 1 resource(s)'})
+
+        assert list(xhm._forget_recorded('mig1')) == [('mig1', 'still has 1 resource(s)')]
+
+    def test_a_record_with_nothing_left_goes(self, monkeypatch):
+        from pegaprox.api import xhm
+
+        _install_fake_record_keeper(monkeypatch, lambda mid: {'forgotten': True})
+
+        assert list(xhm._forget_recorded('mig1')) == [('mig1', None)]
+
+    def test_dismissing_everything_asks_about_each_finished_record(self, monkeypatch):
+        from pegaprox.api import xhm
+
+        asked = []
+        _install_fake_record_keeper(
+            monkeypatch,
+            lambda mid: (asked.append(mid), {'forgotten': True})[1],
+            recorded=[{'id': 'mig1', 'status': 'failed'},
+                      {'id': 'mig2', 'status': 'running'}])
+
+        assert list(xhm._forget_recorded(None)) == [('mig1', None)]
+        # The running one is never offered up: its record is still in use.
+        assert asked == ['mig1']
+
+
+def _install_fake_record_keeper(monkeypatch, forget, recorded=()):
+    """Stand in for the fork's Hyper-V module, which this patch does not depend on."""
+    import sys
+    import types
+
+    module = types.ModuleType('pegaprox.core.hyperv_xhm')
+    module.forget_recorded_migration = forget
+    module.recorded_migrations = lambda known: list(recorded)
+    monkeypatch.setitem(sys.modules, 'pegaprox.core.hyperv_xhm', module)
