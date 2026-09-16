@@ -24223,6 +24223,17 @@
                                 <div className="p-3 rounded-lg bg-proxmox-dark border border-proxmox-border text-sm mb-3">
                                     <span className="text-white">{hypervCleanup.migration.vm_name || hypervCleanup.migration.source_vmid}</span>
                                     <span className="text-gray-500"> · {hypervCleanup.migration.id}</span>
+                                    {/* A storage name alone does not say where something is deleted:
+                                        the same name exists on every cluster. */}
+                                    <div className="mt-2 space-y-0.5 text-xs text-gray-400">
+                                        <div><span className="text-gray-500">{t('hvCleanupCluster') || 'Target cluster'}:</span> {(() => {
+                                            const c = clusters.find(x => x.id === hypervCleanup.migration.target_cluster);
+                                            return c ? `${c.name} (${c.id})` : (hypervCleanup.migration.target_cluster || '—');
+                                        })()}</div>
+                                        <div><span className="text-gray-500">Node:</span> {hypervCleanup.migration.target_node || '—'}</div>
+                                        <div><span className="text-gray-500">Storage:</span> {hypervCleanup.migration.target_storage || '—'}</div>
+                                        <div><span className="text-gray-500">VMID:</span> {hypervCleanup.migration.target_vmid || '—'}</div>
+                                    </div>
                                     {hypervCleanup.leftovers.length > 0 ? (
                                         <ul className="mt-2 space-y-0.5 text-xs text-gray-400 font-mono">
                                             {hypervCleanup.leftovers.map((r, i) => (
@@ -24240,7 +24251,8 @@
                                             className="px-4 py-2 rounded-lg bg-proxmox-dark border border-proxmox-border text-gray-300 text-sm disabled:opacity-50">
                                         {t('cancel') || 'Cancel'}
                                     </button>
-                                    <button onClick={runHypervCleanup} disabled={hypervCleaning}
+                                    {/* Nothing standing on the target means there is nothing to confirm. */}
+                                    <button onClick={runHypervCleanup} disabled={hypervCleaning || hypervCleanup.leftovers.length === 0}
                                             className="px-4 py-2 rounded-lg bg-red-500 text-white text-sm font-medium disabled:opacity-50">
                                         {hypervCleaning ? (t('loading') || 'Working…') : (t('hvCleanupConfirm') || 'Remove them')}
                                     </button>
