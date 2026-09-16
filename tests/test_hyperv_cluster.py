@@ -480,6 +480,64 @@ class TestWhatBootDoes:
             released.set()
             hyperv_cluster.HyperVClusterManager._build_manager = original
 
+    def test_a_connected_source_is_read_once_so_a_search_can_find_its_vms(self, db):
+        """Everything generic answers from the inventory cache, so something has to fill it.
+
+        The global search, the tag merge and the summary tallies all read
+        `get_vm_resources()`, which never reaches a Hyper-V host — by design, because
+        `Get-VM` over WinRM takes tens of seconds. Before this read there was a window
+        after every restart, ending only when somebody happened to open the host view, in
+        which a search returned no Hyper-V VM at all and looked simply broken.
+        """
+        from pegaprox.core import hyperv_db, hyperv_inventory
+
+        hyperv_db.save_host(db.conn, db._encrypt, 'hyperv-warm',
+                            {'name': 'warm', 'host': 'probe-host.example', 'user': 'svc',
+                             'pass': 'fixture-' + 'not-a-real-credential'})
+        managers = {}
+        reachable = FakeManager(vms=[_summary(GUID_1, name='findable')])
+        original = hyperv_cluster.HyperVClusterManager._build_manager
+        hyperv_cluster.HyperVClusterManager._build_manager = lambda self: reachable
+        try:
+            hyperv_cluster.load_hyperv_sources(managers)
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if hyperv_inventory.cached_vms('hyperv-warm'):
+                    break
+                time.sleep(0.01)
+        finally:
+            hyperv_cluster.HyperVClusterManager._build_manager = original
+
+        names = [vm['name'] for vm in hyperv_inventory.cached_vms('hyperv-warm')]
+        assert names == ['findable'], \
+            'start-up connected the host but never read what is on it'
+        assert reachable.list_vms_calls == 1, \
+            f'the host was enumerated {reachable.list_vms_calls} times for one start-up'
+
+    def test_a_source_that_did_not_connect_is_not_read(self, db):
+        """There is nothing to read from, and asking costs a second timeout per host."""
+        from pegaprox.core import hyperv_db, hyperv_inventory
+
+        hyperv_db.save_host(db.conn, db._encrypt, 'hyperv-cold',
+                            {'name': 'cold', 'host': 'probe-host.example', 'user': 'svc',
+                             'pass': 'fixture-' + 'not-a-real-credential'})
+        managers = {}
+        failing = FakeManager(raises=HyperVError('No route to host', kind='unreachable'))
+        original = hyperv_cluster.HyperVClusterManager._build_manager
+        hyperv_cluster.HyperVClusterManager._build_manager = lambda self: failing
+        try:
+            hyperv_cluster.load_hyperv_sources(managers)
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if managers['hyperv-cold'].connection_error:
+                    break
+                time.sleep(0.01)
+        finally:
+            hyperv_cluster.HyperVClusterManager._build_manager = original
+
+        assert failing.list_vms_calls == 0, 'a host that refused the connection was read anyway'
+        assert hyperv_inventory.cached_vms('hyperv-cold') == []
+
     def test_the_background_connection_still_records_what_the_host_said(self, db):
         """Not waiting must not mean not knowing: the state has to arrive on its own."""
         from pegaprox.core import hyperv_db

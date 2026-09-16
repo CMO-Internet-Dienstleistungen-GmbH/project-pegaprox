@@ -203,6 +203,33 @@ def test_a_read_killed_mid_flight_does_not_block_the_host_for_good(spawned):
     assert spawned == [HOST]
 
 
+def test_a_read_asked_for_inline_stays_on_the_calling_thread(spawned):
+    """Start-up connects its sources one after another and reads them the same way.
+
+    A thread per host would turn a dozen slow sources into a dozen simultaneous WinRM
+    inventories at the moment the product comes up, which is what connecting them in
+    sequence exists to avoid. Nothing that serves a request may ask for this.
+    """
+    mgr = _manager()
+
+    in_flight = hyperv_inventory.request_refresh(HOST, mgr, background=False)
+
+    assert spawned == [], 'an inline read spawned a thread anyway'
+    assert in_flight is False, 'the read is over by the time this returns'
+    assert [vm['vmid'] for vm in hyperv_inventory.cached_vms(HOST)] == [100, 101]
+    assert hyperv_inventory.is_refreshing(HOST) is False
+
+
+def test_an_inline_read_still_respects_the_staleness_rules(spawned):
+    """Being sequential is not a licence to read a host that was just read."""
+    mgr = _manager()
+    hyperv_inventory.request_refresh(HOST, mgr, background=False)
+    mgr.get_vms.reset_mock()
+
+    assert hyperv_inventory.request_refresh(HOST, mgr, background=False) is False
+    assert mgr.get_vms.called is False
+
+
 def test_a_read_that_never_started_does_not_leave_the_host_in_flight(monkeypatch):
     def _cannot_start(host_id, mgr, generation):
         raise RuntimeError('no threads left')
