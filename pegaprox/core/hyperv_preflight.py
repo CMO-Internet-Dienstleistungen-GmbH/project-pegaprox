@@ -135,7 +135,12 @@ class PreflightReport:
 # before a migration carrying one of these may start.
 _ACKNOWLEDGEABLE_CHECKS = frozenset({'vtpm', 'bitlocker', 'virtio_drivers',
                                      'power_state', 'merge_state', 'source_access',
-                                     'automatic_start', 'orderly_shutdown'})
+                                     'automatic_start', 'orderly_shutdown',
+                                     # A guest that arrives under a new MAC is a new
+                                     # machine to every switch, lease and licence that
+                                     # knew it by the old one. Nothing downstream reports
+                                     # that, so it is confirmed here or not at all.
+                                     'mac_addresses'})
 
 
 # ---------------------------------------------------------------------------
@@ -290,8 +295,9 @@ def check_network_mapping(adapters: list[dict], mapping: dict) -> Finding:
     if not adapters:
         return Finding('network_mapping', OK, 'The VM has no network adapters to map.')
 
-    unmapped = [a.get('name') or a.get('mac_address') or '<unnamed adapter>'
-                for a in adapters if not (mapping or {}).get(_adapter_key(a))]
+    unmapped = [adapter_label(a, i)
+                for i, a in enumerate(adapters)
+                if not (mapping or {}).get(adapter_key(a, i))]
     if unmapped:
         return Finding('network_mapping', BLOCKING,
                        f'{len(unmapped)} network adapter(s) have no target network.',
@@ -300,6 +306,41 @@ def check_network_mapping(adapters: list[dict], mapping: dict) -> Finding:
                        'it should not be reachable from.')
     return Finding('network_mapping', OK,
                    f'All {len(adapters)} network adapter(s) are mapped to a target network.')
+
+
+def check_mac_addresses(adapters: list[dict]) -> Finding:
+    """Will every adapter arrive with the address it has on the source?
+
+    It has to. A MAC is what the rest of the network knows a guest by: DHCP reservations,
+    static leases, port security on the switches, licence bindings and firewall rules are
+    all written against it. A guest that comes up with a different one is a different
+    machine to all of them, and nothing about the migration's own result shows it.
+
+    The import carries the MAC across unchanged — including a dynamic one, which is a real
+    address that Hyper-V happened to pick rather than an operator. Only the spelling
+    changes, because Proxmox refuses Hyper-V's separator-free form.
+
+    The exception is an adapter that has never had an address at all: Hyper-V assigns a
+    dynamic MAC at the VM's first start and reports zeroes until then. There is nothing to
+    carry over, so the target assigns one — and that is the case worth stopping an operator
+    for, because it is the one where the guest arrives under a new identity.
+    """
+    if not adapters:
+        return Finding('mac_addresses', OK, 'The VM has no network adapters.')
+
+    unassigned = [adapter_label(a, i) for i, a in enumerate(adapters)
+                  if is_unset_mac(a.get('mac_address') or '')]
+    if not unassigned:
+        return Finding('mac_addresses', OK,
+                       'Every adapter keeps the MAC address it has on the source.')
+    return Finding('mac_addresses', WARNING,
+                   f'{len(unassigned)} network adapter(s) have no MAC address yet.',
+                   'The source reports all zeroes for: ' + ', '.join(unassigned) + '. '
+                   'Hyper-V assigns a dynamic address at a VM\'s first start, so a VM that '
+                   'has never run has none to carry over and the target will assign its '
+                   'own. Anything that identifies this guest by its MAC — a DHCP '
+                   'reservation, a switch port, a licence — will not recognise it. Start '
+                   'the VM once on the source if it has to keep a specific address.')
 
 
 def check_vlan_mapping(adapters: list[dict], vlan_map: dict | None = None) -> Finding:
@@ -322,10 +363,10 @@ def check_vlan_mapping(adapters: list[dict], vlan_map: dict | None = None) -> Fi
     multi_mode = []
     untagged = []
     tagged = []
-    for adapter in adapters:
-        label = adapter.get('name') or adapter.get('mac_address') or '<unnamed adapter>'
+    for index, adapter in enumerate(adapters):
+        label = adapter_label(adapter, index)
         mode = (adapter.get('vlan_mode') or '').strip()
-        key = _adapter_key(adapter)
+        key = adapter_key(adapter, index)
         chosen = vlan_map.get(key) if key in vlan_map else vlan_for_adapter(adapter)
         try:
             vlan = int(chosen)
@@ -551,6 +592,7 @@ def run_preflight(vm: dict, target: dict, options: dict | None = None) -> Prefli
                                      options.get('network_map') or {}))
     report.add(check_vlan_mapping(vm.get('network_adapters') or [],
                                   options.get('vlan_map') or {}))
+    report.add(check_mac_addresses(vm.get('network_adapters') or []))
     report.add(check_secure_boot(vm.get('secure_boot_enabled'), vm.get('generation')))
     report.add(check_vtpm(vm.get('vtpm_enabled')))
     report.add(check_bitlocker(vm.get('bitlocker_state'), vm.get('vtpm_enabled')))
@@ -585,13 +627,44 @@ def may_start(report: PreflightReport, acknowledged: list | None = None) -> tupl
     return True, ''
 
 
-def _adapter_key(adapter: dict) -> str:
-    """How one source adapter is addressed in a network map.
+def adapter_label(adapter: dict, index: int) -> str:
+    """What one adapter is called in a message an operator has to act on.
 
-    The MAC is preferred because it is unique and stable; the name is a fallback for an
-    adapter whose MAC is still dynamic and therefore not yet assigned.
+    Always carries its position, because the name and the MAC both stop distinguishing two
+    adapters on the same VM — which is the case this whole pair of functions exists for.
     """
-    return adapter.get('mac_address') or adapter.get('name') or ''
+    parts = [part for part in (adapter.get('name'), adapter.get('mac_address')) if part]
+    return f"#{index + 1}" + (f" ({' / '.join(parts)})" if parts else '')
+
+
+def is_unset_mac(mac: str) -> bool:
+    """Is this the all-zero MAC Hyper-V reports for an adapter that has never been used?
+
+    Hyper-V assigns a dynamic MAC when the VM first starts. Until then the adapter reports
+    zeroes, and passing those on is refused by the target rather than ignored.
+    """
+    return not set((mac or '').replace(':', '').replace('-', '')) - {'0'}
+
+
+def adapter_key(adapter: dict, index: int) -> str:
+    """How one source adapter is addressed in a network map. Unique per adapter.
+
+    The MAC alone is not unique, which is the whole reason this takes an index. Hyper-V
+    reports all zeroes until a VM with a dynamic MAC has started once, and every adapter
+    on a VM is called "Network Adapter" — or its localised spelling — unless somebody
+    renamed it. Two adapters like that produced one key, and the consequences were
+    invisible in exactly the wrong way: the wizard's two dropdowns read and wrote the same
+    entry, so changing one changed the other, and the run mapped both adapters to whatever
+    the surviving value said. A VM on the wrong VLAN is reachable by the wrong people, and
+    nothing about the migration's own result shows it.
+
+    The fallback is the adapter's position in the VM's list, which is the order the plan,
+    the preflight and the run all enumerate them in.
+    """
+    mac = (adapter.get('mac_address') or '').strip()
+    if mac and not is_unset_mac(mac):
+        return mac
+    return f'adapter{index + 1}'
 
 
 def _gib(num_bytes: int) -> str:
