@@ -470,10 +470,11 @@
             
             // NS: No more X-Session-ID header needed for fetch - cookies are automatic
             // But sessionId is still available for WebSocket URLs
-            // #782 (Frisch12) — stable identity. getAuthHeaders returns a constant {} (auth is via
-            // credentials:'include'), but a fresh function every render propagates through authFetch
-            // -> every component's fetchHealth/poll useCallback -> its effect, re-arming the 60s
-            // timers on every SSE-driven render (the ~4 req/s idle storm). useCallback([]) pins it.
+            // Memoised on purpose: this function's IDENTITY is a dependency of
+            // authFetch (dashboard.js), which is itself a dependency of every polling
+            // effect in ui.js. A fresh identity per render re-armed all of them, so a
+            // badge documented as a 60s poll fired once per render instead. The value
+            // returned has always been constant, so [] is the honest dependency list.
             const getAuthHeaders = useCallback(() => {
                 return {};  // Empty - credentials: 'include' handles auth for fetch
             }, []);
