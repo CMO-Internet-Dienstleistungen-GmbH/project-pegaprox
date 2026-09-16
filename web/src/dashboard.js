@@ -8230,6 +8230,9 @@
             const [hypervForm, setHypervForm] = useState({ ...HYPERV_DEFAULT_CONFIG });
             // The VM whose orderly shutdown has been offered, and whether it is running.
             const [hypervShutdownVm, setHypervShutdownVm] = useState(null);
+            // Fork patch #15 — what a failed import left on the target, and the answer to it.
+            const [hypervCleanup, setHypervCleanup] = useState(null);   // {migration, leftovers}
+            const [hypervCleaning, setHypervCleaning] = useState(false);
             const [hypervShuttingDown, setHypervShuttingDown] = useState(false);
             const [hypervCheckBusy, setHypervCheckBusy] = useState(false);
             const [hypervSaving, setHypervSaving] = useState(false);
@@ -12037,6 +12040,51 @@
              * The answer is the same for every guest on the host, so measuring it here is
              * what takes the unanswerable per-VM warning out of the migration wizard.
              */
+            // Fork patch #15 — a failed import can leave a VM and its disks on the target,
+            // and until now nothing in the interface could remove them. The API has always
+            // been able to; it asks twice on purpose, because the second call deletes a
+            // guest. The first call is what produces the list of what would go, so the
+            // dialog shows what the server would actually do rather than what the client
+            // guesses it has.
+            const askHypervCleanup = async (migration) => {
+                try {
+                    const resp = await authFetch(
+                        `${API_URL}/hyperv/${migration.source_cluster}/migrations/${migration.id}/cleanup`,
+                        { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' });
+                    const data = await resp?.json().catch(() => ({}));
+                    if (resp?.status === 400) {
+                        setHypervCleanup({ migration, leftovers: data.leftovers || [] });
+                        return;
+                    }
+                    addToast('Error', data.error || 'Could not read what this migration left behind', 'error');
+                } catch(e) { addToast('Error', e.message, 'error'); }
+            };
+
+            const runHypervCleanup = async () => {
+                if (!hypervCleanup) return;
+                setHypervCleaning(true);
+                try {
+                    const { migration } = hypervCleanup;
+                    const resp = await authFetch(
+                        `${API_URL}/hyperv/${migration.source_cluster}/migrations/${migration.id}/cleanup`,
+                        { method: 'POST', headers: {'Content-Type':'application/json'},
+                          body: JSON.stringify({ confirm: migration.id }) });
+                    const data = await resp?.json().catch(() => ({}));
+                    if (resp?.ok) {
+                        addToast(t('hvCleanupDone') || 'Cleaned up',
+                                 data.message || 'The target is clear.', 'success');
+                        setHypervCleanup(null);
+                        fetchXhmMigrations();
+                    } else {
+                        // A refusal is a result somebody has to read, and it names which
+                        // resources could not go — leaving the dialog open with it.
+                        addToast('Error', data.error || 'Cleanup was refused', 'error');
+                        if (data.kept) setHypervCleanup(prev => prev && {...prev, leftovers: data.kept});
+                    }
+                } catch(e) { addToast('Error', e.message, 'error'); }
+                finally { setHypervCleaning(false); }
+            };
+
             const runHypervTransferCheck = async (hostId, targetCluster, targetNode) => {
                 setHypervCheckBusy(true);
                 try {
@@ -23295,6 +23343,19 @@
                                                                         <span>→ {m.target_node}/{m.target_storage}</span>
                                                                         {m.started_at && <span>{fmtDate(m.started_at)}</span>}
                                                                         {m.target_vmid && <span>VMID: {m.target_vmid}</span>}
+                                                                        {/* Fork patch #15 — a failed import can leave a VM and its disks
+                                                                            on the target. The wizard refuses to start the same VM again
+                                                                            while they are there, and this is the only way to clear them
+                                                                            without a shell on the node. It sits on this line rather than
+                                                                            beside the status badge because another patch owns that one;
+                                                                            two patches rewriting the same element conflict on every
+                                                                            release rebuild. */}
+                                                                        {m.status === 'failed' && m.direction === 'hyperv_to_pve' && (
+                                                                            <button onClick={e => { e.stopPropagation(); askHypervCleanup(m); }}
+                                                                                    className="px-2 py-0.5 rounded bg-red-500/10 border border-red-500/30 text-red-300 hover:text-white hover:border-red-400">
+                                                                                {t('hvCleanupLeftovers') || 'Clean up target'}
+                                                                            </button>
+                                                                        )}
                                                                     </div>
                                                                     {/* Phase timeline */}
                                                                     {m.phase_times && Object.keys(m.phase_times).length > 0 && (
@@ -23853,6 +23914,47 @@
                     {/* Fork patch #15 — a running source VM cannot be migrated, and the
                         shutdown that makes it migratable happens on a customer's machine.
                         That is a confirmed action, not a side effect of pressing Migrate. */}
+                    {hypervCleanup && (
+                        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4"
+                             onClick={() => !hypervCleaning && setHypervCleanup(null)}>
+                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl max-w-lg w-full p-5"
+                                 onClick={e => e.stopPropagation()}>
+                                <h3 className="text-white font-semibold mb-2">
+                                    {t('hvCleanupLeftovers') || 'Clean up target'}
+                                </h3>
+                                <p className="text-sm text-gray-400 mb-3">
+                                    {t('hvCleanupExplain')
+                                     || 'This removes what the failed migration created on the target. It cannot be undone, and the Hyper-V source is not touched by it.'}
+                                </p>
+                                <div className="p-3 rounded-lg bg-proxmox-dark border border-proxmox-border text-sm mb-3">
+                                    <span className="text-white">{hypervCleanup.migration.vm_name || hypervCleanup.migration.source_vmid}</span>
+                                    <span className="text-gray-500"> · {hypervCleanup.migration.id}</span>
+                                    {hypervCleanup.leftovers.length > 0 ? (
+                                        <ul className="mt-2 space-y-0.5 text-xs text-gray-400 font-mono">
+                                            {hypervCleanup.leftovers.map((r, i) => (
+                                                <li key={i}>{r.kind} {r.id}{r.note ? ` — ${r.note}` : ''}</li>
+                                            ))}
+                                        </ul>
+                                    ) : (
+                                        <div className="mt-2 text-xs text-gray-500">
+                                            {t('hvCleanupNothingLeft') || 'Nothing is recorded as left behind.'}
+                                        </div>
+                                    )}
+                                </div>
+                                <div className="flex justify-end gap-2">
+                                    <button onClick={() => setHypervCleanup(null)} disabled={hypervCleaning}
+                                            className="px-4 py-2 rounded-lg bg-proxmox-dark border border-proxmox-border text-gray-300 text-sm disabled:opacity-50">
+                                        {t('cancel') || 'Cancel'}
+                                    </button>
+                                    <button onClick={runHypervCleanup} disabled={hypervCleaning}
+                                            className="px-4 py-2 rounded-lg bg-red-500 text-white text-sm font-medium disabled:opacity-50">
+                                        {hypervCleaning ? (t('loading') || 'Working…') : (t('hvCleanupConfirm') || 'Remove them')}
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
                     {hypervShutdownVm && selectedHyperV && (
                         <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4"
                              onClick={() => !hypervShuttingDown && setHypervShutdownVm(null)}>

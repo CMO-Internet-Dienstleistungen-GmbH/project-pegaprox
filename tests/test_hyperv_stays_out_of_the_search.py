@@ -122,3 +122,47 @@ def test_the_server_still_refuses_deleting_the_source():
 
     assert hyperv_xhm.refuse_hyperv_start('hv_1', 1, {'remove_source': True})
     assert hyperv_xhm.refuse_hyperv_start('hv_1', 1, {'start_after': True}) is None
+
+
+# ===========================================================================
+# What a failed import leaves behind, and the way to remove it
+# ===========================================================================
+
+def test_the_interface_offers_a_way_to_clear_what_a_failed_import_left():
+    """The API has always been able to; nothing in the product could reach it.
+
+    A failed import can leave a VM and its disks on the target, and the wizard refuses to
+    start the same VM again while they are there — so without this the only way out was a
+    shell on the node. Read out of the source: the panel lives in a component this suite
+    cannot mount.
+    """
+    import os
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(repo, 'web', 'src', 'dashboard.js'), encoding='utf-8') as fh:
+        source = fh.read()
+
+    assert 'askHypervCleanup' in source and 'runHypervCleanup' in source
+
+    ask = source[source.index('const askHypervCleanup'):source.index('const runHypervCleanup')]
+    assert "body: '{}'" in ask, (
+        'the first call must go without a confirmation — that is what returns the list of '
+        'what would be deleted')
+
+    run = source[source.index('const runHypervCleanup'):]
+    run = run[:run.index('const startXhmMigration')]
+    assert 'confirm: migration.id' in run, (
+        'the API names the migration in its confirmation so a click on the wrong row '
+        'cannot delete a VM')
+
+
+def test_the_cleanup_button_is_only_on_a_failed_hyperv_migration():
+    import os
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(repo, 'web', 'src', 'dashboard.js'), encoding='utf-8') as fh:
+        source = fh.read()
+
+    assert "m.status === 'failed' && m.direction === 'hyperv_to_pve'" in source, (
+        'the cleanup is offered on rows it does not apply to, or on a run that may still '
+        'be writing')
