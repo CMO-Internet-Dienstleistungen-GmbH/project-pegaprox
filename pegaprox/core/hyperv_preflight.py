@@ -343,6 +343,31 @@ def check_mac_addresses(adapters: list[dict]) -> Finding:
                    'the VM once on the source if it has to keep a specific address.')
 
 
+def check_start_after(requested: bool) -> Finding:
+    """Whether the imported VM will come up by itself, and what that costs.
+
+    Off is the safe answer and the default, but it is not the right answer for every
+    migration — a maintenance window where the source has just been shut down for good is
+    exactly when starting the copy immediately is what somebody wants. So this reports
+    rather than refuses.
+
+    What it reports is the one thing that is easy to forget at that moment: the source has
+    not been deleted, it is off. Two machines with one hostname and one MAC on one network
+    is a failure that looks like a network problem for as long as it takes somebody to
+    remember there are two.
+    """
+    if not requested:
+        return Finding('start_after', OK,
+                       'The imported VM will not be started; somebody starts it when the '
+                       'original is safely down.')
+    return Finding('start_after', WARNING,
+                   'The imported VM will be started as soon as the migration finishes.',
+                   'It carries the original\'s hostname and MAC address. The Hyper-V source '
+                   'is left in place by this direction — that is the rollback — so make '
+                   'sure nobody starts it again while the copy is running, or the same '
+                   'machine is on the network twice.')
+
+
 def check_vlan_mapping(adapters: list[dict], vlan_map: dict | None = None) -> Finding:
     """Say which VLAN each adapter will arrive on, and name the ones that get none.
 
@@ -593,6 +618,7 @@ def run_preflight(vm: dict, target: dict, options: dict | None = None) -> Prefli
     report.add(check_vlan_mapping(vm.get('network_adapters') or [],
                                   options.get('vlan_map') or {}))
     report.add(check_mac_addresses(vm.get('network_adapters') or []))
+    report.add(check_start_after(bool(options.get('start_after'))))
     report.add(check_secure_boot(vm.get('secure_boot_enabled'), vm.get('generation')))
     report.add(check_vtpm(vm.get('vtpm_enabled')))
     report.add(check_bitlocker(vm.get('bitlocker_state'), vm.get('vtpm_enabled')))
