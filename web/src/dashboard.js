@@ -23641,8 +23641,7 @@
                                                                         </select>
                                                                         {version && (
                                                                             <div className="text-[10px] text-gray-600">
-                                                                                {(t('hvGuestIs') || 'Guest: Windows {version} (build {build})')
-                                                                                    .replace('{version}', version).replace('{build}', build ?? '?')}
+                                                                                {(t('hvGuestIs') || 'Guest: {version}').replace('{version}', version)}
                                                                             </div>
                                                                         )}
                                                                         {!xhmForm.target_node && (
