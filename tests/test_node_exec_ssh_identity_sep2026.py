@@ -143,7 +143,11 @@ def test_an_api_token_cluster_with_an_ssh_key_is_still_never_offered_the_secret(
     called = []
     monkeypatch.setattr(ssh_mod, '_ssh_exec',
                         lambda *a, **k: called.append(1) or (0, 'ok', ''))
-    mgr = _Mgr(ssh_key='-----BEGIN OPENSSH PRIVATE KEY-----', pass_='pve-token-secret')
+    # the operator typed a token id as the username — that is what makes pass_ the
+    # secret. (_using_api_token alone does not: we set it ourselves for clusters whose
+    # token we minted, and those keep a real password.)
+    mgr = _Mgr(user='root@pam!pegaprox', ssh_key='-----BEGIN OPENSSH PRIVATE KEY-----',
+               pass_='pve-token-secret')
     mgr._using_api_token = True
     rc, out, err = ssh_mod._pve_node_exec(mgr, 'n1', 'true')
     assert rc == 1
@@ -176,7 +180,7 @@ def test_a_real_password_still_goes_through_even_with_a_key_present(monkeypatch)
 def test_the_secret_never_reaches_the_error_text(monkeypatch):
     """Whatever we refuse to send must not leak into a message the UI renders."""
     monkeypatch.setattr(ssh_mod, '_ssh_exec', lambda *a, **k: (0, 'ok', ''))
-    mgr = _Mgr(ssh_key='k', pass_='pve-token-secret')
+    mgr = _Mgr(user='root@pam!pegaprox', ssh_key='k', pass_='pve-token-secret')
     mgr._using_api_token = True
     _, _, err = ssh_mod._pve_node_exec(mgr, 'n1', 'true')
     assert 'pve-token-secret' not in err
@@ -201,8 +205,37 @@ def test_the_refusal_names_the_reason_it_actually_checked(monkeypatch):
     _, _, err = ssh_mod._pve_node_exec(keyed, 'n1', 'true')
     assert 'ssh key' in err.lower() and 'password only' in err.lower()
 
-    tok = _Mgr(pass_='pve-token-secret', ssh_key='k')
+    tok = _Mgr(user='root@pam!pegaprox', pass_='pve-token-secret', ssh_key='k')
     tok._using_api_token = True
     _, _, err = ssh_mod._pve_node_exec(tok, 'n1', 'true')
     assert 'api token' in err.lower()
     assert 'pve-token-secret' not in err
+
+
+# ── the regression the first round introduced ────────────────────────────────
+
+def test_a_cluster_whose_token_we_minted_keeps_its_ssh_password(monkeypatch):
+    """The #110 path: operator gives username + password, we create our own API token on
+    first connect and switch REST to it — "keep password for SSH", as that code says. It
+    sets _using_api_token=True while config.pass_ is still the account password. Gating on
+    _using_api_token took node commands away from the most ordinary setup there is:
+    screendumps, V2P, XHM and the compliance checks all run through here."""
+    seen = {}
+    monkeypatch.setattr(ssh_mod, '_ssh_exec',
+                        lambda host, user, pwd, cmd, **k: seen.update(pwd=pwd) or (0, 'ok', ''))
+    mgr = _Mgr(user='root@pam', pass_='realpassword')   # no '!' — not a token id
+    mgr._using_api_token = True                          # we minted one
+    rc, out, err = ssh_mod._pve_node_exec(mgr, 'n1', 'true')
+    assert rc == 0, f"refused a usable password: {err}"
+    assert seen.get('pwd') == 'realpassword'
+
+
+def test_an_operator_supplied_token_id_still_never_reaches_sshd(monkeypatch):
+    """#717 unchanged: when the USERNAME is the token id, pass_ is the token secret."""
+    called = []
+    monkeypatch.setattr(ssh_mod, '_ssh_exec', lambda *a, **k: called.append(1) or (0, 'ok', ''))
+    mgr = _Mgr(user='root@pam!pegaprox', pass_='the-token-secret', ssh_key='k')
+    mgr._using_api_token = True
+    rc, _, err = ssh_mod._pve_node_exec(mgr, 'n1', 'true')
+    assert rc == 1 and not called
+    assert 'the-token-secret' not in err

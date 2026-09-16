@@ -430,7 +430,11 @@ def _pve_node_exec(pve_mgr, node, cmd, timeout=600, use_controlmaster=True,
         # goes to sshd in its place — on a token cluster that is the token secret, and
         # every method in _ssh_exec tries it in turn. Key + API token is the setup we
         # recommend, so that is the config generating the most failed root logins.
-        _token_auth = bool(getattr(pve_mgr, '_using_api_token', False))
+        # Same question as ssh_diagnose asks, and for the same reason: pass_ is the token
+        # secret only when the operator typed a token id as the username. A cluster whose
+        # token WE minted (#110) keeps its password, and blanking it here took node
+        # commands away from the most common configuration we have.
+        _token_auth = '!' in (getattr(pve_mgr.config, 'user', '') or '')
         _ssh_pass = '' if _token_auth else (getattr(pve_mgr.config, 'pass_', '') or '')
         if not _ssh_pass:
             # Say which of the three it actually is. The first version of this asserted a

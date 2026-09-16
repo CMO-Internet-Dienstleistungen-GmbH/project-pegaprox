@@ -15409,7 +15409,17 @@ echo "AGENT_INSTALLED_OK"
         # token, not an SSH password — _ssh_node_output will happily offer it to sshd and
         # get nowhere. Treating it as a credential is what made this report "connection
         # failed" on exactly the setup it was written for.
-        has_password = bool(getattr(self.config, 'pass_', '')) and not getattr(self, '_using_api_token', False)
+        #
+        # MK Sep 2026 — but `_using_api_token` is the wrong question. It is also True for a
+        # cluster the operator gave a username and password, where we then minted our own
+        # token on first connect (#110) — and that path says so in as many words: "switch
+        # REST to token auth, keep password for SSH". For those, pass_ is still the account
+        # password and perfectly usable. The secret only lives in pass_ when the OPERATOR
+        # typed a token id as the username, which is what the '!' marks (see the detection
+        # at connect time). Asking _using_api_token instead reported "no SSH credentials"
+        # for the most ordinary setup there is.
+        _pass_is_token_secret = '!' in (getattr(self.config, 'user', '') or '')
+        has_password = bool(getattr(self.config, 'pass_', '')) and not _pass_is_token_secret
         if not getattr(self.config, 'ssh_key', '') and not has_password:
             return ('SSH_NO_CREDENTIALS',
                     "this cluster authenticates with an API token and has no SSH key or "
