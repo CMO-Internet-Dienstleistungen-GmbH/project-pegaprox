@@ -221,6 +221,9 @@ class FakeTask:
         if phase == 'failed':
             self.status = 'failed'
             self.error = error
+            # As the real task does: the reason goes into the log, which is what makes it
+            # part of the record somebody reads afterwards.
+            self.log(f'FAILED: {error}')
         elif phase == 'completed':
             self.status = 'completed'
 
@@ -2257,3 +2260,50 @@ class TestARecordThatOutlivesTheProcess:
         monkeypatch.setattr(hyperv_xhm, '_conn', lambda: None)
 
         assert hyperv_xhm.forget_recorded_migration('gone')['forgotten'] is True
+
+
+class TestTheRecordKeepsTheLog:
+    """A recorded migration without its log is a row that says something failed and not
+    what — which is the one thing somebody looks it up for."""
+
+    def test_the_log_is_filed_when_a_run_fails(self, monkeypatch):
+        filed = {}
+        monkeypatch.setattr(hyperv_xhm.hyperv_db, 'save_log',
+                            lambda conn, mid, lines: filed.update({mid: list(lines)}))
+        monkeypatch.setattr(hyperv_xhm.hyperv_db, 'get_migration',
+                            lambda conn, mid: {'created_resources': []})
+        monkeypatch.setattr(hyperv_xhm, '_conn', lambda: None)
+        monkeypatch.setattr(hyperv_xhm, '_update_migration_row', lambda *a, **k: None)
+
+        task = FakeTask()
+        task.log('Source VM: TestMig_CLONE')
+        hyperv_xhm._fail(task, 'mig1', 'Creating the target VM failed')
+
+        assert 'mig1' in filed
+        # Everything that was said, including what the failure added.
+        assert any('TestMig_CLONE' in line for line in filed['mig1'])
+        assert any('Creating the target VM failed' in line for line in filed['mig1'])
+
+    def test_a_log_that_cannot_be_filed_does_not_fail_the_run(self, monkeypatch):
+        def refuse(*args, **kwargs):
+            raise RuntimeError('database is locked')
+        monkeypatch.setattr(hyperv_xhm.hyperv_db, 'save_log', refuse)
+        monkeypatch.setattr(hyperv_xhm, '_conn', lambda: None)
+
+        # No exception: a migration must not fail because its log could not be written.
+        hyperv_xhm._record_log(FakeTask(), 'mig1')
+
+    def test_a_recorded_row_carries_its_log(self, monkeypatch):
+        monkeypatch.setattr(
+            hyperv_xhm.hyperv_db, 'list_migrations',
+            lambda conn, limit: [{'migration_id': 'mig1', 'source_cluster': SOURCE,
+                                  'source_vm_guid': GUID, 'status': 'failed',
+                                  'log_lines': ['[13:04] Phase: planning',
+                                                '[13:06] FAILED: name invalid format']}])
+        monkeypatch.setattr(hyperv_xhm, '_conn', lambda: None)
+
+        row = hyperv_xhm.recorded_migrations(())[0]
+
+        assert row['log_lines'][-1].endswith('name invalid format')
+        # The timeline is not reconstructed — it lived in the process.
+        assert row['phase_times'] == {}
