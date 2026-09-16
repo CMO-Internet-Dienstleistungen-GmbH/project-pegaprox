@@ -23715,7 +23715,7 @@
                                                     // the reason a migration failed one
                                                     // screenful further down for every entry
                                                     // that happens to be above it.
-                                                    <div className="divide-y divide-proxmox-border/50 max-h-[26rem] overflow-y-auto">
+                                                    <div className="divide-y divide-proxmox-border/50 max-h-96 overflow-y-auto">
                                                         {xhmMigrations.map(m => {
                                                             const isActive = m.status === 'running';
                                                             const phases = ['planning','transfer','creating','attaching','completed'];
