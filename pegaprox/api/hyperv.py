@@ -419,12 +419,11 @@ def list_hyperv_isos(cluster_id):
 @bp.route('/api/hyperv/target-virtio-isos', methods=['GET'])
 @require_auth(perms=['hyperv.vm.media'])
 def list_target_virtio_isos():
-    """The VirtIO driver ISOs a Proxmox node can see, for the migration wizard to offer.
+    """Every ISO a Proxmox node can see, and the driver releases it could fetch.
 
-    Which release is used is a decision, not a lookup: an out-of-support Windows accepts a
-    narrower set of signatures, and the node usually holds more than one ISO. The wizard
-    therefore shows the list and what each entry would mean, instead of the run picking the
-    first file whose name happens to match.
+    All of them, not only the ones whose name says virtio-win: an operator has to be able
+    to point at a file this product would not have recognised. Which release each one is
+    comes from its name, and where the name says nothing, the entry says that too.
     """
     cluster_id = (request.args.get('cluster') or '').strip()
     node = (request.args.get('node') or '').strip()
@@ -442,42 +441,29 @@ def list_target_virtio_isos():
         return jsonify({'error': 'Target cluster is not connected'}), 409
 
     from pegaprox.core import hyperv_drivers
-    from pegaprox.core.hyperv_postimport import find_virtio_isos
+    from pegaprox.core.hyperv_postimport import iso_storages, node_isos
 
     try:
-        found = find_virtio_isos(target, node)
+        isos = node_isos(target, node)
+        storages = iso_storages(target, node)
     except Exception as exc:                                   # noqa: BLE001
-        logger.warning('Could not list VirtIO ISOs on %s', node, exc_info=True)
+        logger.warning('Could not list the ISOs on %s', node, exc_info=True)
         return jsonify({'error': f'Could not list the ISOs on {node}: {exc}'}), 502
 
     return jsonify({
         'node': node,
-        'isos': [{
-            'volid': entry['volid'],
-            'storage': entry['storage'],
-            'size': entry.get('size'),
-            # What the file name says it is. Nothing opens the ISO to check, and an entry
-            # that names no release is offered with that stated rather than assumed.
-            'release': hyperv_drivers.release_of(entry['volid']),
-        } for entry in found],
-        # So the wizard can say which guests need which release without holding a second
-        # copy of the rule.
-        'required_releases': hyperv_drivers.REQUIRED_RELEASE,
-        # What the node could fetch for itself, for the releases it does not have yet.
+        'isos': isos,
+        # Busiest first: a download belongs beside the ISOs an operator already keeps.
+        'storages': storages,
+        'default_storage': storages[0]['storage'] if storages else None,
+        # What the node could fetch for itself, so the wizard can offer a release that is
+        # not there yet as an entry of its own rather than as a dead end.
         'available_releases': [
             {'release': release, 'note': entry['note'], 'filename': entry['filename']}
             for release, entry in sorted(hyperv_drivers.CATALOGUE.items())],
-        'iso_storages': _iso_storages_or_empty(target, node),
+        'legacy_release': hyperv_drivers.LEGACY_RELEASE,
+        'legacy_build': hyperv_drivers.LEGACY_BUILD,
     })
-
-
-def _iso_storages_or_empty(target, node):
-    from pegaprox.core.hyperv_postimport import iso_storages
-    try:
-        return iso_storages(target, node)
-    except Exception:
-        logger.debug('Could not list ISO storages on %s', node, exc_info=True)
-        return []
 
 
 @bp.route('/api/hyperv/target-virtio-isos/download', methods=['POST'])
@@ -494,8 +480,8 @@ def download_target_virtio_iso():
     node = (data.get('node') or '').strip()
     storage = (data.get('storage') or '').strip()
     release = (data.get('release') or '').strip()
-    if not all((cluster_id, node, storage, release)):
-        return jsonify({'error': 'cluster, node, storage and release are required'}), 400
+    if not all((cluster_id, node, release)):
+        return jsonify({'error': 'cluster, node and release are required'}), 400
 
     ok, denied = check_cluster_access(cluster_id)
     if not ok:
@@ -507,7 +493,16 @@ def download_target_virtio_iso():
     if not getattr(target, 'is_connected', False):
         return jsonify({'error': 'Target cluster is not connected'}), 409
 
-    from pegaprox.core.hyperv_postimport import download_release
+    from pegaprox.core.hyperv_postimport import download_release, iso_storages
+
+    if not storage or storage == 'auto':
+        # The storage on which an operator already keeps ISOs, which is the one with the
+        # most of them. Picking the first the API happens to list would scatter downloads
+        # across storages nobody looks at.
+        available = iso_storages(target, node)
+        if not available:
+            return jsonify({'error': f'{node} has no active storage that takes ISOs.'}), 409
+        storage = available[0]['storage']
 
     try:
         upid = download_release(target, node, storage, release)
