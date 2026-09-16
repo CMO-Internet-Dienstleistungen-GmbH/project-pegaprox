@@ -357,7 +357,8 @@ def test_an_unsignable_driver_is_not_made_boot_critical(resolved_node):
 
     virtio-win stopped having the drivers for out-of-support Windows versions signed
     through Microsoft after release 0.1.208; from 0.1.221 the 2012 R2 variants carry
-    'virtio-win / Red Hat Inc.' and nothing else.
+    'virtio-win / Red Hat Inc.' and nothing else. The release used for Server 2012 R2 is
+    0.1.189, whose 2k12R2 drivers chain to Microsoft Code Verification Root.
     """
     calls, _ = resolved_node
     v2p._inject_virtio_drivers(_Manager(), _Task())
