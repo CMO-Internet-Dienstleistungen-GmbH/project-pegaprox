@@ -17,6 +17,8 @@ from pegaprox.core import hyperv_preflight as pf
 def _vm(**overrides):
     """A VM that passes everything, so each test changes exactly one thing."""
     vm = {
+        # Proxmox validates a VM name as a DNS name, so the fixture carries one it accepts.
+        'name': 'synthetic-vm',
         'state': 'Off',
         'generation': 2,
         'checkpoint_count': 0,
@@ -688,3 +690,53 @@ class TestTheMacSurvivesTheMigration:
 
     def test_a_vm_without_adapters_is_not_warned_about(self):
         assert pf.check_mac_addresses([]).severity == pf.OK
+
+
+class TestTheNameTheTargetWillAccept:
+    """Proxmox validates a VM name as a DNS name, and says so only when it creates the VM.
+
+    That call happens after the disks have been converted. A 100 GiB copy that ran for a
+    minute and a half was thrown away because the source VM was called `TestMig_CLONE`, so
+    the question has to be asked while it is still cheap to answer.
+    """
+
+    def test_an_underscore_is_not_a_dns_name(self):
+        assert not pf.is_valid_pve_name('TestMig_CLONE')
+        assert not pf.is_valid_pve_name('has space')
+        assert not pf.is_valid_pve_name('-leading')
+        assert not pf.is_valid_pve_name('trailing-')
+        assert not pf.is_valid_pve_name('')
+
+    def test_what_proxmox_does_accept(self):
+        assert pf.is_valid_pve_name('TestMig-CLONE')
+        assert pf.is_valid_pve_name('srv01')
+        assert pf.is_valid_pve_name('srv01.example.test')
+
+    def test_the_suggestion_keeps_the_name_recognisable(self):
+        assert pf.pve_name_for('TestMig_CLONE', 'fallback') == 'TestMig-CLONE'
+        assert pf.pve_name_for('DC 01 (alt)', 'fallback') == 'DC-01--alt'
+
+    def test_a_name_with_nothing_left_falls_back(self):
+        assert pf.pve_name_for('___', 'hyperv-42') == 'hyperv-42'
+        assert pf.pve_name_for(None, 'hyperv-42') == 'hyperv-42'
+
+    def test_a_source_name_the_target_refuses_warns_and_names_the_replacement(self):
+        finding = pf.check_target_name('TestMig_CLONE')
+        assert finding.severity == pf.WARNING
+        assert 'TestMig-CLONE' in finding.summary
+
+    def test_a_name_the_operator_typed_blocks_instead_of_being_corrected(self):
+        finding = pf.check_target_name('TestMig_CLONE', 'still_wrong')
+        assert finding.severity == pf.BLOCKING
+        assert 'still_wrong' in finding.summary
+
+    def test_a_chosen_name_that_works_passes(self):
+        finding = pf.check_target_name('TestMig_CLONE', 'TestMig-CLONE')
+        assert finding.severity == pf.OK
+
+    def test_the_whole_run_blocks_on_a_name_that_cannot_be_created(self):
+        report = pf.run_preflight(_vm(name='TestMig_CLONE'), _target(),
+                                  dict(_options(), target_name='no_good'))
+        assert report.blocked
+        allowed, why = pf.may_start(report, [])
+        assert not allowed and 'no_good' in why

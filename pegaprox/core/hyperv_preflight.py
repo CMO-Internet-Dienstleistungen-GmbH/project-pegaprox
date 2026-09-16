@@ -24,6 +24,7 @@ migration that treats that as fine is exactly the one that eats a differencing c
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 # Severities, ordered from harmless to fatal so a run's worst finding is max().
@@ -59,6 +60,17 @@ DEFAULT_TARGET_CONTROLLER = 'sata'
 # announces a machine type the target would reject describes a migration that cannot
 # happen.
 GENERATION_FIRMWARE = {1: ('seabios', 'pc'), 2: ('ovmf', 'q35')}
+
+# What Proxmox accepts as a VM name. It validates the field as a DNS name, so an
+# underscore — which Hyper-V allows and Windows administrators use constantly — is
+# refused with "invalid format - value does not look like a valid DNS name". That
+# rejection arrives from the VM-create call, which happens *after* the disks have been
+# converted: a 100 GiB copy ran for over a minute and was thrown away over a character
+# in a name. Hence this check, and hence the fallback name the runner builds from it.
+_PVE_NAME_LABEL = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$')
+
+#: Longest single DNS label, and therefore the longest piece of a VM name.
+_MAX_LABEL = 63
 
 # Headroom on the target beyond the bytes actually transferred, so a storage that reports
 # just enough space does not fill up during the copy.
@@ -602,6 +614,7 @@ def run_preflight(vm: dict, target: dict, options: dict | None = None) -> Prefli
     report.add(check_automatic_start(vm.get('automatic_start_action'),
                                      vm.get('automatic_start_delay_seconds') or 0))
     report.add(check_firmware(vm.get('generation')))
+    report.add(check_target_name(vm.get('name'), options.get('target_name')))
 
     disks = vm.get('disks') or []
     if not disks:
@@ -651,6 +664,75 @@ def may_start(report: PreflightReport, acknowledged: list | None = None) -> tupl
         return False, ('These risks have to be confirmed before the migration can start: '
                        + ', '.join(missing))
     return True, ''
+
+
+def is_valid_pve_name(name: str | None) -> bool:
+    """Would Proxmox accept this as a VM name?
+
+    Mirrors the target's own rule rather than a taste of our own: dot-separated DNS
+    labels, each starting and ending alphanumeric, hyphens allowed in between.
+    """
+    text = (name or '').strip()
+    if not text or len(text) > 255:
+        return False
+    labels = text.split('.')
+    return all(len(l) <= _MAX_LABEL and _PVE_NAME_LABEL.match(l) for l in labels)
+
+
+def pve_name_for(name: str | None, fallback: str) -> str:
+    """The closest name Proxmox would accept, so a valid one is never invented silently.
+
+    Every character the target refuses becomes a hyphen — `TestMig_CLONE` arrives as
+    `TestMig-CLONE`, which is still the name somebody recognises on the list. What cannot
+    be rescued this way (a name made entirely of separators, or none at all) falls back to
+    the caller's spelling, which carries the source VMID.
+    """
+    text = (name or '').strip()
+    labels = []
+    for label in text.split('.'):
+        cleaned = re.sub(r'[^a-zA-Z0-9-]', '-', label).strip('-')[:_MAX_LABEL].strip('-')
+        if cleaned:
+            labels.append(cleaned)
+    candidate = '.'.join(labels)[:255].strip('.-')
+    return candidate if is_valid_pve_name(candidate) else fallback
+
+
+def check_target_name(source_name: str | None, chosen_name: str | None = None) -> Finding:
+    """Can the target be created under this name at all?
+
+    Two different situations, and they deserve different answers. A source name the target
+    refuses is not the operator's mistake — it is a difference between two products, and
+    the import renames rather than stopping. A name the operator typed themselves is
+    another matter: renaming it behind their back produces a VM that is not called what
+    they asked for, so that blocks and says what is wrong with it.
+    """
+    if chosen_name:
+        if is_valid_pve_name(chosen_name):
+            return Finding('target_name', OK,
+                           f'The target VM will be called {chosen_name}.')
+        return Finding('target_name', BLOCKING,
+                       f'Proxmox will not accept {chosen_name!r} as a VM name.',
+                       'A name is validated as a DNS name: letters, digits and hyphens, '
+                       'starting and ending alphanumeric, dots only as separators. '
+                       'Underscores and spaces are refused.')
+
+    if is_valid_pve_name(source_name):
+        return Finding('target_name', OK,
+                       f'The target VM will be called {(source_name or "").strip()}.')
+
+    suggestion = pve_name_for(source_name, '')
+    if not suggestion:
+        return Finding('target_name', WARNING,
+                       'The source name cannot be used on the target and nothing can be '
+                       'derived from it.',
+                       'The VM will be named after its source VMID instead. Set a name in '
+                       'the wizard to choose one.')
+    return Finding('target_name', WARNING,
+                   f'Proxmox will not accept {(source_name or "").strip()!r} as a VM name; '
+                   f'it will be imported as {suggestion}.',
+                   'Proxmox validates a VM name as a DNS name, so the underscores and '
+                   'spaces Hyper-V allows are replaced by hyphens. Set a name in the '
+                   'wizard to choose a different one.')
 
 
 def adapter_label(adapter: dict, index: int) -> str:
