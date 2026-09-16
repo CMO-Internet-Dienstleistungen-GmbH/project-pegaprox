@@ -16,6 +16,7 @@ def register_blueprints(app):
     from pegaprox.api.storage import bp as storage_bp
     from pegaprox.api.datacenter import bp as datacenter_bp
     from pegaprox.api.vmware import bp as vmware_bp
+    from pegaprox.api.hyperv import bp as hyperv_bp
     from pegaprox.api.schedules import bp as schedules_bp
     from pegaprox.api.reports import bp as reports_bp
     from pegaprox.api.settings import bp as settings_bp
@@ -53,6 +54,7 @@ def register_blueprints(app):
     app.register_blueprint(storage_bp)
     app.register_blueprint(datacenter_bp)
     app.register_blueprint(vmware_bp)
+    app.register_blueprint(hyperv_bp)
     app.register_blueprint(schedules_bp)
     app.register_blueprint(reports_bp)
     app.register_blueprint(settings_bp)
