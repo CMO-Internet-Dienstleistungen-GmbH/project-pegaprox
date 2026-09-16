@@ -1103,6 +1103,111 @@ def _free_leftover_volumes(migration, target, volumes):
 # The steps
 # ---------------------------------------------------------------------------
 
+#: How many recorded migrations the list falls back to. The in-memory registry keeps a
+#: hundred finished ones for six hours; this is the part that outlives a restart, and an
+#: estate migrating VMs all week should still see last Tuesday's failure.
+RECORDED_LIMIT = 500
+
+
+def recorded_migrations(already_listed=None) -> list[dict]:
+    """The Hyper-V migrations the database remembers and the process no longer does.
+
+    The wizard's list is built from `_xhm_migrations`, a dict in the process. A restart
+    empties it — and the block that refuses to start the same VM again reads the database,
+    which does not empty. Between the two, an operator saw nothing and could start
+    nothing: no row means no "clean up target" and no way to take the entry off the list,
+    while the refusal kept naming resources.
+
+    So what the database still knows is added to the list. Running migrations are never
+    taken from here: a row that says 'running' after a restart is a run whose process is
+    gone, and `mark_interrupted_migrations` has already corrected it.
+    """
+    known = set(already_listed or ())
+    try:
+        rows = hyperv_db.list_migrations(_conn(), limit=RECORDED_LIMIT)
+    except Exception:
+        logger.warning('Could not read the recorded Hyper-V migrations', exc_info=True)
+        return []
+    return [_as_migration_row(row) for row in rows
+            if row.get('migration_id') not in known]
+
+
+def forget_recorded_migration(migration_id) -> dict:
+    """Take one finished migration off the record. Refuses while it still holds something.
+
+    Dismissing a row is about the list, not about the target — so a migration that still
+    has a VM or a volume on the cluster keeps its record, because that record is what
+    stops the next attempt from copying the same disks twice. What is already gone from
+    the cluster is not counted: the check asks the cluster, not the note.
+    """
+    try:
+        migration = hyperv_db.get_migration(_conn(), migration_id)
+    except Exception:
+        logger.warning('Could not read migration %s', migration_id, exc_info=True)
+        return {'forgotten': False, 'error': 'The migration record could not be read.'}
+
+    if migration is None:
+        # Nothing to forget is the outcome the caller wanted.
+        return {'forgotten': True}
+
+    if migration.get('status') == hyperv_db.STATUS_RUNNING:
+        return {'forgotten': False,
+                'error': 'This migration is still running. Cancel it and let it stop '
+                         'before taking it off the list.'}
+
+    leftovers = _leftovers_that_still_exist(migration)
+    if leftovers:
+        what = ', '.join(f'{r.get("kind")} {r.get("id")}' for r in leftovers[:4])
+        return {'forgotten': False,
+                'error': f'This migration still has {len(leftovers)} resource(s) on the '
+                         f'target ({what}). Clean the target up or remove them yourself; '
+                         f'until then the record is what keeps the next attempt from '
+                         f'copying the same disks a second time.'}
+
+    try:
+        hyperv_db.delete_migration(_conn(), migration_id)
+    except Exception:
+        logger.warning('Could not delete migration %s', migration_id, exc_info=True)
+        return {'forgotten': False, 'error': 'The migration record could not be removed.'}
+    return {'forgotten': True}
+
+
+def _as_migration_row(row: dict) -> dict:
+    """One recorded migration in the shape the migration list renders.
+
+    Deliberately close to `XHMigrationTask.to_dict()`, and deliberately not identical: the
+    phase timeline and the log lived in the process and are gone. `recorded` says so, so
+    the interface can show the row for what it is — a record, not a live task.
+    """
+    completed = row.get('completed_at')
+    return {
+        'id': row.get('migration_id'),
+        'direction': DIRECTION,
+        'source_cluster': row.get('source_cluster'),
+        'source_vmid': row.get('source_vm_guid'),
+        'vm_name': row.get('source_vm_name') or '',
+        'target_cluster': row.get('target_cluster') or '',
+        'target_node': row.get('target_node') or '',
+        'target_storage': row.get('target_storage') or '',
+        'target_vmid': row.get('target_vmid'),
+        'status': row.get('status') or 'failed',
+        'phase': row.get('phase') or '',
+        'progress': row.get('progress') or 0,
+        'error': row.get('error') or '',
+        'started_at': row.get('started_at'),
+        'completed_at': completed,
+        'disk_progress': row.get('disk_progress') or {},
+        # Nothing kept these across the restart, and an empty timeline renders as no
+        # timeline rather than as a run that never got anywhere.
+        'phase_times': {},
+        'log_lines': [],
+        #: What this row is: read back from the database rather than held by a worker.
+        'recorded': True,
+        #: And what it is still holding on the target, which is why it may still block.
+        'created_resources': row.get('created_resources') or [],
+    }
+
+
 def _conn():
     from pegaprox.core.db import get_db
     return get_db().conn
