@@ -322,7 +322,18 @@ def xhm_dismiss(mid):
     A running migration is refused rather than ignored: dropping its record would leave a
     transfer writing to a target with nothing on screen saying so.
     """
-    if mid not in _xhm_migrations or not _xhm_reachable(_xhm_migrations[mid]):
+    if mid not in _xhm_migrations:
+        # After a restart a migration can be on the list without being in this process:
+        # the list also shows what a durable record remembers. Answering 404 here made
+        # exactly those rows impossible to dismiss.
+        answers = list(_forget_recorded(mid))
+        if not answers:
+            return jsonify({'error': 'Migration not found'}), 404
+        why = answers[0][1]
+        if why is not None:
+            return jsonify({'error': why, 'kept': [{'id': mid, 'reason': why}]}), 409
+        return jsonify({'removed': [mid], 'count': 1})
+    if not _xhm_reachable(_xhm_migrations[mid]):
         return jsonify({'error': 'Migration not found'}), 404
     with _xhm_lock:
         task = _xhm_migrations.get(mid)
@@ -353,8 +364,18 @@ def _forget_recorded(mid):
     except ImportError:
         return
 
-    targets = [mid] if mid else [row.get('id') for row in recorded_migrations(())
-                                 if row.get('status') != 'running']
+    # Only what the caller may see on the list may be dismissed from it — the same rule
+    # for one entry and for all of them, so "clear finished" cannot reach records of a
+    # cluster this account has no access to.
+    try:
+        rows = [row for row in recorded_migrations(()) if _may_dismiss_record(row)]
+    except Exception:
+        logging.warning('Could not read the recorded migrations', exc_info=True)
+        return
+    if mid:
+        targets = [row.get('id') for row in rows if row.get('id') == mid]
+    else:
+        targets = [row.get('id') for row in rows if row.get('status') != 'running']
     for target in targets:
         if not target:
             continue
@@ -365,6 +386,20 @@ def _forget_recorded(mid):
                             exc_info=True)
             continue
         yield target, (None if answer.get('forgotten') else answer.get('error'))
+
+
+def _may_dismiss_record(row):
+    """Whether the caller may take a recorded migration off the list.
+
+    A record carries no live task to ask `_xhm_reachable`, so the cluster-level check on
+    its source is asked instead. Anything that goes wrong answers no: a record nobody can
+    place is not one to delete.
+    """
+    try:
+        allowed, _ = check_cluster_access(row.get('source_cluster') or '')
+        return bool(allowed)
+    except Exception:
+        return False
 
 
 @bp.route('/api/xhm/migrations/<mid>', methods=['GET'])
