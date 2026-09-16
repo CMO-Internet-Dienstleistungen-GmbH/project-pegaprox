@@ -430,3 +430,48 @@ class TestTheTransferCheckSurvivesTheRightThings:
         data['_password_submitted'] = False
         hyperv_db.save_host(db.conn, db._encrypt, 'h1', data)
         assert hyperv_db.load_host(db.conn, db._decrypt, 'h1')['transfer_check'].get('ok') is True
+
+
+class TestTheLogOutlivesTheRun:
+    """The migration log lived only in the process, so a restart took it with it — and the
+    log is the part somebody reads to find out what happened, long after the migration."""
+
+    def test_a_log_is_written_and_read_back(self, conn):
+        hyperv_db.create_migration(conn, source_cluster='hv1', source_vm_guid='guid-1',
+                                   source_vm_name='TestMig_CLONE', target_cluster='pve1',
+                                   migration_id='mig-log')
+
+        hyperv_db.save_log(conn, 'mig-log', ['[13:04:56] Phase: planning',
+                                             '[13:06:18] FAILED: name invalid format'])
+
+        row = hyperv_db.get_migration(conn, 'mig-log')
+        assert row['log_lines'] == ['[13:04:56] Phase: planning',
+                                    '[13:06:18] FAILED: name invalid format']
+
+    def test_an_endless_log_is_cut_from_the_front(self, conn):
+        # The end is what matters: the failure and what was said about it.
+        hyperv_db.create_migration(conn, source_cluster='hv1', source_vm_guid='guid-2',
+                                   migration_id='mig-long')
+        lines = [f'line {n}' for n in range(hyperv_db.MAX_RECORDED_LOG_LINES + 50)]
+
+        hyperv_db.save_log(conn, 'mig-long', lines)
+
+        kept = hyperv_db.get_migration(conn, 'mig-long')['log_lines']
+        assert len(kept) == hyperv_db.MAX_RECORDED_LOG_LINES
+        assert kept[-1] == lines[-1]
+
+    def test_a_migration_without_a_log_reads_as_an_empty_one(self, conn):
+        hyperv_db.create_migration(conn, source_cluster='hv1', source_vm_guid='guid-3',
+                                   migration_id='mig-empty')
+
+        assert hyperv_db.get_migration(conn, 'mig-empty')['log_lines'] == []
+
+    def test_the_column_is_added_to_a_database_that_predates_it(self, conn):
+        # Same shape of upgrade as post_import: an existing table is not recreated, so the
+        # column has to be added or every read fails with "no such column".
+        cursor = conn.cursor()
+        cursor.execute('ALTER TABLE hyperv_migrations DROP COLUMN log_lines')
+        hyperv_db.ensure_schema(cursor)
+
+        cursor.execute('PRAGMA table_info(hyperv_migrations)')
+        assert 'log_lines' in [column[1] for column in cursor.fetchall()]
