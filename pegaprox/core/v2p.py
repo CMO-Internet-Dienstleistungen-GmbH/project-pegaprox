@@ -2510,7 +2510,10 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
         # file's certificate table holds only 'virtio-win / Red Hat Inc.'. Red Hat stopped
         # getting the legacy variants signed through Microsoft once those Windows versions
         # went out of support; 0.1.208 was the last release whose 2k12R2 drivers carried a
-        # cross-certificate, and the 2k16 and newer variants are unaffected.
+        # cross-certificate at all, and 0.1.189 is the release to use for that version --
+        # its 2k12R2 drivers chain to Microsoft Code Verification Root and a guest built
+        # from them reaches its login screen on virtio-scsi. The 2k16 and newer variants
+        # are unaffected.
         #
         # Read from the file rather than guessed from the Windows version: an operator who
         # supplies an older ISO for an old guest has a driver that does load, and a rule
@@ -2817,8 +2820,9 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
                  "out of support: virtio-win stopped having them signed through Microsoft "
                  "after release 0.1.208.")
         task.log("[VirtIO]   Point virtio_iso_path at a release that still carries a "
-                 "cross-signed driver for this guest, or leave the VM on its compatible "
-                 "controller and install the drivers from inside the guest.")
+                 "cross-signed driver for this guest — for Windows Server 2012 R2 that is "
+                 "virtio-win 0.1.189 — or leave the VM on its compatible controller and "
+                 "install the drivers from inside the guest.")
         return False
 
     #: Neither storage driver registered is not a success, whatever else was copied. The
