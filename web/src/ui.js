@@ -923,9 +923,9 @@
                     </span>
                     <span className="text-sm min-w-0">
                         {title && <span className="font-medium block">{title}</span>}
-                        {/* break-words rather than a truncation: a reason that is cut off
+                        {/* Wrapped rather than truncated: a reason that is cut off
                             is a reason nobody can act on, and these run to a sentence. */}
-                        <span className={`block break-words${title ? ' opacity-90' : ' font-medium'}`}>{message}</span>
+                        <span className={`block break-all${title ? ' opacity-90' : ' font-medium'}`}>{message}</span>
                     </span>
                     <button onClick={onClose}
                             aria-label="Dismiss"
