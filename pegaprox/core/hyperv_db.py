@@ -128,6 +128,15 @@ def ensure_schema(cursor) -> None:
         cursor.execute("ALTER TABLE hyperv_migrations ADD COLUMN post_import TEXT DEFAULT '{}'")
         logger.info('Added post_import column to hyperv_migrations')
 
+    # The migration's own log. It used to live only in the process, which meant a
+    # restart took it with it — and the log is the part an operator reads to find out what
+    # happened, long after the run. Same shape of addition as post_import above: a
+    # database from before this needs the column adding, not the table creating.
+    cursor.execute('PRAGMA table_info(hyperv_migrations)')
+    if 'log_lines' not in [column[1] for column in cursor.fetchall()]:
+        cursor.execute("ALTER TABLE hyperv_migrations ADD COLUMN log_lines TEXT DEFAULT '[]'")
+        logger.info('Added log_lines column to hyperv_migrations')
+
     # Same reasoning, one step further: an early build of this patch named the key column
     # host_id, and CREATE TABLE IF NOT EXISTS leaves an existing table alone. Without this
     # the host routes fail with "no such column: id" on any database created by that build.
@@ -511,6 +520,27 @@ def migrations_for_cluster(conn, source_cluster: str, limit: int = 100) -> list[
     return [_row_to_dict(row) for row in cursor.fetchall()]
 
 
+#: How much of a migration's log is kept with its record. The run itself holds the last
+#: 500 lines; this is what survives the process, and a failed import's log is a few dozen
+#: lines of which the last ten matter.
+MAX_RECORDED_LOG_LINES = 500
+
+
+def save_log(conn, migration_id: str, lines) -> None:
+    """Write the migration's log into its record.
+
+    Called at each phase change and when the run ends, rather than per line: a transfer
+    logs a handful of lines and reports progress through another path entirely, so this
+    costs a few writes per migration and leaves the log readable even if the process dies
+    mid-run.
+    """
+    kept = [str(line) for line in (lines or [])][-MAX_RECORDED_LOG_LINES:]
+    conn.cursor().execute(
+        'UPDATE hyperv_migrations SET log_lines = ?, updated_at = ? WHERE migration_id = ?',
+        (json.dumps(kept), time.time(), migration_id))
+    conn.commit()
+
+
 def clear_created_resources(conn, migration_id: str) -> None:
     """Forget what a migration created, once it has actually been removed.
 
@@ -601,7 +631,7 @@ def _row_to_dict(row) -> dict:
     """A database row to dict, decoding the two JSON columns."""
     data = dict(row)
     for column, empty in (('created_resources', []), ('disk_progress', {}),
-                          ('post_import', {})):
+                          ('post_import', {}), ('log_lines', [])):
         try:
             data[column] = json.loads(data.get(column) or json.dumps(empty))
         except (TypeError, ValueError):
