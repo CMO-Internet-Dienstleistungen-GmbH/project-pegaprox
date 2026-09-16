@@ -14,11 +14,18 @@ cache answers "nothing known yet, a read is running", which the view renders as 
 
 Three rules keep this from becoming the standing load the patch exists to avoid:
 
-  * **Only a viewer starts a read.** `request_refresh` is called from the routes the host
-    view uses. The SSE broadcast loop and every generic cluster page read
+  * **Only a viewer, or a connection, starts a read.** `request_refresh` is called from
+    the routes the host view uses, and once per host when start-up finishes connecting to
+    it. The SSE broadcast loop, the global search and every generic cluster page read
     `get_vm_resources()`, which serves this cache and never triggers anything -- that loop
     runs once per second per watched manager, and a Hyper-V host in it was until now one
     full WinRM inventory per second.
+
+    The start-up read is what makes a Hyper-V guest findable at all. Everything generic
+    answers from this cache, so before it there was a window -- until somebody opened the
+    host view -- in which a global search returned no Hyper-V VM and looked simply broken.
+    It runs on the thread that connects the hosts one after another, so a dozen sources
+    cost a dozen sequential reads rather than a dozen simultaneous WinRM handshakes.
   * **One read per host at a time.** A second viewer, or a second round of the same view,
     joins the read that is already running instead of starting another.
   * **A failed read is not retried immediately.** The failure is remembered with its
@@ -176,8 +183,9 @@ def _should_refresh(entry: dict | None, force: bool) -> bool:
     return _now() - (entry.get('fetched_at') or 0.0) >= _STALE_AFTER_S
 
 
-def request_refresh(host_id: str, mgr, force: bool = False) -> bool:
-    """Start a background read of this host unless one is unnecessary or already running.
+def request_refresh(host_id: str, mgr, force: bool = False,
+                    background: bool = True) -> bool:
+    """Read this host unless a read is unnecessary or already running.
 
     Returns whether a read is in flight when this returns — which is what the caller puts
     into its response, because it decides whether the view says "updating" or not.
@@ -186,6 +194,14 @@ def request_refresh(host_id: str, mgr, force: bool = False) -> bool:
     dropped. The running read may have enumerated the VM before the power action that
     forced it, so answering "one is already in progress" would leave the wrong state on
     screen until the entry goes stale.
+
+    `background=False` runs the read on the calling thread instead of spawning one. It is
+    for a caller that is already off the request path and wants to stay sequential — the
+    start-up loop that connects the sources one after another. Handing that loop a thread
+    per host would turn a dozen slow hosts into a dozen simultaneous WinRM inventories,
+    which is exactly what reading them in sequence avoids. A request handler must never
+    pass it: `Get-VM` on a host carrying a few dozen guests takes the better part of a
+    minute.
     """
     with _lock:
         if _in_flight.get(host_id):
@@ -201,7 +217,11 @@ def request_refresh(host_id: str, mgr, force: bool = False) -> bool:
         generation = _generation.get(host_id, 0)
 
     try:
-        _spawn(host_id, mgr, generation)
+        if background:
+            _spawn(host_id, mgr, generation)
+        else:
+            read_now(host_id, mgr, generation)
+            return False
     except Exception:                                            # noqa: BLE001
         # Nothing is going to clear the flag if nothing started. A host left marked
         # in-flight is never read again for the life of the process.
