@@ -623,13 +623,13 @@ def run_preflight(vm: dict, target: dict, options: dict | None = None) -> Prefli
     injecting = bool(options.get('drivers_injected'))
     report.add(check_guest_windows(images, injecting))
     report.add(check_driver_release(images, options.get('virtio_iso'), injecting))
-    report.add(check_guest_registry(images, injecting))
     report.add(check_guest_architecture(images, injecting))
     report.add(check_disk_in_use(images))
 
     # What is inside the disks. Everything here is invisible from outside them and every
     # one of these findings is a migration that fails late — after the copy, on the target.
     inspection = options.get('disk_inspection')
+    report.add(check_guest_registry(inspection, injecting))
     report.add(check_guest_hibernated(inspection))
     report.add(check_guest_filesystem(inspection))
     report.add(check_inspection_released_the_disks(inspection))
@@ -814,32 +814,6 @@ def check_driver_release(images: list[dict] | None, iso: str | None,
                    f'Checked against build {disk.get("build")}.')
 
 
-def check_guest_registry(images: list[dict] | None, injecting: bool = True) -> Finding:
-    """Can the guest's SOFTWARE hive be read at all?
-
-    The image header answers the version; the edition comes out of the guest's registry.
-    A disk that gives one and not the other has a hive that could not be read in full —
-    and that is the hive the driver injection writes into, where it fails with "Operation
-    not supported". That failure normally appears after the disks have been converted.
-    """
-    disk = windows_disk(images)
-    if disk is None or not injecting:
-        return Finding('guest_registry', OK,
-                       'Nothing is written into the guest, so its registry is not read.')
-    if disk.get('registry_readable'):
-        return Finding('guest_registry', OK,
-                       'The guest\'s registry can be read.',
-                       f'Edition {disk.get("edition_id") or "unnamed"}, '
-                       f'{disk.get("installation_type") or "type unnamed"}.')
-    return Finding('guest_registry', WARNING,
-                   'The guest\'s registry could not be read in full.',
-                   'The disk reports its Windows version but not its edition, which comes '
-                   'out of the SOFTWARE hive. The driver injection edits that same hive '
-                   'and will most likely refuse it. A guest whose file system was not shut '
-                   'down cleanly looks exactly like this — check that it was powered off '
-                   'rather than saved or killed.')
-
-
 def inspected_volumes(inspection: dict | None) -> list[dict]:
     """Every volume the inspection saw, across all disks."""
     return [vol for disk in ((inspection or {}).get('disks') or [])
@@ -927,6 +901,53 @@ def check_inspection_released_the_disks(inspection: dict | None) -> Finding:
                    f'{names}. The source VM cannot start while they are, so neither the '
                    f'migration nor the rollback can proceed. Detach them on the host '
                    f'(Dismount-VHD) before trying again.')
+
+
+def check_guest_registry(inspection: dict | None, injecting: bool = True) -> Finding:
+    """Can the guest's registry actually be opened?
+
+    Asked by opening it, not by inferring it. The earlier version of this check concluded
+    from `Get-WindowsImage` leaving EditionId empty that the SOFTWARE hive was unreadable
+    and that the driver injection would fail on it. Measured on exactly such a disk, that
+    was wrong: `reg load` succeeded and every value was there, including the edition DISM
+    had not reported. A warning that names a cause which does not exist is worse than no
+    warning.
+
+    What remains is the honest form of it: a hive Windows' own offline loader refuses is
+    one hivex will refuse too, and the injection edits that hive.
+    """
+    if not injecting:
+        return Finding('guest_registry', OK,
+                       'Nothing is written into the guest, so its registry is not opened.')
+
+    volumes = [v for v in inspected_volumes(inspection) if v.get('windows')]
+    if not volumes:
+        return Finding('guest_registry', OK,
+                       'No Windows volume was inspected, so no registry was opened.')
+
+    unreadable = [v for v in volumes if v.get('hive_readable') is False]
+    if unreadable:
+        return Finding('guest_registry', WARNING,
+                       'The guest\'s SOFTWARE hive could not be opened.',
+                       'Windows\' own offline loader refused it, and the driver injection '
+                       'edits that same hive with hivex, which is stricter still. A hive '
+                       'whose transaction logs were never replayed looks like this — boot '
+                       'the guest once on Hyper-V, let it settle and shut it down cleanly.')
+
+    readable = [v for v in volumes if v.get('hive_readable')]
+    if not readable:
+        return Finding('guest_registry', OK,
+                       'The guest\'s registry was not opened.')
+
+    disk = readable[0]
+    named = disk.get('product_name') or 'Windows'
+    build = disk.get('build') or '?'
+    revision = f'.{disk["revision"]}' if disk.get('revision') else ''
+    edition = disk.get('installation_type') or disk.get('edition_id')
+    return Finding('guest_registry', OK,
+                   f'{named} (build {build}{revision}) — its registry opens.',
+                   f'{edition} installation. Read from the guest\'s own SOFTWARE hive, '
+                   f'which is the one the driver injection edits.')
 
 
 def check_disk_in_use(images: list[dict] | None) -> Finding:

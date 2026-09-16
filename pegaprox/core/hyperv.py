@@ -157,6 +157,16 @@ def normalise_disk_inspection(raw: dict) -> dict:
                 'page_file': bool(vol.get('PageFile')),
                 # None where it could not be asked, which is not the same as clean.
                 'dirty': None if exit_code is None else bool(exit_code),
+                # The guest's registry, opened rather than inferred. None means the hive
+                # was not opened at all — on a volume with no Windows that is expected.
+                'hive_readable': (None if vol.get('HiveLoadExit') is None
+                                  else vol.get('HiveLoadExit') == 0),
+                'product_name': vol.get('ProductName') or '',
+                'edition_id': vol.get('EditionID') or '',
+                'installation_type': vol.get('InstallationType') or '',
+                'build': vol.get('CurrentBuildNumber') or '',
+                'revision': vol.get('UBR') or '',
+                'display_version': vol.get('DisplayVersion') or '',
             })
         disks.append({
             'path': entry.get('Path') or '',
@@ -176,10 +186,11 @@ def normalise_disk_inspection(raw: dict) -> dict:
 def normalise_image_facts(raw: dict) -> dict:
     """One disk's image facts, in this product's vocabulary.
 
-    `registry_readable` is the finding that is not in any single field: the version comes
-    from the image header and the edition from the guest's SOFTWARE hive, so a disk that
-    answers with one and not the other has a hive that could not be read in full. That is
-    the same hive the driver injection edits, and it fails there — after the copy.
+    `edition_id` and `installation_type` come out of the guest's SOFTWARE hive and are
+    sometimes empty while the version fields are filled. That is not evidence that the
+    hive is unreadable — measured on such a disk, Windows' own offline loader opened it
+    and every value was there. Whether the hive opens is answered by the disk inspection,
+    which opens it.
     """
     windows = bool(raw.get('Windows'))
     build = int(raw.get('Build') or 0)
@@ -205,7 +216,11 @@ def normalise_image_facts(raw: dict) -> dict:
         'edition_id': edition,
         'installation_type': install_type,
         'system_root': raw.get('SystemRoot') or '',
-        'registry_readable': bool(windows and (edition or install_type)),
+        # Deliberately not a 'registry_readable' flag any more. Concluding from an empty
+        # EditionId that the hive cannot be opened was measured and found wrong: on such a
+        # disk `reg load` succeeded and every value was there. Whether the hive opens is
+        # now answered by opening it, in the disk inspection.
+
         'seconds': raw.get('Seconds'),
     }
 

@@ -383,6 +383,13 @@ foreach ($d in @(Get-VMHardDiskDrive -VM $vm)) {
                 HiberfilSize = 0
                 PageFile   = $false
                 DirtyExit  = $null
+                HiveLoadExit = $null
+                ProductName = ''
+                EditionID = ''
+                InstallationType = ''
+                CurrentBuildNumber = ''
+                UBR = ''
+                DisplayVersion = ''
             }
             if ($root) {
                 $row.Windows = Test-Path -LiteralPath "$root\Windows\System32\config\SOFTWARE"
@@ -398,6 +405,33 @@ foreach ($d in @(Get-VMHardDiskDrive -VM $vm)) {
                     # clean. Measured: 0 on a volume that is not dirty.
                     $null = & $fsutil dirty query $root 2>&1
                     $row.DirtyExit = $LASTEXITCODE
+                }
+
+                # The guest's own registry, opened the way Windows opens an offline one.
+                #
+                # This replaces a guess. `Get-WindowsImage` leaves EditionId and
+                # InstallationType empty on some disks, and concluding from that "the hive
+                # is unreadable, the driver injection will fail" was wrong: measured on
+                # such a disk, `reg load` succeeded and every value was there. So the hive
+                # is opened rather than reasoned about — what comes back is real data, and
+                # a load that fails is the only honest version of that warning, because
+                # hivex would be facing the same hive.
+                if ($row.Windows) {
+                    $hive = "$root\Windows\System32\config\SOFTWARE"
+                    $key = 'HKLM\PegaProxOffline'
+                    $reg = Join-Path $env:SystemRoot 'System32\reg.exe'
+                    $null = & $reg load $key $hive 2>&1
+                    $row.HiveLoadExit = $LASTEXITCODE
+                    if ($LASTEXITCODE -eq 0) {
+                        $cv = "Registry::$key\Microsoft\Windows NT\CurrentVersion"
+                        foreach ($name in 'ProductName','EditionID','InstallationType','CurrentBuildNumber','UBR','DisplayVersion') {
+                            try { $row[$name] = "$((Get-ItemProperty -Path $cv -Name $name -ErrorAction Stop).$name)" } catch { }
+                        }
+                        # The handle has to go before the hive can be unloaded, and
+                        # PowerShell holds one until the collector runs.
+                        [gc]::Collect()
+                        $null = & $reg unload $key 2>&1
+                    }
                 }
             }
             $entry.Volumes += [pscustomobject]$row
