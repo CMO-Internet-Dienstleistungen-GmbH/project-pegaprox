@@ -140,6 +140,22 @@ patches:
     commit_message: 'feat(web): show VM descriptions in Corporate summary'
     requested_by: 14
 
+  # Every search request asked each connected cluster for a fresh /cluster/resources walk
+  # with max_age=0 — the heaviest query PegaProx makes of a cluster, run once per cluster
+  # per keystroke, serially, each able to wait out its own ten-second timeout. The tag
+  # search made that walk once per MATCHING VM rather than once per cluster. Measured at
+  # 0.26s per walk against a node with 45 VMs. Ordered before the Hyper-V patch, which
+  # does not touch this file at all — the search behaviour is general and applies to an
+  # installation with no Hyper-V host in it.
+  - name: search-cluster-walk
+    branch: fix/search-cluster-walk
+    base: main
+    kind: fix
+    upstream_pr:
+    summary: 'The global search and its summary read a cached snapshot instead of walking every cluster live'
+    commit_message: 'fix(search): read a snapshot instead of walking every cluster live'
+    requested_by: 43
+
   # Hyper-V as a restricted migration source, per the epic in issue #15. All of
   # its phases -- connection, inventory, preflight, offline import, console --
   # belong to this one branch and this one entry; the sub-issues do not get
