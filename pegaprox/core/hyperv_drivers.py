@@ -13,6 +13,7 @@ at three in the morning has not read.
 
 from __future__ import annotations
 
+import logging
 import re
 
 #: The one build that may only be driven by the legacy release, and nothing else may be.
@@ -70,6 +71,8 @@ CATALOGUE = {
 RELEASE_SOURCE = {release: entry['url'] for release, entry in CATALOGUE.items()}
 
 #: A virtio-win release inside a file name: `virtio-win-0.1.189.iso`, `virtio-win-0.1.262-2`.
+logger = logging.getLogger(__name__)
+
 _RELEASE_IN_NAME = re.compile(r'virtio[-_]win[-_](\d+\.\d+\.\d+)', re.IGNORECASE)
 
 
@@ -255,3 +258,108 @@ def release_to_fetch(build: int | str | None) -> str | None:
     if number == LEGACY_BUILD:
         return LEGACY_RELEASE
     return newest_release(CATALOGUE)
+
+
+# ---------------------------------------------------------------------------
+# What the current stable release is, asked rather than remembered
+# ---------------------------------------------------------------------------
+
+#: Where the publisher states its current build. The file lists the RPMs of the stable
+#: release — `virtio-win-0.1.302-1.noarch.rpm` — and the version in those names is the
+#: only machine-readable statement of "current" the project publishes. There is no
+#: checksum for the ISO itself, here or in the archive directories (checked 2026-09-16).
+STABLE_CHECKSUM_URL = ('https://fedorapeople.org/groups/virt/virtio-win/'
+                       'direct-downloads/stable-virtio/CHECKSUM')
+
+#: Where a release's ISO lives once its number is known.
+_ARCHIVE_URL = ('https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/'
+                'archive-virtio/virtio-win-{release}-1/virtio-win-{release}.iso')
+
+#: How long a looked-up release stays good. The publisher ships a few times a year, so
+#: asking once a day is generous and asking on every wizard open would be rude.
+LOOKUP_MAX_AGE = 24 * 60 * 60
+
+#: Seconds to wait for the publisher. Short on purpose: this runs while somebody waits
+#: for a page, and the catalogue below is a perfectly good answer.
+LOOKUP_TIMEOUT = 10
+
+_lookup = {'release': None, 'checked_at': 0.0}
+
+
+def catalogue_entry(release: str) -> dict | None:
+    """One release as something that can be downloaded, known or newly discovered."""
+    if release in CATALOGUE:
+        return CATALOGUE[release]
+    if not release_key(release):
+        return None
+    return {
+        'url': _ARCHIVE_URL.format(release=release),
+        'filename': f'virtio-win-{release}.iso',
+        'note': 'Current stable, as published by the virtio-win project.',
+    }
+
+
+def refresh_current_release(force: bool = False) -> str | None:
+    """Ask the publisher which release is current. Returns it, or None on any failure.
+
+    Cached for a day. Never raises and never blocks anything: a lookup that fails leaves
+    the built-in catalogue in place, which is a working answer rather than an error — it
+    is merely one that ages.
+    """
+    import time
+    import urllib.request
+
+    now = time.time()
+    if not force and _lookup['release'] and (now - _lookup['checked_at']) < LOOKUP_MAX_AGE:
+        return _lookup['release']
+
+    try:
+        with urllib.request.urlopen(STABLE_CHECKSUM_URL, timeout=LOOKUP_TIMEOUT) as answer:
+            text = answer.read(64_000).decode('utf-8', 'replace')
+    except Exception:
+        logger.info('Could not ask which virtio-win release is current; '
+                    'using the built-in catalogue', exc_info=True)
+        _lookup['checked_at'] = now
+        return _lookup['release']
+
+    found = {match.group(1) for match in _RELEASE_IN_NAME.finditer(text)}
+    newest = newest_release(found)
+    if newest:
+        _lookup.update({'release': newest, 'checked_at': now})
+        logger.info('Current virtio-win release is %s', newest)
+    else:
+        _lookup['checked_at'] = now
+    return _lookup['release']
+
+
+def offerable_releases() -> dict:
+    """Every release the wizard may offer for download.
+
+    The built-in catalogue plus whatever the publisher currently calls stable. The
+    catalogue is not replaced by the lookup: 0.1.189 is pinned for Server 2012 R2 and is
+    never "current", and a lookup that fails must not empty the list.
+    """
+    entries = dict(CATALOGUE)
+    current = _lookup['release']
+    if current and current not in entries:
+        entry = catalogue_entry(current)
+        if entry:
+            entries[current] = entry
+    return entries
+
+
+def refresh_in_background() -> None:
+    """Start the lookup without making anybody wait for it.
+
+    The wizard answers from what is known and is right one page-open later. Blocking a
+    page for ten seconds to learn a version number that changes a few times a year is the
+    wrong trade, and a publisher that is slow or unreachable must not be able to make the
+    migration wizard slow or unreachable with it.
+    """
+    import threading
+    import time
+
+    if _lookup['release'] and (time.time() - _lookup['checked_at']) < LOOKUP_MAX_AGE:
+        return
+    threading.Thread(target=refresh_current_release, daemon=True,
+                     name='virtio-win-release-lookup').start()

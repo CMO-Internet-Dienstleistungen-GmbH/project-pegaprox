@@ -878,3 +878,33 @@ class TestWhatIsInsideTheDisks:
         allowed, why = pf.may_start(report, [])
         assert not allowed and 'guest_hibernated' in why
         assert pf.may_start(report, ['guest_hibernated'])[0]
+
+
+class TestTheOstypeFollowsTheGuest:
+    """Proxmox files several Windows releases under one `ostype`, and the version alone
+    does not separate them: Windows 10, Windows 11 and every Server from 2016 to 2025
+    report 10.0. Only inside that pair does the build decide."""
+
+    def _ostype(self, version):
+        from pegaprox.core.hyperv_xhm import ostype_for
+        return ostype_for([_image(version=version, build=0)])
+
+    def test_the_releases_before_windows_10_come_from_the_version_alone(self):
+        assert self._ostype('6.3.9600.21562') == 'win8'    # Server 2012 R2 / 8.1
+        assert self._ostype('6.2.9200.1') == 'win8'        # Server 2012 / 8
+        assert self._ostype('6.1.7601.1') == 'win7'        # Server 2008 R2 / 7
+        assert self._ostype('5.2.3790.1') == 'w2k3'
+
+    def test_inside_10_0_the_build_decides(self):
+        assert self._ostype('10.0.14393.1') == 'win10'     # Server 2016
+        assert self._ostype('10.0.17763.1') == 'win10'     # Server 2019
+        assert self._ostype('10.0.19045.1') == 'win10'     # Windows 10 22H2
+        assert self._ostype('10.0.20348.2340') == 'win11'  # Server 2022
+        assert self._ostype('10.0.22631.1') == 'win11'     # Windows 11
+        assert self._ostype('10.0.26100.1') == 'win11'     # Server 2025
+
+    def test_a_guest_nobody_could_read_stays_other(self):
+        from pegaprox.core.hyperv_xhm import ostype_for
+        assert ostype_for([]) == 'other'
+        assert ostype_for([_image(windows=False)]) == 'other'
+        assert self._ostype('') == 'other'

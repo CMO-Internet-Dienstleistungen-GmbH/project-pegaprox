@@ -176,3 +176,65 @@ class TestWhichIsoTheWizardPreselects:
     def test_releases_sort_by_number_not_by_text(self):
         # '0.1.9' must not outrank '0.1.302' the way string comparison would have it.
         assert drivers.newest_release(['0.1.9', '0.1.302']) == '0.1.302'
+
+
+class TestAskingWhichReleaseIsCurrent:
+    """The catalogue ages. A release hardcoded in March is still offered in November,
+    long after the publisher has moved on — so the current one is asked for rather than
+    remembered, and the catalogue is what answers when the question cannot be."""
+
+    def setup_method(self):
+        drivers._lookup.update({'release': None, 'checked_at': 0.0})
+
+    def test_the_release_is_read_out_of_the_published_checksum_file(self, monkeypatch):
+        # The file lists the stable build's RPMs; the version in those names is the only
+        # machine-readable statement of "current" the project publishes.
+        published = ('66f65c16ab3e8dfe12c2855a0d1ac303  virtio-win-0.1.999-1.noarch.rpm\n'
+                     '09c1acd2ff72263c16a6afbf7a5f2e69  virtio-win-0.1.999-1.src.rpm\n')
+        monkeypatch.setattr('urllib.request.urlopen',
+                            lambda *a, **k: _FakeAnswer(published.encode()))
+
+        assert drivers.refresh_current_release(force=True) == '0.1.999'
+        assert '0.1.999' in drivers.offerable_releases()
+
+    def test_a_publisher_that_cannot_be_reached_leaves_the_catalogue_alone(self, monkeypatch):
+        def refuse(*args, **kwargs):
+            raise OSError('no route to host')
+        monkeypatch.setattr('urllib.request.urlopen', refuse)
+
+        assert drivers.refresh_current_release(force=True) is None
+        # And the wizard still has something to offer.
+        assert set(drivers.offerable_releases()) == set(drivers.CATALOGUE)
+
+    def test_the_pinned_legacy_release_survives_a_lookup(self, monkeypatch):
+        monkeypatch.setattr('urllib.request.urlopen',
+                            lambda *a, **k: _FakeAnswer(b'virtio-win-0.1.999-1.noarch.rpm'))
+        drivers.refresh_current_release(force=True)
+
+        # 0.1.189 is never "current" and must never fall out of the list: it is the only
+        # release Server 2012 R2 may be given.
+        assert drivers.LEGACY_RELEASE in drivers.offerable_releases()
+
+    def test_a_discovered_release_can_be_downloaded(self):
+        entry = drivers.catalogue_entry('0.1.999')
+        assert entry['filename'] == 'virtio-win-0.1.999.iso'
+        assert entry['url'].endswith('virtio-win-0.1.999-1/virtio-win-0.1.999.iso')
+
+    def test_nonsense_is_not_turned_into_a_download(self):
+        assert drivers.catalogue_entry('not-a-release') is None
+
+
+class _FakeAnswer:
+    """What urlopen returns, as far as this code uses it."""
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def read(self, *args):
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
