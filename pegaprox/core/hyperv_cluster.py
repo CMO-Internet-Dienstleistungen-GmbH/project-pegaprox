@@ -1022,25 +1022,60 @@ def load_hyperv_sources(managers: dict) -> int:
 
 
 def _connect_in_background(managers: list) -> None:
-    """Reach each registered source once, off the start-up path.
+    """Reach each registered source once, off the start-up path, and read what it has.
 
     Every failure is already recorded on the manager it belongs to, so nothing here has
     to be raised: a host that refuses is a host the operator sees as disconnected, not a
     product that failed to start.
+
+    The inventory read that follows a successful connection is what makes a Hyper-V guest
+    visible outside its own host view. Everything generic — the global search, the tag
+    merge, the summary tallies — answers from `hyperv_inventory` and never asks a host, so
+    without one read after start-up a search found no Hyper-V VM at all until somebody
+    happened to open the host view. Reading here costs one `Get-VM` per host, on this
+    thread, in the same sequence as the connections, at a moment when nobody is waiting.
     """
+    from pegaprox.core import hyperv_inventory
+
     for manager in managers:
         try:
             manager.start()
         except Exception:                                    # noqa: BLE001
             logger.exception('Connecting to Hyper-V source %s failed unexpectedly',
                              manager.id)
+            continue
+        if not manager.is_connected:
+            # Nothing to read from, and the failure is already on the manager. The next
+            # attempt is whoever opens the host view.
+            continue
+        try:
+            hyperv_inventory.request_refresh(manager.id, manager, background=False)
+        except Exception:                                    # noqa: BLE001
+            # A host whose inventory cannot be read is still a registered source; the
+            # host view says why when somebody opens it.
+            logger.warning('Could not read the inventory of Hyper-V source %s at '
+                           'start-up', manager.id, exc_info=True)
 
 
 def register_hyperv_source(host_id: str, record: dict, managers: dict) -> HyperVClusterManager:
-    """Put one host into the registry without touching the database."""
+    """Put one host into the registry without touching the database.
+
+    A host added while the product is running gets the same first read start-up gives the
+    saved ones, so it is searchable without its view having been opened. In the
+    background: someone is waiting for the response to the form they just submitted, and
+    `Get-VM` is not a question to answer in a request.
+    """
+    from pegaprox.core import hyperv_inventory
+
     manager = HyperVClusterManager(host_id, record)
     managers[host_id] = manager
     manager.start()
+    if manager.is_connected:
+        try:
+            hyperv_inventory.request_refresh(host_id, manager)
+        except Exception:                                    # noqa: BLE001
+            logger.warning('Could not start the first inventory read of Hyper-V source '
+                           '%s', host_id, exc_info=True)
     return manager
 
 
