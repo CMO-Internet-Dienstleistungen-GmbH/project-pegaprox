@@ -740,3 +740,141 @@ class TestTheNameTheTargetWillAccept:
         assert report.blocked
         allowed, why = pf.may_start(report, [])
         assert not allowed and 'no_good' in why
+
+
+def _image(**overrides):
+    """One disk as `Get-WindowsImage` and `Get-VHD` describe it, normalised."""
+    image = {'path': 'S:\\vm\\a.vhdx', 'windows': True, 'build': 20348,
+             'version': '10.0.20348.2582', 'architecture': 'x64', 'edition_id': 'ServerStandard',
+             'installation_type': 'Server', 'registry_readable': True, 'attached': False,
+             'vhd_type': 'Dynamic', 'parent_path': '', 'system_root': 'Windows',
+             'windows_error': ''}
+    image.update(overrides)
+    return image
+
+
+def _inspection(**volume_overrides):
+    volume = {'file_system': 'NTFS', 'size': 99 * 1024 ** 3, 'free': 80 * 1024 ** 3,
+              'windows': True, 'hibernated': False, 'hiberfil_size': 0,
+              'page_file': True, 'dirty': False}
+    volume.update(volume_overrides)
+    return {'inspected': True, 'error': '', 'state': 'Off',
+            'disks': [{'path': 'S:\\vm\\a.vhdx', 'mounted': True, 'error': '',
+                       'attached_after': False, 'volumes': [volume]}]}
+
+
+class TestWhatTheDisksSayAboutTheGuest:
+    """Read on the Hyper-V host, off a stopped VM. The integration services report the
+    guest's version over KVP and those items exist only while it runs — measured: complete
+    while running, empty three seconds after the guest finished shutting down. A migration
+    needs the VM off, so the disk is the only source left."""
+
+    def test_the_windows_version_is_reported(self):
+        finding = pf.check_guest_windows([_image()])
+        assert finding.severity == pf.OK
+        assert '10.0.20348.2582' in finding.summary
+
+    def test_a_disk_with_no_windows_is_not_called_linux(self):
+        finding = pf.check_guest_windows([_image(windows=False, windows_error='no image')])
+        assert finding.severity == pf.WARNING
+        assert 'Linux' in finding.detail and 'not distinguished' in finding.detail
+
+    def test_nothing_read_matters_only_where_it_decides_something(self):
+        assert pf.check_guest_windows([], injecting=False).severity == pf.OK
+        assert pf.check_guest_windows([], injecting=True).severity == pf.WARNING
+
+    def test_the_windows_disk_is_the_one_carrying_windows(self):
+        images = [_image(path='data.vhdx', windows=False), _image(path='system.vhdx')]
+        assert pf.windows_disk(images)['path'] == 'system.vhdx'
+
+    def test_a_registry_that_cannot_be_read_warns_before_the_copy(self):
+        # The version comes from the image header, the edition from the guest's SOFTWARE
+        # hive. One without the other means the hive could not be read — and that is the
+        # hive the driver injection edits, where it fails after the disks are converted.
+        finding = pf.check_guest_registry([_image(registry_readable=False)])
+        assert finding.severity == pf.WARNING
+        assert 'SOFTWARE hive' in finding.detail
+
+    def test_a_disk_attached_elsewhere_blocks(self):
+        finding = pf.check_disk_in_use([_image(attached=True)])
+        assert finding.severity == pf.BLOCKING
+
+    def test_a_32_bit_guest_warns_about_the_driver_variant(self):
+        finding = pf.check_guest_architecture([_image(architecture='x86')])
+        assert finding.severity == pf.WARNING
+        assert 'amd64' in finding.summary
+
+
+class TestTheDriverReleaseIsDecidedBeforeTheCopy:
+    """The same rule runs again during the injection — but by then the disks have been
+    converted, and a refusal there has already cost the copy."""
+
+    def test_server_2012_r2_with_the_right_iso_passes(self):
+        finding = pf.check_driver_release([_image(build=9600, version='6.3.9600.1')],
+                                          'vm-pool:iso/virtio-win-0.1.189.iso')
+        assert finding.severity == pf.OK
+
+    def test_server_2012_r2_with_a_newer_iso_blocks(self):
+        finding = pf.check_driver_release([_image(build=9600, version='6.3.9600.1')],
+                                          'vm-pool:iso/virtio-win-0.1.302.iso')
+        assert finding.severity == pf.BLOCKING
+        assert '0.1.189' in finding.detail
+
+    def test_a_current_guest_with_the_legacy_iso_blocks(self):
+        # 0.1.189 has no 2k22, w11 or 2k25 directory at all.
+        finding = pf.check_driver_release([_image(build=20348)],
+                                          'vm-pool:iso/virtio-win-0.1.189.iso')
+        assert finding.severity == pf.BLOCKING
+
+    def test_no_iso_for_a_guest_that_needs_a_specific_one_blocks(self):
+        finding = pf.check_driver_release([_image(build=9600)], '')
+        assert finding.severity == pf.BLOCKING
+        assert '0.1.189' in finding.summary
+
+    def test_no_injection_means_no_release_has_to_match(self):
+        finding = pf.check_driver_release([_image(build=9600)], '', injecting=False)
+        assert finding.severity == pf.OK
+
+
+class TestWhatIsInsideTheDisks:
+    """A hibernated guest and an unclean file system are invisible from outside the disk,
+    and both turn into a migration that fails after the copy."""
+
+    def test_a_hibernated_guest_is_reported_with_its_size(self):
+        finding = pf.check_guest_hibernated(
+            _inspection(hibernated=True, hiberfil_size=6 * 1024 ** 3))
+        assert finding.severity == pf.WARNING
+        assert '6.0 GiB' in finding.summary
+        assert 'cannot be resumed on the target' in finding.detail
+
+    def test_a_clean_shutdown_passes(self):
+        assert pf.check_guest_hibernated(_inspection()).severity == pf.OK
+
+    def test_a_dirty_volume_warns(self):
+        finding = pf.check_guest_filesystem(_inspection(dirty=True))
+        assert finding.severity == pf.WARNING
+        assert 'transaction logs' in finding.detail
+
+    def test_an_unanswered_dirty_check_is_not_a_clean_one(self):
+        finding = pf.check_guest_filesystem(_inspection(dirty=None))
+        assert finding.severity == pf.WARNING
+        assert 'could not be determined' in finding.summary
+
+    def test_a_disk_the_host_did_not_release_blocks(self):
+        inspection = _inspection()
+        inspection['disks'][0]['attached_after'] = True
+        finding = pf.check_inspection_released_the_disks(inspection)
+        assert finding.severity == pf.BLOCKING
+        assert 'cannot start' in finding.detail
+
+    def test_hibernation_has_to_be_confirmed_rather_than_clicked_past(self):
+        report = pf.run_preflight(
+            _vm(), _target(),
+            dict(_options(), drivers_injected=True,
+                 guest_images=[_image()],
+                 virtio_iso='vm-pool:iso/virtio-win-0.1.302.iso',
+                 disk_inspection=_inspection(hibernated=True, hiberfil_size=1024 ** 3)))
+        assert 'guest_hibernated' in report.requires_acknowledgement()
+        allowed, why = pf.may_start(report, [])
+        assert not allowed and 'guest_hibernated' in why
+        assert pf.may_start(report, ['guest_hibernated'])[0]
