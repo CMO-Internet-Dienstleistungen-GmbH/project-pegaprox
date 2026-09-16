@@ -162,6 +162,12 @@ def test_no_hyperv_route_can_change_the_source_beyond_preparing_it(api):
         # permission check. The source keeps running on its original hardware, which is
         # the rollback for everything these three do.
         ('/api/hyperv/<cluster_id>/migrations/<migration_id>/virtio-iso', 'POST'),
+        # Has a *target* node fetch a driver ISO onto one of its storages. It touches
+        # no VM at all, on either side, and exists because which release a guest may
+        # be given is a decision -- Server 2012 R2 may only have virtio-win 0.1.189 --
+        # and carrying a 700 MB file to a node by hand should not be the way to honour
+        # it. A POST because it starts a download, not because it changes a guest.
+        ('/api/hyperv/target-virtio-isos/download', 'POST'),
         ('/api/hyperv/<cluster_id>/migrations/<migration_id>/drivers', 'POST'),
         ('/api/hyperv/<cluster_id>/migrations/<migration_id>/profile', 'POST'),
         # Registering, editing and removing a source. These write PegaProx's own record of

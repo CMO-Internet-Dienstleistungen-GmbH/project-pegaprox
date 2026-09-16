@@ -123,6 +123,36 @@
             return !n || !isFinite(n) ? '0' : (n / (1024 ** 3)).toFixed(1);
         }
 
+        // Would Proxmox accept this as a VM name? It validates the field as a DNS name,
+        // and reports the refusal from the create call — which runs after the disks have
+        // been converted. Mirrors `hyperv_preflight.is_valid_pve_name` so the wizard says
+        // the same thing the server would, before a 100 GiB copy is spent on finding out.
+        function hvIsPveName(name) {
+            const text = String(name || '').trim();
+            if (!text || text.length > 255) return false;
+            return text.split('.').every(label =>
+                label.length <= 63 && /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$/.test(label));
+        }
+
+        // What Proxmox accepts as `ostype`, with the Windows entries spelled out. It is a
+        // field rather than a default because it decides which timers and devices the
+        // guest is given: a Windows guest left on 'other' runs measurably worse with
+        // nothing about it looking wrong.
+        const HV_OSTYPES = [
+            { value: 'other', label: 'Other / unknown' },
+            { value: 'win11', label: 'Windows 11 / Server 2022+' },
+            { value: 'win10', label: 'Windows 10 / Server 2016-2019' },
+            { value: 'win8', label: 'Windows 8 / Server 2012 / 2012 R2' },
+            { value: 'win7', label: 'Windows 7 / Server 2008 R2' },
+            { value: 'l26', label: 'Linux (kernel 2.6 - 6.x)' },
+            { value: 'solaris', label: 'Solaris' },
+        ];
+
+        //: The SCSI controller models Proxmox offers. `virtio-scsi-single` is what the
+        //: import suggests; an older guest may need a model it has a driver for.
+        const HV_SCSIHW = ['virtio-scsi-single', 'virtio-scsi-pci', 'lsi', 'lsi53c810',
+                           'megasas', 'pvscsi'];
+
         // ───────────────────────────────────────────────
         // Preflight
         // ───────────────────────────────────────────────
