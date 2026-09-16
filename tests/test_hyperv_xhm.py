@@ -334,7 +334,7 @@ class TestPlanning:
         another, every adapter stays "unmapped", and the migration can never be started.
         Found in the browser, where the start button stayed disabled with the form filled.
         """
-        from pegaprox.core.hyperv_preflight import _adapter_key, check_network_mapping
+        from pegaprox.core.hyperv_preflight import adapter_key, check_network_mapping
 
         adapter = {'name': 'Network Adapter', 'mac_address': '00:15:5d:00:00:01',
                    'switch_name': 'External'}
@@ -346,7 +346,7 @@ class TestPlanning:
         plan = hyperv_xhm.plan_hyperv_to_pve(SOURCE, VMID, TARGET)
         entry = plan['source']['networks'][0]
 
-        assert entry['network'] == _adapter_key(adapter)
+        assert entry['network'] == adapter_key(adapter, 0)
         # And a map built the way the wizard builds it satisfies the check.
         chosen = {entry['network'] or entry['bridge'] or '0': 'vmbr0'}
         assert check_network_mapping([adapter], chosen).severity == 'ok'
@@ -703,7 +703,9 @@ class TestTheTargetVm:
                                               'mac_address': '000000000000',
                                               'mac_address_colons': '00:00:00:00:00:00',
                                               'switch_name': 'External'}]
-        _run(FakeTask(), network_map={'000000000000': 'vmbr0'})
+        # Keyed by position, not by the zeroes: all-zero is the absence of an address, so
+        # it cannot address the adapter either. Two such adapters would share one key.
+        _run(FakeTask(), network_map={'adapter1': 'vmbr0'})
         net0 = self._created(target)['net0']
         assert 'macaddr' not in net0
         assert 'bridge=vmbr0' in net0
@@ -1808,3 +1810,123 @@ class TestAGuestWhoseDriverTheLoaderRefuses:
         assert any('attached to no controller' in line and 'vm-120-disk-1' in line
                    for line in task.log_lines)
         assert 'could not be moved back' in note
+
+
+# ===========================================================================
+# Two adapters are two adapters
+# ===========================================================================
+
+class TestTwoAdaptersAreTwoAdapters:
+    """A VM with more than one network card must be mappable card by card.
+
+    Reported from the wizard: with two adapters on the same Hyper-V switch, changing one
+    bridge changed the other. Both rows read "Produktion-Vswitch", and both wrote to the
+    same entry in the network map — because the key was the MAC or, failing that, the
+    adapter's name, and neither distinguishes two cards on one VM. Hyper-V reports all
+    zeroes for a MAC until the VM has started once, and every adapter is called "Network
+    Adapter" unless somebody renamed it.
+
+    The consequence is not cosmetic and is invisible in the result: both cards land on one
+    bridge and one VLAN, so a guest can arrive reachable by the wrong people.
+    """
+
+    NO_MAC = [
+        {'name': 'Network Adapter', 'mac_address': '000000000000',
+         'mac_address_colons': '00:00:00:00:00:00', 'switch_name': 'Produktion-Vswitch'},
+        {'name': 'Network Adapter', 'mac_address': '000000000000',
+         'mac_address_colons': '00:00:00:00:00:00', 'switch_name': 'Produktion-Vswitch'},
+    ]
+
+    def test_adapters_without_a_mac_do_not_share_a_key(self):
+        from pegaprox.core.hyperv_preflight import adapter_key
+
+        keys = [adapter_key(a, i) for i, a in enumerate(self.NO_MAC)]
+
+        assert keys[0] != keys[1], (
+            'two adapters share one map entry, so the wizard cannot address them apart')
+        assert len(set(keys)) == len(keys)
+
+    def test_a_real_mac_is_still_the_key(self):
+        """It is stable across a re-plan, which a position is not once an adapter is added."""
+        from pegaprox.core.hyperv_preflight import adapter_key
+
+        adapter = {'name': 'Network Adapter', 'mac_address': '00155D000001'}
+        assert adapter_key(adapter, 3) == '00155D000001'
+
+    def test_every_row_says_which_adapter_it_is(self):
+        from pegaprox.core.hyperv_preflight import adapter_label
+
+        labels = [adapter_label(a, i) for i, a in enumerate(self.NO_MAC)]
+
+        assert labels[0] != labels[1], 'two rows an operator cannot tell apart'
+        assert labels[0].startswith('#1') and labels[1].startswith('#2')
+
+    def test_the_plan_gives_each_adapter_its_own_key(self, db, wired):
+        source, _, _ = wired
+        source.get_vm_disks_for_export = lambda vmid: {'data': {
+            'disks': [], 'network_adapters': list(self.NO_MAC), 'generation': 2,
+            'power_state': 'Off', 'checkpoint_count': 0, 'hyperv_guid': GUID}}
+
+        plan = hyperv_xhm.plan_hyperv_to_pve(SOURCE, VMID, TARGET)
+        networks = plan['source']['networks']
+
+        assert len({n['network'] for n in networks}) == 2
+        assert len({n['label'] for n in networks}) == 2
+
+    def test_the_run_puts_each_adapter_where_it_was_mapped(self, db, wired):
+        """The half that matters: two cards, two bridges, not one bridge twice."""
+        from pegaprox.core.hyperv_preflight import adapter_key
+
+        source, target, _ = wired
+        source._detail['network_adapters'] = list(self.NO_MAC)
+        keys = [adapter_key(a, i) for i, a in enumerate(self.NO_MAC)]
+
+        _run(FakeTask(), network_map={keys[0]: 'vmbr1', keys[1]: 'vmbr9'})
+
+        created = self._created(target)
+        assert 'bridge=vmbr1' in created['net0']
+        assert 'bridge=vmbr9' in created['net1'], (
+            'the second adapter did not get its own bridge')
+
+    @staticmethod
+    def _created(target):
+        return next(data for url, data in target.posts if url.endswith('/qemu'))
+
+
+class TestTheMacArrivesUnchanged:
+    """Whatever the source says the address is, that is what the target gets.
+
+    Only the spelling changes: Hyper-V reports `00155D000001` and Proxmox refuses that
+    outright. The bytes are the same, and a dynamic address is carried like any other —
+    dynamic means Hyper-V picked it, not that it may be replaced.
+    """
+
+    def test_a_dynamic_mac_is_carried_over_byte_for_byte(self, db, wired):
+        source, target, _ = wired
+        source._detail['network_adapters'] = [{
+            'name': 'Network Adapter', 'mac_address': '00155D0A1B2C',
+            'mac_address_colons': '00:15:5d:0a:1b:2c', 'dynamic_mac': True,
+            'switch_name': 'Produktion-Vswitch'}]
+
+        _run(FakeTask(), network_map={'00155D0A1B2C': 'vmbr1'})
+
+        net0 = next(data for url, data in target.posts
+                    if url.endswith('/qemu'))['net0']
+        assert 'macaddr=00:15:5d:0a:1b:2c' in net0, (
+            f'the guest arrives under a different address: {net0}')
+
+    def test_only_an_address_that_does_not_exist_is_left_to_the_target(self, db, wired):
+        from pegaprox.core.hyperv_preflight import adapter_key
+
+        source, target, _ = wired
+        adapter = {'name': 'Network Adapter', 'mac_address': '000000000000',
+                   'mac_address_colons': '00:00:00:00:00:00',
+                   'switch_name': 'Produktion-Vswitch'}
+        source._detail['network_adapters'] = [adapter]
+
+        _run(FakeTask(), network_map={adapter_key(adapter, 0): 'vmbr1'})
+
+        net0 = next(data for url, data in target.posts
+                    if url.endswith('/qemu'))['net0']
+        assert 'macaddr' not in net0
+        assert 'bridge=vmbr1' in net0
