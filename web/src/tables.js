@@ -1546,6 +1546,15 @@
                 if (!paginatedResources?.length) return;
                 const toFetch = paginatedResources.filter(r =>
                     r.type === 'qemu' && r.status === 'running' &&
+                    // A guest that is not on a Proxmox cluster has no QEMU guest agent to
+                    // ask, and this route answers for a Proxmox cluster and nothing else.
+                    // Asking anyway is one round trip per visible row whose only possible
+                    // outcome is "no address" — for every row on such a source, every time
+                    // the table renders. The row says what it is: a Hyper-V guest carries
+                    // the id its own host knows it by. Reading that rather than looking the
+                    // cluster up keeps this independent of whether a Hyper-V source exists
+                    // in this build at all.
+                    !r.hyperv_guid &&
                     !r.ip && _ipCacheEntry(r._clusterId || clusterId, r.vmid) === undefined
                 );
                 if (!toFetch.length) return;

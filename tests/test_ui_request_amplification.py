@@ -86,3 +86,27 @@ def test_frontend_request_amplification_guards(node_bin):
             'frontend behaviour tests failed\n'
             f'--- stdout ---\n{res.stdout}\n--- stderr ---\n{res.stderr}'
         )
+
+
+def test_the_guest_agent_is_not_asked_about_a_guest_that_has_none():
+    """The guest-info fan-out skips a row that is not a Proxmox guest.
+
+    Read out of the source rather than rendered, because the filter lives inside a
+    component this suite has no way to mount. It is still worth holding: the route
+    answers for a Proxmox cluster and nothing else, so on a source whose guests have no
+    QEMU agent every visible row costs a round trip whose only possible answer is "no
+    address" — and it costs it again on every render. A guest from such a source carries
+    the id its own hypervisor knows it by, which is what the guard reads.
+    """
+    tables = os.path.join(REPO_ROOT, 'web', 'src', 'tables.js')
+    with open(tables, encoding='utf-8') as handle:
+        source = handle.read()
+
+    marker = "fetch(`/api/clusters/${cid}/vms/${vm.node}/qemu/${vm.vmid}/guest-info`"
+    assert marker in source, 'the guest-info fetch moved — this guard needs rechecking'
+
+    head = source[:source.index(marker)]
+    selection = head[head.rindex('const toFetch = paginatedResources.filter'):]
+    assert '!r.hyperv_guid' in selection, (
+        'the guest-info selection no longer skips guests that have no QEMU agent; '
+        'every visible row on such a source is one round trip per render')
