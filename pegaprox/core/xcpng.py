@@ -3921,8 +3921,32 @@ echo DONE""",
         },
     }
 
-    def check_node_hardening(self, node_name):
-        """Run CIS checks on XCP-ng host and return status per control."""
+    @staticmethod
+    def _effective_profile(profile):
+        """Names the control set that ran, which here is always this manager's own.
+
+        MK Sep 2026 - XCP-ng has ten checks of its own and no profile sets, so it ignores
+        the profile argument. Echoing 'cis-l1' back would put a PVE profile name on an
+        XCP-ng result. Returning None would be honest but changes the field from string to
+        null for every existing API consumer, so name the set instead: 'xcpng-cis' is what
+        _CIS_CHECKS on this class is, not a claim about any published benchmark. The route
+        also returns requested_profile so a caller can see what it asked for.
+        """
+        return 'xcpng-cis'
+
+    def check_node_hardening(self, node_name, verbose=False, profile=None):
+        """Run CIS checks on XCP-ng host and return status per control.
+
+        MK Sep 2026 - the signature used to be (self, node_name) while the shared route in
+        api/reports.py calls it with verbose= and profile= for every cluster in
+        cluster_managers, XCP-ng included. Opening the hardening panel on an XCP-ng host
+        therefore raised TypeError and answered 500. Found by the daily scan flagging an
+        api mismatch at the call site.
+
+        `profile` is accepted and ignored: this manager has its own ten checks and no
+        profile sets, so there is nothing to filter. The caller is responsible for not
+        labelling the result with a PVE profile name - see _effective_profile there.
+        """
         parts = []
         for cid, spec in self._CIS_CHECKS.items():
             parts.append(f"echo '---{cid}---'")
@@ -3942,6 +3966,14 @@ echo DONE""",
                 continue
             if current_id and stripped in ('OK', 'FAIL'):
                 results[current_id] = (stripped == 'OK')
+        if verbose:
+            # Same shape the PVE manager returns for audit reports, so the report builder
+            # does not have to special-case the hypervisor. No separate evidence command
+            # exists here, so the evidence is the verdict line itself.
+            return {cid: {'status': ok,
+                          'evidence': 'OK' if ok else 'FAIL',
+                          'command': self._CIS_CHECKS.get(cid, {}).get('check', '')}
+                    for cid, ok in results.items()}
         return results
 
     def apply_node_hardening(self, node_name, controls):

@@ -786,7 +786,12 @@ def check_hardening(cluster_id, node):
     if result is None:
         return _ssh_unavailable(mgr, node)
 
-    return jsonify({'node': node, 'controls': result, 'verbose': verbose, 'profile': profile or 'cis-l1'})
+    # Report the profile that actually ran, not the one that was asked for - cis-l2 has no
+    # control set of its own and a PDF naming it would be claiming a level nobody checked.
+    _eff = mgr._effective_profile(profile) if hasattr(mgr, '_effective_profile') else None
+    _eff = _eff or (profile or 'cis-l1')   # always a string - consumers indexed on it before
+    return jsonify({'node': node, 'controls': result, 'verbose': verbose,
+                    'profile': _eff, 'requested_profile': profile or 'cis-l1'})
 
 
 @bp.route('/api/clusters/<cluster_id>/nodes/<node>/hardening', methods=['POST'])

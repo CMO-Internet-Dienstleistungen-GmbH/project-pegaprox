@@ -6927,8 +6927,12 @@
                                 value={profile}
                                 onChange={e => setProfile(e.target.value)}
                                 className="px-3 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm">
+                                {/* LW Sep 2026 - "CIS Level 2" was offered here and ran the exact
+                                    same 44 controls as Level 1, so the report named a level nobody
+                                    had checked. Dropped until there is a real L2 set; the backend
+                                    still accepts cis-l2 for saved links and answers with the
+                                    profile that actually ran. */}
                                 <option value="cis-l1">CIS Level 1 (default)</option>
-                                <option value="cis-l2">CIS Level 2</option>
                                 <option value="vs-nfd">VS-NfD (BSI Grundschutz)</option>
                                 <option value="dr">Diffusion Restreinte (ANSSI II 901)</option>
                                 <option value="rgs">RGS (ANSSI-BP-028)</option>

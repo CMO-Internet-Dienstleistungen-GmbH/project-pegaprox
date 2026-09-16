@@ -15746,7 +15746,7 @@ echo DONE""",
 echo DONE""",
         },
         'journald': {
-            'check': """grep -q '^SystemMaxUse' /etc/systemd/journald.conf.d/99-cis-hardening.conf 2>/dev/null && echo OK || echo FAIL""",
+            'check': """{ systemd-analyze cat-config systemd/journald.conf 2>/dev/null || cat /etc/systemd/journald.conf /etc/systemd/journald.conf.d/*.conf 2>/dev/null; } | grep -qE '^[[:space:]]*SystemMaxUse[[:space:]]*=[[:space:]]*[^[:space:]]' && echo OK || echo FAIL""",
             'verbose_check': """grep -hE '^(Storage|SystemMaxUse|SystemKeepFree)' /etc/systemd/journald.conf.d/99-cis-hardening.conf 2>/dev/null || echo '  (no pegaprox journald config)' ; echo '--- current journal usage ---' ; journalctl --disk-usage 2>/dev/null""",
             'apply': """mkdir -p /etc/systemd/journald.conf.d
 cat > /etc/systemd/journald.conf.d/99-cis-hardening.conf << 'JDEOF'
@@ -15775,7 +15775,7 @@ chown root:root /etc/ssh/ssh_host_*_key.pub 2>/dev/null
 echo DONE""",
         },
         'ssh_crypto': {
-            'check': """grep -q 'CIS SSH Cryptographic Hardening' /etc/ssh/sshd_config 2>/dev/null && echo OK || echo FAIL""",
+            'check': """{ /usr/sbin/sshd -T 2>/dev/null || sshd -T 2>/dev/null; } | awk '/^ciphers /{seen=1; if ($0 ~ /cbc|arcfour|3des/) bad=1} /^macs /{if ($0 ~ /md5|-96/) bad=1} /^gssapiauthentication yes/{bad=1} /^hostbasedauthentication yes/{bad=1} /^ignorerhosts no/{bad=1} /^permituserenvironment yes/{bad=1} END{print (seen && !bad) ? \"OK\" : \"FAIL\"}'""",
             'verbose_check': """grep -E '^(Ciphers|KexAlgorithms|MACs|GSSAPIAuthentication|HostbasedAuthentication|IgnoreRhosts|PermitUserEnvironment|Banner) ' /etc/ssh/sshd_config 2>/dev/null || echo '(no hardening directives found)'""",
             'apply': """cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.cis
 # remove existing crypto directives to avoid conflicts
@@ -16431,7 +16431,7 @@ done
 echo DONE""",
         },
         'sysctl_hardening': {
-            'check': """grep -q 'net.ipv4.conf.all.rp_filter = 1' /etc/sysctl.d/99-pegaprox-hardening.conf 2>/dev/null && echo OK || echo FAIL""",
+            'check': """bad=0; for kv in net.ipv4.conf.all.rp_filter=1 net.ipv4.conf.all.accept_redirects=0 net.ipv4.conf.all.send_redirects=0 net.ipv4.conf.all.accept_source_route=0 net.ipv4.tcp_syncookies=1 kernel.randomize_va_space=2 kernel.dmesg_restrict=1 kernel.kptr_restrict=2 fs.protected_hardlinks=1 fs.protected_symlinks=1 fs.suid_dumpable=0; do k=${kv%%=*}; want=${kv#*=}; have=$(sysctl -n "$k" 2>/dev/null); [ "$have" = "$want" ] || bad=1; done; [ "$bad" = 0 ] && echo OK || echo FAIL""",
             'verbose_check': """if [ -f /etc/sysctl.d/99-pegaprox-hardening.conf ]; then echo 'file exists:' ; grep -E '^[a-z]' /etc/sysctl.d/99-pegaprox-hardening.conf 2>/dev/null | head -10 ; echo '...' ; else echo 'file missing' ; fi ; echo '---live kernel values---' ; for k in net.ipv4.conf.all.rp_filter net.ipv4.tcp_syncookies kernel.randomize_va_space kernel.kptr_restrict ; do v=$(sysctl -n $k 2>/dev/null) ; echo "$k = $v" ; done""",
             'apply': """cat > /etc/sysctl.d/99-pegaprox-hardening.conf << 'SYSEOF'
 # PegaProx Security Hardening - sysctl parameters
@@ -16617,7 +16617,15 @@ echo DONE""",
     # the existing apply UI — not auto-applied.
     _HARDENING_PROFILES = {
         'cis-l1': None,  # None = all CIS_CHECKS (default behaviour)
-        'cis-l2': None,  # alias for now — same surface as cis-l1, kept for future split
+        # MK Sep 2026 — 'cis-l2' still resolves, because API callers and saved links use it,
+        # but it runs the SAME control set as cis-l1 and there is no honest way to label the
+        # result "Level 2". The benchmark defines L1 as the smaller set and L2 as additions
+        # on top; ours had L1 = everything and L2 = the same, so the name was backwards AND
+        # empty. Splitting it properly means sorting 44 controls against the published
+        # benchmark, which wants someone who has it in front of them - until then the
+        # effective profile is reported (see _effective_profile), so a report cannot claim a
+        # level that was never checked.
+        'cis-l2': None,
         'vs-nfd': {
             # Proxmox-safe subset of existing CIS controls
             'fs_modules', 'core_dumps', 'mount_options', 'cron_hardening', 'journald',
@@ -16760,6 +16768,15 @@ echo DONE""",
         if members is None:
             return None
         return set(members)
+
+    @staticmethod
+    def _effective_profile(profile):
+        """The profile whose controls actually ran, which is what a report may name.
+
+        cis-l2 is accepted but carries no distinct control set, so it resolves to cis-l1.
+        Anything else is returned as given.
+        """
+        return 'cis-l1' if (profile or 'cis-l1') == 'cis-l2' else (profile or 'cis-l1')
 
     def _all_hardening_controls(self):
         """Merged dict of CIS_CHECKS + VS-NfD extras (id → control)."""
