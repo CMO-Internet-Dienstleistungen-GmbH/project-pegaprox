@@ -77,11 +77,16 @@ signature ntfs-3g decides from:
 That run also shows the option is not optional: without it the volume mounts read-only and
 the injection's own read-write check fails the run.
 
-**Not measured: that a guest which was hibernated boots after the file is cleared.** That
-needs Windows and a screen. The four rows in `hyperv-windows-matrix.md` were booted from
-images shut down normally, so no version covers this case yet. It is the same open
-question the driver path has carried since it started using the option; this ADR does not
-close it, it only stops the compatible path from being worse than the driver path.
+**Since measured: the compatible path finds a real hibernated guest, says so, and clears
+it.** On 2026-09-16 a Windows Server 2016 image was made to hibernate itself — the volume
+carries a 4 GB `hiberfil.sys` beginning with `HIBR`, and a read-write mount answers
+"Windows is hibernated, refused to mount." Run against it, this mode reports
+`GUEST_WAS_HIBERNATED`, logs the sentence above about the discarded session, and returns
+`ok=True` with the file gone.
+
+**Still not measured: that such a guest then boots.** That needs a screen, and the screens
+are not taken yet — for the driver path either. What the two paths now share is that the
+state is reachable on demand rather than hypothetical.
 
 ## Consequences
 
