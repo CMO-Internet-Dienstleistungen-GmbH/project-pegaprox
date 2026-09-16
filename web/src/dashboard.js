@@ -8254,6 +8254,8 @@
             const [sidebarMultiSdn, setSidebarMultiSdn] = useState(false); // #612 — Multi-Cluster EVPN view
             const [xhmMigrations, setXhmMigrations] = useState([]);
             const [xhmSelectedMigration, setXhmSelectedMigration] = useState(null);
+            const [xhmDismissAsk, setXhmDismissAsk] = useState(null);   // {rows, all}
+            const [xhmDismissing, setXhmDismissing] = useState(false);
             const [xhmMigrationDetail, setXhmMigrationDetail] = useState(null);
             const [xhmPlan, setXhmPlan] = useState(null);
             const [xhmLoading, setXhmLoading] = useState(false);
@@ -12711,19 +12713,31 @@
             // record of a run that is over and nothing else — no VM, no disk, on either
             // side. An operator who has read a failure should be able to put it away;
             // leaving it there means scrolling past it to reach the next one's log.
+            // Only ever called from the confirmation below: removing is asked first, with
+            // every entry it would take named, never done on the first click.
             const dismissXhmMigrations = async (mid) => {
                 const url = mid ? `${API_URL}/xhm/migrations/${mid}` : `${API_URL}/xhm/migrations?finished=1`;
+                setXhmDismissing(true);
                 try {
                     const resp = await authFetch(url, { method: 'DELETE' });
+                    const data = await resp?.json().catch(() => ({}));
                     if (resp?.ok) {
                         if (mid && xhmSelectedMigration === mid) setXhmSelectedMigration(null);
                         if (!mid) setXhmSelectedMigration(null);
+                        // A record that refused to go stays on the list; saying nothing would
+                        // make the click look like it did not register.
+                        (data.kept || []).forEach(k => addToast('Error', `${k.id}: ${k.reason}`, 'error'));
+                        setXhmDismissAsk(null);
                         fetchXhmMigrations();
                     } else {
-                        const err = await resp?.json().catch(() => ({}));
-                        addToast('Error', err.error || 'Could not dismiss the migration', 'error');
+                        addToast('Error', data.error || 'Could not dismiss the migration', 'error');
                     }
                 } catch(e) { addToast('Error', e.message, 'error'); }
+                finally { setXhmDismissing(false); }
+            };
+            const xhmClusterLabel = (id) => {
+                const c = clusters.find(x => x.id === id);
+                return c ? `${c.name} (${id})` : (id || '—');
             };
 
             const startXhmMigration = async () => {
@@ -23699,7 +23713,7 @@
                                                     </h3>
                                                     <div className="flex items-center gap-3">
                                                         {xhmMigrations.some(m => m.status !== 'running') && (
-                                                            <button onClick={() => dismissXhmMigrations()}
+                                                            <button onClick={() => setXhmDismissAsk({ rows: xhmMigrations.filter(m => m.status !== 'running'), all: true })}
                                                                     title={t('xhmDismissFinishedHint') || 'Remove every finished migration from this list. Running ones stay.'}
                                                                     className="text-xs text-gray-500 hover:text-white">
                                                                 {t('xhmDismissFinished') || 'Clear finished'}
@@ -23742,7 +23756,7 @@
                                                                         <div className="flex items-center gap-2">
                                                                             <span className={`px-2 py-0.5 rounded text-xs font-semibold ${m.status === 'completed' ? 'bg-green-500/20 text-green-400' : m.status === 'failed' ? 'bg-red-500/20 text-red-400' : 'bg-purple-500/20 text-purple-400'}`}>{m.status}</span>
                                                                             {m.status !== 'running' && (
-                                                                                <button onClick={e => { e.stopPropagation(); dismissXhmMigrations(m.id); }}
+                                                                                <button onClick={e => { e.stopPropagation(); setXhmDismissAsk({ rows: [m], all: false }); }}
                                                                                         title={t('xhmDismissOneHint') || 'Remove this entry from the list. It removes nothing on either side.'}
                                                                                         aria-label="Dismiss"
                                                                                         className="text-gray-600 hover:text-white text-sm leading-none px-1">×</button>
@@ -24236,6 +24250,57 @@
                             onClose={() => setConfigNode(null)}
                             addToast={addToast}
                         />
+                    )}
+
+                    {/* Taking migrations off the list is a deletion, so it is asked first and
+                        names each entry with where it ran from and to. */}
+                    {xhmDismissAsk && (
+                        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4"
+                             onClick={() => !xhmDismissing && setXhmDismissAsk(null)}>
+                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl max-w-xl w-full p-5"
+                                 onClick={e => e.stopPropagation()}>
+                                <h3 className="text-white font-semibold mb-2">
+                                    {xhmDismissAsk.all
+                                        ? `${t('xhmDismissAskAll') || 'Remove finished migrations from the list'} (${xhmDismissAsk.rows.length})`
+                                        : (t('xhmDismissAskOne') || 'Remove this migration from the list')}
+                                </h3>
+                                <p className="text-sm text-gray-400 mb-3">
+                                    {t('xhmDismissAskExplain')
+                                     || 'Only the entry in this list is removed. Nothing is deleted on the source or the target — no VM, no disk, no volume. Where the migration is also stored durably, that record and its log are deleted as well; this cannot be undone.'}
+                                </p>
+                                <div className="max-h-72 overflow-y-auto space-y-2 mb-3">
+                                    {xhmDismissAsk.rows.map(m => (
+                                        <div key={m.id} className="p-3 rounded-lg bg-proxmox-dark border border-proxmox-border text-sm">
+                                            <div>
+                                                <span className="text-white">{m.vm_name || m.source_vmid}</span>
+                                                <span className="text-gray-500"> · {m.id} · {m.status}</span>
+                                            </div>
+                                            <div className="mt-1 text-xs text-gray-400 space-y-0.5">
+                                                <div>{t('xhmDismissSource') || 'Source'}: {xhmClusterLabel(m.source_cluster)} · VM {m.source_vmid}</div>
+                                                <div>
+                                                    {t('xhmDismissTarget') || 'Target'}: {xhmClusterLabel(m.target_cluster)}
+                                                    {m.target_node && <> · Node {m.target_node}</>}
+                                                    {m.target_storage && <> · Storage {m.target_storage}</>}
+                                                    {m.target_vmid && <> · VMID {m.target_vmid}</>}
+                                                </div>
+                                                {m.started_at && <div>{t('xhmDismissStarted') || 'Started'}: {fmtDate(m.started_at)}</div>}
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                                <div className="flex justify-end gap-2">
+                                    <button onClick={() => setXhmDismissAsk(null)} disabled={xhmDismissing}
+                                            className="px-4 py-2 rounded-lg bg-proxmox-dark border border-proxmox-border text-gray-300 text-sm disabled:opacity-50">
+                                        {t('cancel') || 'Cancel'}
+                                    </button>
+                                    <button onClick={() => dismissXhmMigrations(xhmDismissAsk.all ? null : xhmDismissAsk.rows[0].id)}
+                                            disabled={xhmDismissing}
+                                            className="px-4 py-2 rounded-lg bg-red-500 text-white text-sm font-medium disabled:opacity-50">
+                                        {xhmDismissing ? (t('loading') || 'Working…') : (t('xhmDismissConfirm') || 'Remove from list')}
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
                     )}
 
                     {/* Remove Node Modal - NS Feb 2026 */}
