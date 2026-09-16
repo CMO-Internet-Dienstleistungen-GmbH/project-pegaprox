@@ -8308,7 +8308,6 @@
             });
             // Fork patch #15 — what the target node has, and what it could fetch.
             const [hvIsos, setHvIsos] = useState(null);
-            const [hvIsoBusy, setHvIsoBusy] = useState(false);
             // Fork patch #15 — the Hyper-V preflight re-asked with the target choices in
             // hand. hvRefreshPreflight says why the plan's own verdict is not enough.
             const [hvPreflight, setHvPreflight] = useState(null);
@@ -12759,12 +12758,6 @@
                         body.remove_source = false;
                     }
                     if (xhmPlan?.source?.name) body.vm_name = xhmPlan.source.name;
-                    // A "fetch:" entry is a download that has not happened yet, not a
-                    // path. Sending it would have the injection look for a file called
-                    // "fetch:0.1.189" on the node.
-                    if (String(body.virtio_iso_path || '').startsWith('fetch:')) {
-                        body.virtio_iso_path = '';
-                    }
                     const resp = await authFetch(`${API_URL}/xhm/migrate`, {
                         method: 'POST', headers: {'Content-Type':'application/json'},
                         body: JSON.stringify(body)
@@ -12895,7 +12888,7 @@
                     } catch(e) { /* the field says the list could not be read */ }
                 })();
                 return () => { dropped = true; };
-            }, [xhmPlan, xhmForm.target_cluster, xhmForm.target_node, hvIsoBusy]);
+            }, [xhmPlan, xhmForm.target_cluster, xhmForm.target_node]);
 
             // Fork patch #15 — preselect the ISO that fits the guest on the disk: the
             // legacy release for Server 2012 R2, the newest present for anything else,
@@ -12914,30 +12907,22 @@
                 if (fetchable) setXhmForm(prev => ({...prev, virtio_iso_path: `fetch:${fetchable}`}));
             }, [xhmPlan, hvIsos]);
 
-            // Fork patch #15 — have the node fetch a release it does not have. Proxmox
-            // downloads it itself, so a 700 MB ISO never travels through this browser.
-            const hvDownloadIso = async (release, storage) => {
-                setHvIsoBusy(true);
-                try {
-                    const resp = await authFetch(`${API_URL}/hyperv/target-virtio-isos/download`, {
-                        method: 'POST', headers: {'Content-Type':'application/json'},
-                        body: JSON.stringify({ cluster: xhmForm.target_cluster,
-                                               node: xhmForm.target_node,
-                                               storage, release })});
-                    const data = await resp?.json().catch(() => ({}));
-                    if (resp?.ok) {
-                        addToast(t('hvIsoDownloading') || 'Downloading on the node',
-                                 `virtio-win ${release} → ${data.storage || storage}. ${t('hvIsoDownloadingHint') || 'It appears in this list when the node has finished.'}`,
-                                 'success');
-                        // Clear the placeholder so the refreshed list can preselect the
-                        // file itself once the node has it.
-                        setXhmForm(prev => ({...prev, virtio_iso_path: ''}));
-                    } else {
-                        addToast('Error', data.error || 'Could not start the download', 'error');
-                    }
-                } catch(e) { addToast('Error', e.message, 'error'); }
-                finally { setHvIsoBusy(false); }
-            };
+            // Fork patch #15 — preselect the ISO that fits the guest on the disk: the
+            // legacy release for Server 2012 R2, the newest present for anything else,
+            // and the download entry when the node has nothing suitable. Only while the
+            // field is untouched, so a deliberate choice is never overwritten.
+            useEffect(() => {
+                if (!hvIsHyperVPlan(xhmPlan) || !hvIsos || xhmForm.virtio_iso_path) return;
+                const build = hvGuestBuild(xhmPlan);
+                if (!build) return;
+                const fitting = hvIsoForBuild(build, hvIsos.isos);
+                if (fitting) {
+                    setXhmForm(prev => ({...prev, virtio_iso_path: fitting.volid}));
+                    return;
+                }
+                const fetchable = hvReleaseToFetch(build, hvIsos.available_releases);
+                if (fetchable) setXhmForm(prev => ({...prev, virtio_iso_path: `fetch:${fetchable}`}));
+            }, [xhmPlan, hvIsos]);
 
             // poll XHM migrations when sidebar is open
             useEffect(() => {
@@ -23407,7 +23392,11 @@
                                                                         <input type="text" value={xhmForm.target_name}
                                                                                onChange={e => setXhmForm({...xhmForm, target_name: e.target.value})}
                                                                                className={`${field} ${nameOk ? '' : 'border-red-500'}`} />
-                                                                        {d.source_name && d.source_name !== d.name && (
+                                                                        {/* Only while the suggestion is untouched. Once somebody has
+                                                                            typed their own name, being told what Hyper-V called it is
+                                                                            a note about a decision already made. */}
+                                                                        {d.source_name && d.source_name !== d.name
+                                                                         && xhmForm.target_name === d.name && (
                                                                             <div className="text-[10px] text-amber-400 mt-0.5">
                                                                                 {(t('hvNameAdjusted') || 'Hyper-V calls it {src}; Proxmox validates a VM name as a DNS name.').replace('{src}', d.source_name)}
                                                                             </div>
@@ -23659,10 +23648,11 @@
                                                                         {!xhmForm.target_node && (
                                                                             <div className="text-[10px] text-gray-600">{t('hvVirtioIsoNeedsNode') || 'Choose a target node to see the ISOs it has.'}</div>
                                                                         )}
-                                                                        {/* Where a download would land. "auto" is the storage that
-                                                                            already holds the most ISOs — where an operator keeps
-                                                                            them — and it stays a field because a node with two
-                                                                            ISO storages is a choice somebody may want to make. */}
+                                                                        {/* Chosen a release the node does not have? Then the storage
+                                                                            is the only thing still open: the download runs as the
+                                                                            first step of the migration, before a byte of disk is
+                                                                            copied. No button, no list to wait for. "auto" is the
+                                                                            storage that already holds the most ISOs. */}
                                                                         {String(xhmForm.virtio_iso_path).startsWith('fetch:') && (
                                                                             <div className="flex items-center gap-2">
                                                                                 <span className="text-[10px] text-gray-500">{t('hvIsoStorage') || 'Storage'}</span>
@@ -23679,13 +23669,9 @@
                                                                                         </option>
                                                                                     ))}
                                                                                 </select>
-                                                                                <button onClick={() => hvDownloadIso(
-                                                                                            String(xhmForm.virtio_iso_path).slice(6),
-                                                                                            xhmForm.virtio_iso_storage || 'auto')}
-                                                                                        disabled={hvIsoBusy}
-                                                                                        className="text-[10px] px-2 py-0.5 rounded bg-purple-500/10 border border-purple-500/30 text-purple-400 hover:text-white disabled:opacity-50">
-                                                                                    {hvIsoBusy ? (t('loading') || 'Working…') : (t('hvIsoStartDownload') || 'Start download')}
-                                                                                </button>
+                                                                                <span className="text-[10px] text-gray-600">
+                                                                                    {t('hvIsoDownloadsFirst') || 'The node downloads it as the first step of the migration.'}
+                                                                                </span>
                                                                             </div>
                                                                         )}
                                                                     </div>);

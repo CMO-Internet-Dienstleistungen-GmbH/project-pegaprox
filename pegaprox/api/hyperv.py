@@ -416,6 +416,40 @@ def list_hyperv_isos(cluster_id):
         return _error_response(exc)
 
 
+def _iso_under_test(chosen):
+    """The ISO the release rule is checked against.
+
+    A `fetch:<release>` value is a download the migration has not run yet. It is still an
+    answer to "which release", so it is translated into the file that download would
+    produce rather than being read as "nothing chosen".
+    """
+    from pegaprox.core import hyperv_drivers
+
+    text = (chosen or '').strip()
+    if not text.startswith('fetch:'):
+        return text
+    entry = hyperv_drivers.CATALOGUE.get(text[len('fetch:'):])
+    return entry['filename'] if entry else ''
+
+
+def _guest_images_for(mgr, vmid):
+    """What the disks say about the guest. Cached on the host; never raises here."""
+    try:
+        return mgr.guest_image_facts(vmid)
+    except Exception:
+        logger.debug('Could not read the guest image facts of %s', vmid, exc_info=True)
+        return []
+
+
+def _disk_inspection_for(mgr, vmid):
+    """What is inside the disks. Cached on the host; never raises here."""
+    try:
+        return mgr.inspect_disks(vmid)
+    except Exception:
+        logger.debug('Could not inspect the disks of %s', vmid, exc_info=True)
+        return {}
+
+
 @bp.route('/api/hyperv/target-virtio-isos', methods=['GET'])
 @require_auth(perms=['hyperv.vm.media'])
 def list_target_virtio_isos():
@@ -443,6 +477,12 @@ def list_target_virtio_isos():
     from pegaprox.core import hyperv_drivers
     from pegaprox.core.hyperv_postimport import iso_storages, node_isos
 
+    # Ask the publisher what it currently calls stable — in the background, so this page
+    # answers from what is known and is right one open later. The built-in catalogue is
+    # the fallback and stays in the list either way: 0.1.189 is pinned for Server 2012 R2
+    # and will never be "current".
+    hyperv_drivers.refresh_in_background()
+
     try:
         isos = node_isos(target, node)
         storages = iso_storages(target, node)
@@ -460,7 +500,7 @@ def list_target_virtio_isos():
         # not there yet as an entry of its own rather than as a dead end.
         'available_releases': [
             {'release': release, 'note': entry['note'], 'filename': entry['filename']}
-            for release, entry in sorted(hyperv_drivers.CATALOGUE.items())],
+            for release, entry in sorted(hyperv_drivers.offerable_releases().items())],
         'legacy_release': hyperv_drivers.LEGACY_RELEASE,
         'legacy_build': hyperv_drivers.LEGACY_BUILD,
     })
@@ -745,6 +785,16 @@ def hyperv_vm_preflight(cluster_id, vmid):
         # DNS name and refuses an underscore -- from the create call, which happens after
         # the disks have been converted.
         'target_name': (data.get('target_name') or '').strip(),
+        # Which driver ISO was chosen, so the release rule is answered here instead of on
+        # the node — where it would only be answered after the disks were converted.
+        'virtio_iso': _iso_under_test(data.get('virtio_iso')),
+        # What the guest's own disks say about it, and what is inside them. The plan reads
+        # these once; here they come from the host's cache, because this route runs again
+        # on every change in the wizard and the reads cost seconds per disk on a
+        # customer's machine. Without them every refresh reported "the disks of this VM
+        # could not be examined" while the plan beside it showed the version.
+        'guest_images': _guest_images_for(mgr, vmid),
+        'disk_inspection': _disk_inspection_for(mgr, vmid),
     }
 
     report = hyperv_preflight.run_preflight(vm, target, options)
