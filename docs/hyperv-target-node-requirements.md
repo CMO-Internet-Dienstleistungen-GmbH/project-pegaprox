@@ -90,30 +90,53 @@ is RBD.
 Injection is opt-in. A migration without it produces a VM that needs its
 controller and network card set to hardware Windows already has drivers for.
 
-**Which release is used is chosen in the wizard, per migration.** The node
-usually holds more than one ISO, and which one a guest may be given is not a
-matter of taste:
+**Which release is used is chosen in the wizard, per migration**, and the choice
+runs in both directions:
 
 | Guest | Release | Why |
 |---|---|---|
-| Windows Server 2012 R2, Windows 8.1 (build 9600) | **0.1.189, nothing newer** | From 0.1.221 the drivers are self-signed, and a self-signed boot-start driver cannot load on x64 at all. 0.1.189's `2k12R2/amd64` drivers chain to Microsoft Code Verification Root. |
-| Everything still in support | current stable | — |
+| Windows Server 2012 R2 / Windows 8.1 (build 9600) | **0.1.189, and nothing else** | From 0.1.221 the drivers are self-signed, and a self-signed boot-start driver cannot load on x64 at all. Measured on the ISO: `viostor/2k12R2/amd64/viostor.sys` carries `Microsoft Code Verification Root` in its certificate table. |
+| Anything newer | **anything except 0.1.189** | 0.1.189 contains `xp 2k3 2k8 2k8R2 w7 w8 2k12 w8.1 2k12R2 2k16 2k19 w10` — and no `2k22`, `w11` or `2k25`. A current guest given it ends up with no storage driver registered at all. |
 
-The rule is enforced, not documented at: the injection reads the guest's build
-number out of its registry before it copies anything, and refuses to write
-drivers from a release that build may not have (`core/hyperv_drivers.py`). The
-VM then stays on the hardware it was imported on and boots; nothing on the
-volume is changed. The failure this prevents is silent — Windows does not report
-a rejected signature, it simply does not load the driver, and the machine stops
-at `0xc0000428` naming `viostor.sys`.
+Server and client variants of the same build are byte-identical in 0.1.189
+(checked across viostor, vioscsi, NetKVM, Balloon and vioserial), so Windows 8.1
+and Server 2012 R2 need not be told apart — which is fortunate, because they
+share build 9600.
+
+**The guest's version is read before anything is copied.** `Get-WindowsImage`
+reads a stopped VM's VHDX in place, on the Hyper-V host, without mounting it —
+about one to three seconds per disk. The build is the third component of
+`Version`: `10.0.20348` is build 20348. Major and minor say nothing, because
+Windows 10, Windows 11 and every Server from 2016 to 2025 all report `10.0`.
+
+The integration services would report the same facts over KVP, but only while
+the VM runs — measured: complete while running, empty three seconds after the
+guest finished shutting down. A migration requires a stopped VM, so that source
+is not available when it is needed.
+
+The rule is enforced twice: in the preflight, where it is still free, and again
+during the injection on the node, which refuses before it writes a single file.
+The VM then stays on the hardware it was imported on and boots. The failure this
+prevents is silent — Windows does not report a rejected signature, it simply
+does not load the driver, and the machine stops at `0xc0000428` naming
+`viostor.sys`.
+
+**A chosen ISO is the only one used.** The injection no longer falls back to
+whatever else is lying on the node when the chosen file is missing; it says so
+and stops.
 
 ### Getting the ISO onto the node
 
-The node fetches it itself. In the wizard, a release the node does not have is
-offered with a **Fetch** button next to it; PegaProx asks Proxmox' own
-`download-url` API to pull it onto an ISO storage. The file never passes through
-PegaProx or the browser, which is what makes it workable for a ~700 MB ISO on a
-cluster that is nowhere near the operator.
+The node fetches it itself. The wizard lists every ISO the node has, followed by
+one entry per release it could download — `Download virtio-win-0.1.189.iso…`.
+Choosing such an entry offers a storage and a button; PegaProx then asks
+Proxmox' own `download-url` API to pull the file onto that storage. It never
+passes through PegaProx or the browser, which is what makes it workable for a
+~500 MB ISO on a cluster that is nowhere near the operator.
+
+The storage defaults to **auto**, which means the one that already holds the
+most ISOs — where an operator keeps them. It stays a field, because a node with
+two ISO storages is a choice somebody may want to make.
 
 Requirements for that to work:
 
@@ -125,11 +148,39 @@ Requirements for that to work:
   directories carry none at all, checked 2026-09-16), so TLS is the only thing
   standing between the node and whatever answers that name.
 - A node without internet access is given the file by hand, as before. Any ISO
-  storage works and the file name has to contain `virtio-win` or `virtio_win` —
-  **with the release in it**, because a file called `virtio-win.iso` states
-  nothing about which release it is, and that is exactly the question a 2012 R2
-  guest turns on. Such a file is offered in the list marked as unidentified and
-  is refused for a guest that has a release requirement.
+  storage works, and the file name should carry the release — a file called
+  `virtio-win.iso` states nothing about which release it is, and that is exactly
+  the question a 2012 R2 guest turns on. Such a file is listed as
+  "release not in the file name", is never preselected, and is refused for a
+  guest that has a release requirement.
+
+## What the preflight reads from the source before anything is copied
+
+Every check here exists because the condition it finds turns into a migration
+that fails **after** the disks have been converted. All of them run on the
+Hyper-V host, read-only, against a stopped VM.
+
+| Check | How | What it prevents |
+|---|---|---|
+| Guest's Windows version | `Get-WindowsImage` on the VHDX, no mount, 1–3 s per disk | The wrong driver release, which Windows does not report — it just does not load the driver |
+| Which disk carries Windows | the same call, per disk | A boot entry pointing at a data disk |
+| Registry readable | `EditionId` present while `Version` is | The driver injection failing on a hive it cannot open, after the copy |
+| Disk attached elsewhere | `Get-VHD`'s `Attached` | Copying a disk something else is writing to |
+| **Hibernation / Fast Startup** | read-only `Mount-VHD`, then `hiberfil.sys` | A saved session that cannot be resumed on different hardware, discarded without anybody being told |
+| File system clean | `fsutil dirty query`, **exit code** not text | An unclean volume carried onto the target, and hivex refusing its transaction logs |
+| Disks released again | `Attached` after the inspection | A source VM that can no longer start — which would also end the rollback |
+
+The inspection mounts each disk read-only and unmounts it again, about eight
+seconds for a VM with one disk and three volumes. No drive letters are assigned:
+the volumes are reached through their own GUID paths (`\\?\Volume{…}`), which
+reads the same files and changes nothing on the host. The unmount runs in a
+`finally` on every path, and the result reports `Attached` afterwards — a disk
+left attached is a VM that cannot start, and the preflight blocks on it rather
+than letting it pass unnoticed.
+
+`fsutil`'s answer is read from its exit code because the sentence is localised:
+a German host says "ist NICHT fehlerhaft", and a comparison against English text
+would read every one of them as clean.
 
 ## Network
 
