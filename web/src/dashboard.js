@@ -11142,13 +11142,35 @@
             useEffect(() => { vmwareSelectedVmRef.current = vmwareSelectedVm; }, [vmwareSelectedVm]);
             useEffect(() => { vmwareSelectedMigrationRef.current = vmwareSelectedMigration; }, [vmwareSelectedMigration]);
 
-            const addToast = (message, type = 'success') => {
-                const id = Date.now() + Math.random();
+            // Two call shapes are in use across this app and only one of them worked.
+            //
+            //   addToast('Saved', 'success')                      2 arguments
+            //   addToast('Error', err.error, 'error')             3 arguments
+            //
+            // The second is used at forty call sites, and every one of them lost its
+            // message: `err.error` arrived in the `type` slot and was dropped, leaving a
+            // toast that said "Error" and nothing else. Reported from a migration that
+            // would not start — the server's reason was there, in the response, and the
+            // operator could not see it.
+            //
+            // Both shapes are read now rather than one of them being rewritten at forty
+            // places, because the next call site will be written in whichever style its
+            // neighbours use.
+            const addToast = (first, second, third) => {
+                const hasTitle = third !== undefined;
+                const title = hasTitle ? first : '';
+                const message = hasTitle ? second : first;
+                const type = (hasTitle ? third : second) || 'success';
+                const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
                 // the same message twice at once says nothing new (authFetch and its caller
                 // both report a standby refusal, #625). The newer one replaces the older and
                 // gets its own full lifetime, so a retry that fails the same way still shows.
-                setToasts(prev => [...prev.filter(x => x.message !== message || x.type !== type), { id, message, type }]);
-                // auto remove after 5 seconds
+                setToasts(prev => [...prev.filter(x => x.title !== title || x.message !== message || x.type !== type),
+                    { id, title, message, type }]);
+                // An error stays until it is dismissed. It is the one kind somebody has to
+                // read and usually act on, and five seconds is not enough for a sentence
+                // that names a host, a volume and a reason.
+                if (type === 'error') return;
                 setTimeout(() => {
                     setToasts(prev => prev.filter(t => t.id !== id));
                 }, 5000);
@@ -16775,7 +16797,7 @@
                     React.createElement(BulkMigrateRuns, { key: 'bulk-runs', authFetch, openId: bulkRunOpen, onOpen: setBulkRunOpen,
                         tick: bulkRunsTick, canAct: !haReadOnly, onSettled: bulkRunSettled }),
                     toasts.map(toast =>
-                        React.createElement(Toast, { key: toast.id, message: toast.message, type: toast.type, onClose: () => removeToast(toast.id) })
+                        React.createElement(Toast, { key: toast.id, title: toast.title, message: toast.message, type: toast.type, onClose: () => removeToast(toast.id) })
                     )
                 ),
                 document.body
