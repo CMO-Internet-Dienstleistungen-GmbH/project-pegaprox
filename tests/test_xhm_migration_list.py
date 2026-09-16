@@ -127,16 +127,79 @@ class TestDismissingReachesADurableRecord:
 
         _install_fake_record_keeper(monkeypatch,
                                    lambda mid: {'forgotten': False,
-                                                'error': 'still has 1 resource(s)'})
+                                                'error': 'still has 1 resource(s)'},
+                                   recorded=[{'id': 'mig1', 'status': 'failed'}])
 
         assert list(xhm._forget_recorded('mig1')) == [('mig1', 'still has 1 resource(s)')]
 
     def test_a_record_with_nothing_left_goes(self, monkeypatch):
         from pegaprox.api import xhm
 
-        _install_fake_record_keeper(monkeypatch, lambda mid: {'forgotten': True})
+        _install_fake_record_keeper(monkeypatch, lambda mid: {'forgotten': True},
+                                   recorded=[{'id': 'mig1', 'status': 'failed'}])
 
         assert list(xhm._forget_recorded('mig1')) == [('mig1', None)]
+
+    def test_a_record_the_caller_may_not_see_is_not_touched(self, monkeypatch):
+        from pegaprox.api import xhm
+
+        asked = []
+        _install_fake_record_keeper(
+            monkeypatch, lambda mid: (asked.append(mid), {'forgotten': True})[1],
+            recorded=[{'id': 'mine', 'status': 'failed', 'source_cluster': 'mine'},
+                      {'id': 'theirs', 'status': 'failed', 'source_cluster': 'theirs'}],
+            may_see=lambda row: row.get('source_cluster') == 'mine')
+
+        assert list(xhm._forget_recorded(None)) == [('mine', None)]
+        assert list(xhm._forget_recorded('theirs')) == []
+        assert asked == ['mine']
+
+
+class TestDismissingARowThatOnlyTheRecordKnows:
+    """After a restart the list shows recorded migrations that are not in this process.
+    The X on such a row answered "Migration not found", because the route looked only at
+    the in-memory registry before it ever asked the record."""
+
+    def test_it_is_removed(self, api, seed, registry, monkeypatch):
+        admin = seed.user('root', role='admin')
+        forgotten = []
+        _install_fake_record_keeper(
+            monkeypatch, lambda mid: (forgotten.append(mid), {'forgotten': True})[1],
+            recorded=[{'id': 'fromdb', 'status': 'failed'}])
+
+        resp = api.as_user(admin).delete('/api/xhm/migrations/fromdb')
+
+        assert resp.status_code == 200, resp.get_data(as_text=True)
+        assert forgotten == ['fromdb']
+
+    def test_a_refusal_is_an_error_with_the_reason(self, api, seed, registry, monkeypatch):
+        admin = seed.user('root', role='admin')
+        _install_fake_record_keeper(
+            monkeypatch, lambda mid: {'forgotten': False, 'error': 'still has 2 resource(s)'},
+            recorded=[{'id': 'fromdb', 'status': 'failed'}])
+
+        resp = api.as_user(admin).delete('/api/xhm/migrations/fromdb')
+
+        assert resp.status_code == 409
+        assert resp.get_json()['error'] == 'still has 2 resource(s)'
+
+    def test_an_id_neither_side_knows_is_still_a_404(self, api, seed, registry, monkeypatch):
+        admin = seed.user('root', role='admin')
+        _install_fake_record_keeper(monkeypatch, lambda mid: {'forgotten': True},
+                                   recorded=[{'id': 'other', 'status': 'failed'}])
+
+        assert api.as_user(admin).delete('/api/xhm/migrations/nope').status_code == 404
+
+
+def test_removing_from_the_list_is_asked_before_it_happens():
+    """Read out of the source: the list lives in a component this suite cannot mount.
+    Both the X on a row and "clear finished" open a confirmation; neither deletes."""
+    with open(os.path.join(REPO, 'web', 'src', 'dashboard.js'), encoding='utf-8') as fh:
+        source = fh.read()
+
+    assert 'dismissXhmMigrations(m.id)' not in source
+    assert 'onClick={() => dismissXhmMigrations()}' not in source
+    assert source.count('setXhmDismissAsk(') >= 3
 
     def test_dismissing_everything_asks_about_each_finished_record(self, monkeypatch):
         from pegaprox.api import xhm
@@ -153,10 +216,12 @@ class TestDismissingReachesADurableRecord:
         assert asked == ['mig1']
 
 
-def _install_fake_record_keeper(monkeypatch, forget, recorded=()):
+def _install_fake_record_keeper(monkeypatch, forget, recorded=(), may_see=lambda row: True):
     """Stand in for the fork's Hyper-V module, which this patch does not depend on."""
     import sys
     import types
+
+    monkeypatch.setattr(xhm_api, '_may_dismiss_record', may_see)
 
     module = types.ModuleType('pegaprox.core.hyperv_xhm')
     module.forget_recorded_migration = forget
