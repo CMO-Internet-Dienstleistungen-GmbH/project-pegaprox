@@ -181,8 +181,16 @@ def convert_command(source_file: str, target_path: str) -> str:
     mounted with `cache=none` — which is why that option is not negotiable in
     MOUNT_OPTIONS. Measured together against a read-only Samba export of a dynamic VHDX:
     the conversion completes and the result matches the source's checksum byte for byte.
+
+    `-n` says the target is not to be created, and on some storages it is the difference
+    between a migration and a loop of identical failures. The volume already exists by
+    this point — `pvesm alloc` made it, which is what registers it with Proxmox and gives
+    it the right size. On a file or a block device qemu-img would simply write into what
+    is there; on Ceph the target is an `rbd:` URL, qemu-img tries to create the image
+    behind it, and RBD answers `error rbd create: File exists`. Every attempt fails the
+    same way, because nothing about it is transient.
     """
-    return (f'qemu-img convert -p -f {SOURCE_FORMAT} -O raw -t none -T none '
+    return (f'qemu-img convert -n -p -f {SOURCE_FORMAT} -O raw -t none -T none '
             f'{shlex.quote(source_file)} {shlex.quote(target_path)}')
 
 
