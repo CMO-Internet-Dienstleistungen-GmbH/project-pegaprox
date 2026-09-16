@@ -51,12 +51,24 @@ the machine that ran it. Nothing was typed by hand and nothing was a copy of the
 | Server 2016 | 14393 | `INJECTION_OK` | **login screen** (`LogonUI.exe`) |
 | Server 2022 | 20348 | `INJECTION_OK` | **login screen** (`LogonUI.exe`) |
 | Server 2025 | 26100 | `INJECTION_OK` | **login screen** (`LogonUI.exe`) |
-| Server 2012 R2 | 9600 | refused: `BOOT_SIGNATURE_MISSING viostor`, `vioscsi` | left on SATA, as designed |
+| Server 2012 R2 | 9600 | refused: `BOOT_SIGNATURE_MISSING viostor`, `vioscsi` | left on SATA — but that row was run with the *current* virtio-win, which is the wrong release for this version |
 
-2012 R2 is the documented case, not a regression: virtio-win stopped having its drivers
-signed through Microsoft, the product checks that before registering anything, and a guest
-in that situation keeps the controller it arrived on rather than one it cannot boot from.
-See *Server 2012 R2 is a different case* below.
+**The 2012 R2 cell above is not this version's result.** It is what the product does when
+it is handed a driver release that has no usable 2012 R2 variant: it refuses to register
+the driver and leaves the guest on a controller that boots. Given the release this version
+needs, the same image reaches VirtIO SCSI like every other row — see the next section.
+
+### Server 2012 R2 with the release it needs, 2026-09-16
+
+| Windows version | Build | Driver ISO | Injection | Screen |
+|---|---|---|---|---|
+| Server 2012 R2 | 9600 | virtio-win **0.1.189** | `INJECTION_OK`; `viostor`, `vioscsi`, `NetKVM`, `Balloon`, `pvpanic`, `vioserial` and `viorng` copied from `2k12R2/amd64` | **login screen after 1 minute**, still there after 7 |
+
+Same command as every other row, same pristine snapshot, one argument different:
+
+```
+run.sh matrix --only 2012r2 --driver-iso <path to virtio-win-0.1.189.iso>
+```
 
 ### The earlier hand-run rounds
 
@@ -91,22 +103,26 @@ Microsoft. Read off the files themselves:
 
 | virtio-win release | signer of `viostor/2k12R2` |
 |---|---|
+| 0.1.189 | chains to `Microsoft Code Verification Root` |
 | 0.1.190 | `Symantec Class 3 SHA256 Code Signing CA - G2` |
 | 0.1.208 | `Symantec Class 3 SHA256 Code Signing CA - G2` |
 | 0.1.221 and newer | `virtio-win / Red Hat Inc.` — self-signed |
 
-**0.1.208 is the last release whose 2012 R2 drivers can be boot drivers.** Server 2016 and
-newer are unaffected; theirs are signed by `Microsoft Windows Third Party Component CA
-2014`.
+0.1.208 is the last release whose 2012 R2 drivers carry a cross-certificate at all. Server
+2016 and newer are unaffected; theirs are signed by `Microsoft Windows Third Party
+Component CA 2014`.
 
-The product checks this before it registers anything, so a guest in this situation is left
-on the controller it arrived on — which boots — rather than on one it cannot start from.
-ADR 3 has the decision. To put such a guest on VirtIO SCSI, point `virtio_iso_path` at
-virtio-win 0.1.208 or older.
+**Use virtio-win 0.1.189 for Server 2012 R2.** It is the release this version is run with,
+and the one the row above was measured against: the 2012 R2 drivers in it are dated
+2020-08-10 and their PE certificate table chains to `Microsoft Code Verification Root` —
+one of the three signers the injection accepts, read from the file rather than assumed.
+Later releases that still carry a cross-certificate are not an improvement on it for this
+version, and picking the newest one that happens to pass is how a guest ends up on a driver
+nobody has booted.
 
-With virtio-win 0.1.208 the injection runs, the signature error is gone, and the guest
-reaches its login screen on VirtIO SCSI a minute after starting — the same result as the
-other three.
+The product checks the signature before it registers anything, so a guest handed an
+unusable release is left on the controller it arrived on — which boots — rather than on one
+it cannot start from. ADR 3 has the decision.
 
 Getting there took a second image. The first Server 2012 R2 image built for this matrix
 did not complete a boot even untouched: sixteen minutes on a spinner from its own

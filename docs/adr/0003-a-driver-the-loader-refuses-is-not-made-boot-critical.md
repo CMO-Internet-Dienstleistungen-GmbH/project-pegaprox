@@ -23,13 +23,16 @@ out-of-support Windows versions signed through Microsoft. Read off the files wit
 
 | virtio-win release | signer of `viostor/2k12R2` |
 |---|---|
+| 0.1.189 | chains to `Microsoft Code Verification Root` |
 | 0.1.190 | `Symantec Class 3 SHA256 Code Signing CA - G2` |
 | 0.1.208 | `Symantec Class 3 SHA256 Code Signing CA - G2` |
 | 0.1.221 | `virtio-win / Red Hat Inc.` (self-signed) |
 | 0.1.240 and newer | `virtio-win / Red Hat Inc.` (self-signed) |
 
 `0.1.208` is the last release whose 2012 R2 drivers carry a certificate chaining to
-`Microsoft Code Verification Root`. The variants for Server 2016 and newer are unaffected;
+`Microsoft Code Verification Root` at all. The release to use for Server 2012 R2 is
+`0.1.189`: that is the one this product is run with for that version and the one its row
+in the matrix was measured against. The variants for Server 2016 and newer are unaffected;
 they are signed by `Microsoft Windows Third Party Component CA 2014`.
 
 A self-signed driver cannot be a boot driver on 64-bit Windows. Registering it as one
@@ -58,9 +61,10 @@ Hyper-V migration moves the VM back to its compatible controller so that it boot
 - No migration can produce a guest that stops at `0xc0000428` any more. The worst case is
   a guest on SATA with the drivers staged inside it, which is a machine that runs.
 - Windows Server 2012 R2 reaches VirtIO SCSI when the operator points `virtio_iso_path` at
-  virtio-win 0.1.208 or older. That is a supported configuration, not a workaround: the
-  field exists for exactly this. Measured: with that ISO the guest is at its login screen
-  a minute after starting, on `virtio-scsi-single`, with no manual step.
+  virtio-win 0.1.189. That is a supported configuration, not a workaround: the field exists
+  for exactly this. Measured 2026-09-16 against a pristine 2012 R2 image: the injection
+  copies all seven `2k12R2/amd64` drivers and reports `INJECTION_OK`, and the guest is at
+  its login screen a minute after starting, on `virtio-scsi-single`, with no manual step.
 - The three accepted signer names are a list that could go stale if Microsoft introduces a
   new kernel-mode signing chain. It fails closed — an unrecognised chain means the guest
   is left on hardware that boots — and the log names the file, so the cause is visible.
