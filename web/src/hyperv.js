@@ -353,6 +353,13 @@
                             // the migration would actually build rather than for the
                             // source's own values.
                             vlan_map: form.vlan_map || {},
+                            // The name the VM would be created under. Without it the route
+                            // checks the source's name and keeps warning that it will be
+                            // renamed, however the operator has filled the field in.
+                            target_name: form.target_name || '',
+                            // And the driver ISO, because the release rule is checked here
+                            // — where it is still free — rather than only on the node.
+                            virtio_iso: form.virtio_iso_path || '',
                             // The hardware the migration would build. Without it the route
                             // falls back to its default and the driver check answers for a
                             // machine the wizard is not about to create, so the list can
