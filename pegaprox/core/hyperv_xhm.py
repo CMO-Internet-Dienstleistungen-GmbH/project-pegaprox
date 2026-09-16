@@ -494,6 +494,7 @@ def _run_hyperv_to_pve(task):
         # === TRANSFER ===
         task.set_phase('transfer')
         _update_migration_row(migration_id, phase='transfer')
+        _record_log(task, migration_id)
 
         disks = detail.get('disks') or []
         if not disks:
@@ -520,6 +521,7 @@ def _run_hyperv_to_pve(task):
         # === CREATING ===
         task.set_phase('creating')
         _update_migration_row(migration_id, phase='creating')
+        _record_log(task, migration_id)
 
         created = _create_target_vm(task, target, new_vmid, detail)
         if created is not True:
@@ -532,6 +534,7 @@ def _run_hyperv_to_pve(task):
         # === ATTACHING ===
         task.set_phase('attaching')
         _update_migration_row(migration_id, phase='attaching')
+        _record_log(task, migration_id)
         not_attached = _attach_disks(task, target, new_vmid, allocated, detail)
         if not_attached:
             # Everything created stays recorded and nothing is deleted: the volumes hold
@@ -1197,10 +1200,11 @@ def _as_migration_row(row: dict) -> dict:
         'started_at': row.get('started_at'),
         'completed_at': completed,
         'disk_progress': row.get('disk_progress') or {},
-        # Nothing kept these across the restart, and an empty timeline renders as no
-        # timeline rather than as a run that never got anywhere.
+        # The timeline lived in the process and is gone; an empty one renders as no
+        # timeline rather than as a run that never got anywhere. The log is kept, because
+        # it is the part somebody reads to find out what happened.
         'phase_times': {},
-        'log_lines': [],
+        'log_lines': row.get('log_lines') or [],
         #: What this row is: read back from the database rather than held by a worker.
         'recorded': True,
         #: And what it is still holding on the target, which is why it may still block.
@@ -1211,6 +1215,23 @@ def _as_migration_row(row: dict) -> dict:
 def _conn():
     from pegaprox.core.db import get_db
     return get_db().conn
+
+
+def _record_log(task, migration_id) -> None:
+    """Put the run's log into its record, so it outlives the process.
+
+    Called at each phase change and when the run ends. The log is the part somebody reads
+    to find out what happened — long after the migration, and after a restart that emptied
+    the in-memory list. Never raises: a run must not fail because its log could not be
+    filed.
+    """
+    if not migration_id:
+        return
+    try:
+        hyperv_db.save_log(_conn(), migration_id, getattr(task, 'log_lines', []))
+    except Exception:
+        logger.debug('[XHM:%s] could not record the log', getattr(task, 'id', '?'),
+                     exc_info=True)
 
 
 def _update_migration_row(migration_id, **fields):
@@ -2462,9 +2483,12 @@ def _finish(task, migration_id, new_vmid):
         task.log(f'Migration complete. The Hyper-V source is untouched; starting VMID '
                  f'{new_vmid} on {task.target_node}.')
         _start_target(task, new_vmid)
+        _record_log(task, migration_id)
         return
     task.log(f'Migration complete. The Hyper-V source is untouched; VMID {new_vmid} on '
              f'{task.target_node} has not been started.')
+    # Last line first: the log is filed once everything that belongs in it has been said.
+    _record_log(task, migration_id)
 
 
 def _fail(task, migration_id, reason):
@@ -2480,6 +2504,8 @@ def _fail(task, migration_id, reason):
     _report_leftovers(task, migration_id)
     _update_migration_row(migration_id, status=hyperv_db.STATUS_FAILED, error=str(reason)[:500],
                      completed_at=time.time())
+    # Last, so the log carries the failure and everything that was said about it.
+    _record_log(task, migration_id)
 
 
 def _report_leftovers(task, migration_id):
