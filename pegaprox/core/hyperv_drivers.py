@@ -129,9 +129,20 @@ def guard_snippet(iso: str | None) -> str:
         reason = refuse_iso(build, iso)
         if not reason:
             continue
-        escaped = reason.replace('\\', '\\\\').replace('"', '\\"')
-        branches.append(f'  {build}) echo "REFUSED_DRIVER_RELEASE={escaped}"; '
-                        f'exit {REFUSED_EXIT_CODE} ;;\n')
+        # Single quotes, because the reason quotes the ISO's own name back at the reader
+        # and that name is not ours: it is whatever a file on the node's storage is
+        # called. Inside double quotes a name containing `$(...)` or a backtick would be
+        # executed by the shell that prints this message — as root, on a Proxmox node,
+        # from a file anybody who may upload an ISO can put there. Inside single quotes
+        # nothing is expanded, and the one character that has to be handled is the quote
+        # itself.
+        branches.append(f"  {build}) echo 'REFUSED_DRIVER_RELEASE={_sq(reason)}'; "
+                        f"exit {REFUSED_EXIT_CODE} ;;\n")
     if not branches:
         return ''
     return ('case "$VER_BUILD" in\n' + ''.join(branches) + 'esac\n')
+
+
+def _sq(text: str) -> str:
+    """The body of a single-quoted shell string: end, escaped quote, reopen."""
+    return text.replace("'", "'\\''")
