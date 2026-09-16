@@ -222,6 +222,27 @@ def plan_hyperv_to_pve(source_cluster_id, source_vmid, target_cluster_id) -> dic
     disks = data.get('disks') or []
     total_bytes = sum(int(disk.get('capacity_bytes') or 0) for disk in disks)
 
+    # What the guest's own disks say about it, read on the Hyper-V host without starting
+    # the VM. This is the only moment the answer is available: the integration services
+    # report the version over KVP and those items exist only while the VM runs, and a
+    # migration needs it stopped. Costs a few seconds per disk, asked once here.
+    try:
+        images = source.guest_image_facts(source_vmid)
+    except Exception:
+        logger.warning('Could not read the guest image facts of %s', source_vmid,
+                       exc_info=True)
+        images = []
+
+    # And what is inside those disks: a hibernated guest, an unclean file system. Both
+    # are invisible from outside the disk and both turn into a migration that fails after
+    # the copy. Mounts read-only on the Hyper-V host and releases again, about eight
+    # seconds for a VM with one disk.
+    try:
+        inspection = source.inspect_disks(source_vmid)
+    except Exception:
+        logger.warning('Could not inspect the disks of %s', source_vmid, exc_info=True)
+        inspection = {}
+
     report = hyperv_preflight.run_preflight(
         detail,
         # Capacity is unknown until a storage is chosen, and the check says so. The plan is
@@ -233,6 +254,8 @@ def plan_hyperv_to_pve(source_cluster_id, source_vmid, target_cluster_id) -> dic
         # The plan is rendered before the operator has ticked anything, so it describes
         # the default: the compatible controller, and therefore no injection.
         {'network_map': {}, 'source_access_probed': False,
+         'guest_images': images,
+         'disk_inspection': inspection,
          # What a target node last measured about this host. Turns the file-access finding
          # from a question nobody can answer here into a dated fact -- or into a blocker,
          # when the measurement failed.
@@ -294,7 +317,12 @@ def plan_hyperv_to_pve(source_cluster_id, source_vmid, target_cluster_id) -> dic
         # Fork issue #15 — every value the import would write into the target, prefilled
         # from the source. The wizard renders one field per entry: what the migration is
         # about to do has to be visible before it runs, not reconstructed from the result.
-        'target_defaults': target_defaults(detail, source_vmid, _plan_next_vmid(target)),
+        'target_defaults': target_defaults(detail, source_vmid, _plan_next_vmid(target),
+                                           images),
+        # What the disks said. The wizard renders the guest's Windows version beside the
+        # driver ISO field, so the release it has to pick is on screen with the choice.
+        'guest_images': images,
+        'disk_inspection': inspection,
         'preflight': report.to_dict(),
         # Deliberately not an estimate in seconds. The other directions derive one from a
         # fixed bytes-per-second figure, which is a guess presented as a number; this
@@ -1033,6 +1061,12 @@ def _preflight_gate(task, source, target, detail, guid):
         detail,
         {'available_bytes': available},
         {'network_map': task.network_map or {},
+         # Read again, and not from the cache: between the wizard and the button somebody
+         # can attach one of these disks, and copying an attached disk yields an image
+         # that is consistent with nothing.
+         'guest_images': _guest_images_now(source, task),
+         'disk_inspection': _inspection_now(source, task),
+         'virtio_iso': (task.config or {}).get('virtio_iso_path') or '',
          # The name this run is about to create the VM under. Checking it here is the
          # difference between a refusal in the wizard and one that arrives after the disks
          # have been converted, which is where Proxmox itself raises it.
@@ -1056,6 +1090,27 @@ def _preflight_gate(task, source, target, detail, guid):
 
     task.log(f'Preflight passed with {len(report.warnings)} warning(s)')
     return None
+
+
+def _guest_images_now(source, task):
+    """The guest's disks as they are at this moment. Never raises: a gate that cannot ask
+    reports that through the findings rather than by failing the migration."""
+    try:
+        return source.guest_image_facts(task.source_vmid, max_age=0)
+    except Exception:
+        logger.warning('[XHM:%s] could not re-read the guest image facts', task.id,
+                       exc_info=True)
+        return []
+
+
+def _inspection_now(source, task):
+    """What is inside the disks, read again at the moment of starting. Never raises."""
+    try:
+        return source.inspect_disks(task.source_vmid)
+    except Exception:
+        logger.warning('[XHM:%s] could not inspect the source disks', task.id,
+                       exc_info=True)
+        return {}
 
 
 def _target_free_bytes(target, node, storage):
@@ -1701,7 +1756,7 @@ TARGET_FIELDS = ('name', 'vmid', 'cores', 'sockets', 'memory_mb', 'ostype', 'bio
                  'machine')
 
 
-def target_defaults(detail, source_vmid, next_vmid=None) -> dict:
+def target_defaults(detail, source_vmid, next_vmid=None, images=None) -> dict:
     """What the wizard prefills the target fields with.
 
     Read off the source wherever the source has an answer. The two that it does not have
@@ -1729,7 +1784,7 @@ def target_defaults(detail, source_vmid, next_vmid=None) -> dict:
         # Which disk the guest's loader is on. The source's own boot order answers it when
         # Hyper-V reports one; otherwise the first disk, which is the same one in every
         # ordinary case and wrong in a way nothing about the result shows.
-        'boot_disk': _suggested_boot_index(detail),
+        'boot_disk': _suggested_boot_index(detail, images),
         # Only a Generation 2 guest has a variable store at all. Pre-enrolling Microsoft's
         # keys is right for a guest that had Secure Boot on and stops one that had it off
         # from booting, so it follows the source — and `is True`, because "the host did not
@@ -1744,11 +1799,18 @@ def target_defaults(detail, source_vmid, next_vmid=None) -> dict:
     }
 
 
-def _suggested_boot_index(detail):
-    """The source disk index the guest most likely boots from, or None."""
-    order = detail.get('boot_disk_order') or []
+def _suggested_boot_index(detail, images=None):
+    """The source disk index the guest most likely boots from, or None.
+
+    The disk carrying a Windows installation decides it where that is known — read off the
+    disks themselves rather than inferred. Hyper-V's own boot order comes next, and the
+    first disk last, which is the guess this used to make on its own.
+    """
     disks = detail.get('disks') or []
-    for index in order:
+    for index, image in enumerate(images or []):
+        if image.get('windows') and index < len(disks):
+            return index
+    for index in (detail.get('boot_disk_order') or []):
         if 0 <= index < len(disks):
             return index
     return 0 if disks else None

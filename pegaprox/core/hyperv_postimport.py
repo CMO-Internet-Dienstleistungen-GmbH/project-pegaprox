@@ -192,13 +192,53 @@ def find_virtio_isos(target, node):
 
 
 def iso_storages(target, node):
-    """Storages on this node that ISOs may be written to."""
+    """Storages on this node that ISOs may be written to, busiest first.
+
+    Ordered by how many ISOs each already holds, because that is the one on which an
+    operator keeps them: a download should land beside the others rather than on whichever
+    storage the API happened to list first.
+    """
     response = target._api_get(
         f'https://{target.host}:{target.api_port}/api2/json/nodes/{node}/storage')
     if response.status_code != 200:
         return []
-    return [s.get('storage') for s in (response.json().get('data') or [])
-            if 'iso' in (s.get('content') or '') and s.get('active')]
+
+    counted = []
+    for entry in (response.json().get('data') or []):
+        if 'iso' not in (entry.get('content') or '') or not entry.get('active'):
+            continue
+        name = entry.get('storage')
+        counted.append({'storage': name, 'isos': len(_isos_on(target, node, name))})
+    return sorted(counted, key=lambda s: (-s['isos'], s['storage']))
+
+
+def _isos_on(target, node, storage):
+    """Every ISO on one storage. Not only the driver ones: the wizard lists them all, so
+    an operator can point at a file this product would not have recognised."""
+    listing = target._api_get(
+        f'https://{target.host}:{target.api_port}'
+        f'/api2/json/nodes/{node}/storage/{storage}/content?content=iso')
+    if listing.status_code != 200:
+        return []
+    return listing.json().get('data') or []
+
+
+def node_isos(target, node):
+    """Every ISO the node can see, with the virtio-win release named where there is one."""
+    from pegaprox.core import hyperv_drivers
+
+    found = []
+    for entry in iso_storages(target, node):
+        for item in _isos_on(target, node, entry['storage']):
+            volid = item.get('volid') or ''
+            found.append({
+                'volid': volid,
+                'name': volid.split('/')[-1] or volid,
+                'storage': entry['storage'],
+                'size': item.get('size'),
+                'release': hyperv_drivers.release_of(volid),
+            })
+    return sorted(found, key=lambda i: i['name'].lower())
 
 
 def download_release(target, node, storage, release):
