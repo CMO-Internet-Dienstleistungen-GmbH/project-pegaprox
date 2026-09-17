@@ -2242,13 +2242,7 @@ def _inject_virtio_drivers(pve_mgr, task):
         "  rbd)\n"
         "    command -v rbd >/dev/null || { echo 'rbd cli missing — apt install ceph-common'; "
         "      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ceph-common >/dev/null 2>&1; }\n"
-        "    POOLIMG=$(echo \"$VOL_ID\" | sed 's|^[^:]*:||')\n"
-        "    POOL=$(echo \"$POOLIMG\" | cut -d/ -f1)\n"
-        "    IMG=$(echo \"$POOLIMG\" | cut -d/ -f2)\n"
-        "    [ -z \"$POOL\" ] || [ -z \"$IMG\" ] && { echo 'RBD_PARSE_FAILED'; exit 2; }\n"
-        "    BLK=$(rbd map -p \"$POOL\" \"$IMG\" 2>&1 | tail -1)\n"
-        "    [ -b \"$BLK\" ] || { echo \"RBD_MAP_FAILED: $BLK\"; exit 2; }\n"
-        "    RBD=\"$BLK\"\n"
+        + _rbd_target_lines(vol_path) +  # fork #46: pool/image/options from `pvesm path`
         "    ;;\n"
         # File-based (qcow2 / raw on dir/NFS/CIFS/cephfs/glusterfs/btrfs) — qemu-nbd
         "  dir|nfs|cifs|cephfs|glusterfs|btrfs)\n"
@@ -6815,3 +6809,7 @@ def _attach_imported_disk(pve_mgr, task, disk_index, disk_bus, importdisk_output
     else:
         task.log(f"WARNING: Could not parse disk ref from importdisk output: {importdisk_output[-200:]}")
 
+
+# Fork issue #46 — the injection script's rbd) branch. Imported last: the module reads
+# _parse_rbd_uri and _rbd_map_command from this one.
+from pegaprox.core.virtio_rbd_target import rbd_target_lines as _rbd_target_lines  # noqa: E402
