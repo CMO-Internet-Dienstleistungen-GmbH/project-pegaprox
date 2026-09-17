@@ -3442,11 +3442,80 @@ class PegaProxDB:
         for username, data in users.items():
             self.save_user(username, data)
     
+    def purge_user_grants(self, username: str) -> dict:
+        """Drop every per-resource grant tied to this username. Returns what went.
+
+        MK Sep 2026 - deleting an account revoked its sessions, its console tokens and
+        its API tokens, but left its VM-ACL memberships and pool permissions behind.
+        Both are keyed by the bare username, so the next account created under the same
+        name - a rehire, an MSP reusing a customer login, a tenant delegate naming a new
+        user after one another tenant deleted - silently inherited every VM and pool the
+        old account held, with nothing in the UI to show for it.
+
+        A `*` entry in an ACL is a wildcard, not this user, and is left alone.
+        """
+        removed = {'vm_acls': 0, 'pool_permissions': 0}
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("DELETE FROM pool_permissions WHERE subject_type = 'user' "
+                           "AND subject_id = ?", (username,))
+            removed['pool_permissions'] = cursor.rowcount or 0
+        except Exception as e:
+            logging.error(f"Failed to purge pool permissions for '{username}': {e}")
+
+        try:
+            # full scan on purpose: the member list is JSON in a column, so there is no
+            # index to ask, and a LIKE prefilter would quietly miss an escaped name. This
+            # runs on an admin deleting an account, not on a request path.
+            cursor.execute('SELECT id, users FROM vm_acls')
+            rows = cursor.fetchall()
+        except Exception as e:
+            logging.error(f"Failed to read VM ACLs while purging '{username}': {e}")
+            rows = []
+
+        for row in rows:
+            try:
+                members = json.loads(row['users'] or '[]')
+            except Exception:
+                continue
+            if username not in members:
+                continue
+            members = [m for m in members if m != username]
+            try:
+                if members:
+                    cursor.execute('UPDATE vm_acls SET users = ? WHERE id = ?',
+                                   (json.dumps(members), row['id']))
+                else:
+                    # an ACL row with no members grants nobody anything, but it still
+                    # makes the cluster "have ACLs", which narrows what OTHER callers
+                    # are shown. Drop it rather than leave the litter behind.
+                    cursor.execute('DELETE FROM vm_acls WHERE id = ?', (row['id'],))
+                removed['vm_acls'] += 1
+            except Exception as e:
+                logging.error(f"Failed to purge VM ACL {row['id']} for '{username}': {e}")
+
+        self.conn.commit()
+        if removed['vm_acls'] or removed['pool_permissions']:
+            logging.info(f"purged grants for deleted user '{username}': "
+                         f"{removed['vm_acls']} VM ACL(s), "
+                         f"{removed['pool_permissions']} pool permission(s)")
+            # late import: utils.rbac imports this module, so it cannot be at the top
+            try:
+                from pegaprox.utils.rbac import invalidate_vm_acls_cache, invalidate_pool_cache
+                invalidate_vm_acls_cache()
+                invalidate_pool_cache()
+            except Exception as e:
+                logging.warning(f"could not invalidate the authz caches after the purge: {e}")
+        return removed
+
     def delete_user(self, username: str):
         """Delete user"""
         cursor = self.conn.cursor()
         cursor.execute('DELETE FROM users WHERE username = ?', (username,))
         self.conn.commit()
+        # the grants outlive the account otherwise, and the next account with this
+        # name inherits them
+        self.purge_user_grants(username)
     
     # ========================================
     # SESSION OPERATIONS
