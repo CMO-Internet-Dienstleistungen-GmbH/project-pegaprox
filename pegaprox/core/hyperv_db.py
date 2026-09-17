@@ -57,7 +57,12 @@ STATUS_RUNNING = 'running'
 STATUS_COMPLETED = 'completed'
 STATUS_FAILED = 'failed'
 STATUS_INTERRUPTED = 'interrupted'
-_TERMINAL_STATUSES = (STATUS_COMPLETED, STATUS_FAILED)
+#: The VM exists and its disks are complete, but a step after the copy did not do what was
+#: asked — the driver injection, typically. Not `completed`: that reads as "nothing left to
+#: do" and sent an operator to a guest that booted into recovery. Not `failed` either: the
+#: expensive half is done and nothing may be thrown away over it.
+STATUS_COMPLETED_WITH_ERRORS = 'completed_with_errors'
+_TERMINAL_STATUSES = (STATUS_COMPLETED, STATUS_COMPLETED_WITH_ERRORS, STATUS_FAILED)
 
 
 def ensure_schema(cursor) -> None:

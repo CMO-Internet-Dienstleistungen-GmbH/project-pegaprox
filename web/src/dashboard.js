@@ -8233,6 +8233,8 @@
             // Fork patch #15 — what a failed import left on the target, and the answer to it.
             const [hypervCleanup, setHypervCleanup] = useState(null);   // {migration, leftovers}
             const [hypervCleaning, setHypervCleaning] = useState(false);
+            const [hypervRetry, setHypervRetry] = useState(null);       // migration whose injection is retried
+            const [hypervRetrying, setHypervRetrying] = useState(false);
             const [hypervShuttingDown, setHypervShuttingDown] = useState(false);
             const [hypervCheckBusy, setHypervCheckBusy] = useState(false);
             const [hypervSaving, setHypervSaving] = useState(false);
@@ -12100,6 +12102,30 @@
                     }
                 } catch(e) { addToast('Error', e.message, 'error'); }
                 finally { setHypervCleaning(false); }
+            };
+
+            // Fork patch #15 — a driver injection that failed leaves the VM on its compatible
+            // controller. Once the cause is fixed, the injection is run again from here
+            // instead of from a shell on the node; the server refuses while the VM runs.
+            const runHypervRetryInjection = async () => {
+                if (!hypervRetry) return;
+                setHypervRetrying(true);
+                try {
+                    const resp = await authFetch(
+                        `${API_URL}/hyperv/${hypervRetry.source_cluster}/migrations/${hypervRetry.id}/retry-injection`,
+                        { method: 'POST', headers: {'Content-Type':'application/json'},
+                          body: JSON.stringify({ confirm: hypervRetry.id }) });
+                    const data = await resp?.json().catch(() => ({}));
+                    if (resp?.ok) {
+                        addToast(data.message || t('hvRetryInjectionStarted') || 'Driver injection started', 'success');
+                        setHypervRetry(null);
+                        fetchXhmMigrations();
+                    } else {
+                        // Left open: the refusal says what to do first, usually shutting the VM down.
+                        addToast(data.error || 'The retry was refused', 'error');
+                    }
+                } catch(e) { addToast(e.message, 'error'); }
+                finally { setHypervRetrying(false); }
             };
 
             const runHypervTransferCheck = async (hostId, targetCluster, targetNode) => {
@@ -23696,6 +23722,12 @@
                                                                                 {t('hvCleanupLeftovers') || 'Clean up target'}
                                                                             </button>
                                                                         )}
+                                                                        {m.status === 'completed_with_errors' && m.direction === 'hyperv_to_pve' && (
+                                                                            <button onClick={e => { e.stopPropagation(); setHypervRetry(m); }}
+                                                                                    className="px-2 py-0.5 rounded bg-yellow-500/10 border border-yellow-500/30 text-yellow-300 hover:text-white">
+                                                                                {t('hvRetryInjection') || 'Retry driver injection'}
+                                                                            </button>
+                                                                        )}
                                                                     </div>
                                                                     {/* Phase timeline */}
                                                                     {m.phase_times && Object.keys(m.phase_times).length > 0 && (
@@ -24301,6 +24333,49 @@
                                     <button onClick={runHypervCleanup} disabled={hypervCleaning || hypervCleanup.leftovers.length === 0}
                                             className="px-4 py-2 rounded-lg bg-red-500 text-white text-sm font-medium disabled:opacity-50">
                                         {hypervCleaning ? (t('loading') || 'Working…') : (t('hvCleanupConfirm') || 'Remove them')}
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {hypervRetry && (
+                        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4"
+                             onClick={() => !hypervRetrying && setHypervRetry(null)}>
+                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl max-w-lg w-full p-5"
+                                 onClick={e => e.stopPropagation()}>
+                                <h3 className="text-white font-semibold mb-2">
+                                    {t('hvRetryInjection') || 'Retry driver injection'}
+                                </h3>
+                                <p className="text-sm text-gray-400 mb-3">
+                                    {t('hvRetryInjectionExplain')
+                                     || 'Writes the VirtIO drivers into the imported VM\'s disk again. The VM has to be shut down; it is not shut down from here. If the drivers go in, the VM is moved back to VirtIO and is not started. If they do not, the VM stays as it is. The Hyper-V source is not touched.'}
+                                </p>
+                                <div className="p-3 rounded-lg bg-proxmox-dark border border-proxmox-border text-sm mb-3">
+                                    <span className="text-white">{hypervRetry.vm_name || hypervRetry.source_vmid}</span>
+                                    <span className="text-gray-500"> · {hypervRetry.id}</span>
+                                    <div className="mt-2 space-y-0.5 text-xs text-gray-400">
+                                        <div><span className="text-gray-500">{t('hvCleanupCluster') || 'Target cluster'}:</span> {(() => {
+                                            const c = clusters.find(x => x.id === hypervRetry.target_cluster);
+                                            return c ? `${c.name} (${c.id})` : (hypervRetry.target_cluster || '—');
+                                        })()}</div>
+                                        <div><span className="text-gray-500">Node:</span> {hypervRetry.target_node || '—'}</div>
+                                        <div><span className="text-gray-500">VMID:</span> {hypervRetry.target_vmid || '—'}</div>
+                                    </div>
+                                    {hypervRetry.error && (
+                                        <div className="mt-2 text-xs text-yellow-300">
+                                            <span className="text-gray-500">{t('hvRetryInjectionLastError') || 'Last error'}:</span> {hypervRetry.error}
+                                        </div>
+                                    )}
+                                </div>
+                                <div className="flex justify-end gap-2">
+                                    <button onClick={() => setHypervRetry(null)} disabled={hypervRetrying}
+                                            className="px-4 py-2 rounded-lg bg-proxmox-dark border border-proxmox-border text-gray-300 text-sm disabled:opacity-50">
+                                        {t('cancel') || 'Cancel'}
+                                    </button>
+                                    <button onClick={runHypervRetryInjection} disabled={hypervRetrying}
+                                            className="px-4 py-2 rounded-lg bg-yellow-600 text-white text-sm font-medium disabled:opacity-50">
+                                        {hypervRetrying ? (t('loading') || 'Working…') : (t('hvRetryInjectionConfirm') || 'Inject again')}
                                     </button>
                                 </div>
                             </div>
