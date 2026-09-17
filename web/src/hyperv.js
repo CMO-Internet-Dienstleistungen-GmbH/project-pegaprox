@@ -854,10 +854,9 @@
          *
          * This is not the migration list above it. That one lives in the server's memory
          * and is empty after a restart; this reads the database, which is exactly the
-         * state somebody needs when a transfer died with the process. A failed import
-         * that created a VM or volumes blocks the next attempt on that VM, because
-         * starting again would copy the same disks a second time — so the panel exists to
-         * make the blockage visible and to offer the only thing that resolves it.
+         * state somebody needs when a transfer died with the process. It shows what a
+         * failed import created on the target and offers to remove it; whether to do so
+         * is the operator's decision, and a new attempt is not held back either way.
          *
          * The cleanup asks twice, and the second ask names what will be deleted. It
          * touches nothing on the Hyper-V side: the source is what makes the rollback for
