@@ -2680,6 +2680,15 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
         "  fi; "
         "done\n"
         "[ \"$MSI_OK\" -eq 1 ] || echo 'MSI_MISSING (skipping bulk install)'\n"
+        # Fork patch #15 — the guest agent is not in virtio-win-gt-x64.msi, whatever the
+        # note above says. Checked against virtio-win 0.1.302: the driver MSI names
+        # vioscsi and blnsvr and never qemu-ga, which ships as guest-agent/qemu-ga-x86_64.msi
+        # of its own. Without it a migrated guest has drivers and no agent, and Proxmox
+        # cannot shut it down cleanly, freeze it for a backup or read its addresses.
+        "if [ -f \"$ISO_MNT/guest-agent/qemu-ga-x86_64.msi\" ]; then "
+        "  cp -f \"$ISO_MNT/guest-agent/qemu-ga-x86_64.msi\" \"$PEGADIR/qemu-ga-x86_64.msi\" "
+        "    && echo 'AGENT_STAGED qemu-ga-x86_64.msi'; "
+        "else echo 'AGENT_MISSING (no guest-agent/qemu-ga-x86_64.msi on the ISO)'; fi\n"
         # Register the one-shot service in the SYSTEM hive.
         # ImagePath runs as LocalSystem at next boot; cmd /c chains:
         #   msiexec /quiet → sc delete self → del MSI
@@ -2718,10 +2727,15 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
         "    'cmd.exe /c '\n"
         "    '(msiexec /i \"C:\\\\PegaProx\\\\virtio-win-gt-x64.msi\" '\n"
         "    'ADDLOCAL=ALL /quiet /norestart /l*v \"C:\\\\PegaProx\\\\msi.log\") & '\n"
+        # After the driver MSI, which installs the VirtIO serial driver the agent talks over.
+        "    '(if exist \"C:\\\\PegaProx\\\\qemu-ga-x86_64.msi\" msiexec /i '\n"
+        "    '\"C:\\\\PegaProx\\\\qemu-ga-x86_64.msi\" /quiet /norestart '\n"
+        "    '/l*v \"C:\\\\PegaProx\\\\qemu-ga.log\") & '\n"
         "    '(sc config vioscsi start= boot >> \"C:\\\\PegaProx\\\\bootarm.log\" 2>&1) & '\n"
         "    '(sc config viostor start= boot >> \"C:\\\\PegaProx\\\\bootarm.log\" 2>&1) & '\n"
         "    '(sc delete PegaProxFirstBoot >> \"C:\\\\PegaProx\\\\service.log\" 2>&1) & '\n"
-        "    '(del \"C:\\\\PegaProx\\\\virtio-win-gt-x64.msi\" 2>nul)'\n"
+        "    '(del \"C:\\\\PegaProx\\\\virtio-win-gt-x64.msi\" 2>nul) & '\n"
+        "    '(del \"C:\\\\PegaProx\\\\qemu-ga-x86_64.msi\" 2>nul)'\n"
         ")\n"
         # Same reasoning as the driver registration above: the set that will be active is
         # not knowable here, so every set that exists gets the entry.
@@ -2782,7 +2796,7 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
     # Most markers are once-per-run; COPIED/SKIP/COPY_FAILED are per-driver
     # so we log all of them (otherwise we'd hide which drivers actually staged).
     _multi = ('COPIED ', 'SKIP ', 'COPY_FAILED ', 'BOOT_SIGNATURE_MISSING ')
-    for marker in ['WIN_PART=', 'WDIR=', 'VER_NAME=', 'VER_BUILD=', 'SUBDIR_PRIMARY=', 'SUBDIR_FALLBACKS=', 'SUBDIR=', 'COPIED ', 'SKIP ', 'COPY_FAILED ', 'MSI_STAGED ', 'MSI_MISSING', 'SVC_REGISTERED', 'SVC_FAILED', 'BOOT_SIGNATURE_MISSING ', 'HIVEX have_', 'INJECTION_OK']:
+    for marker in ['WIN_PART=', 'WDIR=', 'VER_NAME=', 'VER_BUILD=', 'SUBDIR_PRIMARY=', 'SUBDIR_FALLBACKS=', 'SUBDIR=', 'COPIED ', 'SKIP ', 'COPY_FAILED ', 'MSI_STAGED ', 'MSI_MISSING', 'AGENT_STAGED ', 'AGENT_MISSING', 'SVC_REGISTERED', 'SVC_FAILED', 'BOOT_SIGNATURE_MISSING ', 'HIVEX have_', 'INJECTION_OK']:
         for line in out_str.splitlines():
             if marker in line:
                 task.log(f"[VirtIO] {line.strip()}")
