@@ -481,6 +481,13 @@ def drift_status(cluster_id):
 def list_events(cluster_id):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    # MK Sep 2026 - a drift event carries the cluster's configuration diff: node config,
+    # storage definitions, network. There is no per-VM notion to filter on, so an
+    # ACL/pool-scoped caller reading this gets the whole cluster's configuration history
+    # - including every other tenant's. The scan and baseline routes below already treat
+    # drift as whole-cluster; reading it is the same scope.
+    _cerr = require_unconfined(cluster_id)
+    if _cerr: return _cerr
     status = request.args.get('status', 'open')
     limit = max(1, min(int(request.args.get('limit', '100')), 500))
     try:
@@ -526,6 +533,11 @@ def acknowledge_event(eid):
         ok, err = check_cluster_access(ev['cluster_id'])
         if not ok:
             return err
+        # acknowledging - and especially promoting, which rewrites the baseline the next
+        # scan compares against - is a whole-cluster act for the same reason
+        _cerr = require_unconfined(ev['cluster_id'])
+        if _cerr:
+            return _cerr
         c.execute('''UPDATE drift_events SET status='acknowledged',
                      acknowledged_at=?, acknowledged_by=? WHERE id=?''',
                   (datetime.now().isoformat(), user, eid))
