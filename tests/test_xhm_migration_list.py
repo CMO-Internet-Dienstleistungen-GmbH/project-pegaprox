@@ -398,3 +398,18 @@ class TestARunThatCompletedWithErrors:
     def test_the_label_exists_in_both_languages(self):
         with open(os.path.join(REPO, 'web', 'src', 'translations.js'), encoding='utf-8') as fh:
             assert fh.read().count('xhmCompletedWithErrors:') == 2
+
+
+class TestTheListSpeaksInWords:
+    """`t()` hands back the key itself when a translation is missing, so a `|| 'fallback'`
+    beside it never applies: an opened migration without log lines said "xhmNoLog"."""
+
+    def test_every_label_the_list_uses_exists_in_german_and_english(self):
+        import re
+        keys = set(re.findall(r"t\('(xhm[A-Za-z0-9]*)'\)", _migration_list(_dashboard())))
+        with open(os.path.join(REPO, 'web', 'src', 'translations.js'), encoding='utf-8') as fh:
+            translations = fh.read()
+        missing = sorted(key for key in keys
+                         if len(re.findall(rf'^\s*{key}:', translations, re.MULTILINE)) < 2)
+        assert 'xhmNoLog' in keys
+        assert missing == []
