@@ -17,6 +17,7 @@ import pytest
 
 from pegaprox.core import hyperv
 from pegaprox.core.hyperv_errors import HyperVError
+from pegaprox.core.hyperv_client import assert_read_only
 
 FIXTURES = pathlib.Path(__file__).parent / 'hyperv_testbed' / 'ps_fixtures'
 
@@ -48,6 +49,10 @@ class FakeClient:
         self.bindings = []
 
     def run_json(self, script, **parameters):
+        # The real client's guard, not a stand-in: a script the transport would refuse on
+        # the read path has to fail here too. Without it the disk inspection, which mounts
+        # a VHDX, passed every test and was refused on every real host.
+        assert_read_only(script)
         self.read_scripts.append(script)
         self.bindings.append(parameters)
         return self._answer(script)
@@ -409,3 +414,24 @@ class TestPropertyVerification:
         # ConvertTo-Json turns an empty array into null, which must not read as a problem.
         manager = _manager({'Get-MissingMembers': {'InspectedVM': 'x', 'Missing': {'VM': None}}})
         assert manager.verify_properties()['complete'] is True
+
+
+class TestDiskInspection:
+    """The inspection mounts a VHDX read-only, so it has to travel the audited action path."""
+
+    ANSWER = {'State': 'Off', 'Inspected': True, 'Error': '', 'Disks': [{
+        'Path': 'C:\\vm\\a.vhdx', 'Mounted': True, 'Error': '', 'AttachedAfter': False,
+        'Volumes': [{'FileSystem': 'NTFS', 'Windows': True, 'HiveLoadExit': 0,
+                     'ProductName': 'Windows Server 2022 Standard',
+                     'CurrentBuildNumber': '20348', 'DirtyExit': 0}]}]}
+
+    def test_the_inspection_is_not_refused_by_the_read_only_guard(self):
+        client = FakeClient({'Mount-VHD': self.ANSWER})
+        manager = hyperv.HyperVManager('hyperv-host-a', client, host='probe-host.example')
+
+        result = manager.inspect_disks(GUID_GEN2)
+
+        assert result['inspected'] is True
+        assert result['disks'][0]['volumes'][0]['product_name'] == 'Windows Server 2022 Standard'
+        assert [description for _, description in client.actions], (
+            'the inspection was not sent as an audited action')
