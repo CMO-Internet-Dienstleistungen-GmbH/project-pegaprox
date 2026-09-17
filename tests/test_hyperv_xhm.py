@@ -1697,6 +1697,134 @@ class TestAnImportThatInstallsNoDrivers:
         assert any('hibernation' in str(line).lower() for line in task.log_lines)
 
 
+class TestAnInjectionThatDoesNotReportBack:
+    """A driver injection whose outcome is unknown must not end in a completed migration.
+
+    Reported from a real import: the list read "completed" right after the attaching phase
+    while the injection was still going, the VM had not been started, and the guest came up
+    without the tools the injection installs. The shared injection gave its script five
+    minutes; when a read ran out, the call raised, the run carried on to `_finish`, and the
+    channel closing under the script killed it at its next line of output.
+    """
+
+    @staticmethod
+    def _run_in_bash(command, close_early):
+        """Run a command the way sshd does, optionally with the reader gone after 0.2 s."""
+        import subprocess
+        import time
+        proc = subprocess.Popen(['bash', '-c', command], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
+        if close_early:
+            time.sleep(0.2)
+            proc.stdout.close()
+            return proc.wait(timeout=10), ''
+        out, _ = proc.communicate(timeout=10)
+        return proc.returncode, out.decode()
+
+    def _script(self, tmp_path):
+        return (f'sleep 0.5; echo copied; touch {tmp_path}/after-first-line; '
+                f'echo registered; touch {tmp_path}/end')
+
+    def test_a_script_whose_reader_went_away_dies_at_its_next_line(self, tmp_path):
+        """The mechanism, reproduced locally: this is what the wrapper exists for."""
+        self._run_in_bash(self._script(tmp_path), close_early=True)
+        assert not (tmp_path / 'end').exists()
+
+    def test_the_session_wrapper_lets_it_run_to_its_end(self, tmp_path):
+        wrapped = hyperv_xhm._survives_the_caller(self._script(tmp_path))
+        self._run_in_bash(wrapped, close_early=True)
+        assert (tmp_path / 'after-first-line').exists()
+        assert (tmp_path / 'end').exists()
+
+    def test_the_wrapper_keeps_the_exit_code_and_both_streams(self):
+        code, out = self._run_in_bash(
+            hyperv_xhm._survives_the_caller('echo to-stdout; echo to-stderr >&2; exit 3'),
+            close_early=False)
+        assert code == 3
+        assert 'to-stdout' in out and 'to-stderr' in out
+
+    def test_a_here_document_still_ends_inside_the_wrapper(self, tmp_path):
+        """The injection writes its script to the node with a here-document."""
+        target = tmp_path / 'inject.sh'
+        command = f"cat > {target} << 'EOFSCRIPT'\necho staged\nEOFSCRIPT\nchmod +x {target}"
+        code, _ = self._run_in_bash(hyperv_xhm._survives_the_caller(command), close_early=False)
+        assert code == 0
+        assert target.read_text() == 'echo staged\n'
+
+    def test_the_session_waits_longer_than_the_five_minutes_it_is_asked_for(self, monkeypatch):
+        import pegaprox.core.xhm as core_xhm
+        seen = {}
+
+        class _Ssh:
+            def close(self):
+                pass
+
+        class _RecordingNode:
+            def __init__(self, ssh, user='root'):
+                pass
+
+            def run(self, command, stdin_data=None, timeout=None):
+                seen['command'], seen['timeout'] = command, timeout
+                return 0, '', ''
+
+        monkeypatch.setattr(core_xhm, '_resolve_pve_node_ip', lambda t, n: '127.0.0.1')
+        monkeypatch.setattr(core_xhm, '_connect_ssh', lambda *a, **kw: _Ssh())
+        monkeypatch.setattr(hyperv_xhm, '_Node', _RecordingNode)
+        task = FakeTask()
+        task.target_node = 'node-a'
+        with hyperv_xhm._node_session(task, FakeTarget(),
+                                      min_timeout=hyperv_xhm._INJECTION_TIMEOUT) as run:
+            run(None, 'node-a', 'bash /tmp/v2p-virtio-inject-120.sh', timeout=300)
+        assert seen['timeout'] == hyperv_xhm._INJECTION_TIMEOUT
+        assert seen['command'] == hyperv_xhm._survives_the_caller(
+            'bash /tmp/v2p-virtio-inject-120.sh')
+
+    @staticmethod
+    def _virtio_task():
+        task = FakeTask()
+        task.config = {'hardware': 'virtio'}
+        task.target_node = 'node-a'
+        task.target_storage = 'vmstorage'
+        return task
+
+    def test_an_injection_that_timed_out_is_not_a_note_but_an_unfinished_run(self, monkeypatch):
+        def times_out(*_a, **_kw):
+            raise TimeoutError()
+
+        monkeypatch.setattr('pegaprox.core.v2p._inject_virtio_drivers', times_out)
+        with pytest.raises(hyperv_xhm.InjectionUnfinished) as raised:
+            hyperv_xhm._inject_drivers_if_asked(self._virtio_task(), FakeTarget(), 120, [],
+                                                {'generation': 2})
+        assert 'not started' in str(raised.value)
+        assert '/tmp/v2p-virtio-inject-120.sh' in str(raised.value)
+
+    def test_a_hibernation_check_that_timed_out_is_unfinished_too(self, monkeypatch):
+        def times_out(*_a, **_kw):
+            raise TimeoutError()
+
+        monkeypatch.setattr('pegaprox.core.v2p._inject_virtio_drivers', times_out)
+        task = TestAnImportThatInstallsNoDrivers._task('compatible')
+        with pytest.raises(hyperv_xhm.InjectionUnfinished):
+            hyperv_xhm._inject_drivers_if_asked(task, FakeTarget(), 120, [], {'generation': 2})
+
+    def test_the_run_fails_and_starts_nothing(self, db, wired, monkeypatch):
+        _, target, _ = wired
+
+        def times_out(*_a, **_kw):
+            raise TimeoutError()
+
+        monkeypatch.setattr('pegaprox.core.v2p._inject_virtio_drivers', times_out)
+        task = _run(FakeTask(config={'start_after': True, 'hardware': 'virtio'}))
+
+        assert task.status == 'failed'
+        assert task.phase != 'completed'
+        assert not [url for url, _ in target.posts if url.endswith('/status/start')]
+        row = hyperv_db.get_migration(db.conn, task.id)
+        assert row['status'] == hyperv_db.STATUS_FAILED
+        # Nothing is removed: the converted disks are the expensive half of the run.
+        assert row['created_resources']
+
+
 class TestAGuestWhoseDriverTheLoaderRefuses:
     """What happens when the drivers cannot be made boot-critical.
 
