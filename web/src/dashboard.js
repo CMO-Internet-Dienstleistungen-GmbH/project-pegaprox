@@ -12190,6 +12190,9 @@
                     smb_share_map: Object.entries(host.smb_share_map || {})
                         .map(([drive, share]) => `${drive}=${share}`).join('\n'),
                     smb_domain: host.smb_domain || '',
+                    // Left out, the field opened blank and saving the form wrote the blank
+                    // back over the stored address.
+                    transfer_host: host.transfer_host || '',
                 });
                 setShowHypervEdit(true);
             };
