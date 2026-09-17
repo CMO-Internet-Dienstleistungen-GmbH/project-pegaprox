@@ -12784,8 +12784,9 @@
                     const resp = await authFetch(url, { method: 'DELETE' });
                     const data = await resp?.json().catch(() => ({}));
                     if (resp?.ok) {
-                        if (mid && xhmSelectedMigration === mid) setXhmSelectedMigration(null);
-                        if (!mid) setXhmSelectedMigration(null);
+                        // Only a row that went takes its open log with it; one whose record
+                        // stayed is still on the list, and so is what it logged.
+                        if ((data.removed || []).includes(xhmSelectedMigration)) setXhmSelectedMigration(null);
                         // A record that refused to go stays on the list; saying nothing would
                         // make the click look like it did not register.
                         (data.kept || []).forEach(k => addToast('Error', `${k.id}: ${k.reason}`, 'error'));
