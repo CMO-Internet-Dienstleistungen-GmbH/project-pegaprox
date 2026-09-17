@@ -6356,7 +6356,9 @@ virtio_iso:form.virtio_iso_path||'',// The hardware the migration would build. W
 // falls back to its default and the driver check answers for a
 // machine the wizard is not about to create, so the list can
 // say "sata controller" while the box above it says VirtIO.
-hardware:form.hardware||''})});if(!resp?.ok)return null;return await resp.json();}catch(e){return null;}}/**
+hardware:form.hardware||'',// Whether the copy is started at the end, so the warning about
+// the original's hostname and MAC appears exactly when it applies.
+start_after:form.start_after!==false})});if(!resp?.ok)return null;return await resp.json();}catch(e){return null;}}/**
          * Whether the wizard's start button may be enabled for a Hyper-V plan.
          *
          * It repeats a decision the API makes again on its own. That duplication is
@@ -7447,11 +7449,7 @@ const[hypervCleaning,setHypervCleaning]=useState(false);const[hypervShuttingDown
 // migration loses both its sources and its entry point.
 const pveClusters=useMemo(()=>clusters.filter(c=>hvType(c)!=='hyperv'),[clusters]);const hypervHosts=useMemo(()=>clusters.filter(c=>hvType(c)==='hyperv').map(c=>({...c,...(hypervHostDetails[c.id]||{})})),[clusters,hypervHostDetails]);// LW: Mar 2026 - Cross-Hypervisor Migration (XHM) state
 const[sidebarXHM,setSidebarXHM]=useState(false);const[sidebarMultiSdn,setSidebarMultiSdn]=useState(false);// #612 — Multi-Cluster EVPN view
-const[xhmMigrations,setXhmMigrations]=useState([]);const[xhmSelectedMigration,setXhmSelectedMigration]=useState(null);const[xhmMigrationDetail,setXhmMigrationDetail]=useState(null);const[xhmPlan,setXhmPlan]=useState(null);const[xhmLoading,setXhmLoading]=useState(false);const[xhmForm,setXhmForm]=useState({source_cluster:'',source_node:'',source_vmid:'',target_cluster:'',target_node:'',target_storage:'',// `start_after` is the shared wizard's default and stays true for the
-// directions that have always offered it. A Hyper-V plan sets it off when
-// the plan is loaded — see the effect below — because there the copy comes
-// up carrying the original's hostname and MAC.
-network_map:{},vlan_map:{},start_after:true,remove_source:false,// Fork patch #15 — on by default: prepare the guest for VirtIO during the
+const[xhmMigrations,setXhmMigrations]=useState([]);const[xhmSelectedMigration,setXhmSelectedMigration]=useState(null);const[xhmMigrationDetail,setXhmMigrationDetail]=useState(null);const[xhmPlan,setXhmPlan]=useState(null);const[xhmLoading,setXhmLoading]=useState(false);const[xhmForm,setXhmForm]=useState({source_cluster:'',source_node:'',source_vmid:'',target_cluster:'',target_node:'',target_storage:'',network_map:{},vlan_map:{},start_after:true,remove_source:false,// Fork patch #15 — on by default: prepare the guest for VirtIO during the
 // migration (inject the drivers, create the VM on VirtIO hardware) rather
 // than importing on compatible hardware and converting by hand afterwards.
 prepare_virtio:true,// Fork patch #15 — preflight warnings a person has confirmed. The API
@@ -7952,17 +7950,13 @@ const openXhmForSource=(clusterId,vm)=>{setSelectedCluster(null);setSelectedPBS(
 const fetchXhmMigrations=async()=>{try{const resp=await authFetch(`${API_URL}/xhm/migrations`);if(resp?.ok){setXhmMigrations(await resp.json());}}catch(e){}};const fetchXhmDetail=async mid=>{try{const r=await authFetch(`${API_URL}/xhm/migrations/${mid}`);if(r?.ok)setXhmMigrationDetail(await r.json());}catch(e){}};const fetchXhmPlan=async()=>{if(!xhmForm.source_cluster||!xhmForm.source_vmid||!xhmForm.target_cluster)return;setXhmLoading(true);try{const srcMgr=clusters.find(c=>c.id===xhmForm.source_cluster);let url=`${API_URL}/xhm/plan?source_cluster=${xhmForm.source_cluster}&source_vmid=${xhmForm.source_vmid}&target_cluster=${xhmForm.target_cluster}`;if(hvNeedsSourceNode(srcMgr)&&xhmForm.source_node)url+=`&source_node=${xhmForm.source_node}`;const resp=await authFetch(url);if(resp?.ok){const data=await resp.json();setXhmPlan(data);// A confirmation belongs to the plan it was given for. Carrying one
 // across to a different VM would let somebody accept a risk they
 // were never shown.
-//
-// Fork patch #15 — and the safe answer for starting the copy is the
-// one this direction begins with. The shared form defaults it to
-// true, which is right where the source is taken away by the same
-// migration; here the source stays, so an unasked start puts the
-// original's hostname and MAC on the network a second time.
 const isHyperV=typeof hvIsHyperVPlan==='function'&&hvIsHyperVPlan(data);// Fork patch #15 — the target fields start on what the source says
 // and stay editable. Prefilled rather than defaulted: the value is
 // on screen, so a migration that would rename, resize or re-number
 // the guest says so before it runs instead of afterwards.
-const d=isHyperV&&data.target_defaults||{};setXhmForm(prev=>({...prev,acknowledged:[],...(isHyperV?{start_after:false}:{}),...(isHyperV?{target_name:d.name||'',target_vmid:d.vmid??'',cores:d.cores??'',sockets:d.sockets??'',memory_mb:d.memory_mb??'',ostype:d.ostype||'other',bios:d.bios||'',machine:d.machine||'',scsihw:d.scsihw||'',cpu_type:'',boot_disk:d.boot_disk??'',efi_pre_enrolled_keys:!!d.efi_pre_enrolled_keys,virtio_iso_path:''}:{})}));}else{const err=await resp?.json().catch(()=>({}));addToast('Error',err.error||'Failed to get plan','error');}}catch(e){addToast('Error',e.message,'error');}finally{setXhmLoading(false);}};const startXhmMigration=async()=>{setXhmLoading(true);try{const body={...xhmForm};// target_hardware() on the server reads `hardware`; the checkbox is the
+const d=isHyperV&&data.target_defaults||{};// Fork patch #15 — a new plan starts on the default again: the copy
+// is started, unless the operator unticks it for this VM.
+setXhmForm(prev=>({...prev,acknowledged:[],...(isHyperV?{start_after:true}:{}),...(isHyperV?{target_name:d.name||'',target_vmid:d.vmid??'',cores:d.cores??'',sockets:d.sockets??'',memory_mb:d.memory_mb??'',ostype:d.ostype||'other',bios:d.bios||'',machine:d.machine||'',scsihw:d.scsihw||'',cpu_type:'',boot_disk:d.boot_disk??'',efi_pre_enrolled_keys:!!d.efi_pre_enrolled_keys,virtio_iso_path:''}:{})}));}else{const err=await resp?.json().catch(()=>({}));addToast('Error',err.error||'Failed to get plan','error');}}catch(e){addToast('Error',e.message,'error');}finally{setXhmLoading(false);}};const startXhmMigration=async()=>{setXhmLoading(true);try{const body={...xhmForm};// target_hardware() on the server reads `hardware`; the checkbox is the
 // wizard's word for the same decision.
 body.hardware=xhmForm.prepare_virtio?'virtio':'compatible';// Fork patch #15 — an option this direction refuses must not be sent
 // just because the form still carries its default. A Hyper-V plan
@@ -8003,7 +7997,8 @@ const[hvPreflightBusy,setHvPreflightBusy]=useState(false);useEffect(()=>{if(!hvI
 xhmForm.target_name,// The hardware choice belongs here too: one of the checks answers whether
 // this guest needs a VirtIO driver, and without this the list goes on
 // saying "sata controller" while the box above it says VirtIO.
-xhmForm.prepare_virtio,JSON.stringify(xhmForm.network_map),JSON.stringify(xhmForm.vlan_map)]);// Fork patch #15 — which driver ISOs the chosen target node can see. Asked
+xhmForm.prepare_virtio,// Starting the copy is reported as a warning, so ticking it changes the list.
+xhmForm.start_after,JSON.stringify(xhmForm.network_map),JSON.stringify(xhmForm.vlan_map)]);// Fork patch #15 — which driver ISOs the chosen target node can see. Asked
 // per node rather than at plan time: the ISO lives on a storage, and which
 // storages exist is a property of the node the operator has just picked.
 useEffect(()=>{if(!hvIsHyperVPlan(xhmPlan)||!xhmForm.target_cluster||!xhmForm.target_node){setHvIsos(null);return;}let dropped=false;(async()=>{try{const resp=await authFetch(`${API_URL}/hyperv/target-virtio-isos`+`?cluster=${encodeURIComponent(xhmForm.target_cluster)}`+`&node=${encodeURIComponent(xhmForm.target_node)}`);const data=await resp?.json().catch(()=>null);if(!dropped&&resp?.ok)setHvIsos(data);}catch(e){/* the field says the list could not be read */}})();return()=>{dropped=true;};},[xhmPlan,xhmForm.target_cluster,xhmForm.target_node]);// Fork patch #15 — which CPU type the chosen node can run. Asked per node like

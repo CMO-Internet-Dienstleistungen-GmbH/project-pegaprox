@@ -8280,10 +8280,6 @@
             const [xhmForm, setXhmForm] = useState({
                 source_cluster: '', source_node: '', source_vmid: '',
                 target_cluster: '', target_node: '', target_storage: '',
-                // `start_after` is the shared wizard's default and stays true for the
-                // directions that have always offered it. A Hyper-V plan sets it off when
-                // the plan is loaded — see the effect below — because there the copy comes
-                // up carrying the original's hostname and MAC.
                 network_map: {}, vlan_map: {}, start_after: true, remove_source: false,
                 // Fork patch #15 — on by default: prepare the guest for VirtIO during the
                 // migration (inject the drivers, create the VM on VirtIO hardware) rather
@@ -12715,20 +12711,16 @@
                         // A confirmation belongs to the plan it was given for. Carrying one
                         // across to a different VM would let somebody accept a risk they
                         // were never shown.
-                        //
-                        // Fork patch #15 — and the safe answer for starting the copy is the
-                        // one this direction begins with. The shared form defaults it to
-                        // true, which is right where the source is taken away by the same
-                        // migration; here the source stays, so an unasked start puts the
-                        // original's hostname and MAC on the network a second time.
                         const isHyperV = typeof hvIsHyperVPlan === 'function' && hvIsHyperVPlan(data);
                         // Fork patch #15 — the target fields start on what the source says
                         // and stay editable. Prefilled rather than defaulted: the value is
                         // on screen, so a migration that would rename, resize or re-number
                         // the guest says so before it runs instead of afterwards.
                         const d = (isHyperV && data.target_defaults) || {};
+                        // Fork patch #15 — a new plan starts on the default again: the copy
+                        // is started, unless the operator unticks it for this VM.
                         setXhmForm(prev => ({...prev, acknowledged: [],
-                                             ...(isHyperV ? { start_after: false } : {}),
+                                             ...(isHyperV ? { start_after: true } : {}),
                                              ...(isHyperV ? {
                                                  target_name: d.name || '',
                                                  target_vmid: d.vmid ?? '',
@@ -12877,6 +12869,8 @@
                 // this guest needs a VirtIO driver, and without this the list goes on
                 // saying "sata controller" while the box above it says VirtIO.
                 xhmForm.prepare_virtio,
+                // Starting the copy is reported as a warning, so ticking it changes the list.
+                xhmForm.start_after,
                 JSON.stringify(xhmForm.network_map), JSON.stringify(xhmForm.vlan_map)]);
 
             // Fork patch #15 — which driver ISOs the chosen target node can see. Asked
