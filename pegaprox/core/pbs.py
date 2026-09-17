@@ -37,6 +37,28 @@ def _validate_pbs_host(host: str) -> bool:
     # hostname, FQDN, IPv4, or IPv6 — no scheme, no path, no whitespace
     return bool(re.match(r'^[a-zA-Z0-9\.\-\:]+$', host))
 
+class _PinnedFingerprintAdapter(requests.adapters.HTTPAdapter):
+    """Verify the peer certificate against a configured SHA-256 fingerprint.
+
+    urllib3 does the comparison (colons and case are normalised away), which is the same
+    digest /api/pbs/probe-fingerprint hands the operator when they add the server. This is
+    independent of `verify`: a pinned connection is authenticated even when the certificate
+    is self-signed and has no chain to check. MK Sep 2026
+    """
+
+    def __init__(self, fingerprint, *args, **kwargs):
+        self._pinned_fingerprint = fingerprint
+        super().__init__(*args, **kwargs)
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        pool_kwargs['assert_fingerprint'] = self._pinned_fingerprint
+        return super().init_poolmanager(connections, maxsize, block, **pool_kwargs)
+
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        proxy_kwargs['assert_fingerprint'] = self._pinned_fingerprint
+        return super().proxy_manager_for(proxy, **proxy_kwargs)
+
+
 class PBSManager:
     """Manages connection to a Proxmox Backup Server instance
     
@@ -71,6 +93,18 @@ class PBSManager:
 
         self._session = requests.Session()
         self._session.verify = self.ssl_verify
+        # MK Sep 2026 - the fingerprint field has been in the schema, the add-PBS wizard and
+        # the connection test since the beginning, and NOTHING checked it on a real request:
+        # every call carrying the PBS password or API token went out over a connection whose
+        # peer was never identified. PBS ships a self-signed certificate, so CA validation is
+        # off for almost everyone and turning it on by default would break those installs -
+        # pinning is the check that actually fits. Configured fingerprint: verified on every
+        # connection. No fingerprint: unchanged, so nothing breaks on upgrade.
+        _pin = (self.fingerprint or '').strip()
+        if _pin:
+            self._session.mount('https://', _PinnedFingerprintAdapter(_pin))
+            logging.info(f"[PBS] {self.name}: pinning the server certificate to its "
+                         f"configured fingerprint")
         self._ticket = None
         self._csrf_token = None
         self._using_api_token = bool(self.api_token_id and self.api_token_secret)
