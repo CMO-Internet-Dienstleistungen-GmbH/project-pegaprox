@@ -1271,6 +1271,38 @@ def confirm_hyperv_drivers(cluster_id, migration_id):
     return jsonify(result)
 
 
+@bp.route('/api/hyperv/<cluster_id>/migrations/<migration_id>/retry-injection',
+          methods=['POST'])
+@require_auth(perms=['hyperv.vm.migrate'])
+def retry_hyperv_driver_injection(cluster_id, migration_id):
+    """Run the offline driver injection again, once whatever made it fail is fixed.
+
+    Writes into the imported guest's disk, so it asks for the migration id as confirmation,
+    and the core refuses while that VM runs. The source is not touched.
+    """
+    _migration, err = _post_import_gate(cluster_id, migration_id)
+    if err:
+        return err
+
+    data = request.json or {}
+    if data.get('confirm') != migration_id:
+        return jsonify({
+            'error': 'This writes the VirtIO drivers into the imported VM\'s disk and needs '
+                     'the VM shut down. Send {"confirm": "<migration_id>"} to perform it.',
+        }), 400
+
+    from pegaprox.core.hyperv_xhm import retry_driver_injection
+
+    result = retry_driver_injection(migration_id, _acting_user(), iso=data.get('iso'))
+    if not result.get('success'):
+        return jsonify(result), 409
+
+    log_audit(_acting_user(), 'hyperv.migration.retry_injection',
+              f'Started the VirtIO driver injection again for the VM imported by '
+              f'migration {_sl(migration_id)}')
+    return jsonify(result), 202
+
+
 @bp.route('/api/hyperv/<cluster_id>/migrations/<migration_id>/profile', methods=['POST'])
 @require_auth(perms=['hyperv.vm.migrate'])
 def apply_hyperv_vm_profile(cluster_id, migration_id):
