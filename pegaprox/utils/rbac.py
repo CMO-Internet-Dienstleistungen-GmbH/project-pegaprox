@@ -354,6 +354,20 @@ def get_user_permissions(user: dict, tenant_id: str = None) -> list:
         _cap = set(get_role_permissions_for_user({'role': _eff}, _tenant_defining_role(_eff, tenant_id)))
         base_perms = [p for p in base_perms if p in _cap]
 
+    # MK Sep 2026 - and cap by what the OWNER holds right now. The block above caps by the
+    # token's own role, which is the right ceiling only while the owner still outranks it.
+    # A token bound to a custom role never went through the numeric floor in
+    # build_authz_user, so demoting its owner, stripping one of their permissions, or
+    # editing the custom role itself left the token resolving through the old, larger set.
+    # require_auth re-floors BUILTIN token roles on every request; this is the same
+    # promise for custom ones, and it is evaluated per-tenant because that is the only
+    # place the answer is actually decidable.
+    if user.get('_token_owner_capped'):
+        _owner = {k: v for k, v in user.items()
+                  if k not in ('effective_role', '_token_owner_capped')}
+        _owner_perms = set(get_user_permissions(_owner, tenant_id))
+        base_perms = [p for p in base_perms if p in _owner_perms]
+
     return base_perms
 
 def has_permission(user: dict, permission: str, tenant_id: str = None) -> bool:

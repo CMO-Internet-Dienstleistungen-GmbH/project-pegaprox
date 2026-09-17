@@ -333,6 +333,14 @@ def build_authz_user(username: str, session: dict) -> dict:
         # re-floors the numeric role every request. A BUILTIN token role is still floored numerically.
         if token_role and token_role not in _h:
             user['effective_role'] = token_role
+            # MK Sep 2026 - a CUSTOM token role keeps its name (see above), and the numeric
+            # floor above therefore never runs for it. So the token kept resolving through
+            # that role's permission list no matter what happened to its owner afterwards:
+            # demote the owner to viewer, strip a permission from their account, and a token
+            # they minted while they still held it carried on working. Mark the identity so
+            # get_user_permissions can intersect with what the owner holds TODAY - it has to
+            # happen there, not here, because the answer is per-tenant.
+            user['_token_owner_capped'] = True
         else:
             eff = min(_h.get(token_role, 1), _h.get(user.get('role'), 1))
             user['effective_role'] = next((r for r, lvl in _h.items() if lvl == eff), ROLE_VIEWER)
