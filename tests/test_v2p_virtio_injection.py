@@ -249,6 +249,91 @@ def test_the_first_boot_service_reaches_the_same_control_sets(resolved_node):
 
 
 # ---------------------------------------------------------------------------
+# The guest agent, which the driver MSI does not contain
+# ---------------------------------------------------------------------------
+
+def _staging_part(script):
+    """The shell lines that copy the installers from the ISO into C:\\PegaProx."""
+    start = script.index('PEGADIR=')
+    return script[start:script.index('SYSTEM_HIVE=', start)]
+
+
+def _first_boot_command(script):
+    """The command line the first-boot service runs, as Windows will receive it."""
+    service = _embedded_python(script)[1]
+    fragment = service[service.index('cmdline = ('):]
+    fragment = fragment[:fragment.index('\n)\n') + 3]
+    scope = {}
+    exec(fragment, scope)
+    return scope['cmdline']
+
+
+def test_the_guest_agent_installer_is_staged_from_the_iso(resolved_node, tmp_path):
+    """virtio-win ships the agent as guest-agent/qemu-ga-x86_64.msi. Checked against
+    0.1.302: virtio-win-gt-x64.msi names vioscsi and blnsvr and never qemu-ga."""
+    import subprocess
+    calls, _ = resolved_node
+    v2p._inject_virtio_drivers(_Manager(), _Task())
+
+    iso = tmp_path / 'iso'
+    (iso / 'guest-agent').mkdir(parents=True)
+    (iso / 'virtio-win-gt-x64.msi').write_bytes(b'drivers')
+    (iso / 'guest-agent' / 'qemu-ga-x86_64.msi').write_bytes(b'agent')
+    (tmp_path / 'win' / 'Windows').mkdir(parents=True)
+    done = subprocess.run(
+        ['bash', '-c', _staging_part(_injection_script(calls))], capture_output=True,
+        text=True, env={'PATH': '/usr/bin:/bin', 'ISO_MNT': str(iso),
+                        'WIN_MNT': str(tmp_path / 'win'), 'WDIR': 'Windows'})
+
+    assert 'AGENT_STAGED qemu-ga-x86_64.msi' in done.stdout, done.stdout + done.stderr
+    assert (tmp_path / 'win' / 'PegaProx' / 'qemu-ga-x86_64.msi').read_bytes() == b'agent'
+
+
+def test_an_iso_without_the_agent_says_so(resolved_node, tmp_path):
+    import subprocess
+    calls, _ = resolved_node
+    v2p._inject_virtio_drivers(_Manager(), _Task())
+
+    iso = tmp_path / 'iso'
+    iso.mkdir()
+    (iso / 'virtio-win-gt-x64.msi').write_bytes(b'drivers')
+    (tmp_path / 'win' / 'Windows').mkdir(parents=True)
+    done = subprocess.run(
+        ['bash', '-c', _staging_part(_injection_script(calls))], capture_output=True,
+        text=True, env={'PATH': '/usr/bin:/bin', 'ISO_MNT': str(iso),
+                        'WIN_MNT': str(tmp_path / 'win'), 'WDIR': 'Windows'})
+
+    assert 'AGENT_MISSING' in done.stdout
+    assert 'MSI_STAGED virtio-win-gt-x64.msi' in done.stdout
+
+
+def test_the_first_boot_service_installs_the_agent_after_the_drivers(resolved_node):
+    """The agent talks over the VirtIO serial port, whose driver the first MSI installs."""
+    calls, _ = resolved_node
+    v2p._inject_virtio_drivers(_Manager(), _Task())
+
+    command = _first_boot_command(_injection_script(calls))
+    drivers = command.index('msiexec /i "C:\\PegaProx\\virtio-win-gt-x64.msi"')
+    agent = command.index('msiexec /i "C:\\PegaProx\\qemu-ga-x86_64.msi"')
+    removes_itself = command.index('sc delete PegaProxFirstBoot')
+    assert drivers < agent < removes_itself
+    assert 'if exist "C:\\PegaProx\\qemu-ga-x86_64.msi"' in command
+    assert '(del "C:\\PegaProx\\qemu-ga-x86_64.msi" 2>nul)' in command
+
+
+def test_what_was_staged_reaches_the_migration_log(node_calls):
+    calls, answers = node_calls
+    answers['pvesm path'] = (0, '/dev/zvol/tank/vm-100-disk-0\n', '')
+    answers['pvesm status'] = (0, 'zfspool\n', '')
+    answers['bash /tmp/v2p-virtio-inject-'] = (
+        0, 'MSI_STAGED virtio-win-gt-x64.msi\nAGENT_STAGED qemu-ga-x86_64.msi\n'
+           'HIVEX have_viostor=True have_vioscsi=True\nINJECTION_OK\n', '')
+    task = _Task()
+    v2p._inject_virtio_drivers(_Manager(), task)
+    assert '[VirtIO] AGENT_STAGED qemu-ga-x86_64.msi' in task.lines
+
+
+# ---------------------------------------------------------------------------
 # The scripts are built from strings, so nothing else checks their syntax
 # ---------------------------------------------------------------------------
 
