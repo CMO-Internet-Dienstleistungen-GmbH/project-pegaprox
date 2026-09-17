@@ -24,6 +24,7 @@ import json
 import logging
 import re
 import shlex
+import threading
 import time
 
 from pegaprox.core import hyperv_cpu, hyperv_db, hyperv_preflight, hyperv_transfer
@@ -1183,6 +1184,12 @@ def _preflight_gate(task, source, target, detail, guid):
         return f'The source VM is not in a state its disks can be read from: {reason}'
 
     available = _target_free_bytes(target, task.target_node, task.target_storage)
+    images = _guest_images_now(source, task)
+    inspection = _inspection_now(source, task)
+    # Kept for the driver injection, which runs half an hour later on the node and sees
+    # only the partition it mounted. Without this it read its own "no Windows directory"
+    # as "not a Windows guest", on a disk this check had just found Windows on.
+    task.guest_windows = guest_is_windows(images, inspection)
     report = hyperv_preflight.run_preflight(
         detail,
         {'available_bytes': available},
@@ -1190,8 +1197,8 @@ def _preflight_gate(task, source, target, detail, guid):
          # Read again, and not from the cache: between the wizard and the button somebody
          # can attach one of these disks, and copying an attached disk yields an image
          # that is consistent with nothing.
-         'guest_images': _guest_images_now(source, task),
-         'disk_inspection': _inspection_now(source, task),
+         'guest_images': images,
+         'disk_inspection': inspection,
          'virtio_iso': (task.config or {}).get('virtio_iso_path') or '',
          'start_after': wants_start_after(task),
          # The name this run is about to create the VM under. Checking it here is the
@@ -1216,6 +1223,21 @@ def _preflight_gate(task, source, target, detail, guid):
         return why
 
     task.log(f'Preflight passed with {len(report.warnings)} warning(s)')
+    return None
+
+
+def guest_is_windows(images, inspection):
+    """What the source said about the guest: True, False, or None when it could not tell.
+
+    False only on positive evidence — the disks were mounted, their volumes were looked at,
+    and none of them holds Windows. A disk `Get-WindowsImage` could not read looks exactly
+    like a Linux disk from there, so that alone is not an answer.
+    """
+    volumes = hyperv_preflight.inspected_volumes(inspection)
+    if hyperv_preflight.windows_disk(images) or any(v.get('windows') for v in volumes):
+        return True
+    if volumes and (inspection or {}).get('inspected'):
+        return False
     return None
 
 
@@ -1774,10 +1796,10 @@ def _inject_drivers_if_asked(task, target, new_vmid, volumes, detail):
     taught to look elsewhere; that keeps the shared function unaware of which direction
     called it.
 
-    Returns None when there is nothing to report, or a line for the log.
+    Returns None when there is nothing to report, or a line for the log. A failure also
+    leaves `completion_problem` on the task, which is what keeps the run from being
+    reported as a plain success.
     """
-    from pegaprox.core import v2p
-
     if target_hardware(task.config)['hardware'] != 'virtio':
         # No drivers wanted — but the disk still has to be made bootable on a platform the
         # guest was not shut down on. A guest that shut down with Fast Startup left a saved
@@ -1794,42 +1816,103 @@ def _inject_drivers_if_asked(task, target, new_vmid, volumes, detail):
             _clear_hibernation(task, target, new_vmid)
         return None
 
-    class _InjectionView:
-        """What v2p's injection reads, filled from a Hyper-V migration."""
-        install_virtio_drivers = True
+    view, ok = _run_offline_injection(task, target, new_vmid)
+    if ok:
+        return None
 
-        def __init__(self, inner, vmid):
-            self.proxmox_vmid = vmid
-            self.target_node = inner.target_node
-            self.target_storage = inner.target_storage
-            self.config = inner.config or {}
-            self.virtio_iso_path = (inner.config or {}).get('virtio_iso_path', '') or ''
-            #: Why the injection did not happen, when it did not. Read off the log lines
-            #: rather than a return value: the injection is shared with the VMware
-            #: direction and returns a plain bool, and widening that would change a
-            #: function four other call sites depend on. The markers are written by the
-            #: same repository and are pinned by tests.
-            self.refused_for_signature = False
-            #: There is no Windows on this disk. A Linux guest carries VirtIO in its
-            #: kernel and wants the VirtIO hardware it was given, so this is the one
-            #: failure that must not send the VM back to the compatible controller.
-            self.guest_is_not_windows = False
-            self._inner = inner
+    known = getattr(task, 'guest_windows', None)
+    if view.guest_is_not_windows and known is False:
+        # Nothing was injected because there was nothing to inject into, and the source said
+        # the same before the copy. A Linux guest has VirtIO in its kernel, so the hardware
+        # it was given is the hardware it wants.
+        return ('No Windows installation was found on the disk, and the checks before the '
+                'copy found none either, so no drivers were injected. The VM keeps the '
+                'VirtIO hardware it was created with, which a Linux guest boots from.')
 
-        def log(self, message):
-            text = str(message)
-            if 'BOOT_SIGNATURE_MISSING vioscsi' in text:
-                self.refused_for_signature = True
-            # The release guard refused before anything was written. Same consequence as a
-            # missing signature — the guest has no VirtIO storage driver — so the VM has to
-            # go back to hardware it can boot on, and the same flag carries it there.
-            if 'REFUSED_DRIVER_RELEASE' in text:
-                self.refused_for_signature = True
-            if 'NO_WINDOWS_DIR' in text:
-                self.guest_is_not_windows = True
-            self._inner.log(text)
+    # The VM was built on VirtIO because that is what was asked for, and the drivers that
+    # would let it start from VirtIO are not in it. Whatever the reason, the machine as
+    # configured does not boot. Moving it back to the compatible controller is the
+    # difference between a machine that starts and one that does not, and nothing has
+    # started it yet, so it can still be moved.
+    if view.refused_for_signature:
+        reason = ('This guest\'s Windows version has no VirtIO driver that its loader would '
+                  'accept as a boot driver')
+    elif view.guest_is_not_windows and known:
+        # The contradiction is the finding: Windows is on this disk, and the injection
+        # looked somewhere else. Reporting it as a Linux guest is what left a Windows VM on
+        # VirtIO without drivers, booting into recovery.
+        reason = (f'The driver injection found no Windows directory on the partition it '
+                  f'mounted ({view.windows_partition or "unknown"}), although the checks '
+                  f'before the copy found Windows on this disk')
+    elif view.guest_is_not_windows:
+        reason = ('The driver injection found no Windows directory, and nothing read before '
+                  'the copy could say whether this guest is Windows')
+    else:
+        reason = 'The VirtIO drivers could not be injected'
+    moved = _move_to_compatible_hardware(task, target, new_vmid, volumes, detail)
+    _record_injection_failure(task, reason, moved)
+    retry = ('Fix the cause, shut the VM down and use "Retry driver injection" on this '
+             'migration; it moves the VM back to VirtIO once the drivers are in.')
+    if moved:
+        return (f'{reason}, so the VM was built on its compatible controller instead and '
+                f'boots as it is. See the log above for the reason. {retry}')
+    task.target_unbootable = True
+    return (f'{reason}, and the VM could not be moved back to the compatible controller. '
+            f'It will not start as configured - change the disk controller to SATA before '
+            f'starting it.')
 
-    view = _InjectionView(task, new_vmid)
+
+class _InjectionView:
+    """What v2p's injection reads, filled from a Hyper-V migration."""
+    install_virtio_drivers = True
+
+    def __init__(self, inner, vmid):
+        self.proxmox_vmid = vmid
+        self.target_node = inner.target_node
+        self.target_storage = inner.target_storage
+        self.config = inner.config or {}
+        self.virtio_iso_path = (inner.config or {}).get('virtio_iso_path', '') or ''
+        #: Why the injection did not happen, when it did not. Read off the log lines
+        #: rather than a return value: the injection is shared with the VMware
+        #: direction and returns a plain bool, and widening that would change a
+        #: function four other call sites depend on. The markers are written by the
+        #: same repository and are pinned by tests.
+        self.refused_for_signature = False
+        #: The injection mounted a partition and found no Windows directory on it. That is
+        #: what a Linux guest looks like - and what a Windows guest looks like when the
+        #: wrong partition was mounted. Which of the two is decided by the caller, against
+        #: what the source said before the copy.
+        self.guest_is_not_windows = False
+        #: The partition the injection mounted, for the message that has to name it.
+        self.windows_partition = ''
+        self._inner = inner
+
+    def log(self, message):
+        text = str(message)
+        if 'BOOT_SIGNATURE_MISSING vioscsi' in text:
+            self.refused_for_signature = True
+        # The release guard refused before anything was written. Same consequence as a
+        # missing signature — the guest has no VirtIO storage driver — so the VM has to
+        # go back to hardware it can boot on, and the same flag carries it there.
+        if 'REFUSED_DRIVER_RELEASE' in text:
+            self.refused_for_signature = True
+        if 'NO_WINDOWS_DIR' in text:
+            self.guest_is_not_windows = True
+        found = re.search(r'WIN_PART=(\S+)', text)
+        if found:
+            self.windows_partition = found.group(1)
+        self._inner.log(text)
+
+
+def _run_offline_injection(task, target, vmid):
+    """Run v2p's injection against the target disk. Returns (view, succeeded).
+
+    Raises `InjectionUnfinished` when the node did not report back, because then nobody
+    knows what the disk looks like and nothing may start the VM.
+    """
+    from pegaprox.core import v2p
+
+    view = _InjectionView(task, vmid)
     # The injection prints nothing until its script has ended, which on a slow disk is
     # minutes of a log that looks stuck in the attaching phase.
     task.log('Injecting the VirtIO drivers into the guest disk. This runs on the node and '
@@ -1848,35 +1931,250 @@ def _inject_drivers_if_asked(task, target, new_vmid, volumes, detail):
         # Nothing is thrown away by this: `_fail` removes nothing, and the converted disks
         # stay attached and recorded. What it prevents is a migration that reads as done,
         # and a start, while the guest disk is in a state nobody has seen.
-        raise _unfinished_injection(new_vmid, task.target_node, exc) from exc
+        raise _unfinished_injection(vmid, task.target_node, exc) from exc
     task.log(f'The driver injection ended after {time.monotonic() - began:.0f} s.')
-    if ok:
-        return None
-    if view.guest_is_not_windows:
-        # Nothing was injected because there was nothing to inject into. A Linux guest has
-        # VirtIO in its kernel, so the hardware it was given is the hardware it wants.
-        return ('No Windows installation was found on the disk, so no drivers were '
-                'injected. The VM keeps the VirtIO hardware it was created with, which is '
-                'what a Linux guest wants.')
+    return view, bool(ok)
 
-    # The VM was built on VirtIO because that is what was asked for, and the drivers that
-    # would let it start from VirtIO are not in it. Whatever the reason, the machine as
-    # configured does not boot. Moving it back to the compatible controller is the
-    # difference between a machine that starts and one that does not, and nothing has
-    # started it yet, so it can still be moved.
-    reason = ('This guest\'s Windows version has no VirtIO driver that its loader would '
-              'accept as a boot driver'
-              if view.refused_for_signature else
-              'The VirtIO drivers could not be injected')
-    moved = _move_to_compatible_hardware(task, target, new_vmid, volumes, detail)
-    if moved:
-        return (f'{reason}, so the VM was built on its compatible controller instead and '
-                f'boots as it is. See the log above for the reason, and switch it to '
-                f'VirtIO once the drivers are in.')
-    return (f'{reason}, and the VM could not be moved back to the compatible controller. '
-            f'It will not start as configured - change the disk controller to SATA before '
-            f'starting it.')
 
+def _record_injection_failure(task, reason, moved):
+    """Mark the run as finished with an error, and keep what a retry needs.
+
+    The ISO is kept with the migration because the in-memory task, which holds the wizard's
+    choice, is gone after a restart — and a retry button that works only until then is one
+    nobody can rely on.
+    """
+    task.completion_problem = reason
+    migration_id = getattr(task, 'id', None)
+    if not migration_id:
+        return
+    try:
+        hyperv_db.set_post_import(
+            _conn(), migration_id,
+            injection={'failed': True, 'reason': reason, 'moved_to_compatible': bool(moved),
+                       'iso': (getattr(task, 'config', None) or {}).get('virtio_iso_path')
+                       or '',
+                       'at': time.time()})
+    except Exception:
+        logger.warning('[XHM:%s] could not record the failed injection', migration_id,
+                       exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Retrying the driver injection after the cause was fixed
+# ---------------------------------------------------------------------------
+
+#: Migrations whose retry is running in this process. Two retries on one disk would mount
+#: the same NTFS twice and write the same hive from two places.
+_retries_running: set = set()
+_retries_lock = threading.Lock()
+
+
+class _RecordedRun:
+    """The handful of task attributes a retry needs, for a migration the process forgot.
+
+    A restart empties the in-memory migration list, and the retry has to work after one:
+    a guest that booted into recovery is usually noticed the next morning, not in the
+    minute after the import.
+    """
+
+    def __init__(self, row, iso):
+        self.id = row['migration_id']
+        self.target_cluster = row.get('target_cluster') or ''
+        self.target_node = row.get('target_node') or ''
+        self.target_storage = row.get('target_storage') or ''
+        self.config = {'hardware': 'virtio', 'virtio_iso_path': iso}
+        self.log_lines = list(row.get('log_lines') or [])
+        self.status = row.get('status')
+        self.error = row.get('error')
+
+    def log(self, message):
+        from datetime import datetime
+        self.log_lines.append(f"[{datetime.now():%H:%M:%S}] {message}")
+        logger.info('[XHM:%s] %s', self.id, message)
+
+    def _broadcast_status(self):
+        try:
+            from pegaprox.utils.realtime import broadcast_sse
+            broadcast_sse('xhm_migration', {'id': self.id, 'status': self.status,
+                                            'error': self.error})
+        except Exception:                                      # noqa: BLE001
+            pass
+
+
+def retry_driver_injection(migration_id, by, *, iso=None, background=True):
+    """Run the offline driver injection again on a migration that completed with errors.
+
+    Refuses while the VM runs: the injection writes into the guest's file system, and it is
+    not shut down from here. On success the VM is moved back onto the VirtIO hardware the
+    migration was asked to build, and the migration is reported as completed. On failure
+    nothing about the VM changes; it keeps the controller it boots from.
+
+    Returns a result dict at once. The injection itself takes minutes and reports into the
+    migration's log.
+    """
+    prepared = _prepare_injection_retry(migration_id, iso)
+    if 'error' in prepared:
+        return {'success': False, 'error': prepared['error']}
+    with _retries_lock:
+        if migration_id in _retries_running:
+            return {'success': False,
+                    'error': 'A retry of this injection is already running.'}
+        _retries_running.add(migration_id)
+    work = (prepared['run'], prepared['target'], prepared['vmid'], by)
+    if background:
+        threading.Thread(target=_run_injection_retry, args=work, daemon=True).start()
+    else:
+        _run_injection_retry(*work)
+    return {'success': True, 'vmid': prepared['vmid'],
+            'message': f'The driver injection for VM {prepared["vmid"]} was started again. '
+                       f'It runs on the node and reports into this migration\'s log.'}
+
+
+def _prepare_injection_retry(migration_id, iso):
+    """Everything a retry is refused over, asked before anything runs."""
+    migration = hyperv_db.get_migration(_conn(), migration_id)
+    if migration is None:
+        return {'error': f'No such migration: {migration_id}'}
+    if migration.get('status') != hyperv_db.STATUS_COMPLETED_WITH_ERRORS:
+        return {'error': 'Only a migration that completed with errors has an injection to '
+                         'retry.'}
+    vmid = migration.get('target_vmid')
+    if not vmid:
+        return {'error': 'This migration never created a VM on the target.'}
+    target = cluster_managers.get(migration.get('target_cluster'))
+    if not target or not getattr(target, 'is_connected', False):
+        return {'error': f'Target cluster {migration.get("target_cluster")} is not '
+                         f'connected.'}
+    node = migration.get('target_node') or ''
+    base = f'https://{target.host}:{target.api_port}/api2/json/nodes/{node}/qemu/{vmid}'
+    try:
+        config = target._api_get(f'{base}/config')
+        status = target._api_get(f'{base}/status/current')
+    except Exception as exc:                                   # noqa: BLE001
+        return {'error': f'VM {vmid} could not be read: {exc}'}
+    if config.status_code != 200:
+        return {'error': f'VM {vmid} could not be read on {node}.'}
+    if not _describes_migration((config.json().get('data') or {}).get('description', ''),
+                                migration_id):
+        return {'error': f'VM {vmid} on {node} does not carry this migration\'s mark, so '
+                         f'nothing is written into its disk.'}
+    if status.status_code != 200 or \
+            (status.json().get('data') or {}).get('status') != 'stopped':
+        return {'error': f'VM {vmid} is not shut down. The injection writes into its disk, '
+                         f'so shut it down first; it is not shut down from here.'}
+
+    recorded = (migration.get('post_import') or {}).get('injection') or {}
+    chosen = (iso or recorded.get('iso') or '').strip()
+    if not chosen:
+        return {'error': 'No driver ISO is recorded for this migration. Choose one.'}
+
+    from pegaprox.globals import _xhm_migrations
+    run = _xhm_migrations.get(migration_id) or _RecordedRun(migration, chosen)
+    run.config = {**(run.config or {}), 'hardware': 'virtio', 'virtio_iso_path': chosen}
+    return {'run': run, 'target': target, 'vmid': int(vmid)}
+
+
+def _run_injection_retry(run, target, vmid, by):
+    """The retry itself. Never raises: it runs on a thread nobody joins."""
+    migration_id = run.id
+    try:
+        run.log(f'Retrying the VirtIO driver injection, requested by {by}.')
+        _set_retry_status(run, hyperv_db.STATUS_RUNNING, None)
+        try:
+            view, ok = _run_offline_injection(run, target, vmid)
+        except InjectionUnfinished as exc:
+            _end_retry(run, str(exc))
+            return
+        if not ok:
+            reason = ('The driver injection failed again; see the lines above. The VM was '
+                      'not changed and still boots from its compatible controller')
+            if view.guest_is_not_windows:
+                reason = (f'The driver injection again found no Windows directory on the '
+                          f'partition it mounted ({view.windows_partition or "unknown"}). '
+                          f'The VM was not changed')
+            _end_retry(run, reason)
+            return
+        if not _move_to_virtio_hardware(run, target, vmid):
+            _end_retry(run, 'The drivers were injected, but the VM could not be moved back '
+                            'to VirtIO. See the lines above; its disks may need attaching by '
+                            'hand')
+            return
+        try:
+            hyperv_db.set_post_import(
+                _conn(), migration_id, injection=None,
+                drivers={'confirmed': True, 'by': f'offline injection, retried by {by}',
+                         'at': time.time()})
+        except Exception:
+            logger.warning('[XHM:%s] could not record the injection', migration_id,
+                           exc_info=True)
+        run.log(f'The drivers are in and VM {vmid} is back on VirtIO. It has not been '
+                f'started.')
+        _set_retry_status(run, hyperv_db.STATUS_COMPLETED, None)
+    except Exception as exc:                                   # noqa: BLE001
+        logger.exception('[XHM:%s] injection retry failed', migration_id)
+        _end_retry(run, f'The retry stopped unexpectedly: {exc}')
+    finally:
+        with _retries_lock:
+            _retries_running.discard(migration_id)
+        _record_log(run, migration_id)
+
+
+def _end_retry(run, reason):
+    run.log(f'Retry ended with errors: {reason}.')
+    _set_retry_status(run, hyperv_db.STATUS_COMPLETED_WITH_ERRORS, reason)
+
+
+def _set_retry_status(run, status, error):
+    run.status = status
+    run.error = error
+    _broadcast(run)
+    _update_migration_row(run.id, status=status, error=(error or '')[:500])
+
+
+def _move_to_virtio_hardware(run, target, vmid):
+    """Put this migration's disks back on the VirtIO controller. True when that worked.
+
+    Only the volumes the migration recorded as its own are moved, from wherever they sit
+    now; a disk somebody attached afterwards stays where they put it. The disk the VM boots
+    from keeps being the one it boots from.
+    """
+    try:
+        response = target._api_get(
+            f'https://{target.host}:{target.api_port}'
+            f'/api2/json/nodes/{run.target_node}/qemu/{vmid}/config')
+        config = (response.json().get('data') or {}) if response.status_code == 200 else None
+    except Exception as exc:                                   # noqa: BLE001
+        run.log(f'Could not read VM {vmid}: {exc}')
+        return False
+    if config is None:
+        run.log(f'Could not read VM {vmid}.')
+        return False
+
+    migration = hyperv_db.get_migration(_conn(), run.id) or {}
+    ours = {r.get('id') for r in migration.get('created_resources') or []
+            if r.get('kind') == 'volume'}
+    slots = []
+    for key, value in config.items():
+        found = re.fullmatch(rf'{COMPATIBLE_CONTROLLER}(\d+)', key)
+        volume = str(value).split(',')[0]
+        if found and volume in ours and 'media=cdrom' not in str(value):
+            slots.append({'index': int(found.group(1)), 'volume': volume, 'key': key})
+    if not slots:
+        if any(re.fullmatch(rf'{VIRTIO_CONTROLLER}\d+', key) for key in config):
+            run.log('The disks are already on VirtIO; nothing to move.')
+            return True
+        run.log('None of this migration\'s volumes is attached on the compatible '
+                'controller, so there is nothing to move back.')
+        return False
+
+    ordered = sorted(slots, key=lambda slot: slot['index'])
+    boot = re.search(rf'order=(?:[^;]*;)*?{COMPATIBLE_CONTROLLER}(\d+)',
+                     str(config.get('boot') or ''))
+    detail = {'boot_disk_order': [int(boot.group(1))]} if boot else {}
+    extra = {} if config.get('scsihw') else {'scsihw': 'virtio-scsi-single'}
+    return _move_disks(run, target, vmid, ordered, [slot['key'] for slot in ordered],
+                       detail, VIRTIO_CONTROLLER, COMPATIBLE_NIC_MODEL, VIRTIO_NIC_MODEL,
+                       extra)
 
 
 class InjectionUnfinished(Exception):
@@ -1974,6 +2272,20 @@ def _move_to_compatible_hardware(task, target, new_vmid, volumes, detail):
     written and correct; what changes is the bus they hang on and the NIC model that went
     with the VirtIO choice.
     """
+    ordered = sorted(volumes, key=lambda volume: volume['index'])
+    current = [f"{VIRTIO_CONTROLLER}{slot}" for slot, _ in enumerate(ordered)]
+    return _move_disks(task, target, new_vmid, ordered, current, detail,
+                       COMPATIBLE_CONTROLLER, VIRTIO_NIC_MODEL, COMPATIBLE_NIC_MODEL)
+
+
+def _move_disks(task, target, new_vmid, ordered, current, detail, controller,
+                nic_from, nic_to, extra=None):
+    """Detach `current`, attach `ordered` on `controller`, rewrite the NIC model.
+
+    Shared by both directions — onto the compatible controller when the drivers are
+    missing, back onto VirtIO once they are in — so the order that Proxmox needs is written
+    down once.
+    """
     config_url = (f'https://{target.host}:{target.api_port}'
                   f'/api2/json/nodes/{task.target_node}/qemu/{new_vmid}/config')
 
@@ -1987,8 +2299,6 @@ def _move_to_compatible_hardware(task, target, new_vmid, volumes, detail):
             task.log(f'Could not change the VM hardware: {exc}')
         return False
 
-    ordered = sorted(volumes, key=lambda volume: volume['index'])
-    current = [f"{VIRTIO_CONTROLLER}{slot}" for slot, _ in enumerate(ordered)]
     # Detached first and in one call: Proxmox refuses a volume that is still attached
     # somewhere else on the same VM.
     if not post({'delete': ','.join(current)}):
@@ -2002,7 +2312,7 @@ def _move_to_compatible_hardware(task, target, new_vmid, volumes, detail):
     # instead of for a disk that is missing.
     attached, orphaned = [], []
     for slot, volume in enumerate(ordered):
-        name = f'{COMPATIBLE_CONTROLLER}{slot}'
+        name = f'{controller}{slot}'
         if post({name: volume['volume']}):
             attached.append((volume['index'], name))
             task.log(f"Re-attached {volume['volume']} as {name}")
@@ -2015,14 +2325,14 @@ def _move_to_compatible_hardware(task, target, new_vmid, volumes, detail):
                  + '. Attach them by hand or clean the migration up.')
 
     boot_disk = _boot_disk_name(attached, detail)
-    changes = {}
+    changes = dict(extra or {})
     if boot_disk:
         changes['boot'] = f'order={boot_disk}'
-    # The NIC followed the disk controller into VirtIO, and a guest without the VirtIO
-    # network driver installed comes up with no network at all.
-    nic = _current_nic_settings(target, task, new_vmid)
+    # The NIC followed the disk controller, and a guest without the matching network
+    # driver installed comes up with no network at all.
+    nic = _current_nic_settings(target, task, new_vmid, nic_from)
     for name, value in nic.items():
-        changes[name] = value.replace(f'{VIRTIO_NIC_MODEL}=', f'{COMPATIBLE_NIC_MODEL}=', 1)
+        changes[name] = value.replace(f'{nic_from}=', f'{nic_to}=', 1)
     if changes and not post(changes):
         return False
     # Not "did every call succeed" but "can this VM start": a guest missing one of its
@@ -2030,8 +2340,8 @@ def _move_to_compatible_hardware(task, target, new_vmid, volumes, detail):
     return not orphaned
 
 
-def _current_nic_settings(target, task, new_vmid):
-    """The VM's net* entries, so their model can be rewritten without losing the MAC."""
+def _current_nic_settings(target, task, new_vmid, model=VIRTIO_NIC_MODEL):
+    """The VM's net* entries on `model`, so it can be rewritten without losing the MAC."""
     try:
         response = target._api_get(
             f'https://{target.host}:{target.api_port}'
@@ -2043,7 +2353,7 @@ def _current_nic_settings(target, task, new_vmid):
         return {}
     return {name: value for name, value in data.items()
             if name.startswith('net') and name[3:].isdigit()
-            and isinstance(value, str) and value.startswith(f'{VIRTIO_NIC_MODEL}=')}
+            and isinstance(value, str) and value.startswith(f'{model}=')}
 
 #: Every value the target VM is created with that the operator can decide instead.
 #: The source's own value is the suggestion, never the silent answer: the wizard renders
@@ -2481,8 +2791,27 @@ def _finish(task, migration_id, new_vmid):
     """
     task.progress = 100
     task.set_phase('completed')
-    _update_migration_row(migration_id, phase='completed', status=hyperv_db.STATUS_COMPLETED,
-                     progress=100, completed_at=time.time())
+    problem = getattr(task, 'completion_problem', None)
+    if problem:
+        # Every phase ran, so the timeline is complete - but a guest that did not get what
+        # was asked for is not a success, and green said it was.
+        task.status = hyperv_db.STATUS_COMPLETED_WITH_ERRORS
+        task.error = problem
+        _broadcast(task)
+        _update_migration_row(migration_id, phase='completed',
+                              status=hyperv_db.STATUS_COMPLETED_WITH_ERRORS,
+                              error=str(problem)[:500], progress=100,
+                              completed_at=time.time())
+        task.log(f'Migration completed with errors: {problem}.')
+    else:
+        _update_migration_row(migration_id, phase='completed',
+                              status=hyperv_db.STATUS_COMPLETED, progress=100,
+                              completed_at=time.time())
+    if getattr(task, 'target_unbootable', False):
+        task.log(f'VMID {new_vmid} on {task.target_node} was not started: it cannot boot '
+                 f'as it is configured. The Hyper-V source is untouched.')
+        _record_log(task, migration_id)
+        return
     if wants_start_after(task):
         task.log(f'Migration complete. The Hyper-V source is untouched; starting VMID '
                  f'{new_vmid} on {task.target_node}.')
@@ -2493,6 +2822,13 @@ def _finish(task, migration_id, new_vmid):
              f'{task.target_node} has not been started.')
     # Last line first: the log is filed once everything that belongs in it has been said.
     _record_log(task, migration_id)
+
+
+def _broadcast(task):
+    """Tell the open lists about a status change that did not come from `set_phase`."""
+    announce = getattr(task, '_broadcast_status', None)
+    if callable(announce):
+        announce()
 
 
 def _fail(task, migration_id, reason):
