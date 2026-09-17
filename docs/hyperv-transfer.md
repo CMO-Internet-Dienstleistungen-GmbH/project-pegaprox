@@ -15,7 +15,7 @@ product or the load it is under.
 | Virtual size and physical size told apart, both ends | **Measured** — a 64 GiB disk holding 256 MiB, and the same disk holding 4 GiB |
 | Memory of the converting process against disk size | **Measured** — ~24 MiB either way |
 | Memory and output kept by PegaProx while it watches | **Measured and locked** — the peak does not grow between 2 000 progress reads and 200 000 (`test_a_hundred_times_the_progress_costs_no_more_memory`) |
-| Remote calls against disk size | **Measured and locked** — 7 per run at 40 GiB and at 4 TiB (`test_one_disk_costs_these_seven_calls_and_no_others`) |
+| Remote calls against disk size | **Measured and locked** — 8 per run at 40 GiB and at 4 TiB (`test_one_disk_costs_these_eight_calls_and_no_others`) |
 | A target that runs out of room | **Measured** — non-zero exit, the byte it stopped at, partial volume freed. The wording differs by target type, see below |
 | An interrupted conversion and the retry after it | **Measured** — `tests/test_hyperv_xhm.py`, fresh volume per attempt |
 | `pvesm alloc`, `pvesm path` and the write into a real Proxmox volume | **Measured** — on a Proxmox VE 9.2.11 node, against a directory storage and a ZFS block storage |
@@ -131,22 +131,25 @@ Counted from the commands the runner actually issued:
 
 | Run | Commands over SSH | Mounts | Conversions |
 |---|---|---|---|
-| One disk, 40 GiB | 7 | 1 | 1 |
-| One disk, 4 TiB | 7 | 1 | 1 |
-| Two disks on one drive, 40 GiB each | 11 | 1 | 2 |
+| One disk, 40 GiB | 8 | 1 | 1 |
+| One disk, 4 TiB | 8 | 1 | 1 |
+| Two disks on one drive, 40 GiB each | 12 | 1 | 2 |
 
 Every figure in that table is asserted, not observed once:
-`test_one_disk_costs_these_seven_calls_and_no_others` names the seven in order,
-`test_two_disks_on_one_drive_cost_eleven_calls_and_one_mount` holds the eleven and the
+`test_one_disk_costs_these_eight_calls_and_no_others` names the eight in order,
+`test_two_disks_on_one_drive_cost_twelve_calls_and_one_mount` holds the twelve and the
 single mount, and `test_the_number_of_remote_calls_does_not_depend_on_the_disk` holds the
-part that matters most — that a disk a hundred times the size costs the same seven.
+part that matters most — that a disk a hundred times the size costs the same eight.
 
-The seven are: mount the share, check the file is readable and read its size, allocate the
-volume, resolve the volume's device path, convert, unmount, remove the credentials file.
+The eight are: ask the target storage what type it is, mount the share, check the file is
+readable and read its size, allocate the volume, resolve the volume's device path, convert,
+unmount, remove the credentials file.
 Writing that credentials file is one further command, issued once when the connection to
 the node is opened and counted separately here because the measurement replaces that step.
-A disk a hundred times the size costs the same seven, because the node is told once what to
-convert and then only watched. A second disk on the same drive costs four more and **no
+An LVM-thin storage costs a ninth, which asks whether its pool zeroes the blocks it
+provisions; only then are the empty regions of a VHDX left unwritten
+(`TestEmptyRegionsOnAThinPool`). A disk a hundred times the size costs the same eight,
+because the node is told once what to convert and then only watched. A second disk on the same drive costs four more and **no
 second mount** — the share is mounted per share, not per disk.
 
 The credentials never appear in any of those commands. The file is created with
