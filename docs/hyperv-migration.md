@@ -325,19 +325,17 @@ successful migration. That is what keeps step 2 possible at all.
 ## When an import fails
 
 A failed import leaves what it had already created: a VM shell, and volumes at
-full size. They are recorded, listed per migration, and they block a second
-attempt on that VM — starting again would copy the same disks into a second set
-of volumes and fill the storage with copies nobody can tell apart afterwards.
-
-Two ways forward, both a person's decision:
+full size. They are recorded and listed per migration. They do not block a new
+attempt on that VM: a new import allocates its own volumes next to them, and
+what happens to the old ones is a person's decision:
 
 - **Remove them.** The wizard offers it per migration, asks a second time, and
   names what it will delete. It verifies that the target VM still carries that
   migration's mark before deleting anything: a VMID is not ownership, and
   between a failed import and a cleanup that number can have been given to an
   unrelated guest.
-- **Keep them deliberately**, for example to look at a half-converted disk. The
-  VM stays blocked for a new import until they are gone.
+- **Keep them**, for example to look at a half-converted disk. They cost
+  storage until they are removed.
 
 Cleanup never touches the Hyper-V source.
 

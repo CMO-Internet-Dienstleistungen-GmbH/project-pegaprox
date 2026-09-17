@@ -654,14 +654,9 @@ def wants_start_after(task) -> bool:
 def refuse_hyperv_start(source_cluster_id, source_vmid, options=None):
     """Why this VM may not be started now, or None.
 
-    Two reasons, and they are different failures with the same shape. A live claim means
-    somebody else is already moving this VM. Leftovers mean an earlier attempt created
-    things on the target that nobody has looked at: starting again would allocate a second
-    set of volumes for the same disks, and the storage would fill with copies whose origin
-    nobody can reconstruct.
-
-    Neither is resolved by trying harder. The first ends by itself, the second needs a
-    person to decide what happens to what the last attempt left behind.
+    A live claim means somebody else is already moving this VM. What an earlier attempt
+    left on the target does not stop a new one: whether to keep, reuse or remove it is the
+    operator's call, and "Clean up target" is there for when they want it gone.
     """
     for name, reason in _REFUSED_OPTIONS.items():
         if (options or {}).get(name):
@@ -676,25 +671,10 @@ def refuse_hyperv_start(source_cluster_id, source_vmid, options=None):
         return None
 
     try:
-        conn = _conn()
-        holder = hyperv_db.active_claim(conn, source_cluster_id, guid)
+        holder = hyperv_db.active_claim(_conn(), source_cluster_id, guid)
         if holder:
             return (f'Migration {holder["migration_id"]} is already moving this VM. '
                     f'Wait for it to finish, or cancel it.')
-
-        for migration in hyperv_db.migrations_for_cluster(conn, source_cluster_id):
-            if migration['source_vm_guid'] != guid:
-                continue
-            if migration['status'] not in (hyperv_db.STATUS_FAILED,
-                                           hyperv_db.STATUS_INTERRUPTED):
-                continue
-            leftovers = _leftovers_that_still_exist(migration)
-            if leftovers:
-                what = ', '.join(f'{r.get("kind")} {r.get("id")}' for r in leftovers[:4])
-                return (f'Migration {migration["migration_id"]} failed and left '
-                        f'{len(leftovers)} resource(s) on the target ({what}). Remove them '
-                        f'or keep them deliberately before starting again, so the same '
-                        f'disks are not copied twice.')
     except Exception:
         # A bookkeeping failure must not become a migration nobody can start. It is logged
         # and the start proceeds, which is the same position the product was in before.
@@ -706,91 +686,6 @@ def refuse_hyperv_start(source_cluster_id, source_vmid, options=None):
 # What the two sides call a machine that is running. Hyper-V says 'Running', Proxmox says
 # 'running', and anything else — 'Off', 'stopped', 'paused', 'Saved' — is not running.
 _RUNNING = 'running'
-
-
-def _leftovers_that_still_exist(migration) -> list:
-    """The recorded leftovers of one migration, minus the ones that are already gone.
-
-    A record is not the target. Somebody who removes a leftover disk in the Proxmox
-    interface — the obvious way to do it — used to stay blocked by a note in this
-    database, with a message naming a volume that no longer exists anywhere. So the record
-    is checked against the cluster, and what has gone is forgotten here too.
-
-    A cluster that cannot be asked keeps its leftovers: not knowing is a reason to hold
-    the block, because starting again over a disk that is still there copies it twice.
-    """
-    recorded = migration.get('created_resources') or []
-    if not recorded:
-        return []
-
-    target = cluster_managers.get(migration.get('target_cluster'))
-    if not target or not getattr(target, 'is_connected', False):
-        return recorded
-
-    node = migration.get('target_node') or ''
-    still_there, gone = [], []
-    for entry in recorded:
-        kind, identifier = entry.get('kind'), entry.get('id')
-        try:
-            if kind == 'volume':
-                present = _volume_exists(target, node, identifier)
-            elif kind == 'vm':
-                present = _vm_still_ours(target, migration, identifier)
-            else:
-                present = True
-        except Exception:
-            logger.debug('Could not verify %s %s of migration %s', kind, identifier,
-                         migration.get('migration_id'), exc_info=True)
-            present = True
-        (still_there if present else gone).append(entry)
-
-    for entry in gone:
-        try:
-            hyperv_db.forget_created_resource(_conn(), migration['migration_id'],
-                                              entry.get('kind'), entry.get('id'))
-            logger.info('[XHM] %s %s of migration %s is gone from the target; forgetting it',
-                        entry.get('kind'), entry.get('id'), migration['migration_id'])
-        except Exception:
-            logger.warning('Could not forget %s %s', entry.get('kind'), entry.get('id'),
-                           exc_info=True)
-    return still_there
-
-
-def _vm_still_ours(target, migration, vmid) -> bool:
-    """Is that VM still there and still this migration's?
-
-    Deliberately not `_is_our_target_vm`, which answers False when it could not ask at
-    all. Here that difference decides whether a record is deleted, and "I could not
-    reach the cluster" must never be read as "it is gone".
-    """
-    node = migration.get('target_node') or ''
-    response = target._api_get(
-        f'https://{target.host}:{target.api_port}'
-        f'/api2/json/nodes/{node}/qemu/{vmid}/config')
-    if response.status_code == 404:
-        return False
-    if response.status_code != 200:
-        return True
-    description = (response.json().get('data') or {}).get('description', '')
-    # A VMID that now carries somebody else's guest is not this migration's leftover
-    # either — the number was reused, and blocking on it would be blocking on a stranger.
-    return _describes_migration(description, migration['migration_id'])
-
-
-def _volume_exists(target, node, volid) -> bool:
-    """Is this volume still on the storage it was allocated on?"""
-    if not volid or ':' not in str(volid):
-        return True
-    storage = str(volid).split(':', 1)[0]
-    response = target._api_get(
-        f'https://{target.host}:{target.api_port}'
-        f'/api2/json/nodes/{node}/storage/{storage}/content?content=images')
-    if response.status_code != 200:
-        # Asked and not answered. Treated as still there, for the same reason a cluster
-        # that cannot be reached keeps its leftovers.
-        return True
-    return any((item.get('volid') or '') == volid
-               for item in (response.json().get('data') or []))
 
 
 def refuse_source_start(source_cluster_id, source_vmid):
@@ -1136,12 +1031,10 @@ def recorded_migrations(already_listed=None) -> list[dict]:
 
 
 def forget_recorded_migration(migration_id) -> dict:
-    """Take one finished migration off the record. Refuses while it still holds something.
+    """Take one finished migration off the record. Refuses only while it still runs.
 
-    Dismissing a row is about the list, not about the target — so a migration that still
-    has a VM or a volume on the cluster keeps its record, because that record is what
-    stops the next attempt from copying the same disks twice. What is already gone from
-    the cluster is not counted: the check asks the cluster, not the note.
+    Dismissing a row is about the list, not about the target: whatever the migration
+    created on the cluster stays where it is, and nothing here asks about it.
     """
     try:
         migration = hyperv_db.get_migration(_conn(), migration_id)
@@ -1157,15 +1050,6 @@ def forget_recorded_migration(migration_id) -> dict:
         return {'forgotten': False,
                 'error': 'This migration is still running. Cancel it and let it stop '
                          'before taking it off the list.'}
-
-    leftovers = _leftovers_that_still_exist(migration)
-    if leftovers:
-        what = ', '.join(f'{r.get("kind")} {r.get("id")}' for r in leftovers[:4])
-        return {'forgotten': False,
-                'error': f'This migration still has {len(leftovers)} resource(s) on the '
-                         f'target ({what}). Clean the target up or remove them yourself; '
-                         f'until then the record is what keeps the next attempt from '
-                         f'copying the same disks a second time.'}
 
     try:
         hyperv_db.delete_migration(_conn(), migration_id)
