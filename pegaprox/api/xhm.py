@@ -3,6 +3,7 @@
 Endpoints for Proxmox <-> XCP-ng <-> ESXi migration.
 """
 
+import logging
 import threading
 import uuid
 from datetime import datetime, timedelta
@@ -249,6 +250,139 @@ def _xhm_reachable(t):
 @require_auth(perms=['vm.migrate'])
 def xhm_list():
     return jsonify([t.to_dict() for t in _xhm_migrations.values() if _xhm_reachable(t)])
+
+
+@bp.route('/api/xhm/migrations', methods=['DELETE'])
+@require_auth(perms=['vm.migrate'])
+def xhm_dismiss_finished():
+    """Take every finished migration off the list. Running ones are left alone.
+
+    The list is where an operator reads what happened, and the log of the one they picked
+    is rendered under it. An entry they have already read and acted on is in the way of
+    the next one, and nothing in the product could put it away — it left on a timer, six
+    hours later.
+
+    This removes a record of a run that is over. It removes nothing on either hypervisor:
+    no VM, no disk, no volume. What a failed run left behind on the target is a separate
+    question with its own answer, and dropping the entry here does not touch it.
+    """
+    with _xhm_lock:
+        finished = [mid for mid, task in _xhm_migrations.items()
+                    if task.status != 'running' and _xhm_reachable(task)]
+
+    # A migration can also be recorded somewhere that outlives this process, and then the
+    # entry comes back on the next page load unless that record goes too. The record is
+    # asked first: the log lives only in the in-memory entry, so dropping that entry for a
+    # record that stays would bring the row back without the log it had a moment ago.
+    removed, refused = [], {}
+    for mid, why in _forget_recorded(None):
+        if why is None:
+            removed.append(mid)
+        else:
+            refused[mid] = why
+
+    with _xhm_lock:
+        for mid in finished:
+            task = _xhm_migrations.get(mid)
+            if mid in refused or task is None or task.status == 'running':
+                continue
+            del _xhm_migrations[mid]
+            if mid not in removed:
+                removed.append(mid)
+
+    kept = [{'id': mid, 'reason': why} for mid, why in refused.items()]
+    return jsonify({'removed': removed, 'count': len(removed), 'kept': kept})
+
+
+@bp.route('/api/xhm/migrations/<mid>', methods=['DELETE'])
+@require_auth(perms=['vm.migrate'])
+def xhm_dismiss(mid):
+    """Take one finished migration off the list.
+
+    A running migration is refused rather than ignored: dropping its record would leave a
+    transfer writing to a target with nothing on screen saying so.
+    """
+    if mid not in _xhm_migrations:
+        # After a restart a migration can be on the list without being in this process:
+        # the list also shows what a durable record remembers. Answering 404 here made
+        # exactly those rows impossible to dismiss.
+        answers = list(_forget_recorded(mid))
+        if not answers:
+            return jsonify({'error': 'Migration not found'}), 404
+        why = answers[0][1]
+        if why is not None:
+            return jsonify({'error': why, 'kept': [{'id': mid, 'reason': why}]}), 409
+        return jsonify({'removed': [mid], 'count': 1})
+    if not _xhm_reachable(_xhm_migrations[mid]):
+        return jsonify({'error': 'Migration not found'}), 404
+    with _xhm_lock:
+        task = _xhm_migrations.get(mid)
+        if task is None:
+            return jsonify({'error': 'Migration not found'}), 404
+        if task.status == 'running':
+            return jsonify({'error': 'This migration is still running. Cancel it first, or '
+                                     'wait for it to finish.'}), 409
+
+    for _, why in _forget_recorded(mid):
+        if why is not None:
+            # The entry stays, and with it the log: that lives only here, and a record
+            # that stayed would bring the row back on the next load without it.
+            return jsonify({'error': why, 'kept': [{'id': mid, 'reason': why}]}), 409
+    with _xhm_lock:
+        _xhm_migrations.pop(mid, None)
+    return jsonify({'removed': [mid], 'count': 1})
+
+
+def _forget_recorded(mid):
+    """Ask whoever keeps durable migration records to drop one, or all finished ones.
+
+    Yields `(migration_id, reason_it_stayed)` — `None` as the reason means it went. A
+    product without such records answers with nothing at all, which is why this is written
+    as an optional import rather than a dependency.
+    """
+    try:
+        from pegaprox.core.hyperv_xhm import forget_recorded_migration, recorded_migrations
+    except ImportError:
+        return
+
+    # Only what the caller may see on the list may be dismissed from it — the same rule
+    # for one entry and for all of them, so "clear finished" cannot reach records of a
+    # cluster this account has no access to.
+    try:
+        rows = [row for row in recorded_migrations(()) if _may_dismiss_record(row)]
+    except Exception:
+        logging.warning('Could not read the recorded migrations', exc_info=True)
+        return
+    if mid:
+        targets = [row.get('id') for row in rows if row.get('id') == mid]
+    else:
+        targets = [row.get('id') for row in rows if row.get('status') != 'running']
+    for target in targets:
+        if not target:
+            continue
+        try:
+            answer = forget_recorded_migration(target)
+        except Exception:
+            logging.warning('Could not forget the record of migration %s', target,
+                            exc_info=True)
+            # No answer is not a yes: the record may well still be there.
+            yield target, 'The migration record could not be removed.'
+            continue
+        yield target, (None if answer.get('forgotten') else answer.get('error'))
+
+
+def _may_dismiss_record(row):
+    """Whether the caller may take a recorded migration off the list.
+
+    A record carries no live task to ask `_xhm_reachable`, so the cluster-level check on
+    its source is asked instead. Anything that goes wrong answers no: a record nobody can
+    place is not one to delete.
+    """
+    try:
+        allowed, _ = check_cluster_access(row.get('source_cluster') or '')
+        return bool(allowed)
+    except Exception:
+        return False
 
 
 @bp.route('/api/xhm/migrations/<mid>', methods=['GET'])
