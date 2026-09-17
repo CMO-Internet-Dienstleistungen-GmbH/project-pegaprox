@@ -2246,3 +2246,32 @@ class TestTheRecordKeepsTheLog:
         assert row['log_lines'][-1].endswith('name invalid format')
         # The timeline is not reconstructed — it lived in the process.
         assert row['phase_times'] == {}
+
+
+class TestTheSidebarCanLeaveAHypervHost:
+    """The Hyper-V host view comes before every sidebar view in the dashboard's render
+    chain, and the upstream sidebar buttons clear the other selections but know nothing
+    of this one. With a host open, "Hypervisor Migration" in the sidebar switched the
+    view on underneath it and nothing visible happened; only the host's own migrate
+    button, which clears the host itself, reached the page."""
+
+    @staticmethod
+    def _dashboard():
+        import os
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(repo, 'web', 'src', 'dashboard.js'), encoding='utf-8') as fh:
+            return fh.read()
+
+    def test_the_host_view_still_ranks_above_the_migration_view(self):
+        """The premise of the fix: if this order ever changes, the effect is moot."""
+        web = self._dashboard()
+        assert web.index(') : selectedHyperV ? (') < web.index(') : sidebarXHM ? (')
+
+    def test_choosing_a_sidebar_view_clears_the_selected_host(self):
+        import re
+        web = self._dashboard()
+        effects = re.findall(r'useEffect\(\(\) => \{([^}]*setSelectedHyperV\(null\)[^}]*)\}, \[([^\]]*)\]\);',
+                             web)
+        views = ('sidebarXHM', 'sidebarTopology', 'sidebarWorldmap', 'sidebarMultiSdn')
+        assert any(all(v in body and v in deps for v in views) for body, deps in effects), (
+            'no effect clears the Hyper-V host when a sidebar view is chosen')
