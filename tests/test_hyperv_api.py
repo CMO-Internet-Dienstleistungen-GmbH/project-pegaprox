@@ -170,6 +170,9 @@ def test_no_hyperv_route_can_change_the_source_beyond_preparing_it(api):
         ('/api/hyperv/target-virtio-isos/download', 'POST'),
         ('/api/hyperv/<cluster_id>/migrations/<migration_id>/drivers', 'POST'),
         ('/api/hyperv/<cluster_id>/migrations/<migration_id>/profile', 'POST'),
+        # Writes the VirtIO drivers into the imported VM's disk again, on the target node,
+        # and only while that VM is shut down. The source is not part of it.
+        ('/api/hyperv/<cluster_id>/migrations/<migration_id>/retry-injection', 'POST'),
         # Registering, editing and removing a source. These write PegaProx's own record of
         # which hosts exist -- a Hyper-V host is a migration source, not a cluster, so it is
         # managed here rather than through /api/clusters (docs/adr/0001). None of them
