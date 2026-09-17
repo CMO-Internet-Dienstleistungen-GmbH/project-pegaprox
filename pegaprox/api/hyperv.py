@@ -812,6 +812,9 @@ def hyperv_vm_preflight(cluster_id, vmid):
         # DNS name and refuses an underscore -- from the create call, which happens after
         # the disks have been converted.
         'target_name': (data.get('target_name') or '').strip(),
+        # Whether the copy comes up by itself, so the warning about a second machine with
+        # the original's hostname and MAC answers for the box the operator sees.
+        'start_after': data.get('start_after', True),
         # Which driver ISO was chosen, so the release rule is answered here instead of on
         # the node — where it would only be answered after the disks were converted.
         'virtio_iso': _iso_under_test(data.get('virtio_iso')),

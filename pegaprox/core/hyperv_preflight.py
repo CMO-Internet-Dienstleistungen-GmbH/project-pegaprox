@@ -359,10 +359,10 @@ def check_mac_addresses(adapters: list[dict]) -> Finding:
 def check_start_after(requested: bool) -> Finding:
     """Whether the imported VM will come up by itself, and what that costs.
 
-    Off is the safe answer and the default, but it is not the right answer for every
-    migration — a maintenance window where the source has just been shut down for good is
-    exactly when starting the copy immediately is what somebody wants. So this reports
-    rather than refuses.
+    On is the default, as in every other direction: a maintenance window where the source
+    has just been shut down for good is exactly when starting the copy immediately is what
+    somebody wants. It is not the right answer for every migration, so this reports rather
+    than refuses, and the operator can switch it off.
 
     What it reports is the one thing that is easy to forget at that moment: the source has
     not been deleted, it is off. Two machines with one hostname and one MAC on one network
@@ -649,7 +649,7 @@ def run_preflight(vm: dict, target: dict, options: dict | None = None) -> Prefli
     report.add(check_vlan_mapping(vm.get('network_adapters') or [],
                                   options.get('vlan_map') or {}))
     report.add(check_mac_addresses(vm.get('network_adapters') or []))
-    report.add(check_start_after(bool(options.get('start_after'))))
+    report.add(check_start_after(bool(options.get('start_after', True))))
     report.add(check_secure_boot(vm.get('secure_boot_enabled'), vm.get('generation')))
     report.add(check_vtpm(vm.get('vtpm_enabled')))
     report.add(check_bitlocker(vm.get('bitlocker_state'), vm.get('vtpm_enabled')))
