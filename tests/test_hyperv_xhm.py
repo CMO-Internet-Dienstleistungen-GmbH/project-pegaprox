@@ -1956,6 +1956,57 @@ class TestAnInjectionThatDoesNotReportBack:
         assert row['created_resources']
 
 
+class TestARunWhoseInjectionFailed:
+    """A finished copy with a failed injection is neither a success nor a failure."""
+
+    @staticmethod
+    def _fail_injection(monkeypatch):
+        def fake_injection(_target, view, node_exec=None):
+            view.log('[VirtIO] WIN_PART=/dev/loop1p5')
+            view.log('[VirtIO] NO_WINDOWS_DIR')
+            return False
+
+        monkeypatch.setattr('pegaprox.core.v2p._inject_virtio_drivers', fake_injection)
+        monkeypatch.setattr(hyperv_xhm, 'guest_is_windows', lambda *a: True)
+
+    def test_it_completes_with_errors(self, db, wired, monkeypatch):
+        self._fail_injection(monkeypatch)
+        task = _run(FakeTask(config={'start_after': False, 'hardware': 'virtio'}))
+
+        assert task.phase == 'completed'
+        assert task.status == hyperv_db.STATUS_COMPLETED_WITH_ERRORS
+        assert task.error
+        row = hyperv_db.get_migration(db.conn, task.id)
+        assert row['status'] == hyperv_db.STATUS_COMPLETED_WITH_ERRORS
+        assert row['error']
+        assert any('completed with errors' in line for line in task.log_lines)
+
+    def test_it_keeps_what_a_retry_needs(self, db, wired, monkeypatch):
+        self._fail_injection(monkeypatch)
+        task = _run(FakeTask(config={'start_after': False, 'hardware': 'virtio',
+                                     'virtio_iso_path': '/isos/virtio-win.iso'}))
+
+        injection = hyperv_db.get_migration(db.conn, task.id)['post_import']['injection']
+        assert injection['iso'] == '/isos/virtio-win.iso'
+        assert injection['moved_to_compatible'] is True
+
+    def test_a_vm_moved_to_sata_is_still_started_when_asked(self, db, wired, monkeypatch):
+        _, target, _ = wired
+        self._fail_injection(monkeypatch)
+        _run(FakeTask(config={'start_after': True, 'hardware': 'virtio'}))
+
+        assert [url for url, _ in target.posts if url.endswith('/status/start')]
+
+    def test_a_vm_that_cannot_boot_is_not_started(self, db, wired, monkeypatch):
+        _, target, _ = wired
+        self._fail_injection(monkeypatch)
+        target.refuse_posts = ('sata0',)
+        task = _run(FakeTask(config={'start_after': True, 'hardware': 'virtio'}))
+
+        assert not [url for url, _ in target.posts if url.endswith('/status/start')]
+        assert any('was not started' in line for line in task.log_lines)
+
+
 class TestAGuestWhoseDriverTheLoaderRefuses:
     """What happens when the drivers cannot be made boot-critical.
 
@@ -2050,9 +2101,9 @@ class TestAGuestWhoseDriverTheLoaderRefuses:
         assert 'could not be injected' in note
         assert any('sata0' in payload for _, payload in target.posts)
 
-    def test_a_guest_that_is_not_windows_keeps_its_virtio_hardware(self, monkeypatch):
-        """A Linux guest has VirtIO in its kernel and wants what it was given."""
+    def _no_windows_dir(self, monkeypatch, guest_windows):
         def fake_injection(_target, view, node_exec=None):
+            view.log('[VirtIO] WIN_PART=/dev/loop1p5')
             view.log('[VirtIO] NO_WINDOWS_DIR')
             return False
 
@@ -2062,11 +2113,37 @@ class TestAGuestWhoseDriverTheLoaderRefuses:
         task.config = {'hardware': 'virtio'}
         task.target_node = 'node-a'
         task.target_storage = 'vmstorage'
-
+        task.guest_windows = guest_windows
         note = hyperv_xhm._inject_drivers_if_asked(task, target, 120, self._volumes(),
-                                                   {'generation': 1})
+                                                   {'generation': 2})
+        return task, target, note
+
+    def test_a_guest_that_is_not_windows_keeps_its_virtio_hardware(self, monkeypatch):
+        """A Linux guest has VirtIO in its kernel and wants what it was given."""
+        task, target, note = self._no_windows_dir(monkeypatch, guest_windows=False)
+
         assert 'No Windows installation' in note
         assert not any('sata0' in payload for _, payload in target.posts)
+        assert not getattr(task, 'completion_problem', None)
+
+    def test_a_windows_guest_whose_windows_was_not_found_is_moved_to_sata(self, monkeypatch):
+        """Measured: a 100 GB Windows partition beside a 700 GB data partition. The
+        injection mounted the data partition, found no Windows directory, and the VM was
+        left on VirtIO without drivers - booting into recovery - under a note about Linux."""
+        task, target, note = self._no_windows_dir(monkeypatch, guest_windows=True)
+
+        assert any('sata0' in payload for _, payload in target.posts)
+        assert 'Linux' not in note
+        assert '/dev/loop1p5' in note and 'found Windows' in note
+        assert task.completion_problem
+
+    def test_a_guest_nobody_could_identify_is_moved_to_sata_too(self, monkeypatch):
+        """SATA boots Linux and Windows alike; VirtIO without drivers boots only one."""
+        task, target, note = self._no_windows_dir(monkeypatch, guest_windows=None)
+
+        assert any('sata0' in payload for _, payload in target.posts)
+        assert 'Linux' not in note
+        assert task.completion_problem
 
     def test_a_volume_that_cannot_be_re_attached_is_named(self, monkeypatch):
         """After the detach it is on no controller at all, so it is gone from the VM.
