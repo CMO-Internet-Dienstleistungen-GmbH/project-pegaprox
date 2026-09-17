@@ -32,7 +32,7 @@ from pegaprox.utils.ldap import get_ldap_settings, ldap_authenticate, ldap_provi
 from pegaprox.utils.oidc import (
     get_oidc_settings, get_oidc_endpoints, oidc_build_auth_url,
     oidc_exchange_code, oidc_decode_id_token, oidc_get_user_info,
-    oidc_get_user_groups, oidc_map_groups_to_role, oidc_provision_user,
+    oidc_get_user_groups, oidc_get_user_groups_ex, oidc_map_groups_to_role, oidc_provision_user,
     oidc_derive_username,
 )
 from pegaprox.utils.rbac import get_user_permissions, DEFAULT_TENANT_ID
@@ -207,8 +207,11 @@ def oidc_callback():
         return jsonify({'error': 'Could not retrieve user information from provider'}), 401
     
     # Step 4: Get group memberships for role mapping
-    groups = oidc_get_user_groups(config, access_token)
-    role_mapping = oidc_map_groups_to_role(config, groups, id_claims)
+    # NS Sep 2026 - _ex also reports whether the group set is complete. That decides
+    # whether this login may revoke or only grant; see oidc_provision_user.
+    groups, groups_complete = oidc_get_user_groups_ex(config, access_token)
+    role_mapping = oidc_map_groups_to_role(config, groups, id_claims,
+                                           groups_complete=groups_complete)
     
     # Step 5: Provision/update local user
     if not config['auto_create_users']:
