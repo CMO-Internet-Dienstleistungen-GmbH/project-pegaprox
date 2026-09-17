@@ -184,6 +184,21 @@ patches:
     commit_message: 'fix(search): read a snapshot instead of walking every cluster live'
     requested_by: 43
 
+  # The VirtIO driver injection mapped a Ceph RBD boot disk with pool and image taken
+  # from the PVE volume id, which carries no pool, so it failed on every Ceph target
+  # for both the VMware and the Hyper-V direction. The rbd) branch is now built from
+  # `pvesm path` in a module of its own; v2p.py keeps a one-line hook in the script
+  # and an import at the end of the file. Ordered before the Hyper-V patch, which
+  # edits other parts of the same function and applies on top of this one.
+  - name: virtio-injection-rbd-target
+    branch: fix/virtio-injection-rbd-target
+    base: main
+    kind: fix
+    upstream_pr:
+    summary: 'VirtIO driver injection maps a Ceph RBD boot disk with the pool and options from pvesm path'
+    commit_message: 'fix(v2p): map the Ceph pool from pvesm path when injecting VirtIO drivers'
+    requested_by: 46
+
   # Hyper-V as a restricted migration source, per the epic in issue #15. All of
   # its phases -- connection, inventory, preflight, offline import, console --
   # belong to this one branch and this one entry; the sub-issues do not get
