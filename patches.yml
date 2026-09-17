@@ -110,20 +110,6 @@ patches:
     commit_message: 'fix(web): show why something failed, not that it failed'
     requested_by: 44
 
-  # The migration panel after something went wrong in it: the phase timeline ticked the
-  # step the run died in, and nothing could be taken off the list while the log of the
-  # selected entry is rendered below it. Ordered after toast-swallows-the-message because
-  # the dismiss path reports its refusals through addToast, and before the Hyper-V patch,
-  # which adds a cleanup button to the same rows.
-  - name: migration-list-usability
-    branch: fix/migration-list-usability
-    base: main
-    kind: fix
-    upstream_pr:
-    summary: 'A failed phase is not drawn as passed, and a finished migration can be taken off the list'
-    commit_message: 'fix(web): keep the migration list usable after a failure'
-    requested_by: 45
-
   # The health rollup is a cluster-wide number, but every tab used to compute its
   # own -- get_node_status() plus one uncached storage call per online node, per
   # request. Now it is computed once per watched cluster and pushed over the SSE
