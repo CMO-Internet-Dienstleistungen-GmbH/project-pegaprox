@@ -176,6 +176,14 @@ _SSH_COMMAND_TIMEOUT = 60
 _CREATE_TASK_TIMEOUT = 120
 _CONVERT_TIMEOUT = 24 * 3600
 
+# How long a run waits for the driver injection before it stops waiting. It does not bound
+# the injection itself: the node session keeps the script's output in a file on the node
+# (`_survives_the_caller`), so a run that gives up leaves the script to finish instead of
+# cutting it off half-way through the guest's registry. The shared injection asks for five
+# minutes, which is a guess about a step whose length depends on the guest's hives and the
+# storage under them.
+_INJECTION_TIMEOUT = 30 * 60
+
 
 # ===========================================================================
 # Planning
@@ -561,6 +569,9 @@ def _run_hyperv_to_pve(task):
 
     except TransferError as exc:
         logger.warning('[XHM:%s] transfer refused: %s', task.id, exc)
+        _fail(task, migration_id, str(exc))
+    except InjectionUnfinished as exc:
+        logger.warning('[XHM:%s] driver injection unfinished: %s', task.id, exc)
         _fail(task, migration_id, str(exc))
     except HyperVError as exc:
         logger.warning('[XHM:%s] source failure: %s', task.id, exc.kind)
@@ -1676,10 +1687,15 @@ def _clear_hibernation(task, target, new_vmid):
             self._inner.log(str(message))
 
     try:
-        with _node_session(task, target) as run_on_node:
+        with _node_session(task, target, min_timeout=_INJECTION_TIMEOUT) as run_on_node:
             v2p._inject_virtio_drivers(target, _CleanView(task, new_vmid),
                                        node_exec=run_on_node,
                                        clear_hibernation_only=True)
+    except TimeoutError as exc:
+        # The script may still be writing to the disk, which is a different thing from a
+        # node that could not be reached: nothing may start this VM yet.
+        raise _unfinished_injection(new_vmid, task.target_node, exc,
+                                    'hibernation file check') from exc
     except Exception as exc:                                   # noqa: BLE001
         task.log(f'Could not check the imported disk for a hibernation file: {exc}')
 
@@ -1767,8 +1783,13 @@ def _inject_drivers_if_asked(task, target, new_vmid, volumes, detail):
             self._inner.log(text)
 
     view = _InjectionView(task, new_vmid)
+    # The injection prints nothing until its script has ended, which on a slow disk is
+    # minutes of a log that looks stuck in the attaching phase.
+    task.log('Injecting the VirtIO drivers into the guest disk. This runs on the node and '
+             'can take several minutes.')
+    began = time.monotonic()
     try:
-        with _node_session(task, target) as run_on_node:
+        with _node_session(task, target, min_timeout=_INJECTION_TIMEOUT) as run_on_node:
             # The wizard offers the ISOs the node can see, and a storage lists them by
             # volid. The injection wants a path, so the volid is resolved here rather than
             # asking an operator to type one — `local:iso/virtio-win-0.1.189.iso` is what
@@ -1777,9 +1798,11 @@ def _inject_drivers_if_asked(task, target, new_vmid, volumes, detail):
                                                      view.virtio_iso_path)
             ok = v2p._inject_virtio_drivers(target, view, node_exec=run_on_node)
     except Exception as exc:                                   # noqa: BLE001
-        # The migration itself succeeded; the drivers are a preparation for the switch that
-        # follows it. Failing the whole run here would throw away a completed copy.
-        return f'VirtIO driver injection failed: {exc}'
+        # Nothing is thrown away by this: `_fail` removes nothing, and the converted disks
+        # stay attached and recorded. What it prevents is a migration that reads as done,
+        # and a start, while the guest disk is in a state nobody has seen.
+        raise _unfinished_injection(new_vmid, task.target_node, exc) from exc
+    task.log(f'The driver injection ended after {time.monotonic() - began:.0f} s.')
     if ok:
         return None
     if view.guest_is_not_windows:
@@ -1809,8 +1832,46 @@ def _inject_drivers_if_asked(task, target, new_vmid, volumes, detail):
 
 
 
+class InjectionUnfinished(Exception):
+    """The driver injection did not report back, so what it did to the guest disk is unknown.
+
+    Not a failed injection, which says what it refused and leaves the disk as it was. This
+    one may have stopped anywhere, or still be running on the node, and a VM started on
+    that disk - or a migration reported as complete with it - hands somebody a guest that
+    is neither prepared nor untouched.
+    """
+
+
+def _unfinished_injection(new_vmid, node, exc, what='VirtIO driver injection'):
+    waited = (f'no answer within {_INJECTION_TIMEOUT // 60} minutes'
+              if isinstance(exc, TimeoutError) else str(exc) or type(exc).__name__)
+    return InjectionUnfinished(
+        f'The {what} for VM {new_vmid} did not finish ({waited}). The disks are converted '
+        f'and attached, but whether the guest disk was fully prepared is unknown, so the VM '
+        f'was not started and the migration is not reported as complete. If '
+        f'/tmp/v2p-virtio-inject-{new_vmid}.sh is still running on {node}, let it end '
+        f'before starting or cleaning up the VM.')
+
+
+def _survives_the_caller(command):
+    """The command, rewritten so that the caller going away cannot kill it half-way.
+
+    Its output goes to a file on the node and is printed once it has ended. Without that, a
+    read that timed out closed the channel and the remote script died of SIGPIPE at its
+    next line of output. Measured on a PVE 9.2 node with paramiko: the script ran on until
+    its next `echo` and no further; with the output in a file it ran to its end. For the
+    driver injection the next line comes somewhere between copying the drivers and
+    registering the first-boot service that installs them.
+
+    stdout and stderr arrive merged, which is how the injection runs its script anyway.
+    The newline before the closing parenthesis ends a here-document the command may carry.
+    """
+    return (f'out=$(mktemp) || exit 1; ( {command}\n) > "$out" 2>&1; rc=$?; '
+            f'cat "$out"; rm -f "$out"; exit $rc')
+
+
 @contextlib.contextmanager
-def _node_session(task, target):
+def _node_session(task, target, min_timeout=0):
     """A way for the injection to reach the node that works for this cluster.
 
     The shared `_pve_node_exec` logs in as `root` with the cluster's password. A cluster
@@ -1848,7 +1909,7 @@ def _node_session(task, target):
     node = _Node(ssh, getattr(target.config, 'ssh_user', '') or 'root')
 
     def run_on_node(_manager, _node, command, timeout=600, **_ignored):
-        return node.run(command, timeout=timeout)
+        return node.run(_survives_the_caller(command), timeout=max(timeout, min_timeout))
 
     try:
         yield run_on_node
