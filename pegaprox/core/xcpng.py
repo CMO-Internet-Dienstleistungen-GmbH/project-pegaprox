@@ -1810,13 +1810,20 @@ class XcpngManager:
 
             # console URL is like https://host/console?ref=OpaqueRef:xxxx
             location = api.console.get_location(rfb_console)
-            # extract session ID for auth
-            session_ref = api.xenapi._session
+            # MK Sep 2026 - `session_ref` used to travel in this response. That is the POOL
+            # management session: whoever holds it can call the XenAPI directly with our
+            # service account's rights, which is every VM in the pool, not the one console
+            # they opened. Both callers hand this dict straight to the browser, so every
+            # console user - including a client-portal customer with one guest - was handed
+            # it. Nothing consumes it: no relay, no frontend path reads the field.
+            #
+            # When the XCP-ng console is finished, the ticket belongs on the SERVER side of
+            # the relay (the pattern the PVE console already uses) and must never reach the
+            # client. Deliberately not returned here.
             return {
                 'success': True,
                 'type': 'xcpng_vnc',
                 'url': location,
-                'session_ref': session_ref,
                 'host': self.host,
                 'port': 443,
             }
