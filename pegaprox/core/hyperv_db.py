@@ -142,6 +142,16 @@ def ensure_schema(cursor) -> None:
         cursor.execute("ALTER TABLE hyperv_migrations ADD COLUMN log_lines TEXT DEFAULT '[]'")
         logger.info('Added log_lines column to hyperv_migrations')
 
+    # Everything else the migration list shows about a run: the phase timeline, what was
+    # chosen in the wizard, how far it got. Without it a record read back after a restart
+    # was a name, a date and a status - a failed run could not be told from a finished one
+    # by anything but its colour. Kept as the run's own snapshot rather than a column per
+    # field, so a field the list gains later is recorded without another migration.
+    cursor.execute('PRAGMA table_info(hyperv_migrations)')
+    if 'snapshot' not in [column[1] for column in cursor.fetchall()]:
+        cursor.execute("ALTER TABLE hyperv_migrations ADD COLUMN snapshot TEXT DEFAULT '{}'")
+        logger.info('Added snapshot column to hyperv_migrations')
+
     # Same reasoning, one step further: an early build of this patch named the key column
     # host_id, and CREATE TABLE IF NOT EXISTS leaves an existing table alone. Without this
     # the host routes fail with "no such column: id" on any database created by that build.
@@ -377,7 +387,8 @@ def update_migration(conn, migration_id: str, **fields) -> None:
     from a caller's dictionary keys.
     """
     allowed = {'phase', 'status', 'progress', 'error', 'target_vmid', 'target_cluster',
-               'target_node', 'target_storage', 'completed_at'}
+               'target_node', 'target_storage', 'completed_at', 'source_vm_guid',
+               'source_vm_name'}
     unknown = set(fields) - allowed
     if unknown:
         raise ValueError(f'Not migration fields: {sorted(unknown)}')
@@ -525,24 +536,30 @@ def migrations_for_cluster(conn, source_cluster: str, limit: int = 100) -> list[
     return [_row_to_dict(row) for row in cursor.fetchall()]
 
 
-#: How much of a migration's log is kept with its record. The run itself holds the last
-#: 500 lines; this is what survives the process, and a failed import's log is a few dozen
-#: lines of which the last ten matter.
-MAX_RECORDED_LOG_LINES = 500
+#: How much of a migration's log is kept with its record. The whole log, in practice: an
+#: import writes a few lines per disk and per phase, so a run stays in the hundreds. The
+#: bound is only there so that a loop logging without end cannot fill the database.
+MAX_RECORDED_LOG_LINES = 10000
 
 
-def save_log(conn, migration_id: str, lines) -> None:
-    """Write the migration's log into its record.
+def save_log(conn, migration_id: str, lines, snapshot: dict | None = None) -> None:
+    """Write the migration's log - and, when given, its snapshot - into its record.
 
-    Called at each phase change and when the run ends, rather than per line: a transfer
-    logs a handful of lines and reports progress through another path entirely, so this
-    costs a few writes per migration and leaves the log readable even if the process dies
-    mid-run.
+    Called for every line the run logs and at every phase change, so what a record says
+    is what the run had said when the process stopped, not what it had said at its last
+    phase boundary. A transfer logs a handful of lines per disk and reports its progress
+    through another path, so this stays a few dozen small writes per migration.
     """
     kept = [str(line) for line in (lines or [])][-MAX_RECORDED_LOG_LINES:]
-    conn.cursor().execute(
-        'UPDATE hyperv_migrations SET log_lines = ?, updated_at = ? WHERE migration_id = ?',
-        (json.dumps(kept), time.time(), migration_id))
+    if snapshot is None:
+        conn.cursor().execute(
+            'UPDATE hyperv_migrations SET log_lines = ?, updated_at = ? WHERE migration_id = ?',
+            (json.dumps(kept), time.time(), migration_id))
+    else:
+        conn.cursor().execute(
+            'UPDATE hyperv_migrations SET log_lines = ?, snapshot = ?, updated_at = ? '
+            'WHERE migration_id = ?',
+            (json.dumps(kept), json.dumps(snapshot, default=str), time.time(), migration_id))
     conn.commit()
 
 
@@ -631,10 +648,10 @@ def _drop_finished_claims(conn, source_cluster: str, vm_guid: str) -> None:
 
 
 def _row_to_dict(row) -> dict:
-    """A database row to dict, decoding the two JSON columns."""
+    """A database row to dict, decoding the JSON columns."""
     data = dict(row)
     for column, empty in (('created_resources', []), ('disk_progress', {}),
-                          ('post_import', {}), ('log_lines', [])):
+                          ('post_import', {}), ('log_lines', []), ('snapshot', {})):
         try:
             data[column] = json.loads(data.get(column) or json.dumps(empty))
         except (TypeError, ValueError):
