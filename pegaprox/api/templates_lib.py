@@ -266,7 +266,12 @@ def _run_deploy(dep_id, cluster_id, node, template_id, storage, vmid, vm_name):
         return
 
     img_basename = tpl['image_url'].rsplit('/', 1)[-1]
-    img_path = f"/tmp/pegaprox-ci-{template_id}-{img_basename}"
+    # MK Sep 2026 - this used to be /tmp/pegaprox-ci-<template>-<image>, which any local
+    # account on the node can work out from the template list and pre-create as a symlink.
+    # `wget -O` follows one, so a root download landed wherever the symlink pointed. A random
+    # name inside a 0700 directory of our own removes both halves of that.
+    _img_dir = f"/tmp/pegaprox-ci-{uuid.uuid4().hex}"
+    img_path = f"{_img_dir}/{img_basename}"
 
     # use management IP if we have one, otherwise cluster host
     try:
@@ -327,6 +332,7 @@ def _run_deploy(dep_id, cluster_id, node, template_id, storage, vmid, vm_name):
 
         # 1. download
         # MK: -nc skip if exists, -q quiet output. show-progress would flood log
+        run(f"mkdir -m 700 -p {shlex.quote(_img_dir)}", 'staging dir', weight=1)
         run(f"wget -q -O {q_img_path} {q_url}", 'download')
         _update_dep(dep_id, progress=35, log_append='download done')
 
@@ -365,7 +371,7 @@ def _run_deploy(dep_id, cluster_id, node, template_id, storage, vmid, vm_name):
         _update_dep(dep_id, progress=95, log_append='converted to template')
 
         # 6. cleanup downloaded img
-        run(f"rm -f {q_img_path}", 'cleanup', weight=2)
+        run(f"rm -rf {shlex.quote(_img_dir)}", 'cleanup', weight=2)
 
         _update_dep(dep_id, status='completed', progress=100,
                     log_append=f"template {vm_name} (vmid {vmid}) ready",
