@@ -1120,10 +1120,17 @@ def start_vmware_migration(vmware_id, vm_id):
         return jsonify({'error': 'Permission denied: You do not have access to this VM'}), 403
     
     data = request.json or {}
-    
+
     for field in ('target_cluster', 'target_node', 'target_storage'):
         if not data.get(field):
             return jsonify({'error': f'{field} is required'}), 400
+
+    # MK Sep 2026 - same rule as the XHM path: remove_source destroys the source guest
+    # when the copy lands, and destruction is vmware.vm.manage, not vmware.vm.migrate.
+    if data.get('remove_source'):
+        if not user_can_access_vmware_vm(user, vmware_id, vm_id, 'vmware.vm.manage'):
+            return jsonify({'error': 'Permission denied: removing the source guest needs '
+                                     'vmware.vm.manage on it'}), 403
 
     # MK May 2026 (#481 port) — target_storage flows into `pvesm` calls on the
     # PVE node. Validate at the api boundary before the shell touches it.
