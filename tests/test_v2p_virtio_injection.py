@@ -607,3 +607,96 @@ class TestTheHibernationOnlyModeReachesItsOwnWork:
         script = self._script(False)
         assert 'CLEAN_ONLY=0' in script
         assert 'mount -o ro,loop' in script
+
+
+# ===========================================================================
+# Which partition is the Windows volume
+# ===========================================================================
+
+def _partition_choice(script):
+    """The shell lines that decide which partition is mounted as the Windows volume."""
+    start = script.index('NTFS_PARTS=$(')
+    end = script.index('echo "WIN_PART=$WIN_PART"', start)
+    return script[start:script.index('\n', end) + 1]
+
+
+def _choose_partition(script, tmp_path, partitions):
+    """Run the choice against fake partitions: {name: (size, fstype, has_windows)}.
+
+    `blkid`, `blockdev`, `mount` and `umount` are stand-ins on PATH, and `[ -b ]` answers
+    yes for the fake partition files, so the real shell logic runs without a block device.
+    A "mount" copies the partition's fixture directory into the mount point.
+    """
+    import subprocess
+
+    fake_bin = tmp_path / 'bin'
+    fake_bin.mkdir()
+    loop = tmp_path / 'loop0'
+    for name, (size, fstype, has_windows) in partitions.items():
+        part = tmp_path / f'loop0{name}'
+        part.write_text(f'{size} {fstype}\n')
+        content = tmp_path / 'content' / f'loop0{name}'
+        content.mkdir(parents=True)
+        if has_windows:
+            (content / 'Windows' / 'System32' / 'config').mkdir(parents=True)
+    tools = {
+        'blkid': 'cut -d" " -f2 "${@: -1}"',
+        'blockdev': 'cut -d" " -f1 "${@: -1}"',
+        'mount': f'cp -R {tmp_path}/content/$(basename "${{@: -2:1}}")/. "${{@: -1}}"/ '
+                 f'&& echo "$*" >> {tmp_path}/mounts',
+        'umount': 'find "$1" -mindepth 1 -delete',
+    }
+    for name, body in tools.items():
+        tool = fake_bin / name
+        tool.write_text(f'#!/bin/bash\n{body}\n')
+        tool.chmod(0o755)
+    win_mnt = tmp_path / 'win'
+    win_mnt.mkdir()
+    prelude = ('[() { if builtin test "$1" = -b; then builtin test -f "$2"; return; fi; '
+               'builtin test "${@:1:$#-1}"; }\n')
+    done = subprocess.run(
+        ['bash', '-c', prelude + _partition_choice(script)], capture_output=True, text=True,
+        env={'PATH': f'{fake_bin}:/usr/bin:/bin', 'LOOP': str(loop), 'WIN_MNT': str(win_mnt)})
+    mounts = (tmp_path / 'mounts').read_text() if (tmp_path / 'mounts').exists() else ''
+    return done.stdout + done.stderr, mounts
+
+
+def test_the_windows_partition_is_chosen_over_a_larger_data_partition(resolved_node, tmp_path):
+    """800 GB disk: Windows on 100 GB, data on 700 GB. The largest one is the wrong one."""
+    calls, _ = resolved_node
+    v2p._inject_virtio_drivers(_Manager(), _Task())
+
+    out, mounts = _choose_partition(_injection_script(calls), tmp_path, {
+        'p1': (500 * 2**20, 'vfat', False),
+        'p2': (100 * 2**30, 'ntfs', True),
+        'p3': (700 * 2**30, 'ntfs', False),
+    })
+
+    assert f'WIN_PART={tmp_path}/loop0p2' in out, out
+    assert 'WINDOWS_PARTITION_NOT_IDENTIFIED' not in out
+
+
+def test_partitions_are_only_looked_at_read_only_while_choosing(resolved_node, tmp_path):
+    calls, _ = resolved_node
+    v2p._inject_virtio_drivers(_Manager(), _Task())
+
+    _, mounts = _choose_partition(_injection_script(calls), tmp_path, {
+        'p1': (100 * 2**30, 'ntfs', True),
+        'p2': (700 * 2**30, 'ntfs', False),
+    })
+
+    assert mounts, 'no candidate was looked at'
+    assert all('-o ro ' in line for line in mounts.splitlines()), mounts
+
+
+def test_without_a_recognisable_windows_the_largest_is_kept_and_said(resolved_node, tmp_path):
+    calls, _ = resolved_node
+    v2p._inject_virtio_drivers(_Manager(), _Task())
+
+    out, _ = _choose_partition(_injection_script(calls), tmp_path, {
+        'p1': (100 * 2**30, 'ntfs', False),
+        'p2': (700 * 2**30, 'ntfs', False),
+    })
+
+    assert 'WINDOWS_PARTITION_NOT_IDENTIFIED' in out, out
+    assert f'WIN_PART={tmp_path}/loop0p2' in out, out
