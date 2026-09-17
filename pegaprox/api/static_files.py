@@ -17,7 +17,7 @@ from pegaprox.utils.audit import log_audit
 # log lines.
 from pegaprox.utils.sanitization import sanitize_log_message as _sl
 from pegaprox.utils.rbac import (
-    get_user_permissions, get_vm_acls,
+    get_user_permissions, get_vm_acls, acl_grants_user,
     get_pool_membership_cache, invalidate_pool_cache,
     get_user_effective_role, get_role_permissions_for_user,
     DEFAULT_TENANT_ID,
@@ -385,7 +385,7 @@ def get_user_vm_access(username):
     
     for cluster_id, cluster_acls in acls.items():
         for vmid, acl in cluster_acls.items():
-            if username in acl.get('users', []) or '*' in acl.get('users', []):
+            if acl_grants_user(acl, username):
                 access.append({
                     'cluster_id': cluster_id,
                     'vmid': int(vmid),

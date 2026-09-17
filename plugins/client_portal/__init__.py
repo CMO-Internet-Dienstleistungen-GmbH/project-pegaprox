@@ -13,7 +13,8 @@ from flask import request, jsonify, send_file
 
 from pegaprox.api.plugins import register_plugin_route
 from pegaprox.globals import cluster_managers
-from pegaprox.utils.rbac import load_vm_acls, user_can_access_vm, get_user_permissions, get_user_pool_vmids
+from pegaprox.utils.rbac import (load_vm_acls, user_can_access_vm, get_user_permissions,
+                                 get_user_pool_vmids, acl_grants_user)
 from pegaprox.utils.auth import load_users
 
 PLUGIN_NAME = "Client Portal"
@@ -88,8 +89,7 @@ def _get_my_vms():
         # find VMIDs where this user has access
         user_vmids = set()
         for vmid_str, acl in cluster_acls.items():
-            acl_users = acl.get('users', [])
-            if username in acl_users or '*' in acl_users:
+            if acl_grants_user(acl, username):
                 user_vmids.add(int(vmid_str))
 
         # #555 — pool-only users: include VMs reachable via their resource-pool perms.

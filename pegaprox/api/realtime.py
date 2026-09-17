@@ -311,7 +311,7 @@ def validate_ws_token_api():
     if requested_cluster:
         try:
             from pegaprox.utils.auth import load_users
-            from pegaprox.utils.rbac import get_user_clusters, load_vm_acls
+            from pegaprox.utils.rbac import get_user_clusters, load_vm_acls, acl_grants_user
             from pegaprox.core.db import get_db
             # MK Aug 2026 — resolve the token's user by its indexed row, not a whole-table
             # load_users() reload. That read decrypts every user's TOTP; on a transient
@@ -346,7 +346,7 @@ def validate_ws_token_api():
                 # VM-ACL fallback (mirrors api/helpers.py check_cluster_access)
                 cluster_acls = load_vm_acls().get(requested_cluster, {}) or {}
                 for _vmid, acl in cluster_acls.items():
-                    if data['user'] in (acl.get('users') or []) or '*' in (acl.get('users') or []):
+                    if acl_grants_user(acl, data['user']):
                         access_ok = True
                         break
             if not access_ok:

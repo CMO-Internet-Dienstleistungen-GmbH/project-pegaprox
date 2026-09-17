@@ -48,11 +48,11 @@ def get_clusters():
     # #248: users without cluster.view can still see clusters where they have VM ACLs
     acl_cluster_ids = set()
     if not has_cluster_view:
-        from pegaprox.utils.rbac import load_vm_acls
+        from pegaprox.utils.rbac import load_vm_acls, acl_grants_user
         all_acls = load_vm_acls()
         for cid, vm_acls in all_acls.items():
             for vmid, acl in vm_acls.items():
-                if user['username'] in acl.get('users', []) or '*' in acl.get('users', []):
+                if acl_grants_user(acl, user['username']):
                     acl_cluster_ids.add(cid)
                     break
         # #555: also surface clusters where the user holds pool perms

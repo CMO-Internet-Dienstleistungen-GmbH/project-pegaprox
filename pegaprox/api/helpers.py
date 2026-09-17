@@ -394,10 +394,10 @@ def check_cluster_access(cluster_id):
     if allowed is not None and cluster_id not in allowed:
         # #248: check VM ACLs as fallback — users with VM-level access can reach the cluster
         username = request.session.get('user', '')
-        from pegaprox.utils.rbac import load_vm_acls
+        from pegaprox.utils.rbac import load_vm_acls, acl_grants_user
         cluster_acls = load_vm_acls().get(cluster_id, {})
         for vmid, acl in cluster_acls.items():
-            if username in acl.get('users', []) or '*' in acl.get('users', []):
+            if acl_grants_user(acl, username):
                 return True, None
         # #555: pool fallback — any pool grant in THIS cluster lets the user reach it
         # (per-VM gating still runs downstream via user_can_access_vm)
@@ -429,7 +429,7 @@ def caller_is_scoped(user, cluster_id):
     here so the rule can't drift between call sites again."""
     from pegaprox.models.permissions import ROLE_ADMIN
     from pegaprox.utils.rbac import (get_user_clusters, user_has_any_pool_access, get_vm_acls,
-                                     acls_unavailable)
+                                     acls_unavailable, acl_grants_user)
     if not user:
         return True   # unknown identity → treat as confined (fail closed)
     if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
@@ -451,7 +451,9 @@ def caller_is_scoped(user, cluster_id):
             # Same answer as the except below: cannot tell, so treat as confined.
             return True
         for _vmid, acl in (_acls.get(cluster_id, {}) or {}).items():
-            if username in (acl.get('users') or []):
+            # the wildcard counts here too: a user whose only reach is a '*' row is
+            # still confined to that row's VM, not a cluster-wide operator
+            if acl_grants_user(acl, username):
                 return True
     except Exception:
         return True

@@ -585,6 +585,26 @@ def check_tenant_vmid(tenant_id, vmid):
 
 VM_ACLS_FILE = os.path.join(CONFIG_DIR, 'vm_acls.json')
 
+def acl_grants_user(acl, username: str) -> bool:
+    """Does this one VM-ACL row grant `username` access?
+
+    Nine places asked this question and one of them asked it differently:
+    caller_is_scoped() tested `username in users` and left out the `'*'` wildcard
+    that every other gate honours. So a user whose ONLY reach into a cluster was a
+    wildcard ACL was classified as "not confined" and handed the whole-cluster
+    views, while user_can_access_vm() correctly treated them as ACL-scoped. One
+    definition now, so the two cannot drift apart again. MK Sep 2026
+
+    Note this is the *membership* question. The narrower "is this caller confined
+    to specific VMs" question in user_can_access_vm deliberately counts explicit
+    names only - a wildcard row confines nobody - and is left alone.
+    """
+    if not isinstance(acl, dict):
+        return False
+    members = acl.get('users') or []
+    return username in members or '*' in members
+
+
 def load_vm_acls() -> dict:
     """Load VM access control lists from SQLite database
     
@@ -1014,7 +1034,7 @@ def user_can_access_vm(user: dict, cluster_id: str, vmid: int, permission: str =
         logging.debug(f"[VM-ACL] VM {vmid} ACL found, allowed users: {allowed_users}")
         
         # MK: If user is in the ACL whitelist, check their ACL permissions
-        if username in allowed_users or '*' in allowed_users:
+        if acl_grants_user(vm_acl, username):
             if vm_acl.get('inherit_role', True):
                 # inherit_role=True: FULL VM access (start, stop, console, etc.)
                 # This means "this user has access to this VM"
@@ -1156,8 +1176,7 @@ def get_user_vms(user: dict, cluster_id: str) -> list:
     # collect VMs user has access to
     allowed_vms = []
     for vmid, acl in cluster_acls.items():
-        users = acl.get('users', [])
-        if username in users or '*' in users:
+        if acl_grants_user(acl, username):
             allowed_vms.append(int(vmid))
     
     return allowed_vms if allowed_vms else None
