@@ -2275,13 +2275,7 @@ def _inject_virtio_drivers(pve_mgr, task):
         "  rbd)\n"
         "    command -v rbd >/dev/null || { echo 'rbd cli missing — apt install ceph-common'; "
         "      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ceph-common >/dev/null 2>&1; }\n"
-        "    POOLIMG=$(echo \"$VOL_ID\" | sed 's|^[^:]*:||')\n"
-        "    POOL=$(echo \"$POOLIMG\" | cut -d/ -f1)\n"
-        "    IMG=$(echo \"$POOLIMG\" | cut -d/ -f2)\n"
-        "    [ -z \"$POOL\" ] || [ -z \"$IMG\" ] && { echo 'RBD_PARSE_FAILED'; exit 2; }\n"
-        "    BLK=$(rbd map -p \"$POOL\" \"$IMG\" 2>&1 | tail -1)\n"
-        "    [ -b \"$BLK\" ] || { echo \"RBD_MAP_FAILED: $BLK\"; exit 2; }\n"
-        "    RBD=\"$BLK\"\n"
+        + _rbd_target_lines(vol_path) +  # pool/image/options from `pvesm path`
         "    ;;\n"
         # File-based (qcow2 / raw on dir/NFS/CIFS/cephfs/glusterfs/btrfs) — qemu-nbd
         "  dir|nfs|cifs|cephfs|glusterfs|btrfs)\n"
@@ -3413,6 +3407,56 @@ def _rbd_map_command(pool, image, opts):
     if opts.get('mon_host'):
         flags += f" -m {shlex.quote(opts['mon_host'])}"
     return f"rbd map{flags} -p {shlex.quote(pool)} {shlex.quote(image)}"
+
+
+# The injection script's rbd) branch used to take pool and image from the PVE volume id,
+# `<storage>:vm-<vmid>-disk-0`, which names the storage and carries no pool, so both came
+# out as the image name and `rbd map` failed on every Ceph target. The `pvesm path` result
+# has what the node needs: `rbd:<pool>/<image>:conf=…:id=…:keyring=…` on a krbd=0 storage,
+# `/dev/rbd-pve/<fsid>/<pool>/<image>` on a krbd=1 storage, which PVE maps itself. The URI
+# is parsed here with the helpers above, and the script only receives the finished
+# command. Every value reaches the shell quoted.
+_KRBD_PVE_PATH = re.compile(r'^/dev/rbd-pve/[^/]+/([^/]+)/([^/]+)$')
+
+_RBD_MAP_AND_OWN = (
+    '{indent}BLK=$({command} 2>&1 | tail -1)\n'
+    '{indent}[ -b "$BLK" ] || {{ echo "RBD_MAP_FAILED: $BLK"; exit 2; }}\n'
+    # The cleanup unmaps what RBD names, so only a map made here goes into it.
+    '{indent}RBD="$BLK"\n'
+)
+
+
+def _rbd_target_lines(vol_path):
+    """The body of the injection script's `rbd)` branch for this `pvesm path` result.
+
+    Sets BLK to the block device to open. Sets RBD only when the script mapped the image
+    itself, because the cleanup unmaps whatever RBD names.
+    """
+    path = str(vol_path or '').strip()
+
+    krbd = _KRBD_PVE_PATH.match(path)
+    if krbd:
+        pool, image = krbd.groups()
+        # PVE's own map: used as it is and left in place, since unmapping it would pull
+        # the disk out from under PVE. Only when the device node is missing is it mapped
+        # here, from the pool and image the path names.
+        return (
+            '    if [ -b "$VOL" ]; then\n'
+            '      BLK="$VOL"\n'
+            '    else\n'
+            + _RBD_MAP_AND_OWN.format(indent='      ',
+                                  command=_rbd_map_command(pool, image, {}))
+            + '    fi\n'
+        )
+
+    if path.startswith('rbd:'):
+        pool, image, opts = _parse_rbd_uri(path)
+        if pool and image:
+            return _RBD_MAP_AND_OWN.format(indent='    ',
+                                       command=_rbd_map_command(pool, image, opts))
+
+    return "    echo 'RBD_PARSE_FAILED'; exit 2\n"
+
 
 
 def _map_rbd_uri_to_device(pve_mgr, node, vol_id, rbd_uri):
