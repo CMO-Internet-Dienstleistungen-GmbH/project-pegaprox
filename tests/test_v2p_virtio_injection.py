@@ -253,7 +253,7 @@ def test_the_first_boot_service_reaches_the_same_control_sets(resolved_node):
 # ---------------------------------------------------------------------------
 
 def _staging_part(script):
-    """The shell lines that copy the installers from the ISO into C:\\PegaProx."""
+    """The shell lines that copy the installers from the ISO into C:\\qemu."""
     start = script.index('PEGADIR=')
     return script[start:script.index('SYSTEM_HIVE=', start)]
 
@@ -286,7 +286,7 @@ def test_the_guest_agent_installer_is_staged_from_the_iso(resolved_node, tmp_pat
                         'WIN_MNT': str(tmp_path / 'win'), 'WDIR': 'Windows'})
 
     assert 'AGENT_STAGED qemu-ga-x86_64.msi' in done.stdout, done.stdout + done.stderr
-    assert (tmp_path / 'win' / 'PegaProx' / 'qemu-ga-x86_64.msi').read_bytes() == b'agent'
+    assert (tmp_path / 'win' / 'qemu' / 'qemu-ga-x86_64.msi').read_bytes() == b'agent'
 
 
 def test_an_iso_without_the_agent_says_so(resolved_node, tmp_path):
@@ -313,12 +313,77 @@ def test_the_first_boot_service_installs_the_agent_after_the_drivers(resolved_no
     v2p._inject_virtio_drivers(_Manager(), _Task())
 
     command = _first_boot_command(_injection_script(calls))
-    drivers = command.index('msiexec /i "C:\\PegaProx\\virtio-win-gt-x64.msi"')
-    agent = command.index('msiexec /i "C:\\PegaProx\\qemu-ga-x86_64.msi"')
+    drivers = command.index('msiexec /i "C:\\qemu\\virtio-win-gt-x64.msi"')
+    agent = command.index('msiexec /i "C:\\qemu\\qemu-ga-x86_64.msi"')
     removes_itself = command.index('sc delete PegaProxFirstBoot')
     assert drivers < agent < removes_itself
-    assert 'if exist "C:\\PegaProx\\qemu-ga-x86_64.msi"' in command
-    assert '(del "C:\\PegaProx\\qemu-ga-x86_64.msi" 2>nul)' in command
+    assert 'if exist "C:\\qemu\\qemu-ga-x86_64.msi"' in command
+    assert '(del "C:\\qemu\\qemu-ga-x86_64.msi" 2>nul)' in command
+
+
+def test_each_installer_is_waited_for_before_the_next_one_starts(resolved_node):
+    """msiexec is a GUI program, and cmd /c does not wait for one: both installers ran
+    three seconds apart, and the agent's COM registration failed with 0x8007041F
+    (ERROR_SERVICE_DATABASE_LOCKED) while the driver installer was still at work."""
+    calls, _ = resolved_node
+    v2p._inject_virtio_drivers(_Manager(), _Task())
+
+    command = _first_boot_command(_injection_script(calls))
+    assert command.count('msiexec') == 2
+    assert command.count('start "" /wait msiexec /i ') == 2
+
+
+def test_the_staging_folder_is_named_qemu(resolved_node, tmp_path):
+    import subprocess
+    calls, _ = resolved_node
+    v2p._inject_virtio_drivers(_Manager(), _Task())
+
+    iso = tmp_path / 'iso'
+    iso.mkdir()
+    (iso / 'virtio-win-gt-x64.msi').write_bytes(b'drivers')
+    (tmp_path / 'win' / 'Windows').mkdir(parents=True)
+    subprocess.run(
+        ['bash', '-c', _staging_part(_injection_script(calls))], capture_output=True,
+        text=True, env={'PATH': '/usr/bin:/bin', 'ISO_MNT': str(iso),
+                        'WIN_MNT': str(tmp_path / 'win'), 'WDIR': 'Windows'})
+
+    assert (tmp_path / 'win' / 'qemu' / 'virtio-win-gt-x64.msi').read_bytes() == b'drivers'
+    assert not (tmp_path / 'win' / 'PegaProx').exists()
+    assert 'C:\\PegaProx' not in _first_boot_command(_injection_script(calls))
+
+
+FAILED_MARKER = 'type nul > "C:\\qemu\\install-failed"'
+
+
+def test_a_failed_install_leaves_a_marker_behind(resolved_node):
+    """Exit 0 and 3010 (success, restart required) count as installed; everything else
+    marks the run failed. `if errorlevel N` means N or higher, and it is read when the
+    step runs -- %ERRORLEVEL% would be expanded once, when cmd parses the whole line."""
+    calls, _ = resolved_node
+    v2p._inject_virtio_drivers(_Manager(), _Task())
+
+    command = _first_boot_command(_injection_script(calls))
+    below_3010 = f'(if errorlevel 1 if not errorlevel 3010 {FAILED_MARKER})'
+    above_3010 = f'(if errorlevel 3011 {FAILED_MARKER})'
+    drivers = command.index('msiexec /i "C:\\qemu\\virtio-win-gt-x64.msi"')
+    agent = command.index('msiexec /i "C:\\qemu\\qemu-ga-x86_64.msi"')
+    boot_arm = command.index('sc config vioscsi')
+    checks = [m.start() for m in re.finditer(re.escape(below_3010), command)]
+    assert len(checks) == 2
+    assert drivers < checks[0] < agent < checks[1] < boot_arm
+    assert command.count(above_3010) == 2
+
+
+def test_the_staging_folder_is_removed_only_after_a_successful_install(resolved_node):
+    """On success nothing of the import stays on the guest; on failure the logs do."""
+    calls, _ = resolved_node
+    v2p._inject_virtio_drivers(_Manager(), _Task())
+
+    command = _first_boot_command(_injection_script(calls))
+    cleanup = '(if not exist "C:\\qemu\\install-failed" rmdir /s /q "C:\\qemu")'
+    assert command.endswith(cleanup)
+    assert command.count('rmdir') == 1
+    assert command.index('sc delete PegaProxFirstBoot') < command.index(cleanup)
 
 
 def test_what_was_staged_reaches_the_migration_log(node_calls):

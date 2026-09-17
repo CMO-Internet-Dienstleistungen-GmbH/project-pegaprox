@@ -2693,7 +2693,7 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
         # ran into "registry corrupt" because RunOnce executes with the
         # logged-in user's standard token (no elevation), even for admins.
         # SYSTEM service has full token, no UAC.
-        "PEGADIR=\"$WIN_MNT/$WDIR/../PegaProx\"\n"
+        "PEGADIR=\"$WIN_MNT/$WDIR/../qemu\"\n"
         "mkdir -p \"$PEGADIR\"\n"
         "MSI_OK=0\n"
         # Pick the right MSI by host arch — almost always x64 these days
@@ -2717,10 +2717,9 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
         "else echo 'AGENT_MISSING (no guest-agent/qemu-ga-x86_64.msi on the ISO)'; fi\n"
         # Register the one-shot service in the SYSTEM hive.
         # ImagePath runs as LocalSystem at next boot; cmd /c chains:
-        #   msiexec /quiet → sc delete self → del MSI
-        # Service stays disabled-by-failure if msiexec doesn't exit 0,
-        # so user can investigate via msi.log. Self-deletion needs the
-        # service to have already returned, hence the trailing & chain.
+        #   msiexec drivers → msiexec agent → sc config → sc delete self → del MSIs
+        # Self-deletion needs the service to have already returned, hence the
+        # trailing & chain.
         "SYSTEM_HIVE=\"$WIN_MNT/$WDIR/System32/config/SYSTEM\"\n"
         "python3 - \"$SYSTEM_HIVE\" \"$MSI_OK\" << 'PYSV' || { echo 'SVC_FAILED (non-fatal)'; }\n"
         "import sys, hivex\n"
@@ -2751,17 +2750,30 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
         # any manual `sc config` step on the customer side.
         "cmdline = (\n"
         "    'cmd.exe /c '\n"
-        "    '(msiexec /i \"C:\\\\PegaProx\\\\virtio-win-gt-x64.msi\" '\n"
-        "    'ADDLOCAL=ALL /quiet /norestart /l*v \"C:\\\\PegaProx\\\\msi.log\") & '\n"
+        # Fork patch #15 — `start "" /wait` on each install. msiexec is a GUI program and
+        # cmd /c does not wait for one, so both installers ran three seconds apart and the
+        # agent's COM registration failed with ERROR_SERVICE_DATABASE_LOCKED.
+        "    '(start \"\" /wait msiexec /i \"C:\\\\qemu\\\\virtio-win-gt-x64.msi\" '\n"
+        "    'ADDLOCAL=ALL /quiet /norestart /l*v \"C:\\\\qemu\\\\msi.log\") & '\n"
+        # 0 and 3010 (installed, restart required) are success; anything else leaves a
+        # marker. `if errorlevel N` means N or higher and is read when the step runs, where
+        # %ERRORLEVEL% would be expanded once, when cmd parses the whole line.
+        "    '(if errorlevel 1 if not errorlevel 3010 type nul > \"C:\\\\qemu\\\\install-failed\") & '\n"
+        "    '(if errorlevel 3011 type nul > \"C:\\\\qemu\\\\install-failed\") & '\n"
         # After the driver MSI, which installs the VirtIO serial driver the agent talks over.
-        "    '(if exist \"C:\\\\PegaProx\\\\qemu-ga-x86_64.msi\" msiexec /i '\n"
-        "    '\"C:\\\\PegaProx\\\\qemu-ga-x86_64.msi\" /quiet /norestart '\n"
-        "    '/l*v \"C:\\\\PegaProx\\\\qemu-ga.log\") & '\n"
-        "    '(sc config vioscsi start= boot >> \"C:\\\\PegaProx\\\\bootarm.log\" 2>&1) & '\n"
-        "    '(sc config viostor start= boot >> \"C:\\\\PegaProx\\\\bootarm.log\" 2>&1) & '\n"
-        "    '(sc delete PegaProxFirstBoot >> \"C:\\\\PegaProx\\\\service.log\" 2>&1) & '\n"
-        "    '(del \"C:\\\\PegaProx\\\\virtio-win-gt-x64.msi\" 2>nul) & '\n"
-        "    '(del \"C:\\\\PegaProx\\\\qemu-ga-x86_64.msi\" 2>nul)'\n"
+        "    '(if exist \"C:\\\\qemu\\\\qemu-ga-x86_64.msi\" start \"\" /wait msiexec /i '\n"
+        "    '\"C:\\\\qemu\\\\qemu-ga-x86_64.msi\" /quiet /norestart '\n"
+        "    '/l*v \"C:\\\\qemu\\\\qemu-ga.log\") & '\n"
+        "    '(if errorlevel 1 if not errorlevel 3010 type nul > \"C:\\\\qemu\\\\install-failed\") & '\n"
+        "    '(if errorlevel 3011 type nul > \"C:\\\\qemu\\\\install-failed\") & '\n"
+        "    '(sc config vioscsi start= boot >> \"C:\\\\qemu\\\\bootarm.log\" 2>&1) & '\n"
+        "    '(sc config viostor start= boot >> \"C:\\\\qemu\\\\bootarm.log\" 2>&1) & '\n"
+        "    '(sc delete PegaProxFirstBoot >> \"C:\\\\qemu\\\\service.log\" 2>&1) & '\n"
+        "    '(del \"C:\\\\qemu\\\\virtio-win-gt-x64.msi\" 2>nul) & '\n"
+        "    '(del \"C:\\\\qemu\\\\qemu-ga-x86_64.msi\" 2>nul) & '\n"
+        # Nothing of the import stays on a guest that installed cleanly; one that did not
+        # keeps its logs.
+        "    '(if not exist \"C:\\\\qemu\\\\install-failed\" rmdir /s /q \"C:\\\\qemu\")'\n"
         ")\n"
         # Same reasoning as the driver registration above: the set that will be active is
         # not knowable here, so every set that exists gets the entry.
