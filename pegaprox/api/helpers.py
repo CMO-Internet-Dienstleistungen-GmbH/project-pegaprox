@@ -580,7 +580,12 @@ def check_vmware_access(vmware_id):
     linked = getattr(vmware_managers[vmware_id], 'linked_clusters', None) or []
     if not linked:
         return True, None   # backward-compat: unlinked server is accessible to all
-    uc = get_user_clusters(user)
+    # MK Sep 2026 - include_pools=False. get_user_clusters() with pools counts a cluster
+    # the caller only REACHES through a pool grant, so holding one pool on a Proxmox
+    # cluster that happens to be linked here handed them the ESXi server's whole
+    # inventory. A pool grant is a claim on VMs inside that cluster, not a claim on the
+    # server it is linked to; tenant ownership is the right question for that boundary.
+    uc = get_user_clusters(user, include_pools=False)
     if uc is None:
         return True, None
     if any(c in uc for c in linked):

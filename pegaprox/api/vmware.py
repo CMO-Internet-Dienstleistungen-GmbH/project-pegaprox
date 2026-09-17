@@ -962,7 +962,10 @@ def clone_vmware_vm(vmware_id, vm_id):
 
 
 @bp.route('/api/vmware/<vmware_id>/vms/<vm_id>', methods=['DELETE'])
-@require_auth(perms=['vmware.vm.power'])
+# MK Sep 2026 - was vmware.vm.power on both the route and the per-VM check, so anyone
+# allowed to switch a guest on and off could DELETE it. Power and destruction are not the
+# same authority; vmware.vm.manage is the one that already means "may change this guest".
+@require_auth(perms=['vmware.vm.manage'])
 def delete_vmware_vm(vmware_id, vm_id):
     """Delete a VM (must be powered off)"""
     if vmware_id not in vmware_managers:
@@ -974,7 +977,7 @@ def delete_vmware_vm(vmware_id, vm_id):
     # outside its token scope (user_can_access_vmware_vm honors effective_role).
     user = build_authz_user(request.session.get('user', ''), request.session)
     
-    if not user_can_access_vmware_vm(user, vmware_id, vm_id, 'vmware.vm.power'):
+    if not user_can_access_vmware_vm(user, vmware_id, vm_id, 'vmware.vm.manage'):
         return jsonify({'error': 'Permission denied: You do not have access to this VM'}), 403
     
     mgr = vmware_managers[vmware_id]
@@ -988,7 +991,7 @@ def delete_vmware_vm(vmware_id, vm_id):
 
 
 @bp.route('/api/vmware/<vmware_id>/vms/<vm_id>/rename', methods=['POST'])
-@require_auth(perms=['vmware.vm.power'])
+@require_auth(perms=['vmware.vm.manage'])   # renaming is a config change, not a power one
 def rename_vmware_vm(vmware_id, vm_id):
     """Rename a VM"""
     if vmware_id not in vmware_managers:
@@ -1003,7 +1006,7 @@ def rename_vmware_vm(vmware_id, vm_id):
     # outside its token scope (user_can_access_vmware_vm honors effective_role).
     user = build_authz_user(request.session.get('user', ''), request.session)
     
-    if not user_can_access_vmware_vm(user, vmware_id, vm_id, 'vmware.vm.power'):
+    if not user_can_access_vmware_vm(user, vmware_id, vm_id, 'vmware.vm.manage'):
         return jsonify({'error': 'Permission denied: You do not have access to this VM'}), 403
     
     mgr = vmware_managers[vmware_id]
