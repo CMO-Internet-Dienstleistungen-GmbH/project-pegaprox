@@ -506,6 +506,33 @@ def list_target_virtio_isos():
     })
 
 
+@bp.route('/api/hyperv/target-cpu', methods=['GET'])
+@require_auth(perms=['hyperv.vm.view'])
+def target_cpu_choice():
+    """The CPU type the import suggests for a node, and the types it offers.
+
+    Asked per node, like the ISO list: whether x86-64-v3 is safe depends on the processor
+    of the node the operator has just picked.
+    """
+    cluster_id = (request.args.get('cluster') or '').strip()
+    node = (request.args.get('node') or '').strip()
+    if not cluster_id or not node:
+        return jsonify({'error': 'cluster and node are required'}), 400
+
+    ok, denied = check_cluster_access(cluster_id)
+    if not ok:
+        return denied
+
+    target = cluster_managers.get(cluster_id)
+    if target is None:
+        return jsonify({'error': 'Target cluster not found'}), 404
+    if not getattr(target, 'is_connected', False):
+        return jsonify({'error': 'Target cluster is not connected'}), 409
+
+    from pegaprox.core import hyperv_cpu
+    return jsonify(hyperv_cpu.node_cpu_choice(target, node))
+
+
 @bp.route('/api/hyperv/target-virtio-isos/download', methods=['POST'])
 @require_auth(perms=['hyperv.vm.media'])
 def download_target_virtio_iso():
