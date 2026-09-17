@@ -439,13 +439,19 @@ def _run_hyperv_to_pve(task):
     allocated = []
 
     try:
+        # Recorded before anything can fail. A run that ended at "source not found" used
+        # to leave no record at all, and was gone from the list after the next restart -
+        # a failure is exactly the entry somebody comes back to read.
+        migration_id = _record_start(task, '')
+        _keep_on_record(task, migration_id)
+
         source = cluster_managers.get(task.source_cluster)
         target = cluster_managers.get(task.target_cluster)
         if not source or getattr(source, 'cluster_type', '') != 'hyperv':
-            task.set_phase('failed', 'Source Hyper-V host not found')
+            _fail(task, migration_id, 'Source Hyper-V host not found')
             return
         if not target or not target.is_connected:
-            task.set_phase('failed', 'Target Proxmox cluster not connected')
+            _fail(task, migration_id, 'Target Proxmox cluster not connected')
             return
 
         # === PLANNING ===
@@ -454,17 +460,17 @@ def _run_hyperv_to_pve(task):
 
         guid = source.guid_for(task.source_vmid)
         if not guid:
-            task.set_phase('failed', f'No Hyper-V VM is known here as {task.source_vmid}')
+            _fail(task, migration_id, f'No Hyper-V VM is known here as {task.source_vmid}')
             return
+        _update_migration_row(migration_id, source_vm_guid=guid)
 
         detail = source.vm_detail(task.source_vmid)
         if 'error' in detail:
-            task.set_phase('failed', detail['error'])
+            _fail(task, migration_id, detail['error'])
             return
         task.vm_name = task.vm_name or detail.get('name') or ''
+        _update_migration_row(migration_id, source_vm_name=task.vm_name)
         task.log(f"Source VM: {task.vm_name}")
-
-        migration_id = _record_start(task, guid)
 
         # Taken before anything is created, and after the row exists: the claim's liveness
         # is read off that row, so claiming first would leave a window in which this claim
@@ -1087,33 +1093,45 @@ def forget_recorded_migration(migration_id) -> dict:
 def _as_migration_row(row: dict) -> dict:
     """One recorded migration in the shape the migration list renders.
 
-    Deliberately close to `XHMigrationTask.to_dict()`, and deliberately not identical: the
-    phase timeline and the log lived in the process and are gone. `recorded` says so, so
-    the interface can show the row for what it is — a record, not a live task.
+    The same shape as `XHMigrationTask.to_dict()`: the run's snapshot carries everything
+    the live entry showed - timeline, wizard choices, the guest's Windows finding - and the
+    record's own columns win where they are the later word, because a retry, a cleanup or
+    the restart that marked a run interrupted changed them after the run had ended. The log
+    comes whole, under the key the list reads. `recorded` says what the row is: read back
+    from the database rather than held by a worker.
     """
     completed = row.get('completed_at')
+    snapshot = row.get('snapshot') or {}
+    lines = row.get('log_lines') or []
     return {
+        **snapshot,
         'id': row.get('migration_id'),
         'direction': DIRECTION,
         'source_cluster': row.get('source_cluster'),
-        'source_vmid': row.get('source_vm_guid'),
-        'vm_name': row.get('source_vm_name') or '',
+        # A run that failed before it found the VM has neither; the snapshot still says
+        # which VM it was asked for.
+        'source_vmid': row.get('source_vm_guid') or snapshot.get('source_vmid'),
+        'vm_name': row.get('source_vm_name') or snapshot.get('vm_name') or '',
         'target_cluster': row.get('target_cluster') or '',
         'target_node': row.get('target_node') or '',
         'target_storage': row.get('target_storage') or '',
         'target_vmid': row.get('target_vmid'),
         'status': row.get('status') or 'failed',
-        'phase': row.get('phase') or '',
-        'progress': row.get('progress') or 0,
+        # Only the run moves the phase, and the snapshot follows it line by line while the
+        # column is written at three boundaries - so the snapshot is never the older word.
+        # Without it a run that failed mid-transfer read back as "Planning".
+        'phase': snapshot.get('phase') or row.get('phase') or '',
+        # The column is written at phase boundaries, the snapshot with every line; a run
+        # that failed half-way through a transfer got further than its last boundary.
+        'progress': max(row.get('progress') or 0, snapshot.get('progress') or 0),
         'error': row.get('error') or '',
         'started_at': row.get('started_at'),
         'completed_at': completed,
-        'disk_progress': row.get('disk_progress') or {},
-        # The timeline lived in the process and is gone; an empty one renders as no
-        # timeline rather than as a run that never got anywhere. The log is kept, because
-        # it is the part somebody reads to find out what happened.
-        'phase_times': {},
-        'log_lines': row.get('log_lines') or [],
+        'disk_progress': row.get('disk_progress') or snapshot.get('disk_progress') or {},
+        'phase_times': snapshot.get('phase_times') or {},
+        'config': snapshot.get('config') or {},
+        'log': lines,
+        'log_lines': lines,
         #: What this row is: read back from the database rather than held by a worker.
         'recorded': True,
         #: And what it is still holding on the target, which is why it may still block.
@@ -1127,20 +1145,88 @@ def _conn():
 
 
 def _record_log(task, migration_id) -> None:
-    """Put the run's log into its record, so it outlives the process.
+    """Put the run's log and everything else the list shows about it into its record.
 
-    Called at each phase change and when the run ends. The log is the part somebody reads
-    to find out what happened — long after the migration, and after a restart that emptied
-    the in-memory list. Never raises: a run must not fail because its log could not be
-    filed.
+    Called for every logged line, at every phase change and when the run ends. The record
+    is what the list shows once a restart has emptied the in-memory one, and it has to show
+    the same entry: a failed run with its reason, its timeline and its whole log, not a name
+    and a date. Never raises: a run must not fail because its record could not be written.
     """
     if not migration_id:
         return
+    lines = getattr(task, '_recorded_lines', None)
+    if lines is None:
+        lines = getattr(task, 'log_lines', [])
     try:
-        hyperv_db.save_log(_conn(), migration_id, getattr(task, 'log_lines', []))
+        hyperv_db.save_log(_conn(), migration_id, lines, _snapshot(task))
     except Exception:
-        logger.debug('[XHM:%s] could not record the log', getattr(task, 'id', '?'),
-                     exc_info=True)
+        # A warning, not a debug line: a record that silently stops being written is the
+        # failure this function exists to prevent.
+        logger.warning('[XHM:%s] could not record the migration', getattr(task, 'id', '?'),
+                       exc_info=True)
+
+
+#: Wizard fields that are never written into a record, whatever a request carries. The
+#: wizard sends no credentials; this keeps it that way for a client that adds some.
+_CREDENTIAL_FIELD = re.compile(r'pass|secret|token|credential', re.IGNORECASE)
+
+#: What the run learned along the way that `to_dict()` does not carry.
+_RUN_FINDINGS = ('guest_windows', 'completion_problem', 'target_unbootable')
+
+
+def _snapshot(task):
+    """The run as the list shows it, for its record. None for a run that has no such view."""
+    to_dict = getattr(task, 'to_dict', None)
+    if not callable(to_dict):
+        return None
+    try:
+        data = dict(to_dict())
+    except Exception:
+        logger.warning('[XHM:%s] could not take the migration snapshot',
+                       getattr(task, 'id', '?'), exc_info=True)
+        return None
+    # The whole log has a column of its own; to_dict() carries only its last lines.
+    data.pop('log', None)
+    # to_dict() names what the list renders (start_after, the network map, the hardware);
+    # the task's own config holds the rest of what the wizard sent. Both go in, with
+    # to_dict()'s reading winning where the two name the same field.
+    chosen = {key: value for key, value in (getattr(task, 'config', None) or {}).items()
+              if not _CREDENTIAL_FIELD.search(str(key))}
+    data['config'] = {**chosen, **(data.get('config') or {})}
+    for name in _RUN_FINDINGS:
+        if hasattr(task, name):
+            data[name] = getattr(task, name)
+    return data
+
+
+def _keep_on_record(task, migration_id) -> None:
+    """Make every line and every phase change of this run reach its record as it happens.
+
+    The task is upstream's and says nothing about records, so its two reporting methods are
+    wrapped on this one instance. The log is also kept whole here: the task trims its own
+    to the last 500 lines, which is right for a live frame and wrong for the record of what
+    happened.
+    """
+    if not migration_id:
+        return
+    lines = list(getattr(task, 'log_lines', []) or [])
+    task._recorded_lines = lines
+    log, set_phase = task.log, task.set_phase
+
+    def log_and_record(message):
+        log(message)
+        # The task stamps the line, and the stamped one is what goes into the record. A
+        # trim in the same call removes lines from the front; the new one is still last.
+        if task.log_lines:
+            lines.append(task.log_lines[-1])
+        _record_log(task, migration_id)
+
+    def set_phase_and_record(phase, error=None):
+        set_phase(phase, error)
+        _record_log(task, migration_id)
+
+    task.log = log_and_record
+    task.set_phase = set_phase_and_record
 
 
 def _update_migration_row(migration_id, **fields):
