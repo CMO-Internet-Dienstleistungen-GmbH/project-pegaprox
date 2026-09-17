@@ -173,9 +173,16 @@ def convert_command(source_file: str, target_path: str) -> str:
     """Read the VHDX and write raw into the allocated volume.
 
     The source format is stated rather than probed, and `-p` makes qemu-img emit a
-    percentage the caller can turn into progress. `-t none` and `-T none` keep the node's
-    page cache out of the way: a multi-hundred-gigabyte copy would otherwise evict
-    everything the guests already running on that node are using.
+    percentage the caller can turn into progress. `-T none` keeps the node's page cache
+    out of the way while reading: a multi-hundred-gigabyte copy would otherwise evict
+    everything the guests already running on that node are using. `-t none` does the
+    same on the writing side, but only where the kernel writes: a block device or a file.
+
+    An `rbd:` target is written through librbd in user space, where the node's page cache
+    is not involved and `-t none` only switches off the rbd cache (bounded per process,
+    32 MiB by default). Measured on a PVE 9.2.2 node against an HDD Ceph pool with a
+    10 GiB VHDX: 124 s and 150 s with `-t none`, 34 s without it, images identical. PVE's
+    own `qm disk import` writes the same way, without `-t`.
 
     `-T none` opens the source with O_DIRECT, which a CIFS mount only supports when it was
     mounted with `cache=none` — which is why that option is not negotiable in
@@ -190,7 +197,8 @@ def convert_command(source_file: str, target_path: str) -> str:
     behind it, and RBD answers `error rbd create: File exists`. Every attempt fails the
     same way, because nothing about it is transient.
     """
-    return (f'qemu-img convert -n -p -f {SOURCE_FORMAT} -O raw -t none -T none '
+    target_cache = '' if target_path.startswith('rbd:') else '-t none '
+    return (f'qemu-img convert -n -p -f {SOURCE_FORMAT} -O raw {target_cache}-T none '
             f'{shlex.quote(source_file)} {shlex.quote(target_path)}')
 
 
