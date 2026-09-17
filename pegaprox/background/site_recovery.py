@@ -432,7 +432,7 @@ def _disconnect_test_nics(tgt_mgr, node, vmid, vm_type='qemu'):
     return n
 
 
-def execute_failover(plan_id, failover_type='planned'):
+def execute_failover(plan_id, failover_type='planned', authorized_vmids=None):
     """Main failover orchestrator. Runs in greenlet.
 
     failover_type: 'planned', 'emergency', 'failback'
@@ -444,6 +444,18 @@ def execute_failover(plan_id, failover_type='planned'):
 
     event_id = _create_event(plan_id, failover_type)
     vms = _get_plan_vms(plan_id)
+    # MK Sep 2026 - the route authorized a VM list and then spawned us, and we read the
+    # list again from the database. Anything added in between - by a second request, or by
+    # the same caller racing their own approval - was acted on without ever being
+    # authorized. Work on the intersection with what was actually approved. None means an
+    # internal caller (the scheduler) that has no per-request authorization to carry.
+    if authorized_vmids is not None:
+        _approved = {str(v) for v in authorized_vmids}
+        _before = len(vms)
+        vms = [v for v in vms if str(v.get('vmid')) in _approved]
+        if len(vms) != _before:
+            logger.warning(f"[SR] plan {plan_id}: {_before - len(vms)} VM(s) were added "
+                           f"after authorization and are excluded from this failover")
     boot_groups = _group_vms_by_boot(vms)
     results = {}
     failed = False
@@ -861,6 +873,38 @@ def _heartbeat_check():
         timeout = plan.get('failover_timeout', 120)
 
         if elapsed >= timeout:
+            # MK Sep 2026 - "I cannot reach the source" and "the source is down" are not the
+            # same statement, and starting the replicas on the strength of the first one is
+            # how you get two copies of a guest writing to their own disks. We cannot fence
+            # the source: it is unreachable, that is the whole premise. What we CAN do is
+            # notice when the problem is at our end - if this management plane cannot reach
+            # ANY cluster right now, the far more likely explanation is our own network, and
+            # the source is sitting there running happily.
+            _others = [cid for cid in cluster_managers
+                       if cid not in (plan['source_cluster'], plan.get('target_cluster'))]
+            if _others:
+                _any_other_up = any(
+                    getattr(cluster_managers.get(cid), 'is_connected', False) for cid in _others)
+                if not _any_other_up:
+                    logger.error(
+                        f"[SR] BLOCKING auto-failover for '{_sl(plan['name'])}': this server "
+                        f"cannot reach any of its {len(_others)} other cluster(s) either, so the "
+                        f"source is probably up and we are the ones isolated. Starting the "
+                        f"replicas now would run the same guests twice.")
+                    log_audit('system', 'site_recovery.auto_failover_blocked',
+                              f"Auto-failover for '{_sl(plan['name'])}' blocked: management "
+                              f"plane is isolated from every cluster")
+                    _cooldowns[plan_id] = now + 300
+                    continue
+            # the target has to be reachable too - failing over into a cluster we cannot talk
+            # to accomplishes nothing and leaves the plan in 'running'
+            _tgt_mgr = cluster_managers.get(plan.get('target_cluster'))
+            if _tgt_mgr is not None and not getattr(_tgt_mgr, 'is_connected', False):
+                logger.error(f"[SR] BLOCKING auto-failover for '{_sl(plan['name'])}': the "
+                             f"target cluster is not reachable either")
+                _cooldowns[plan_id] = now + 300
+                continue
+
             # NS Apr 2026: before auto-failover, verify every VM in plan has a healthy recent
             # replication. Otherwise we'd start VMs that were never copied, or worse, stale copies.
             vms = db.query("SELECT * FROM site_recovery_vms WHERE plan_id = ?", (plan_id,))
