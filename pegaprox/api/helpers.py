@@ -428,7 +428,8 @@ def caller_is_scoped(user, cluster_id):
     treated a portal user as a cluster-wide operator and handed back the whole cluster. Centralised
     here so the rule can't drift between call sites again."""
     from pegaprox.models.permissions import ROLE_ADMIN
-    from pegaprox.utils.rbac import get_user_clusters, user_has_any_pool_access, get_vm_acls
+    from pegaprox.utils.rbac import (get_user_clusters, user_has_any_pool_access, get_vm_acls,
+                                     acls_unavailable)
     if not user:
         return True   # unknown identity → treat as confined (fail closed)
     if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
@@ -443,7 +444,13 @@ def caller_is_scoped(user, cluster_id):
         return True
     username = user.get('username', '')
     try:
-        for _vmid, acl in (get_vm_acls().get(cluster_id, {}) or {}).items():
+        _acls = get_vm_acls()
+        if acls_unavailable(_acls):
+            # the store no longer raises on a failed read, it answers with an empty
+            # snapshot - which would walk past this loop and report "not confined".
+            # Same answer as the except below: cannot tell, so treat as confined.
+            return True
+        for _vmid, acl in (_acls.get(cluster_id, {}) or {}).items():
             if username in (acl.get('users') or []):
                 return True
     except Exception:

@@ -24,6 +24,34 @@ from pegaprox.models.permissions import (
 )
 from pegaprox.core.db import get_db
 
+class _Snapshot(dict):
+    """A snapshot of a store that knows whether it is real.
+
+    Both loaders in this file answered `{}` for two different things: "this install
+    has none configured" and "the store did not load". Read as the former, an empty
+    answer WIDENS - an ACL-scoped user falls through to their role on the whole
+    cluster - and, worse, the writers here start with a DELETE and hand that empty
+    answer straight back to the table. MK Sep 2026
+    """
+    __slots__ = ('unavailable',)
+
+    def __init__(self, *args, unavailable=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.unavailable = unavailable
+
+
+def store_unavailable(snapshot) -> bool:
+    """True when this is an "I could not read it", not an empty store.
+
+    Tolerates a plain dict from a caller that built one itself.
+    """
+    return bool(getattr(snapshot, 'unavailable', False))
+
+
+# the ACL paths were written against this name first; keep it reading naturally there
+acls_unavailable = store_unavailable
+
+
 def load_custom_roles() -> dict:
     """Load custom roles from SQLite database
     
@@ -74,19 +102,27 @@ def load_custom_roles() -> dict:
                 # Global role
                 global_roles[row['name']] = role_data
         
-        return {'global': global_roles, 'tenants': tenant_roles}
+        return _Snapshot({'global': global_roles, 'tenants': tenant_roles})
     except Exception as e:
         logging.error(f"Error loading custom roles from database: {e}")
         # NS May 2026 - plain-JSON CUSTOM_ROLES_FILE fallback removed (encrypted DB only).
 
-    return {'global': {}, 'tenants': {}}
+    # NOT "this install has no custom roles" - we could not read them.
+    return _Snapshot({'global': {}, 'tenants': {}}, unavailable=True)
 
 
 def save_custom_roles(roles: dict):
-    """Save custom roles to SQLite database
+    """Save custom roles to SQLite database. True when the table was rewritten.
     
     uses SQLite now
     """
+    if store_unavailable(roles):
+        # this starts with a DELETE; writing back a snapshot that never loaded would
+        # drop every custom role in the installation, in every tenant, and leave the
+        # accounts bound to them with nothing to resolve against.
+        logging.error("[RBAC] refusing to rewrite custom_roles from a snapshot that "
+                      "failed to load")
+        return False
     try:
         db = get_db()
         cursor = db.conn.cursor()
@@ -124,8 +160,14 @@ def save_custom_roles(roles: dict):
                 ))
         
         db.conn.commit()
+        return True
     except Exception as e:
+        try:
+            get_db().conn.rollback()
+        except Exception:
+            pass
         logging.error(f"Failed to save custom roles: {e}")
+        return False
 
 # cache
 _custom_roles_cache = None
@@ -133,7 +175,14 @@ _custom_roles_cache = None
 def get_custom_roles():
     global _custom_roles_cache
     if _custom_roles_cache is None:
-        _custom_roles_cache = load_custom_roles()
+        fresh = load_custom_roles()
+        if store_unavailable(fresh):
+            # this cache has no TTL - it is filled once and kept until something
+            # invalidates it. Pinning a failed load here would leave every
+            # custom-role account with no permissions until the next restart, and
+            # hand the empty snapshot to the next writer.
+            return fresh
+        _custom_roles_cache = fresh
     return _custom_roles_cache
 
 def invalidate_roles_cache():
@@ -554,29 +603,40 @@ def load_vm_acls() -> dict:
     """
     try:
         db = get_db()
-        return db.get_all_vm_acls()
+        return _Snapshot(db.get_all_vm_acls())
     except Exception as e:
         logging.error(f"Failed to load VM ACLs from database: {e}")
         # Legacy fallback
         if os.path.exists(VM_ACLS_FILE):
             try:
                 with open(VM_ACLS_FILE, 'r') as f:
-                    return json.load(f)
-            except:
+                    return _Snapshot(json.load(f))
+            except Exception:
                 pass
-    return {}
+    # NOT an empty ACL table - we do not know what the ACLs are.
+    return _Snapshot(unavailable=True)
 
 
 def save_vm_acls(acls: dict):
-    """Save VM ACLs to SQLite database
+    """Save VM ACLs to SQLite database. True when it wrote.
     
     SQLite migration
     """
+    if store_unavailable(acls):
+        # save_all_vm_acls only upserts, so this cannot clear the table the way the
+        # role writer could - but writing back a snapshot that never loaded is still
+        # writing a decision we did not make. Refuse, and keep the pair symmetric so
+        # a future delete in save_all_vm_acls does not turn this into a wipe.
+        logging.error("[RBAC] refusing to write VM ACLs from a snapshot that failed "
+                      "to load")
+        return False
     try:
         db = get_db()
         db.save_all_vm_acls(acls)
+        return True
     except Exception as e:
         logging.error(f"Failed to save VM ACLs: {e}")
+        return False
 
 _vm_acls_cache = None
 
@@ -895,7 +955,12 @@ def get_vm_acls():
     now = time.monotonic()
     if _vm_acls_cache is not None and (now - _vm_acls_cache_time) < _VM_ACLS_TTL:
         return _vm_acls_cache
-    _vm_acls_cache = load_vm_acls()
+    fresh = load_vm_acls()
+    if acls_unavailable(fresh):
+        # never cache a failed load: a momentary DB hiccup would otherwise deny
+        # every scoped user for the whole TTL, and a stale success is no better.
+        return fresh
+    _vm_acls_cache = fresh
     _vm_acls_cache_time = now
     return _vm_acls_cache
 
@@ -928,7 +993,14 @@ def user_can_access_vm(user: dict, cluster_id: str, vmid: int, permission: str =
 
     username = user.get('username', '')
     acls = get_vm_acls()
-    
+    if acls_unavailable(acls):
+        # An unread ACL store is not an empty one. Reading it as empty lets this
+        # function fall through to the role-wide grant below and hands a confined
+        # user the whole cluster.
+        logging.error(f"[VM-ACL] ACL store unavailable - denying {permission} for "
+                      f"'{username}' on {cluster_id}/{vmid}")
+        return False
+
     # LW: Debug logging to help troubleshoot ACL issues
     logging.debug(f"[VM-ACL] Checking access for user={username}, cluster={cluster_id}, vmid={vmid}, perm={permission}")
     logging.debug(f"[VM-ACL] Available ACLs for cluster: {list(acls.get(cluster_id, {}).keys())}")
@@ -1069,6 +1141,12 @@ def get_user_vms(user: dict, cluster_id: str) -> list:
 
     username = user.get('username', '')
     acls = get_vm_acls()
+    if acls_unavailable(acls):
+        # None here means "no restrictions at all" - the last thing to answer when
+        # we could not read the restrictions.
+        logging.error(f"[VM-ACL] ACL store unavailable - no VMs listed for "
+                      f"'{username}' on {cluster_id}")
+        return []
     cluster_acls = acls.get(cluster_id, {})
     
     # if no acls for this cluster, user can see all (based on general perms)
@@ -1121,6 +1199,10 @@ def user_can_access_vmware_vm(user: dict, vmware_id: str, vm_id: str, permission
 
     username = user.get('username', '')
     acls = get_vm_acls()
+    if acls_unavailable(acls):
+        logging.error(f"[VM-ACL] ACL store unavailable - denying {permission} for "
+                      f"'{username}' on vmware:{vmware_id}/{vm_id}")
+        return False
 
     # VMware ACLs are stored under vmware_id as the cluster key
     vmware_acls = acls.get(f'vmware:{vmware_id}', {})

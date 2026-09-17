@@ -1647,8 +1647,17 @@ def create_custom_role():
             'created': datetime.now().isoformat()
         }
     
-    save_custom_roles(custom)
+    _saved = save_custom_roles(custom)
+    # `custom` IS the live cached dict (get_custom_roles hands it back by reference)
+    # and the edits above already went into it, so the cache has to go either way -
+    # otherwise a refused write leaves a role that was never persisted sitting in
+    # memory, granting permissions.
     invalidate_roles_cache()
+    if not _saved:
+        # save_custom_roles clears the table before rewriting it, so it refuses a
+        # snapshot that never loaded. Do not audit this as done or report success.
+        return jsonify({'error': 'Could not save the role - check the server logs',
+                        'code': 'ROLE_WRITE_FAILED'}), 500
     
     usr = request.session['user']
     scope = f"tenant:{tenant_id}" if tenant_id else "global"
@@ -1707,8 +1716,11 @@ def update_custom_role(role_id):
         roles[role_id]['permissions'] = permissions
     roles[role_id]['modified'] = datetime.now().isoformat()
     
-    save_custom_roles(custom)
-    invalidate_roles_cache()
+    _saved = save_custom_roles(custom)
+    invalidate_roles_cache()   # `custom` is the live cache - drop it either way
+    if not _saved:
+        return jsonify({'error': 'Could not save the role - check the server logs',
+                        'code': 'ROLE_WRITE_FAILED'}), 500
     
     log_audit(request.session['user'], 'role.updated', f"Updated role: {role_id}")
     return jsonify({'success': True})
@@ -1772,8 +1784,11 @@ def delete_custom_role(role_id):
     else:
         del custom['global'][role_id]
 
-    save_custom_roles(custom)
-    invalidate_roles_cache()
+    _saved = save_custom_roles(custom)
+    invalidate_roles_cache()   # `custom` is the live cache - drop it either way
+    if not _saved:
+        return jsonify({'error': 'Could not save the role - check the server logs',
+                        'code': 'ROLE_WRITE_FAILED'}), 500
     
     log_audit(request.session['user'], 'role.deleted', f"Deleted role: {role_id}")
     return jsonify({'success': True})
@@ -1856,8 +1871,11 @@ def apply_role_template(template_id):
             return jsonify({'error': 'Role already exists'}), 400
         custom['global'][role_id] = role_data
     
-    save_custom_roles(custom)
-    invalidate_roles_cache()
+    _saved = save_custom_roles(custom)
+    invalidate_roles_cache()   # `custom` is the live cache - drop it either way
+    if not _saved:
+        return jsonify({'error': 'Could not save the role - check the server logs',
+                        'code': 'ROLE_WRITE_FAILED'}), 500
     
     usr = request.session['user']
     scope = f"tenant:{tenant_id}" if tenant_id else "global"
@@ -1951,8 +1969,11 @@ def set_vm_acl(cluster_id, vmid):
         'modified_by': request.session['user']
     }
     
-    save_vm_acls(acls)
+    _saved = save_vm_acls(acls)
     invalidate_vm_acls_cache()
+    if not _saved:
+        return jsonify({'error': 'Could not save the VM ACL - check the server logs',
+                        'code': 'ACL_WRITE_FAILED'}), 500
     
     cluster_name = cluster_managers[cluster_id].config.name if cluster_id in cluster_managers else cluster_id
     log_audit(request.session['user'], 'vm.acl_updated', 
