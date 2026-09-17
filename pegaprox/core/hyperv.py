@@ -411,7 +411,13 @@ class HyperVManager:
         Six seconds for a 100 GiB disk with three volumes. `attached_after` is reported
         per disk, because the one way this can hurt is by not letting go.
         """
-        raw = self._client.run_json(scripts.VM_DISK_INSPECTION, VmId=vm_guid) or {}
+        # Not `run_json`: its read-only guard refuses `Mount-VHD` by name, so the inspection
+        # never ran and every check built on it reported "not inspected" as a pass. It is
+        # a read-only mount and changes no data, but it does attach the disk to the host
+        # for a few seconds, which is exactly what the audited action path is for.
+        raw = self._client.run_action(scripts.VM_DISK_INSPECTION,
+                                      'inspecting the disks of a stopped VM read-only',
+                                      VmId=vm_guid) or {}
         return normalise_disk_inspection(raw)
 
     def get_vm_state(self, vm_guid: str) -> dict:
