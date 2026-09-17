@@ -287,21 +287,31 @@ def xhm_dismiss_finished():
     no VM, no disk, no volume. What a failed run left behind on the target is a separate
     question with its own answer, and dropping the entry here does not touch it.
     """
-    removed, kept = [], []
     with _xhm_lock:
-        for mid, task in list(_xhm_migrations.items()):
-            if task.status == 'running' or not _xhm_reachable(task):
-                continue
-            del _xhm_migrations[mid]
-            removed.append(mid)
+        finished = [mid for mid, task in _xhm_migrations.items()
+                    if task.status != 'running' and _xhm_reachable(task)]
 
     # A migration can also be recorded somewhere that outlives this process, and then the
-    # entry comes back on the next page load unless that record goes too. Whoever keeps
-    # such a record decides whether it may: one that still has something standing on the
-    # target says no, because it is what stops the next attempt copying the same disks.
+    # entry comes back on the next page load unless that record goes too. The record is
+    # asked first: the log lives only in the in-memory entry, so dropping that entry for a
+    # record that stays would bring the row back without the log it had a moment ago.
+    removed, refused = [], {}
     for mid, why in _forget_recorded(None):
-        (removed if why is None else kept).append(mid if why is None else {'id': mid, 'reason': why})
+        if why is None:
+            removed.append(mid)
+        else:
+            refused[mid] = why
 
+    with _xhm_lock:
+        for mid in finished:
+            task = _xhm_migrations.get(mid)
+            if mid in refused or task is None or task.status == 'running':
+                continue
+            del _xhm_migrations[mid]
+            if mid not in removed:
+                removed.append(mid)
+
+    kept = [{'id': mid, 'reason': why} for mid, why in refused.items()]
     return jsonify({'removed': removed, 'count': len(removed), 'kept': kept})
 
 
@@ -333,13 +343,14 @@ def xhm_dismiss(mid):
         if task.status == 'running':
             return jsonify({'error': 'This migration is still running. Cancel it first, or '
                                      'wait for it to finish.'}), 409
-        del _xhm_migrations[mid]
 
     for _, why in _forget_recorded(mid):
         if why is not None:
-            # The in-memory entry is gone either way; saying nothing here would let it
-            # reappear on the next load with no explanation.
-            return jsonify({'removed': [mid], 'count': 1, 'kept': [{'id': mid, 'reason': why}]})
+            # The entry stays, and with it the log: that lives only here, and a record
+            # that stayed would bring the row back on the next load without it.
+            return jsonify({'error': why, 'kept': [{'id': mid, 'reason': why}]}), 409
+    with _xhm_lock:
+        _xhm_migrations.pop(mid, None)
     return jsonify({'removed': [mid], 'count': 1})
 
 
@@ -375,6 +386,8 @@ def _forget_recorded(mid):
         except Exception:
             logging.warning('Could not forget the record of migration %s', target,
                             exc_info=True)
+            # No answer is not a yes: the record may well still be there.
+            yield target, 'The migration record could not be removed.'
             continue
         yield target, (None if answer.get('forgotten') else answer.get('error'))
 

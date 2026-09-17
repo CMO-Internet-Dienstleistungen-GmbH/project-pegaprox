@@ -7906,7 +7906,9 @@ setXhmForm(prev=>({...prev,acknowledged:[],...(isHyperV?{start_after:true}:{}),.
 // leaving it there means scrolling past it to reach the next one's log.
 // Only ever called from the confirmation below: removing is asked first, with
 // every entry it would take named, never done on the first click.
-const dismissXhmMigrations=async mid=>{const url=mid?`${API_URL}/xhm/migrations/${mid}`:`${API_URL}/xhm/migrations?finished=1`;setXhmDismissing(true);try{const resp=await authFetch(url,{method:'DELETE'});const data=await resp?.json().catch(()=>({}));if(resp?.ok){if(mid&&xhmSelectedMigration===mid)setXhmSelectedMigration(null);if(!mid)setXhmSelectedMigration(null);// A record that refused to go stays on the list; saying nothing would
+const dismissXhmMigrations=async mid=>{const url=mid?`${API_URL}/xhm/migrations/${mid}`:`${API_URL}/xhm/migrations?finished=1`;setXhmDismissing(true);try{const resp=await authFetch(url,{method:'DELETE'});const data=await resp?.json().catch(()=>({}));if(resp?.ok){// Only a row that went takes its open log with it; one whose record
+// stayed is still on the list, and so is what it logged.
+if((data.removed||[]).includes(xhmSelectedMigration))setXhmSelectedMigration(null);// A record that refused to go stays on the list; saying nothing would
 // make the click look like it did not register.
 (data.kept||[]).forEach(k=>addToast('Error',`${k.id}: ${k.reason}`,'error'));setXhmDismissAsk(null);fetchXhmMigrations();}else{addToast('Error',data.error||'Could not dismiss the migration','error');}}catch(e){addToast('Error',e.message,'error');}finally{setXhmDismissing(false);}};const xhmClusterLabel=id=>{const c=clusters.find(x=>x.id===id);return c?`${c.name} (${id})`:id||'—';};const startXhmMigration=async()=>{setXhmLoading(true);try{const body={...xhmForm};// target_hardware() on the server reads `hardware`; the checkbox is the
 // wizard's word for the same decision.

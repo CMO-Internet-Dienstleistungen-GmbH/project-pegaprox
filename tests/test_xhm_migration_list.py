@@ -191,6 +191,84 @@ class TestDismissingARowThatOnlyTheRecordKnows:
         assert api.as_user(admin).delete('/api/xhm/migrations/nope').status_code == 404
 
 
+class TestTheLogStaysUntilTheRecordHasGone:
+    """The log of a migration lives only in this process. Dismissing used to drop the
+    in-memory entry first and ask the durable record afterwards, so a record that stayed
+    brought the row back on the next load — without the log it had a moment ago."""
+
+    def test_a_refused_record_keeps_the_entry_and_its_log(self, api, seed, registry,
+                                                          monkeypatch):
+        admin = seed.user('root', role='admin')
+        registry['mig1'] = _Task('mig1', status='failed')
+        _install_fake_record_keeper(
+            monkeypatch, lambda mid: {'forgotten': False, 'error': 'record busy'},
+            recorded=[{'id': 'mig1', 'status': 'failed'}])
+
+        resp = api.as_user(admin).delete('/api/xhm/migrations/mig1')
+
+        assert resp.status_code == 409
+        assert resp.get_json()['kept'] == [{'id': 'mig1', 'reason': 'record busy'}]
+        assert 'mig1' in registry
+
+    def test_a_record_that_went_takes_the_entry_with_it(self, api, seed, registry,
+                                                        monkeypatch):
+        admin = seed.user('root', role='admin')
+        registry['mig1'] = _Task('mig1', status='failed')
+        _install_fake_record_keeper(monkeypatch, lambda mid: {'forgotten': True},
+                                    recorded=[{'id': 'mig1', 'status': 'failed'}])
+
+        resp = api.as_user(admin).delete('/api/xhm/migrations/mig1')
+
+        assert resp.status_code == 200, resp.get_data(as_text=True)
+        assert resp.get_json()['removed'] == ['mig1']
+        assert 'mig1' not in registry
+
+    def test_clearing_finished_keeps_the_entries_whose_record_stayed(self, api, seed,
+                                                                     registry, monkeypatch):
+        admin = seed.user('root', role='admin')
+        registry['kept1'] = _Task('kept1', status='failed')
+        registry['gone1'] = _Task('gone1', status='completed')
+        registry['live'] = _Task('live', status='running')
+        _install_fake_record_keeper(
+            monkeypatch,
+            lambda mid: ({'forgotten': True} if mid != 'kept1'
+                         else {'forgotten': False, 'error': 'record busy'}),
+            recorded=[{'id': 'kept1', 'status': 'failed'},
+                      {'id': 'gone1', 'status': 'completed'}])
+
+        resp = api.as_user(admin).delete('/api/xhm/migrations')
+
+        body = resp.get_json()
+        assert resp.status_code == 200, resp.get_data(as_text=True)
+        assert body['removed'] == ['gone1']
+        assert body['kept'] == [{'id': 'kept1', 'reason': 'record busy'}]
+        assert sorted(registry) == ['kept1', 'live']
+
+    def test_a_record_that_could_not_be_asked_counts_as_kept(self, monkeypatch):
+        """An exception is not an answer. Reading it as "gone" was the other way the
+        in-memory entry disappeared while the record stayed behind."""
+        def broken(mid):
+            raise OSError('database locked')
+
+        _install_fake_record_keeper(monkeypatch, broken,
+                                    recorded=[{'id': 'mig1', 'status': 'failed'}])
+
+        answers = list(xhm_api._forget_recorded('mig1'))
+
+        assert [mid for mid, _ in answers] == ['mig1']
+        assert answers[0][1]
+
+    def test_the_selected_log_is_closed_only_for_a_row_that_went(self):
+        """Read out of the source: the list lives in a component this suite cannot mount."""
+        with open(os.path.join(REPO, 'web', 'src', 'dashboard.js'), encoding='utf-8') as fh:
+            source = fh.read()
+        start = source.index('const dismissXhmMigrations = async')
+        handler = source[start:source.index('const xhmClusterLabel', start)]
+
+        assert 'if (!mid) setXhmSelectedMigration(null)' not in handler
+        assert "(data.removed || []).includes(xhmSelectedMigration)" in handler
+
+
 def test_removing_from_the_list_is_asked_before_it_happens():
     """Read out of the source: the list lives in a component this suite cannot mount.
     Both the X on a row and "clear finished" open a confirmation; neither deletes."""
