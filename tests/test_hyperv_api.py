@@ -1007,6 +1007,30 @@ class TestCleanupIsRefusedUnlessEverythingAgrees:
         assert 'not connected' in response.get_json()['error']
 
 
+class TestTheStartIsAttributed:
+    """The imported VM's description names whoever started the migration."""
+
+    def test_the_user_comes_from_the_session_not_from_the_request(self, api, seed,
+                                                                  monkeypatch):
+        from pegaprox.core import hyperv_xhm
+
+        _hyperv_manager(api)
+        api.set_manager('pve_1', api.make_fake_manager(cluster_id='pve_1',
+                                                       cluster_type='proxmox'))
+        monkeypatch.setattr(hyperv_xhm, 'refuse_hyperv_start', lambda *a, **kw: None)
+        started = []
+        monkeypatch.setattr(hyperv_xhm, '_run_hyperv_to_pve', started.append)
+        admin = seed.user('root', role='admin')
+
+        response = api.as_user(admin).post('/api/xhm/migrate', json={
+            'source_cluster': HOST, 'source_vmid': VM_A, 'target_cluster': 'pve_1',
+            'target_node': 'node-a', 'target_storage': 'local-lvm',
+            'started_by': 'somebody-else'})
+
+        assert response.status_code == 202, response.get_json()
+        assert started and started[0].config['started_by'] == 'root'
+
+
 class TestTheSourceIsNotStartedWhileItsCopyRuns:
     """The route refuses, not just the core: a direct POST must hit the same wall."""
 

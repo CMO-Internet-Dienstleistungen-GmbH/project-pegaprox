@@ -12,6 +12,7 @@
 import json
 import shlex
 import threading
+from datetime import datetime
 
 import pytest
 
@@ -807,6 +808,23 @@ class TestTheTargetVm:
         _, target, _ = wired
         _run(FakeTask())
         assert self._created(target)['ostype'] == 'other'
+
+    def test_a_description_with_start_time_and_user_still_marks_the_migration(self):
+        """The cleanup recognises its VM by prefix and id; what follows must not hide it."""
+        description = hyperv_xhm.target_vm_description(
+            'mig12345', 'guest-a', datetime(2026, 9, 17, 8, 5, 9), 'operator@pve')
+        assert hyperv_xhm._describes_migration(description, 'mig12345')
+        assert not hyperv_xhm._describes_migration(description, 'mig99999')
+
+    def test_the_description_says_when_and_by_whom_the_run_was_started(self, db, wired):
+        _, target, _ = wired
+        task = FakeTask(config={'started_by': 'operator@pve'})
+        task.vm_name = 'guest-a'
+        task.started_at = datetime(2026, 9, 17, 8, 5, 9)
+        _run(task)
+        assert self._created(target)['description'] == (
+            'Imported from Hyper-V by PegaProx migration mig12345 (source: guest-a), '
+            'started 2026-09-17 08:05:09 by operator@pve')
 
     def test_the_migrated_vm_is_not_started(self, db, wired):
         """It boots when somebody has looked at it. An automatic start would put a second

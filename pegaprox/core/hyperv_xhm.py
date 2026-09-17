@@ -617,10 +617,22 @@ def _run_hyperv_to_pve(task):
 _DESCRIPTION_PREFIX = 'Imported from Hyper-V by PegaProx migration'
 
 
-def target_vm_description(migration_id, vm_name=''):
-    """The ownership mark written onto every VM this patch creates."""
+# When the run was started, in the form the Proxmox notes show it. Server-local time, the
+# same clock the migration log is stamped with.
+_DESCRIPTION_TIME_FORMAT = '%Y-%m-%d %H:%M:%S'
+
+
+def target_vm_description(migration_id, vm_name='', started_at=None, started_by=''):
+    """The ownership mark written onto every VM this patch creates.
+
+    When and by whom follow the mark rather than precede it: a cleanup recognises its VM by
+    the prefix and migration id alone, so a description written before these were added is
+    still recognised.
+    """
     source = f' (source: {vm_name})' if vm_name else ''
-    return f'{_DESCRIPTION_PREFIX} {migration_id}{source}'
+    started = f', started {started_at.strftime(_DESCRIPTION_TIME_FORMAT)}' if started_at else ''
+    by = f' by {started_by}' if started_by else ''
+    return f'{_DESCRIPTION_PREFIX} {migration_id}{source}{started}{by}'
 
 
 def _describes_migration(description, migration_id):
@@ -2240,7 +2252,9 @@ def _create_target_vm(task, target, new_vmid, detail):
         # Who made this, and under which migration. A cleanup reads it back before it
         # deletes anything: a VMID says nothing about ownership, and the number can have
         # been taken by somebody else's guest since this run failed.
-        'description': target_vm_description(task.id, task.vm_name),
+        'description': target_vm_description(task.id, task.vm_name,
+                                             getattr(task, 'started_at', None),
+                                             (task.config or {}).get('started_by', '')),
     }
     # Left out, Proxmox would create the VM on kvm64. The suggestion depends on what the
     # target node's processor can provide, because a model it lacks keeps the VM from
