@@ -415,6 +415,22 @@ def _may_dismiss_record(row):
         return False
 
 
+@bp.route('/api/xhm/migrations/<mid>/log', methods=['GET'])
+@require_auth(perms=['vm.migrate'])
+def xhm_log(mid):
+    """The whole log of one migration.
+
+    to_dict() carries the last 30 lines, which is enough for the list and its live frames.
+    An opened row is where an operator reads what happened, and after a reload it showed
+    only what the last phase had written. A route of its own rather than a change to the
+    detail route, whose last line other patches build on.
+    """
+    task = _xhm_migrations.get(mid)
+    if task is None or not _xhm_reachable(task):
+        return jsonify({'error': 'Migration not found'}), 404
+    return jsonify({'id': mid, 'log': list(task.log_lines)})
+
+
 @bp.route('/api/xhm/migrations/<mid>', methods=['GET'])
 @require_auth(perms=['vm.migrate'])
 def xhm_detail(mid):

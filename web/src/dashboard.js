@@ -8317,6 +8317,7 @@
             const [hvPreflight, setHvPreflight] = useState(null);
             const [xhmSourceVms, setXhmSourceVms] = useState([]);
             const xhmSelectedMigrationRef = useRef(null);
+            const xhmDetailRefetchRef = useRef(null);
             const lastReconnectToast = useRef({});  // cluster_id -> timestamp, avoid toast spam
 
             // LW Apr 2026: monthly sponsor modal for admins (optional 90-day snooze).
@@ -11169,7 +11170,9 @@
                                         return [m, ...prev];
                                     });
                                     if (xhmSelectedMigrationRef.current === m.id) {
-                                        setXhmMigrationDetail(prev => prev ? {...prev, ...m} : m);
+                                        // The frame's log is the last 30 lines; the open row holds the whole one.
+                                        setXhmMigrationDetail(prev => prev ? {...prev, ...m, log: xhmMergeLog(prev.log, m.log)} : m);
+                                        xhmRefetchDetailSoon(m.id);
                                     }
                                 }
                             } else if (data.type === 'hyperv_inventory') {
@@ -11205,6 +11208,9 @@
                                         if (m.line && !logs.includes(m.line)) logs.push(m.line);
                                         return {...prev, log: logs, progress: m.progress || prev.progress, phase: m.phase || prev.phase};
                                     });
+                                    // The server sends at most one log frame per second and drops the rest,
+                                    // so the lines in between are fetched shortly after instead of never.
+                                    xhmRefetchDetailSoon(m.id);
                                 }
                             }
                         } catch (e) {
@@ -12721,9 +12727,31 @@
             };
             const fetchXhmDetail = async (mid) => {
                 try {
-                    const r = await authFetch(`${API_URL}/xhm/migrations/${mid}`);
-                    if (r?.ok) setXhmMigrationDetail(await r.json());
+                    // The detail carries the last 30 log lines; the whole log has its own route.
+                    const [r, l] = await Promise.all([
+                        authFetch(`${API_URL}/xhm/migrations/${mid}`),
+                        authFetch(`${API_URL}/xhm/migrations/${mid}/log`),
+                    ]);
+                    if (!r?.ok) return;
+                    const detail = await r.json();
+                    const full = l?.ok ? await l.json().catch(() => null) : null;
+                    setXhmMigrationDetail(full?.log ? {...detail, log: full.log} : detail);
                 } catch(e) {}
+            };
+            // Lines the open row already shows stay; lines only the incoming copy has are appended.
+            const xhmMergeLog = (have, incoming) => {
+                const kept = have || [];
+                const seen = new Set(kept);
+                const extra = (incoming || []).filter(line => !seen.has(line));
+                return extra.length ? [...kept, ...extra] : kept;
+            };
+            // One detail request per burst of frames, not one per frame.
+            const xhmRefetchDetailSoon = (mid) => {
+                if (xhmDetailRefetchRef.current) return;
+                xhmDetailRefetchRef.current = setTimeout(() => {
+                    xhmDetailRefetchRef.current = null;
+                    if (xhmSelectedMigrationRef.current === mid) fetchXhmDetail(mid);
+                }, 2000);
             };
             const fetchXhmPlan = async () => {
                 if (!xhmForm.source_cluster || !xhmForm.source_vmid || !xhmForm.target_cluster) return;
@@ -23849,13 +23877,10 @@
                                                     </div>
                                                 </div>
                                                 {xhmMigrations.length > 0 ? (
-                                                    // Bounded on purpose. The log of the
-                                                    // selected migration is rendered below
-                                                    // this panel, so an unbounded list puts
-                                                    // the reason a migration failed one
-                                                    // screenful further down for every entry
-                                                    // that happens to be above it.
-                                                    <div className="divide-y divide-proxmox-border/50 max-h-96 overflow-y-auto">
+                                                    // Not height-bounded: each entry opens its own log in place,
+                                                    // and a scrolling list around a scrolling log is two
+                                                    // scrollbars fighting over one wheel.
+                                                    <div className="divide-y divide-proxmox-border/50">
                                                         {xhmMigrations.map(m => {
                                                             const isActive = m.status === 'running';
                                                             const phases = ['planning','transfer','creating','attaching','completed'];
@@ -23874,6 +23899,7 @@
                                                                      onClick={() => setXhmSelectedMigration(xhmSelectedMigration === m.id ? null : m.id)}>
                                                                     <div className="flex items-center justify-between mb-2">
                                                                         <div className="flex items-center gap-3">
+                                                                            <Icons.ChevronRight className={`w-3.5 h-3.5 text-gray-500 transform transition-transform ${xhmSelectedMigration === m.id ? 'rotate-90' : ''}`} />
                                                                             <div className={`w-2.5 h-2.5 rounded-full ${isActive ? 'bg-purple-400 animate-pulse' : m.status === 'completed' ? 'bg-green-400' : m.status === 'failed' ? 'bg-red-400' : 'bg-gray-500'}`} />
                                                                             <span className="text-sm font-medium text-white">{m.vm_name || m.source_vmid}</span>
                                                                             <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-400 font-medium">{dirLabel}</span>
@@ -23920,22 +23946,64 @@
                                                                         )}
                                                                     </div>
                                                                     {/* Phase timeline */}
-                                                                    {m.phase_times && Object.keys(m.phase_times).length > 0 && (
-                                                                        <div className="flex items-center gap-0.5 mt-2">
-                                                                            {phases.map((ph, idx) => {
-                                                                                const pt = m.phase_times[ph];
-                                                                                const broke = ph === brokeAt;
-                                                                                const isCur = m.phase === ph && !broke;
-                                                                                const isDone = pt && pt.end && !broke;
-                                                                                return (<React.Fragment key={ph}>
-                                                                                    {idx > 0 && <div className={`flex-1 h-px ${isDone ? 'bg-purple-500' : broke ? 'bg-red-500/60' : isCur ? 'bg-purple-500/40' : 'bg-proxmox-border'}`} />}
-                                                                                    <div title={broke ? `${ph} — failed here` : `${ph}${pt?.duration ? ` (${pt.duration}s)` : ''}`} className={`w-5 h-5 rounded-full flex items-center justify-center text-[8px] font-bold border ${broke ? 'bg-red-500/20 border-red-500 text-red-400' : isDone ? 'bg-purple-500/20 border-purple-500 text-purple-400' : isCur ? 'bg-purple-500/20 border-purple-400 text-purple-400 animate-pulse' : 'bg-proxmox-dark border-proxmox-border text-gray-600'}`}>
-                                                                                        {broke ? '✕' : isDone ? '✓' : idx+1}
-                                                                                    </div>
-                                                                                </React.Fragment>);
-                                                                            })}
+                                                                    {xhmSelectedMigration === m.id && (() => {
+                                                                        // The row is where its details are read: phase bar, disk
+                                                                        // progress and the whole log open under the entry they
+                                                                        // belong to, instead of in a panel below a list that pushes
+                                                                        // them further down with every entry above.
+                                                                        const d = xhmMigrationDetail && xhmMigrationDetail.id === m.id ? {...m, ...xhmMigrationDetail} : m;
+                                                                        const times = d.phase_times || {};
+                                                                        return (
+                                                                        <div className="mt-3 space-y-3" style={{cursor: 'auto'}} onClick={e => e.stopPropagation()}>
+                                                                            {Object.keys(times).length > 0 && (
+                                                                                <div className="flex items-start">
+                                                                                    {phases.map((ph, idx) => {
+                                                                                        const pt = times[ph];
+                                                                                        const broke = ph === brokeAt;
+                                                                                        // "completed" is the state the run ends in, so it never
+                                                                                        // gets an end time of its own. Reaching it is passing it.
+                                                                                        const isDone = !broke && !!pt && (!!pt.end || (ph === 'completed' && d.status === 'completed'));
+                                                                                        const isCur = d.phase === ph && !broke && !isDone;
+                                                                                        return (<React.Fragment key={ph}>
+                                                                                            {idx > 0 && <div style={{marginTop: 10}} className={`flex-1 h-px ${isDone ? 'bg-purple-500' : broke ? 'bg-red-500/60' : isCur ? 'bg-purple-500/40' : 'bg-proxmox-border'}`} />}
+                                                                                            <div className="flex flex-col items-center w-16 shrink-0">
+                                                                                                <div title={broke ? `${ph} — failed here` : `${ph}${pt?.duration ? ` (${pt.duration}s)` : ''}`} className={`w-5 h-5 rounded-full flex items-center justify-center text-[8px] font-bold border ${broke ? 'bg-red-500/20 border-red-500 text-red-400' : isDone ? 'bg-purple-500/20 border-purple-500 text-purple-400' : isCur ? 'bg-purple-500/20 border-purple-400 text-purple-400 animate-pulse' : 'bg-proxmox-dark border-proxmox-border text-gray-600'}`}>
+                                                                                                    {broke ? '✕' : isDone ? '✓' : idx+1}
+                                                                                                </div>
+                                                                                                <span className={`mt-1 text-[10px] ${broke ? 'text-red-400' : isDone || isCur ? 'text-gray-300' : 'text-gray-600'}`}>{phaseLabel[ph]}</span>
+                                                                                                {pt?.duration ? <span className="text-[10px] text-gray-600">{pt.duration}s</span> : null}
+                                                                                            </div>
+                                                                                        </React.Fragment>);
+                                                                                    })}
+                                                                                </div>
+                                                                            )}
+                                                                            {d.disk_progress && Object.keys(d.disk_progress).length > 0 && (
+                                                                                <div className="space-y-2">
+                                                                                    {Object.entries(d.disk_progress).map(([key, dp]) => (
+                                                                                        <div key={key}>
+                                                                                            <div className="flex justify-between text-xs text-gray-400 mb-0.5">
+                                                                                                <span>{key}</span>
+                                                                                                <span>{dp.pct}% - {(dp.copied/(1024*1024*1024)).toFixed(1)}/{(dp.total/(1024*1024*1024)).toFixed(1)} GB</span>
+                                                                                            </div>
+                                                                                            <div className="h-2 bg-proxmox-dark rounded-full overflow-hidden"><div className="h-full bg-purple-400 rounded-full transition-all" style={{width:`${dp.pct}%`}} /></div>
+                                                                                        </div>
+                                                                                    ))}
+                                                                                </div>
+                                                                            )}
+                                                                            {/* column-reverse keeps the newest line in view while a run is still writing
+                                                                                (inline: the shipped Tailwind build has no flex-col-reverse) */}
+                                                                            <div className="bg-black/30 rounded max-h-80 overflow-y-auto" style={{display: 'flex', flexDirection: 'column-reverse', userSelect: 'text'}}>
+                                                                                <div className="p-3 font-mono text-xs leading-relaxed">
+                                                                                    {(d.log || []).length === 0 && <div className="text-gray-600">{xhmMigrationDetail ? (t('xhmNoLog') || 'No log lines.') : (t('loading') || 'Loading…')}</div>}
+                                                                                    {(d.log || []).map((line, i) => (
+                                                                                        <div key={i} style={{wordBreak: 'break-word'}} className={`whitespace-pre-wrap ${line.includes('FAIL') || line.includes('ERROR') || line.includes('✗') ? 'text-red-400' : line.includes('Phase:') ? 'text-purple-400 font-bold' : line.includes('===') ? 'text-blue-400' : 'text-gray-400'}`}>{line}</div>
+                                                                                    ))}
+                                                                                </div>
+                                                                            </div>
+                                                                            {d.error && <div className="p-2 rounded bg-red-500/10 border border-red-500/20 text-red-400 text-xs">Error: {d.error}</div>}
                                                                         </div>
-                                                                    )}
+                                                                        );
+                                                                    })()}
                                                                 </div>
                                                             );
                                                         })}
@@ -23943,36 +24011,6 @@
                                                 ) : <div className="p-8 text-center text-gray-600 text-sm">{t('xhmNoMigrations') || 'No migrations yet.'}</div>}
                                             </div>
 
-                                            {/* Migration Log Viewer */}
-                                            {xhmSelectedMigration && xhmMigrationDetail && (
-                                                <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
-                                                    <div className="p-4 border-b border-proxmox-border flex items-center justify-between">
-                                                        <h3 className="text-sm font-semibold text-white">Migration Log - {xhmMigrationDetail.vm_name} <span className="text-gray-500 font-normal">({xhmSelectedMigration})</span></h3>
-                                                        <button onClick={() => setXhmSelectedMigration(null)} className="text-xs text-gray-500 hover:text-white px-2 py-1 rounded bg-proxmox-dark">Close</button>
-                                                    </div>
-                                                    {xhmMigrationDetail.disk_progress && Object.keys(xhmMigrationDetail.disk_progress).length > 0 && (
-                                                        <div className="p-4 border-b border-proxmox-border/50 space-y-2">
-                                                            <div className="text-xs text-gray-500 uppercase font-semibold">Disk Transfer</div>
-                                                            {Object.entries(xhmMigrationDetail.disk_progress).map(([key, dp]) => (
-                                                                <div key={key}>
-                                                                    <div className="flex justify-between text-xs text-gray-400 mb-0.5">
-                                                                        <span>{key}</span>
-                                                                        <span>{dp.pct}% - {(dp.copied/(1024*1024*1024)).toFixed(1)}/{(dp.total/(1024*1024*1024)).toFixed(1)} GB</span>
-                                                                    </div>
-                                                                    <div className="h-2 bg-proxmox-dark rounded-full overflow-hidden"><div className="h-full bg-purple-400 rounded-full transition-all" style={{width:`${dp.pct}%`}} /></div>
-                                                                </div>
-                                                            ))}
-                                                        </div>
-                                                    )}
-                                                    <div className="p-3 bg-black/30 max-h-60 overflow-y-auto font-mono text-xs leading-relaxed">
-                                                        {(xhmMigrationDetail.log || []).map((line, i) => (
-                                                            <div key={i} className={line.includes('FAIL') || line.includes('ERROR') ? 'text-red-400' : line.includes('Phase:') ? 'text-purple-400 font-bold' : line.includes('===') ? 'text-blue-400' : 'text-gray-500'}>{line}</div>
-                                                        ))}
-                                                    </div>
-                                                    {xhmMigrationDetail.error && <div className="p-3 bg-red-500/10 border-t border-red-500/20 text-red-400 text-xs">Error: {xhmMigrationDetail.error}</div>}
-                                                    {xhmMigrationDetail.status === 'completed' && <div className="p-3 bg-green-500/10 border-t border-green-500/20 text-green-400 text-xs">Migration complete! Target: {xhmMigrationDetail.target_vmid}</div>}
-                                                </div>
-                                            )}
                                         </div>
                                     </div>
                                 ) : sidebarMultiSdn ? (
