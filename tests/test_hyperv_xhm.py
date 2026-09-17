@@ -528,6 +528,12 @@ class TestTheTargetVm:
     def _created(self, target):
         return next(data for url, data in target.posts if url.endswith('/qemu'))
 
+    def test_the_guest_agent_channel_is_switched_on(self, db, wired):
+        """The injection installs the agent; without the flag Proxmox never talks to it."""
+        _, target, _ = wired
+        _run(FakeTask())
+        assert self._created(target)['agent'] == 'enabled=1'
+
     def test_a_generation_two_source_becomes_a_uefi_q35_machine(self, db, wired):
         _, target, _ = wired
         _run(FakeTask())
