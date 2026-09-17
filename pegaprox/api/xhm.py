@@ -196,6 +196,9 @@ def xhm_start():
         refused = refuse_hyperv_start(data['source_cluster'], vmid_int, data)
         if refused:
             return jsonify({'error': refused}), 409
+        # Named in the imported VM's description. Set here from the session, never taken
+        # from the request body, which anybody can fill in with any name.
+        data['started_by'] = request.session['user']
 
     mid = str(uuid.uuid4())[:8]
     task = XHMigrationTask(
