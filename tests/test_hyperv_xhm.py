@@ -2544,7 +2544,8 @@ class TestTheRecordKeepsTheLog:
     def test_the_log_is_filed_when_a_run_fails(self, monkeypatch):
         filed = {}
         monkeypatch.setattr(hyperv_xhm.hyperv_db, 'save_log',
-                            lambda conn, mid, lines: filed.update({mid: list(lines)}))
+                            lambda conn, mid, lines, snapshot=None: filed.update(
+                                {mid: list(lines)}))
         monkeypatch.setattr(hyperv_xhm.hyperv_db, 'get_migration',
                             lambda conn, mid: {'created_resources': []})
         monkeypatch.setattr(hyperv_xhm, '_conn', lambda: None)
@@ -2579,9 +2580,169 @@ class TestTheRecordKeepsTheLog:
 
         row = hyperv_xhm.recorded_migrations(())[0]
 
-        assert row['log_lines'][-1].endswith('name invalid format')
-        # The timeline is not reconstructed — it lived in the process.
+        # Under the key the list reads: `log_lines` alone rendered as "no log".
+        assert row['log'][-1].endswith('name invalid format')
+        assert row['log_lines'] == row['log']
+        # A row from before snapshots were kept has no timeline, and shows none.
         assert row['phase_times'] == {}
+
+
+def _real_task(**config):
+    """The upstream task, so that what is recorded is what its own to_dict() says."""
+    from pegaprox.core.xhm import XHMigrationTask
+    return XHMigrationTask('mig12345', hyperv_xhm.DIRECTION, SOURCE, '', VMID, TARGET,
+                           'node-a', 'local-lvm', config=config)
+
+
+def _recorded(db, migration_id):
+    return hyperv_xhm._as_migration_row(hyperv_db.get_migration(db.conn, migration_id))
+
+
+class TestTheWholeMigrationIsOnRecord:
+    """After a restart the list is read from the database, and it has to show the entry it
+    showed before: status, reason, timeline, wizard choices and the whole log."""
+
+    def test_a_run_that_fails_before_it_finds_the_source_is_recorded(self, db, wired):
+        import pegaprox.globals as ppglobals
+        ppglobals.cluster_managers.pop(SOURCE)
+
+        task = _run(_real_task())
+
+        row = _recorded(db, task.id)
+        assert row['status'] == hyperv_db.STATUS_FAILED
+        assert row['error'] == 'Source Hyper-V host not found'
+        assert row['phase'] == 'failed'
+        assert any('Source Hyper-V host not found' in line for line in row['log'])
+        assert row['source_vmid'] == VMID
+
+    def test_a_failed_run_keeps_its_timeline_choices_and_log(self, db, wired):
+        _, _, node = wired
+        node.convert_exit = 1
+
+        task = _run(_real_task(start_after=False, hardware='virtio',
+                               network_map={'00155D000001': 'vmbr0'}))
+
+        row = _recorded(db, task.id)
+        assert row['status'] == hyperv_db.STATUS_FAILED
+        assert row['error']
+        assert 'planning' in row['phase_times']
+        assert row['phase_times'] == task.phase_times
+        # What the live entry showed, not the last boundary the column was written at.
+        assert row['phase'] == task.phase == 'failed'
+        assert row['config']['start_after'] is False
+        assert row['config']['hardware'] == 'virtio'
+        assert row['config']['network_map']
+        assert row['log'] == task.log_lines
+        assert row['vm_name'] == 'guest-a'
+
+    def test_a_completed_run_reads_back_as_the_live_entry_did(self, db, wired):
+        task = _run(_real_task(start_after=False))
+
+        row = _recorded(db, task.id)
+        live = task.to_dict()
+        for key in ('phase', 'progress', 'phase_times', 'target_vmid', 'vm_name'):
+            assert row[key] == live[key], key
+        assert row['log'][-len(live['log']):] == live['log']
+
+    def test_a_run_that_completed_with_errors_keeps_all_of_it(self, db, wired, monkeypatch):
+        TestARunWhoseInjectionFailed._fail_injection(monkeypatch)
+
+        task = _run(_real_task(start_after=False, hardware='virtio'))
+
+        row = _recorded(db, task.id)
+        assert row['status'] == hyperv_db.STATUS_COMPLETED_WITH_ERRORS
+        assert row['error']
+        assert row['phase_times'].get('completed')
+        assert row['guest_windows'] is True
+        assert any('NO_WINDOWS_DIR' in line for line in row['log'])
+
+    def test_every_line_is_on_record_as_soon_as_it_is_logged(self, db, monkeypatch):
+        task = _real_task()
+        mid = hyperv_xhm._record_start(task, GUID)
+        hyperv_xhm._keep_on_record(task, mid)
+
+        task.log('Copying disk 1 of 2')
+
+        assert _recorded(db, mid)['log'][-1].endswith('Copying disk 1 of 2')
+
+    def test_the_record_keeps_lines_the_live_task_trims(self, db, monkeypatch):
+        monkeypatch.setattr('pegaprox.core.xhm._MAX_LOG_LINES', 5)
+        task = _real_task()
+        mid = hyperv_xhm._record_start(task, GUID)
+        hyperv_xhm._keep_on_record(task, mid)
+
+        for n in range(12):
+            task.log(f'line {n}')
+
+        assert len(task.log_lines) == 5
+        recorded = _recorded(db, mid)['log']
+        assert len(recorded) == 12
+        assert recorded[0].endswith('line 0') and recorded[-1].endswith('line 11')
+
+    def test_a_phase_change_is_on_record_as_soon_as_it_happens(self, db):
+        task = _real_task()
+        mid = hyperv_xhm._record_start(task, GUID)
+        hyperv_xhm._keep_on_record(task, mid)
+
+        task.set_phase('transfer')
+
+        assert 'transfer' in _recorded(db, mid)['phase_times']
+
+    def test_credentials_in_the_wizard_config_are_not_recorded(self, db):
+        task = _real_task(start_after=True, source_password=SECRET, api_token=SECRET)
+        mid = hyperv_xhm._record_start(task, GUID)
+        hyperv_xhm._keep_on_record(task, mid)
+
+        task.log('x')
+
+        stored = hyperv_db.get_migration(db.conn, mid)['snapshot']
+        assert SECRET not in json.dumps(stored)
+        assert stored['config']['start_after'] is True
+
+    def test_the_record_columns_win_over_the_snapshot(self, db):
+        """A retry or the restart that marked a run interrupted changed the row after the run
+        had last written its snapshot."""
+        task = _real_task()
+        mid = hyperv_xhm._record_start(task, GUID)
+        hyperv_xhm._keep_on_record(task, mid)
+        task.set_phase('failed', 'disk read error')
+        hyperv_db.update_migration(db.conn, mid, status=hyperv_db.STATUS_COMPLETED, error='')
+
+        row = _recorded(db, mid)
+
+        assert row['status'] == hyperv_db.STATUS_COMPLETED
+        assert row['error'] == ''
+        assert 'failed' in row['phase_times']
+
+
+class TestTheSnapshotColumn:
+    def test_an_existing_table_gains_it(self, tmp_path):
+        import sqlite3
+        conn = sqlite3.connect(tmp_path / 'old.db')
+        # The table as a build before this change left it: everything but the snapshot.
+        conn.execute("CREATE TABLE hyperv_migrations (migration_id TEXT PRIMARY KEY, "
+                     "source_cluster TEXT NOT NULL, source_vm_guid TEXT NOT NULL, "
+                     "source_vm_name TEXT DEFAULT '', target_cluster TEXT DEFAULT '', "
+                     "target_node TEXT DEFAULT '', target_storage TEXT DEFAULT '', "
+                     "target_vmid INTEGER, phase TEXT DEFAULT 'planning', "
+                     "status TEXT DEFAULT 'running', progress INTEGER DEFAULT 0, "
+                     "error TEXT DEFAULT '', created_resources TEXT DEFAULT '[]', "
+                     "disk_progress TEXT DEFAULT '{}', post_import TEXT DEFAULT '{}', "
+                     "log_lines TEXT DEFAULT '[]', started_at REAL NOT NULL, "
+                     "updated_at REAL NOT NULL, completed_at REAL)")
+
+        hyperv_db.ensure_schema(conn.cursor())
+
+        columns = [c[1] for c in conn.execute('PRAGMA table_info(hyperv_migrations)')]
+        assert 'snapshot' in columns
+
+    def test_the_guid_found_after_the_start_can_be_written(self, db):
+        mid = hyperv_db.create_migration(db.conn, source_cluster=SOURCE, source_vm_guid='')
+
+        hyperv_db.update_migration(db.conn, mid, source_vm_guid=GUID, source_vm_name='guest-a')
+
+        row = hyperv_db.get_migration(db.conn, mid)
+        assert (row['source_vm_guid'], row['source_vm_name']) == (GUID, 'guest-a')
 
 
 class TestTheSidebarCanLeaveAHypervHost:
