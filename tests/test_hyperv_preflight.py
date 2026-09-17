@@ -286,7 +286,8 @@ class TestWholeRun:
     def test_the_report_severity_is_the_worst_finding(self):
         assert pf.run_preflight(_vm(state='Running'), _target(), _options()).severity == pf.BLOCKING
         assert pf.run_preflight(_vm(vtpm_enabled=True), _target(), _options()).severity == pf.WARNING
-        assert pf.run_preflight(_vm(), _target(), _options()).severity == pf.OK
+        assert pf.run_preflight(_vm(), _target(),
+                                _options(start_after=False)).severity == pf.OK
 
     def test_a_warning_does_not_block(self):
         report = pf.run_preflight(_vm(vtpm_enabled=True), _target(), _options())
@@ -938,3 +939,23 @@ class TestTheRegistryIsOpenedRatherThanInferred:
     def test_a_volume_without_windows_is_not_a_finding(self):
         finding = pf.check_guest_registry(_inspection(windows=False, hive_readable=None))
         assert finding.severity == pf.OK
+
+
+class TestStartingTheCopy:
+    """Starting the imported VM is the default, so the warning is too."""
+
+    def _finding(self, options):
+        report = pf.run_preflight(_vm(), _target(), options)
+        return next(f for f in report.findings if f.check == 'start_after')
+
+    def test_a_request_that_does_not_say_is_warned_about_the_start(self):
+        assert self._finding(_options()).severity == pf.WARNING
+
+    def test_switching_the_start_off_clears_the_warning(self):
+        assert self._finding(_options(start_after=False)).severity == pf.OK
+
+    def test_the_warning_needs_no_confirmation(self):
+        """It says what the default does; confirming it on every migration would only
+        teach people to click through the ones that matter."""
+        report = pf.run_preflight(_vm(), _target(), _options())
+        assert 'start_after' not in report.requires_acknowledgement()

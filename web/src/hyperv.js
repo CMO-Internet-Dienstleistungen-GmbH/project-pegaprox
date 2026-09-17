@@ -382,6 +382,9 @@
                             // machine the wizard is not about to create, so the list can
                             // say "sata controller" while the box above it says VirtIO.
                             hardware: form.hardware || '',
+                            // Whether the copy is started at the end, so the warning about
+                            // the original's hostname and MAC appears exactly when it applies.
+                            start_after: form.start_after !== false,
                         }),
                     });
                 if (!resp?.ok) return null;

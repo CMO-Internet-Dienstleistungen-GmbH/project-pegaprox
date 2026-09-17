@@ -826,13 +826,6 @@ class TestTheTargetVm:
             'Imported from Hyper-V by PegaProx migration mig12345 (source: guest-a), '
             'started 2026-09-17 08:05:09 by operator@pve')
 
-    def test_the_migrated_vm_is_not_started(self, db, wired):
-        """It boots when somebody has looked at it. An automatic start would put a second
-        copy of a live machine on the network beside the original."""
-        _, target, _ = wired
-        _run(FakeTask())
-        assert not any('/status/start' in url for url, _ in target.posts)
-
 
 # ===========================================================================
 # The durable record
@@ -1245,11 +1238,17 @@ class TestOptionsThisDirectionRefuses:
 
 
 class TestStartingTheImportedVm:
-    """Off unless asked for, and asked for means asked for."""
+    """On unless switched off, and switched off means switched off."""
 
-    def test_nothing_is_started_when_nobody_asked(self, db, wired):
+    def test_the_vm_is_started_when_the_request_does_not_say(self, db, wired):
         _, target, _ = wired
         _run(FakeTask())
+        started = [url for url, _ in target.posts if url.endswith('/status/start')]
+        assert started, 'starting the imported VM is the default and did not happen'
+
+    def test_nothing_is_started_when_the_operator_switched_it_off(self, db, wired):
+        _, target, _ = wired
+        _run(FakeTask(config={'start_after': False}))
         assert not [url for url, _ in target.posts if url.endswith('/status/start')]
 
     def test_the_vm_is_started_when_the_request_says_so(self, db, wired):

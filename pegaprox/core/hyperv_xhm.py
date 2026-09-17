@@ -656,8 +656,8 @@ def _forget_volume(migration_id, volume):
 # `start_after` used to be here too and should not have been. Starting the copy is a real
 # risk — it carries the original's hostname and MAC — but it is the operator's call, not
 # the product's, and refusing it outright meant the wizard sent an option it did not offer
-# and every migration was rejected. It is a choice now, off by default, and the preflight
-# says what it means when it is on.
+# and every migration was rejected. It is a choice now, on by default like every other
+# direction, and the preflight says what it means when it is on.
 _REFUSED_OPTIONS = {
     'remove_source': 'This direction never deletes the Hyper-V source. The surviving '
                      'original is the entire rollback: without it a failed import has '
@@ -666,14 +666,13 @@ _REFUSED_OPTIONS = {
 
 
 def wants_start_after(task) -> bool:
-    """Did the request ask for the imported VM to be started?
+    """Should the imported VM be started once the migration finishes?
 
-    Read off the request rather than the shared task object, which defaults it to True for
-    the other directions. This one defaults to off: the copy carries the original's
-    hostname and MAC, so coming up unasked is the failure the whole direction is arranged
-    to avoid.
+    On unless the request turns it off, the same default the shared task gives every other
+    direction. Read off the request all the same: an explicit false is the operator's
+    decision and must not be lost to a truthiness check on a missing key.
     """
-    return bool((getattr(task, 'config', None) or {}).get('start_after'))
+    return bool((getattr(task, 'config', None) or {}).get('start_after', True))
 
 
 def refuse_hyperv_start(source_cluster_id, source_vmid, options=None):
@@ -1194,6 +1193,7 @@ def _preflight_gate(task, source, target, detail, guid):
          'guest_images': _guest_images_now(source, task),
          'disk_inspection': _inspection_now(source, task),
          'virtio_iso': (task.config or {}).get('virtio_iso_path') or '',
+         'start_after': wants_start_after(task),
          # The name this run is about to create the VM under. Checking it here is the
          # difference between a refusal in the wizard and one that arrives after the disks
          # have been converted, which is where Proxmox itself raises it.
