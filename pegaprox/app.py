@@ -827,7 +827,8 @@ def _resolve_ssl_context(reverse_proxy, domain='', app_name='PegaProx',
 
 def main(debug_mode=False):
     """Main entry point - starts PegaProx server."""
-    from pegaprox.utils.auth import load_users, load_sessions, backfill_initialized_marker, is_initialized
+    from pegaprox.utils.auth import (load_users, load_sessions, backfill_initialized_marker,
+                                     initialization_state, INIT_UNINITIALIZED, INIT_UNKNOWN)
     from pegaprox.utils.audit import load_audit_log
     from pegaprox.core.config import load_config
     from pegaprox.core.pbs import load_pbs_servers
@@ -972,13 +973,23 @@ def main(debug_mode=False):
     # /login path's is_initialized() doesn't fall through to NOT_INITIALIZED).
     backfill_initialized_marker()
 
-    if not is_initialized():
+    _init_state = initialization_state()
+    if _init_state == INIT_UNINITIALIZED:
         print("\n" + "=" * 50)
         print("FIRST-RUN SETUP REQUIRED")
         print("  No admin account exists yet — open the PegaProx URL")
         print("  in a browser to create the first administrator via the")
         print("  setup wizard. /api/auth/login is disabled until that")
         print("  is done.")
+        print("=" * 50 + "\n")
+    elif _init_state == INIT_UNKNOWN:
+        # not a fresh install - the store simply did not answer. Both login and
+        # setup refuse in this state, so say which one the operator is looking at.
+        print("\n" + "=" * 50)
+        print("USER STORE UNREADABLE")
+        print("  Could not read the user table. Login and the setup wizard")
+        print("  are BOTH refused until this is resolved - check the")
+        print("  encryption key and the permissions on config/.")
         print("=" * 50 + "\n")
 
     # Load existing configuration

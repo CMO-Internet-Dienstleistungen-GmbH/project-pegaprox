@@ -18,7 +18,9 @@ from pegaprox.core.db import get_db
 from pegaprox.utils.auth import (
     hash_password, verify_password, needs_password_rehash,
     validate_password_policy, load_users, save_users, save_single_user,
-    create_initial_admin, is_initialized,
+    create_initial_admin, is_initialized, initialization_state,
+    INIT_UNINITIALIZED, INIT_UNKNOWN,
+    claim_admin_initialization, release_admin_initialization,
     create_session, validate_session, invalidate_session,
     invalidate_all_user_sessions, cleanup_expired_sessions,
     generate_api_token, create_api_token, validate_api_token, revoke_user_api_tokens,
@@ -441,7 +443,18 @@ _setup_attempts_by_ip = {}  # very light rate-limit, IP → list[ts]
 
 @bp.route('/api/auth/setup', methods=['POST'])
 def auth_setup():
-    if is_initialized():
+    state = initialization_state()
+    if state == INIT_UNKNOWN:
+        # MK Sep 2026 - the user store did not answer. That used to read as "fresh
+        # install" and opened this endpoint on a running deployment whose DB had
+        # simply become unreadable. Say what is actually wrong instead.
+        logging.error("[SETUP] refused: the user store is unreadable, cannot tell "
+                      "whether this install already has an administrator")
+        return jsonify({
+            'error': 'Cannot read the user store - refusing setup. Check the server logs.',
+            'code': 'USER_STORE_UNAVAILABLE',
+        }), 503
+    if state != INIT_UNINITIALIZED:
         # already done, no replay
         return jsonify({
             'error': 'PegaProx is already initialised',
@@ -478,14 +491,39 @@ def auth_setup():
     if not ok:
         return jsonify({'error': err}), 400
 
-    # build, save, mark — order matters: if mark fails the next request
-    # would re-allow setup and double-create, so the audit log catches it.
+    # Claim first, create second. The is_initialized() check above and the write
+    # below used to be two separate steps with a JSON body read, a password policy
+    # check and an argon2 hash in between - all of which yield under gevent. Two
+    # concurrent requests both passed the check and both created an administrator,
+    # because save_users() upserts. O_EXCL settles who owns this install before any
+    # account exists.
+    if not claim_admin_initialization():
+        logging.warning(f"[SETUP] lost the initialisation race to a concurrent request "
+                        f"from {client_ip}")
+        return jsonify({
+            'error': 'PegaProx is already initialised',
+            'code': 'ALREADY_INITIALIZED',
+        }), 409
+
     try:
         admin = create_initial_admin(username, password, display_name=display_name, email=email)
         save_users(admin)
-        mark_admin_initialized()
+        # save_users() logs its own failure and returns normally, so "it came back" is
+        # not evidence that anything was written. Read the account back before telling
+        # the operator the install is theirs - otherwise setup answers "Setup complete",
+        # the marker is in place, and the install has no account to log in with.
+        _persisted = load_users().get(username) or {}
+        if not _persisted.get('password_hash'):
+            raise RuntimeError("the administrator record was not persisted")
     except Exception as e:
+        # Hand the claim back, otherwise the install is bricked: setup says
+        # "already initialised" and login has nobody to authenticate. This does
+        # re-open the first-run window, so it is an ERROR the operator must see -
+        # the alternative is an install nobody can ever finish setting up.
+        release_admin_initialization()
         logging.error(f"[SETUP] failed to create initial admin: {e}")
+        logging.error("[SETUP] first-run setup is OPEN again after that failure - "
+                      "restrict access to this port until it completes")
         return jsonify({'error': 'Setup failed, check server logs'}), 500
 
     log_audit(username, 'admin.initial_setup',
@@ -526,7 +564,16 @@ def auth_login():
     # is no admin to authenticate against; refusing /login here closes the old
     # hardcoded-creds path (`pegaprox/admin` was bootstrapped automatically
     # which let any network-reachable fresh install be taken over).
-    if not is_initialized():
+    _init_state = initialization_state()
+    if _init_state == INIT_UNKNOWN:
+        # Not "wrong password" - the store this would authenticate against is gone.
+        # Saying so is what tells the operator to look at the DB instead of at the
+        # user, and it keeps the setup wizard shut while they do.
+        return jsonify({
+            'error': 'Cannot read the user store - check the server logs',
+            'code': 'USER_STORE_UNAVAILABLE',
+        }), 503
+    if _init_state == INIT_UNINITIALIZED:
         return jsonify({
             'error': 'PegaProx is not initialised — run the setup wizard first',
             'code': 'NOT_INITIALIZED',
@@ -770,8 +817,16 @@ def auth_login():
             'SELECT COUNT(*) AS n FROM webauthn_credentials WHERE username = ?', (username,)
         )
         has_webauthn = bool(_cnt_row and _cnt_row['n'] > 0)
-    except Exception:
-        has_webauthn = False
+    except Exception as e:
+        # MK Sep 2026 - this used to swallow the error into "no key enrolled". For an
+        # account whose ONLY second factor is a security key that silently dropped the
+        # second factor and let the password alone through. We cannot tell whether a key
+        # is required, so we refuse rather than guess downwards.
+        logging.error(f"[LOGIN] cannot read WebAuthn enrolment for '{username}': {e}")
+        return jsonify({
+            'error': 'Cannot verify second-factor enrolment - check the server logs',
+            'code': 'MFA_STATE_UNAVAILABLE',
+        }), 503
 
     if has_totp or has_webauthn:
         # Path A: caller submitted a WebAuthn proof (from /api/webauthn/auth/finish)

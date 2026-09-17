@@ -2095,9 +2095,10 @@ class PegaProxDB:
         # Migrate clusters (only if no clusters exist)
         if cluster_count == 0:
             if self._migrate_clusters():
+                # commit here so the user rollback further down cannot discard them
+                self.conn.commit()
                 migrated_any = True
-        
-        # Migrate users (always if needs_user_remigration or no users)
+
         if needs_user_remigration and not self._read_legacy_users():
             # MK: the DELETE below used to run unconditionally, and _migrate_users() writes
             # nothing when the legacy file is gone or no longer decrypts — which is every
@@ -2108,17 +2109,35 @@ class PegaProxDB:
                           "keeping the existing accounts")
             needs_user_remigration = False
 
-        if needs_user_remigration or cluster_count == 0:
-            # Clear existing users if re-migrating
-            if needs_user_remigration:
-                try:
-                    cursor.execute("DELETE FROM users")
-                    self.conn.commit()
-                    logging.info("Cleared users table for re-migration")
-                except Exception as e:
-                    logging.error(f"Error clearing users: {e}")
+        # MK Sep 2026 - `cluster_count == 0` is not a "never migrated" signal. A fresh
+        # install has no clusters, and neither does one whose last cluster was removed, so
+        # this branch ran on ordinary restarts and _migrate_users() wrote the legacy file
+        # over the live table: a rotated password fell back to the old one, a demoted
+        # account regained its role, a disabled one came back enabled, a deleted one
+        # reappeared. Import only into an empty table. Re-migration clears the table first
+        # and is the one case allowed to write over what is there.
+        cursor.execute("SELECT COUNT(*) FROM users")
+        user_count = cursor.fetchone()[0]
 
+        if needs_user_remigration:
+            # The clear and the refill are one unit. Committing the DELETE on its own meant
+            # a refill that wrote nothing left an empty users table with nothing to restore
+            # from, and the next request landed in the first-run setup wizard.
+            try:
+                cursor.execute("DELETE FROM users")
+                if self._migrate_users():
+                    self.conn.commit()
+                    migrated_any = True
+                    logging.info("Re-migrated users from the legacy store")
+                else:
+                    self.conn.rollback()
+                    logging.error("Re-migration wrote no users - kept the existing accounts")
+            except Exception as e:
+                self.conn.rollback()
+                logging.error(f"Error re-migrating users: {e}")
+        elif user_count == 0:
             if self._migrate_users():
+                self.conn.commit()
                 migrated_any = True
         
         # Migrate sessions
@@ -2277,15 +2296,19 @@ class PegaProxDB:
 
         cursor = self.conn.cursor()
         now = datetime.now().isoformat()
-        
+        written = 0
+
         for username, user in data.items():
             try:
+                # OR IGNORE, not OR REPLACE: importing the legacy store must never write
+                # over an account that already exists here. The caller clears the table
+                # first when it really does mean to replace everything.
                 cursor.execute('''
-                    INSERT OR REPLACE INTO users
+                    INSERT OR IGNORE INTO users
                     (username, password_salt, password_hash, role, permissions, tenant, 
                      created_at, last_login, password_expiry, 
-                     totp_secret_encrypted, totp_enabled, force_password_change)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     totp_secret_encrypted, totp_enabled, force_password_change, enabled)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     username,
                     user.get('password_salt', ''),
@@ -2298,13 +2321,19 @@ class PegaProxDB:
                     user.get('password_expiry'),
                     self._encrypt(user.get('totp_secret', '')),
                     1 if user.get('totp_enabled', False) else 0,
-                    1 if user.get('force_password_change', False) else 0
+                    1 if user.get('force_password_change', False) else 0,
+                    # the column defaults to 1, so leaving it out brought a disabled
+                    # legacy account back enabled. Truthiness, not `is False`: the JSON
+                    # store wrote this as 0/1 as often as true/false.
+                    1 if user.get('enabled', True) else 0
                 ))
+                if cursor.rowcount > 0:
+                    written += 1
             except Exception as e:
                 logging.error(f"Failed to migrate user {username}: {e}")
-        
-        logging.info(f"Migrated {len(data)} users to SQLite")
-        return True
+
+        logging.info(f"Migrated {written}/{len(data)} users to SQLite")
+        return written > 0
     
     def _migrate_sessions(self) -> bool:
         """Migrate sessions from encrypted file"""
