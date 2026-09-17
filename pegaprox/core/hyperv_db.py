@@ -556,9 +556,7 @@ def clear_created_resources(conn, migration_id: str) -> None:
 def delete_migration(conn, migration_id: str) -> None:
     """Remove one finished migration's record entirely.
 
-    The counterpart to `clear_created_resources`, and used only once nothing is left on
-    the target: the record is what stops a second attempt from copying the same disks, so
-    it outlives the run on purpose and goes only when it has nothing left to say.
+    Only the record goes; nothing on the target is touched.
     """
     conn.cursor().execute('DELETE FROM hyperv_migrations WHERE migration_id = ?',
                           (migration_id,))
