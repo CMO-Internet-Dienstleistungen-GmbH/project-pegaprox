@@ -13440,6 +13440,9 @@
 
             // NS: auto-clear topology/xhm sidebar when navigating to something else
             useEffect(() => { if (selectedCluster || selectedPBS || selectedVMware || selectedHyperV || selectedGroup) { setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); setSidebarAutoInstall(false); setSidebarGuests(false); } }, [selectedCluster, selectedPBS, selectedVMware, selectedGroup, selectedHyperV]);
+            // Fork issue #15 — the Hyper-V host view ranks above every sidebar view below, and the
+            // upstream sidebar buttons do not clear it, so choosing one of them clears it here.
+            useEffect(() => { if (sidebarXHM || sidebarTopology || sidebarWorldmap || sidebarMultiSdn || sidebarAutoInstall || sidebarGuests) setSelectedHyperV(null); }, [sidebarXHM, sidebarTopology, sidebarWorldmap, sidebarMultiSdn, sidebarAutoInstall, sidebarGuests]);
 
             // All Clusters used to check only XHM, so it stayed lit next to World Map / EVPN
             const onGlobalView = sidebarTopology || sidebarWorldmap || sidebarXHM || sidebarMultiSdn || sidebarAutoInstall || sidebarGuests;
