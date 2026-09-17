@@ -89,15 +89,81 @@ def test_the_timeline_does_not_tick_the_step_that_failed():
 
     assert 'brokeAt' in block, (
         'nothing distinguishes the phase a failed run died in, so it is drawn as passed')
-    assert 'const isDone = pt && pt.end && !broke;' in block
+    assert "const isDone = !broke && !!pt && (" in block
 
 
-def test_the_list_cannot_push_the_log_off_the_screen():
+def _dashboard():
+    with open(os.path.join(REPO, 'web', 'src', 'dashboard.js'), encoding='utf-8') as fh:
+        return fh.read()
+
+
+def _migration_list(source):
+    start = source.index('{xhmMigrations.length > 0 ? (')
+    return source[start:source.index("t('xhmNoMigrations')", start)]
+
+
+class TestAMigrationOpensInPlace:
+    """Read out of the source: the list lives in a component this suite cannot mount.
+
+    The log of the selected migration used to be a panel below the whole list, so every
+    entry above pushed it further down. Each row now opens under itself, with the phase
+    bar and the log in it."""
+
+    def test_the_phase_bar_and_the_log_are_inside_the_row(self):
+        rows = _migration_list(_dashboard())
+        assert 'xhmSelectedMigration === m.id && (() =>' in rows
+        opened = rows[rows.index('xhmSelectedMigration === m.id && (() =>'):]
+        assert 'phases.map(' in opened
+        assert '(d.log || []).map(' in opened
+
+    def test_there_is_no_log_panel_below_the_list_any_more(self):
+        assert 'Migration Log - {xhmMigrationDetail.vm_name}' not in _dashboard()
+
+    def test_a_row_shows_whether_it_is_open(self):
+        rows = _migration_list(_dashboard())
+        assert "Icons.ChevronRight" in rows
+        assert "rotate-90" in rows
+
+    def test_a_completed_run_ticks_its_last_phase(self):
+        """"completed" is where a run ends, so it never gets an end time. The bar drew
+        it as step 5, not reached, under a migration that says completed."""
+        rows = _migration_list(_dashboard())
+        assert "ph === 'completed' && d.status === 'completed'" in rows
+
+    def test_each_phase_is_named_under_its_step(self):
+        rows = _migration_list(_dashboard())
+        assert '{phaseLabel[ph]}' in rows
+
+    def test_a_phase_frame_does_not_cut_the_open_log_back_to_30_lines(self):
+        source = _dashboard()
+        assert 'log: xhmMergeLog(prev.log, m.log)' in source
+        assert 'setXhmMigrationDetail(prev => prev ? {...prev, ...m} : m)' not in source
+
+    def test_lines_the_server_did_not_send_live_are_fetched_afterwards(self):
+        """XHMigrationTask.log sends at most one frame per second and drops the others."""
+        source = _dashboard()
+        assert source.count('xhmRefetchDetailSoon(m.id)') >= 2
+
+
+def test_the_log_route_returns_the_whole_log(api, seed, registry):
+    """to_dict() keeps the last 30 lines. After a reload the open log showed only what the
+    last phase had written."""
+    admin = seed.user('root', role='admin')
+    task = _Task('long1')
+    task.log_lines = [f'[00:00:{i:02d}] line {i}' for i in range(120)]
+    task.to_dict = lambda: {'id': 'long1', 'status': 'completed', 'log': task.log_lines[-30:]}
+    registry['long1'] = task
+
+    resp = api.as_user(admin).get('/api/xhm/migrations/long1/log')
+
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    assert resp.get_json() == {'id': 'long1', 'log': task.log_lines}
+
+
+def test_an_opened_row_loads_the_whole_log():
     with open(os.path.join(REPO, 'web', 'src', 'dashboard.js'), encoding='utf-8') as fh:
         source = fh.read()
-    start = source.index('{xhmMigrations.length > 0 ? (')
-    assert 'overflow-y-auto' in source[start:start + 900], (
-        'the list is unbounded again; the log of the selected migration is below it')
+    assert '/xhm/migrations/${mid}/log' in source
 
 
 class TestDismissingReachesADurableRecord:
