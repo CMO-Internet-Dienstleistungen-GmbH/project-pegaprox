@@ -478,7 +478,36 @@ def set_user_perms(username):
         for p in extra + denied:
             if p not in PERMISSIONS:
                 return jsonify({'error': f'Invalid permission: {p}'}), 400
-        
+
+        # MK Sep 2026 - the admin.* prefix check above stops the obvious escalation and
+        # nothing else. Two ways past it were left:
+        #   1. any permission WITHOUT that prefix - vm.delete, storage.edit, cluster.edit -
+        #      could be granted by a delegate who does not hold it. The sibling route
+        #      create_custom_role has asked _caller_can_grant_perms this since August;
+        #      this one never did.
+        #   2. `role` was only compared against ROLE_ADMIN, never resolved. A custom role
+        #      carrying admin.* permissions (legitimately created by a global admin) set as
+        #      a tenant role walks straight past the prefix test.
+        # Resolve what the request would actually confer and weigh all of it.
+        if request.session.get('role') != ROLE_ADMIN:
+            from pegaprox.utils.rbac import get_role_permissions_for_user, has_permission
+            from pegaprox.utils.auth import build_authz_user
+            # the caller's OWN effective permissions, token-floored like everywhere else
+            _caller = build_authz_user(request.session.get('user', ''), request.session)
+            _conferred = list(extra)
+            if role:
+                _conferred += get_role_permissions_for_user({'role': role}, tenant_id)
+            _over = [p for p in _conferred if not has_permission(_caller, p)]
+            if _over:
+                log_audit(request.session.get('user', ''), 'security.grant_ceiling_denied',
+                          f"Denied granting {len(_over)} permission(s) beyond own to {username}")
+                return jsonify({'error': 'Cannot grant permissions you do not hold: '
+                                         + ', '.join(sorted(set(_over))[:8])}), 403
+            # and nobody edits their own grants
+            if username == request.session.get('user', ''):
+                return jsonify({'error': 'Access denied: you cannot change your own '
+                                         'permissions'}), 403
+
         if 'tenant_permissions' not in users_db[username]:
             users_db[username]['tenant_permissions'] = {}
         
