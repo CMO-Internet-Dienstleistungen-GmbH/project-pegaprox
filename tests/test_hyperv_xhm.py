@@ -9,6 +9,8 @@
 # testbed, where a real cifs mount and a real qemu-img conversion produce a raw image whose
 # checksum matches the source VHDX.
 
+import json
+import shlex
 import threading
 
 import pytest
@@ -1375,6 +1377,10 @@ def _kinds(commands):
             labels.append('probe')
         elif command.startswith('rm -f'):
             labels.append('remove-credentials')
+        elif command.startswith('pvesh get /storage/'):
+            labels.append('storage-type')
+        elif command.startswith('lvs '):
+            labels.append('pool-zeroing')
         else:
             labels.append(f'other: {command[:40]}')
     return labels
@@ -1420,32 +1426,34 @@ class TestTheTransferTakesTheAddressItWasGiven:
 class TestWhatOneImportCostsTheHosts:
     """How much a transfer asks of either end, counted rather than estimated."""
 
-    def test_one_disk_costs_these_seven_calls_and_no_others(self, db, wired):
+    def test_one_disk_costs_these_eight_calls_and_no_others(self, db, wired):
         """The figures docs/hyperv-transfer.md publishes, locked where they can drift.
 
         The test below proves the count does not grow with the disk; this one proves what
-        the count actually is. Without it the document could keep naming seven long after
-        the runner had started issuing nine, and nothing would fail.
+        the count actually is. Without it the document could keep naming eight long after
+        the runner had started issuing ten, and nothing would fail. The eighth asks the
+        target storage's type once per run; only an LVM-thin storage costs a ninth.
         """
         source, target, node = wired
-        _run(FakeTask(id='mig-seven'))
+        _run(FakeTask(id='mig-eight'))
 
         assert _kinds(node.commands) == [
-            'mount', 'probe', 'allocate', 'resolve', 'convert',
+            'storage-type', 'mount', 'probe', 'allocate', 'resolve', 'convert',
             'umount', 'remove-credentials']
 
-    def test_two_disks_on_one_drive_cost_eleven_calls_and_one_mount(self, db, wired):
+    def test_two_disks_on_one_drive_cost_twelve_calls_and_one_mount(self, db, wired):
         source, target, node = wired
         source._detail['disks'] = [
             dict(source._detail['disks'][0]),
             {**source._detail['disks'][0], 'path': 'C:\\vm\\b.vhdx'},
         ]
-        _run(FakeTask(id='mig-eleven'))
+        _run(FakeTask(id='mig-twelve'))
 
         kinds = _kinds(node.commands)
-        assert len(kinds) == 11, f'{len(kinds)} calls for two disks: {kinds}'
+        assert len(kinds) == 12, f'{len(kinds)} calls for two disks: {kinds}'
         assert kinds.count('mount') == 1, 'a second disk on the same drive remounted'
         assert kinds.count('convert') == 2
+        assert kinds.count('storage-type') == 1, 'the storage was asked about per disk'
 
     def test_the_number_of_remote_calls_does_not_depend_on_the_disk(self, db, wired):
         """A constant per disk, not one per gigabyte.
@@ -1487,6 +1495,93 @@ class TestWhatOneImportCostsTheHosts:
         assert mounts_for_one == 1, 'the one-disk run did not mount the share at all'
         assert mounts_for_two == mounts_for_one, 'a second disk on the same drive remounted'
         assert len(node.commands) > one
+
+
+class _StorageNode(FakeNode):
+    """A FakeNode that answers the storage questions the way a PVE node does."""
+
+    def __init__(self, storage_json='', zero_out='', **kw):
+        super().__init__(**kw)
+        self.storage_json = storage_json
+        self.zero_out = zero_out
+
+    def run(self, command, stdin_data=None, timeout=None):
+        if command.startswith('pvesh get /storage/'):
+            self.commands.append(command)
+            return 0, self.storage_json, ''
+        if command.startswith('lvs '):
+            self.commands.append(command)
+            return 0, self.zero_out, ''
+        return super().run(command, stdin_data, timeout)
+
+
+_LVMTHIN = json.dumps({'type': 'lvmthin', 'vgname': 'pve', 'thinpool': 'data',
+                       'storage': 'local-lvm', 'content': 'images,rootdir'})
+
+
+class TestEmptyRegionsOnAThinPool:
+    """Whether the conversion may skip what the VHDX leaves empty.
+
+    On LVM-thin, writing those zeroes provisions the whole volume and is what made an
+    import onto NVMe take as long for the empty half of a disk as for the data. Skipping
+    them is only safe where a fresh volume reads as zero, so everything else keeps them.
+    """
+
+    def test_a_thin_pool_that_zeroes_its_blocks_skips_them(self):
+        node = _StorageNode(_LVMTHIN, '  zero\n')
+        task = FakeTask()
+
+        assert hyperv_xhm._fresh_volumes_read_zero(task, node) is True
+        assert node.commands[-1] == 'lvs --noheadings -o zero pve/data'
+        assert any('zeroing on' in line for line in task.log_lines)
+
+    def test_a_thin_pool_created_without_zeroing_keeps_the_writes(self):
+        """`lvcreate -Z n` hands out blocks with another volume's old data in them."""
+        node = _StorageNode(_LVMTHIN, '  \n')
+        assert hyperv_xhm._fresh_volumes_read_zero(FakeTask(), node) is False
+
+    @pytest.mark.parametrize('config', [
+        {'type': 'lvm', 'vgname': 'pve'},
+        {'type': 'rbd', 'pool': 'vm-pool'},
+        {'type': 'dir', 'path': '/var/lib/vz'},
+        {'type': 'lvmthin', 'vgname': 'pve'},
+    ])
+    def test_any_other_storage_keeps_the_writes_and_is_not_asked_further(self, config):
+        node = _StorageNode(json.dumps(config), '  zero\n')
+
+        assert hyperv_xhm._fresh_volumes_read_zero(FakeTask(), node) is False
+        assert not any(c.startswith('lvs ') for c in node.commands)
+
+    @pytest.mark.parametrize('answer', ['', 'not json', '[]'])
+    def test_an_answer_that_cannot_be_read_keeps_the_writes(self, answer):
+        node = _StorageNode(answer, '  zero\n')
+        assert hyperv_xhm._fresh_volumes_read_zero(FakeTask(), node) is False
+
+    def test_the_storage_name_reaches_the_shell_as_one_word(self):
+        node = _StorageNode('')
+        task = FakeTask()
+        task.target_storage = "odd name; rm -rf /"
+
+        hyperv_xhm._fresh_volumes_read_zero(task, node)
+
+        assert shlex.split(node.commands[0])[2] == '/storage/odd name; rm -rf /'
+
+    def test_an_import_onto_a_zeroing_thin_pool_passes_the_flag(self, db, wired, monkeypatch):
+        source, target, _ = wired
+        node = _StorageNode(_LVMTHIN, '  zero\n')
+        monkeypatch.setattr(hyperv_xhm, '_open_target_node',
+                            lambda task, src, tgt: (node, '/mnt/pegaprox-hyperv/x.cred'))
+        _run(FakeTask(id='mig-thin'))
+
+        converts = [c for c in node.commands if 'qemu-img convert' in c]
+        assert converts and all('--target-is-zero' in c for c in converts)
+
+    def test_an_import_onto_any_other_storage_does_not(self, db, wired):
+        source, target, node = wired
+        _run(FakeTask(id='mig-thick'))
+
+        converts = [c for c in node.commands if 'qemu-img convert' in c]
+        assert converts and not any('--target-is-zero' in c for c in converts)
 
 
 class TestTwoSourcesSideBySide:
