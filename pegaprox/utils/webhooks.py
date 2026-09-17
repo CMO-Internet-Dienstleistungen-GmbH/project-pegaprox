@@ -261,5 +261,10 @@ def new_channel(payload):
     out = {k: v for k, v in (payload or {}).items() if k in allowed}
     out.setdefault('enabled', True)
     out.setdefault('type', 'generic')
-    out['id'] = (payload or {}).get('id') or uuid.uuid4().hex[:12]
+    # MK Sep 2026 - the caller used to be able to name the id. alert_webhooks is one
+    # global list, so submitting the id of somebody else's channel produced two entries
+    # sharing it, and every lookup here takes the first match: the edit route would then
+    # rewrite whichever one it found, and the dispatch path deliver to it. Nobody needs
+    # to choose an id - the only caller is the create route - so we always mint one.
+    out['id'] = uuid.uuid4().hex[:12]
     return out
