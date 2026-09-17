@@ -585,6 +585,13 @@ def check_tenant_vmid(tenant_id, vmid):
 
 VM_ACLS_FILE = os.path.join(CONFIG_DIR, 'vm_acls.json')
 
+# What an ACL row with inherit_role=True actually hands out. It is a fixed set, not the
+# beneficiary's own role, and it is the DEFAULT for a new row - so the grant-ceiling check
+# on the write path has to weigh THIS, not the (unused) explicit permission list. MK Sep 2026
+ACL_INHERITED_VM_PERMISSIONS = ('vm.view', 'vm.start', 'vm.stop', 'vm.restart', 'vm.console',
+                                'vm.snapshot', 'vm.migrate', 'vm.clone', 'vm.config', 'vm.backup')
+
+
 def acl_grants_user(acl, username: str) -> bool:
     """Does this one VM-ACL row grant `username` access?
 
@@ -1038,9 +1045,7 @@ def user_can_access_vm(user: dict, cluster_id: str, vmid: int, permission: str =
             if vm_acl.get('inherit_role', True):
                 # inherit_role=True: FULL VM access (start, stop, console, etc.)
                 # This means "this user has access to this VM"
-                vm_permissions = ['vm.view', 'vm.start', 'vm.stop', 'vm.restart', 'vm.console', 
-                                  'vm.snapshot', 'vm.migrate', 'vm.clone', 'vm.config', 'vm.backup']
-                result = permission in vm_permissions
+                result = permission in ACL_INHERITED_VM_PERMISSIONS
                 logging.debug(f"[VM-ACL] User {username} in ACL with inherit_role=True, checking {permission}: {result}")
                 return result
             else:

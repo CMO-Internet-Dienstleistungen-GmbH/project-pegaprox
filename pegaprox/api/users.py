@@ -128,8 +128,11 @@ def _authz_object_write(cluster_id, subjects=(), permissions=()):
         _users = load_users()
         for s in subjects:
             if not s or s == '*':
-                # a wildcard grant reaches every account, including other tenants'
-                return jsonify({'error': 'Access denied: wildcard grants require a global admin'}), 403
+                # A wildcard row reaches every account, including other tenants'. That
+                # holds whichever direction the write goes: creating one grants across the
+                # boundary, deleting one revokes across it. Either way it is not a
+                # tenant-scoped decision.
+                return jsonify({'error': 'Access denied: wildcard rules require a global admin'}), 403
             _t = (_users.get(s) or {}).get('tenant_id', DEFAULT_TENANT_ID)
             if _t != _ct:
                 return jsonify({'error': f'Access denied: {s} is not in your tenant'}), 403
@@ -1947,7 +1950,13 @@ def set_vm_acl(cluster_id, vmid):
         if p not in PERMISSIONS:
             return jsonify({'error': f'Invalid permission: {p}'}), 400
 
-    _err = _authz_object_write(cluster_id, subjects=users, permissions=permissions)
+    # sec (Sep 2026): weigh what the row ACTUALLY hands out. inherit_role is the default
+    # and grants a fixed ten-permission set (vm.config and vm.migrate among them) while
+    # `permissions` goes unused - so the ceiling check was reading the wrong list, and a
+    # delegate holding only vm.view could grant full VM control by leaving the default on.
+    from pegaprox.utils.rbac import ACL_INHERITED_VM_PERMISSIONS
+    _effective = list(ACL_INHERITED_VM_PERMISSIONS) if inherit_role else list(permissions)
+    _err = _authz_object_write(cluster_id, subjects=users, permissions=_effective)
     if _err:
         return _err
     # and the caller must actually control the VM they are writing a rule for
@@ -1987,11 +1996,15 @@ def set_vm_acl(cluster_id, vmid):
 @require_auth(perms=['admin.users'])
 def delete_vm_acl(cluster_id, vmid):
     """Remove VM-specific ACL (use default permissions)"""
-    _err = _authz_object_write(cluster_id)
-    if _err:
-        return _err
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    # sec (Sep 2026): same gap as the pool-permission delete - the row's own members were
+    # never weighed, so a tenant-scoped admin could drop an ACL granting access to another
+    # tenant's user. Read the row first and hand its members to the gate.
+    _existing = (get_vm_acls().get(cluster_id, {}) or {}).get(str(vmid), {}) or {}
+    _err = _authz_object_write(cluster_id, subjects=list(_existing.get('users') or []))
+    if _err:
+        return _err
     
     # NS: Fixed - was only deleting from dict, not from DB!
     # Now we delete directly from DB
@@ -2159,9 +2172,12 @@ def add_pool_permission_api(cluster_id, pool_id):
     # pool.admin, which short-circuits the per-VM gate for every VM in the pool — this is the
     # strongest grant primitive in the product and it had no object gate. _pool_visibility (the
     # H3 fix, ~100 lines up) gates pool READS; apply the same confinement to the write.
+    # sec (Sep 2026): `permissions=[]` meant the ceiling check ran over nothing, so a
+    # delegate could hand out pool permissions they do not hold - pool.admin included,
+    # which short-circuits the per-VM gate for every VM in the pool.
     _err = _authz_object_write(cluster_id,
                                subjects=[subject_id] if subject_type == 'user' else [],
-                               permissions=[])
+                               permissions=permissions)
     if _err:
         return _err
     _confined, _granted = _pool_visibility(cluster_id)
@@ -2187,7 +2203,11 @@ def delete_pool_permission_api(cluster_id, pool_id, subject_type, subject_id):
     """Delete pool permission"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
-    _err = _authz_object_write(cluster_id)
+    # sec (Sep 2026): the subject was not passed, so a tenant-scoped admin could revoke
+    # a grant belonging to another tenant's principal. Revoking is not granting, but it
+    # is still reaching across the boundary - and it is how you lock a rival out.
+    _err = _authz_object_write(cluster_id,
+                               subjects=[subject_id] if subject_type == 'user' else [])
     if _err:
         return _err
     _confined, _granted = _pool_visibility(cluster_id)
