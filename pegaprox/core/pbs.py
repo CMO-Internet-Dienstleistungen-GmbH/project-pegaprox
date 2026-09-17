@@ -1127,12 +1127,24 @@ def save_pbs_server(pbs_id: str, config: dict):
 
     # fetch old values once to preserve encrypted fields when blank is submitted
     existing = cursor.execute(
-        "SELECT pass_encrypted, api_token_secret_encrypted, ssh_key_encrypted FROM pbs_servers WHERE id = ?",
+        "SELECT pass_encrypted, api_token_secret_encrypted, ssh_key_encrypted, linked_clusters "
+        "FROM pbs_servers WHERE id = ?",
         (pbs_id,)
     ).fetchone()
     old_pass = existing[0] if existing else ''
     old_token = existing[1] if existing else ''
     old_sshkey = existing[2] if existing and len(existing) > 2 else ''
+
+    # MK Sep 2026 - linked_clusters is authorization-bearing data, not a display field:
+    # check_pbs_access reads it, and a PBS with an EMPTY list is reachable by everyone
+    # ("backward compatibility"). Writing `config.get('linked_clusters', [])` therefore
+    # turned an update that simply did not mention the field into a silent grant of the
+    # whole backup server to every tenant. Omission preserves; only an explicit list
+    # replaces - the same rule the three encrypted fields above already follow.
+    if 'linked_clusters' in config:
+        linked_json = json.dumps(list(config.get('linked_clusters') or []))
+    else:
+        linked_json = (existing[3] if existing and len(existing) > 3 else None) or '[]'
 
     cursor.execute('''
         INSERT OR REPLACE INTO pbs_servers
@@ -1150,7 +1162,7 @@ def save_pbs_server(pbs_id: str, config: dict):
         config.get('api_token_id', ''),
         api_token_secret_encrypted or old_token,
         config.get('fingerprint', ''), int(config.get('ssl_verify', False)),
-        int(config.get('enabled', True)), json.dumps(config.get('linked_clusters', [])),
+        int(config.get('enabled', True)), linked_json,
         config.get('notes', ''),
         config.get('ssh_user', '') or '',
         int(config.get('ssh_port', 22) or 22),

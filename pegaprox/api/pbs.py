@@ -408,6 +408,9 @@ def refresh_pbs_apt(pbs_id):
     ok, err = check_pbs_access(pbs_id)
     if not ok:
         return err
+    _wide = require_pbs_wide(pbs_id, 'an apt refresh')
+    if _wide:
+        return _wide
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
@@ -428,6 +431,9 @@ def start_pbs_update(pbs_id):
     ok, err = check_pbs_access(pbs_id)
     if not ok:
         return err
+    _wide = require_pbs_wide(pbs_id, 'a host upgrade')
+    if _wide:
+        return _wide
     
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
@@ -638,6 +644,9 @@ def pbs_start_gc(pbs_id, store):
     ok, err = check_pbs_access(pbs_id)
     if not ok:
         return err
+    _wide = require_pbs_wide(pbs_id, 'garbage collection')
+    if _wide:
+        return _wide
     
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
@@ -656,6 +665,9 @@ def pbs_start_verify(pbs_id, store):
     ok, err = check_pbs_access(pbs_id)
     if not ok:
         return err
+    _wide = require_pbs_wide(pbs_id, 'verification')
+    if _wide:
+        return _wide
     
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
@@ -675,6 +687,9 @@ def pbs_prune(pbs_id, store):
     ok, err = check_pbs_access(pbs_id)
     if not ok:
         return err
+    _wide = require_pbs_wide(pbs_id, 'prune')
+    if _wide:
+        return _wide
     
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
@@ -764,6 +779,92 @@ def _caller_is_scoped_here(mgr, user):
     from pegaprox.api.helpers import caller_is_scoped
     _cids = list(mgr.linked_clusters or []) or list(cluster_managers.keys())
     return any(caller_is_scoped(user, c) for c in _cids)
+
+
+def _authz_restore_node(cluster_id, node, user):
+    """A confined caller may not pick an arbitrary node to restore onto.
+
+    Placing a guest on a node is a cluster-level decision - it consumes that node's CPU,
+    memory and local storage. An ACL/pool-scoped caller has no cluster-level standing, so
+    they restore where their existing guests already live and nowhere else. Returns an
+    error response, or None. MK Sep 2026
+    """
+    from pegaprox.api.helpers import caller_is_scoped
+    if not caller_is_scoped(user, cluster_id):
+        return None
+    from pegaprox.utils.rbac import get_user_vms
+    _mine = get_user_vms(user, cluster_id)
+    if _mine is None:
+        return None                      # no restrictions expressed for them here
+    mgr = cluster_managers.get(cluster_id)
+    try:
+        _nodes = {r.get('node') for r in (mgr.get_vm_resources() or [])
+                  if r.get('node') and str(r.get('vmid', '')).isdigit()
+                  and int(r['vmid']) in set(_mine)}
+    except Exception as e:
+        logging.error(f"[PBS] cannot resolve the caller's nodes on {cluster_id}: {e}")
+        return jsonify({'error': 'Cannot verify the restore destination - check the server logs'}), 503
+    if node not in _nodes:
+        logging.warning(f"[PBS] {request.session.get('user','?')} refused a restore onto "
+                        f"'{node}' on {cluster_id}: none of their guests live there")
+        return jsonify({'error': 'Access denied: you cannot restore onto this node'}), 403
+    return None
+
+
+def require_pbs_wide(pbs_id, action='this action'):
+    """Gate for an operation that hits the WHOLE PBS resource, not one backup.
+
+    check_pbs_access proves the caller reaches ONE of the PBS's linked clusters. That is
+    the right question for reading, and the wrong one for garbage collection, prune,
+    verify, datastore creation/removal, job management and host upgrades: a PBS backing
+    up three tenants' clusters is shared infrastructure, and those actions hit all of it.
+    A tenant operator was reaching them with one linked cluster to their name - GC and
+    prune destroy data other tenants own, and an upgrade with reboot takes the backup
+    target away from everyone.
+
+    So: a global admin passes, and so does a caller who holds EVERY linked cluster (the
+    single-tenant install, which is most of them). Anyone else is refused. Deliberately
+    coarse - the datastore-to-tenant ownership mapping Aikido asks for is a data-model
+    change, and this is the honest guard until that exists.
+
+    Returns an error response to `return`, or None when the caller may proceed. MK Sep 2026
+    """
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import get_user_clusters
+    from pegaprox.api.helpers import caller_is_scoped
+
+    mgr = pbs_managers.get(pbs_id)
+    if mgr is None:
+        return jsonify({'error': 'PBS server not found'}), 404
+
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+        return None
+
+    linked = list(mgr.linked_clusters or [])
+    if not linked:
+        # unlinked PBS: no tenant boundary is expressed at all, so fall back to the
+        # confinement question on the clusters we do know about
+        linked = list(cluster_managers.keys())
+
+    mine = get_user_clusters(user)
+    if mine is not None:
+        missing = [c for c in linked if c not in mine]
+        if missing:
+            logging.warning(
+                f"[PBS] {request.session.get('user','?')} refused {action} on {pbs_id}: "
+                f"it also serves {len(missing)} cluster(s) outside their scope")
+            return jsonify({
+                'error': 'Access denied: this PBS server also serves clusters outside '
+                         'your scope, and this action affects all of them',
+            }), 403
+
+    # reaching every linked cluster is not the same as being unconfined on them
+    if any(caller_is_scoped(user, c) for c in linked):
+        return jsonify({
+            'error': 'Access denied: this action affects the whole backup server',
+        }), 403
+    return None
 
 
 def _authz_pbs_backup(mgr, backup_type, backup_id, permission='vm.backup', user=None, scoped=None):
@@ -935,6 +1036,9 @@ def run_pbs_job(pbs_id, job_type, job_id):
     ok, err = check_pbs_access(pbs_id)
     if not ok:
         return err
+    _wide = require_pbs_wide(pbs_id, 'running a job')
+    if _wide:
+        return _wide
     
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
@@ -1363,6 +1467,9 @@ def create_pbs_datastore(pbs_id):
     ok, err = check_pbs_access(pbs_id)
     if not ok:
         return err
+    _wide = require_pbs_wide(pbs_id, 'creating a datastore')
+    if _wide:
+        return _wide
     
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
@@ -1472,6 +1579,9 @@ def delete_pbs_datastore(pbs_id, store):
     ok, err = check_pbs_access(pbs_id)
     if not ok:
         return err
+    _wide = require_pbs_wide(pbs_id, 'removing a datastore')
+    if _wide:
+        return _wide
     
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
@@ -1510,6 +1620,9 @@ def create_pbs_job(pbs_id, job_type):
     ok, err = check_pbs_access(pbs_id)
     if not ok:
         return err
+    _wide = require_pbs_wide(pbs_id, 'creating a job')
+    if _wide:
+        return _wide
     
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
@@ -1587,6 +1700,9 @@ def delete_pbs_job(pbs_id, job_type, job_id):
     ok, err = check_pbs_access(pbs_id)
     if not ok:
         return err
+    _wide = require_pbs_wide(pbs_id, 'removing a job')
+    if _wide:
+        return _wide
     
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
@@ -3273,6 +3389,23 @@ def restore_backup(cluster_id):
         if _src_vmid is None or not user_can_access_vm(_src_authz_user, cluster_id, _src_vmid,
                                                        'vm.backup', 'lxc' if _src_is_lxc else 'qemu'):
             return jsonify({'error': 'Permission denied for source backup'}), 403
+
+    # MK Sep 2026 - mode='new' creates a guest, so it has to respect the same boundaries the
+    # create routes do. Only the SOURCE backup and (below) an existing target were authorized,
+    # which left the destination free: a scoped caller could restore into any VMID on any node,
+    # including one inside another tenant's configured VMID range, and onto storage they have
+    # no claim to. vms.py has enforced the range on create since the tenant-limits work; the
+    # restore path never learned about it.
+    if mode == 'new' and _src_authz_user.get('effective_role',
+                                             _src_authz_user.get('role')) != ROLE_ADMIN:
+        from pegaprox.utils.rbac import check_tenant_vmid, DEFAULT_TENANT_ID as _DT
+        _rok, _rmsg = check_tenant_vmid(_src_authz_user.get('tenant_id') or _DT, target_vmid)
+        if not _rok:
+            return jsonify({'error': _rmsg}), 403
+        # and the node has to be one this caller may actually place a guest on
+        _nerr = _authz_restore_node(cluster_id, target_node, _src_authz_user)
+        if _nerr:
+            return _nerr
 
     # NS Aug 2026 (Aikido pentest) — overwrite (destructive qmrestore --force) and test (boots into
     # the VMID) both act on an EXISTING target VM, so require the same per-VM ACL as a direct VM op;
