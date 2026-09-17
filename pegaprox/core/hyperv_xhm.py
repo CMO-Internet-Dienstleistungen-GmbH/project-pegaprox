@@ -25,7 +25,7 @@ import re
 import shlex
 import time
 
-from pegaprox.core import hyperv_db, hyperv_preflight, hyperv_transfer
+from pegaprox.core import hyperv_cpu, hyperv_db, hyperv_preflight, hyperv_transfer
 from pegaprox.core.hyperv import format_mac
 from pegaprox.core.hyperv_errors import HyperVError
 from pegaprox.core.hyperv_transfer import TransferError
@@ -2207,6 +2207,12 @@ def _create_target_vm(task, target, new_vmid, detail):
         # been taken by somebody else's guest since this run failed.
         'description': target_vm_description(task.id, task.vm_name),
     }
+    # Left out, Proxmox would create the VM on kvm64. The suggestion depends on what the
+    # target node's processor can provide, because a model it lacks keeps the VM from
+    # starting at all.
+    create['cpu'], cpu_note = hyperv_cpu.chosen_cpu_type(task.config, target,
+                                                         task.target_node)
+    task.log(cpu_note)
 
     network_map = task.network_map or {}
     # Read off the request rather than the shared task object: `vlan_map` is this fork's

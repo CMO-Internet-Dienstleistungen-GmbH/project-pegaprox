@@ -8300,6 +8300,8 @@
                 // what the field shows; the request carries whatever stands in it.
                 target_name: '', target_vmid: '', cores: '', sockets: '', memory_mb: '',
                 ostype: '', bios: '', machine: '', scsihw: '', boot_disk: '',
+                // Empty means the CPU type the target node is suggested (hvCpu below).
+                cpu_type: '',
                 efi_pre_enrolled_keys: null,
                 // Which driver ISO the injection reads. Not a default any more: an
                 // out-of-support Windows accepts a narrower set of signatures, and a
@@ -8308,6 +8310,8 @@
             });
             // Fork patch #15 — what the target node has, and what it could fetch.
             const [hvIsos, setHvIsos] = useState(null);
+            // Fork patch #15 — the CPU type the chosen target node is suggested.
+            const [hvCpu, setHvCpu] = useState(null);
             // Fork patch #15 — the Hyper-V preflight re-asked with the target choices in
             // hand. hvRefreshPreflight says why the plan's own verdict is not enough.
             const [hvPreflight, setHvPreflight] = useState(null);
@@ -12732,6 +12736,7 @@
                                                  bios: d.bios || '',
                                                  machine: d.machine || '',
                                                  scsihw: d.scsihw || '',
+                                                 cpu_type: '',
                                                  boot_disk: d.boot_disk ?? '',
                                                  efi_pre_enrolled_keys: !!d.efi_pre_enrolled_keys,
                                                  virtio_iso_path: ''
@@ -12889,6 +12894,27 @@
                         const data = await resp?.json().catch(() => null);
                         if (!dropped && resp?.ok) setHvIsos(data);
                     } catch(e) { /* the field says the list could not be read */ }
+                })();
+                return () => { dropped = true; };
+            }, [xhmPlan, xhmForm.target_cluster, xhmForm.target_node]);
+
+            // Fork patch #15 — which CPU type the chosen node can run. Asked per node like
+            // the ISO list: x86-64-v3 on a processor without it is a VM that does not start.
+            useEffect(() => {
+                if (!hvIsHyperVPlan(xhmPlan) || !xhmForm.target_cluster || !xhmForm.target_node) {
+                    setHvCpu(null);
+                    return;
+                }
+                let dropped = false;
+                (async () => {
+                    try {
+                        const resp = await authFetch(
+                            `${API_URL}/hyperv/target-cpu`
+                            + `?cluster=${encodeURIComponent(xhmForm.target_cluster)}`
+                            + `&node=${encodeURIComponent(xhmForm.target_node)}`);
+                        const data = await resp?.json().catch(() => null);
+                        if (!dropped) setHvCpu(resp?.ok ? data : null);
+                    } catch(e) { if (!dropped) setHvCpu(null); }
                 })();
                 return () => { dropped = true; };
             }, [xhmPlan, xhmForm.target_cluster, xhmForm.target_node]);
@@ -23467,6 +23493,26 @@
                                                                             <option value="pc">pc (i440fx)</option>
                                                                             <option value="q35">q35</option>
                                                                         </select>
+                                                                    </div>
+                                                                    <div>
+                                                                        <label className="text-[10px] text-gray-500 block mb-0.5">{t('hvCpuType') || 'CPU type'}</label>
+                                                                        {/* Empty is the node's suggestion, resolved again when the VM is
+                                                                            created, so a node picked later is not handed a model it lacks. */}
+                                                                        <select value={xhmForm.cpu_type}
+                                                                                onChange={e => setXhmForm({...xhmForm, cpu_type: e.target.value})}
+                                                                                className={field}>
+                                                                            <option value="">
+                                                                                {(t('hvCpuSuggested') || '{type} (suggested)').replace('{type}', (hvCpu && hvCpu.default) || 'x86-64-v2-AES')}
+                                                                            </option>
+                                                                            {HV_CPU_TYPES.map(o => <option key={o} value={o}>{o}</option>)}
+                                                                        </select>
+                                                                        <div className="text-[10px] text-gray-600 mt-0.5">
+                                                                            {!xhmForm.target_node ? (t('hvCpuPickNode') || 'Pick a target node to check its processor')
+                                                                                : !hvCpu ? (t('loading') || 'Loading…')
+                                                                                : !hvCpu.flags_known ? (t('hvCpuUnknown') || 'The node did not report its CPU flags')
+                                                                                : hvCpu.supports_x86_64_v3 ? (t('hvCpuHasV3') || 'The node supports x86-64-v3')
+                                                                                : (t('hvCpuNoV3') || 'The node lacks x86-64-v3')}
+                                                                        </div>
                                                                     </div>
                                                                     <div>
                                                                         <label className="text-[10px] text-gray-500 block mb-0.5">{t('hvScsiHw') || 'SCSI controller'}</label>
