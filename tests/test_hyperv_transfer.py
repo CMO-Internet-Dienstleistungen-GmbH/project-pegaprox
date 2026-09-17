@@ -148,6 +148,31 @@ class TestTheCommands:
             'without -n the conversion re-creates a volume that already exists, which '
             'Ceph refuses outright')
 
+    def test_the_source_is_always_read_past_the_page_cache(self):
+        """The share can hold hundreds of gigabytes; reading it through the cache would
+        evict what the guests already running on the node are using."""
+        for target in ('/dev/pve/vm-100-disk-0',
+                       'rbd:pool/vm-100-disk-0:conf=/etc/pve/ceph.conf:id=admin'):
+            assert ' -T none ' in transfer.convert_command('/mnt/x/a.vhdx', target)
+
+    def test_a_target_the_kernel_writes_through_bypasses_the_page_cache(self):
+        """A block device or a file is written through the node's page cache, which a
+        long copy would fill at the cost of the running guests."""
+        for target in ('/dev/pve/vm-100-disk-0', '/dev/rbd-pve/fsid/pool/vm-100-disk-0',
+                       '/var/lib/vz/images/100/vm-100-disk-0.raw'):
+            assert ' -t none ' in transfer.convert_command('/mnt/x/a.vhdx', target)
+
+    def test_a_ceph_target_written_through_librbd_keeps_its_own_cache(self):
+        """On an `rbd:` target qemu-img writes through librbd in user space, so the node's
+        page cache is not involved and `-t none` only switches off the rbd cache.
+        Measured on a PVE 9.2.2 node against an HDD Ceph pool with a 10 GiB VHDX: 124 s
+        and 150 s with `-t none`, 34 s without, and the images compared identical."""
+        command = transfer.convert_command(
+            '/mnt/x/a.vhdx',
+            'rbd:pool/vm-100-disk-0:conf=/etc/pve/ceph.conf:id=admin')
+        assert '-t ' not in command, (
+            'with -t none a Ceph import runs several times slower for no page-cache benefit')
+
     def test_a_path_with_a_space_or_a_quote_reaches_the_shell_as_one_word(self):
         """Counting quotes proves nothing; splitting the command the way a shell would
         proves the file name arrives as a single argument and unchanged."""
