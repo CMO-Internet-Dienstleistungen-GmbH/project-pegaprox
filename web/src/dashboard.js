@@ -23883,6 +23883,10 @@
                                                     <div className="divide-y divide-proxmox-border/50">
                                                         {xhmMigrations.map(m => {
                                                             const isActive = m.status === 'running';
+                                                            // The copy finished and the VM exists, but a step after it did
+                                                            // not work - a driver injection, say. Green would hide that, red
+                                                            // would claim nothing was built.
+                                                            const withErrors = m.status === 'completed_with_errors';
                                                             const phases = ['planning','transfer','creating','attaching','completed'];
                                                             // A failed run still leaves an end time on the phase it died in —
                                                             // that is what "the phase is over" means — and the timeline read
@@ -23900,13 +23904,13 @@
                                                                     <div className="flex items-center justify-between mb-2">
                                                                         <div className="flex items-center gap-3">
                                                                             <Icons.ChevronRight className={`w-3.5 h-3.5 text-gray-500 transform transition-transform ${xhmSelectedMigration === m.id ? 'rotate-90' : ''}`} />
-                                                                            <div className={`w-2.5 h-2.5 rounded-full ${isActive ? 'bg-purple-400 animate-pulse' : m.status === 'completed' ? 'bg-green-400' : m.status === 'failed' ? 'bg-red-400' : 'bg-gray-500'}`} />
+                                                                            <div className={`w-2.5 h-2.5 rounded-full ${isActive ? 'bg-purple-400 animate-pulse' : m.status === 'completed' ? 'bg-green-400' : withErrors ? 'bg-yellow-400' : m.status === 'failed' ? 'bg-red-400' : 'bg-gray-500'}`} />
                                                                             <span className="text-sm font-medium text-white">{m.vm_name || m.source_vmid}</span>
                                                                             <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-400 font-medium">{dirLabel}</span>
                                                                             <span className="text-xs px-1.5 py-0.5 rounded bg-proxmox-dark text-gray-400">{phaseLabel[m.phase] || m.phase}</span>
                                                                         </div>
                                                                         <div className="flex items-center gap-2">
-                                                                            <span className={`px-2 py-0.5 rounded text-xs font-semibold ${m.status === 'completed' ? 'bg-green-500/20 text-green-400' : m.status === 'failed' ? 'bg-red-500/20 text-red-400' : 'bg-purple-500/20 text-purple-400'}`}>{m.status}</span>
+                                                                            <span className={`px-2 py-0.5 rounded text-xs font-semibold ${m.status === 'completed' ? 'bg-green-500/20 text-green-400' : withErrors ? 'bg-yellow-500/20 text-yellow-400' : m.status === 'failed' ? 'bg-red-500/20 text-red-400' : 'bg-purple-500/20 text-purple-400'}`}>{withErrors ? (t('xhmCompletedWithErrors') || 'completed with errors') : m.status}</span>
                                                                             {m.status !== 'running' && (
                                                                                 <button onClick={e => { e.stopPropagation(); setXhmDismissAsk({ rows: [m], all: false }); }}
                                                                                         title={t('xhmDismissOneHint') || 'Remove this entry from the list. It removes nothing on either side.'}
@@ -23917,7 +23921,7 @@
                                                                     </div>
                                                                     <div className="flex items-center gap-3 mb-1">
                                                                         <div className="flex-1 h-1.5 bg-proxmox-dark rounded-full overflow-hidden">
-                                                                            <div className={`h-full rounded-full transition-all duration-500 ${m.status === 'failed' ? 'bg-red-400' : m.status === 'completed' ? 'bg-green-400' : 'bg-purple-400'}`} style={{width: `${m.progress || 0}%`}} />
+                                                                            <div className={`h-full rounded-full transition-all duration-500 ${m.status === 'failed' ? 'bg-red-400' : m.status === 'completed' ? 'bg-green-400' : withErrors ? 'bg-yellow-400' : 'bg-purple-400'}`} style={{width: `${m.progress || 0}%`}} />
                                                                         </div>
                                                                         <span className="text-xs text-gray-500 w-8 text-right">{m.progress || 0}%</span>
                                                                     </div>
@@ -23962,15 +23966,17 @@
                                                                                         const broke = ph === brokeAt;
                                                                                         // "completed" is the state the run ends in, so it never
                                                                                         // gets an end time of its own. Reaching it is passing it.
-                                                                                        const isDone = !broke && !!pt && (!!pt.end || (ph === 'completed' && d.status === 'completed'));
+                                                                                        const isDone = !broke && !!pt && (!!pt.end || (ph === 'completed' && (d.status === 'completed' || d.status === 'completed_with_errors')));
+                                                                                        // Reached, but not cleanly: the last step says so itself.
+                                                                                        const warned = isDone && ph === 'completed' && d.status === 'completed_with_errors';
                                                                                         const isCur = d.phase === ph && !broke && !isDone;
                                                                                         return (<React.Fragment key={ph}>
                                                                                             {idx > 0 && <div style={{marginTop: 10}} className={`flex-1 h-px ${isDone ? 'bg-purple-500' : broke ? 'bg-red-500/60' : isCur ? 'bg-purple-500/40' : 'bg-proxmox-border'}`} />}
                                                                                             <div className="flex flex-col items-center w-16 shrink-0">
-                                                                                                <div title={broke ? `${ph} — failed here` : `${ph}${pt?.duration ? ` (${pt.duration}s)` : ''}`} className={`w-5 h-5 rounded-full flex items-center justify-center text-[8px] font-bold border ${broke ? 'bg-red-500/20 border-red-500 text-red-400' : isDone ? 'bg-purple-500/20 border-purple-500 text-purple-400' : isCur ? 'bg-purple-500/20 border-purple-400 text-purple-400 animate-pulse' : 'bg-proxmox-dark border-proxmox-border text-gray-600'}`}>
-                                                                                                    {broke ? '✕' : isDone ? '✓' : idx+1}
+                                                                                                <div title={broke ? `${ph} — failed here` : warned ? `${ph} — with errors` : `${ph}${pt?.duration ? ` (${pt.duration}s)` : ''}`} className={`w-5 h-5 rounded-full flex items-center justify-center text-[8px] font-bold border ${broke ? 'bg-red-500/20 border-red-500 text-red-400' : warned ? 'bg-yellow-500/20 border-yellow-500/40 text-yellow-400' : isDone ? 'bg-purple-500/20 border-purple-500 text-purple-400' : isCur ? 'bg-purple-500/20 border-purple-400 text-purple-400 animate-pulse' : 'bg-proxmox-dark border-proxmox-border text-gray-600'}`}>
+                                                                                                    {broke ? '✕' : warned ? '!' : isDone ? '✓' : idx+1}
                                                                                                 </div>
-                                                                                                <span className={`mt-1 text-[10px] ${broke ? 'text-red-400' : isDone || isCur ? 'text-gray-300' : 'text-gray-600'}`}>{phaseLabel[ph]}</span>
+                                                                                                <span className={`mt-1 text-[10px] ${broke ? 'text-red-400' : warned ? 'text-yellow-400' : isDone || isCur ? 'text-gray-300' : 'text-gray-600'}`}>{phaseLabel[ph]}</span>
                                                                                                 {pt?.duration ? <span className="text-[10px] text-gray-600">{pt.duration}s</span> : null}
                                                                                             </div>
                                                                                         </React.Fragment>);
@@ -24000,7 +24006,7 @@
                                                                                     ))}
                                                                                 </div>
                                                                             </div>
-                                                                            {d.error && <div className="p-2 rounded bg-red-500/10 border border-red-500/20 text-red-400 text-xs">Error: {d.error}</div>}
+                                                                            {d.error && <div className={`p-2 rounded text-xs border ${d.status === 'completed_with_errors' ? 'bg-yellow-500/10 border-yellow-500/20 text-yellow-400' : 'bg-red-500/10 border-red-500/20 text-red-400'}`}>Error: {d.error}</div>}
                                                                         </div>
                                                                         );
                                                                     })()}

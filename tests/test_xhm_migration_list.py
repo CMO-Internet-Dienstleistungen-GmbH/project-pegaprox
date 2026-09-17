@@ -128,7 +128,7 @@ class TestAMigrationOpensInPlace:
         """"completed" is where a run ends, so it never gets an end time. The bar drew
         it as step 5, not reached, under a migration that says completed."""
         rows = _migration_list(_dashboard())
-        assert "ph === 'completed' && d.status === 'completed'" in rows
+        assert "ph === 'completed' && (d.status === 'completed' ||" in rows
 
     def test_each_phase_is_named_under_its_step(self):
         rows = _migration_list(_dashboard())
@@ -371,3 +371,30 @@ def _install_fake_record_keeper(monkeypatch, forget, recorded=(), may_see=lambda
     module.forget_recorded_migration = forget
     module.recorded_migrations = lambda known: list(recorded)
     monkeypatch.setitem(sys.modules, 'pegaprox.core.hyperv_xhm', module)
+
+
+class TestARunThatCompletedWithErrors:
+    """Read out of the source: the list lives in a component this suite cannot mount.
+
+    A Hyper-V import whose driver injection failed ends with the VM built but not as asked.
+    The list showed the status in grey text on the fallback colour and left the last phase
+    unticked, or - once the run said "completed" - green, which hid the failure."""
+
+    def test_the_badge_dot_and_bar_are_yellow_not_green(self):
+        rows = _migration_list(_dashboard())
+        assert "const withErrors = m.status === 'completed_with_errors';" in rows
+        assert "withErrors ? 'bg-yellow-400'" in rows
+        assert "withErrors ? 'bg-yellow-500/20 text-yellow-400'" in rows
+
+    def test_the_badge_says_what_happened_in_words(self):
+        rows = _migration_list(_dashboard())
+        assert "t('xhmCompletedWithErrors')" in rows
+
+    def test_the_last_phase_is_reached_but_marked(self):
+        rows = _migration_list(_dashboard())
+        assert "d.status === 'completed_with_errors')));" in rows
+        assert "warned ? '!'" in rows
+
+    def test_the_label_exists_in_both_languages(self):
+        with open(os.path.join(REPO, 'web', 'src', 'translations.js'), encoding='utf-8') as fh:
+            assert fh.read().count('xhmCompletedWithErrors:') == 2
