@@ -20,6 +20,7 @@ have seen the migrated VM boot.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import re
 import shlex
@@ -511,6 +512,7 @@ def _run_hyperv_to_pve(task):
 
         node, credentials_path = _open_target_node(task, source, target)
         share_map = getattr(source.config, 'smb_share_map', {}) or {}
+        target_is_zero = _fresh_volumes_read_zero(task, node)
 
         for index, disk in enumerate(disks):
             if task.cancel_event.is_set():
@@ -519,7 +521,7 @@ def _run_hyperv_to_pve(task):
             source_file = _mounted_path_for(task, node, source, credentials_path,
                                             mounts, share_map, disk.get('path') or '')
             volume = _transfer_one_disk(task, node, migration_id, source_file,
-                                        new_vmid, index, disk)
+                                        new_vmid, index, disk, target_is_zero)
             if volume is None:
                 return
             allocated.append(volume)
@@ -1519,7 +1521,40 @@ def _share_slug(share):
     return re.sub(r'[^A-Za-z0-9]', '-', share).strip('-') or 'share'
 
 
-def _transfer_one_disk(task, node, migration_id, source_file, new_vmid, index, disk):
+def _fresh_volumes_read_zero(task, node) -> bool:
+    """Whether a volume `pvesm alloc` just made on the target storage reads as zero.
+
+    Only then may qemu-img skip the regions the VHDX leaves empty. Answered yes for one
+    case, the one that was measured: an LVM-thin pool that zeroes the blocks it provisions.
+    An unprovisioned block of a thin volume reads as zero; a pool created with zeroing
+    off (`lvcreate -Z n`) can hand back another volume's old data in the rest of a block
+    that is only partly written, which qemu-img's zero writes would otherwise cover.
+    Thick LVM keeps whatever was on the disk before. Everything else keeps the explicit
+    zero writes, which are correct everywhere and only cost time.
+    """
+    storage = task.target_storage
+    try:
+        code, out, _ = node.run(f'pvesh get /storage/{shlex.quote(storage)} '
+                                f'--output-format json')
+        config = json.loads(out) if code == 0 else {}
+        if config.get('type') != 'lvmthin' or not config.get('vgname') \
+                or not config.get('thinpool'):
+            return False
+        pool = f"{config['vgname']}/{config['thinpool']}"
+        code, out, _ = node.run(f'lvs --noheadings -o zero {shlex.quote(pool)}')
+    except (ValueError, AttributeError, OSError):
+        logger.debug('[XHM:%s] could not tell whether %s reads as zero', task.id, storage,
+                     exc_info=True)
+        return False
+    if code != 0 or out.strip() != 'zero':
+        return False
+    task.log(f'{storage} is LVM-thin with zeroing on, so the empty regions of the disks '
+             f'are not written.')
+    return True
+
+
+def _transfer_one_disk(task, node, migration_id, source_file, new_vmid, index, disk,
+                       target_is_zero=False):
     """Copy and convert one disk. Returns the volume, or None after failing the task."""
     disk_key = f'disk-{index}'
     path = disk.get('path') or ''
@@ -1562,7 +1597,7 @@ def _transfer_one_disk(task, node, migration_id, source_file, new_vmid, index, d
                 logger.debug('Could not record disk progress', exc_info=True)
 
         exit_code, _, err = node.run_with_progress(
-            hyperv_transfer.convert_command(source_file, device),
+            hyperv_transfer.convert_command(source_file, device, target_is_zero),
             report, task.cancel_event.is_set)
 
         if exit_code == 0:
