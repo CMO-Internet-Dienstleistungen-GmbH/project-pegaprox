@@ -8368,6 +8368,9 @@
 
             // NS: auto-clear topology/xhm sidebar when navigating to something else
             useEffect(() => { if (selectedCluster || selectedPBS || selectedVMware || selectedGroup || selectedHyperV) { setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); } }, [selectedCluster, selectedPBS, selectedVMware, selectedGroup, selectedHyperV]);
+            // Fork issue #15 — the Hyper-V host view ranks above every sidebar view below, and the
+            // upstream sidebar buttons do not clear it, so choosing one of them clears it here.
+            useEffect(() => { if (sidebarXHM || sidebarTopology || sidebarWorldmap || sidebarMultiSdn) setSelectedHyperV(null); }, [sidebarXHM, sidebarTopology, sidebarWorldmap, sidebarMultiSdn]);
 
             // track selected XHM migration in ref for SSE updates
             useEffect(() => { xhmSelectedMigrationRef.current = xhmSelectedMigration; }, [xhmSelectedMigration]);
