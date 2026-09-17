@@ -150,6 +150,11 @@
 
         //: The SCSI controller models Proxmox offers. `virtio-scsi-single` is what the
         //: import suggests; an older guest may need a model it has a driver for.
+        //: The CPU models the import offers, mirrored from `hyperv_cpu.CPU_TYPES`. The
+        //: wizard's empty entry is the node's suggestion: x86-64-v3, or x86-64-v2-AES on
+        //: a processor without v3.
+        const HV_CPU_TYPES = ['x86-64-v2-AES', 'x86-64-v3', 'x86-64-v4', 'host', 'kvm64', 'qemu64'];
+
         const HV_SCSIHW = ['virtio-scsi-single', 'virtio-scsi-pci', 'lsi', 'lsi53c810',
                            'megasas', 'pvscsi'];
 

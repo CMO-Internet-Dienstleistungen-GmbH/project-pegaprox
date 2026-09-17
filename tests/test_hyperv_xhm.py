@@ -528,6 +528,19 @@ class TestTheTargetVm:
     def _created(self, target):
         return next(data for url, data in target.posts if url.endswith('/qemu'))
 
+    def test_the_vm_gets_the_cpu_type_the_node_can_run(self, db, wired):
+        """Left out, Proxmox creates kvm64. The fake node reports no CPU flags, which
+        is the case that has to fall back to x86-64-v2-AES rather than guess v3."""
+        _, target, _ = wired
+        task = _run(FakeTask())
+        assert self._created(target)['cpu'] == 'x86-64-v2-AES'
+        assert 'CPU type x86-64-v2-AES, the suggestion for node-a' in task.log_lines
+
+    def test_the_operators_cpu_type_wins(self, db, wired):
+        _, target, _ = wired
+        _run(FakeTask(config={'cpu_type': 'x86-64-v3'}))
+        assert self._created(target)['cpu'] == 'x86-64-v3'
+
     def test_the_guest_agent_channel_is_switched_on(self, db, wired):
         """The injection installs the agent; without the flag Proxmox never talks to it."""
         _, target, _ = wired
