@@ -2198,6 +2198,10 @@ def _create_target_vm(task, target, new_vmid, detail):
         'bios': bios,
         'machine': machine,
         'scsihw': (task.config or {}).get('scsihw') or DEFAULT_SCSIHW,
+        # The driver injection installs the QEMU guest agent at first boot. Without the
+        # flag Proxmox never opens the channel to it, so shutdown, backup freeze and the
+        # guest's addresses stay unavailable although the agent is running.
+        'agent': 'enabled=1',
         # Who made this, and under which migration. A cleanup reads it back before it
         # deletes anything: a VMID says nothing about ownership, and the number can have
         # been taken by somebody else's guest since this run failed.
