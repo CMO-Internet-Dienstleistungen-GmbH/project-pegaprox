@@ -9,7 +9,9 @@ flask-compress>=1.14
 werkzeug>=3.1.6
 requests>=2.34.0
 requests-toolbelt>=1.0.0
-urllib3>=2.7.0
+# MK Sep 2026 - 2.8.0 closes six advisories against 2.7.x, two of them critical.
+# Floor, not a pin: an exact == here fights requests, which carries its own range.
+urllib3>=2.8.0
 dnspython>=2.7.0
 
 # === Encryption & Security ===

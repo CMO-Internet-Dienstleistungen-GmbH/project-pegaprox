@@ -347,6 +347,38 @@ def _migrate_vm_cross_cluster(src_mgr, tgt_mgr, vmid, vm_type, storage_map, net_
         return False, str(e)
 
 
+def _source_vm_is_running(src_mgr, vmid):
+    """(running, checked) for the source guest.
+
+    MK Sep 2026 - emergency failover starts the replica on the target while the source is
+    presumed gone. If the source is in fact still up, both guests now run with the same
+    identity on the same replicated disks, and whichever the storage believes last wins.
+
+    The important half is what happens when we CANNOT look: that is the network partition,
+    which is the case emergency failover exists for. Refusing there would block the one
+    scenario the feature is for, so unreachable means proceed - loudly. Only a source we
+    can see AND that is still running gets refused, because that is not an emergency, it
+    is a planned failover somebody clicked the wrong button for.
+
+    Returns (running, checked). checked=False means we could not tell.
+    """
+    if not src_mgr or not getattr(src_mgr, 'is_connected', False):
+        return False, False
+    try:
+        res = src_mgr._api_get(
+            f"https://{src_mgr.host}:{src_mgr.api_port}/api2/json/cluster/resources",
+            params={'type': 'vm'})
+        if res.status_code != 200:
+            return False, False
+        for r in res.json().get('data', []):
+            if int(r.get('vmid', 0)) == int(vmid):
+                return r.get('status') == 'running', True
+        return False, True          # gone from the source entirely: nothing to collide with
+    except Exception as e:
+        logger.debug(f"[SR] could not read source state for {vmid}: {e}")
+        return False, False
+
+
 def _start_replicated_vm(tgt_mgr, vmid, vm_type='qemu'):
     """Start a replicated VM on target (emergency failover).
     The VM should already exist on target from replication.
@@ -533,7 +565,18 @@ def execute_failover(plan_id, failover_type='planned', authorized_vmids=None):
                 # source is down - start replicated VM on target
                 logger.info(f"[SR] Emergency: starting {_sl(vm_name)} ({vmid}) on target")
                 _broadcast_progress(plan_id, f"Starting {_sl(vm_name)} on target...", int(completed / total_vms * 100))
-                ok, err = _start_replicated_vm(tgt_mgr, vmid, vm_type)
+                _running, _checked = _source_vm_is_running(src_mgr, vmid)
+                if _running:
+                    ok, err = False, ("source guest is still running - this is not an "
+                                      "emergency; stop it or use planned failover")
+                    logger.error(f"[SR] refusing emergency start of {_sl(vm_name)} ({vmid}): "
+                                 f"the source is reachable and the guest is running")
+                else:
+                    if not _checked:
+                        logger.warning(f"[SR] source state for {vmid} could not be verified "
+                                       f"(cluster unreachable) - starting the replica anyway, "
+                                       f"which is what emergency failover is for")
+                    ok, err = _start_replicated_vm(tgt_mgr, vmid, vm_type)
             else:
                 # planned or failback - live migrate
                 if not src_mgr or not src_mgr.is_connected:

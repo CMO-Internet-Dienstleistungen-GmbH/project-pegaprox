@@ -106,7 +106,7 @@ def _caller_can_grant_perms(permissions):
     return all(has_permission(caller, p) for p in (permissions or []))
 
 
-def _authz_object_write(cluster_id, subjects=(), permissions=()):
+def _authz_object_write(cluster_id, subjects=(), permissions=(), groups=()):
     """sec (audit): vm-acls, pool permissions and the pools themselves are the authorization
     objects the per-VM gate
     consults — writing them IS granting access, so cluster reach is nowhere near enough. Every
@@ -125,6 +125,17 @@ def _authz_object_write(cluster_id, subjects=(), permissions=()):
         return jsonify({'error': 'Access denied: you cannot manage access rules on this cluster'}), 403
     _ct = _caller_tenant_or_none()
     if _ct is not None:
+        # MK Sep 2026 - a GROUP subject is the wildcard case wearing a different hat. Group
+        # names come from LDAP or OIDC and carry no tenant association at all; the grant is
+        # matched by name, so a delegate can hand pool permissions to a group whose members
+        # sit in somebody else's tenant, and neither they nor we can see how far it reaches.
+        # Members who have never logged in are not even in our user table, so counting them
+        # would only look like a check. Same answer as the wildcard below: not a tenant-scoped
+        # decision.
+        for g in groups:
+            if g:
+                return jsonify({'error': 'Access denied: group-based grants require a '
+                                         'global admin'}), 403
         _users = load_users()
         for s in subjects:
             if not s or s == '*':
@@ -2177,6 +2188,7 @@ def add_pool_permission_api(cluster_id, pool_id):
     # which short-circuits the per-VM gate for every VM in the pool.
     _err = _authz_object_write(cluster_id,
                                subjects=[subject_id] if subject_type == 'user' else [],
+                               groups=[subject_id] if subject_type == 'group' else [],
                                permissions=permissions)
     if _err:
         return _err
@@ -2207,7 +2219,8 @@ def delete_pool_permission_api(cluster_id, pool_id, subject_type, subject_id):
     # a grant belonging to another tenant's principal. Revoking is not granting, but it
     # is still reaching across the boundary - and it is how you lock a rival out.
     _err = _authz_object_write(cluster_id,
-                               subjects=[subject_id] if subject_type == 'user' else [])
+                               subjects=[subject_id] if subject_type == 'user' else [],
+                               groups=[subject_id] if subject_type == 'group' else [])
     if _err:
         return _err
     _confined, _granted = _pool_visibility(cluster_id)

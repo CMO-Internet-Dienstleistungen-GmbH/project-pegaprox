@@ -1269,6 +1269,39 @@ def run_auto_storage_balance():
                                 if mig.get('active'):
                                     actively_migrating_vmids.add(mig.get('vmid'))
 
+                        # MK Sep 2026 - this worker moves disks, and the interactive route that
+                        # does the same thing (execute_storage_migration, ~300 lines up) requires
+                        # vm.config on that specific VM. The worker runs USERLESS, so it has no
+                        # identity to check and simply moved anything. A guest that somebody
+                        # deliberately fenced off with a VM ACL or a pool grant is exactly the
+                        # guest that should not be moved by a job nobody authorized. Built once
+                        # per cycle, like the two skip-sets above.
+                        restricted_vmids = set()
+                        try:
+                            from pegaprox.utils.rbac import get_vm_acls, get_pool_membership_cache
+                            for _v in (get_vm_acls().get(cluster_id, {}) or {}):
+                                try:
+                                    restricted_vmids.add(int(_v))
+                                except (TypeError, ValueError):
+                                    pass
+                            _granted_pools = {r.get('pool_id') for r
+                                              in (get_db().get_pool_permissions(cluster_id) or [])}
+                            if _granted_pools:
+                                _members = get_pool_membership_cache(cluster_id) or {}
+                                for _pool, _vmids in _members.items():
+                                    if _pool in _granted_pools:
+                                        for _v in (_vmids or []):
+                                            try:
+                                                restricted_vmids.add(int(_v))
+                                            except (TypeError, ValueError):
+                                                pass
+                        except Exception as e:
+                            # a skip-set we could not build is not a reason to move MORE, so
+                            # sit this cycle out rather than run unrestricted
+                            logging.warning(f"Auto-balance: cannot determine protected VMs, "
+                                            f"skipping this cycle: {e}")
+                            continue
+
                         for vm in all_vms:
                             if migration_done or vms_checked >= max_vms_per_cycle:
                                 break
@@ -1283,6 +1316,11 @@ def run_auto_storage_balance():
 
                             # NS: Feb 2026 - skip VMs with active efficient snapshots
                             if vmid in eff_snap_vmids:
+                                continue
+
+                            # somebody fenced this guest off; only a human with vm.config on it
+                            # may move its disks
+                            if vmid in restricted_vmids:
                                 continue
 
                             # Check if target storage is available on this VM's node
