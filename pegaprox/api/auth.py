@@ -1299,10 +1299,19 @@ def get_cluster_creds_internal(cluster_id):
     mgr = cluster_managers[cluster_id]
 
     # NS Mar 2026: use standard cluster access check (validates user's cluster assignments + tenant)
-    from pegaprox.api.helpers import check_cluster_access
+    from pegaprox.api.helpers import check_cluster_access, require_unconfined
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
+    # MK Sep 2026 - what this hands back is a root shell on a hypervisor node, which is as
+    # whole-cluster as an operation gets. check_cluster_access deliberately admits a caller
+    # who only reached the cluster through a VM ACL or a pool grant (#248/#555), and deferring
+    # the real decision downstream is right for a per-VM route - this is not one. node.shell is
+    # an admin-only builtin, so nothing but a custom role can arrive here confined in the first
+    # place, and for that caller the answer is no.
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     # Check permissions - NS Feb 2026
     users_db = load_users()
@@ -1320,7 +1329,10 @@ def get_cluster_creds_internal(cluster_id):
         return jsonify({'error': 'Account disabled'}), 403
     # MK 2026-06-10 (RBAC): gate on node.shell only — admin holds it via all-perms, so the
     # explicit admin bypass was redundant; a custom role with node.shell now works too.
-    user_perms = get_user_permissions(user_data)
+    # ...and at the authority of whoever is actually calling: user_data is the stored account,
+    # so an admin-owned token capped at viewer used to be handed its owner's node.shell.
+    from pegaprox.utils.auth import build_authz_user as _bau
+    user_perms = get_user_permissions(_bau(session['user'], session))
     if 'node.shell' not in user_perms:
         logging.warning(f"[CLUSTER-CREDS] User {session['user']} lacks node.shell permission")
         return jsonify({'error': 'Permission denied'}), 403
@@ -1815,6 +1827,27 @@ def get_2fa_status():
 # LW: Admins can see all tokens, users can only manage their own
 # =============================================================================
 
+def _api_token_admin_scope():
+    """The tenant an admin.api holder may act in, or None for a global admin.
+
+    MK Sep 2026 - admin.api was the whole gate on "list every token" and "revoke any
+    token". It is an admin-only builtin, so a non-admin only ever holds it through a
+    custom role, which is by definition a tenant delegation - and that delegate could
+    read every other tenant's token inventory (owner, prefix, role, permissions, last
+    used IP) and revoke any of it. Same rule the user-management routes use.
+    """
+    from pegaprox.utils.auth import build_authz_user
+    u = build_authz_user(request.session.get('user', ''), request.session)
+    if u.get('effective_role', u.get('role')) == ROLE_ADMIN:
+        return None
+    return u.get('tenant_id', DEFAULT_TENANT_ID)
+
+
+def _token_owner_tenant(owner, users=None):
+    users = users if users is not None else load_users()
+    return (users.get(owner) or {}).get('tenant_id', DEFAULT_TENANT_ID)
+
+
 @bp.route('/api/auth/tokens', methods=['GET'])
 @require_auth()
 def list_api_tokens():
@@ -1838,6 +1871,11 @@ def list_api_tokens():
                 FROM api_tokens ORDER BY created_at DESC
             ''')
             tokens = [dict(row) for row in cursor.fetchall()]
+            _scope = _api_token_admin_scope()
+            if _scope is not None:
+                _users = load_users()
+                tokens = [t for t in tokens
+                          if _token_owner_tenant(t.get('username'), _users) == _scope]
             return jsonify({'tokens': tokens})
         except Exception as e:
             return jsonify({'error': safe_error(e, 'Failed to list tokens')}), 500
@@ -1910,6 +1948,10 @@ def revoke_api_token_endpoint(token_id):
             cursor.execute('SELECT username, name FROM api_tokens WHERE id = ?', (token_id,))
             row = cursor.fetchone()
             if row:
+                _scope = _api_token_admin_scope()
+                if (_scope is not None
+                        and _token_owner_tenant(dict(row)['username']) != _scope):
+                    return jsonify({'error': 'Token not found'}), 404
                 cursor.execute('UPDATE api_tokens SET revoked = 1 WHERE id = ?', (token_id,))
                 db.conn.commit()
                 token_owner = dict(row)['username']
