@@ -241,15 +241,21 @@ def load_tenants() -> dict:
     try:
         db = get_db()
         tenants_list = db.get_all_tenants()
-        
-        if tenants_list:
-            # Convert list to dict format
-            return {t['id']: t for t in tenants_list}
     except Exception as e:
         logging.error(f"Error loading tenants from database: {e}")
         # NS May 2026 - plain-JSON TENANTS_FILE fallback removed (encrypted DB only).
+        # MK Sep 2026 - this used to fall through to "create the default tenant", and the
+        # default tenant's empty cluster list is the one that means ALL clusters. So a
+        # single unreadable row handed every default-tenant user the whole estate, and
+        # then SAVED that invented tenant over whatever an operator had confined it to.
+        # Unreadable is not empty. Say which one it was and let the callers decide.
+        return _Snapshot(unavailable=True)
 
-    # Create default tenant
+    if tenants_list:
+        # Convert list to dict format
+        return _Snapshot({t['id']: t for t in tenants_list})
+
+    # nothing stored and the read succeeded, so this really is a fresh install
     default = {
         DEFAULT_TENANT_ID: {
             'id': DEFAULT_TENANT_ID,
@@ -259,7 +265,7 @@ def load_tenants() -> dict:
         }
     }
     save_tenants(default)
-    return default
+    return _Snapshot(default)
 
 
 def save_tenants(tenants: dict):
@@ -416,6 +422,14 @@ def get_user_clusters(user: dict, include_pools: bool = True) -> list:
     # restricted to viewer/user doesn't inherit the owner's all-cluster access.
     if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
         return None  # None means all clusters
+
+    # MK Sep 2026 - we could not read the tenant table, so we do not know what this caller
+    # is confined to. A default-tenant user would otherwise land on the empty-clusters
+    # branch below and be handed every cluster. Nobody gets widened on a failed read; a
+    # tenant with no clusters already answers [] and this matches it.
+    if store_unavailable(tenants_db):
+        tenants_db = {}      # never keep a failed read around
+        return []
 
     tenant_id = user.get('tenant_id', DEFAULT_TENANT_ID)
 
