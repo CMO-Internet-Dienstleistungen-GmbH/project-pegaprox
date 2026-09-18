@@ -2230,6 +2230,19 @@ def install_starlvm_plugin(cluster_id):
         return jsonify({'error': 'StarWind plugin install is Proxmox-only'}), 400
 
     body = request.get_json(silent=True) or {}
+    # MK Sep 2026 - the key URL is the TRUST ANCHOR for a root apt-install on every node
+    # in the cluster, so overriding it is "run my code as root here", not a setting. The
+    # SSRF guard below decides where the request may go, not whose key it fetches.
+    # admin.settings is an admin-only builtin, which means a non-admin only ever holds it
+    # through a hand-built custom role - a delegation of settings, and nobody delegates
+    # settings meaning to hand over the hypervisors. The default StarWind repo stays open
+    # to that delegate; pointing it somewhere else is the global admin's call.
+    from pegaprox.utils.auth import build_authz_user as _bau
+    _caller = _bau(request.session.get('user', ''), request.session)
+    if (_caller.get('effective_role', _caller.get('role')) != ROLE_ADMIN
+            and (body.get('repo_url') or body.get('key_url'))):
+        return jsonify({'error': 'Only a global admin can install from a repository or '
+                                 'signing key other than the default'}), 403
     try:
         repo_url = _safe_repo_url(body.get('repo_url'), STARWIND_REPO_DEFAULT)
         key_url = _safe_repo_url(body.get('key_url'), STARWIND_KEY_DEFAULT)

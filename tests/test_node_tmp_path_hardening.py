@@ -138,3 +138,84 @@ def test_the_relay_token_is_not_derived_from_pid_and_clock(monkeypatch):
     src = ''.join(inspect.getsource(f) for f in fn) if fn else inspect.getsource(repl)
     body = src[src.find('tok ='):src.find('tok =') + 200] if 'tok =' in src else ''
     assert 'uuid4' in body, f'relay token still derived from something guessable: {body[:120]}'
+
+
+# ── the APT trust anchor is not a setting ────────────────────────────────────
+# MK Sep 2026: install_starlvm_plugin accepts repo_url and key_url and runs a root
+# apt-install on every node in the cluster. The key URL is the TRUST ANCHOR for that
+# install, so overriding it is "run my code as root on your hypervisors", not a
+# preference. admin.settings is an admin-only builtin, so a non-admin only ever holds
+# it through a hand-built custom role - and nobody delegates settings meaning to hand
+# over the hypervisors. The default repo stays open to that delegate.
+# Aikido ai_pentest 700489405 / 700487796.
+
+def _install_handler():
+    import pegaprox.api.nodes as nodes
+    fn = nodes.install_starlvm_plugin
+    while hasattr(fn, '__wrapped__'):
+        fn = fn.__wrapped__
+    return fn
+
+
+def _install_ctx(api, session, body):
+    from flask import request as _rq
+    import contextlib
+
+    @contextlib.contextmanager
+    def _cm():
+        with api.app.test_request_context('/', base_url='http://localhost', json=body):
+            _rq.session = session
+            yield
+    return _cm()
+
+
+@pytest.fixture
+def starlvm_estate(api, seed):
+    from tests.conftest import make_fake_manager
+    seed.tenant('tenant_a', clusters=['cluster_1'])
+    seed.user('deleg', role='user', tenant_id='tenant_a', permissions=['admin.settings'])
+    seed.user('root5', role='admin')
+    m = make_fake_manager('cluster_1')
+    m.cluster_type = 'proxmox'
+    api.set_manager('cluster_1', m)
+    return seed
+
+
+def test_a_settings_delegate_cannot_choose_the_signing_key(api, starlvm_estate, monkeypatch):
+    # neutralise the SSRF guard: without DNS it refuses the hostname with a 400
+    # and the test would pass on the unfixed code for the wrong reason
+    import pegaprox.api.nodes as _n
+    monkeypatch.setattr(_n, '_safe_repo_url', lambda u, d: u or d)
+    body = {'key_url': 'https://attacker.example/their.asc'}
+    with _install_ctx(api, {'user': 'deleg', 'role': 'user'}, body):
+        resp = _install_handler()('cluster_1')
+
+    assert resp[1] == 403
+    assert 'global admin' in resp[0].get_json()['error']
+
+
+def test_a_settings_delegate_cannot_choose_the_repository_either(api, starlvm_estate, monkeypatch):
+    # neutralise the SSRF guard: without DNS it refuses the hostname with a 400
+    # and the test would pass on the unfixed code for the wrong reason
+    import pegaprox.api.nodes as _n
+    monkeypatch.setattr(_n, '_safe_repo_url', lambda u, d: u or d)
+    body = {'repo_url': 'https://attacker.example/debian'}
+    with _install_ctx(api, {'user': 'deleg', 'role': 'user'}, body):
+        resp = _install_handler()('cluster_1')
+
+    assert resp[1] == 403
+
+
+def test_the_default_repository_stays_open_to_the_delegate(api, starlvm_estate):
+    """The counterweight: installing the plugin is the point of the permission.
+
+    It runs on to the real SSH path against a fake manager and dies there, which is
+    fine - what matters is that it got past the gate rather than stopping at 403.
+    """
+    with _install_ctx(api, {'user': 'deleg', 'role': 'user'}, {}):
+        try:
+            resp = _install_handler()('cluster_1')
+        except Exception:
+            return          # reached the transport, so the gate let it through
+    status = resp[1] if isinstance(resp, tuple) else resp.status_code
+    assert status != 403, resp
