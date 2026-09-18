@@ -28,7 +28,8 @@ from datetime import datetime
 from pegaprox.core import hyperv_db
 from pegaprox.core.hyperv import HyperVManager
 from pegaprox.core.hyperv_client import (
-    DEFAULT_AUTH_METHOD, HyperVConnection, PsrpHyperVClient, default_winrm_port,
+    DEFAULT_AUTH_METHOD, DEFAULT_MAX_SESSIONS, HyperVConnection, PooledHyperVClient,
+    default_winrm_port, parse_max_sessions,
 )
 from pegaprox.core.hyperv_errors import (
     HyperVError, KIND_MISSING_FEATURE, KIND_OK, KIND_UNKNOWN, remedy,
@@ -87,6 +88,16 @@ class HyperVConfig:
         # picker -- an interface name on this side would say nothing about which way the
         # node routes.
         self.transfer_host = (data.get('transfer_host') or '').strip()
+
+        # How many calls may run against this host at once (docs/adr/0006). A stored value
+        # outside the range is a row somebody edited by hand; the host still loads, with the
+        # default, rather than failing on a setting that only tunes throughput.
+        try:
+            self.max_sessions = parse_max_sessions(data.get('max_sessions'))
+        except ValueError:
+            logger.warning('Ignoring an invalid session count for Hyper-V host %s',
+                           data.get('id') or data.get('name') or '?')
+            self.max_sessions = DEFAULT_MAX_SESSIONS
 
         # Read by the cluster list and the balancer without a getattr guard. A Hyper-V host
         # is never balanced and never a migration target, so every one of these is off.
@@ -173,6 +184,11 @@ class HyperVClusterManager:
         self.connection_kind = ''
         self.connection_remedy = ''
         self._manager = manager
+        # Two requests arriving while the host is disconnected both call connect(). Without
+        # this each built its own manager and the one that lost was never closed -- with a
+        # pool of sessions behind every manager, that is up to N shells left open on the
+        # host for nobody.
+        self._manager_lock = threading.Lock()
         self._connected = False
         self._property_report: dict | None = None
 
@@ -228,7 +244,8 @@ class HyperVClusterManager:
             encrypt_messages=self.config.encrypt_messages,
             verify_certificate=self.config.ssl_verification,
         )
-        return HyperVManager(self.id, PsrpHyperVClient(connection), host=self.config.host)
+        client = PooledHyperVClient(connection, max_sessions=self.config.max_sessions)
+        return HyperVManager(self.id, client, host=self.config.host)
 
     def connect(self) -> bool:
         """Reach the host once and record what it said.
@@ -239,8 +256,9 @@ class HyperVClusterManager:
         generation and no checkpoints.
         """
         try:
-            if self._manager is None:
-                self._manager = self._build_manager()
+            with self._manager_lock:
+                if self._manager is None:
+                    self._manager = self._build_manager()
             facts = self._manager.host_facts()
             self._property_report = self._manager.verify_properties()
             self._connected = True

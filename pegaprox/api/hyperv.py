@@ -21,6 +21,7 @@ leaving it out is the cross-tenant class of bug the route contract test exists t
 """
 
 import logging
+import threading
 import uuid
 
 from flask import Blueprint, jsonify, request
@@ -33,7 +34,7 @@ from pegaprox.utils.sanitization import sanitize_log_message as _sl
 from pegaprox.api.helpers import check_cluster_access, caller_is_scoped
 from pegaprox.core import hyperv_inventory, hyperv_preflight
 from pegaprox.core.hyperv_errors import (
-    HyperVError, KIND_AUTHENTICATION, KIND_AUTHORIZATION, KIND_CERTIFICATE,
+    HyperVError, KIND_AUTHENTICATION, KIND_AUTHORIZATION, KIND_BUSY, KIND_CERTIFICATE,
     KIND_CLIENT_DEPENDENCY, KIND_MISSING_FEATURE, KIND_REFUSED, KIND_TIMEOUT,
     KIND_UNREACHABLE,
 )
@@ -60,6 +61,9 @@ _HTTP_STATUS_FOR_KIND = {
     # PegaProx's own state, and neither is fixed on the Hyper-V host.
     KIND_CLIENT_DEPENDENCY: 503,
     KIND_REFUSED: 500,
+    # Every session to the host was busy. Nothing is wrong on either side; the caller
+    # may retry, which is what 503 says.
+    KIND_BUSY: 503,
 }
 _DEFAULT_ERROR_STATUS = 502
 
@@ -164,6 +168,31 @@ def _unsupported_auth(data: dict):
     return None
 
 
+def _invalid_max_sessions(data: dict):
+    """A 400 naming the accepted range when the submitted session count is outside it."""
+    from pegaprox.core.hyperv_client import parse_max_sessions
+
+    try:
+        parse_max_sessions(data.get('max_sessions'))
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    return None
+
+
+def _close_quietly(manager, host_id: str) -> None:
+    """Close a manager nobody will use again, so its sessions do not stay open on the host.
+
+    Each manager holds up to N sessions, and the host counts every one of them against
+    the account's shell quota until WinRM times it out on its own.
+    """
+    if manager is None:
+        return
+    try:
+        manager.stop()
+    except Exception:                                        # noqa: BLE001
+        logging.warning('Hyper-V source %s did not close cleanly', host_id)
+
+
 @bp.route('/api/hyperv/hosts', methods=['GET'])
 @require_auth(perms=['hyperv.view'])
 def list_hyperv_hosts():
@@ -192,6 +221,7 @@ def list_hyperv_hosts():
             # What a target node last measured. The host view renders it, and its absence
             # is why the migration wizard would otherwise ask about disk access per VM.
             'transfer_check': record.get('transfer_check') or {},
+            'max_sessions': record.get('max_sessions'),
             # Never the password, not even its length.
             'has_password': bool(record['pass']),
             'connected': bool(manager and manager.is_connected),
@@ -216,7 +246,7 @@ def create_hyperv_host():
     data = request.json or {}
     if not data.get('host'):
         return jsonify({'error': 'A host address is required'}), 400
-    auth_error = _unsupported_auth(data)
+    auth_error = _unsupported_auth(data) or _invalid_max_sessions(data)
     if auth_error:
         return auth_error
 
@@ -224,6 +254,8 @@ def create_hyperv_host():
     manager, hv_error = connect_hyperv_source(host_id, data)
     if hv_error:
         return jsonify({'error': f"Failed to connect: {hv_error['message']}", **hv_error}), 400
+    # The test connection has answered; the registered source below opens its own.
+    _close_quietly(manager, host_id)
 
     db = get_db()
     hyperv_db.save_host(db.conn, db._encrypt, host_id, data)
@@ -255,17 +287,25 @@ def update_hyperv_host(host_id):
     data['_password_submitted'] = bool((request.json or {}).get('pass'))
     if not (request.json or {}).get('pass'):
         data['pass'] = existing['pass']
-    auth_error = _unsupported_auth(data)
+    auth_error = _unsupported_auth(data) or _invalid_max_sessions(data)
     if auth_error:
         return auth_error
 
     manager, hv_error = connect_hyperv_source(host_id, data)
     if hv_error:
         return jsonify({'error': f"Connection failed: {hv_error['message']}", **hv_error}), 400
+    _close_quietly(manager, host_id)
 
     hyperv_db.save_host(db.conn, db._encrypt, host_id, data)
+    previous = cluster_managers.get(host_id)
     register_hyperv_source(host_id, hyperv_db.load_host(db.conn, db._decrypt, host_id),
                            cluster_managers)
+    # The source under the old settings is replaced, and its sessions go with it. Closed
+    # off the request: a session still serving a call is closed only when that call ends,
+    # and the person who saved the form should not wait for somebody else's preflight.
+    if previous is not None:
+        threading.Thread(target=_close_quietly, args=(previous, host_id),
+                         name='hyperv-close-replaced', daemon=True).start()
     # A host reached under new settings may be a different host. What the old settings
     # returned is dropped rather than shown with a fresh timestamp on the next read.
     hyperv_inventory.invalidate(host_id)

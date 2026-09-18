@@ -28,6 +28,9 @@ KIND_CLIENT_DEPENDENCY = 'client_dependency'
 # than a plain exception so the refusal reaches an API response with the same shape as
 # every other failure, instead of surfacing as an unclassified 500.
 KIND_REFUSED = 'refused'
+# Also this side: every session PegaProx keeps to the host was taken for longer than a
+# caller may wait. The host is answering; it is answering somebody else.
+KIND_BUSY = 'busy'
 KIND_UNKNOWN = 'unknown'
 
 REMEDIES = {
@@ -45,6 +48,9 @@ REMEDIES = {
     KIND_REFUSED: 'PegaProx declined to send this script because it would change the source. '
                   'Read-only paths may only run read-only cmdlets; this is a defect in the '
                   'caller, not a setting on the host.',
+    KIND_BUSY: 'Every session PegaProx keeps to this host stayed in use while this request '
+               'waited. Try again when the running calls have finished, or allow more '
+               'parallel sessions for this host.',
     KIND_UNKNOWN: 'No classification matched. The raw message is carried through unchanged.',
 }
 
