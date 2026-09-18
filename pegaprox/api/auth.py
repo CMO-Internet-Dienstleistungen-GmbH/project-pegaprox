@@ -1505,8 +1505,16 @@ def verify_password_api():
             db = get_db()
             wa_row = db.query('SELECT COUNT(*) AS n FROM webauthn_credentials WHERE username = ?', (username,))
             has_webauthn = bool(wa_row and wa_row[0]['n'] > 0)
-        except Exception:
-            has_webauthn = False
+        except Exception as e:
+            # Same trap as the login path: swallowing this into False drops the whole
+            # WebAuthn rung of the ladder below, and the session fallback then waves the
+            # caller straight through. That turns a database hiccup into a re-auth bypass
+            # for exactly the admins who secured themselves with a key. Refuse instead.
+            logging.error(f"[AUTH] OIDC re-auth cannot read WebAuthn enrolment for '{username}': {e}")
+            return jsonify({
+                'error': 'Cannot verify second-factor enrolment - check the server logs',
+                'code': 'MFA_STATE_UNAVAILABLE',
+            }), 503
 
         if has_webauthn:
             if not webauthn_proof:

@@ -4382,8 +4382,14 @@ echo DONE""",
             vm_ref = self._resolve_vm(vmid)
             power = api.VM.get_power_state(vm_ref)
 
-            # connect to remote pool to get session
-            remote_session = XenAPI.Session(target_endpoint, ignore_ssl=True)
+            # connect to remote pool to get session. The TLS setting is the source
+            # cluster's - we have no config object for the target here, only its URL,
+            # and this call already logs into the target with the SOURCE credentials
+            # below, so the source's setting is the one that is actually meaningful.
+            # MK Sep 2026 - was pinned to ignore_ssl=True, which quietly ignored an
+            # operator who had turned verification ON for this cluster.
+            remote_session = XenAPI.Session(target_endpoint,
+                                            ignore_ssl=not self.config.ssl_verification)
             remote_session.xenapi.login_with_password(
                 self.config.user, self.config.pass_, '1.0', 'PegaProx')
 
