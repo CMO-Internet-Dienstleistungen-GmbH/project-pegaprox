@@ -623,8 +623,13 @@
             use_ssl: false, auth: 'negotiate', encrypt_messages: true,
             ssl_verification: true, iso_library_paths: '', smb_share_map: '', smb_domain: '',
             transfer_host: '',
+            max_sessions: 4,
             cluster_type: 'hyperv',
         };
+
+        // How many calls PegaProx runs against one host at once. Mirrors the server's range
+        // (hyperv_client.MIN_SESSIONS / MAX_SESSIONS), which is what actually enforces it.
+        const HYPERV_SESSIONS = { min: 1, max: 8, fallback: 4 };
 
         // The listener Windows creates by default answers on 5985; an HTTPS listener on 5986
         // exists only where somebody set one up with a certificate. The form follows the
@@ -663,6 +668,7 @@
                 use_ssl: !!form.use_ssl,
                 encrypt_messages: form.encrypt_messages !== false,
                 port: parseInt(form.port, 10) || hvDefaultPort(form.use_ssl),
+                max_sessions: parseInt(form.max_sessions, 10) || HYPERV_SESSIONS.fallback,
                 iso_library_paths: (form.iso_library_paths || '')
                     .split('\n').map(s => s.trim()).filter(Boolean),
                 smb_share_map: shareMap,
@@ -755,6 +761,19 @@
                                 {say('hvWinrmPortHint', 'Follows the transport until you set it yourself.')}
                             </p>
                         </div>
+                    </div>
+
+                    <div>
+                        <label className={label}>{say('hvMaxSessions', 'Parallel sessions')}</label>
+                        <input type="number" min={HYPERV_SESSIONS.min} max={HYPERV_SESSIONS.max} step="1"
+                            className={input} value={config.max_sessions ?? HYPERV_SESSIONS.fallback}
+                            onChange={e => field('max_sessions', e.target.value)} />
+                        <p className="mt-1 text-xs text-gray-500">
+                            {say('hvMaxSessionsHint', 'How many requests PegaProx sends to this host '
+                                 + 'at the same time, 1 to 8. Each is its own WinRM shell on the host '
+                                 + 'and counts against MaxShellsPerUser there. Requests beyond this '
+                                 + 'number wait and show as waiting under Tasks.')}
+                        </p>
                     </div>
 
                     <div className="space-y-4">

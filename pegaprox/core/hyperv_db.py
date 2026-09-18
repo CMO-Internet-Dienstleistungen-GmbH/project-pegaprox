@@ -39,7 +39,9 @@ import uuid
 # that actually ships. Measured: the guard against two migrations of one VM let the raw
 # error through instead of naming the migration that already holds the source.
 from pegaprox.core.dbcrypto import IntegrityError
-from pegaprox.core.hyperv_client import DEFAULT_AUTH_METHOD, default_winrm_port
+from pegaprox.core.hyperv_client import (
+    DEFAULT_AUTH_METHOD, DEFAULT_MAX_SESSIONS, default_winrm_port, parse_max_sessions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +185,13 @@ def ensure_schema(cursor) -> None:
     if host_columns and 'transfer_host' not in host_columns:
         cursor.execute("ALTER TABLE hyperv_hosts ADD COLUMN transfer_host TEXT DEFAULT ''")
         logger.info('Added transfer_host column to hyperv_hosts')
+    # Hosts registered before this column talked to their host over one session. They get
+    # the new default rather than keeping one: a single session is what queued every user
+    # of a host behind every other, and nothing about an existing host asked for that.
+    if host_columns and 'max_sessions' not in host_columns:
+        cursor.execute(f'ALTER TABLE hyperv_hosts ADD COLUMN max_sessions INTEGER '
+                       f'DEFAULT {DEFAULT_MAX_SESSIONS}')
+        logger.info('Added max_sessions column to hyperv_hosts')
     if host_columns and 'transfer_check' not in host_columns:
         cursor.execute("ALTER TABLE hyperv_hosts ADD COLUMN transfer_check TEXT DEFAULT '{}'")
         logger.info('Added transfer_check column to hyperv_hosts')
@@ -234,6 +243,8 @@ def ensure_schema(cursor) -> None:
             -- per VM, and asking somebody to confirm the answer per VM, is what made the
             -- wizard's longest warning the one it repeated most (issue #15).
             transfer_check TEXT DEFAULT '{}',
+            -- How many sessions PegaProx keeps to this host at most (docs/adr/0006).
+            max_sessions INTEGER DEFAULT 4,
             enabled INTEGER DEFAULT 1,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
@@ -734,8 +745,8 @@ def save_host(conn, encrypt, host_id: str, data: dict) -> None:
         '(id, name, host, username, pass_encrypted, winrm_port, use_ssl, auth, '
         ' encrypt_messages, verify_certificate, '
         ' iso_library_paths, smb_share_map, smb_domain, transfer_host, transfer_check, '
-        ' enabled, created_at, updated_at) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        ' max_sessions, enabled, created_at, updated_at) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         (host_id,
          data.get('name') or data.get('host') or 'Hyper-V host',
          data.get('host') or '',
@@ -751,6 +762,7 @@ def save_host(conn, encrypt, host_id: str, data: dict) -> None:
          data.get('smb_domain') or '',
          (data.get('transfer_host') or '').strip(),
          transfer_check,
+         parse_max_sessions(data.get('max_sessions')),
          1 if data.get('enabled', True) else 0,
          existing['created_at'] if existing else now,
          now))
@@ -802,8 +814,19 @@ def _host_row(row, decrypt) -> dict:
         'transfer_check': _decode_json(
             row['transfer_check'] if 'transfer_check' in row.keys() else '{}', {},
             row['id'], 'transfer check'),
+        'max_sessions': _stored_max_sessions(row),
         'enabled': bool(row['enabled']),
     }
+
+
+def _stored_max_sessions(row) -> int:
+    """The stored session count, or the default for a value nobody could have saved."""
+    raw = row['max_sessions'] if 'max_sessions' in row.keys() else None
+    try:
+        return parse_max_sessions(raw)
+    except ValueError:
+        logger.warning('Ignoring an invalid session count for Hyper-V host %s', row['id'])
+        return DEFAULT_MAX_SESSIONS
 
 
 def _decode_json(raw, fallback, host_id: str, label: str):

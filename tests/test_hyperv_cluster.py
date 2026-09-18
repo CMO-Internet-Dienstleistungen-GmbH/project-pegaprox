@@ -625,11 +625,11 @@ class TestWhatBootDoes:
         that a transport is not good enough for it."""
         captured = {}
 
-        def fake_client(connection):
+        def fake_client(connection, max_sessions):
             captured['connection'] = connection
             return FakeManager()
 
-        monkeypatch.setattr(hyperv_cluster, 'PsrpHyperVClient', fake_client)
+        monkeypatch.setattr(hyperv_cluster, 'PooledHyperVClient', fake_client)
         monkeypatch.setattr(hyperv_cluster, 'HyperVManager', lambda *a, **kw: FakeManager())
 
         config = {**CONFIG, 'use_ssl': False, 'auth': 'basic', 'encrypt_messages': False,
