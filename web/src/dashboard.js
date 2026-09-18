@@ -29,7 +29,12 @@
             
             // Ensure tasks is an array
             const safeTasks = Array.isArray(tasks) ? tasks : [];
-            const runningCount = safeTasks.filter(task => task && task.status === 'running').length;
+            // Fork: a Hyper-V call waiting for the host's session is 'queued'. It is work in
+            // flight, so it counts with the running ones -- a waiting call that the bar did not
+            // count would look like nothing was happening.
+            const isActive = (task) => task && (task.status === 'running' || task.status === 'queued');
+            const statusLabel = (status) => status === 'queued' ? t('taskStatusQueued') : (status || '-');
+            const runningCount = safeTasks.filter(isActive).length;
             const failedCount = safeTasks.filter(task => task && (task.status === 'failed' || task.status === 'error')).length;
             
             // #738 — auto-expand only for a task the user actually just started: an unseen UPID
@@ -95,7 +100,7 @@
             // Filter tasks
             const filteredTasks = safeTasks.filter(task => {
                 if (!task) return false;
-                if (filter === 'running') return task.status === 'running';
+                if (filter === 'running') return isActive(task);
                 if (filter === 'error') return task.status === 'failed' || task.status === 'error';
                 if (filter === 'today') {
                     const today = new Date();
@@ -126,6 +131,15 @@
                     'portalstop': 'Portal: Stop', 'portalshutdown': 'Portal: Shutdown',
                     'portalreboot': 'Portal: Reboot', 'portalsnapshot': 'Portal: Snapshot',
                     'portalrollback': 'Portal: Rollback', 'portalpassword': 'Portal: Password',
+                    // Fork: calls PegaProx makes to a Hyper-V host
+                    'hv_host_facts': t('hvTaskHostFacts'), 'hv_verify': t('hvTaskVerify'),
+                    'hv_inventory': t('hvTaskInventory'), 'hv_detail': t('hvTaskDetail'),
+                    'hv_image_facts': t('hvTaskImageFacts'), 'hv_inspect': t('hvTaskInspect'),
+                    'hv_state': t('hvTaskState'), 'hv_merge_state': t('hvTaskMergeState'),
+                    'hv_disk_chain': t('hvTaskDiskChain'), 'hv_iso_list': t('hvTaskIsoList'),
+                    'hv_safety_check': t('hvTaskSafetyCheck'), 'hv_start': t('hvTaskStart'),
+                    'hv_shutdown': t('hvTaskShutdown'), 'hv_checkpoint_remove': t('hvTaskCheckpointRemove'),
+                    'hv_iso_mount': t('hvTaskIsoMount'), 'hv_iso_eject': t('hvTaskIsoEject'),
                 };
                 return types[type] || type;
             };
@@ -206,6 +220,7 @@
                                 <div className="flex items-center justify-between p-4 border-b border-proxmox-border bg-proxmox-dark">
                                     <div className="flex items-center gap-3">
                                         <span className={`w-3 h-3 rounded-full ${
+                                            selectedTask.status === 'queued' ? 'bg-yellow-400' :
                                             selectedTask.status === 'running' ? 'bg-blue-500 animate-pulse' :
                                             selectedTask.status === 'failed' || selectedTask.status === 'error' ? 'bg-red-500' :
                                             'bg-green-500'
@@ -229,10 +244,11 @@
                                     <div>
                                         <span className="text-gray-500 block">{t('status')}</span>
                                         <span className={`font-medium ${
+                                            selectedTask.status === 'queued' ? 'text-yellow-400' :
                                             selectedTask.status === 'running' ? 'text-blue-400' :
                                             selectedTask.status === 'failed' || selectedTask.status === 'error' ? 'text-red-400' :
                                             'text-green-400'
-                                        }`}>{selectedTask.status || '-'}</span>
+                                        }`}>{statusLabel(selectedTask.status)}</span>
                                     </div>
                                     <div>
                                         <span className="text-gray-500 block">{t('startTime')}</span>
@@ -277,7 +293,7 @@
                                 </div>
                                 
                                 {/* Actions */}
-                                {selectedTask.status === 'running' && onCancel && (
+                                {selectedTask.status === 'running' && onCancel && selectedTask.cancellable !== false && (
                                     <div className="p-4 border-t border-proxmox-border bg-proxmox-dark">
                                         <button
                                             onClick={() => { onCancel(selectedTask); setSelectedTask(null); }}
@@ -392,11 +408,12 @@
                                             ) : filteredTasks.map((task, idx) => {
                                                 if (!task) return null;
                                                 const isRunning = task.status === 'running';
+                                                const isQueued = task.status === 'queued';
                                                 // NS: a finished PVE task is 'stopped' with the real result in exitstatus
                                                 // ('OK' = success, anything else = failure). #590: failed backups came back
                                                 // as 'stopped' + a non-OK exitstatus and slipped through to the green bucket.
                                                 const _ex = task.exitstatus || '';
-                                                const isFailed = task.status === 'failed' || task.status === 'error' || (!isRunning && _ex && _ex !== 'OK');
+                                                const isFailed = task.status === 'failed' || task.status === 'error' || (!isRunning && !isQueued && _ex && _ex !== 'OK');
                                                 
                                                 return (
                                                     <tr 
@@ -406,6 +423,7 @@
                                                     >
                                                         <td className="px-4 py-2">
                                                             <span className={`inline-block w-2 h-2 rounded-full ${
+                                                                isQueued ? 'bg-yellow-400' :
                                                                 isRunning ? 'bg-blue-500 animate-pulse' :
                                                                 isFailed ? 'bg-red-500' :
                                                                 'bg-green-500'
@@ -428,11 +446,12 @@
                                                         </td>
                                                         <td className="px-4 py-2">
                                                             <span className={`px-2 py-0.5 rounded text-xs ${
+                                                                isQueued ? 'bg-yellow-500/20 text-yellow-400' :
                                                                 isRunning ? 'bg-blue-500/20 text-blue-400' : 
                                                                 isFailed ? 'bg-red-500/20 text-red-400' : 
                                                                 'bg-green-500/20 text-green-400'
                                                             }`}>
-                                                                {task.status || '-'}
+                                                                {statusLabel(task.status)}
                                                             </span>
                                                         </td>
                                                     </tr>
@@ -10675,7 +10694,8 @@
 
             const clearCompletedTasks = () => {
                 taskUpdateTimestamp.current = Date.now();
-                setTasks(prev => prev.filter(item => item && item.status === 'running'));
+                // Fork: a Hyper-V call still waiting for a session is not completed either.
+                setTasks(prev => prev.filter(item => item && (item.status === 'running' || item.status === 'queued')));
             };
 
             // Cancel a running task
@@ -12412,6 +12432,27 @@
                 }, 5000);
                 return () => clearInterval(id);
             }, [selectedHyperV?.id, hypervFreshness?.refreshing]);
+
+            // The calls PegaProx is making to the selected Hyper-V host, in the task bar.
+            //
+            // A cluster gets this from the cluster effect further down, which never runs for
+            // a Hyper-V host because selecting one leaves selectedCluster empty. The SSE
+            // 'tasks' frame for the host arrives through the "all clusters" branch; this is
+            // the initial read and the fallback when SSE is quiet. The list is held in
+            // PegaProx's memory, so polling it costs the host nothing.
+            useEffect(() => {
+                const hostId = selectedHyperV?.id;
+                if (!hostId || selectedCluster) return;
+                taskUpdateTimestamp.current = 0;
+                initialTaskFetchPending.current = true;
+                setTasks([]);
+                fetchTasks(hostId);
+                const id = setInterval(() => {
+                    if (Date.now() - taskUpdateTimestamp.current < 3000) return;
+                    fetchTasks(hostId);
+                }, 5000);
+                return () => clearInterval(id);
+            }, [selectedHyperV?.id, selectedCluster?.id]);
             
             // Watch VM detail via SSE (replaces 10s polling)
             useEffect(() => {
@@ -26608,8 +26649,8 @@
                             onClear={clearCompletedTasks}
                             onClose={() => setShowTaskBar(false)}
                             onCancel={cancelTask}
-                            onRefresh={() => selectedCluster && fetchTasks(selectedCluster.id)}
-                            clusterId={selectedCluster?.id}
+                            onRefresh={() => (selectedCluster || selectedHyperV) && fetchTasks((selectedCluster || selectedHyperV).id)}
+                            clusterId={selectedCluster?.id || selectedHyperV?.id}
                             autoExpandEnabled={user?.taskbar_auto_expand !== false}
                         />
                     )}
