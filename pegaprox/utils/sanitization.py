@@ -216,3 +216,39 @@ def sanitize_log_message(value) -> str:
     return s
 
 
+
+
+def bounded_list(value, max_items=256, max_length=253, dedupe=True, name='list'):
+    """A list that came out of a request body, bounded in both directions.
+
+    Ten endpoints took a list from the caller, checked at most that it WAS a list, and
+    persisted it: fallback hosts, excluded nodes, cluster reorder, affinity-rule members,
+    multipath nodes, PBS cluster links, template metadata, pool members, VM tags. None of
+    them bounded the item count or the item length, so one request could store a million
+    entries of a megabyte each - durably, and then reload them into memory on every start.
+    Duplicates matter too: several of these fan out one request per entry.
+
+    Returns (cleaned, error). `error` is None when it is fine, otherwise a sentence for
+    the 400. MK Sep 2026
+    """
+    if value is None:
+        return [], None
+    if not isinstance(value, (list, tuple)):
+        return None, f'{name} must be a list'
+    if len(value) > max_items:
+        return None, f'{name} accepts at most {max_items} entries ({len(value)} given)'
+    out, seen = [], set()
+    for item in value:
+        if item is None or isinstance(item, (dict, list, tuple, bool)):
+            return None, f'{name} entries must be plain strings or numbers'
+        text = str(item).strip()
+        if not text:
+            continue
+        if len(text) > max_length:
+            return None, f'{name} entries are limited to {max_length} characters'
+        if dedupe:
+            if text in seen:
+                continue
+            seen.add(text)
+        out.append(text)
+    return out, None

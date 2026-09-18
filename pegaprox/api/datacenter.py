@@ -16,6 +16,7 @@ from pegaprox.core.db import get_db
 
 from pegaprox.utils.auth import require_auth
 from pegaprox.utils.audit import log_audit
+from pegaprox.utils.sanitization import bounded_list
 from pegaprox.api.helpers import get_connected_manager, check_cluster_access, safe_error, parse_pve_error, require_unconfined
 from pegaprox.utils.ssh import read_capped as _read_capped
 
@@ -333,7 +334,12 @@ def setup_multipath(cluster_id):
         return error
 
     data = request.json or {}
-    target_nodes = data.get('nodes', [])  # Empty = all nodes
+    # MK Sep 2026 - one multipath.conf push per entry, and duplicates were pushed twice.
+    # Nothing bounded the array, so the request decided how much work the cluster did.
+    target_nodes, _lerr = bounded_list(data.get('nodes'), max_items=256, max_length=253,
+                                       name='nodes')
+    if _lerr:
+        return jsonify({'error': _lerr}), 400
     vendor = data.get('vendor', 'default')  # default, netapp, emc, hpe, pure, dell
     policy = data.get('policy', 'service-time')  # round-robin, service-time, queue-length
     # NS Aug 2026 (Aikido pentest) — policy is interpolated raw into `path_selector "{policy} 0"`

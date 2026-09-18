@@ -12,6 +12,7 @@ from pegaprox.core.db import get_db
 
 from pegaprox.utils.auth import require_auth
 from pegaprox.utils.audit import log_audit
+from pegaprox.utils.sanitization import bounded_list
 from pegaprox.api.helpers import safe_error, check_pbs_access, check_cluster_access, scope_vm_rows, require_unconfined
 from pegaprox.core.pbs import PBSManager, load_pbs_servers, save_pbs_server
 
@@ -2855,7 +2856,13 @@ def auto_attach_pbs_to_clusters(pbs_id):
         return jsonify({'error': 'PBS not found'}), 404
     pbs_mgr = pbs_managers[pbs_id]
     body = request.json or {}
-    cluster_ids = body.get('clusters') or pbs_mgr.linked_clusters or []
+    # MK Sep 2026 - the authz loop below runs once per entry and then does real work per
+    # entry. Unbounded and un-deduped, so the body sized the fan-out.
+    cluster_ids, _lerr = bounded_list(body.get('clusters'), max_items=256, max_length=64,
+                                      name='clusters')
+    if _lerr:
+        return jsonify({'error': _lerr}), 400
+    cluster_ids = cluster_ids or list(pbs_mgr.linked_clusters or [])
     if not cluster_ids:
         return jsonify({'error': 'no clusters specified or linked'}), 400
     # NS Aug 2026 (Aikido 469089213) — this injects the PBS's stored (often root@pam) credentials

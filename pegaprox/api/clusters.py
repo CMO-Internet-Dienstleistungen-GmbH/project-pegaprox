@@ -26,6 +26,7 @@ from pegaprox.utils.realtime import broadcast_sse, broadcast_update, push_immedi
 from pegaprox.core.config import load_config, save_config
 from pegaprox.core.manager import PegaProxManager
 from pegaprox.core.xcpng import XcpngManager, XENAPI_AVAILABLE
+from pegaprox.utils.sanitization import bounded_list
 from pegaprox.api.helpers import (load_server_settings, get_connected_manager, check_cluster_access,
                                   safe_error, scope_vm_rows, require_unconfined, parse_pve_error)
 
@@ -149,7 +150,13 @@ def get_clusters():
             })
 
     # MK: Sort clusters by sort_order first, then by name for consistent ordering
-    clusters.sort(key=lambda c: (c.get('sort_order', 0), c.get('name', '').lower()))
+    # MK Sep 2026 - coerce in the key: rows written before the validation above exist,
+    # and one of them must not be able to 500 the cluster list for everyone.
+    def _order_key(c):
+        v = c.get('sort_order', 0)
+        return (v if isinstance(v, int) and not isinstance(v, bool) else 0,
+                str(c.get('name', '')).lower())
+    clusters.sort(key=_order_key)
 
     return jsonify(clusters)
 
@@ -668,12 +675,26 @@ def reorder_clusters():
     NS: Allows admins to reorder clusters via drag-and-drop in UI
     Request body: { "order": ["cluster_id_1", "cluster_id_2", ...] }
     """
-    data = request.get_json()
-    order = data.get('order', [])
-    
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Body must be an object'}), 400
+    # MK Sep 2026 - this ran one UPDATE per element of a caller-supplied array inside a
+    # single transaction, with nothing bounding the array. And it reordered by id without
+    # asking whose cluster that is; sidebar order is cosmetic, but it is still somebody
+    # else's row.
+    order, _lerr = bounded_list(data.get('order'), max_items=512, max_length=64,
+                                name='order')
+    if _lerr:
+        return jsonify({'error': _lerr}), 400
     if not order:
         return jsonify({'error': 'No order provided'}), 400
-    
+
+    _own = get_user_clusters(build_authz_user(request.session.get('user', ''), request.session))
+    if _own is not None:
+        order = [c for c in order if c in _own]
+        if not order:
+            return jsonify({'error': 'No order provided'}), 400
+
     db = get_db()
     cursor = db.conn.cursor()
     
@@ -703,8 +724,19 @@ def update_cluster_sort_order(cluster_id):
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
 
-    data = request.get_json()
-    sort_order = data.get('sort_order', 0)
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Body must be an object'}), 400
+    # MK Sep 2026 - this went to the DB unchecked, and GET /api/clusters sorts on the
+    # column. One string in one row and the cluster list raises TypeError comparing str
+    # to int - for everybody, durably, until somebody finds the row. bool is excluded on
+    # purpose: it is an int subclass and `True` is not a position.
+    _raw = data.get('sort_order', 0)
+    if isinstance(_raw, bool) or not isinstance(_raw, int):
+        return jsonify({'error': 'sort_order must be an integer'}), 400
+    if not (-100000 <= _raw <= 100000):
+        return jsonify({'error': 'sort_order is out of range'}), 400
+    sort_order = _raw
 
     db = get_db()
     cursor = db.conn.cursor()
@@ -1382,11 +1414,11 @@ def set_excluded_nodes(cluster_id):
     data = request.get_json() or {}
     excluded_nodes = data.get('excluded_nodes', [])
     
-    # Validate it's a list of strings
-    if not isinstance(excluded_nodes, list):
-        return jsonify({'error': 'excluded_nodes must be a list'}), 400
-    
-    excluded_nodes = [str(n) for n in excluded_nodes]  # Ensure strings
+    # same shape as fallback_hosts above: durable, reloaded at start, previously unbounded
+    excluded_nodes, _lerr = bounded_list(excluded_nodes, max_items=512, max_length=253,
+                                         name='excluded_nodes')
+    if _lerr:
+        return jsonify({'error': _lerr}), 400
     
     mgr = cluster_managers[cluster_id]
     mgr.config.excluded_nodes = excluded_nodes
@@ -1726,10 +1758,13 @@ def set_fallback_hosts(cluster_id):
     data = request.get_json() or {}
     fallback_hosts = data.get('fallback_hosts', [])
     
-    if not isinstance(fallback_hosts, list):
-        return jsonify({'error': 'fallback_hosts must be a list'}), 400
-    
-    fallback_hosts = [str(h) for h in fallback_hosts if h]
+    # MK Sep 2026 - the type check was the whole validation, so one request could store
+    # a million entries of a megabyte each. They are durable and get loaded back into
+    # mgr.config on every start.
+    fallback_hosts, _lerr = bounded_list(fallback_hosts, max_items=32, max_length=253,
+                                         name='fallback_hosts')
+    if _lerr:
+        return jsonify({'error': _lerr}), 400
     
     mgr = cluster_managers[cluster_id]
     mgr.config.fallback_hosts = fallback_hosts
