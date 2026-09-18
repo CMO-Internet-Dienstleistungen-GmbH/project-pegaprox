@@ -238,8 +238,10 @@ def test_strict_mode_reaches_the_node_as_a_refusal(driven, monkeypatch):
     (CodeAnt, 18.09.: the first version of this test monkeypatched the helper and then
     asserted a ternary it had written itself, so it exercised nothing.)
     """
-    import pegaprox.utils.ssh_security as sec
-    monkeypatch.setattr(sec, 'strict_host_keys_enabled', lambda: True)
+    # the env var, not the helper: xhm imports the function inside the handler today,
+    # so patching the module happens to work - but that is an implementation detail of
+    # where the import sits, and this is the switch an operator actually flips
+    monkeypatch.setenv('PEGAPROX_SSH_STRICT_HOST_KEYS', '1')
 
     _task, commands = driven(listing=b'')
 
@@ -251,8 +253,7 @@ def test_strict_mode_reaches_the_node_as_a_refusal(driven, monkeypatch):
 def test_without_strict_mode_the_node_still_learns_the_host(driven, monkeypatch):
     """The counterweight: turning strict mode off must keep first-use working, or every
     ESXi migration on a default install stops."""
-    import pegaprox.utils.ssh_security as sec
-    monkeypatch.setattr(sec, 'strict_host_keys_enabled', lambda: False)
+    monkeypatch.delenv('PEGAPROX_SSH_STRICT_HOST_KEYS', raising=False)
 
     _task, commands = driven(listing=b'')
 
@@ -261,8 +262,10 @@ def test_without_strict_mode_the_node_still_learns_the_host(driven, monkeypatch)
 
 def test_both_of_the_nested_commands_carry_it(driven, monkeypatch):
     """The sshfs mount and the scp fallback - missing either leaves a way round."""
-    import pegaprox.utils.ssh_security as sec
-    monkeypatch.setattr(sec, 'strict_host_keys_enabled', lambda: True)
+    # the env var, not the helper: xhm imports the function inside the handler today,
+    # so patching the module happens to work - but that is an implementation detail of
+    # where the import sits, and this is the switch an operator actually flips
+    monkeypatch.setenv('PEGAPROX_SSH_STRICT_HOST_KEYS', '1')
 
     _task, commands = driven(listing=b'')
 
