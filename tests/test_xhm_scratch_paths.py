@@ -250,6 +250,17 @@ def test_strict_mode_reaches_the_node_as_a_refusal(driven, monkeypatch):
     assert set(values) == {'yes'}, values
 
 
+def test_the_mount_path_carries_it_too_not_just_the_fallback(driven, monkeypatch):
+    """The other branch: when the SSHFS mount succeeds the scp fallback never runs, so
+    the mount command has to carry the setting on its own."""
+    monkeypatch.setenv('PEGAPROX_SSH_STRICT_HOST_KEYS', '1')
+
+    _task, commands = driven(listing=b'vm.vmdk\n')      # mount succeeds, no fallback
+
+    assert not [c for c in commands if ' scp ' in c or c.startswith('scp ')]
+    assert _hostkey_values(commands) == ['yes']
+
+
 def test_without_strict_mode_the_node_still_learns_the_host(driven, monkeypatch):
     """The counterweight: turning strict mode off must keep first-use working, or every
     ESXi migration on a default install stops."""
