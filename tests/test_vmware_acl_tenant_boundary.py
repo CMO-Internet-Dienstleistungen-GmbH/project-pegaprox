@@ -106,14 +106,40 @@ def test_an_admin_is_unaffected(estate):
         'vmware.vm.power') is True
 
 
-def test_an_unreadable_acl_store_still_denies_first(estate):
-    """Ordering check: the tenant gate must not be reachable on a failed read."""
+def test_an_unreadable_acl_store_still_denies_first(estate, monkeypatch):
+    """Ordering check: the tenant gate must not be reachable on a failed read.
+
+    (CodeAnt, 18.09.: this used to assign get_vm_acls straight onto the module with a
+    `finally: pass` that restored nothing - the stub then leaked into every test that
+    ran after it in the same process.)"""
     estate(acl_users=('bert',))
-    import pegaprox.utils.rbac as _r
-    snapshot = _r._Snapshot(unavailable=True)
-    _r.get_vm_acls = lambda: snapshot
-    try:
-        assert rbac.user_can_access_vmware_vm(
-            _user('bert', clusters=['cluster_b']), SERVER, VM, 'vmware.vm.view') is False
-    finally:
-        pass
+    monkeypatch.setattr(rbac, 'get_vm_acls', lambda: rbac._Snapshot(unavailable=True))
+
+    assert rbac.user_can_access_vmware_vm(
+        _user('bert', clusters=['cluster_b']), SERVER, VM, 'vmware.vm.view') is False
+
+
+def test_the_tenant_gate_denies_when_it_cannot_run(estate, monkeypatch):
+    """CodeAnt, 18.09.: the gate used to log its own error and carry on. While it only
+    guarded the no-ACL fallback that merely reopened the older hole; now that it guards
+    the ACL path too, swallowing an exception skips exactly the cross-tenant check this
+    function exists for."""
+    estate(acl_users=('ann',))
+
+    def _boom(user, include_pools=True):
+        raise RuntimeError('tenant lookup exploded')
+    monkeypatch.setattr(rbac, 'get_user_clusters', _boom)
+
+    assert rbac.user_can_access_vmware_vm(
+        _user('ann', clusters=['cluster_a']), SERVER, VM, 'vmware.vm.power') is False
+
+
+def test_an_admin_is_still_answered_before_the_gate_can_fail(estate, monkeypatch):
+    """Failing closed must not lock out whoever has to go and fix it."""
+    estate(acl_users=('ann',))
+    monkeypatch.setattr(rbac, 'get_user_clusters',
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError('boom')))
+
+    assert rbac.user_can_access_vmware_vm(
+        _user('root', all_clusters=True, role=rbac.ROLE_ADMIN), SERVER, VM,
+        'vmware.vm.power') is True

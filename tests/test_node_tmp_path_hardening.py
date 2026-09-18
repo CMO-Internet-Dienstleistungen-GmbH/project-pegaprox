@@ -206,16 +206,18 @@ def test_a_settings_delegate_cannot_choose_the_repository_either(api, starlvm_es
     assert resp[1] == 403
 
 
-def test_the_default_repository_stays_open_to_the_delegate(api, starlvm_estate):
+def test_the_default_repository_stays_open_to_the_delegate(api, starlvm_estate, monkeypatch):
     """The counterweight: installing the plugin is the point of the permission.
 
-    It runs on to the real SSH path against a fake manager and dies there, which is
-    fine - what matters is that it got past the gate rather than stopping at 403.
-    """
+    (CodeAnt, 18.09.: this used to wrap the call in `except Exception: return`, which
+    passes on ANY failure - the test could not go red again. Stub the node enumeration
+    instead so the handler gives a real answer past the gate.)"""
+    import pegaprox.api.nodes as _n
+    monkeypatch.setattr(_n, '_cluster_node_names', lambda mgr: [])
+
     with _install_ctx(api, {'user': 'deleg', 'role': 'user'}, {}):
-        try:
-            resp = _install_handler()('cluster_1')
-        except Exception:
-            return          # reached the transport, so the gate let it through
-    status = resp[1] if isinstance(resp, tuple) else resp.status_code
-    assert status != 403, resp
+        resp = _install_handler()('cluster_1')
+
+    # 404 "No nodes found" is past the permission gate, which is the whole point here
+    assert resp[1] == 404, resp
+    assert 'No nodes found' in resp[0].get_json()['error']

@@ -1264,21 +1264,27 @@ def user_can_access_vmware_vm(user: dict, vmware_id: str, vm_id: str, permission
     # WITHIN a tenant's estate, never a way into somebody else's. Mirrors check_pbs_access: admin
     # already returned above; an unlinked server stays backward-compat open; otherwise the caller
     # must reach one of the server's linked clusters.
+    # MK Sep 2026 (CodeAnt, same day) - this used to log the error and carry on. While the
+    # gate only guarded the no-ACL fallback that merely reopened the older hole; now that it
+    # guards the ACL path too, an exception here skips exactly the cross-tenant check this
+    # function exists for. A gate that cannot run has not said yes. Matches the ACL-store
+    # check a few lines above, which already denies when it cannot read.
     try:
         from pegaprox.globals import vmware_managers
         _mgr = vmware_managers.get(vmware_id)
         _linked = (getattr(_mgr, 'linked_clusters', None) or []) if _mgr else []
-        if _linked:
-            # include_pools=False: a Proxmox POOL grant says nothing about the ESXi guests on a
-            # server that happens to be linked to that cluster, and the default (True) let a
-            # pool-scoped caller through. Tenant ownership is the right question here.
-            _uc = get_user_clusters(user, include_pools=False)   # None => all (admin/default tenant)
-            if _uc is not None and not any(c in _uc for c in _linked):
-                logging.debug(f"[VMWARE-ACL] {username} cannot reach any linked cluster of "
-                              f"{vmware_id} - deny {permission}")
-                return False
+        # include_pools=False: a Proxmox POOL grant says nothing about the ESXi guests on a
+        # server that happens to be linked to that cluster, and the default (True) let a
+        # pool-scoped caller through. Tenant ownership is the right question here.
+        _uc = get_user_clusters(user, include_pools=False) if _linked else None
     except Exception as _e:
-        logging.error(f"[VMWARE-ACL] tenant-gate error for {vmware_id}: {_e}")
+        logging.error(f"[VMWARE-ACL] tenant gate could not run for {vmware_id}, denying "
+                      f"{permission} for '{username}': {_e}")
+        return False
+    if _linked and _uc is not None and not any(c in _uc for c in _linked):
+        logging.debug(f"[VMWARE-ACL] {username} cannot reach any linked cluster of "
+                      f"{vmware_id} - deny {permission}")
+        return False
 
     # VMware ACLs are stored under vmware_id as the cluster key
     vmware_acls = acls.get(f'vmware:{vmware_id}', {})

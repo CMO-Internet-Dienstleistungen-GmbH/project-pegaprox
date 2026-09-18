@@ -577,12 +577,17 @@ def deploy(cluster_id):
         _cerr = _runc(cluster_id)
         if _cerr:
             return _cerr
+        # CodeAnt, same day: erring open here would undo the paragraph above. The range is
+        # the boundary that stops two tenants colliding on an id, and a check that could not
+        # run has not cleared anything - refuse and say why, rather than deploy and find out
+        # at restore time.
         try:
             from pegaprox.utils.rbac import check_tenant_vmid, DEFAULT_TENANT_ID as _DT
             _rok, _rmsg = check_tenant_vmid(_caller.get('tenant_id') or _DT, vmid)
         except Exception as _re:
-            logging.debug(f"[vmid-range] template deploy pre-flight skipped: {_re}")
-            _rok, _rmsg = True, ''
+            logging.error(f"[vmid-range] template deploy: range check failed, refusing: {_re}")
+            _rok, _rmsg = False, ('Cannot verify the tenant VMID range right now - '
+                                  'check the server logs')
         if not _rok:
             return jsonify({'error': _rmsg}), 403
 

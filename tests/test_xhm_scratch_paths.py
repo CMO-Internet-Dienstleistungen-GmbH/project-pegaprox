@@ -222,3 +222,50 @@ def test_the_local_conversion_directory_is_created_private(monkeypatch):
         m = re.search(rf'{var} = f"([^"]+)"', body)
         assert m, var
         assert m.group(1).startswith('{task.scratch}/'), (var, m.group(1))
+
+
+# --- the host-key policy the operator configured -----------------------------------
+
+def _hostkey_values(commands):
+    return re.findall(r'StrictHostKeyChecking=([A-Za-z-]+)', ' '.join(commands))
+
+
+def test_strict_mode_reaches_the_node_as_a_refusal(driven, monkeypatch):
+    """These two commands run on the PVE node and reach the ESXi host from there, so the
+    setting has to travel with them. They were hardcoded to accept-new, which is
+    trust-on-first-use - the one thing strict mode exists to switch off.
+
+    (CodeAnt, 18.09.: the first version of this test monkeypatched the helper and then
+    asserted a ternary it had written itself, so it exercised nothing.)
+    """
+    import pegaprox.utils.ssh_security as sec
+    monkeypatch.setattr(sec, 'strict_host_keys_enabled', lambda: True)
+
+    _task, commands = driven(listing=b'')
+
+    values = _hostkey_values(commands)
+    assert values, 'no ssh command carried a host-key option at all'
+    assert set(values) == {'yes'}, values
+
+
+def test_without_strict_mode_the_node_still_learns_the_host(driven, monkeypatch):
+    """The counterweight: turning strict mode off must keep first-use working, or every
+    ESXi migration on a default install stops."""
+    import pegaprox.utils.ssh_security as sec
+    monkeypatch.setattr(sec, 'strict_host_keys_enabled', lambda: False)
+
+    _task, commands = driven(listing=b'')
+
+    assert set(_hostkey_values(commands)) == {'accept-new'}
+
+
+def test_both_of_the_nested_commands_carry_it(driven, monkeypatch):
+    """The sshfs mount and the scp fallback - missing either leaves a way round."""
+    import pegaprox.utils.ssh_security as sec
+    monkeypatch.setattr(sec, 'strict_host_keys_enabled', lambda: True)
+
+    _task, commands = driven(listing=b'')
+
+    assert len([c for c in commands if 'sshfs' in c]) == 1
+    assert len([c for c in commands if ' scp ' in c or c.startswith('scp ')]) >= 1
+    assert len(_hostkey_values(commands)) == 2

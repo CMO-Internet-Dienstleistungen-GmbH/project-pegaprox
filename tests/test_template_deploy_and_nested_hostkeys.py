@@ -92,6 +92,22 @@ def test_a_tenant_operator_deploys_inside_their_range(api, estate):
     assert resp.get_json()['vmid'] == 250
 
 
+def test_a_range_check_that_cannot_run_refuses_the_deploy(api, estate, monkeypatch):
+    """CodeAnt, 18.09.: the except around check_tenant_vmid set (True, '') and deployed
+    anyway, which undoes the guard above it. The range is what stops two tenants landing
+    on the same id; a check that could not run has not cleared anything."""
+    estate.user('bob', role='user', tenant_id='tenant_a', permissions=['vm.create'])
+    import pegaprox.utils.rbac as _rbac
+    monkeypatch.setattr(_rbac, 'check_tenant_vmid',
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError('db gone')))
+
+    with _ctx(api, {'user': 'bob', 'role': 'user'}, _body(vmid=250)):
+        resp = _handler('deploy')('cluster_1')
+
+    assert resp[1] == 403
+    assert 'VMID range' in resp[0].get_json()['error']
+
+
 def test_a_global_admin_is_not_held_to_a_tenant_range(api, estate):
     estate.user('root7', role='admin')
 
@@ -117,11 +133,6 @@ def test_both_nested_commands_use_the_resolved_value():
     assert len(re.findall(r'StrictHostKeyChecking=\{_hk\}', body)) == 2, body.count('StrictHost')
 
 
-def test_strict_mode_turns_into_a_refusal_not_a_first_use(monkeypatch):
-    """What the operator switched on has to be what reaches the node."""
-    import pegaprox.utils.ssh_security as sec
-
-    monkeypatch.setattr(sec, 'strict_host_keys_enabled', lambda: True)
-    assert ('yes' if sec.strict_host_keys_enabled() else 'accept-new') == 'yes'
-    monkeypatch.setattr(sec, 'strict_host_keys_enabled', lambda: False)
-    assert ('yes' if sec.strict_host_keys_enabled() else 'accept-new') == 'accept-new'
+# The behavioural half of this - what StrictHostKeyChecking value actually reaches the
+# node under each setting - lives in test_xhm_scratch_paths.py, where the recording-SSH
+# harness for _run_esxi_to_pve already is.
