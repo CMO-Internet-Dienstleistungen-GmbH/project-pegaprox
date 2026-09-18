@@ -19,6 +19,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from pegaprox.core.db import get_db
 from pegaprox.globals import pbs_managers
+from pegaprox.utils.ssh import read_capped as _read_capped
 
 def _validate_pbs_host(host: str) -> bool:
     """Format-only check on the PBS host string.
@@ -424,7 +425,7 @@ class PBSManager:
 
             # are we root?
             stdin, stdout, _ = ssh.exec_command('id -u')
-            uid = stdout.read().decode().strip()
+            uid = _read_capped(stdout).strip()
             sudo = '' if uid == '0' else 'sudo '
 
             # apt update
@@ -432,8 +433,8 @@ class PBSManager:
             task.add_output("Running apt update...")
             stdin, stdout, stderr = ssh.exec_command(f'{sudo}DEBIAN_FRONTEND=noninteractive apt-get update')
             rc = stdout.channel.recv_exit_status()
-            out = stdout.read().decode('utf-8', errors='replace')
-            err = stderr.read().decode('utf-8', errors='replace')
+            out = _read_capped(stdout)
+            err = _read_capped(stderr)
             if rc != 0:
                 raise Exception(f"apt update failed (rc={rc}): {err or out[:300]}")
             task.add_output("[OK] apt update successful")
@@ -445,8 +446,8 @@ class PBSManager:
                    f'-o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"')
             stdin, stdout, stderr = ssh.exec_command(cmd, timeout=1800)
             rc = stdout.channel.recv_exit_status()
-            out = stdout.read().decode('utf-8', errors='replace')
-            err = stderr.read().decode('utf-8', errors='replace')
+            out = _read_capped(stdout)
+            err = _read_capped(stderr)
             if rc != 0:
                 raise Exception(f"dist-upgrade failed (rc={rc}): {err[:400] or out[:400]}")
             # crude counter

@@ -54,6 +54,7 @@ from pegaprox.utils.realtime import broadcast_sse, is_cluster_watched
 from pegaprox.utils.ssh import get_ssh_connection_stats, _ssh_track_connection
 from pegaprox.utils.concurrent import GEVENT_PATCHED
 from pegaprox.core.db import get_db
+from pegaprox.utils.ssh import read_capped as _read_capped
 
 # Lazy paramiko import
 def get_paramiko():
@@ -8947,7 +8948,7 @@ echo "AGENT_INSTALLED_OK"
             exit_code = stdout.channel.recv_exit_status()
             
             # Also capture any stderr
-            stderr_output = stderr.read().decode('utf-8').strip()
+            stderr_output = _read_capped(stderr).strip()
             if stderr_output and task:
                 for line in stderr_output.split('\n'):
                     if line.strip():
@@ -9075,7 +9076,7 @@ echo "AGENT_INSTALLED_OK"
             
             # Check if we're root (common on Proxmox) - if so, no sudo needed
             stdin, stdout, stderr = ssh.exec_command('id -u')
-            uid = stdout.read().decode().strip()
+            uid = _read_capped(stdout).strip()
             sudo_prefix = '' if uid == '0' else 'sudo '
             
             if uid == '0':
@@ -9144,7 +9145,7 @@ echo "AGENT_INSTALLED_OK"
                     try:
                         # Check if root
                         stdin, stdout, stderr = ssh.exec_command('id -u')
-                        uid = stdout.read().decode().strip()
+                        uid = _read_capped(stdout).strip()
                         is_root = (uid == '0')
 
                         # Check if related node requires a reboot

@@ -19,6 +19,7 @@ from pegaprox.core.db import get_db
 
 from pegaprox.utils.auth import require_auth, load_users, verify_password
 from pegaprox.utils.audit import log_audit
+from pegaprox.utils.ssh import read_capped as _read_capped
 from pegaprox.api.helpers import check_cluster_access, safe_error, scope_vm_rows, caller_is_scoped, require_unconfined
 
 bp = Blueprint('nodes', __name__)
@@ -1239,7 +1240,7 @@ def _ssh_sudo_prefix(ssh):
         return cached
     try:
         stdin, stdout, _ = ssh.exec_command('id -u', timeout=10)
-        uid = stdout.read().decode().strip()
+        uid = _read_capped(stdout).strip()
         prefix = '' if uid == '0' else 'sudo -n '
     except Exception:
         prefix = ''
@@ -1270,9 +1271,9 @@ def _ssh_run_script(ssh, script, timeout=180):
     runner = 'sudo -n bash' if prefix else 'bash'
     full = f"echo {enc} | base64 -d | {runner}"
     stdin, stdout, stderr = ssh.exec_command(full, timeout=timeout)
-    out = stdout.read().decode('utf-8', errors='replace')
+    out = _read_capped(stdout)
     rc = stdout.channel.recv_exit_status()
-    err = stderr.read().decode('utf-8', errors='replace').strip()
+    err = _read_capped(stderr).strip()
     if rc != 0:
         raise RuntimeError(f"script failed (rc={rc}): {err or out[:200] or 'no output'}")
     return out, err
@@ -1293,9 +1294,9 @@ def _ssh_run_checked(ssh, cmd, timeout=30):
     else:
         full = f"{prefix}{cmd}"
     stdin, stdout, stderr = ssh.exec_command(full, timeout=timeout)
-    out = stdout.read().decode('utf-8', errors='replace')
+    out = _read_capped(stdout)
     rc = stdout.channel.recv_exit_status()
-    err = stderr.read().decode('utf-8', errors='replace').strip()
+    err = _read_capped(stderr).strip()
     if rc != 0:
         raise RuntimeError(f"`{cmd}` failed (rc={rc}): {err or out[:200] or 'no output'}")
     return out, err
@@ -1321,7 +1322,7 @@ def _ssh_write_file(ssh, path, content, mode=None):
     stdin, stdout, stderr = ssh.exec_command(f"{prefix}mkdir -p {q_parent}")
     rc = stdout.channel.recv_exit_status()
     if rc != 0:
-        err = stderr.read().decode('utf-8', errors='replace').strip()
+        err = _read_capped(stderr).strip()
         raise RuntimeError(f"mkdir -p {parent} failed (rc={rc}): {err or 'permission denied?'}")
 
     if not prefix:
@@ -1340,7 +1341,7 @@ def _ssh_write_file(ssh, path, content, mode=None):
             stdin.channel.shutdown_write()
             rc = stdout.channel.recv_exit_status()
             if rc != 0:
-                err = stderr.read().decode('utf-8', errors='replace').strip()
+                err = _read_capped(stderr).strip()
                 raise RuntimeError(f"write {path} failed (rc={rc}): {err or 'unknown'}")
             if mode is not None:
                 _ssh_run_checked(ssh, f"chmod {oct(mode)[2:]} {q_path}")
@@ -1368,7 +1369,7 @@ def _ssh_write_file(ssh, path, content, mode=None):
         stdin, stdout, stderr = ssh.exec_command(mv_cmd)
         rc = stdout.channel.recv_exit_status()
         if rc != 0:
-            err = stderr.read().decode('utf-8', errors='replace').strip()
+            err = _read_capped(stderr).strip()
             # best-effort cleanup so /tmp doesn't stay littered on failure
             try: ssh.exec_command(f"rm -f {q_tmp}")
             except Exception: pass
@@ -1688,16 +1689,16 @@ def get_smbios_autoconfig_status(cluster_id, node):
         
         # Check if script exists
         stdin, stdout, stderr = ssh.exec_command('test -f /opt/pegaprox-smbios-autoconfig.py && echo exists')
-        installed = 'exists' in stdout.read().decode()
+        installed = 'exists' in _read_capped(stdout)
         
         # Check if service is running
         stdin, stdout, stderr = ssh.exec_command('systemctl is-active pegaprox-smbios-autoconfig 2>/dev/null || echo inactive')
-        status = stdout.read().decode().strip()
+        status = _read_capped(stdout).strip()
         running = status == 'active'
         
         # Get last log entries
         stdin, stdout, stderr = ssh.exec_command('tail -5 /var/log/pegaprox-smbios.log 2>/dev/null || echo "No logs yet"')
-        logs = stdout.read().decode().strip()
+        logs = _read_capped(stdout).strip()
         
         ssh.close()
         
@@ -1770,12 +1771,12 @@ def deploy_smbios_autoconfig(cluster_id, node):
 
         # confirm it actually became active (systemctl start/restart can succeed even when unit fails)
         stdin, stdout, stderr = ssh.exec_command('systemctl is-active pegaprox-smbios-autoconfig')
-        active = stdout.read().decode('utf-8', errors='replace').strip()
+        active = _read_capped(stdout).strip()
         stdout.channel.recv_exit_status()
         if active != 'active':
             # grab last log lines for context
             stdin, stdout, stderr = ssh.exec_command('journalctl -u pegaprox-smbios-autoconfig -n 10 --no-pager 2>/dev/null | tail -10')
-            log_tail = stdout.read().decode('utf-8', errors='replace').strip()
+            log_tail = _read_capped(stdout).strip()
             raise RuntimeError(f"service not active (state={active}). Last log: {log_tail[:400]}")
 
         usr = getattr(request, 'session', {}).get('user', 'system')
@@ -1964,11 +1965,11 @@ def get_smbios_autoconfig_status_all(cluster_id):
                 try:
                     # Check if script exists
                     stdin, stdout, stderr = ssh.exec_command('test -f /opt/pegaprox-smbios-autoconfig.py && echo exists')
-                    installed = 'exists' in stdout.read().decode()
+                    installed = 'exists' in _read_capped(stdout)
                     
                     # Check if service is running
                     stdin, stdout, stderr = ssh.exec_command('systemctl is-active pegaprox-smbios-autoconfig 2>/dev/null || echo inactive')
-                    status = stdout.read().decode().strip()
+                    status = _read_capped(stdout).strip()
                     running = status == 'active'
                     
                     results[node_name] = {
@@ -2072,7 +2073,7 @@ def deploy_smbios_autoconfig_all(cluster_id):
 
             # verify active
             stdin, stdout, stderr = ssh.exec_command('systemctl is-active pegaprox-smbios-autoconfig')
-            active = stdout.read().decode('utf-8', errors='replace').strip()
+            active = _read_capped(stdout).strip()
             stdout.channel.recv_exit_status()
             if active != 'active':
                 raise RuntimeError(f"service not active (state={active})")
@@ -2754,7 +2755,7 @@ def run_custom_script(cluster_id, script_id):
             sftp.close()
 
             stdin, stdout, stderr = ssh.exec_command(f'{interpreter} {script_path} 2>&1', timeout=300)
-            output = stdout.read().decode('utf-8', errors='replace')
+            output = _read_capped(stdout)
             exit_code = stdout.channel.recv_exit_status()
 
             ssh.exec_command(f'rm -f {script_path}')

@@ -63,6 +63,7 @@ VNC_PVE_CONNECT_TIMEOUT = int(os.environ.get('PEGAPROX_VNC_CONNECT_TIMEOUT', '15
 # offloaded PVE socket calls burn VNC_PVE_CONNECT_TIMEOUT instead of connecting. Route to_thread
 # through gevent once, process-wide; no-op when gevent isn't patched in (e.g. under pytest).
 from pegaprox.utils.concurrent import install_gevent_to_thread, gevent_listen_socket
+from pegaprox.utils.ssh import read_capped as _read_capped
 install_gevent_to_thread()
 
 
@@ -2672,17 +2673,17 @@ def test_node_connection(cluster_id):
 
         # Get hostname
         stdin, stdout, stderr = ssh.exec_command('hostname')
-        hostname = stdout.read().decode().strip()
+        hostname = _read_capped(stdout).strip()
         
         # Check if Proxmox is installed
         stdin, stdout, stderr = ssh.exec_command('pveversion 2>/dev/null || echo "NOT_INSTALLED"')
-        pve_output = stdout.read().decode().strip()
+        pve_output = _read_capped(stdout).strip()
         proxmox_installed = 'NOT_INSTALLED' not in pve_output
         proxmox_version = pve_output if proxmox_installed else None
         
         # Check if already in a cluster
         stdin, stdout, stderr = ssh.exec_command('pvecm status 2>/dev/null || echo "NO_CLUSTER"')
-        cluster_output = stdout.read().decode().strip()
+        cluster_output = _read_capped(stdout).strip()
         already_in_cluster = 'NO_CLUSTER' not in cluster_output and 'Cluster information' in cluster_output
         
         current_cluster = None
@@ -2702,7 +2703,7 @@ def test_node_connection(cluster_id):
             'ls /etc/pve/corosync.conf 2>/dev/null && echo HAS_PVE_COROSYNC; '
             'ls /etc/pve/nodes/ 2>/dev/null | wc -l'
         )
-        orphan_output = stdout.read().decode().strip()
+        orphan_output = _read_capped(stdout).strip()
         has_old_config = 'HAS_AUTHKEY' in orphan_output or 'HAS_COROSYNC' in orphan_output or 'HAS_PVE_COROSYNC' in orphan_output
         
         # Check if /etc/pve/nodes/ has dirs for other nodes (leftover from old cluster)
@@ -3200,8 +3201,8 @@ def remove_node_from_cluster(cluster_id, node_name):
         stdin, stdout, stderr = ssh.exec_command(cmd, timeout=60)
         
         exit_code = stdout.channel.recv_exit_status()
-        stdout_text = stdout.read().decode('utf-8', errors='ignore')
-        stderr_text = stderr.read().decode('utf-8', errors='ignore')
+        stdout_text = _read_capped(stdout)
+        stderr_text = _read_capped(stderr)
         
         ssh.close()
         
@@ -3256,7 +3257,7 @@ def remove_node_from_cluster(cluster_id, node_name):
                 if cleanup_connected:
                     # SAFETY CHECK: Verify we're on the correct node before wiping config!
                     stdin, stdout, stderr = ssh_cleanup.exec_command('hostname', timeout=10)
-                    actual_hostname = stdout.read().decode().strip()
+                    actual_hostname = _read_capped(stdout).strip()
                     
                     # LW: Case-insensitive compare - Proxmox uses lowercase node names
                     # but hostname might be "Pve1" while node_name is "pve1"
@@ -3442,7 +3443,7 @@ def node_action_api(cluster_id, node_name, action):
         try:
             # Check if we're already root (common on Proxmox)
             stdin, stdout, stderr = ssh.exec_command('id -u')
-            uid = stdout.read().decode().strip()
+            uid = _read_capped(stdout).strip()
             is_root = (uid == '0')
             
             # Always use PTY for reliable execution

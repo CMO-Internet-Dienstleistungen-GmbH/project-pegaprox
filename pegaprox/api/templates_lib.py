@@ -34,6 +34,7 @@ from pegaprox.globals import cluster_managers
 from pegaprox.utils.auth import require_auth
 from pegaprox.api.helpers import check_cluster_access, scope_vm_rows
 from pegaprox.core.db import get_db
+from pegaprox.utils.ssh import read_capped as _read_capped
 
 bp = Blueprint('templates_lib', __name__)
 
@@ -295,8 +296,8 @@ def _run_deploy(dep_id, cluster_id, node, template_id, storage, vmid, vm_name):
             _update_dep(dep_id, log_append=f"$ {cmd}")
             stdin, stdout, stderr = ssh.exec_command(cmd, get_pty=False, timeout=900)
             rc = stdout.channel.recv_exit_status()
-            out = stdout.read().decode('utf-8', errors='replace').strip()
-            err = stderr.read().decode('utf-8', errors='replace').strip()
+            out = _read_capped(stdout).strip()
+            err = _read_capped(stderr).strip()
             if out:
                 _update_dep(dep_id, log_append=out[:1000])
             if err and rc != 0:

@@ -20,6 +20,7 @@ from pegaprox.constants import LOG_DIR
 from pegaprox import globals as _g
 from pegaprox.core.db import get_db
 from pegaprox.utils.realtime import broadcast_sse
+from pegaprox.utils.ssh import read_capped as _read_capped
 
 # XenAPI is optional - only needed for XCP-ng clusters
 try:
@@ -3168,8 +3169,8 @@ class XcpngManager:
         try:
             _, stdout, stderr = ssh.exec_command(cmd, timeout=timeout)
             rc = stdout.channel.recv_exit_status()
-            out = stdout.read().decode('utf-8', errors='replace')
-            err = stderr.read().decode('utf-8', errors='replace')
+            out = _read_capped(stdout)
+            err = _read_capped(stderr)
             return rc, out, err
         except Exception as e:
             return -1, '', str(e)
@@ -3583,7 +3584,7 @@ class XcpngManager:
             task.add_output("Running yum update -y ...")
             _, stdout, stderr = ssh.exec_command("yum update -y 2>&1", timeout=600)
             rc = stdout.channel.recv_exit_status()
-            output = stdout.read().decode('utf-8', errors='replace')
+            output = _read_capped(stdout)
 
             pkg_count = 0
             for line in output.splitlines():

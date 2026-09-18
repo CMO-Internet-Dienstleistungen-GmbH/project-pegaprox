@@ -26,6 +26,7 @@ from pegaprox.core.cache import APIRateLimiter, StorageDataCache
 from pegaprox.api.helpers import get_connected_manager, check_cluster_access, safe_error, parse_pve_error, scope_vm_rows, require_unconfined
 from pegaprox.utils.ssh import get_paramiko, _ssh_track_connection
 from pegaprox import globals as _g
+from pegaprox.utils.ssh import read_capped as _read_capped
 
 bp = Blueprint('storage', __name__)
 
@@ -1856,7 +1857,7 @@ def rescan_storage(cluster_id, storage_id):
                                         'else echo "no_multipath"; fi',
                                         timeout=30
                                     )
-                                    mp_output = stdout.read().decode().strip()
+                                    mp_output = _read_capped(stdout).strip()
                                     mp_exit_code = stdout.channel.recv_exit_status()
                                     if mp_output != "no_multipath":
                                         node_result['actions'].append({
@@ -1875,7 +1876,7 @@ def rescan_storage(cluster_id, storage_id):
                                         'else echo "no_multipath"; fi',
                                         timeout=60
                                     )
-                                    resize_output = stdout.read().decode().strip()
+                                    resize_output = _read_capped(stdout).strip()
                                     resize_exit_code = stdout.channel.recv_exit_status()
                                     if resize_output != "no_multipath":
                                         node_result['actions'].append({
@@ -1894,7 +1895,7 @@ def rescan_storage(cluster_id, storage_id):
                                         f'pvs --noheadings -o pv_name -S vgname={shlex.quote(vgname)} 2>/dev/null | xargs -r -n1 pvresize 2>&1',
                                         timeout=60
                                     )
-                                    output = stdout.read().decode()
+                                    output = _read_capped(stdout)
                                     exit_code = stdout.channel.recv_exit_status()
                                     node_result['actions'].append({
                                         'action': 'pvresize',

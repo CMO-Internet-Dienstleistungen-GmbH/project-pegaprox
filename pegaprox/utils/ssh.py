@@ -73,6 +73,47 @@ task_pegaprox_users_cache = {}  # In-memory cache for fast lookups
 task_pegaprox_users_lock = threading.Lock()
 TASK_USER_CACHE_TTL = 86400  # Keep for 24 hours (in DB, will be cleaned on startup)
 
+# MK Sep 2026 - a managed node answers over a channel we do not get to bound. `read()`
+# on a paramiko ChannelFile reads to EOF, so one runaway command, one enormous log, or
+# one node somebody else controls takes the hub's memory with it - and this copies on a
+# greenlet that yields to nobody while it runs. 8 MB is far past anything a legitimate
+# command here produces (the biggest are apt logs, a few hundred KB).
+_SSH_OUTPUT_CAP = max(1, int(os.environ.get('PEGAPROX_SSH_OUTPUT_MB', '8') or 8)) * 1024 * 1024
+_SSH_DRAIN_FACTOR = 10          # keep draining past the cap so the far end is not wedged
+
+
+def read_capped(fh, limit=None):
+    """Read a paramiko channel file into a str, bounded.
+
+    Past the cap the content is dropped but the channel keeps being drained, so the
+    remote is not left blocked writing into a full pipe and recv_exit_status() still
+    comes back. At limit*_SSH_DRAIN_FACTOR the command is pathological rather than
+    chatty and we stop; the channel timeout bounds the wall clock either way.
+    Returns the text with a marker appended when anything was dropped.
+    """
+    limit = _SSH_OUTPUT_CAP if limit is None else limit
+    chunks, kept, seen = [], 0, 0
+    hard = limit * _SSH_DRAIN_FACTOR
+    while True:
+        try:
+            block = fh.read(65536)
+        except Exception:
+            break
+        if not block:
+            break
+        seen += len(block)
+        if kept < limit:
+            take = block[:limit - kept]
+            chunks.append(take)
+            kept += len(take)
+        if seen >= hard:
+            break
+    out = b''.join(chunks).decode('utf-8', errors='replace')
+    if seen > kept:
+        out += f"\n[... output truncated at {kept} of {seen}+ bytes ...]"
+    return out
+
+
 def _ssh_exec(host, user, password, cmd, timeout=30, use_controlmaster=False,
               connect_timeout=8):
     """Execute command on remote host via SSH.
@@ -260,8 +301,8 @@ def _ssh_exec(host, user, password, cmd, timeout=30, use_controlmaster=False,
         # Execute command
         try:
             stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
-            out = stdout.read().decode('utf-8', errors='replace')
-            err = stderr.read().decode('utf-8', errors='replace')
+            out = read_capped(stdout)
+            err = read_capped(stderr)
             rc = stdout.channel.recv_exit_status()
             client.close()
             return rc, out, err

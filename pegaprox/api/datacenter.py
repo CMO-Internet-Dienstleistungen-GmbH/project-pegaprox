@@ -17,6 +17,7 @@ from pegaprox.core.db import get_db
 from pegaprox.utils.auth import require_auth
 from pegaprox.utils.audit import log_audit
 from pegaprox.api.helpers import get_connected_manager, check_cluster_access, safe_error, parse_pve_error, require_unconfined
+from pegaprox.utils.ssh import read_capped as _read_capped
 
 bp = Blueprint('datacenter', __name__)
 
@@ -129,7 +130,7 @@ def _get_node_multipath_data(manager, node):
         def ssh_run(command, timeout=15):
             try:
                 stdin, stdout, stderr = ssh.exec_command(command, timeout=timeout)
-                return stdout.read().decode('utf-8', errors='replace')
+                return _read_capped(stdout)
             except Exception as e:
                 logging.debug(f"[Multipath] exec failed on {node}: {e}")
                 return None
@@ -389,8 +390,8 @@ def setup_multipath(cluster_id):
                 def _exec(cmd, timeout=30):
                     """Run command, return (rc, stdout, stderr)"""
                     stdin, stdout, stderr = ssh.exec_command(cmd, timeout=timeout)
-                    out = stdout.read().decode('utf-8', errors='replace')
-                    err = stderr.read().decode('utf-8', errors='replace')
+                    out = _read_capped(stdout)
+                    err = _read_capped(stderr)
                     rc = stdout.channel.recv_exit_status()
                     return rc, out, err
 
@@ -674,8 +675,8 @@ def reconfigure_multipath(cluster_id, node):
 
         # Reconfigure multipath
         stdin, stdout, stderr = ssh.exec_command('multipathd reconfigure && sleep 2 && multipath -ll', timeout=60)
-        out = stdout.read().decode('utf-8', errors='replace')
-        err = stderr.read().decode('utf-8', errors='replace')
+        out = _read_capped(stdout)
+        err = _read_capped(stderr)
         rc = stdout.channel.recv_exit_status()
 
         user = getattr(request, 'session', {}).get('user', 'system')
@@ -835,8 +836,8 @@ def login_iscsi_target(cluster_id, node):
 
         def _exec(cmd, timeout=30):
             stdin, stdout, stderr = ssh.exec_command(cmd, timeout=timeout)
-            out = stdout.read().decode('utf-8', errors='replace')
-            err = stderr.read().decode('utf-8', errors='replace')
+            out = _read_capped(stdout)
+            err = _read_capped(stderr)
             rc = stdout.channel.recv_exit_status()
             return rc, out, err
 
