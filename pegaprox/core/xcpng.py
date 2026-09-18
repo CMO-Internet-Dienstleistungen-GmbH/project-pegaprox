@@ -888,12 +888,22 @@ class XcpngManager:
 
             api.VM.destroy(ref)
 
-            # cleanup vmid mapping
+            # MK Sep 2026 - retire the mapping instead of deleting it. The allocator
+            # takes MAX(vmid)+1 from this very table, so removing the row lowers the
+            # high-water mark and hands the id straight to the next VM created here.
+            # Anything still pointing at it - a VM-ACL row, a pool grant, a scheduled
+            # action - would then apply to a completely different guest, possibly
+            # another tenant's. Blanking the uuid keeps the id spent: the lookup by
+            # uuid never matches a retired row, and resolve returns nothing for it.
             db = get_db()
-            cursor = db.conn.cursor()
-            cursor.execute('DELETE FROM xcpng_vmid_map WHERE cluster_id = ? AND vmid = ?',
-                          (self.id, int(vmid)))
-            db.conn.commit()
+            db.xcpng_retire_vmid(self.id, int(vmid))
+
+            # and drop what pointed at it, so nothing is left to inherit even if the
+            # id is somehow reused by a path we have not thought of
+            try:
+                db.purge_vm_grants(self.id, int(vmid))
+            except Exception as e:
+                self.logger.warning(f"could not purge grants for retired VM {vmid}: {e}")
 
             # invalidate cache
             self._cached_vms = None

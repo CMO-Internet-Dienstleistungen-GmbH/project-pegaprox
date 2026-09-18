@@ -9798,6 +9798,13 @@ echo "AGENT_INSTALLED_OK"
                     if cursor.rowcount > 0:
                         self.logger.info(f"Removed VM {vmid} from balancing exclusion list")
                     db.conn.commit()
+                    # MK Sep 2026 - and the authorization objects pointing at this vmid.
+                    # PVE hands out the LOWEST free id, so the number comes back quickly,
+                    # and a VM-ACL row or a scheduled action left behind then applies to
+                    # whichever guest takes it next. The client portal's teardown route
+                    # has cleaned up after itself since #556; the ordinary delete path
+                    # never did, and it is the one most deletions go through.
+                    db.purge_vm_grants(self.id, vmid)
                 except Exception as cleanup_err:
                     self.logger.warning(f"Failed to cleanup balancing exclusion for VM {vmid}: {cleanup_err}")
 

@@ -3234,6 +3234,21 @@ class PegaProxDB:
         self.conn.commit()
 
     # XCP-ng VMID mapping helpers - MK Mar 2026
+    #
+    # MK Sep 2026: a retired mapping keeps its row with this in place of the uuid, so the
+    # vmid stays spent and cannot be handed to a new VM (the allocator takes MAX+1 from
+    # this table). NOT NULL and the (cluster_id, uuid) primary key rule out a plain NULL,
+    # and a real XenAPI uuid never looks like this.
+    XCPNG_RETIRED_UUID = 'retired:'
+
+    def xcpng_retire_vmid(self, cluster_id, vmid):
+        """Mark a synthetic vmid as spent without freeing it for reuse."""
+        cursor = self.conn.cursor()
+        cursor.execute('UPDATE xcpng_vmid_map SET uuid = ? WHERE cluster_id = ? AND vmid = ?',
+                       (f'{self.XCPNG_RETIRED_UUID}{int(vmid)}', cluster_id, int(vmid)))
+        self.conn.commit()
+        return cursor.rowcount or 0
+
     def xcpng_get_vmid(self, cluster_id, vm_uuid):
         """Get or create synthetic VMID for XCP-ng VM UUID"""
         cursor = self.conn.cursor()
@@ -3257,7 +3272,11 @@ class PegaProxDB:
         cursor.execute('SELECT uuid FROM xcpng_vmid_map WHERE cluster_id = ? AND vmid = ?',
                        (cluster_id, int(vmid)))
         row = cursor.fetchone()
-        return row['uuid'] if row else None
+        if not row:
+            return None
+        _u = row['uuid'] or ''
+        # a retired row holds the id, not a guest
+        return None if _u.startswith(self.XCPNG_RETIRED_UUID) else _u
 
     # ========================================
     # USER OPERATIONS
@@ -3530,6 +3549,40 @@ class PegaProxDB:
                 invalidate_pool_cache()
             except Exception as e:
                 logging.warning(f"could not invalidate the authz caches after the purge: {e}")
+        return removed
+
+    def purge_vm_grants(self, cluster_id: str, vmid) -> dict:
+        """Drop every per-resource grant that pointed at one VM. Returns what went.
+
+        A vmid is only unique while the guest exists. Once it is gone the number can
+        come back - PVE reuses freely, and our XCP-ng mapping did too until the id was
+        retired instead of deleted. A VM-ACL row or a scheduled action left pointing at
+        it then applies to whatever takes the number next. The client portal's teardown
+        route has done this for its own deletions since #556; everything else had not.
+        MK Sep 2026
+        """
+        removed = {'vm_acls': 0, 'scheduled_actions': 0}
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute('DELETE FROM vm_acls WHERE cluster_id = ? AND vmid = ?',
+                           (cluster_id, str(vmid)))
+            removed['vm_acls'] = cursor.rowcount or 0
+        except Exception as e:
+            logging.error(f"Failed to purge VM ACL for {cluster_id}/{vmid}: {e}")
+        try:
+            cursor.execute('DELETE FROM scheduled_actions WHERE cluster_id = ? AND vmid = ?',
+                           (cluster_id, int(vmid)))
+            removed['scheduled_actions'] = cursor.rowcount or 0
+        except Exception as e:
+            logging.error(f"Failed to purge schedules for {cluster_id}/{vmid}: {e}")
+        self.conn.commit()
+        if any(removed.values()):
+            logging.info(f"purged grants for removed VM {cluster_id}/{vmid}: {removed}")
+            try:
+                from pegaprox.utils.rbac import invalidate_vm_acls_cache
+                invalidate_vm_acls_cache()
+            except Exception:
+                pass
         return removed
 
     def delete_user(self, username: str):
