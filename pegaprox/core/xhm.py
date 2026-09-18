@@ -660,11 +660,10 @@ def _run_xcpng_to_pve(task):
         task.log(f"Found {len(vdi_list)} disk(s), total {sum(v['size'] for v in vdi_list) / (1024**3):.1f} GB")
 
         # get next VMID on target
-        try:
-            nxt = tgt_mgr._api_get(f"https://{tgt_mgr.host}:{tgt_mgr.api_port}/api2/json/cluster/nextid")
-            new_vmid = int(nxt.json().get('data', 100))
-        except:
-            new_vmid = 100
+        new_vmid = _next_pve_vmid(tgt_mgr)
+        if not new_vmid:
+            task.set_phase('failed', 'Cannot allocate VMID on the target cluster')
+            return
         task.log(f"Target VMID: {new_vmid}")
         task.target_vmid = new_vmid
         task.progress = 5
@@ -1514,6 +1513,23 @@ def _run_pve_to_xcpng(task):
 # ============================================================
 # helpers
 # ============================================================
+
+def _next_pve_vmid(pve_mgr):
+    """Ask the target cluster for the next free VMID.
+
+    MK Sep 2026 - the ESXi->PVE leg called this by name since 0.9.2 but nobody ever
+    wrote it, so that migration died on a NameError before it transferred a byte. The
+    XCP-ng->PVE leg had the same three lines inline; both use this now.
+    """
+    try:
+        nxt = pve_mgr._api_get(
+            f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/cluster/nextid")
+        if nxt.status_code == 200:
+            return int(nxt.json().get('data', 100))
+    except Exception as e:
+        logger.warning(f"nextid lookup on {pve_mgr.host} failed: {e}")
+    return None
+
 
 def _resolve_pve_node_ip(pve_mgr, node_name):
     """Get the SSH-reachable IP of a Proxmox node. Tries API, then cluster host."""
