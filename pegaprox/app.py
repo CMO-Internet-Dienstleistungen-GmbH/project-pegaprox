@@ -1447,12 +1447,47 @@ def _create_listener(bind_host, port_num):
 # streams, uploads, websocket upgrades) is never touched. PEGAPROX_KEEPALIVE_TIMEOUT=0 restores the
 # old unbounded behaviour.
 _KEEPALIVE_IDLE_TIMEOUT = float(os.environ.get('PEGAPROX_KEEPALIVE_TIMEOUT', '75'))
+# MK Sep 2026 - how long a connection may take to finish saying hello. The keepalive
+# timeout above covers the wait for the NEXT request line on an idle connection; these two
+# cover the two phases before that where a client can simply stop and hold a pool slot
+# forever: the TLS handshake, and the headers after the request line. Generous on purpose -
+# a phone on a bad train connection still completes both inside a second - but finite,
+# because `workers` slots held open is the whole server.
+_HANDSHAKE_TIMEOUT = float(os.environ.get('PEGAPROX_HANDSHAKE_TIMEOUT', '30'))
+_HEADER_TIMEOUT = float(os.environ.get('PEGAPROX_HEADER_TIMEOUT', '30'))
 
 
 class _IdleTimeoutMixin:
-    """Bound the idle wait for the next request line. Compose ahead of a gevent pywsgi handler
-    class in the MRO so `super().read_requestline()` reaches the real handler."""
+    """Bound the idle wait for the next request line, and the header read after it.
+
+    Compose ahead of a gevent pywsgi handler class in the MRO so `super().read_requestline()`
+    reaches the real handler.
+
+    MK Sep 2026 - read_requestline was the only bounded phase, so `GET / HTTP/1.1` followed by
+    headers dribbled one byte at a time held a slot indefinitely: the request line arrived
+    promptly, and everything after it was unbounded. Note this bounds the HEADERS only - the
+    body is read later, by the application, and a WebSocket upgrade completes its headers in
+    one packet like any other request, so a live console is unaffected.
+    """
     _idle_timeout = _KEEPALIVE_IDLE_TIMEOUT
+    _header_timeout = _HEADER_TIMEOUT
+
+    def read_request(self, raw_requestline):
+        to = self._header_timeout
+        if not to or to <= 0:
+            return super().read_request(raw_requestline)
+        import gevent
+        t = gevent.Timeout(to)
+        t.start()
+        try:
+            return super().read_request(raw_requestline)
+        except gevent.Timeout as ex:
+            if ex is t:
+                # pywsgi turns a falsy return into a clean 400 and closes the connection
+                return False
+            raise
+        finally:
+            t.close()
 
     def read_requestline(self):
         to = self._idle_timeout
@@ -1594,9 +1629,35 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
     # Custom error handler to suppress SSL errors (from bots/scanners/disconnects)
     class QuietWSGIServer(WSGIServer):
         def wrap_socket_and_handle(self, client_socket, address):
-            """Override to catch SSL errors and the shutdown GreenletExit during handshake"""
+            """Override to catch SSL errors and the shutdown GreenletExit during handshake.
+
+            MK Sep 2026 - and to put a clock on the handshake. This method already runs
+            inside the spawned greenlet, so a TCP connection that opens and then never
+            completes its TLS handshake holds a pool slot for as long as it likes; `workers`
+            of those and the server answers nobody, no login required. A real handshake is
+            a couple of round trips.
+            """
+            # A socket timeout, not a gevent.Timeout around the call: the handshake does
+            # not necessarily happen inside wrap_socket(). With an stdlib SSLContext it can
+            # be deferred to the first read, which lands in the handler - outside any timer
+            # we start here. A timeout on the socket travels with it and bounds that read
+            # too. handle() clears it the moment the connection is up, so keep-alive and
+            # long-lived console sockets are untouched.
+            if _HANDSHAKE_TIMEOUT > 0:
+                try:
+                    client_socket.settimeout(_HANDSHAKE_TIMEOUT)
+                except Exception:
+                    pass
             try:
                 return super().wrap_socket_and_handle(client_socket, address)
+            except (socket.timeout, OSError) as e:
+                if isinstance(e, socket.timeout) or 'timed out' in str(e).lower():
+                    try:
+                        client_socket.close()
+                    except Exception:
+                        pass
+                    return
+                raise
             except GreenletExit:
                 # gevent cancels connection greenlets on stop(); expected at exit, and it
                 # is a BaseException so the handler below would never see it. Its siblings
@@ -1606,6 +1667,19 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
                 if 'ssl' in str(type(e).__name__).lower() or 'ssl' in str(e).lower():
                     return
                 raise
+
+        def handle(self, sock, address):
+            """The handshake is done by the time we get here, so lift its deadline.
+
+            Everything after this point has its own bounds: _IdleTimeoutMixin for the
+            request line and the headers, and the application for the body. A console
+            WebSocket lives here for hours and must not inherit a 30s socket timeout.
+            """
+            try:
+                sock.settimeout(None)
+            except Exception:
+                pass
+            return super().handle(sock, address)
 
         def handle_error(self, *args):
             """Suppress SSL errors - they're normal with self-signed certs"""
