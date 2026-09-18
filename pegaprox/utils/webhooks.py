@@ -20,6 +20,7 @@ Short timeout + per-channel try/except so one dead webhook can't block the rest.
 """
 import json
 import logging
+from pegaprox.utils.sanitization import redact_url
 import re
 import uuid
 from datetime import datetime
@@ -85,11 +86,16 @@ _WEBHOOK_PATH_ONLY_RE = re.compile(
 
 
 def _redact_webhook_url(s):
-    """Strip secret-bearing webhook URL paths from a string before logging."""
+    """Strip secret-bearing webhook URL paths from a string before logging.
+
+    MK Sep 2026 - this existed and guarded exactly one of the four log lines below.
+    The patterns above only know the shapes we had seen; redact_url handles the rest
+    (userinfo, secret query parameters, any deep path), so run both.
+    """
     if not s: return s
     s = _WEBHOOK_URL_RE.sub('[REDACTED-WEBHOOK-URL]', str(s))
     s = _WEBHOOK_PATH_ONLY_RE.sub('[REDACTED-WEBHOOK-PATH]', s)
-    return s
+    return redact_url(s)
 
 
 def _ntfy_priority(sev):
@@ -237,7 +243,7 @@ def send_to_channels(alert, channel_ids=None):
         from pegaprox.api.helpers import load_server_settings
         channels = (load_server_settings() or {}).get('alert_webhooks') or []
     except Exception as e:
-        logging.debug(f"[webhooks] could not load channels: {e}")
+        logging.debug(f"[webhooks] could not load channels: {_redact_webhook_url(str(e))}")
         return
     if channel_ids is not None:
         wanted = {str(c) for c in channel_ids}
@@ -248,9 +254,9 @@ def send_to_channels(alert, channel_ids=None):
             # MK May 2026 (M-11) — detail comes from send_to_channel which already
             # redacts; redact again on outer dispatch-error to be defensive.
             if ok:
-                logging.info(f"[webhooks] → {ch.get('name', ch.get('id'))}: {detail}")
+                logging.info(f"[webhooks] → {ch.get('name', ch.get('id'))}: {_redact_webhook_url(detail)}")
             else:
-                logging.warning(f"[webhooks] → {ch.get('name', ch.get('id'))}: FAILED ({detail})")
+                logging.warning(f"[webhooks] → {ch.get('name', ch.get('id'))}: FAILED ({_redact_webhook_url(detail)})")
         except Exception as e:
             logging.debug(f"[webhooks] channel {ch.get('id')} dispatch error: {_redact_webhook_url(str(e))}")
 

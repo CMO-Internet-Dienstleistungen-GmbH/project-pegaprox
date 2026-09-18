@@ -13,6 +13,7 @@ from pegaprox.globals import cluster_managers
 from pegaprox.utils.audit import log_audit
 from pegaprox.utils.realtime import broadcast_sse
 from pegaprox.utils.sanitization import sanitize_log_message as _sl  # MK #338693885 (Aikido CWE-117): plan name is request-body-controlled → strip CR/LF before any log/audit/SSE line
+from pegaprox.utils.sanitization import redact_url
 
 logger = logging.getLogger('pegaprox.site_recovery')
 
@@ -62,7 +63,10 @@ def _fire_webhook(url):
                             timeout=30, allow_redirects=False, stream=True)
         _wh.close()
     except Exception as e:
-        logger.warning(f"[SR] Webhook failed: {url} - {e}")
+        # MK Sep 2026 - a Slack or Teams webhook URL has no userinfo: the secret IS the
+        # path, and this printed the whole thing on every failure. The exception text can
+        # carry it too, so both go through the redactor.
+        logger.warning(f"[SR] Webhook failed: {redact_url(url)} - {redact_url(str(e))}")
 
 
 # NS 2026-04-24 — pre-flight validation. Real-world cause of most "Site Recovery failed

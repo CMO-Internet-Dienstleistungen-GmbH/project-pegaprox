@@ -6,6 +6,7 @@ import json
 import time
 import logging
 from pegaprox.utils.sanitization import sanitize_log_message as _sl  # CWE-117 tainted-log sanitiser
+from pegaprox.utils.sanitization import redact_url
 import threading
 import uuid
 import hashlib
@@ -2405,7 +2406,7 @@ def download_from_url(cluster_id, node, storage):
                 download_data['checksum-algorithm'] = algo
                 download_data['checksum'] = hash_value
         
-        logging.info(f"Downloading {_sl(url)} as {_sl(filename)} to {_sl(storage)}")
+        logging.info(f"Downloading {_sl(redact_url(url))} as {_sl(filename)} to {_sl(storage)}")
         resp = manager._create_session().post(download_url, data=download_data, timeout=60)
         
         if resp.status_code == 200:
@@ -2425,7 +2426,8 @@ def download_from_url(cluster_id, node, storage):
             return jsonify({'error': error_msg}), resp.status_code
             
     except Exception as e:
-        logging.error(f"Error downloading from URL: {e}")
+        # the exception text repeats the URL, pre-signed query and all
+        logging.error(f"Error downloading from URL: {redact_url(str(e))}")
         return jsonify({'error': safe_error(e, 'Failed to download from URL')}), 500
 
 
