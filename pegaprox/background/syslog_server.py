@@ -34,6 +34,25 @@ import queue as _queue
 _LOG_QUEUE = _queue.Queue(maxsize=20000)
 _DROPPED = 0
 
+# MK Sep 2026 - a 20000-entry cap is a cap on COUNT, and the receiver is unauthenticated,
+# so the sender picks the size. _MAX_LINE is 64 KB, which makes the honest worst case
+# 20000 x 64 KB = about 1.2 GB of resident memory that anyone able to reach :1514 can
+# demand, on a box whose job is to keep clusters running. Count the bytes as well and stop
+# at whichever bound is reached first. 64 MB is roomy for the real traffic (a syslog line
+# is a couple of hundred bytes, so this is ~300k of them) and survivable on a small VM.
+_QUEUE_MAX_BYTES = int(os.environ.get('PEGAPROX_SYSLOG_QUEUE_MB', '64')) * 1024 * 1024
+_QUEUE_BYTES = 0
+_QUEUE_BYTES_LOCK = threading.Lock()
+
+
+def _entry_bytes(entry):
+    """Rough resident size of one queued entry. The message dominates; the rest is
+    small fixed fields, so a flat allowance beats summing every one of them."""
+    try:
+        return len(entry.get('message') or '') + 200
+    except Exception:
+        return 200
+
 # Runtime start/stop so the Settings → Syslog toggle can open/close the port live
 # (not only on restart). The listeners track their socket here so stop can close it.
 _stop_event = threading.Event()
@@ -42,13 +61,37 @@ _tcp_sock = None
 
 
 def _enqueue_log(entry):
-    global _DROPPED
+    global _DROPPED, _QUEUE_BYTES
+    _sz = _entry_bytes(entry)
+    if _QUEUE_MAX_BYTES > 0:
+        with _QUEUE_BYTES_LOCK:
+            if _QUEUE_BYTES + _sz > _QUEUE_MAX_BYTES:
+                _DROPPED += 1
+                if _DROPPED % 1000 == 1:
+                    logging.warning(f"[Syslog] ingest queue at its byte ceiling "
+                                    f"({_QUEUE_MAX_BYTES // (1024*1024)}MB) - dropped "
+                                    f"{_DROPPED} messages (flood?)")
+                return
+            _QUEUE_BYTES += _sz
     try:
         _LOG_QUEUE.put_nowait(entry)
     except _queue.Full:
+        if _QUEUE_MAX_BYTES > 0:
+            with _QUEUE_BYTES_LOCK:
+                _QUEUE_BYTES -= _sz          # never queued, so give the budget back
         _DROPPED += 1
         if _DROPPED % 1000 == 1:
             logging.warning(f"[Syslog] ingest queue full — dropped {_DROPPED} messages (flood / slow disk?)")
+
+
+def _release_queue_bytes(entries):
+    """Hand the budget back once a batch has left the queue."""
+    global _QUEUE_BYTES
+    if _QUEUE_MAX_BYTES <= 0:
+        return
+    _freed = sum(_entry_bytes(e) for e in entries)
+    with _QUEUE_BYTES_LOCK:
+        _QUEUE_BYTES = max(0, _QUEUE_BYTES - _freed)
 
 
 def _flush_batch(batch):
@@ -89,6 +132,47 @@ def _prune_old_logs():
             conn.commit()
             if n and n > 0:
                 logging.info(f"[Syslog] retention prune: deleted {n} rows older than {days}d")
+
+            # MK Sep 2026 - the retention window is the ONLY bound on this file, and the
+            # receiver is unauthenticated: anyone who can reach :1514 decides how much
+            # arrives inside those 30 days. syslog.db sits in config/, beside the main
+            # encrypted database and the master key, so filling that volume takes the
+            # whole installation down, not just the log viewer. Cap the size too, and
+            # drop the oldest rows until it fits.
+            #
+            # No VACUUM: reclaiming the pages would mean copying a multi-gigabyte file
+            # on a server that is by then short of disk, which is the worst possible
+            # moment. The freed pages are reused, so the file stops GROWING, which is
+            # what actually matters here.
+            try:
+                from pegaprox.api.helpers import load_server_settings as _lss
+                _max_mb = int(_lss().get('syslog_max_db_mb', 2048) or 2048)
+            except Exception:
+                _max_mb = 2048
+            if _max_mb > 0:
+                _limit = _max_mb * 1024 * 1024
+                for _round in range(12):
+                    try:
+                        _size = os.path.getsize(DB_FILE)
+                    except OSError:
+                        break
+                    if _size <= _limit:
+                        break
+                    # oldest 10% by id, which is insertion order
+                    cur.execute("SELECT COUNT(*) FROM logs")
+                    _total = cur.fetchone()[0] or 0
+                    if _total < 1000:
+                        break          # nothing left worth deleting; the file is bloat
+                    cur.execute("DELETE FROM logs WHERE id IN "
+                                "(SELECT id FROM logs ORDER BY id LIMIT ?)",
+                                (max(1000, _total // 10),))
+                    _gone = cur.rowcount
+                    conn.commit()
+                    logging.warning(
+                        f"[Syslog] size cap: {_size // (1024*1024)}MB exceeds "
+                        f"{_max_mb}MB, dropped the {_gone} oldest rows")
+                    if not _gone:
+                        break
         finally:
             try:
                 conn.close()
@@ -127,6 +211,10 @@ def _drain_loop():
                         batch.append(_LOG_QUEUE.get_nowait())
                     except _queue.Empty:
                         break
+                # give the byte budget back the moment the batch leaves the queue -
+                # NOT after the write. The write runs off-hub and can be slow or fail;
+                # tying the budget to it would let one stuck flush stall ingestion.
+                _release_queue_bytes(batch)
                 _offhub(_flush_batch, (batch,))
             if time.monotonic() - last_prune > 3600:
                 last_prune = time.monotonic()
