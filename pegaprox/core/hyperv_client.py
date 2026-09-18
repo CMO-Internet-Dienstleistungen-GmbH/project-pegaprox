@@ -27,7 +27,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from pegaprox.core import hyperv_tasks
-from pegaprox.core.hyperv_errors import HyperVError, KIND_MISSING_FEATURE, KIND_REFUSED
+from pegaprox.core.hyperv_errors import (
+    HyperVError, KIND_BUSY, KIND_MISSING_FEATURE, KIND_REFUSED,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +59,15 @@ _ENCRYPTION_NEVER = 'never'
 # enforces that rather than trusting a caller to keep them in step.
 DEFAULT_OPERATION_TIMEOUT_SECONDS = 180
 _READ_TIMEOUT_HEADROOM_SECONDS = 30
+
+# How many sessions PegaProx keeps to one host at most. Each is its own WSMan shell on the
+# host, so this is also the most shells a host ever sees from PegaProx. Four lets a wizard,
+# an inventory refresh and a running migration proceed side by side; eight is well under
+# WinRM's default MaxShellsPerUser of 30 and keeps the load on a customer's hypervisor
+# bounded. See docs/adr/0006.
+DEFAULT_MAX_SESSIONS = 4
+MIN_SESSIONS = 1
+MAX_SESSIONS = 8
 
 # Verbs that change a host. A script carrying one of these does not go out over the
 # inventory path, whatever the caller believed it was sending.
@@ -144,6 +155,28 @@ def wsman_encryption_for(use_ssl: bool, auth: str, encrypt_messages: bool) -> st
     if auth == 'basic' or not encrypt_messages:
         return _ENCRYPTION_NEVER
     return _ENCRYPTION_AUTO
+
+
+def parse_max_sessions(value: Any) -> int:
+    """The submitted number of sessions, or ValueError naming the accepted range.
+
+    None and an empty string mean "not set" and give the default, so a host saved before
+    the setting existed and a form that leaves the field blank both get four.
+    """
+    if value is None or value == '':
+        return DEFAULT_MAX_SESSIONS
+    not_whole = 'The number of parallel sessions must be a whole number.'
+    # int() would quietly turn True into 1 and 4.5 into 4; neither is what was meant.
+    if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+        raise ValueError(not_whole)
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(not_whole) from exc
+    if not MIN_SESSIONS <= number <= MAX_SESSIONS:
+        raise ValueError(f'The number of parallel sessions must be between {MIN_SESSIONS} '
+                         f'and {MAX_SESSIONS}.')
+    return number
 
 
 def redact(text: str, secrets: list[str]) -> str:
@@ -370,3 +403,92 @@ def _kind_for_script_error(message: str) -> str:
     if kind == 'unknown' and 'not recognized' in message.lower():
         return KIND_MISSING_FEATURE
     return kind
+
+
+class PooledHyperVClient(HyperVPowerShellClient):
+    """Up to N independent sessions to one host, handed out one caller at a time each.
+
+    A single `PsrpHyperVClient` serialises every call to its host, which put all users of a
+    host into one queue: four preflights on four VMs took as long as the four in a row.
+    This spreads calls over several sessions instead.
+
+    Several sessions, not one session with several runspaces. A runspace pool with
+    `max_runspaces > 1` would share one WSMan connection between callers, and pypsrp makes
+    no promise that one connection can serve several greenlets at once — the failure
+    `PsrpHyperVClient` describes, where a caller waits for a reply another caller took,
+    is exactly what that sharing risks. Each session here keeps its own connection, its
+    own lock and its own stale-shell retry, unchanged. docs/adr/0006 has the alternatives.
+
+    Sessions are created on first need and kept for reuse, so a host that only ever sees
+    one caller at a time only ever has one shell open. A transport failure on one session
+    drops that session's shell and nothing else; the others carry on.
+    """
+
+    def __init__(self, connection: HyperVConnection, max_sessions: int = DEFAULT_MAX_SESSIONS,
+                 wait_seconds: float | None = None, session_factory=None):
+        self._connection = connection
+        self._max_sessions = parse_max_sessions(max_sessions)
+        # A caller waits at most as long as one call may take before its own read timeout
+        # fires. Waiting longer than that means every session is held by something that is
+        # itself overdue, and "the host is busy" is then the honest answer.
+        self._wait_seconds = connection.read_timeout if wait_seconds is None else wait_seconds
+        self._session_factory = session_factory or PsrpHyperVClient
+        self._slots = threading.BoundedSemaphore(self._max_sessions)
+        self._lock = threading.Lock()
+        self._idle: list[HyperVPowerShellClient] = []
+        self._sessions: list[HyperVPowerShellClient] = []
+
+    @property
+    def max_sessions(self) -> int:
+        return self._max_sessions
+
+    def _borrow(self) -> HyperVPowerShellClient:
+        if not self._slots.acquire(timeout=self._wait_seconds):
+            raise HyperVError(
+                f'All {self._max_sessions} sessions to this host stayed in use for '
+                f'{self._wait_seconds:.0f} s.',
+                kind=KIND_BUSY)
+        try:
+            with self._lock:
+                if self._idle:
+                    return self._idle.pop()
+                session = self._session_factory(self._connection)
+                self._sessions.append(session)
+                return session
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def _give_back(self, session: HyperVPowerShellClient) -> None:
+        with self._lock:
+            self._idle.append(session)
+        self._slots.release()
+
+    def run_json(self, script: str, **parameters: Any) -> Any:
+        # Refused before a session is taken: a script that may not go out should not
+        # occupy one of N slots while it is being refused.
+        assert_read_only(script)
+        session = self._borrow()
+        try:
+            return session.run_json(script, **parameters)
+        finally:
+            self._give_back(session)
+
+    def run_action(self, script: str, description: str, **parameters: Any) -> Any:
+        session = self._borrow()
+        try:
+            return session.run_action(script, description, **parameters)
+        finally:
+            self._give_back(session)
+
+    def close(self) -> None:
+        """Close every session this pool opened. Each stays usable and reopens on demand,
+        like a single client after `close()`."""
+        with self._lock:
+            sessions = list(self._sessions)
+        for session in sessions:
+            try:
+                session.close()
+            except Exception:  # noqa: BLE001 - one session failing to close must not keep the rest open
+                logger.debug('Ignoring error while closing a pooled Hyper-V session',
+                             exc_info=True)
