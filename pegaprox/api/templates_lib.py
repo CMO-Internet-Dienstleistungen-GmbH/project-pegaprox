@@ -562,6 +562,30 @@ def deploy(cluster_id):
     if not name:
         name = f"tpl-{tpl['distro']}-{tpl['version']}".replace('.', '')
 
+    # MK Sep 2026 - deploying a template CREATES a guest, on a node and under a VMID the
+    # caller picks, and this route asked neither of the two questions vms.py asks on
+    # create. A caller confined to their own VMs by an ACL or a pool grant has no
+    # cluster-level standing to place a new guest at all, and a tenant with a configured
+    # VMID range must not land outside it - a collision there surfaces at restore time,
+    # long after anyone can tell which guest was meant. The PBS restore-into-a-new-VMID
+    # path was closed the same way earlier this month.
+    from pegaprox.utils.auth import build_authz_user as _bau
+    from pegaprox.api.helpers import require_unconfined as _runc
+    from pegaprox.models.permissions import ROLE_ADMIN as _RA
+    _caller = _bau(request.session.get('user', ''), request.session)
+    if _caller.get('effective_role', _caller.get('role')) != _RA:
+        _cerr = _runc(cluster_id)
+        if _cerr:
+            return _cerr
+        try:
+            from pegaprox.utils.rbac import check_tenant_vmid, DEFAULT_TENANT_ID as _DT
+            _rok, _rmsg = check_tenant_vmid(_caller.get('tenant_id') or _DT, vmid)
+        except Exception as _re:
+            logging.debug(f"[vmid-range] template deploy pre-flight skipped: {_re}")
+            _rok, _rmsg = True, ''
+        if not _rok:
+            return jsonify({'error': _rmsg}), 403
+
     user = _current_user()
 
     dep_id = uuid.uuid4().hex[:12]

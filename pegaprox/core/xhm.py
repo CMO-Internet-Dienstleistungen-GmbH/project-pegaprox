@@ -1920,6 +1920,15 @@ def _run_esxi_to_pve(task):
 
                 # create SSHFS mount on PVE node to ESXi datastore
                 mount_dir = f"{mount_base}-{idx}"
+                # MK Sep 2026 - these two commands run on the PVE NODE and reach the ESXi
+                # host from there, so the host-key policy the operator configured here has
+                # to travel with them. They were hardcoded to accept-new, which is
+                # trust-on-first-use: with strict host keys switched on, every other SSH
+                # path in the product refuses an unknown host and these two did not. The
+                # known_hosts file cannot come along (it is ours, not the node's), so the
+                # node uses its own and the operator seeds it the way they seed any other.
+                from pegaprox.utils.ssh_security import strict_host_keys_enabled
+                _hk = 'yes' if strict_host_keys_enabled() else 'accept-new'
                 mount_cmds = [
                     # 0700 on the scratch root, not just the leaf: `mkdir -p` would create
                     # the parent with the default mode and that is the directory whose
@@ -1927,7 +1936,7 @@ def _run_esxi_to_pve(task):
                     # component.
                     f"mkdir -m 700 -p {_q_local(task.scratch)}",
                     f"mkdir -m 700 -p {_q_local(mount_dir)}",
-                    f"sshfs -o StrictHostKeyChecking=accept-new,password_stdin "
+                    f"sshfs -o StrictHostKeyChecking={_hk},password_stdin "
                     f"{_q_local(esxi_user + '@' + esxi_host + ':/vmfs/volumes/' + datastore_name)} "
                     f"{_q_local(mount_dir)} <<< {_q_local(esxi_pass)}",
                 ]
@@ -1969,7 +1978,7 @@ def _run_esxi_to_pve(task):
                     # (same idiom as the HA-sync/smbios fixes).
                     scp_cmd = (
                         f"IFS= read -r SSHPASS; export SSHPASS; sshpass -e "
-                        f"scp -o StrictHostKeyChecking=accept-new "
+                        f"scp -o StrictHostKeyChecking={_hk} "
                         f"{_q_local(remote_src)} {_q_local(tmp_path)}"
                     )
                     scp_in, scp_out, scp_err = ssh_pve.exec_command(scp_cmd, timeout=7200)
