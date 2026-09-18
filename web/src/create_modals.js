@@ -1987,7 +1987,8 @@
                             smb_share_map: Object.entries(rc.smb_share_map || {})
                                 .map(([drive, share]) => `${drive}=${share}`).join('\n'),
                             smb_domain: rc.smb_domain || '',
-                            transfer_host: rc.transfer_host || '' }));
+                            transfer_host: rc.transfer_host || '',
+                            max_sessions: rc.max_sessions || 4 }));
                     } else if (rc.cluster_type === 'xcpng') {
                         setXcpConfig(prev => ({ ...prev, name: rc.name || '', host: rc.host || '', user: rc.user || '', pass: '', ssl_verification: rc.ssl_verification || false, migration_threshold: rc.migration_threshold || 20, check_interval: rc.check_interval || 300, auto_migrate: rc.auto_migrate || false, dry_run: rc.dry_run || false }));
                     } else {
