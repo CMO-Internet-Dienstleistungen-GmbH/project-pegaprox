@@ -1256,15 +1256,37 @@ def user_can_access_vmware_vm(user: dict, vmware_id: str, vm_id: str, permission
                       f"'{username}' on vmware:{vmware_id}/{vm_id}")
         return False
 
+    # Gate on the VMware server's tenant reach BEFORE anything else. NS Jul 2026 (CodeAnt BOLA)
+    # added this for the no-ACL fallback only: the general role permission previously granted ANY
+    # vmware.vm.* holder access to EVERY server's VMs regardless of tenant. MK Sep 2026 - an ACL
+    # row returned True above it, so a row naming a tenant-A user (or carrying '*') on a server
+    # that belongs to tenant B handed over full VM access across the boundary. An ACL is a grant
+    # WITHIN a tenant's estate, never a way into somebody else's. Mirrors check_pbs_access: admin
+    # already returned above; an unlinked server stays backward-compat open; otherwise the caller
+    # must reach one of the server's linked clusters.
+    try:
+        from pegaprox.globals import vmware_managers
+        _mgr = vmware_managers.get(vmware_id)
+        _linked = (getattr(_mgr, 'linked_clusters', None) or []) if _mgr else []
+        if _linked:
+            # include_pools=False: a Proxmox POOL grant says nothing about the ESXi guests on a
+            # server that happens to be linked to that cluster, and the default (True) let a
+            # pool-scoped caller through. Tenant ownership is the right question here.
+            _uc = get_user_clusters(user, include_pools=False)   # None => all (admin/default tenant)
+            if _uc is not None and not any(c in _uc for c in _linked):
+                logging.debug(f"[VMWARE-ACL] {username} cannot reach any linked cluster of "
+                              f"{vmware_id} - deny {permission}")
+                return False
+    except Exception as _e:
+        logging.error(f"[VMWARE-ACL] tenant-gate error for {vmware_id}: {_e}")
+
     # VMware ACLs are stored under vmware_id as the cluster key
     vmware_acls = acls.get(f'vmware:{vmware_id}', {})
     vm_acl = vmware_acls.get(str(vm_id), {})
     
     if vm_acl:
-        allowed_users = vm_acl.get('users', [])
-        
-        # If user is in the ACL whitelist, check their ACL permissions
-        if username in allowed_users or '*' in allowed_users:
+        # one definition of what a row grants, wildcard included (acl_grants_user)
+        if acl_grants_user(vm_acl, username):
             if vm_acl.get('inherit_role', True):
                 # inherit_role=True: FULL VM access
                 vmware_permissions = ['vmware.vm.view', 'vmware.vm.power', 'vmware.vm.manage', 
@@ -1275,30 +1297,6 @@ def user_can_access_vmware_vm(user: dict, vmware_id: str, vm_id: str, permission
                 vm_perms = vm_acl.get('permissions', [])
                 return permission in vm_perms
     
-    # No VM-specific ACL — fall back to the general role permission, BUT gate it by the VMware
-    # server's tenant reach first. NS Jul 2026 (CodeAnt BOLA) — this fallback previously granted
-    # ANY vmware.vm.* holder access to EVERY VMware server's VMs regardless of tenant (the Proxmox
-    # user_can_access_vm has the equivalent guard at ~853; the VMware path was missing it). Mirror
-    # check_pbs_access: admin already returned above; an unlinked server stays backward-compat open;
-    # otherwise require the caller to reach one of the server's linked clusters.
-    try:
-        from pegaprox.globals import vmware_managers
-        _mgr = vmware_managers.get(vmware_id)
-        _linked = (getattr(_mgr, 'linked_clusters', None) or []) if _mgr else []
-        if _linked:
-            # sec (audit): include_pools=False. A Proxmox POOL grant says nothing about the ESXi
-            # guests on a server that happens to be linked to that cluster — but the default
-            # (include_pools=True) let a pool-scoped caller through this gate, and the scope-wins
-            # guard below only confines callers who hold a vmware:<id> ACL. So a pool grant on one
-            # Proxmox cluster widened into every VM on a linked ESXi server. Tenant ownership is
-            # the right question here.
-            _uc = get_user_clusters(user, include_pools=False)   # None => all (admin/default tenant)
-            if _uc is not None and not any(c in _uc for c in _linked):
-                logging.debug(f"[VMWARE-ACL] {username} cannot reach any linked cluster of {vmware_id} → deny {permission}")
-                return False
-    except Exception as _e:
-        logging.error(f"[VMWARE-ACL] tenant-gate error for {vmware_id}: {_e}")
-
     # MK Aug 2026 (sec-report, symplasson) — mirror the Proxmox user_can_access_vm scope-wins
     # guard: a user EXPLICITLY scoped to specific VMware VMs via a vmware:<id> ACL must stay
     # confined to those VMs, not inherit every VM on the server once their tenant reaches a
