@@ -4264,6 +4264,16 @@ def start_rolling_update(cluster_id):
     
     # Configuration options
     include_reboot = data.get('include_reboot', False)
+    # MK Sep 2026 - node.reboot is a permission this product defines, ships in the
+    # tenant-admin template and enforced in exactly no route, so an operator who built a
+    # role with node.update and deliberately withheld node.reboot still got their nodes
+    # rebooted. Asked for only when the run will actually reboot one, so an update-only
+    # rolling pass keeps working on node.update alone.
+    if include_reboot:
+        from pegaprox.utils.rbac import has_permission as _hasp
+        from pegaprox.utils.auth import build_authz_user as _bau
+        if not _hasp(_bau(request.session.get('user', ''), request.session), 'node.reboot'):
+            return jsonify({'error': 'Rebooting nodes needs the node.reboot permission'}), 403
     node_order = data.get('node_order', None)
     skip_up_to_date = data.get('skip_up_to_date', True)
     force_all = data.get('force_all', False)

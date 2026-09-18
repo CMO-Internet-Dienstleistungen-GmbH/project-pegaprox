@@ -1045,7 +1045,17 @@ def set_update_schedule(cluster_id):
     
     data = request.json or {}
     usr = getattr(request, 'session', {}).get('user', 'system')
-    
+
+    # MK Sep 2026 - arming this with include_reboot set schedules a node reboot, and
+    # node.reboot is the permission for that (see the manual route in settings.py). It
+    # was enforced nowhere, so withholding it from a role changed nothing.
+    if data.get('enabled', False) and data.get('include_reboot', True):
+        from pegaprox.utils.rbac import has_permission as _hasp
+        from pegaprox.utils.auth import build_authz_user as _bau
+        if not _hasp(_bau(usr, getattr(request, 'session', {}) or {}), 'node.reboot'):
+            return jsonify({'error': 'Scheduling a node reboot needs the node.reboot '
+                                     'permission'}), 403
+
     schedule = {
         'enabled': data.get('enabled', False),
         'schedule_type': data.get('schedule_type', 'recurring'),
