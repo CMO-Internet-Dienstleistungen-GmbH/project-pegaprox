@@ -594,12 +594,52 @@ class HyperVClusterManager:
     # with migration. XCP-ng carries the same block for the same reason.
 
     def get_tasks(self, limit: int = 50) -> list:
-        """No task log. Hyper-V jobs are the host's, and PegaProx does not adopt them.
+        """The calls PegaProx is making to this host, waiting, running or just finished.
 
-        What PegaProx itself does to this host is a migration, and that is recorded in the
-        migration table and shown on the migration page, not here.
+        Only PegaProx's own calls: jobs the host runs on its own are the host's, and
+        PegaProx does not adopt them. A migration as a whole stays on the migration page;
+        what shows here are the individual questions it and everybody else sends.
+
+        Shaped like XCP-ng's rows, with `starttime` in Unix seconds, because the task bar
+        sorts on it and compares it against the clock (#738). `vmid` is the synthetic
+        VMID, which is what the scoped task route filters on.
         """
-        return []
+        from pegaprox.core import hyperv_tasks
+        rows = []
+        for task in hyperv_tasks.tasks_for(self.id)[:max(0, int(limit))]:
+            if task.vm_guid and task.vmid is None:
+                try:
+                    task.vmid = self.vmid_for(task.vm_guid)
+                except Exception:                            # noqa: BLE001
+                    logger.debug('No VMID for a Hyper-V task on %s', self.id, exc_info=True)
+            rows.append({
+                'upid': task.upid,
+                'type': task.task_type,
+                'status': task.status,
+                'exitstatus': task.error or (task.status if task.finished else ''),
+                'vmid': task.vmid,
+                'id': str(task.vmid) if task.vmid is not None else '',
+                'starttime': int(task.queued_at),
+                'endtime': int(task.ended_at) if task.ended_at else None,
+                'node': self.config.name,
+                'user': task.user,
+                # Nothing here can be stopped half-way: a PowerShell pipeline on the host
+                # finishes or times out, and pretending otherwise offers a button that lies.
+                'cancellable': False,
+            })
+        return rows
+
+    def get_node_task_log(self, node, upid, start=0, limit=50) -> list[str]:
+        """A short account of one call, since the host keeps no log of it.
+
+        The error text is the transport's, which has host, account and password already
+        removed.
+        """
+        from pegaprox.core import hyperv_tasks
+        task = hyperv_tasks.find(self.id, str(upid))
+        if task is None:
+            return ['This Hyper-V call is no longer in the list.']
+        return hyperv_tasks.summary_lines(task)
 
     def get_next_vmid(self) -> dict:
         """The next synthetic VMID this host would allocate, without allocating it.

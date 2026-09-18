@@ -298,6 +298,8 @@ def delete_hyperv_host(host_id):
 
     hyperv_db.delete_host(db.conn, host_id)
     hyperv_inventory.invalidate(host_id)
+    from pegaprox.core import hyperv_tasks
+    hyperv_tasks.forget_host(host_id)
     log_audit(_acting_user(), 'hyperv.host.delete',
               f'Removed Hyper-V migration source {_sl(host_id)}')
     return jsonify({'success': True})
