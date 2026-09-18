@@ -269,6 +269,13 @@ class PegaProxDB:
                 avatar_data TEXT DEFAULT '',
                 ldap_dn TEXT DEFAULT '',
                 last_ldap_sync TEXT DEFAULT '',
+                -- MK Sep 2026: what the directory itself last granted, so a sync can take
+                -- back its OWN grants without touching anything an admin set by hand. The
+                -- August revocation fix wrote both of these into the user dict and neither
+                -- had a column, so every restart wiped them and the revocation silently
+                -- stopped working.
+                ldap_permissions TEXT DEFAULT '[]',
+                ldap_tenant TEXT DEFAULT '',
                 tenant_permissions TEXT DEFAULT '{}',
                 denied_permissions TEXT DEFAULT '[]',
                 oidc_sub TEXT DEFAULT '',
@@ -973,6 +980,15 @@ class PegaProxDB:
                 except Exception as e:
                     logging.error(f"Failed to add ldap_dn column: {e}")
             
+            for _col, _decl in (('ldap_permissions', "TEXT DEFAULT '[]'"),
+                                ('ldap_tenant', "TEXT DEFAULT ''")):
+                if _col not in columns:
+                    try:
+                        cursor.execute(f"ALTER TABLE users ADD COLUMN {_col} {_decl}")
+                        logging.info(f"Added {_col} column to users table")
+                    except Exception as e:
+                        logging.error(f"Failed to add {_col} column: {e}")
+
             if 'last_ldap_sync' not in columns:
                 try:
                     cursor.execute("ALTER TABLE users ADD COLUMN last_ldap_sync TEXT DEFAULT ''")
@@ -3302,6 +3318,8 @@ class PegaProxDB:
                 'avatar_url': build_avatar_url(row_dict),
                 'ldap_dn': row_dict.get('ldap_dn', ''),
                 'last_ldap_sync': row_dict.get('last_ldap_sync', ''),
+                'ldap_permissions': json.loads(row_dict.get('ldap_permissions') or '[]'),
+                'ldap_tenant': row_dict.get('ldap_tenant', '') or '',
                 # NS: Feb 2026 - OIDC and tenant permission fields
                 'tenant_permissions': json.loads(row_dict.get('tenant_permissions') or '{}'),
                 'denied_permissions': json.loads(row_dict.get('denied_permissions') or '[]'),
@@ -3368,6 +3386,8 @@ class PegaProxDB:
             'avatar_url': build_avatar_url(row_dict),
             'ldap_dn': row_dict.get('ldap_dn', ''),
             'last_ldap_sync': row_dict.get('last_ldap_sync', ''),
+            'ldap_permissions': json.loads(row_dict.get('ldap_permissions') or '[]'),
+            'ldap_tenant': row_dict.get('ldap_tenant', '') or '',
             # NS: Feb 2026 - OIDC and tenant permission fields
             'tenant_permissions': json.loads(row_dict.get('tenant_permissions') or '{}'),
             'denied_permissions': json.loads(row_dict.get('denied_permissions') or '[]'),
@@ -3391,12 +3411,14 @@ class PegaProxDB:
              totp_secret_encrypted, totp_pending_secret_encrypted, totp_enabled, force_password_change,
             enabled, theme, language, ui_layout, taskbar_auto_expand,
              auth_source, display_name, email, avatar_mime, avatar_data, ldap_dn, last_ldap_sync,
+             ldap_permissions, ldap_tenant,
              tenant_permissions, denied_permissions, oidc_sub, last_oidc_sync,
              layout_chosen, portal_only, sidebar_show_vmid, user_folder)
             VALUES (?, ?, ?, ?, ?, ?,
                     COALESCE((SELECT created_at FROM users WHERE username = ?), ?),
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?,
                     ?, ?, ?, ?,
                     ?, ?, ?, ?)
         ''', (
@@ -3425,6 +3447,8 @@ class PegaProxDB:
             data.get('avatar_data', ''),
             data.get('ldap_dn', ''),
             data.get('last_ldap_sync', ''),
+            json.dumps(list(data.get('ldap_permissions') or [])),
+            data.get('ldap_tenant', '') or '',
             # NS: Feb 2026 - OIDC and tenant permission fields
             json.dumps(data.get('tenant_permissions', {})),
             json.dumps(data.get('denied_permissions', [])),
