@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 
 from pegaprox.core import hyperv_scripts as scripts
+from pegaprox.core import hyperv_tasks
 from pegaprox.core.hyperv_client import HyperVPowerShellClient
 from pegaprox.core.hyperv_errors import HyperVError
 
@@ -333,11 +334,25 @@ class HyperVManager:
         self.host = host
         self._client = client
 
+    # -- the two ways a script reaches the host -----------------------------------------
+    #
+    # Every call goes through one of these, so every call shows up in the task bar under a
+    # name that says what it is for. The task type is the only thing a caller adds; the
+    # read-only guard and the audit line stay the transport's.
+
+    def _read(self, task_type: str, vm_guid: str, script: str, **parameters):
+        with hyperv_tasks.track(self.cluster_id, task_type, vm_guid):
+            return self._client.run_json(script, **parameters)
+
+    def _act(self, task_type: str, vm_guid: str, script: str, description: str, **parameters):
+        with hyperv_tasks.track(self.cluster_id, task_type, vm_guid):
+            return self._client.run_action(script, description, **parameters)
+
     # -- reading ---------------------------------------------------------------------
 
     def host_facts(self) -> dict:
         """Versions of the host, its PowerShell and its Hyper-V module."""
-        raw = self._client.run_json(scripts.HOST_FACTS) or {}
+        raw = self._read('hv_host_facts', '', scripts.HOST_FACTS) or {}
         return {
             'os_caption': raw.get('OSCaption'),
             'os_version': raw.get('OSVersion'),
@@ -357,7 +372,7 @@ class HyperVManager:
         because a documentation gap should show up as a clear warning about this host, not
         as a product that refuses to start.
         """
-        raw = self._client.run_json(scripts.VERIFY_PROPERTIES) or {}
+        raw = self._read('hv_verify', '', scripts.VERIFY_PROPERTIES) or {}
         missing = raw.get('Missing') or {}
         # PowerShell serialises an empty array as null, so "nothing missing" arrives as
         # None and has to be read as the empty list it means.
@@ -373,12 +388,12 @@ class HyperVManager:
 
     def list_vms(self) -> list[dict]:
         """Every VM on the host, without the per-VM detail that costs a call each."""
-        raw = self._client.run_json(scripts.VM_INVENTORY) or []
+        raw = self._read('hv_inventory', '', scripts.VM_INVENTORY) or []
         return [normalise_vm_summary(vm) for vm in raw]
 
     def get_vm(self, vm_guid: str) -> dict:
         """Everything about one VM that a migration has to reproduce or refuse."""
-        raw = self._client.run_json(scripts.VM_DETAIL, VmId=vm_guid)
+        raw = self._read('hv_detail', vm_guid, scripts.VM_DETAIL, VmId=vm_guid)
         if not raw:
             raise HyperVError(f'The host returned nothing for VM {vm_guid}.', kind='unknown')
         return normalise_vm_detail(raw)
@@ -397,7 +412,8 @@ class HyperVManager:
         `windows: False` with the reason, which is an answer and not an error — and it
         says that about *that disk*, never about the guest.
         """
-        raw = self._client.run_json(scripts.VM_IMAGE_FACTS, VmId=vm_guid) or []
+        raw = self._read('hv_image_facts', vm_guid, scripts.VM_IMAGE_FACTS,
+                         VmId=vm_guid) or []
         return [normalise_image_facts(row) for row in raw]
 
     def inspect_disks(self, vm_guid: str) -> dict:
@@ -415,9 +431,9 @@ class HyperVManager:
         # never ran and every check built on it reported "not inspected" as a pass. It is
         # a read-only mount and changes no data, but it does attach the disk to the host
         # for a few seconds, which is exactly what the audited action path is for.
-        raw = self._client.run_action(scripts.VM_DISK_INSPECTION,
-                                      'inspecting the disks of a stopped VM read-only',
-                                      VmId=vm_guid) or {}
+        raw = self._act('hv_inspect', vm_guid, scripts.VM_DISK_INSPECTION,
+                        'inspecting the disks of a stopped VM read-only',
+                        VmId=vm_guid) or {}
         return normalise_disk_inspection(raw)
 
     def get_vm_state(self, vm_guid: str) -> dict:
@@ -427,7 +443,7 @@ class HyperVManager:
         Re-reading costs one round trip and is the only thing standing between that and a
         copy taken from underneath a running guest.
         """
-        raw = self._client.run_json(scripts.VM_STATE, VmId=vm_guid) or {}
+        raw = self._read('hv_state', vm_guid, scripts.VM_STATE, VmId=vm_guid) or {}
         return {'guid': raw.get('Id'), 'state': raw.get('State'),
                 'checkpoint_count': raw.get('CheckpointCount')}
 
@@ -439,7 +455,8 @@ class HyperVManager:
         the parent carries on afterwards, invisible to the checkpoint list. Reading the disks
         in that window copies a file Hyper-V is still writing into.
         """
-        raw = self._client.run_json(scripts.VM_MERGE_STATE, VmId=vm_guid) or {}
+        raw = self._read('hv_merge_state', vm_guid, scripts.VM_MERGE_STATE,
+                         VmId=vm_guid) or {}
         secondary = raw.get('SecondaryStatus')
         return {
             'primary_status': raw.get('PrimaryStatus'),
@@ -458,6 +475,12 @@ class HyperVManager:
         a migration and the copy starting, a checkpoint can be taken, a merge can begin, or
         the VM can be started by another person entirely.
         """
+        # One task for the whole gate, not one per question: it is a single check to the
+        # person watching, and two rows would read as two things the runner asked for.
+        with hyperv_tasks.track(self.cluster_id, 'hv_safety_check', vm_guid):
+            return self._disks_are_safe_to_read(vm_guid)
+
+    def _disks_are_safe_to_read(self, vm_guid: str) -> tuple[bool, str]:
         state = self.get_vm_state(vm_guid)
         if state.get('state') != 'Off':
             return False, f"The VM is {state.get('state')}, not off."
@@ -481,7 +504,8 @@ class HyperVManager:
         the parent. The chain is read rather than the checkpoint list, because the list
         empties the moment a checkpoint is deleted while the merge is still running.
         """
-        raw = self._client.run_json(scripts.VM_DISK_CHAIN, VmId=vm_guid) or []
+        raw = self._read('hv_disk_chain', vm_guid, scripts.VM_DISK_CHAIN,
+                         VmId=vm_guid) or []
         return [{'path': entry.get('Path'),
                  'chain_length': entry.get('ChainLength'),
                  'chain': [{'path': link.get('Path'), 'vhd_type': link.get('VhdType'),
@@ -497,7 +521,7 @@ class HyperVManager:
         """
         if not library_paths:
             return []
-        raw = self._client.run_json(scripts.ISO_LIBRARY, Paths=library_paths) or []
+        raw = self._read('hv_iso_list', '', scripts.ISO_LIBRARY, Paths=library_paths) or []
         return [{'path': iso.get('Path'), 'name': iso.get('Name'),
                  'size': iso.get('Length'), 'modified_at': iso.get('LastModified')}
                 for iso in raw]
@@ -506,8 +530,8 @@ class HyperVManager:
 
     def start_vm(self, vm_guid: str) -> dict:
         """Start a VM, for preparation only. A migration never starts a source VM."""
-        raw = self._client.run_action(
-            scripts.START_VM, f'start Hyper-V VM {vm_guid}', VmId=vm_guid) or {}
+        raw = self._act('hv_start', vm_guid,
+                        scripts.START_VM, f'start Hyper-V VM {vm_guid}', VmId=vm_guid) or {}
         return {'guid': raw.get('Id'), 'state': raw.get('State')}
 
     def shutdown_vm(self, vm_guid: str, timeout_seconds: int = 300) -> dict:
@@ -517,8 +541,9 @@ class HyperVManager:
         pulling its power to get on with the migration is how a copy ends up
         crash-consistent while the log says the shutdown succeeded.
         """
-        raw = self._client.run_action(
-            scripts.SHUTDOWN_VM, f'request orderly shutdown of Hyper-V VM {vm_guid}',
+        raw = self._act(
+            'hv_shutdown', vm_guid, scripts.SHUTDOWN_VM,
+            f'request orderly shutdown of Hyper-V VM {vm_guid}',
             VmId=vm_guid, TimeoutSeconds=timeout_seconds) or {}
         return {
             'guid': raw.get('Id'),
@@ -540,8 +565,8 @@ class HyperVManager:
         if not remove_all and not checkpoint_name:
             raise ValueError('Deleting a checkpoint needs either a name or remove_all=True.')
 
-        raw = self._client.run_action(
-            scripts.REMOVE_CHECKPOINTS, f'remove checkpoint(s) from Hyper-V VM {vm_guid}',
+        raw = self._act(
+            'hv_checkpoint_remove', vm_guid, scripts.REMOVE_CHECKPOINTS, f'remove checkpoint(s) from Hyper-V VM {vm_guid}',
             VmId=vm_guid, CheckpointName=checkpoint_name or '', All=remove_all) or {}
 
         disks = [{'path': d.get('Path'), 'vhd_type': d.get('VhdType'),
@@ -554,14 +579,14 @@ class HyperVManager:
         }
 
     def mount_iso(self, vm_guid: str, iso_path: str) -> dict:
-        raw = self._client.run_action(
-            scripts.MOUNT_ISO, f'mount an ISO on Hyper-V VM {vm_guid}',
+        raw = self._act(
+            'hv_iso_mount', vm_guid, scripts.MOUNT_ISO, f'mount an ISO on Hyper-V VM {vm_guid}',
             VmId=vm_guid, IsoPath=iso_path) or {}
         return {'path': raw.get('Path')}
 
     def eject_iso(self, vm_guid: str) -> dict:
-        raw = self._client.run_action(
-            scripts.EJECT_ISO, f'eject the ISO from Hyper-V VM {vm_guid}',
+        raw = self._act(
+            'hv_iso_eject', vm_guid, scripts.EJECT_ISO, f'eject the ISO from Hyper-V VM {vm_guid}',
             VmId=vm_guid) or {}
         return {'path': raw.get('Path')}
 

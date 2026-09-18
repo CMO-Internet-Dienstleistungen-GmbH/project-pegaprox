@@ -26,6 +26,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
+from pegaprox.core import hyperv_tasks
 from pegaprox.core.hyperv_errors import HyperVError, KIND_MISSING_FEATURE, KIND_REFUSED
 
 logger = logging.getLogger(__name__)
@@ -262,6 +263,9 @@ class PsrpHyperVClient(HyperVPowerShellClient):
 
     def _invoke(self, script: str, context: str, parameters: dict | None = None) -> Any:
         with self._lock:
+            # The wait for the session ends here, and that is the moment the task bar has
+            # to see: everything before it was queueing behind somebody else's call.
+            hyperv_tasks.mark_running()
             # A shell the host has already closed is not a failed request, it is a
             # connection that has to be reopened — and the caller cannot tell the two
             # apart. WinRM ends an idle shell on its own schedule, so the first call after
