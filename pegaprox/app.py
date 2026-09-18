@@ -388,39 +388,17 @@ def create_app():
     return app
 
 
+# MK Sep 2026 - the sweep this used to carry ran whenever the map passed 1024 entries
+# and removed only EXPIRED windows. Keep the map just above the threshold with LIVE
+# windows and you get a full scan on every single request that frees nothing: O(n) per
+# request with n still climbing, which is a better attack than the one it was added to
+# stop. The shared counter sweeps on a clock and evicts the oldest keys once the ceiling
+# is genuinely breached, so neither the map nor the work per request can run away.
 def _check_api_rate_limit(client_ip: str) -> bool:
     """Simple sliding window rate limiter."""
     if API_RATE_LIMIT <= 0:
         return True
-
-    current_time = time.time()
-
-    with g.api_rate_limit_lock:
-        # sec (audit): this map is keyed by an unauthenticated remote IP and entries were only
-        # ever added — a rotating source (an IPv6 /64 costs nothing) grew it without bound.
-        # Sweep windows that have already expired; the check below resets a live one anyway.
-        if len(g.api_request_counts) > 1024:
-            _stale = [ip for ip, i in g.api_request_counts.items()
-                      if current_time - i.get('window_start', 0) > API_RATE_WINDOW]
-            for _ip in _stale:
-                g.api_request_counts.pop(_ip, None)
-
-        if client_ip not in g.api_request_counts:
-            g.api_request_counts[client_ip] = {'count': 1, 'window_start': current_time}
-            return True
-
-        info = g.api_request_counts[client_ip]
-
-        if current_time - info['window_start'] > API_RATE_WINDOW:
-            info['count'] = 1
-            info['window_start'] = current_time
-            return True
-
-        if info['count'] >= API_RATE_LIMIT:
-            return False
-
-        info['count'] += 1
-        return True
+    return g.api_rate_window.allow(client_ip)
 
 
 def download_static_files():

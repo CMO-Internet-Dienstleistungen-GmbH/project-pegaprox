@@ -873,10 +873,20 @@ def test_syslog_tcp_buffer_is_bounded():
 
 
 def test_api_rate_limit_map_is_pruned():
-    src = open('pegaprox/app.py').read()
-    i = src.index('with g.api_rate_limit_lock:')
-    assert 'g.api_request_counts.pop(' in src[i:i + 1200], \
-        "the rate-limit map is still never pruned"
+    """Keyed by an unauthenticated remote IP, so it must not grow without bound.
+
+    Sep 2026: this used to look for the open-coded `g.api_request_counts.pop(` sweep.
+    That sweep removed only EXPIRED windows and ran on a size trigger, so holding the
+    map just above the threshold with live windows gave a full scan per request that
+    freed nothing. The shared bounded counter replaced it; the property is the same,
+    so ask about the property instead of the spelling."""
+    from pegaprox.utils.ratelimit import SlidingWindow
+
+    w = SlidingWindow(limit=1000, window=60, max_keys=64)
+    for i in range(5000):
+        w.allow(f'2001:db8::{i}')
+
+    assert len(w) <= 64, f"{len(w)} keys retained from 5000 distinct sources"
 
 
 def test_scheduler_touches_only_the_task_it_ran(db):

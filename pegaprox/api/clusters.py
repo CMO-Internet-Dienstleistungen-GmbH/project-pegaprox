@@ -730,7 +730,10 @@ def update_cluster_sort_order(cluster_id):
 # cluster.config could otherwise hammer this endpoint to flood the HMAC-signed
 # audit log (each location update writes one entry). 30 updates/min is way more
 # than any legitimate UI flow needs — operators set lat/lon once and move on.
-_location_put_attempts = {}  # (ip, cluster_id) → list[ts]
+from pegaprox.utils.ratelimit import SlidingWindow as _SlidingWindow
+
+# keyed by (ip, cluster_id): the IP half is caller-chosen, so this needs a ceiling
+_location_put_attempts = _SlidingWindow(limit=30, window=60, max_keys=4096, name='cluster-location')
 
 
 @bp.route('/api/clusters/<cluster_id>/location', methods=['PUT'])
@@ -749,14 +752,9 @@ def update_cluster_location(cluster_id):
     from pegaprox.utils.audit import get_client_ip
     import time as _t
     client_ip = get_client_ip()
-    key = (client_ip, cluster_id)
-    now = _t.time()
-    window = [t for t in _location_put_attempts.get(key, []) if now - t < 60]
-    if len(window) >= 30:
+    if not _location_put_attempts.allow((client_ip, cluster_id)):
         logging.warning(f"[CLUSTER-LOC] rate-limited update on {cluster_id} from {client_ip}")
         return jsonify({'error': 'Too many location updates — slow down'}), 429
-    window.append(now)
-    _location_put_attempts[key] = window
 
     data = request.get_json() or {}
     lat = data.get('latitude')

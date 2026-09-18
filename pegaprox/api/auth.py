@@ -438,7 +438,11 @@ def oidc_test_connection():
 # is uninitialised; closes itself once the first admin is created. Replaces
 # the old auto-bootstrapped `pegaprox/admin` default that exposed every
 # fresh install to a network-attacker race.
-_setup_attempts_by_ip = {}  # very light rate-limit, IP → list[ts]
+from pegaprox.utils.ratelimit import SlidingWindow as _SlidingWindow
+
+# very light rate-limit, keyed by an UNAUTHENTICATED remote IP - so it needs the
+# ceiling the plain dict never had (MK Sep 2026)
+_setup_attempts_by_ip = _SlidingWindow(limit=5, window=60, max_keys=2048, name='setup')
 
 
 @bp.route('/api/auth/setup', methods=['POST'])
@@ -466,12 +470,9 @@ def auth_setup():
     # crude per-IP rate-limit: max 5 attempts / 60s. Mostly hygiene; the real
     # race-window protection is the operator firewalling 5000 until setup
     # completes. Document that in the install guide.
-    window = [t for t in _setup_attempts_by_ip.get(client_ip, []) if now - t < 60]
-    if len(window) >= 5:
+    if not _setup_attempts_by_ip.allow(client_ip):
         logging.warning(f"[SETUP] rate-limited setup attempt from {client_ip}")
         return jsonify({'error': 'Too many attempts, slow down'}), 429
-    window.append(now)
-    _setup_attempts_by_ip[client_ip] = window
 
     data = request.get_json() or {}
     username = sanitize_username(str(data.get('username', '')).strip().lower(), max_length=64)

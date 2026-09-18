@@ -150,7 +150,7 @@ def get_security_status():
                 'enabled': API_RATE_LIMIT > 0,
                 'requests_per_window': API_RATE_LIMIT,
                 'window_seconds': API_RATE_WINDOW,
-                'active_clients': len(api_request_counts),
+                'active_clients': len(api_rate_window),
             }
         },
         'session_management': {

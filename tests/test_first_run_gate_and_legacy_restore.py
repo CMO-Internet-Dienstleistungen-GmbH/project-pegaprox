@@ -270,7 +270,10 @@ def marker(tmp_path, monkeypatch):
     import pegaprox.api.auth as apiauth
     path = str(tmp_path / '.admin_initialized')
     monkeypatch.setattr(authmod, 'ADMIN_INITIALIZED_FILE', path)
-    monkeypatch.setattr(apiauth, '_setup_attempts_by_ip', {})
+    # a fresh counter per test (it is a bounded SlidingWindow since Sep 2026, not a dict)
+    from pegaprox.utils.ratelimit import SlidingWindow
+    monkeypatch.setattr(apiauth, '_setup_attempts_by_ip',
+                        SlidingWindow(limit=5, window=60, max_keys=2048))
     return path
 
 
