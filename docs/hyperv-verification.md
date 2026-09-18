@@ -87,6 +87,43 @@ Read access to the VHDX files is a separate question from Hyper-V rights and
 belongs to sub-issue #20. `Get-VHD` reports metadata; it does not prove the
 migration can read the file bytes.
 
+### WinRM quotas
+
+PegaProx keeps up to `max_sessions` shells open to a host at once (1 to 8, default
+4; `docs/adr/0006-a-hyper-v-host-is-reached-over-a-pool-of-sessions.md`). Each is a
+WSMan shell owned by the configured account and counts against that account's
+quotas on the host. Two of them matter:
+
+- **`MaxShellsPerUser`** -- how many shells one account may hold. Microsoft
+  documents 30 as the default for the WinRM service. A PowerShell session
+  configuration (the `microsoft.powershell` plugin) carries a quota of its own,
+  and the lower of the two applies.
+- **`MaxConcurrentOperationsPerUser`** -- how many operations one account may run
+  at once across all its shells. Each running call is one operation.
+
+Read them rather than assume them; a hardened host may have them lowered:
+
+```powershell
+Get-Item WSMan:\localhost\Shell\MaxShellsPerUser
+Get-Item WSMan:\localhost\Service\MaxConcurrentOperationsPerUser
+Get-Item WSMan:\localhost\Plugin\microsoft.powershell\Quotas\MaxShellsPerUser
+```
+
+A host with the account at its quota refuses the next shell, and the call that
+wanted it fails as a transport error. Set the host's parallel sessions below the
+quota, less whatever other tooling uses the same account, and count every PegaProx
+instance that reaches the host: each keeps its own pool.
+
+What PegaProx holds at a given moment:
+
+```powershell
+Get-WSManInstance -ResourceURI shell -Enumerate |
+    Where-Object Owner -like '*<hyperv-account>' | Measure-Object
+```
+
+It never exceeds the configured number per PegaProx instance. None of this has
+been measured against a live host yet.
+
 ## Versions to measure
 
 The implementation must not guess these. `misc/hyperv_connectivity_check.py`

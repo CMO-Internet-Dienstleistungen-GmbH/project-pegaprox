@@ -12305,6 +12305,9 @@
                     // Left out, the field opened blank and saving the form wrote the blank
                     // back over the stored address.
                     transfer_host: host.transfer_host || '',
+                    // Left out, saving the form sent the default and reset a host that was
+                    // set to anything else.
+                    max_sessions: host.max_sessions || 4,
                 });
                 setShowHypervEdit(true);
             };
