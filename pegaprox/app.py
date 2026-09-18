@@ -844,6 +844,13 @@ def main(debug_mode=False):
         format='%(asctime)s [%(name)s] %(levelname)s: %(message)s' if debug_mode else '%(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
+    # MK Sep 2026 - CWE-117 at the sink. Names, URLs and error strings the caller chose
+    # reach log lines all over this tree; CR/LF forges a line and ESC repaints the
+    # operator's terminal. Guarding the call sites means seventy-five edits and a
+    # seventy-sixth somebody forgets, so it goes on the handlers instead. Tracebacks
+    # arrive via exc_info and keep their newlines.
+    from pegaprox.utils.sanitization import install_log_injection_filter
+    install_log_injection_filter()
 
     if not debug_mode:
         logging.getLogger('werkzeug').setLevel(logging.ERROR)

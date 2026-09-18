@@ -3,6 +3,7 @@
 PegaProx Input Sanitization - Layer 2
 """
 
+import logging
 import re
 import html
 
@@ -193,6 +194,11 @@ def sanitize_csv_field(value) -> str:
     return s
 
 
+# everything in C0 except tab, DEL, and the C1 range - ESC among them, which is what
+# every ANSI sequence starts with
+_CONTROL_CHARS_RE = re.compile(r'[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f-\x9f]')
+
+
 def sanitize_log_message(value) -> str:
     """Strip CR/LF from a value before writing it to the text audit log.
 
@@ -213,7 +219,12 @@ def sanitize_log_message(value) -> str:
     s = str(value)
     s = s.replace('\r', ' ').replace('\n', ' ')
     s = s.replace('\u2028', ' ').replace('\u2029', ' ')
-    return s
+    # MK Sep 2026 - and the rest of the control range. A name carrying \x1b[2K\r does not
+    # just add a line, it rewrites what the operator sees in their terminal: erase the
+    # line, move the cursor, repaint something else, set the window title. Stripping CR
+    # and LF stopped the forged LINE and left the forged SCREEN. Tab stays: it is
+    # legitimate in action strings and cannot move a cursor about.
+    return _CONTROL_CHARS_RE.sub(' ', s)
 
 
 
@@ -306,3 +317,39 @@ def redact_url(value):
     return re.sub(
         r'(https?)://(?:([^/@\s]+)@)?([A-Za-z0-9_.\-:\[\]]+)([^\s\'"<>]*)',
         _one, text)
+
+
+class LogInjectionFilter(logging.Filter):
+    """Neutralise control characters on every log record, at the sink.
+
+    Fourteen findings named fourteen files for the same thing: a name, a URL, an error
+    string the caller chose ends up in a log line, and CR/LF lets them forge a line
+    while ESC lets them repaint the operator's terminal. Wrapping the call sites means
+    seventy-five edits and a seventy-sixth that somebody forgets next month, so this
+    sits on the root logger instead and covers the ones written after today too.
+
+    Deliberately only `msg` and `args`. A traceback arrives through exc_info and is
+    appended by the formatter afterwards, so it keeps its newlines - it is ours, not
+    the caller's, and an unreadable traceback helps nobody. MK Sep 2026
+    """
+
+    def filter(self, record):
+        if isinstance(record.msg, str):
+            record.msg = sanitize_log_message(record.msg)
+        if record.args:
+            if isinstance(record.args, dict):
+                record.args = {k: (sanitize_log_message(v) if isinstance(v, str) else v)
+                               for k, v in record.args.items()}
+            elif isinstance(record.args, tuple):
+                record.args = tuple(sanitize_log_message(a) if isinstance(a, str) else a
+                                    for a in record.args)
+        return True
+
+
+def install_log_injection_filter(logger=None):
+    """Attach the filter to a logger's handlers (root by default). Idempotent."""
+    target = logger if logger is not None else logging.getLogger()
+    for handler in target.handlers:
+        if not any(isinstance(f, LogInjectionFilter) for f in handler.filters):
+            handler.addFilter(LogInjectionFilter())
+    return target
