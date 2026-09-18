@@ -20,6 +20,7 @@ and says what it saw.
 from __future__ import annotations
 
 import logging
+import threading
 
 from pegaprox.core import hyperv_scripts as scripts
 from pegaprox.core import hyperv_tasks
@@ -333,6 +334,16 @@ class HyperVManager:
         self.cluster_id = cluster_id
         self.host = host
         self._client = client
+        # One lock per VM for everything that changes a VM or attaches its disks. With
+        # several sessions to a host, two inspections of the same VM would otherwise run at
+        # once, and two Mount-VHD on one file lock each other out. Reads take no lock: they
+        # can run side by side on the same VM, which is the point of having the sessions.
+        self._vm_locks: dict[str, threading.Lock] = {}
+        self._vm_locks_guard = threading.Lock()
+
+    def _vm_lock(self, vm_guid: str) -> threading.Lock:
+        with self._vm_locks_guard:
+            return self._vm_locks.setdefault(vm_guid.lower(), threading.Lock())
 
     # -- the two ways a script reaches the host -----------------------------------------
     #
@@ -345,7 +356,8 @@ class HyperVManager:
             return self._client.run_json(script, **parameters)
 
     def _act(self, task_type: str, vm_guid: str, script: str, description: str, **parameters):
-        with hyperv_tasks.track(self.cluster_id, task_type, vm_guid):
+        # The VM lock is taken inside the task, so waiting for it shows as waiting.
+        with hyperv_tasks.track(self.cluster_id, task_type, vm_guid), self._vm_lock(vm_guid):
             return self._client.run_action(script, description, **parameters)
 
     # -- reading ---------------------------------------------------------------------
