@@ -52,8 +52,15 @@ def _fire_webhook(url):
             return
         # M-8: don't follow a 30x to an internal host (the guard above only
         # validates the first hop).
-        requests.post(url, json={'event': 'site_recovery', 'timestamp': datetime.utcnow().isoformat()},
-                      timeout=30, allow_redirects=False)
+        # MK Sep 2026 - nothing here reads the response, but without stream=True requests
+        # downloads the whole body anyway. The URL is operator-configured and the guard
+        # above only decides where it may point, not what comes back, so a webhook that
+        # answers with a gigabyte would take the failover worker with it. Ask for the
+        # headers, then close.
+        _wh = requests.post(url, json={'event': 'site_recovery',
+                                       'timestamp': datetime.utcnow().isoformat()},
+                            timeout=30, allow_redirects=False, stream=True)
+        _wh.close()
     except Exception as e:
         logger.warning(f"[SR] Webhook failed: {url} - {e}")
 

@@ -1423,13 +1423,19 @@ def download_pbs_file(pbs_id, store):
         filename = _re.sub(r'["\r\n\x00-\x1f]', '', filename)  # NS Feb 2026 - strip control chars
         content_type = resp.headers.get('content-type', 'application/octet-stream')
         from flask import Response
+        # MK Sep 2026 - api_get_raw already asks PBS for a streamed response, and its
+        # docstring says the point is to stream it on to the client. `resp.content`
+        # threw that away: it pulls the WHOLE file into the hub's memory first, so a
+        # file-level restore of anything large is a self-inflicted outage. Hand the
+        # iterator to Flask instead and keep the length only when PBS told us one.
+        _len = resp.headers.get('content-length')
+        _headers = {'Content-Disposition': f'attachment; filename="{filename}"'}
+        if _len:
+            _headers['Content-Length'] = _len
         return Response(
-            resp.content,
+            resp.iter_content(chunk_size=64 * 1024),
             mimetype=content_type,
-            headers={
-                'Content-Disposition': f'attachment; filename="{filename}"',
-                'Content-Length': str(len(resp.content))
-            }
+            headers=_headers,
         )
     except Exception as e:
         logging.error(f"[PBS:{pbs_id}] File download error: {e}")
