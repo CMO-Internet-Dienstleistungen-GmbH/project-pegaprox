@@ -167,3 +167,74 @@ def test_the_api_limiter_is_the_shared_one():
     body = inspect.getsource(app._check_api_rate_limit)
     assert 'api_rate_window.allow(' in body
     assert 'api_request_counts' not in body
+
+
+# --- the auth-action limiter (found by the 19.09. scan, not by the first sweep) ------
+
+def test_the_auth_action_limiter_is_bounded():
+    """check_auth_action_rate_limit was the ninth copy and the only one reachable
+    WITHOUT a session: /api/webauthn/auth/begin keys it by raw client IP. A rotating
+    source therefore grew the map for free, which is the exact thing SlidingWindow
+    exists to stop.
+
+    Deliberately measured as a PROPERTY of the module rather than by reaching for a
+    known attribute: the first version of this asserted on the new store's name, so it
+    went red against the old code with an AttributeError instead of on the leak, which
+    proves nothing about the leak."""
+    import pegaprox.utils.ssh as sshmod
+
+    def retained():
+        """Total keys the module is holding, whatever it keeps them in."""
+        total = 0
+        for value in vars(sshmod).values():
+            if isinstance(value, dict):
+                for inner in list(value.values()) + [value]:
+                    if isinstance(inner, SlidingWindow):
+                        total += len(inner)
+                if value and all(isinstance(v, list) for v in value.values()):
+                    total += len(value)          # the longhand key -> [timestamps] map
+        return total
+
+    before = retained()
+    for n in range(9000):
+        sshmod.check_auth_action_rate_limit(f'webauthn_begin:2001:db8::{n:x}',
+                                            max_attempts=20, window=300)
+
+    grew_by = retained() - before
+    assert grew_by < 9000, (
+        f'9000 distinct anonymous keys added {grew_by} retained entries - the limiter '
+        'still grows without bound')
+
+
+def test_the_budget_itself_is_unchanged():
+    """Tightening the store must not tighten the policy - the callers rely on these
+    exact budgets (5/300 for password change, 3/120 for TOTP, 20/300 for webauthn)."""
+    import pegaprox.utils.ssh as sshmod
+    sshmod._auth_action_windows.clear()
+
+    assert all(sshmod.check_auth_action_rate_limit('pwd_change:bob', 5, 300)
+               for _ in range(5))
+    assert not sshmod.check_auth_action_rate_limit('pwd_change:bob', 5, 300)
+    # a different principal is untouched
+    assert sshmod.check_auth_action_rate_limit('pwd_change:alice', 5, 300)
+
+
+def test_the_buckets_do_not_bleed_into_each_other():
+    """Three call sites, three (max_attempts, window) pairs. A TOTP attempt must not
+    spend the password-change budget for the same username."""
+    import pegaprox.utils.ssh as sshmod
+    sshmod._auth_action_windows.clear()
+
+    for _ in range(3):
+        sshmod.check_auth_action_rate_limit('totp_verify:bob', 3, 120)
+    assert not sshmod.check_auth_action_rate_limit('totp_verify:bob', 3, 120)
+    assert sshmod.check_auth_action_rate_limit('pwd_change:bob', 5, 300)
+
+
+def test_the_shadowed_global_is_gone():
+    """ssh.py imported _auth_action_attempts from globals and then redefined it one
+    screen later, so the two names pointed at different dicts and utils/auth.py held a
+    reference to the dead one. Nothing should import it any more."""
+    import pegaprox.utils.ssh as sshmod
+
+    assert not hasattr(sshmod, '_auth_action_attempts')

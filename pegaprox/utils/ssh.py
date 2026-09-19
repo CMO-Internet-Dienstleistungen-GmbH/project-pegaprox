@@ -14,7 +14,6 @@ from pegaprox.constants import SSH_MAX_CONCURRENT
 from pegaprox.utils.ssh_security import apply_host_key_policy, persist_host_keys, verify_transport_host_key
 from pegaprox.globals import (
     _ssh_active_connections, _ssh_connection_lock,
-    _auth_action_attempts, _auth_action_lock,
     cluster_managers,
 )
 
@@ -43,23 +42,32 @@ def _ssh_track_connection(conn_type: str, delta: int):
 # NS: Feb 2026 - Rate limiter for authenticated security actions
 # Prevents brute-force of TOTP codes, passwords via 2FA disable/password change
 # These endpoints require a session, but a stolen session could be used to brute-force
-_auth_action_attempts = {}  # key -> [timestamps]
+#
+# MK Sep 2026 - this was the last of the longhand limiters and it was the one that
+# mattered most: /api/webauthn/auth/begin calls it with the raw client IP and that route
+# takes no session, so an anonymous caller rotating source addresses grew the map for
+# free. Over IPv6 that is a /64 worth of keys and nothing ever removed one. Same shape
+# the SlidingWindow module was written for, so use it here too rather than keep a ninth
+# copy. One window per (max_attempts, window) pair - the call sites use three fixed
+# pairs, so that registry is bounded by the code, not by anything a caller sends.
+_auth_action_windows = {}
 _auth_action_lock = threading.Lock()
 
+
 def check_auth_action_rate_limit(key: str, max_attempts: int = 5, window: int = 300) -> bool:
-    """Simple sliding window rate limiter for auth actions (2FA verify, pwd change, etc.)
-    MK: 5 attempts per 5 min by default, should be enough for typos but stops brute force
+    """Sliding window rate limiter for auth actions (2FA verify, pwd change, webauthn).
+    MK: 5 attempts per 5 min by default, should be enough for typos but stops brute force.
+    Keys are capped, so the limiter cannot itself be used to exhaust us.
     """
-    now = time.time()
+    from pegaprox.utils.ratelimit import SlidingWindow
+    bucket = (int(max_attempts), int(window))
     with _auth_action_lock:
-        if key not in _auth_action_attempts:
-            _auth_action_attempts[key] = []
-        attempts = [t for t in _auth_action_attempts[key] if now - t < window]
-        if len(attempts) >= max_attempts:
-            return False
-        attempts.append(now)
-        _auth_action_attempts[key] = attempts
-        return True
+        win = _auth_action_windows.get(bucket)
+        if win is None:
+            win = SlidingWindow(limit=max_attempts, window=window, max_keys=4096,
+                                name=f'auth-action-{max_attempts}/{window}')
+            _auth_action_windows[bucket] = win
+    return win.allow(key)
 
 # Global sessions store
 # MK: this is in-memory, will be lost on restart
