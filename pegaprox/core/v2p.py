@@ -20,6 +20,7 @@ from pegaprox.utils.ssh import _ssh_exec, _pve_node_exec
 from pegaprox.utils.realtime import broadcast_sse
 from pegaprox.utils.audit import log_audit
 from pegaprox.core import hyperv_drivers
+from pegaprox.core.virtio_firstboot import (FIRST_BOOT_SCRIPT_NAME, FIRST_BOOT_SERVICE, FIRST_BOOT_SERVICE_COMMAND, first_boot_script_staging as _first_boot_script_staging)  # Fork patch #15
 
 
 class V2PCutoverCancelled(Exception):
@@ -2734,19 +2735,21 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
         "  cp -f \"$ISO_MNT/guest-agent/qemu-ga-x86_64.msi\" \"$PEGADIR/qemu-ga-x86_64.msi\" "
         "    && echo 'AGENT_STAGED qemu-ga-x86_64.msi'; "
         "else echo 'AGENT_MISSING (no guest-agent/qemu-ga-x86_64.msi on the ISO)'; fi\n"
-        # Register the one-shot service in the SYSTEM hive.
-        # ImagePath runs as LocalSystem at next boot; cmd /c chains:
-        #   msiexec drivers → msiexec agent → sc config → sc delete self → del MSIs
-        # Self-deletion needs the service to have already returned, hence the
-        # trailing & chain.
+        # Fork patch #15 — the first-boot install is a script of its own; see virtio_firstboot.
+        "if [ \"$MSI_OK\" -eq 1 ]; then " + _first_boot_script_staging('PEGADIR') + "fi\n"
+        # Register the one-shot service in the SYSTEM hive. It runs as LocalSystem at
+        # next boot and only launches firstboot.ps1, which installs, arms the boot
+        # drivers and deletes the service.
         "SYSTEM_HIVE=\"$WIN_MNT/$WDIR/System32/config/SYSTEM\"\n"
-        "python3 - \"$SYSTEM_HIVE\" \"$MSI_OK\" << 'PYSV' || { echo 'SVC_FAILED (non-fatal)'; }\n"
-        "import sys, hivex\n"
+        "python3 - \"$SYSTEM_HIVE\" \"$MSI_OK\" \"$PEGADIR\" << 'PYSV' || { echo 'SVC_FAILED (non-fatal)'; }\n"
+        "import os, sys, hivex\n"
         "from hivex.hive_types import REG_DWORD, REG_SZ, REG_EXPAND_SZ\n"
         "h = hivex.Hivex(sys.argv[1], write=True)\n"
         "msi_ok = int(sys.argv[2])\n"
         "if msi_ok == 0:\n"
         "    print('skipping service — no MSI'); sys.exit(0)\n"
+        "if not os.path.isfile(os.path.join(sys.argv[3], '" + FIRST_BOOT_SCRIPT_NAME + "')):\n"
+        "    print('skipping service — no first-boot script'); sys.exit(0)\n"
         "def fc(p, n): return h.node_get_child(p, n)\n"
         "def navigate(parent, parts):\n"
         "    n = parent\n"
@@ -2761,39 +2764,7 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
         "    h.node_set_value(node, {'key': k, 't': REG_SZ, 'value': (v + chr(0)).encode('utf-16-le')})\n"
         "def set_exp(node, k, v):\n"
         "    h.node_set_value(node, {'key': k, 't': REG_EXPAND_SZ, 'value': (v + chr(0)).encode('utf-16-le')})\n"
-        # NS May 2026 — after MSI install, also flip vioscsi/viostor to Start=0
-        # (boot-critical). MSI registers them as Start=3 (manual), which means
-        # if the user later switches scsihw to virtio-scsi-*, Windows boot
-        # loader can't find a boot-time storage driver → INACCESSIBLE_BOOT_DEVICE.
-        # Pre-arming Start=0 means the controller switch "just works" without
-        # any manual `sc config` step on the customer side.
-        "cmdline = (\n"
-        "    'cmd.exe /c '\n"
-        # Fork patch #15 — `start "" /wait` on each install. msiexec is a GUI program and
-        # cmd /c does not wait for one, so both installers ran three seconds apart and the
-        # agent's COM registration failed with ERROR_SERVICE_DATABASE_LOCKED.
-        "    '(start \"\" /wait msiexec /i \"C:\\\\qemu\\\\virtio-win-gt-x64.msi\" '\n"
-        "    'ADDLOCAL=ALL /quiet /norestart /l*v \"C:\\\\qemu\\\\msi.log\") & '\n"
-        # 0 and 3010 (installed, restart required) are success; anything else leaves a
-        # marker. `if errorlevel N` means N or higher and is read when the step runs, where
-        # %ERRORLEVEL% would be expanded once, when cmd parses the whole line.
-        "    '(if errorlevel 1 if not errorlevel 3010 type nul > \"C:\\\\qemu\\\\install-failed\") & '\n"
-        "    '(if errorlevel 3011 type nul > \"C:\\\\qemu\\\\install-failed\") & '\n"
-        # After the driver MSI, which installs the VirtIO serial driver the agent talks over.
-        "    '(if exist \"C:\\\\qemu\\\\qemu-ga-x86_64.msi\" start \"\" /wait msiexec /i '\n"
-        "    '\"C:\\\\qemu\\\\qemu-ga-x86_64.msi\" /quiet /norestart '\n"
-        "    '/l*v \"C:\\\\qemu\\\\qemu-ga.log\") & '\n"
-        "    '(if errorlevel 1 if not errorlevel 3010 type nul > \"C:\\\\qemu\\\\install-failed\") & '\n"
-        "    '(if errorlevel 3011 type nul > \"C:\\\\qemu\\\\install-failed\") & '\n"
-        "    '(sc config vioscsi start= boot >> \"C:\\\\qemu\\\\bootarm.log\" 2>&1) & '\n"
-        "    '(sc config viostor start= boot >> \"C:\\\\qemu\\\\bootarm.log\" 2>&1) & '\n"
-        "    '(sc delete PegaProxFirstBoot >> \"C:\\\\qemu\\\\service.log\" 2>&1) & '\n"
-        "    '(del \"C:\\\\qemu\\\\virtio-win-gt-x64.msi\" 2>nul) & '\n"
-        "    '(del \"C:\\\\qemu\\\\qemu-ga-x86_64.msi\" 2>nul) & '\n"
-        # Nothing of the import stays on a guest that installed cleanly; one that did not
-        # keeps its logs.
-        "    '(if not exist \"C:\\\\qemu\\\\install-failed\" rmdir /s /q \"C:\\\\qemu\")'\n"
-        ")\n"
+        "cmdline = " + repr(FIRST_BOOT_SERVICE_COMMAND) + "\n"
         # Same reasoning as the driver registration above: the set that will be active is
         # not knowable here, so every set that exists gets the entry.
         "for cs in [c for c in h.node_children(h.root())\n"
@@ -2801,7 +2772,7 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
         "           and h.node_name(c)[len('controlset'):].isdigit()]:\n"
         "    services = fc(cs, 'Services')\n"
         "    if services is None: continue\n"
-        "    svc = navigate(services, ['PegaProxFirstBoot'])\n"
+        "    svc = navigate(services, [" + repr(FIRST_BOOT_SERVICE) + "])\n"
         "    set_sz(svc, 'DisplayName', 'PegaProx First-Boot Driver Install')\n"
         "    set_dword(svc, 'Type', 0x10)\n"
         "    set_dword(svc, 'Start', 2)\n"
@@ -2853,7 +2824,7 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
     # Most markers are once-per-run; COPIED/SKIP/COPY_FAILED are per-driver
     # so we log all of them (otherwise we'd hide which drivers actually staged).
     _multi = ('COPIED ', 'SKIP ', 'COPY_FAILED ', 'BOOT_SIGNATURE_MISSING ')
-    for marker in ['WIN_PART=', 'WINDOWS_PARTITION_NOT_IDENTIFIED', 'WDIR=', 'VER_NAME=', 'VER_BUILD=', 'SUBDIR_PRIMARY=', 'SUBDIR_FALLBACKS=', 'SUBDIR=', 'COPIED ', 'SKIP ', 'COPY_FAILED ', 'MSI_STAGED ', 'MSI_MISSING', 'AGENT_STAGED ', 'AGENT_MISSING', 'SVC_REGISTERED', 'SVC_FAILED', 'BOOT_SIGNATURE_MISSING ', 'HIVEX have_', 'INJECTION_OK']:
+    for marker in ['WIN_PART=', 'WINDOWS_PARTITION_NOT_IDENTIFIED', 'WDIR=', 'VER_NAME=', 'VER_BUILD=', 'SUBDIR_PRIMARY=', 'SUBDIR_FALLBACKS=', 'SUBDIR=', 'COPIED ', 'SKIP ', 'COPY_FAILED ', 'MSI_STAGED ', 'MSI_MISSING', 'AGENT_STAGED ', 'AGENT_MISSING', 'FIRSTBOOT_STAGED ', 'FIRSTBOOT_FAILED ', 'SVC_REGISTERED', 'SVC_FAILED', 'BOOT_SIGNATURE_MISSING ', 'HIVEX have_', 'INJECTION_OK']:
         for line in out_str.splitlines():
             if marker in line:
                 task.log(f"[VirtIO] {line.strip()}")
