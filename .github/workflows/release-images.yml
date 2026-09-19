@@ -53,11 +53,15 @@ jobs:
             REL="false"
           fi
           # NS Sep 2026 - the env-var quoting above only protects THIS step. Once $V
-          # is in GITHUB_OUTPUT the later steps read it back with a bare ${{ }} inside
+          # is in GITHUB_OUTPUT the later steps read it back as a bare expression inside
           # their run blocks (the gyptazy poll below, and the artifact names in
           # build-lxc/build-vm), where a single quote in the tag breaks straight out of
           # the surrounding shell string. Cheaper to refuse a tag we would never cut
           # than to chase every sink: semver with an optional v, or our dev stamp.
+          # And note what broke this file for a day: the expression braces are evaluated
+          # inside a run block too, comment or not. Only a YAML-level comment is safe to
+          # write them in - which is exactly what the note at the top of this step says,
+          # and I wrote the example into the wrong kind of comment anyway.
           if ! printf '%s' "$V" | grep -qE '^(v?[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9]+)*(\+[A-Za-z0-9.-]+)?|dev-[0-9]{8}-[0-9]{6})$'; then
             echo "::error::refusing version '$V' - expected v1.2.3 / 1.2.3-rc1 or dev-YYYYMMDD-HHMMSS"
             exit 1
