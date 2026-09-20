@@ -22,6 +22,31 @@ from pegaprox.utils.ssh import read_capped as _read_capped
 
 bp = Blueprint('datacenter', __name__)
 
+# MK Sep 2026 - every SDN id here arrives as a URL path segment and is then interpolated
+# into the PVE API path we speak with the cluster's stored root credential. requests
+# resolves dot segments before sending, so an id of ".." moves the whole PUT or DELETE one
+# level up the SDN tree and onto a sibling collection - measured, not assumed. The router
+# refuses a slash, so it is one level per request rather than the walk the snapshot name
+# allowed, but it is the same class and the same fix.
+#
+# Deliberately here rather than at each of the eighteen handlers: the nineteenth is the one
+# that would have been forgotten. subnet_id is excluded because it legitimately contains a
+# slash (it is a CIDR) and its handler already percent-encodes it.
+_SDN_ID_PARAMS = ('zone_id', 'vnet_id', 'fabric_id', 'controller_id', 'ipam_id', 'dns_id')
+
+
+@bp.before_request
+def _reject_unusable_sdn_ids():
+    from pegaprox.utils.sanitization import validate_sdn_id
+    for key in _SDN_ID_PARAMS:
+        val = (request.view_args or {}).get(key)
+        if val is not None and not validate_sdn_id(val):
+            logging.warning("[SDN] refused %s=%r on %s - not a usable SDN id",
+                            key, val, request.path)
+            return jsonify({'error': f'invalid {key}'}), 400
+    return None
+
+
 
 def _list_cluster_node_names(manager):
     """Return node names from the cluster-wide /nodes endpoint."""

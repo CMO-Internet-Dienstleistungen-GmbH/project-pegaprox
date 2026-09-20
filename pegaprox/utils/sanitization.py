@@ -166,6 +166,24 @@ def validate_snapshot_name(value) -> bool:
     return bool(_SNAPSHOT_NAME_RE.match(value))
 
 
+# MK Sep 2026 - SDN object ids arrive as a URL path segment and are then interpolated into
+# the PVE API path, which we speak with the cluster's stored root credential. requests
+# resolves dot segments before it sends, so an id of ".." moves the whole PUT or DELETE one
+# level up the SDN tree - the same shape as the snapshot-name traversal, caught earlier this
+# time because the router will not pass a slash. Proxmox publishes the grammar itself
+# (pve-sdn-vnet-id is [a-zA-Z][a-zA-Z0-9]*[a-zA-Z0-9]); dash and underscore are allowed here
+# too so an id someone already created is not suddenly refused. A dot never is.
+_SDN_ID_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_\-]{0,62}$')
+
+
+def validate_sdn_id(value) -> bool:
+    """True if `value` is usable as a single PVE SDN path segment (zone, vnet, fabric,
+    controller, ipam, dns). Rejects dot segments, empties and anything with a separator."""
+    if not value or not isinstance(value, str):
+        return False
+    return bool(_SDN_ID_RE.match(value))
+
+
 def sanitize_csv_field(value) -> str:
     """Sanitize field for CSV export to prevent formula injection.
     
