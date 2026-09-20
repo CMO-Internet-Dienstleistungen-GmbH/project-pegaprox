@@ -16883,6 +16883,13 @@
                                                                             <th onClick={() => toggleSnapshotSort('snapshot_name')} className={isCorporate ? '' : 'px-4 py-3 text-left cursor-pointer hover:text-white'}>
                                                                                 Snapshot {snapshotSortBy === 'snapshot_name' && (snapshotSortDir === 'asc' ? '↑' : '↓')}
                                                                             </th>
+                                                                            {/* fork patch (issue #39): author + description, same fallbacks as the VM view */}
+                                                                            <th onClick={() => toggleSnapshotSort('author')} className={isCorporate ? '' : 'px-4 py-3 text-left cursor-pointer hover:text-white'}>
+                                                                                {t('snapshotAuthor') || 'Created by'} {snapshotSortBy === 'author' && (snapshotSortDir === 'asc' ? '↑' : '↓')}
+                                                                            </th>
+                                                                            <th className={isCorporate ? '' : 'px-4 py-3 text-left'}>
+                                                                                {t('description') || 'Description'}
+                                                                            </th>
                                                                             <th onClick={() => toggleSnapshotSort('snapshot_date')} className={isCorporate ? '' : 'px-4 py-3 text-left cursor-pointer hover:text-white'}>
                                                                                 {t('snapshotsDate') || 'Created'} {snapshotSortBy === 'snapshot_date' && (snapshotSortDir === 'asc' ? '↑' : '↓')}
                                                                             </th>
@@ -16922,6 +16929,12 @@
                                                                                 </td>
                                                                                 <td className={isCorporate ? '' : 'px-4 py-3 text-gray-300'}>{snap.node ?? '-'}</td>
                                                                                 <td className={isCorporate ? 'corp-snap-mono' : 'px-4 py-3 font-mono text-gray-200'}>{snap.snapshot_name ?? '-'}</td>
+                                                                                <td className={isCorporate ? '' : 'px-4 py-3 text-gray-300'}>
+                                                                                    <SnapshotAuthor snap={snap} t={t} />
+                                                                                </td>
+                                                                                <td className={isCorporate ? '' : 'px-4 py-3 text-gray-300'} style={{maxWidth: '22rem'}}>
+                                                                                    <SnapshotDescription text={snap.description} t={t} />
+                                                                                </td>
                                                                                 <td className={isCorporate ? '' : 'px-4 py-3 text-gray-300'}>{snap.snapshot_date ?? '-'}</td>
                                                                                 <td className={isCorporate ? 'corp-snap-age' : 'px-4 py-3 text-yellow-400'}>{snap.age ?? '-'}</td>
                                                                                 <td className={isCorporate ? 'corp-snap-action' : 'px-4 py-3 text-right'}>
