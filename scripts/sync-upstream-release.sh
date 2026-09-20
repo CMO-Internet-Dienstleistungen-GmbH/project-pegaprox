@@ -20,6 +20,12 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 
 CONFIG_FILE="${SYNC_CONFIG:-$REPO_ROOT/patches.yml}"
+# The suite peaks around 450 concurrently open files. macOS hands a process
+# started from a terminal a soft limit of 256 (launchctl limit maxfiles), so
+# the run has to raise its own before pytest, and refuse to judge a tree it
+# cannot test properly.
+FD_LIMIT_WANTED=4096
+FD_LIMIT_REQUIRED=1024
 DO_PUSH=0
 CHECK_ONLY=0
 SKIP_TESTS=0
@@ -381,6 +387,21 @@ ok "built $(git -C "$WORKTREE" log -1 --format=%h) on $RELEASE_TAG"
 # ------------------------------------------------------------------ verify
 
 if [ "$SKIP_TESTS" -eq 0 ] && { [ "$RUN_PYTEST" = "True" ] || [ "$RUN_PYTEST" = "true" ]; }; then
+    # Without this the same tree passes or fails depending only on which shell
+    # started the run: a terminal gives 256 descriptors, enough for four fifths
+    # of the suite, and the exhaustion then surfaces as a cascade of unrelated
+    # errors ending in EMFILE inside pytest's teardown -- which reads like a
+    # broken tree rather than a missing resource. Refuse rather than report a
+    # red suite we caused ourselves.
+    if [ "$(ulimit -Sn)" -lt "$FD_LIMIT_WANTED" ]; then
+        ulimit -Sn "$FD_LIMIT_WANTED" 2>/dev/null \
+            || ulimit -Sn "$(ulimit -Hn)" 2>/dev/null \
+            || true
+    fi
+    fd_limit="$(ulimit -Sn)"
+    [ "$fd_limit" = unlimited ] || [ "$fd_limit" -ge "$FD_LIMIT_REQUIRED" ] \
+        || die "only $fd_limit open files allowed, need $FD_LIMIT_REQUIRED — raise the hard limit and run again"
+
     info "running the test suite (isolated venv, like upstream CI)"
     (
         cd "$WORKTREE"
