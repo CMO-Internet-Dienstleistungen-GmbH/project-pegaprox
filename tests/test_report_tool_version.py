@@ -62,3 +62,32 @@ def test_the_bundle_carries_the_current_version():
         f"stale one")
     src = _CONST.read_text(encoding='utf-8')
     assert f'"{want}"' in src, 'web/src/constants.js is behind version.json'
+
+
+def test_every_place_that_carries_the_version_agrees_with_version_json():
+    """version.json is the release; five other files repeat it and used to drift.
+
+    The backend constant is the one that costs something. The update check compares
+    PEGAPROX_VERSION from constants.py against the version.json served by the mirror, so
+    if the constant is left behind at release time every install reports "update
+    available" forever - including right after it updated. update.sh does not catch it
+    either; its post-update check reads version.json, not the constant.
+
+    1.1.1 shipped with PEGAPROX_BUILD still on 1.1.0's date for exactly this reason:
+    nothing was watching. NS
+    """
+    import json
+    want = json.loads((_ROOT / 'version.json').read_text(encoding='utf-8'))['version']
+
+    backend = (_ROOT / 'pegaprox' / 'constants.py').read_text(encoding='utf-8')
+    m = re.search(r'^PEGAPROX_VERSION\s*=\s*"([^"]+)"', backend, re.M)
+    assert m, 'no PEGAPROX_VERSION in pegaprox/constants.py'
+    assert m.group(1) == want, (
+        f"pegaprox/constants.py says {m.group(1)}, version.json says {want} - the update "
+        f"check would offer an update that is already installed")
+
+    readme = (_ROOT / 'README.md').read_text(encoding='utf-8')
+    badge = re.search(r'badge/version-([0-9][^-\s]*)-blue', readme)
+    assert badge, 'no version badge in README.md'
+    assert badge.group(1) == want, \
+        f"README badge says {badge.group(1)}, version.json says {want}"

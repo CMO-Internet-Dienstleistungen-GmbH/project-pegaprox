@@ -8,8 +8,8 @@ import os
 from pathlib import Path
 
 # Version
-PEGAPROX_VERSION = "1.1.1"
-PEGAPROX_BUILD = "2026.08.30"
+PEGAPROX_VERSION = "1.2.0"
+PEGAPROX_BUILD = "2026.09.20"
 
 # File Paths & Directories
 CONFIG_DIR = 'config'
