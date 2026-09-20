@@ -496,6 +496,10 @@ def _tcp_listener(host, port):
             time.sleep(0.1)
 
 
+SYSLOG_SETTINGS_ATTEMPTS = 10      # 10 x 30s = 5 min, dann bleibt der Port zu
+SYSLOG_SETTINGS_RETRY_S = 30
+
+
 def _syslog_loop():
     """Main syslog server loop — runs UDP + TCP in gevent greenlets"""
     import gevent
@@ -504,13 +508,36 @@ def _syslog_loop():
     # enabled. Default True keeps existing behaviour (the receiver has always
     # been on); operators who don't ingest syslog can close the port. The
     # per-packet DoS is fixed regardless by the queue+batched-drain above.
-    try:
-        from pegaprox.api.helpers import load_server_settings
-        if not load_server_settings().get('syslog_enabled', True):
-            logging.info("[Syslog] disabled (syslog_enabled=false) — not binding 1514")
-            return
-    except Exception:
-        pass  # settings unreadable at boot → fall through to default-on
+    # MK Sep 2026 - the old version swallowed a failed settings read and fell through to
+    # default-on, which binds an UNAUTHENTICATED port on a box whose operator may have
+    # switched it off on purpose. An error must not overrule an explicit choice. The
+    # default-on only applies when we actually managed to read and found nothing, so on a
+    # read failure keep retrying rather than guessing - a transient problem at boot heals
+    # itself within a few minutes, and a persistent one leaves the port closed and says so.
+    _settings = None
+    for _attempt in range(SYSLOG_SETTINGS_ATTEMPTS):
+        try:
+            from pegaprox.api.helpers import load_server_settings
+            _settings = load_server_settings()
+            break
+        except Exception as _e:
+            logging.warning(
+                "[Syslog] cannot read server settings (attempt %d/%d): %s - not binding "
+                "1514 until we know whether it is wanted",
+                _attempt + 1, SYSLOG_SETTINGS_ATTEMPTS, _e)
+            gevent.sleep(SYSLOG_SETTINGS_RETRY_S)
+
+    if _settings is None:
+        logging.error(
+            "[Syslog] server settings still unreadable after %ds - receiver stays down. "
+            "It is not starting an unauthenticated listener it cannot confirm is wanted; "
+            "fix the settings store and restart.",
+            SYSLOG_SETTINGS_ATTEMPTS * SYSLOG_SETTINGS_RETRY_S)
+        return
+
+    if not _settings.get('syslog_enabled', True):
+        logging.info("[Syslog] disabled (syslog_enabled=false) — not binding 1514")
+        return
 
     _init_db()
 

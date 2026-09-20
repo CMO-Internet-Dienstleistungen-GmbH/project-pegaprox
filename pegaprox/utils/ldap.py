@@ -126,6 +126,20 @@ def ldap_authenticate(username: str, password: str) -> dict:
             if validate == ssl_module.CERT_NONE:
                 logging.warning("[LDAP] TLS certificate verification disabled - MITM risk")
             tls_config = Tls(validate=validate)
+        else:
+            # MK Sep 2026 - the warning above only fires INSIDE the TLS branch, so the one
+            # configuration that has no protection at all was the only one that said nothing.
+            # Both toggles default to off, which makes this the state an operator lands in by
+            # filling in a server and a bind DN and touching nothing else. Three binds follow
+            # on this connection and the middle one carries the END USER'S password, not just
+            # ours. Refusing outright would break installs that run LDAP on a trusted segment
+            # on purpose, so this says it loudly instead and leaves that call to a release.
+            logging.warning(
+                "[LDAP] neither ldap_use_ssl nor ldap_use_starttls is set for %s:%s - the "
+                "service-account bind DN and password, every user password checked against "
+                "this directory, and the group lookup all cross the network in plaintext. "
+                "Enable LDAPS or STARTTLS in Settings unless this link is physically trusted.",
+                server_url, port)
         
         server = Server(server_url, port=port, use_ssl=ldap_config['use_ssl'], 
                        tls=tls_config, get_info=ALL, connect_timeout=10)
