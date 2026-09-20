@@ -798,6 +798,7 @@
                     fetchServerSettings();
                     fetchPlugins();
                     fetchTenants();
+                    fetchMyTenants();
                     fetchPermissions();
                     fetchClusters();
                     fetchClusterGroups();
@@ -849,6 +850,19 @@
                     if(r.ok) setTenants(await r.json());
                     else console.warn('Failed to fetch tenants:', r.status);
                 } catch(e) { console.error('fetchTenants error:', e); }
+            };
+
+            // NS Sep 2026 — which tenants this account actually acts in: its own plus any it was
+            // delegated into via tenant_permissions. /api/tenants cannot answer that (it lists
+            // what you may SEE, and for a non-admin that is home + default), so someone delegated
+            // into a second tenant had no way to find out they were. Display only — the backend
+            // keeps deriving the acting tenant from the session, this changes no permission.
+            const [myTenants, setMyTenants] = useState({ tenants: [], home: '' });
+            const fetchMyTenants = async () => {
+                try {
+                    const r = await fetch(`${API_URL}/me/tenants`, { credentials: 'include', headers: getAuthHeaders() });
+                    if(r.ok) setMyTenants(await r.json());
+                } catch(e) { /* display-only, a failure just hides the line */ }
             };
             
             // fetch clusters for tenant assignment
@@ -2946,8 +2960,11 @@
                                                                     )}
                                                                 </select>
                                                             ) : (
-                                                                <>
-                                                                <span className={`px-2 py-1 rounded text-xs font-medium ${
+                                                                /* LW Sep 2026 (#795) - these were bare inline siblings, so a custom role id
+                                                                   long enough to fill the 10% column pushed the source badge into a mid-word
+                                                                   break and it read as if it belonged to the tenant next door. */
+                                                                <div className="flex flex-wrap items-center gap-1">
+                                                                <span className={`px-2 py-1 rounded text-xs font-medium whitespace-nowrap ${
                                                                     user.role === 'admin' ? 'bg-red-500/10 text-red-400' :
                                                                     user.role === 'user' ? 'bg-blue-500/10 text-blue-400' :
                                                                     user.role === 'viewer' ? 'bg-gray-500/10 text-gray-400' :
@@ -2959,15 +2976,15 @@
                                                                      user.role}
                                                                 </span>
                                                                 {user.auth_source === 'ldap' && (
-                                                                    <span className="px-1.5 py-0.5 rounded text-xs bg-blue-500/10 text-blue-400 border border-blue-500/20">LDAP</span>
+                                                                    <span className="px-1.5 py-0.5 rounded text-xs whitespace-nowrap bg-blue-500/10 text-blue-400 border border-blue-500/20">LDAP</span>
                                                                 )}
                                                                 {user.auth_source === 'entra' && (
-                                                                    <span className="px-1.5 py-0.5 rounded text-xs bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">Entra ID</span>
+                                                                    <span className="px-1.5 py-0.5 rounded text-xs whitespace-nowrap bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">Entra ID</span>
                                                                 )}
                                                                 {user.auth_source === 'oidc' && (
-                                                                    <span className="px-1.5 py-0.5 rounded text-xs bg-purple-500/10 text-purple-400 border border-purple-500/20">OIDC</span>
+                                                                    <span className="px-1.5 py-0.5 rounded text-xs whitespace-nowrap bg-purple-500/10 text-purple-400 border border-purple-500/20">OIDC</span>
                                                                 )}
-                                                                </>
+                                                                </div>
                                                             )}
                                                         </td>
                                                         <td className="px-4 py-3 text-gray-400 text-sm">
@@ -3180,7 +3197,7 @@
                                                 </div>
                                                 <div>
                                                     <label className="block text-sm text-gray-400 mb-1">{t('clusters') || 'Clusters'}</label>
-                                                    <p className="text-xs text-gray-500 mb-2">Select clusters this tenant can access (empty = all)</p>
+                                                    <p className="text-xs text-gray-500 mb-2">Select clusters this tenant can access (empty = none)</p>
                                                     <div className="grid grid-cols-2 gap-2 max-h-40 overflow-y-auto">
                                                         {clusters.map(c => (
                                                             <label key={c.id} className="flex items-center gap-2 p-2 bg-proxmox-darker rounded cursor-pointer hover:bg-proxmox-hover">
@@ -3196,7 +3213,7 @@
                                                                     }}
                                                                     className="rounded"
                                                                 />
-                                                                <span className="text-sm text-white">{c.name}</span>
+                                                                <span className="text-sm text-white">{clusterLabel(c)}</span>
                                                             </label>
                                                         ))}
                                                     </div>
@@ -3238,6 +3255,24 @@
                                     )}
                                     
                                     {/* Tenants list */}
+                                    {/* NS Sep 2026 — which tenant this account is acting in, and which others it has
+                                        been delegated into. Only rendered when there is more than one, which is the
+                                        only case where it tells anyone anything. Display only. */}
+                                    {(myTenants.tenants || []).length > 1 && (
+                                        <div className="mb-3 px-4 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-xs text-gray-400 flex items-center gap-2 flex-wrap">
+                                            <Icons.Building className="w-3.5 h-3.5 flex-shrink-0" />
+                                            <span>{t('actingInTenant') || 'Acting in'}:</span>
+                                            {(myTenants.tenants || []).map(mt => (
+                                                <span key={mt.id}
+                                                    className={`px-2 py-0.5 rounded whitespace-nowrap ${mt.is_home
+                                                        ? 'bg-proxmox-orange/20 text-proxmox-orange'
+                                                        : 'bg-proxmox-darker text-gray-400'}`}
+                                                    title={`${mt.id} — ${mt.effective_role}`}>
+                                                    {mt.name}{mt.is_home ? '' : ` (${mt.effective_role})`}
+                                                </span>
+                                            ))}
+                                        </div>
+                                    )}
                                     <div className="bg-proxmox-dark border border-proxmox-border rounded-xl overflow-hidden">
                                         <table className="w-full">
                                             <thead>
@@ -3262,9 +3297,9 @@
                                                         </td>
                                                         <td className="px-4 py-3 text-sm text-gray-400">
                                                             {tenant.clusters.length === 0 ? 'All clusters' : tenant.clusters.length + ' clusters'}
-                                                            {(tenant.quota_max_vms > 0 || tenant.quota_max_cores > 0 || tenant.quota_max_memory_gb > 0) && (
+                                                            {(tenant.quota_max_vms > 0 || tenant.quota_max_cores > 0 || tenant.quota_max_memory_gb > 0 || tenant.quota_max_disk_gb > 0) && (
                                                                 <div className="text-xs text-gray-600 mt-0.5">
-                                                                    {t('quota') || 'Quota'}: {tenant.quota_max_vms > 0 ? `${tenant.quota_max_vms} VMs ` : ''}{tenant.quota_max_cores > 0 ? `${tenant.quota_max_cores}c ` : ''}{tenant.quota_max_memory_gb > 0 ? `${tenant.quota_max_memory_gb}GB` : ''}
+                                                                    {t('quota') || 'Quota'}: {tenant.quota_max_vms > 0 ? `${tenant.quota_max_vms} VMs ` : ''}{tenant.quota_max_cores > 0 ? `${tenant.quota_max_cores}c ` : ''}{tenant.quota_max_memory_gb > 0 ? `${tenant.quota_max_memory_gb}GB RAM ` : ''}{tenant.quota_max_disk_gb > 0 ? `${tenant.quota_max_disk_gb}GB disk` : ''}
                                                                 </div>
                                                             )}
                                                         </td>
@@ -3353,7 +3388,7 @@
                                                     
                                                     <div>
                                                         <label className="block text-sm text-gray-400 mb-1">{t('clusters') || 'Clusters'}</label>
-                                                        <p className="text-xs text-gray-500 mb-2">{t('tenantClustersHint') || 'Select which clusters this tenant can access (empty = all)'}</p>
+                                                        <p className="text-xs text-gray-500 mb-2">{t('tenantClustersHint') || 'Select which clusters this tenant can access (empty = none)'}</p>
                                                         <div className="grid grid-cols-2 gap-2 max-h-48 overflow-y-auto bg-proxmox-dark rounded-lg p-3">
                                                             {clusters.map(c => (
                                                                 <label key={c.id} className="flex items-center gap-2 p-2 hover:bg-proxmox-hover rounded cursor-pointer">
@@ -3369,7 +3404,7 @@
                                                                         }}
                                                                         className="rounded border-gray-600"
                                                                     />
-                                                                    <span className="text-sm text-white">{c.name}</span>
+                                                                    <span className="text-sm text-white">{clusterLabel(c)}</span>
                                                                 </label>
                                                             ))}
                                                         </div>
@@ -3399,6 +3434,28 @@
                                                                     onChange={e => setEditingTenant({...editingTenant, quota_max_memory_gb: parseInt(e.target.value) || 0})}
                                                                     className="w-full px-2 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm" />
                                                             </div>
+                                                            <div>
+                                                                <label className="block text-xs text-gray-500 mb-1">{t('maxDiskGb') || 'Max Disk (GB)'}</label>
+                                                                <input type="number" min="0" value={editingTenant.quota_max_disk_gb || 0}
+                                                                    onChange={e => setEditingTenant({...editingTenant, quota_max_disk_gb: parseInt(e.target.value) || 0})}
+                                                                    className="w-full px-2 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm" />
+                                                            </div>
+                                                        </div>
+                                                        {/* NS Sep 2026 — VMID slice. 0/0 leaves numbering to the cluster, which is
+                                                            what every install does until it has more than one customer on a node. */}
+                                                        <div className="grid grid-cols-2 gap-3 mt-2">
+                                                            <div>
+                                                                <label className="block text-xs text-gray-500 mb-1">{t('vmidRangeStart') || 'VMID from'}</label>
+                                                                <input type="number" min="0" placeholder="0 = any" value={editingTenant.vmid_range_start || 0}
+                                                                    onChange={e => setEditingTenant({...editingTenant, vmid_range_start: parseInt(e.target.value) || 0})}
+                                                                    className="w-full px-2 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm" />
+                                                            </div>
+                                                            <div>
+                                                                <label className="block text-xs text-gray-500 mb-1">{t('vmidRangeEnd') || 'VMID to'}</label>
+                                                                <input type="number" min="0" placeholder="0 = any" value={editingTenant.vmid_range_end || 0}
+                                                                    onChange={e => setEditingTenant({...editingTenant, vmid_range_end: parseInt(e.target.value) || 0})}
+                                                                    className="w-full px-2 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm" />
+                                                            </div>
                                                         </div>
                                                         <div className="mt-2">
                                                             <label className="block text-xs text-gray-500 mb-1">{t('quotaEnforcement') || 'When exceeded'}</label>
@@ -3426,7 +3483,10 @@
                                                                         quota_max_vms: editingTenant.quota_max_vms || 0,
                                                                         quota_max_cores: editingTenant.quota_max_cores || 0,
                                                                         quota_max_memory_gb: editingTenant.quota_max_memory_gb || 0,
-                                                                        quota_enforcement: editingTenant.quota_enforcement || 'block'
+                                                                        quota_max_disk_gb: editingTenant.quota_max_disk_gb || 0,
+                                                                        quota_enforcement: editingTenant.quota_enforcement || 'block',
+                                                                        vmid_range_start: editingTenant.vmid_range_start || 0,
+                                                                        vmid_range_end: editingTenant.vmid_range_end || 0
                                                                     })
                                                                 });
                                                                 if(r.ok) {
@@ -4018,7 +4078,7 @@
                                                 >
                                                     <option value="">{t('select') || '-- Select --'}</option>
                                                     {clusters.map(c => (
-                                                        <option key={c.id} value={c.id}>{c.name}</option>
+                                                        <option key={c.id} value={c.id}>{clusterLabel(c)}</option>
                                                     ))}
                                                 </select>
                                                 
@@ -4239,7 +4299,7 @@
                                                 >
                                                     <option value="">{t('select') || '-- Select --'}</option>
                                                     {clusters.map(c => (
-                                                        <option key={c.id} value={c.id}>{c.name}</option>
+                                                        <option key={c.id} value={c.id}>{clusterLabel(c)}</option>
                                                     ))}
                                                 </select>
                                                 {selectedPoolCluster && (
@@ -5909,6 +5969,12 @@
                                                 <span className="text-sm text-gray-300">{t('enableSsl')}</span>
                                             </label>
                                         </div>
+                                        {/* LW Sep 2026 (#638) - the label reads like a master switch for TLS and
+                                            isn't one: since the fail-closed work HTTPS is served either way, and
+                                            unchecking this only means "no certificate of my own". Someone read the
+                                            code expecting the off position to do something and filed a bug about
+                                            it, which is fair — a toggle shouldn't need the source to understand. */}
+                                        <p className="text-xs text-gray-500 -mt-2">{t('sslAlwaysOnNote') || 'HTTPS is always on. This switch only controls whether your own certificate is used.'}</p>
                                         
                                         {serverSettings.ssl_enabled && (
                                             <div className="space-y-4 pt-2">
