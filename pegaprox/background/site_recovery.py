@@ -442,37 +442,49 @@ def _disconnect_test_nics(tgt_mgr, node, vmid, vm_type='qemu'):
     'unplugged' (link_down=1) so the isolated test can't collide with production
     IPs on the live network. QEMU-only (link_down is a KVM NIC property); a no-op
     for LXC. Runs while the clone is still stopped, so it boots disconnected.
-    Returns the number of NICs disconnected."""
+
+    MK Sep 2026 - used to return a bare count, and the caller threw it away and started the
+    clone regardless. A count cannot tell "this guest has no NICs" from "we could not read
+    its config", and both came back as 0 - so the one failure mode that matters, a test
+    clone coming up with live NICs as a twin of a running production VM, looked exactly
+    like success. Returns {'ok', 'disconnected', 'total', 'unsupported', 'error'} now and
+    the caller treats not-ok as a reason not to start.
+    """
     if vm_type != 'qemu':
-        return 0
+        # link_down is a KVM NIC property; there is no equivalent for a container here.
+        return {'ok': True, 'disconnected': 0, 'total': 0, 'unsupported': True, 'error': ''}
     try:
         res = tgt_mgr.get_vm_config(node, int(vmid), vm_type)
     except Exception as e:
         logger.warning(f"[SR] link-down: cannot read config for test VM {vmid}: {e}")
-        return 0
+        return {'ok': False, 'disconnected': 0, 'total': 0, 'unsupported': False,
+                'error': f'config unreadable: {e}'}
     # get_vm_config returns {'success': True, 'config': parsed}; the flat netN
     # keys live in config['raw'] (parsed itself only has grouped sections).
     if not isinstance(res, dict) or not res.get('success'):
-        logger.warning(f"[SR] link-down: get_vm_config failed for test VM {vmid}: "
-                       f"{res.get('error') if isinstance(res, dict) else res}")
-        return 0
+        _why = res.get('error') if isinstance(res, dict) else res
+        logger.warning(f"[SR] link-down: get_vm_config failed for test VM {vmid}: {_why}")
+        return {'ok': False, 'disconnected': 0, 'total': 0, 'unsupported': False,
+                'error': f'config unavailable: {_why}'}
     cfg = res.get('config') or {}
     raw = cfg.get('raw', cfg)
-    n = 0
-    for key in list(raw.keys()):
-        # netN entries are the VM's virtual NICs (net0, net1, ...)
-        if key.startswith('net') and key[3:].isdigit():
-            try:
-                res = tgt_mgr.toggle_network_link(node, int(vmid), key, True)
-                if not isinstance(res, dict) or res.get('success', True) is not False:
-                    n += 1
-                else:
-                    logger.warning(f"[SR] link-down: {key} on test VM {vmid} failed: {res.get('error')}")
-            except Exception as e:
-                logger.warning(f"[SR] link-down: {key} on test VM {vmid} raised: {e}")
+    nics = [k for k in raw.keys() if k.startswith('net') and k[3:].isdigit()]
+    n, failed = 0, []
+    for key in nics:
+        try:
+            r = tgt_mgr.toggle_network_link(node, int(vmid), key, True)
+            if not isinstance(r, dict) or r.get('success', True) is not False:
+                n += 1
+            else:
+                failed.append(f"{key}: {r.get('error')}")
+                logger.warning(f"[SR] link-down: {key} on test VM {vmid} failed: {r.get('error')}")
+        except Exception as e:
+            failed.append(f"{key}: {e}")
+            logger.warning(f"[SR] link-down: {key} on test VM {vmid} raised: {e}")
     if n:
-        logger.info(f"[SR] Test VM {vmid}: started with {n} NIC(s) disconnected (link_down)")
-    return n
+        logger.info(f"[SR] Test VM {vmid}: {n} of {len(nics)} NIC(s) disconnected (link_down)")
+    return {'ok': not failed, 'disconnected': n, 'total': len(nics),
+            'unsupported': False, 'error': '; '.join(failed)}
 
 
 def execute_failover(plan_id, failover_type='planned', authorized_vmids=None):
@@ -730,8 +742,28 @@ def execute_test_failover(plan_id):
                                 test_vmids.append({'vmid': test_vmid, 'vm_type': vtype})
                                 # MK Jul 2026 (#413) — optionally disconnect every NIC
                                 # BEFORE start so the test clone can't grab a live IP.
+                                _iso = None
                                 if plan.get('test_disconnect_nics'):
-                                    _disconnect_test_nics(tgt_mgr, node_name, test_vmid, vtype)
+                                    _iso = _disconnect_test_nics(tgt_mgr, node_name, test_vmid, vtype)
+                                    if not _iso.get('ok'):
+                                        # The operator asked for isolation. Starting anyway is
+                                        # the one outcome a TEST failover must never produce:
+                                        # a clone of a running production guest, on its network,
+                                        # with its addresses. Leave it stopped and say why.
+                                        logger.error(
+                                            f"[SR] Test failover: NIC isolation failed for test VM "
+                                            f"{test_vmid} ({_iso.get('error')}) - leaving it stopped")
+                                        results[str(vmid)] = {
+                                            'success': False, 'test_vmid': test_vmid,
+                                            'error': f"cloned OK but NIC isolation failed, not started: "
+                                                     f"{_iso.get('error')}"}
+                                        found = True
+                                        break
+                                    if _iso.get('unsupported'):
+                                        logger.warning(
+                                            f"[SR] Test failover: NIC isolation was requested but "
+                                            f"link_down does not exist for {vtype} - test CT "
+                                            f"{test_vmid} starts on the live network")
                                 # NS Apr 2026: was start_vm() which doesn't exist — use vm_action
                                 start_res = tgt_mgr.vm_action(node_name, test_vmid, vtype, 'start')
                                 if start_res.get('success'):

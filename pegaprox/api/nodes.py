@@ -2485,6 +2485,19 @@ def cleanup_orphaned_excluded_vms():
             # Check if VM still exists
             try:
                 vms = mgr.get_vm_resources()
+                # MK Sep 2026 - an enumeration that FAILS does not raise here, it answers
+                # with an empty list: XcpngManager.get_vms returns [] when _api() is
+                # unavailable, and the Proxmox one does the same when the session is gone.
+                # Read literally that means "every VM on this cluster is gone", and the very
+                # next line deletes the exclusions for all of them - the operator's
+                # deliberate do-not-balance list, wiped by a connection blip. A cluster that
+                # genuinely holds zero VMs has no exclusions worth cleaning either, so
+                # skipping on empty costs nothing and only ever defers a stale row by a day.
+                if not vms:
+                    logging.debug(
+                        f"[CLEANUP] {cluster_id} enumerated no VMs - leaving its exclusions "
+                        "alone rather than treating that as 'they all went away'")
+                    continue
                 vm_exists = any(vm.get('vmid') == vmid for vm in vms)
                 
                 if not vm_exists:
