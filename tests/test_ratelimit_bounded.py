@@ -238,3 +238,37 @@ def test_the_shadowed_global_is_gone():
     import pegaprox.utils.ssh as sshmod
 
     assert not hasattr(sshmod, '_auth_action_attempts')
+
+
+def test_the_bucket_registry_is_bounded_too():
+    """Found by the 20.09. scan, on the fix from the 19.09. scan. The registry is keyed
+    by the budget the CALLER passes, and each entry owns a 4096-key window - so a call
+    site that ever derives a budget from a request leaks worse than the map this
+    replaced. All four call sites pass literals today; the ceiling makes that structural
+    rather than a convention the next person has to notice."""
+    import pegaprox.utils.ssh as sshmod
+
+    sshmod._auth_action_windows.clear()
+    for n in range(200):
+        sshmod.check_auth_action_rate_limit('someone', max_attempts=5, window=60 + n)
+
+    # Deliberately NOT asserted against the new ceiling constant by name: that makes the
+    # test go red against the old code with an AttributeError, which says nothing about
+    # the leak. Same mistake as the sibling test above, caught the same way.
+    held = len(sshmod._auth_action_windows)
+    assert held < 200, (
+        f'200 distinct budgets left {held} windows behind - the registry grows with '
+        'whatever the caller asks for, and each entry owns a 4096-key window')
+
+
+def test_the_real_call_sites_still_get_their_own_window():
+    """The ceiling must not start evicting the budgets we actually use - three pairs,
+    well under it."""
+    import pegaprox.utils.ssh as sshmod
+
+    sshmod._auth_action_windows.clear()
+    sshmod.check_auth_action_rate_limit('pwd_change:bob', 5, 300)
+    sshmod.check_auth_action_rate_limit('totp_verify:bob', 3, 120)
+    sshmod.check_auth_action_rate_limit('webauthn_begin:1.2.3.4', 20, 300)
+
+    assert set(sshmod._auth_action_windows) == {(5, 300), (3, 120), (20, 300)}

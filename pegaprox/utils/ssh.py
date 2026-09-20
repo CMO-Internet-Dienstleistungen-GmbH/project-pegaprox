@@ -52,6 +52,12 @@ def _ssh_track_connection(conn_type: str, delta: int):
 # pairs, so that registry is bounded by the code, not by anything a caller sends.
 _auth_action_windows = {}
 _auth_action_lock = threading.Lock()
+# The registry is keyed by the budget the CALLER asks for, and every entry owns a window
+# that can hold 4096 keys. Today all four call sites pass literals - (5,300), (3,120),
+# (20,300) - so it holds three, and the day somebody wires a request-derived budget in
+# here the leak comes back bigger than the one this replaced. Bound it the same way
+# SlidingWindow bounds its own keys rather than trusting the call sites to stay literal.
+_AUTH_ACTION_MAX_BUCKETS = 8
 
 
 def check_auth_action_rate_limit(key: str, max_attempts: int = 5, window: int = 300) -> bool:
@@ -64,6 +70,17 @@ def check_auth_action_rate_limit(key: str, max_attempts: int = 5, window: int = 
     with _auth_action_lock:
         win = _auth_action_windows.get(bucket)
         if win is None:
+            if len(_auth_action_windows) >= _AUTH_ACTION_MAX_BUCKETS:
+                # More distinct budgets than the code has call sites means somebody is
+                # passing them in from a request. Drop the least recently created one;
+                # the budgets themselves are not secret and a re-created window simply
+                # starts counting again.
+                oldest = next(iter(_auth_action_windows))
+                _auth_action_windows.pop(oldest, None)
+                logging.warning(
+                    '[RATELIMIT] auth-action budgets exceeded %d distinct pairs - '
+                    'evicted %s. A caller is choosing the budget; it should be a literal.',
+                    _AUTH_ACTION_MAX_BUCKETS, oldest)
             win = SlidingWindow(limit=max_attempts, window=window, max_keys=4096,
                                 name=f'auth-action-{max_attempts}/{window}')
             _auth_action_windows[bucket] = win
