@@ -15,7 +15,7 @@ from datetime import datetime
 from urllib.parse import urlencode, urlparse, urlunparse
 
 # NS May 2026 — SSRF guard for admin-supplied OIDC URLs (discovery / token / userinfo).
-from pegaprox.utils.url_security import sanitize_outbound_url, SsrfError
+from pegaprox.utils.url_security import sanitize_outbound_url, SsrfError, resolve_and_pin_url
 
 # auth_source values that mean "this row is owned by an OIDC-family IdP", i.e.
 # the ones whose oidc_sub is meaningful. 'local' and 'ldap' rows are excluded on
@@ -198,7 +198,21 @@ def get_oidc_endpoints(config: dict) -> dict:
                 # MK May 2026 (#412): pass allow_private through so internal
                 # IdPs at 10.x / 192.168.x can be used when the operator
                 # explicitly opted in. Metadata blocklist still binds.
-                sanitize_outbound_url(discovery_url, allow_private=allow_private_ip)
+                #
+                # MK Sep 2026 - the guard only CHECKED the host and then requests.get below
+                # resolved it a second time, which is the rebinding window senti-man reported
+                # against the shared guard (GHSA-hmcf-9q7f-vx35). Same treatment the webhook,
+                # SIEM and download paths already got: pin the address we vetted. For plain
+                # https this returns the URL untouched, because the certificate check already
+                # defeats a rebind - it only rewrites for the installs that turned
+                # oidc_skip_ssl_verify on, which are exactly the ones with nothing else
+                # catching it. allowed_schemes stays at the default https-only on purpose:
+                # the one thing NOT to do here is let discovery run over plain http, where
+                # whoever answers picks the authorization and token endpoints.
+                discovery_url = resolve_and_pin_url(
+                    discovery_url,
+                    allow_private=allow_private_ip,
+                    tls_verified=not skip_ssl)
             except SsrfError as guard_err:
                 logging.warning(f"[OIDC] discovery_url rejected by SSRF guard: {guard_err}")
                 # MK May 2026 (#188 follow-up): never return None — callers
@@ -405,7 +419,7 @@ def oidc_decode_id_token(id_token: str, expected_nonce: str = None,
                 # UNVERIFIED decode, so a raise here would DOWNGRADE signature verification.
                 # allow_private=True keeps internal IdPs (RFC1918) working while cloud-metadata
                 # endpoints stay blocked (always) + control chars/bad schemes rejected.
-                from pegaprox.utils.url_security import sanitize_outbound_url, SsrfError
+                from pegaprox.utils.url_security import sanitize_outbound_url, SsrfError, resolve_and_pin_url
                 try:
                     sanitize_outbound_url(jwks_uri, allow_private=True)
                 except SsrfError as _se:
@@ -728,7 +742,23 @@ def oidc_map_groups_to_role(config: dict, groups: list, id_token_claims: dict = 
 
     for mapping in config.get('group_mappings', []):
         map_group = (mapping.get('group_id') or mapping.get('group_dn') or '').strip().lower()
-        if map_group and (map_group in group_ids or map_group in group_names):
+        _by_id = bool(map_group) and map_group in group_ids
+        _by_name = bool(map_group) and map_group in group_names
+        if _by_name and not _by_id:
+            # MK Sep 2026 - a group's display name is not a stable identifier. In an Entra
+            # tenant where users may create security groups (the default in plenty of them),
+            # anyone can make a group called whatever a mapping names and inherit the role it
+            # grants. The id cannot be squatted that way. Removing name matching outright
+            # would break every install that configured mappings by name - the field is even
+            # called group_dn, so it was meant to be used that way - so for now say so, loudly
+            # and per match, and leave the decision about a migration to a release.
+            logging.warning(
+                "[OIDC] group mapping '%s' matched on display NAME, not on group id, and "
+                "granted role '%s'. Display names are not unique and are not stable - anyone "
+                "who can create a group in the directory can claim this mapping. Re-point it "
+                "at the group's object id.",
+                map_group, mapping.get('role') or '(no role)')
+        if _by_id or _by_name:
             if mapping.get('role') and mapping['role'] not in _role_prio:
                 matched_custom_roles.append(mapping['role'])
             # The configured default stands for "no group matched" (that is how the setting

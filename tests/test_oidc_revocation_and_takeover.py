@@ -225,7 +225,11 @@ def test_discovery_refuses_a_redirect(monkeypatch, caplog):
     # The SSRF guard rejects the example host before any request is made (it cannot be
     # resolved from a test box), which is correct and has its own tests. Step past it so
     # this one can reach the redirect behaviour it is about.
-    monkeypatch.setattr(O, 'sanitize_outbound_url', lambda u, **k: u)
+    # MK Sep 2026 - the discovery path pins the vetted address now instead of only
+    # checking it, so this is the seam to step past, not sanitize_outbound_url. Same
+    # intent as before: the guard's own behaviour has its own tests, this one is about
+    # what happens to a 302.
+    monkeypatch.setattr(O, 'resolve_and_pin_url', lambda u, **k: u)
     O._oidc_discovery_cache.clear()
     ep = O.get_oidc_endpoints({'provider': 'keycloak',
                                'authority': 'https://idp.example.com/realms/x'})
@@ -257,7 +261,11 @@ def test_the_redirect_target_is_sanitised_before_it_is_logged(monkeypatch, caplo
         def json(self): return {}
 
     monkeypatch.setattr(O.requests, 'get', lambda url, **kw: _Redirect())
-    monkeypatch.setattr(O, 'sanitize_outbound_url', lambda u, **k: u)
+    # MK Sep 2026 - the discovery path pins the vetted address now instead of only
+    # checking it, so this is the seam to step past, not sanitize_outbound_url. Same
+    # intent as before: the guard's own behaviour has its own tests, this one is about
+    # what happens to a 302.
+    monkeypatch.setattr(O, 'resolve_and_pin_url', lambda u, **k: u)
     monkeypatch.setattr(O, 'load_server_settings', lambda: {}, raising=False)
     O._oidc_discovery_cache.clear()
     with caplog.at_level('WARNING'):
