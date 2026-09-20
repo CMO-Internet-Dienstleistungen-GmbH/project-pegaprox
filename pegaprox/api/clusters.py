@@ -2195,8 +2195,19 @@ def disable_ha(cluster_id):
     # Flip the flag + clear in-memory ha_config bookkeeping last so the
     # state we report back to the UI matches what's actually on disk.
     mgr.config.ha_enabled = False
+    # MK Sep 2026 - this used to clear the whole map, including the nodes whose teardown had
+    # just failed. The audit line below already says "manual cleanup required" for those, but
+    # our own bookkeeping said the opposite, and the next HA-enable cycle reads the
+    # bookkeeping. A node we believe has no agent, still running one, is a self-fence agent
+    # acting on heartbeat state nobody is maintaining any more - it can reboot the node.
+    # Keep the ones that did not come off; drop only what actually went.
     if isinstance(mgr.ha_config.get('node_agent_installed'), dict):
-        mgr.ha_config['node_agent_installed'] = {}
+        _still_there = {n: True for n, ok in (uninstall_results or {}).items() if not ok}
+        if _still_there:
+            logging.warning(
+                "[HA disable] agent still installed on %s - keeping it in node_agent_installed "
+                "so the next enable does not assume a clean slate", sorted(_still_there))
+        mgr.ha_config['node_agent_installed'] = _still_there
     save_config()
 
     nodes_ok = sum(1 for v in uninstall_results.values() if v)

@@ -159,3 +159,22 @@ def test_the_incident_handlers_do_not_hand_back_the_exception():
     stripped = '\n'.join(l for l in src.split('\n') if not l.strip().startswith('#'))
     assert "{'error': str(e)}, 500" not in stripped, \
         'a database exception still goes back over HTTP verbatim'
+
+
+# --- HA disable: the bookkeeping must not contradict the audit line -------------------
+
+def test_a_node_whose_teardown_failed_stays_marked_as_having_the_agent():
+    """`_ha_uninstall_self_fence_on_all_nodes` returns {node: ok}. The handler already
+    writes "manual cleanup required" into the audit entry for the failures - and then
+    cleared the whole node_agent_installed map anyway, so our own state said the opposite.
+    The next enable reads the state, not the audit log. A self-fence agent we believe is
+    gone, still running, fences on heartbeat state nobody maintains any more."""
+    import inspect
+    import pegaprox.api.clusters as C
+
+    body = inspect.getsource(C.disable_ha) if hasattr(C, 'disable_ha') else inspect.getsource(C)
+    stripped = '\n'.join(l for l in body.split('\n') if not l.strip().startswith('#'))
+
+    assert "node_agent_installed'] = {}" not in stripped, \
+        'the whole map is still cleared, failures included'
+    assert '_still_there' in stripped

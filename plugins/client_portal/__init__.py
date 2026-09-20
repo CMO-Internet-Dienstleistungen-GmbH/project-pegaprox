@@ -9,6 +9,7 @@ Hoster configures allowed actions via config.json.
 import os
 import json
 import logging
+import threading
 from flask import request, jsonify, send_file
 
 from pegaprox.api.plugins import register_plugin_route
@@ -16,6 +17,21 @@ from pegaprox.globals import cluster_managers
 from pegaprox.utils.rbac import (load_vm_acls, user_can_access_vm, get_user_permissions,
                                  get_user_pool_vmids, acl_grants_user)
 from pegaprox.utils.auth import load_users
+
+
+# One creation lock per tenant - see the note in the create handler. gevent monkey-patches
+# threading.Lock into a greenlet-aware one, which is what the workers here actually are.
+_tenant_create_locks = {}
+_tenant_create_locks_guard = threading.Lock()
+
+
+def _tenant_create_lock(tenant_id):
+    with _tenant_create_locks_guard:
+        lk = _tenant_create_locks.get(tenant_id)
+        if lk is None:
+            lk = threading.Lock()
+            _tenant_create_locks[tenant_id] = lk
+        return lk
 
 PLUGIN_NAME = "Client Portal"
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -804,33 +820,44 @@ def _create_ct():
     # customer can call in a loop.
     from pegaprox.utils.rbac import DEFAULT_TENANT_ID as _DT
     tenant_id = user.get('tenant_id') or _DT
-    try:
-        from pegaprox.utils.rbac import check_tenant_quota
-        # `disk` is the already-validated disk_gb from the form above, in GB
-        q = check_tenant_quota(tenant_id, add_cores=cores, add_mem_gb=memory / 1024.0, add_vms=1,
-                               add_disk_gb=float(disk))
-    except Exception:
-        logging.exception('[client_portal] quota check failed')
-        return {'error': 'Cannot verify your quota right now - try again shortly'}, 503
-    if q.get('violations') and q.get('enforce') == 'block':
-        return {'error': 'Quota exceeded (' + ', '.join(q['violations']) + ')',
-                'quota': q.get('quota'), 'usage': q.get('usage')}, 403
 
-    cluster_id = cc['cluster_id']; node = cc['node']
-    mgr = cluster_managers.get(cluster_id)
-    if not mgr or not mgr.is_connected:
-        return {'error': 'Target cluster is currently unavailable'}, 503
+    # MK Sep 2026 - the check and the create were two separate steps with nothing between
+    # them. Usage is computed from what exists, so two requests arriving together both
+    # measured the world before either had created anything, both passed, and both went on
+    # to create. A customer at one container below the ceiling could have as many as they
+    # could fire in parallel, which on a self-service route is not a theoretical number.
+    # One lock per tenant is enough: the check only has to see the effect of the create it
+    # is racing, and creates for different tenants never need to wait on each other. Keyed
+    # by tenant id, which comes from a stored user record rather than from the request, so
+    # this map is bounded by the install and not by anyone calling it.
+    with _tenant_create_lock(tenant_id):
+        try:
+            from pegaprox.utils.rbac import check_tenant_quota
+            # `disk` is the already-validated disk_gb from the form above, in GB
+            q = check_tenant_quota(tenant_id, add_cores=cores, add_mem_gb=memory / 1024.0,
+                                   add_vms=1, add_disk_gb=float(disk))
+        except Exception:
+            logging.exception('[client_portal] quota check failed')
+            return {'error': 'Cannot verify your quota right now - try again shortly'}, 503
+        if q.get('violations') and q.get('enforce') == 'block':
+            return {'error': 'Quota exceeded (' + ', '.join(q['violations']) + ')',
+                    'quota': q.get('quota'), 'usage': q.get('usage')}, 403
 
-    ct_config = {
-        'template': template, 'hostname': hostname, 'name': hostname,
-        'memory': memory, 'cores': cores, 'password': password,
-        'storage': cc.get('storage', 'local-lvm'), 'disk_size': str(disk),
-        'net_bridge': cc.get('bridge', 'vmbr0'),
-    }
-    res = mgr.create_container(node, ct_config)
-    if not res.get('success'):
-        return {'error': res.get('error', 'Container creation failed')}, 500
-    new_vmid = res.get('vmid') or ct_config.get('vmid')
+        cluster_id = cc['cluster_id']; node = cc['node']
+        mgr = cluster_managers.get(cluster_id)
+        if not mgr or not mgr.is_connected:
+            return {'error': 'Target cluster is currently unavailable'}, 503
+
+        ct_config = {
+            'template': template, 'hostname': hostname, 'name': hostname,
+            'memory': memory, 'cores': cores, 'password': password,
+            'storage': cc.get('storage', 'local-lvm'), 'disk_size': str(disk),
+            'net_bridge': cc.get('bridge', 'vmbr0'),
+        }
+        res = mgr.create_container(node, ct_config)
+        if not res.get('success'):
+            return {'error': res.get('error', 'Container creation failed')}, 500
+        new_vmid = res.get('vmid') or ct_config.get('vmid')
 
     # grant the creator access to their new CT (portal scopes on VM-ACL / pool)
     try:
