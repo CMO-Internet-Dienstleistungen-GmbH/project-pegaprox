@@ -125,23 +125,6 @@ patches:
     commit_message: 'feat(health): broadcast one shared cluster health rollup'
     requested_by: 11
 
-  # Snapshot mutations in the Corporate VM detail discarded the JSON error
-  # returned by the server. Keep the existing generic text only as a fallback
-  # when the response is missing or cannot be parsed.
-  # Taken upstream into `Testing` as our own commit -- same sha, because the
-  # pull request was merged rather than rebased -- but v1.1.1 predates that, so
-  # the release we build on does not have the fix and the patch still applies.
-  # The branch is rebased onto the release tag, which is what makes its commit
-  # set this patch alone again.
-  - name: snapshot-error-toasts
-    branch: fix/snapshot-error-toasts
-    base: Testing
-    kind: fix
-    upstream_pr:
-    summary: 'Snapshot action toasts show the error returned by the server'
-    commit_message: 'fix(web): surface snapshot API errors in toasts'
-    requested_by: 13
-
   # The Corporate QEMU summary already fetches the VM config for hardware
   # details. Reuse that response to show a non-empty description as escaped,
   # multiline text without changing the Config editor or Markdown preview.
