@@ -93,15 +93,21 @@ def test_the_hivex_shell_the_version_probe_uses_is_installed(node_calls):
     assert 'libhivex-bin' in _apt_command(calls)
 
 
-def test_a_node_without_the_hivex_shell_is_not_called_ready(node_calls):
-    # The probe decides whether apt runs at all, so a missing hivexsh has to appear
-    # in it -- otherwise the install that would supply it never happens.
+def test_a_missing_hivex_shell_does_not_abort_a_migration_that_used_to_work(node_calls):
+    # hivexsh only feeds the version probe, which has its own fallback (the w11/amd64
+    # default), so its absence must not gate the tools the injection cannot run at all
+    # without: doing that would turn an air-gapped node that worked into a failed
+    # migration. It is checked and installed separately, after the required probe,
+    # and its own failure is logged rather than fatal.
     calls, answers = node_calls
-    answers["import hivex"] = (1, '', '')
-    answers['apt-get install'] = (1, '', '')
+    answers['command -v hivexsh'] = (1, '', '')
+    answers['libhivex-bin'] = (1, '', '')
 
     v2p._inject_virtio_drivers(_Manager(), _Task())
-    assert 'hivexsh' in calls[0]
+    assert 'hivexsh' not in calls[0]
+    assert any('command -v hivexsh' in c for c in calls)
+    # Execution kept going past the failed hivexsh install rather than stopping there.
+    assert any('test -f' in c for c in calls)
 
 
 def _injection_script(calls):
