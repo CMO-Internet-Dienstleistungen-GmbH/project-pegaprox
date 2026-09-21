@@ -325,10 +325,19 @@ def redact_url(value):
         out += host
         path, sep, query = rest.partition('?')
         segments = [s for s in path.split('/') if s]
-        if segments:
-            out += '/' + segments[0]
-            if len(segments) > 1:
-                out += '/[REDACTED]'
+        if len(segments) > 1:
+            # The first segment of a multi-segment path is structural - 'services' on a
+            # Slack hook, 'api' on a Discord one - so keeping it says which endpoint
+            # failed without giving anything away.
+            out += '/' + segments[0] + '/[REDACTED]'
+        elif segments:
+            # MK Sep 2026 (follow-up) - a LONE segment is not structure, it is the whole
+            # path, and for an ntfy topic that path is the credential: anyone holding
+            # https://ntfy.sh/<topic> can publish to it and read it. The first version
+            # kept segments[0] unconditionally and printed such a URL verbatim, which is
+            # exactly the leak this function exists to stop. Nothing is learned from a
+            # single segment anyway - the host already says which service it was.
+            out += '/[REDACTED]'
         if sep:
             parts = []
             for pair in query.split('&'):

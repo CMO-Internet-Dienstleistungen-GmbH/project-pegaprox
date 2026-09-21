@@ -172,3 +172,52 @@ def test_every_module_that_calls_the_redactor_can_actually_reach_it():
             missing.append(rel)
 
     assert missing == [], missing
+
+
+# --- follow-up: a lone path segment is the credential, not structure -------------
+# CodeAnt threat-hunt scan 2026-09-21 against Testing found the first version of
+# redact_url() printing https://ntfy.sh/<topic> verbatim: it kept segments[0]
+# unconditionally, and on a one-segment path that IS the whole secret. MK
+
+_LONE_SEGMENT_SECRETS = [
+    'https://ntfy.sh/my-secret-topic-name',
+    'http://ntfy.internal:8080/alerts-4f3a9c',
+    'https://push.example.com/Ab3Xy9Zq',
+]
+
+_STRUCTURED = [
+    ('https://hooks.slack.com/services/T000/B000/XXXXsecret', 'services'),
+    ('https://discord.com/api/webhooks/123/SECRETTOKEN', 'api'),
+    ('https://outlook.office.com/webhook/aaa/IncomingWebhook/bbb', 'webhook'),
+]
+
+
+@pytest.mark.parametrize('url', _LONE_SEGMENT_SECRETS)
+def test_a_one_segment_path_is_never_printed(url):
+    """The property: no part of a single-segment path survives redaction.
+
+    Asserts on the output rather than on the implementation - checking that the
+    source says `len(segments) > 1` would pass against any code containing that
+    text and would say nothing about what actually reaches the log.
+    """
+    from pegaprox.utils.sanitization import redact_url
+    out = redact_url(url)
+    secret = url.rstrip('/').rsplit('/', 1)[-1]
+    assert secret not in out, f'the path segment survived redaction: {out}'
+    assert '[REDACTED]' in out, f'nothing was redacted at all: {out}'
+
+
+@pytest.mark.parametrize('url,keep', _STRUCTURED)
+def test_the_structural_first_segment_still_survives(url, keep):
+    """The mirror. Redacting the lone segment must not turn into redacting every
+    path, or the operator loses the only clue about which endpoint failed."""
+    from pegaprox.utils.sanitization import redact_url
+    out = redact_url(url)
+    assert f'/{keep}' in out, f'the structural segment was lost: {out}'
+    assert 'SECRET' not in out.upper().replace('[REDACTED]', ''), out
+
+
+def test_the_host_is_still_readable():
+    """A URL with no path at all must come through untouched - it carries no secret."""
+    from pegaprox.utils.sanitization import redact_url
+    assert redact_url('https://pbs.internal:8007') == 'https://pbs.internal:8007'
