@@ -10703,6 +10703,14 @@ echo "AGENT_INSTALLED_OK"
             
             if response.status_code == 200:
                 task_data = response.json()
+                # fork patch (issue #39): the name is free again — drop the author
+                # record so a later snapshot of the same name cannot inherit it.
+                # Never let the bookkeeping decide whether a delete succeeded.
+                try:
+                    from pegaprox.core import snapshot_meta
+                    snapshot_meta.forget(getattr(self, 'id', ''), vm_type, vmid, snapname)
+                except Exception as meta_err:
+                    self.logger.warning(f"snapshot author record not dropped: {meta_err}")
                 return {'success': True, 'task': task_data.get('data')}
             else:
                 return {'success': False, 'error': response.text}
@@ -10928,7 +10936,8 @@ echo "AGENT_INSTALLED_OK"
 
     def create_efficient_snapshot(self, node: str, vmid: int, vm_type: str,
                                   snapname: str, description: str = '',
-                                  snap_size_gb: float = None) -> dict:
+                                  snap_size_gb: float = None,
+                                  created_by: str = '') -> dict:
         """Create space-efficient LVM COW snapshots for all VM disks.
 
         NS: Feb 2026 - Core creation flow:
@@ -11054,7 +11063,9 @@ echo "AGENT_INSTALLED_OK"
             'total_snap_alloc_gb': total_alloc,
             'fs_frozen': fs_frozen,
             'status': 'active',
-            'created_by': '',
+            # fork patch (issue #39): the column existed and was always written
+            # empty, so no efficient snapshot could say who made it.
+            'created_by': created_by or '',
         })
 
         self.logger.info(f"Created efficient snapshot '{snapname}' for {vm_type}/{vmid}: "

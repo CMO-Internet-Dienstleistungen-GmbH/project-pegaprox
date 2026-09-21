@@ -42,6 +42,7 @@ from pegaprox.globals import cluster_managers
 from pegaprox.utils.auth import require_auth, load_users, build_authz_user
 from pegaprox.api.helpers import check_cluster_access
 from pegaprox.core.db import get_db
+from pegaprox.core import snapshot_meta  # fork patch (issue #39): snapshot author metadata
 from pegaprox.utils.audit import log_audit
 from pegaprox.utils.rbac import user_can_access_vm
 from pegaprox.models.permissions import ROLE_ADMIN
@@ -464,6 +465,11 @@ def _execute_policy(policy_id, force=False):
         try:
             res = mgr.create_snapshot(node, vmid, vm_type, snap, f"PegaProx policy {policy['name']}", policy['include_ram'])
             if res.get('success'):
+                # fork patch (issue #39): a policy run is provenance we can prove,
+                # so it is recorded as automatic rather than left unknown.
+                snapshot_meta.record_creation(policy['cluster_id'], vm_type, vmid, snap,
+                                              policy.get('name', ''),
+                                              origin=snapshot_meta.ORIGIN_AUTOMATIC)
                 # MK May 2026 (#436 aalandez): create_snapshot returns success as soon
                 # as PVE accepts the request and the task starts — NOT when it
                 # completes. While the create task runs, PVE holds the VM at

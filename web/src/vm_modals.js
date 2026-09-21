@@ -2579,9 +2579,17 @@
                                                             </span>
                                                         )}
                                                     </div>
+                                                    {/* fork patch (issue #39): who took it, and the full description */}
                                                     <div className="text-[11px] mt-0.5" style={{color: 'var(--corp-text-muted, #728b9a)'}}>
                                                         {node.snaptime ? new Date(node.snaptime * 1000).toLocaleString() : ''}
-                                                        {node.description && <span className="ml-2" style={{color: '#5a7a8a'}}>— {node.description}</span>}
+                                                        <span className="ml-2">
+                                                            {t('snapshotAuthor') || 'Author'}:{' '}
+                                                            <SnapshotAuthor snap={node} t={t} />
+                                                        </span>
+                                                    </div>
+                                                    <div className="text-[11px] mt-0.5" style={{color: '#5a7a8a'}}>
+                                                        {t('description') || 'Description'}:{' '}
+                                                        <SnapshotDescription text={node.description} t={t} />
                                                     </div>
                                                 </div>
                                             </div>
@@ -2641,8 +2649,17 @@
                                                             </span>
                                                         )}
                                                     </div>
+                                                    {/* fork patch (issue #39): same two facts as a PVE snapshot */}
                                                     <div className="text-[11px] mt-0.5" style={{color: 'var(--corp-text-muted, #728b9a)'}}>
                                                         {snap.created ? new Date(snap.created).toLocaleString() : ''}
+                                                        <span className="ml-2">
+                                                            {t('snapshotAuthor') || 'Author'}:{' '}
+                                                            <SnapshotAuthor snap={snap} t={t} />
+                                                        </span>
+                                                    </div>
+                                                    <div className="text-[11px] mt-0.5" style={{color: '#5a7a8a'}}>
+                                                        {t('description') || 'Description'}:{' '}
+                                                        <SnapshotDescription text={snap.description} t={t} />
                                                     </div>
                                                 </div>
                                                 <div className="flex gap-1">
