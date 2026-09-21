@@ -2188,19 +2188,28 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
     # the w11/amd64 default. Measured on a Windows Server 2022 guest: build 20348 with
     # hivexsh present, nothing without it, so the drivers copied in were the wrong
     # variant while the log said the injection had succeeded.
-    _probe = ("command -v ntfs-3g >/dev/null && command -v ntfsfix >/dev/null"
-              if clear_hibernation_only else
-              "python3 -c 'import hivex' 2>/dev/null && command -v ntfs-3g >/dev/null "
-              "&& command -v ntfsfix >/dev/null")
-    _packages = ('ntfs-3g' if clear_hibernation_only
-                 else 'python3-hivex ntfs-3g libhivex-bin')
-    rc, _, _ = run_on_node(pve_mgr, node, _probe, timeout=10)
+    if clear_hibernation_only:
+        rc, _, _ = run_on_node(pve_mgr, node,
+            "command -v ntfs-3g >/dev/null && command -v ntfsfix >/dev/null",
+            timeout=10)
+    else:
+        rc, _, _ = run_on_node(pve_mgr, node,
+            "python3 -c 'import hivex' 2>/dev/null && command -v ntfs-3g >/dev/null "
+            "&& command -v ntfsfix >/dev/null",
+            timeout=10)
     if rc != 0:
-        task.log(f"[VirtIO] Installing {_packages} (one-time)...")
-        rc_apt, out_apt, _ = run_on_node(pve_mgr, node,
-            "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "
-            f"{_packages} 2>&1 | tail -25",
-            timeout=180)
+        if clear_hibernation_only:
+            task.log("[VirtIO] Installing ntfs-3g (one-time)...")
+            rc_apt, out_apt, _ = run_on_node(pve_mgr, node,
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "
+                "ntfs-3g 2>&1 | tail -25",
+                timeout=180)
+        else:
+            task.log("[VirtIO] Installing python3-hivex / ntfs-3g / libhivex-bin (one-time)...")
+            rc_apt, out_apt, _ = run_on_node(pve_mgr, node,
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "
+                "python3-hivex ntfs-3g libhivex-bin 2>&1 | tail -25",
+                timeout=180)
         if rc_apt != 0:
             # tail -5 used to cut the reason off — an apt refusal on PVE is several
             # lines of hook output and the operator got "✗ apt install failed:" with

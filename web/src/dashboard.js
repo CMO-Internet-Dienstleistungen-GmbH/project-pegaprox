@@ -14552,7 +14552,7 @@
                     if (hvType(clusters.find(c => c.id === cId)) === 'hyperv') {
                         items.push(
                             { separator: true },
-                            { label: t('hvMigrateToProxmox') || 'Migrate to Proxmox',
+                            { perm: 'vm.migrate', label: t('hvMigrateToProxmox') || 'Migrate to Proxmox',
                               icon: <Icons.FolderInput className="w-3.5 h-3.5" />,
                               onClick: () => openXhmForSource(cId, vm) },
                         );

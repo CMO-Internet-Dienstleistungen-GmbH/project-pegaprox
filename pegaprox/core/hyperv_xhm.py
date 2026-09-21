@@ -32,6 +32,7 @@ from pegaprox.core.hyperv import format_mac
 from pegaprox.core.hyperv_errors import HyperVError
 from pegaprox.core.hyperv_transfer import TransferError
 from pegaprox.globals import cluster_managers
+from pegaprox.utils.ssh import read_capped
 
 logger = logging.getLogger(__name__)
 
@@ -383,8 +384,8 @@ class _Node:
         if stdin_data is not None:
             stdin.write(stdin_data)
             stdin.channel.shutdown_write()
-        err = stderr.read().decode('utf-8', errors='replace')
-        out = stdout.read().decode('utf-8', errors='replace')
+        err = read_capped(stderr)
+        out = read_capped(stdout)
         return stdout.channel.recv_exit_status(), out, err
 
     def run_with_progress(self, command, on_progress, cancelled, timeout=_CONVERT_TIMEOUT):
@@ -411,7 +412,7 @@ class _Node:
                 time.sleep(0.5)
         return (channel.recv_exit_status(),
                 buffered,
-                stderr.read().decode('utf-8', errors='replace'))
+                read_capped(stderr))
 
     def close(self):
         try:
