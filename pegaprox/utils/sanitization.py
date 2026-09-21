@@ -72,12 +72,20 @@ def sanitize_bool(value, default: bool = False) -> bool:
     return default
 
 
+# MK Sep 2026 - every anchored validator below ends in \Z, not $. In Python `$` also
+# matches immediately BEFORE a trailing newline, so `re.match(r'^[a-z]+$', 'abc\n')` is a
+# match and every one of these accepted a value with a newline glued to the end. Two of
+# them gate values that reach a root shell on a PVE node unquoted, where a newline is a
+# command terminator, and one gates a path segment we hand to the PVE API. Nothing
+# legitimate here ever ends in a newline. \Z means the end of the string and only that.
+
+
 def validate_email(email: str) -> bool:
     """Validate email format"""
     if not email or not isinstance(email, str):
         return False
     # Simple regex - not perfect but catches most issues
-    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\Z'
     return bool(re.match(pattern, email))
 
 
@@ -86,8 +94,8 @@ def validate_hostname(hostname: str) -> bool:
     if not hostname or not isinstance(hostname, str):
         return False
     # Allow IP addresses and hostnames
-    ip_pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
-    hostname_pattern = r'^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$'
+    ip_pattern = r'^(\d{1,3}\.){3}\d{1,3}\Z'
+    hostname_pattern = r'^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*\Z'
     return bool(re.match(ip_pattern, hostname) or re.match(hostname_pattern, hostname))
 
 
@@ -103,7 +111,7 @@ def validate_storage_name(storage) -> bool:
     if not storage or not isinstance(storage, str):
         return False
     # Must start with alphanumeric, 1-100 chars total, set: [A-Za-z0-9._-]
-    pattern = r'^[a-zA-Z0-9][a-zA-Z0-9_\-\.]{0,99}$'
+    pattern = r'^[a-zA-Z0-9][a-zA-Z0-9_\-\.]{0,99}\Z'
     return bool(re.match(pattern, storage))
 
 
@@ -114,7 +122,7 @@ def validate_storage_name(storage) -> bool:
 # low-priv storage.upload holder. A PVE ISO/vztmpl filename is a single path
 # component of [A-Za-z0-9._+-] (e.g. debian-12.iso, ubuntu_22.04-1_amd64.tar.zst) —
 # reject anything else (no '/', no spaces, no shell metachars) and fail closed.
-_CONTENT_FILENAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._+\-]{0,254}$')
+_CONTENT_FILENAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._+\-]{0,254}\Z')
 
 def validate_content_filename(value) -> bool:
     """True if `value` is a safe single ISO/template filename for the content-sync
@@ -130,7 +138,7 @@ def validate_content_filename(value) -> bool:
 # set in these; a single component never contains '/'. Anything with shell
 # metacharacters (; | & $ ` < > newlines quotes backslash) or a slash is an
 # injection attempt against the V2P shell pipeline — reject it hard, fail closed.
-_ESXI_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9 ._()+\-]{0,127}$')
+_ESXI_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9 ._()+\-]{0,127}\Z')
 
 def validate_esxi_path_component(value) -> bool:
     """True if `value` is a safe single ESXi datastore / directory name.
@@ -153,7 +161,7 @@ def validate_esxi_path_component(value) -> bool:
 # copy of this check when the same bug was found there; the dashboard twins never got it, so
 # it lives here now and the sinks in manager.py enforce it for every caller.
 # PVE's own snapshot-name rule is [A-Za-z][A-Za-z0-9_-]*, so nothing legitimate is refused.
-_SNAPSHOT_NAME_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_\-]{0,62}$')
+_SNAPSHOT_NAME_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_\-]{0,62}\Z')
 
 
 def validate_snapshot_name(value) -> bool:
@@ -173,7 +181,7 @@ def validate_snapshot_name(value) -> bool:
 # time because the router will not pass a slash. Proxmox publishes the grammar itself
 # (pve-sdn-vnet-id is [a-zA-Z][a-zA-Z0-9]*[a-zA-Z0-9]); dash and underscore are allowed here
 # too so an id someone already created is not suddenly refused. A dot never is.
-_SDN_ID_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_\-]{0,62}$')
+_SDN_ID_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_\-]{0,62}\Z')
 
 
 def validate_sdn_id(value) -> bool:
