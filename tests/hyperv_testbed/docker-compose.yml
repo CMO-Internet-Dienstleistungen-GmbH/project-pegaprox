@@ -1,0 +1,36 @@
+# Read-only SMB export of the generated VHDX fixtures.
+#
+# This stands in for the Hyper-V host's file share: the migration reads the VHDX files
+# over SMB with explicit credentials and must never need write access. The share is
+# mounted read-only here so an accidental write fails the test rather than passing it.
+#
+# Run ./make_fixtures.sh first; without it the share is empty and the tests skip.
+services:
+  hyperv-share:
+    image: dperson/samba:latest
+    container_name: pegaprox-hyperv-share
+    # -p keeps container ownership off the host files; the share is read-only anyway.
+    command: >
+      -p
+      -u "${HYPERV_SMB_USER:-migrate};${HYPERV_SMB_PASSWORD:-migrate-testbed-only}"
+      -s "vhdx;/share;yes;yes;no;${HYPERV_SMB_USER:-migrate}"
+    ports:
+      # High port: the testbed must not collide with a real SMB service on the host.
+      - "${HYPERV_SMB_PORT:-14450}:445"
+    volumes:
+      - ./fixtures:/share:ro
+    healthcheck:
+      test: ["CMD-SHELL", "smbclient -L //127.0.0.1 -U % -N >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # The console proxy. guacd is what actually speaks RDP; PegaProx speaks the Guacamole
+  # protocol to it and relays that to the browser. The console verification uses this
+  # container to prove the whole server-side path except the Hyper-V host itself.
+  guacd:
+    image: guacamole/guacd:1.6.0
+    container_name: pegaprox-hyperv-guacd
+    ports:
+      # High port for the same reason as the share above.
+      - "${HYPERV_GUACD_PORT:-14822}:4822"

@@ -118,6 +118,13 @@
         }
 
         function ConfigModal({ vm, clusterId, allClusters = [], dashboardAuthFetch, onClose, addToast, isCorporate = false }) {
+            // Fork patch #15 — a Hyper-V guest is a migration source, not a machine this
+            // product manages. Its hardware is shown so the operator can see what a
+            // migration has to reproduce; changing it would address a Proxmox API the host
+            // does not have. Read-only is enforced on the form as a whole rather than field
+            // by field, so a field added later cannot quietly become editable here.
+            const isReadOnlySource = typeof hvType === 'function'
+                && hvType((allClusters || []).find(c => c.id === clusterId)) === 'hyperv';
             const { t } = useTranslation();
             const { getAuthHeaders } = useAuth();
             const [config, setConfig] = useState(null);
@@ -1149,6 +1156,7 @@
             };
 
             const handleSave = async () => {
+                if (isReadOnlySource) return;
                 if (Object.keys(changes).length === 0) return;
 
                 // Validate VM name format (DNS-compatible)
@@ -1604,7 +1612,7 @@
                                     {hasChanges && (
                                         <span className="corp-unsaved-pill">{t('unsavedChanges') || 'Unsaved Changes'}</span>
                                     )}
-                                    {hasChanges && (
+                                    {hasChanges && !isReadOnlySource && (
                                         <button
                                             onClick={handleSave}
                                             disabled={saving}
@@ -1686,6 +1694,18 @@
 
                         {/* Content */}
                         <div className={isCorporate ? 'corp-vm-modal-body' : 'flex-1 overflow-y-auto p-6'}>
+                            {/* Fork patch #15 — one fieldset around the whole form rather than a
+                                disabled attribute on every input: a field added later is covered
+                                without anybody remembering to cover it. `contents` keeps the
+                                element out of the layout. */}
+                            {isReadOnlySource && (
+                                <div className="mb-4 rounded-lg border border-proxmox-border bg-proxmox-dark px-3 py-2
+                                                text-xs text-gray-400">
+                                    {t('hvSourceReadOnly')
+                                        || 'This is a migration source. Its hardware is shown as it is on the Hyper-V host and cannot be changed from here.'}
+                                </div>
+                            )}
+                            <fieldset disabled={isReadOnlySource} className="contents">
                             {loading ? (
                                 isCorporate ? (
                                     <div className="corp-vm-modal-state">
@@ -5294,6 +5314,7 @@
                                     Konfiguration konnte nicht geladen werden
                                 </div>
                             )}
+                            </fieldset>
                         </div>
 
                         {/* Footer */}
@@ -5314,7 +5335,8 @@
                                 </button>
                                 <button
                                     onClick={handleSave}
-                                    disabled={!hasChanges || saving}
+                                    disabled={!hasChanges || saving || isReadOnlySource}
+                                    hidden={isReadOnlySource}
                                     className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange rounded-lg text-white font-medium hover:bg-orange-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                                 >
                                     {saving ? (

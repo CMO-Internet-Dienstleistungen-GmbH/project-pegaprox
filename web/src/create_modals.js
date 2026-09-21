@@ -1972,11 +1972,37 @@
             // Sync with initialType when modal opens with different type
             useEffect(() => {
                 if (isOpen) setConnectionType(initialType);
+                // Fork patch #15 — a form that opens fresh opens EMPTY.
+                //
+                // This dialog stays mounted; `isOpen` only hides it. Nothing reset the
+                // fields, so whatever was typed last time was still in them the next time
+                // it opened — and after a Re-configure that is another host's name, address
+                // and account, one Save away from being registered a second time. Reset
+                // first, then let the reconfigure branch below fill what it means to fill.
+                if (isOpen && !reconfigureConfig) {
+                    setConfig(emptyProxmoxConfig());
+                    setXcpConfig(emptyXcpConfig());
+                    setHyperVConfig({ ...HYPERV_DEFAULT_CONFIG });
+                    setShowSshSettings(false);
+                }
                 // #256: pre-fill config for re-configure
                 if (isOpen && reconfigureConfig) {
                     setConnectionType(reconfigureConfig.cluster_type || 'proxmox');
                     const rc = reconfigureConfig;
-                    if (rc.cluster_type === 'xcpng') {
+                    if (rc.cluster_type === 'hyperv') {
+                        setHyperVConfig(prev => ({ ...prev, name: rc.name || '', host: rc.host || '',
+                            use_ssl: rc.use_ssl === true, auth: rc.auth || 'negotiate',
+                            encrypt_messages: rc.encrypt_messages !== false,
+                            port: rc.port || rc.api_port || hvDefaultPort(rc.use_ssl === true),
+                            user: rc.user || '', pass: '',
+                            ssl_verification: rc.ssl_verification !== false,
+                            iso_library_paths: (rc.iso_library_paths || []).join('\n'),
+                            smb_share_map: Object.entries(rc.smb_share_map || {})
+                                .map(([drive, share]) => `${drive}=${share}`).join('\n'),
+                            smb_domain: rc.smb_domain || '',
+                            transfer_host: rc.transfer_host || '',
+                            max_sessions: rc.max_sessions || 4 }));
+                    } else if (rc.cluster_type === 'xcpng') {
                         setXcpConfig(prev => ({ ...prev, name: rc.name || '', host: rc.host || '', user: rc.user || '', pass: '', ssl_verification: rc.ssl_verification || false, migration_threshold: rc.migration_threshold || 20, check_interval: rc.check_interval || 300, auto_migrate: rc.auto_migrate || false, dry_run: rc.dry_run || false }));
                     } else {
                         // #762 — carry EVERY persisted cluster setting into the reconfigure form, not
@@ -1994,6 +2020,9 @@
 
             // XCP-ng config
             const [xcpConfig, setXcpConfig] = useState(emptyXcpConfig);
+
+            // Hyper-V source config (fork patch #15) — shape and parsing live in hyperv.js
+            const [hyperVConfig, setHyperVConfig] = useState({ ...HYPERV_DEFAULT_CONFIG });
 
             // PBS config
             const [pbsConfig, setPbsConfig] = useState(emptyPbsConfig);
@@ -2020,6 +2049,7 @@
                 e.preventDefault();
                 if (connectionType === 'proxmox') onSubmit(config);
                 else if (connectionType === 'xcpng') onSubmit({...xcpConfig, cluster_type: 'xcpng'});
+                else if (connectionType === 'hyperv') onSubmit(hvNormaliseConfig(hyperVConfig));
                 else if (connectionType === 'pbs') onAddPBS(pbsConfig);
                 else if (connectionType === 'vmware') onAddVMware(vmwConfig);
             };
@@ -2036,6 +2066,7 @@
                                 {[
                                     { id: 'proxmox', label: 'Proxmox VE', icon: Icons.Server, active: 'bg-orange-500/20 text-orange-400 border-orange-500/40', inactive: 'bg-proxmox-dark text-gray-500 border-transparent hover:text-gray-300 hover:border-proxmox-border' },
                                     { id: 'xcpng', label: 'XCP-ng (TP)', icon: Icons.Cpu, active: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/40', inactive: 'bg-proxmox-dark text-gray-500 border-transparent hover:text-gray-300 hover:border-proxmox-border' },
+                                    { id: 'hyperv', label: 'Hyper-V', icon: Icons.Server, active: 'bg-indigo-500/20 text-indigo-400 border-indigo-500/40', inactive: 'bg-proxmox-dark text-gray-500 border-transparent hover:text-gray-300 hover:border-proxmox-border' },
                                     { id: 'pbs', label: 'PBS', icon: Icons.Shield, active: 'bg-blue-500/20 text-blue-400 border-blue-500/40', inactive: 'bg-proxmox-dark text-gray-500 border-transparent hover:text-gray-300 hover:border-proxmox-border' },
                                     { id: 'vmware', label: 'ESXi', icon: Icons.Cloud, active: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40', inactive: 'bg-proxmox-dark text-gray-500 border-transparent hover:text-gray-300 hover:border-proxmox-border' },
                                 ].map(tab => (
@@ -2060,6 +2091,11 @@
                         )}
 
                         <form onSubmit={handleSubmit} className="p-6 space-y-5">
+                            {/* ===== HYPER-V SOURCE FORM (fork patch #15) ===== */}
+                            {connectionType === 'hyperv' && (
+                                <HyperVSourceForm config={hyperVConfig} setConfig={setHyperVConfig} t={t} />
+                            )}
+
                             {/* ===== PROXMOX VE FORM ===== */}
                             {connectionType === 'proxmox' && (<>
                             <div className="grid grid-cols-2 gap-4">

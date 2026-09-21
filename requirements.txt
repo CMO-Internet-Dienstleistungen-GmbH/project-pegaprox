@@ -65,6 +65,12 @@ pyvmomi>=8.0.0
 # === XCP-ng Integration (Optional) ===
 XenAPI>=23.14.0
 
+# === Hyper-V Migration Source (Optional) ===
+# PowerShell Remoting over WinRM. Without it a registered Hyper-V host cannot be reached
+# at all -- the transport raises a classified "pypsrp is not installed" and every route
+# below it reports a client dependency.
+pypsrp>=0.9.1
+
 # === Hardened XML parsing ===
 defusedxml>=0.7.1
 
