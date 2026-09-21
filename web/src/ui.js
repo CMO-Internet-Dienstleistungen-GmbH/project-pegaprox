@@ -902,23 +902,37 @@
         // Notification Toast
         // LW: Simple toast - auto-closes after 3s
         // tried 5s but users complained it was too long
-        function Toast({ message, type = 'success', onClose }) {
+        function Toast({ title, message, type = 'success', onClose }) {
+            // An error waits for a person. Three seconds is long enough to notice that
+            // something went wrong and far too short to read why — and why is the only
+            // part worth showing. Everything else still clears itself.
             useEffect(() => {
-                const timer = setTimeout(onClose, 3000);  // 3000ms = 3s
+                if (type === 'error') return;
+                const timer = setTimeout(onClose, 5000);
                 return() => clearTimeout(timer);
-            }, [onClose]);
+            }, [onClose, type]);
 
             // NS: ternary hell but it works lol
             return(
-                <div className={`toast-enter flex items-center gap-3 px-4 py-3 rounded-lg border ${
-                    type === 'success' 
-                        ? 'bg-green-500/10 border-green-500/30 text-green-400' 
+                <div className={`toast-enter flex items-start gap-3 px-4 py-3 rounded-lg border max-w-md ${
+                    type === 'success'
+                        ? 'bg-green-500/10 border-green-500/30 text-green-400'
                         : type === 'error'
                         ? 'bg-red-500/10 border-red-500/30 text-red-400'
                         : 'bg-proxmox-orange/10 border-proxmox-orange/30 text-proxmox-orange'
                 }`}>
-                    {type === 'success' ? <Icons.Check /> : type === 'error' ? <Icons.X /> : <Icons.Activity />}
-                    <span className="text-sm font-medium">{message}</span>
+                    <span className="shrink-0 mt-0.5">
+                        {type === 'success' ? <Icons.Check /> : type === 'error' ? <Icons.X /> : <Icons.Activity />}
+                    </span>
+                    <span className="text-sm min-w-0">
+                        {title && <span className="font-medium block">{title}</span>}
+                        {/* Wrapped rather than truncated: a reason that is cut off
+                            is a reason nobody can act on, and these run to a sentence. */}
+                        <span className={`block break-all${title ? ' opacity-90' : ' font-medium'}`}>{message}</span>
+                    </span>
+                    <button onClick={onClose}
+                            aria-label="Dismiss"
+                            className="shrink-0 ml-1 opacity-60 hover:opacity-100 leading-none">×</button>
                 </div>
             );
         }
