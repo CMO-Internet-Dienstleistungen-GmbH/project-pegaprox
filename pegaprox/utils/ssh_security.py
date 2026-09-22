@@ -147,10 +147,18 @@ def persist_host_keys(client):
             try:
                 if os.path.exists(_KNOWN_HOSTS):
                     merged.load(_KNOWN_HOSTS)
-            except Exception:
-                # unreadable/corrupt file: fall back to writing what we hold rather
-                # than losing this client's keys too
-                merged = _pk.hostkeys.HostKeys()
+            except Exception as _le:
+                # MK Sep 2026 - this used to carry on with an EMPTY set and save, which
+                # replaced the file with just this client's keys. Measured: paramiko's
+                # load() raises ValueError on a truncated entry, which is exactly what an
+                # interrupted save leaves behind, and it raises for the whole file - one
+                # bad line loses every good pin before it. Writing then is the worst of
+                # the two outcomes: a lost pin puts that host back on trust-on-first-use,
+                # while a key we fail to add just means the next connect pins it. So do
+                # not write when we could not read.
+                _log.warning("known_hosts unreadable (%s) - not persisting host keys this "
+                             "round rather than overwriting pins we cannot see", _le)
+                return
             added = 0
             for hostname, keys in (client.get_host_keys() or {}).items():
                 on_disk = merged.lookup(hostname)
@@ -294,10 +302,14 @@ def verify_transport_host_key(transport, hostname, paramiko, port=22):
             try:
                 if os.path.exists(_KNOWN_HOSTS):
                     fresh.load(_KNOWN_HOSTS)
-            except Exception:
-                # unreadable on disk: fall back to what we hold rather than dropping
-                # this key too, same call as persist_host_keys makes
-                fresh = hostkeys
+            except Exception as _le:
+                # Same call persist_host_keys makes, and for the same reason: if the file
+                # cannot be read we cannot merge into it, and writing anyway would replace
+                # pins we never saw. Skip the write; the host stays unpinned and the next
+                # connect tries again.
+                _log.warning("known_hosts unreadable (%s) - not pinning %s this round",
+                             _le, hostname)
+                raise
             fresh.add(lookup_name, keytype, key)
             fresh.save(_KNOWN_HOSTS)
     except Exception:

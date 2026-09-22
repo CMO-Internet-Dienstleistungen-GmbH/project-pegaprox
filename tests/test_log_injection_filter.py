@@ -277,3 +277,75 @@ def test_a_traceback_keeps_its_newlines():
         assert buf.getvalue().count('\n') > 2, 'the traceback was flattened'
     finally:
         root.handlers = old
+
+
+# --- and the most common value we log is not a str ---------------------------------
+# Sanitising record.msg and record.args only reaches str values. `logging.error("%s", e)`
+# passes the EXCEPTION object, and str(e) carries whatever a remote server wrote into its
+# error text - so the single most common logging shape in this tree walked through both
+# the factory and the handler filter untouched. Rendering is where msg and args become
+# text whatever their type, so that is where it has to be cleaned. Found by the CodeAnt
+# scan on the commit that introduced the factory. MK
+
+
+class _RemoteError(Exception):
+    pass
+
+
+class _WeirdStr:
+    def __str__(self):
+        return 'obj\x1b]0;pwned\x07end'
+
+
+def _capture_with_sanitizer(name):
+    buf = io.StringIO()
+    h = logging.StreamHandler(buf)
+    h.setFormatter(logging.Formatter('%(message)s'))
+    lg = logging.getLogger(name)
+    lg.handlers = [h]
+    lg.setLevel(logging.INFO)
+    lg.propagate = False
+    _sanitizer()()
+    return lg, buf
+
+
+def test_an_exception_object_as_an_argument_cannot_forge_a_line():
+    """The property: what reaches the stream has one line, whatever type the arg was."""
+    lg, buf = _capture_with_sanitizer('pegaprox.test.exc_arg')
+
+    lg.warning('request failed: %s',
+               _RemoteError('upstream said\r\n2026-01-01 00:00:00 ADMIN deleted everything'))
+
+    out = buf.getvalue()
+    assert out.count('\n') == 1, f'a forged line got through: {out!r}'
+    assert 'ADMIN deleted everything' in out, 'the text was dropped rather than neutralised'
+
+
+def test_any_object_with_control_characters_in_str_is_neutralised():
+    lg, buf = _capture_with_sanitizer('pegaprox.test.weird_arg')
+
+    lg.warning('obj: %s', _WeirdStr())
+
+    leftover = [c for c in buf.getvalue() if ord(c) < 32 and c != '\n']
+    assert not leftover, f'control characters survived: {[hex(ord(c)) for c in leftover]}'
+
+
+def test_percent_d_still_formats_as_a_number():
+    """The mirror: cleaning the RENDERED message must happen after % formatting, or a
+    numeric placeholder would break the moment its argument were stringified early."""
+    lg, buf = _capture_with_sanitizer('pegaprox.test.numeric_arg')
+
+    lg.warning('count %d items on %s', 42, 'pve1')
+
+    assert 'count 42 items on pve1' in buf.getvalue()
+
+
+def test_a_traceback_still_survives_the_rendered_clean():
+    lg, buf = _capture_with_sanitizer('pegaprox.test.tb_render')
+    try:
+        1 / 0
+    except ZeroDivisionError:
+        lg.exception('boom')
+
+    out = buf.getvalue()
+    assert 'Traceback' in out and out.count('\n') > 2, out

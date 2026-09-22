@@ -185,10 +185,11 @@ _LONE_SEGMENT_SECRETS = [
     'https://push.example.com/Ab3Xy9Zq',
 ]
 
+# (url, segment that must survive, the tail segment that must NOT)
 _STRUCTURED = [
-    ('https://hooks.slack.com/services/T000/B000/XXXXsecret', 'services'),
-    ('https://discord.com/api/webhooks/123/SECRETTOKEN', 'api'),
-    ('https://outlook.office.com/webhook/aaa/IncomingWebhook/bbb', 'webhook'),
+    ('https://hooks.slack.com/services/T000/B000/XXXXsecret', 'services', 'XXXXsecret'),
+    ('https://discord.com/api/webhooks/123/SECRETTOKEN', 'api', 'SECRETTOKEN'),
+    ('https://outlook.office.com/webhook/aaa/IncomingWebhook/bbb', 'webhook', 'bbb'),
 ]
 
 
@@ -207,14 +208,17 @@ def test_a_one_segment_path_is_never_printed(url):
     assert '[REDACTED]' in out, f'nothing was redacted at all: {out}'
 
 
-@pytest.mark.parametrize('url,keep', _STRUCTURED)
-def test_the_structural_first_segment_still_survives(url, keep):
+@pytest.mark.parametrize('url,keep,tail', _STRUCTURED)
+def test_the_structural_first_segment_still_survives(url, keep, tail):
     """The mirror. Redacting the lone segment must not turn into redacting every
     path, or the operator loses the only clue about which endpoint failed."""
     from pegaprox.utils.sanitization import redact_url
     out = redact_url(url)
     assert f'/{keep}' in out, f'the structural segment was lost: {out}'
-    assert 'SECRET' not in out.upper().replace('[REDACTED]', ''), out
+    # and the part that actually carries the secret is gone. Checking for the literal
+    # "SECRET" only tested anything for two of these three URLs; the tail segment is the
+    # thing every one of them has to lose.
+    assert tail not in out, f'the secret-bearing tail segment survived: {out}' 
 
 
 def test_the_host_is_still_readable():

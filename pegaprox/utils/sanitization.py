@@ -433,6 +433,21 @@ def install_log_record_sanitizer():
             elif isinstance(record.args, tuple):
                 record.args = tuple(sanitize_log_message(a) if isinstance(a, str) else a
                                     for a in record.args)
+
+        # MK Sep 2026 (follow-up) - sanitising msg and args covers str values and nothing
+        # else, and the most common thing we log is not a str: `logging.error("...: %s", e)`
+        # passes the EXCEPTION, and str(e) carries whatever a remote server put in its error
+        # text. Measured: that forged a line straight through both this factory and the
+        # handler filter. Rendering is the one place where msg and args become text
+        # regardless of their types, so clean the rendered result too. It happens after %
+        # formatting, so a %d with an int still formats as an int; exc_info is appended by
+        # the formatter afterwards, so tracebacks keep their newlines.
+        _render = record.getMessage
+
+        def _clean_render(_r=_render):
+            return sanitize_log_message(_r())
+
+        record.getMessage = _clean_render
         return record
 
     logging.setLogRecordFactory(_sanitising_factory)
