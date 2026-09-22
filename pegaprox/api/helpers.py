@@ -366,14 +366,22 @@ def get_connected_manager(cluster_id):
         }), 503)
     return manager, None
 
-def check_cluster_access(cluster_id):
-    """Check if current user can access a cluster based on tenant or VM ACLs.
-    Returns (True, None) if allowed, (False, error_response) if not.
+def acting_user():
+    """The identity an authorization decision should be made against.
+
+    require_auth stashes the RAW stored record in g.current_user. That record carries no
+    effective_role, so handing it straight to get_user_clusters gives an API token its
+    OWNER's scope — and for an admin owner get_user_clusters answers None, "all clusters",
+    which makes a caller's own filtering a no-op rather than a refusal. Every route that
+    scopes its own output wants this function, not g.current_user.
+
+    #491 — for an API token, floor the acting role to the token's grant (like
+    build_authz_user) so an admin-owned scoped token can't reach clusters outside its
+    scope. H2 (scale audit): reuse the user require_auth already fetched, else fetch just
+    that one — don't re-scan the whole users table per cluster route, which is also why
+    this does not simply call build_authz_user. MK Sep 2026, Aikido 700487434.
     """
-    from flask import request, jsonify, g
-    from pegaprox.utils.rbac import get_user_clusters
-    # H2 (scale audit): reuse the acting user require_auth already fetched (g.current_user),
-    # else fetch just that one user — don't re-scan the whole users table per cluster route.
+    from flask import request, g
     user = getattr(g, 'current_user', None)
     if user is None:
         try:
@@ -381,22 +389,19 @@ def check_cluster_access(cluster_id):
         except Exception:
             from pegaprox.utils.auth import load_users
             user = load_users().get(request.session['user'], {})
-    # #491 — for an API token, floor the acting role to the token's grant (like build_authz_user)
-    # so an admin-owned scoped token can't reach clusters outside its scope. Done inline (a copy,
-    # not mutating g.current_user) to avoid the whole-table load_users() this hot path deliberately
-    # skips; get_user_clusters now honors effective_role.
-    #
-    # MK Sep 2026 - this used to be its own inline copy of that floor, and it collapsed a
-    # tenant CUSTOM role to a builtin level - the very thing removed from build_authz_user
-    # in Aug 2026. require_auth stashes the RAW stored record in g.current_user, with no
-    # effective_role on it, so the branch ran on every token request: the custom role became
-    # 'viewer', get_user_clusters saw a builtin and skipped its custom-role -> tenant remap,
-    # the caller fell back to the default tenant, and an empty cluster list there means ALL
-    # clusters. A token scoped below its owner read every cluster on the installation.
-    # apply_token_role is the shared decision now; it does not load the users table either.
     if request.session.get('api_token') and isinstance(user, dict) and 'effective_role' not in user:
         from pegaprox.utils.auth import apply_token_role
         user = apply_token_role(user, request.session.get('role'))
+    return user
+
+
+def check_cluster_access(cluster_id):
+    """Check if current user can access a cluster based on tenant or VM ACLs.
+    Returns (True, None) if allowed, (False, error_response) if not.
+    """
+    from flask import request, jsonify, g
+    from pegaprox.utils.rbac import get_user_clusters
+    user = acting_user()
     allowed = get_user_clusters(user)
     if allowed is not None and cluster_id not in allowed:
         # #248: check VM ACLs as fallback — users with VM-level access can reach the cluster
