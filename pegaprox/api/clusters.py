@@ -28,7 +28,8 @@ from pegaprox.core.manager import PegaProxManager
 from pegaprox.core.xcpng import XcpngManager, XENAPI_AVAILABLE
 from pegaprox.utils.sanitization import bounded_list
 from pegaprox.api.helpers import (load_server_settings, get_connected_manager, check_cluster_access,
-                                  safe_error, scope_vm_rows, require_unconfined, parse_pve_error)
+                                  safe_error, scope_vm_rows, require_unconfined, parse_pve_error,
+                                  bounded_limit)
 
 # MK: this used to be 200 lines down in the monolith, good luck finding anything there
 bp = Blueprint('clusters', __name__)
@@ -1828,7 +1829,7 @@ def get_cluster_tasks(cluster_id):
     if not mgr.is_connected:
         return jsonify([])
 
-    limit = request.args.get('limit', 50, type=int)
+    limit = bounded_limit(request.args.get('limit'), 50, 1000)
     tasks = mgr.get_tasks(limit=limit) or []
 
     # sec (private disclosure Sep 2026 — audit M3): the task log carries per-VM UPIDs (vmid/node/type,

@@ -540,6 +540,27 @@ def check_pbs_access(pbs_id):
     return False, (jsonify({'error': 'Access denied to this PBS server'}), 403)
 
 
+def bounded_limit(value, default=50, maximum=1000):
+    """Clamp a caller-supplied row limit.
+
+    NS Sep 2026 (audit) — several routes took ?limit= with Flask's type=int, which stops
+    a string but not `?limit=99999999`, and handed it straight to a SQL LIMIT or to the
+    upstream PVE/PBS API. type=int is a parser, not a bound.
+
+    1000 is deliberately generous: the frontend's largest ask on these routes is 200.
+    The audit CSV export is NOT routed through here — it documents ?limit=10000 in the
+    UI and is a deliberate export, so capping it would break a feature rather than close
+    a hole.
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    if n <= 0:
+        return default
+    return min(n, maximum)
+
+
 def require_unconfined(cluster_id):
     """sec (audit): guard for a WHOLE-CLUSTER operation — one with no per-object notion, so
     user_can_access_vm has nothing to ask about: rebooting a node, draining it, rewriting the

@@ -13,7 +13,7 @@ from pegaprox.core.db import get_db
 from pegaprox.utils.auth import require_auth
 from pegaprox.utils.audit import log_audit
 from pegaprox.utils.sanitization import bounded_list
-from pegaprox.api.helpers import safe_error, check_pbs_access, check_cluster_access, scope_vm_rows, require_unconfined
+from pegaprox.api.helpers import safe_error, check_pbs_access, check_cluster_access, scope_vm_rows, require_unconfined, bounded_limit
 from pegaprox.core.pbs import PBSManager, load_pbs_servers, save_pbs_server
 
 bp = Blueprint('pbs', __name__)
@@ -992,7 +992,7 @@ def get_pbs_tasks(pbs_id):
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
-    limit = int(request.args.get('limit', 50))
+    limit = bounded_limit(request.args.get('limit'), 50, 1000)
     typefilter = request.args.get('typefilter', None)
     running = request.args.get('running', None)
     result = mgr.get_tasks(limit=limit, typefilter=typefilter,
@@ -1327,7 +1327,7 @@ def get_pbs_syslog(pbs_id):
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
-    limit = request.args.get('limit', 100, type=int)
+    limit = bounded_limit(request.args.get('limit'), 100, 1000)
     since = request.args.get('since')
     result = mgr.get_syslog(limit=limit, since=since)
     failed = pbs_upstream_error(result)
@@ -2580,7 +2580,7 @@ def get_backup_verification_history(cluster_id):
         return err
 
     vmid = request.args.get('vmid', type=int)
-    limit = request.args.get('limit', 50, type=int)
+    limit = bounded_limit(request.args.get('limit'), 50, 1000)
 
     results = get_verification_history(cluster_id, vmid, limit)
     return jsonify(_verification_rows_visible(cluster_id, results))
