@@ -6836,7 +6836,16 @@ def _untagged_replica_error(job_id, vmid, node, detail):
 # ============================================================================
 
 def _xcincr_node_ip(mgr, node):
-    """Resolve a cluster node name to an IP for SSH (cluster/status)."""
+    """Resolve a cluster node name to an IP for SSH (cluster/status), or None.
+
+    MK Sep 2026 — this used to hand the name straight back when cluster/status did not
+    list it. The name comes off the stored replication job, where it was supplied when
+    the job was created, so an unresolvable one became the SSH destination itself and
+    _ssh_connect offers THAT cluster's stored root credentials to it. Same contract as
+    manager.member_node_ip, and for the same reason: None means refuse, never "use the
+    name". A deployment that was relying on the node name resolving in DNS now fails
+    the job with a message saying so instead of dialling a host we never verified.
+    """
     try:
         r = mgr._api_get(f"https://{mgr.host}:{mgr.api_port}/api2/json/cluster/status")
         if r.status_code == 200:
@@ -6845,7 +6854,7 @@ def _xcincr_node_ip(mgr, node):
                     return it['ip']
     except Exception:
         pass
-    return node
+    return None
 
 
 def _xcincr_rbd_pool(ssh, storage):
@@ -7057,8 +7066,16 @@ def _execute_replication_incremental(job):
                  f"({len(disks)} disk(s), base={last_snap or 'none/seed'})")
     src_ssh = tgt_ssh = None
     try:
-        src_ssh = source_mgr._ssh_connect(_xcincr_node_ip(source_mgr, source_node))
-        tgt_ssh = target_mgr._ssh_connect(_xcincr_node_ip(target_mgr, target_node))
+        _src_ip = _xcincr_node_ip(source_mgr, source_node)
+        _tgt_ip = _xcincr_node_ip(target_mgr, target_node)
+        if not _src_ip or not _tgt_ip:
+            _missing = source_node if not _src_ip else target_node
+            _update_repl_status(db, job_id, 'error',
+                                f'Node {_missing!r} is not listed as a member of its cluster - '
+                                f'refusing to SSH to it')
+            return True
+        src_ssh = source_mgr._ssh_connect(_src_ip)
+        tgt_ssh = target_mgr._ssh_connect(_tgt_ip)
         if not src_ssh or not tgt_ssh:
             _update_repl_status(db, job_id, 'error', 'SSH to source/target node failed (incremental needs SSH creds on both clusters)')
             return True
