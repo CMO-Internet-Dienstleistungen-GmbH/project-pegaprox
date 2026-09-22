@@ -6836,6 +6836,15 @@ echo "AGENT_INSTALLED_OK"
 
         NS: Jan 2026 - HA status checks bypass semaphore for immediate execution
         """
+        # #941 — this family is a second SSH ladder that never went through
+        # _ssh_connect, so gating that one reached one of five ways out of this process.
+        # Live E2E is what caught it: the switch read True in the cluster listing and the
+        # hardening report still came back full of real results.
+        _blocked = self.ssh_blocked_reason()
+        if _blocked:
+            self.logger.debug(f"SSH suppressed ({_blocked}) for {host}")
+            return None
+
         # NS 2026-04-24 — auto-sudo for non-root SSH users (pegaprox@pam etc).
         # Wrap multi-line/shell-redirect commands through base64 → `sudo bash`.
         if user and user != 'root':
@@ -6872,6 +6881,15 @@ echo "AGENT_INSTALLED_OK"
 
         NS: Jan 2026 - HA operations bypass semaphore
         """
+        # #941 — this family is a second SSH ladder that never went through
+        # _ssh_connect, so gating that one reached one of five ways out of this process.
+        # Live E2E is what caught it: the switch read True in the cluster listing and the
+        # hardening report still came back full of real results.
+        _blocked = self.ssh_blocked_reason()
+        if _blocked:
+            self.logger.debug(f"SSH suppressed ({_blocked}) for {host}")
+            return None
+
         # NS 2026-04-24 — auto-sudo for non-root SSH users (pegaprox@pam etc).
         # Wrap multi-line/shell-redirect commands through base64 → `sudo bash`.
         if user and user != 'root':
@@ -6926,6 +6944,15 @@ echo "AGENT_INSTALLED_OK"
 
         NS: Jan 2026 - HA operations bypass semaphore
         """
+        # #941 — this family is a second SSH ladder that never went through
+        # _ssh_connect, so gating that one reached one of five ways out of this process.
+        # Live E2E is what caught it: the switch read True in the cluster listing and the
+        # hardening report still came back full of real results.
+        _blocked = self.ssh_blocked_reason()
+        if _blocked:
+            self.logger.debug(f"SSH suppressed ({_blocked}) for {host}")
+            return None
+
         # NS 2026-04-24 — auto-sudo for non-root SSH users (pegaprox@pam etc).
         # Wrap multi-line/shell-redirect commands through base64 → `sudo bash`.
         if user and user != 'root':
@@ -7757,6 +7784,15 @@ echo "AGENT_INSTALLED_OK"
         2. They are short (< 5 seconds typically)
         3. They are rare (only during actual failures)
         """
+        # #941 — this family is a second SSH ladder that never went through
+        # _ssh_connect, so gating that one reached one of five ways out of this process.
+        # Live E2E is what caught it: the switch read True in the cluster listing and the
+        # hardening report still came back full of real results.
+        _blocked = self.ssh_blocked_reason()
+        if _blocked:
+            self.logger.debug(f"SSH suppressed ({_blocked}) for {host}")
+            return False
+
         # NS 2026-04-24 — auto-sudo for non-root SSH users (pegaprox@pam etc).
         # Wrap multi-line/shell-redirect commands through base64 → `sudo bash`.
         if user and user != 'root':
@@ -7799,6 +7835,15 @@ echo "AGENT_INSTALLED_OK"
         MK: Security fix - writes key to temp file with strict permissions,
         uses it for SSH, then immediately deletes it.
         """
+        # #941 — this family is a second SSH ladder that never went through
+        # _ssh_connect, so gating that one reached one of five ways out of this process.
+        # Live E2E is what caught it: the switch read True in the cluster listing and the
+        # hardening report still came back full of real results.
+        _blocked = self.ssh_blocked_reason()
+        if _blocked:
+            self.logger.debug(f"SSH suppressed ({_blocked}) for {host}")
+            return False
+
         # NS 2026-04-24 — auto-sudo for non-root SSH users (pegaprox@pam etc).
         # Wrap multi-line/shell-redirect commands through base64 → `sudo bash`.
         if user and user != 'root':
@@ -7855,6 +7900,15 @@ echo "AGENT_INSTALLED_OK"
 
         NS: Jan 2026 - HA operations bypass semaphore for immediate execution
         """
+        # #941 — this family is a second SSH ladder that never went through
+        # _ssh_connect, so gating that one reached one of five ways out of this process.
+        # Live E2E is what caught it: the switch read True in the cluster listing and the
+        # hardening report still came back full of real results.
+        _blocked = self.ssh_blocked_reason()
+        if _blocked:
+            self.logger.debug(f"SSH suppressed ({_blocked}) for {host}")
+            return False
+
         # NS 2026-04-24 — auto-sudo for non-root SSH users (pegaprox@pam etc).
         # Wrap multi-line/shell-redirect commands through base64 → `sudo bash`.
         if user and user != 'root':

@@ -120,6 +120,12 @@ def get_clusters():
                 # the sshd_hardening control (PermitRootLogin prohibit-password) cuts off PegaProx's
                 # own access on a cluster we reach by root password with no key deployed.
                 'has_ssh_key': bool(getattr(mgr.config, 'ssh_key', '')),
+                # MK Sep 2026 (#941) — the listing is what the cluster dialog reads back, so
+                # a field missing here is a toggle that reverts on refresh. Same trap as
+                # proxlb_tags_enabled below (#628); the round-trip test I wrote went through
+                # save_cluster/get_cluster and never touched this serializer, so only the
+                # live E2E caught it.
+                'ssh_disabled': bool(getattr(mgr.config, 'ssh_disabled', False)),
                 'migration_threshold': mgr.config.migration_threshold,
                 'migration_tolerance': getattr(mgr.config, 'migration_tolerance', 10),
                 'check_interval': mgr.config.check_interval,

@@ -209,3 +209,48 @@ def test_the_field_is_accepted_by_the_update_route():
     silently, which looks exactly like the revert above from the outside."""
     from pegaprox.api.clusters import ALLOWED_CONFIG_FIELDS
     assert 'ssh_disabled' in ALLOWED_CONFIG_FIELDS
+
+
+# ------------------------------------------------- the SECOND ssh ladder
+
+@pytest.mark.parametrize('method,args,expected', [
+    ('_ssh_run_command_output',              ('h', 'u', 'cmd'),            None),
+    ('_ssh_run_command_with_key_output',     ('h', 'u', 'cmd', 'KEY'),     None),
+    ('_ssh_run_command_with_password_output',('h', 'u', 'cmd', 'PW'),      None),
+    ('_ssh_run_command',                     ('h', 'u', 'cmd'),            False),
+    ('_ssh_run_command_with_key',            ('h', 'u', 'cmd', 'KEY'),     False),
+    ('_ssh_run_command_with_password',       ('h', 'u', 'cmd', 'PW'),      False),
+])
+def test_the_other_ssh_ladder_is_blocked_too(monkeypatch, method, args, expected):
+    """_ssh_connect is not the only way out of this process.
+
+    _ssh_node_output_ex has its own key/agent/password ladder built on these six, and
+    none of them goes through _ssh_connect — so gating that one reached ONE of five
+    ways to open SSH to a node. Three of these are handed self.config.pass_ by their
+    callers, which on a token-auth cluster is the token secret, so the disclosure this
+    ticket is about lived here as well.
+
+    The live E2E is what caught it: the off switch read True in the cluster listing and
+    the hardening report still came back with 44 real control results. Unit tests over
+    _ssh_connect could not see it. This pins all six.
+    """
+    from pegaprox.core.manager import PegaProxManager
+    m = _manager(_cfg(ssh_key='-----BEGIN KEY-----', ssh_disabled=True))
+
+    # make the real implementation explode if the guard ever lets us reach it
+    monkeypatch.setattr('pegaprox.core.manager.subprocess', _Exploding(), raising=False)
+
+    assert getattr(PegaProxManager, method)(m, *args) is expected
+
+
+class _Exploding:
+    def __getattr__(self, _name):
+        raise AssertionError('SSH was attempted while the switch was off')
+
+
+def test_the_other_ladder_still_runs_when_ssh_is_allowed():
+    """The mirror. With credentials and the switch off-by-default, the guard must not
+    be what stops the call — anything after it is the real implementation's business."""
+    from pegaprox.core.manager import PegaProxManager
+    m = _manager(_cfg(ssh_key='-----BEGIN KEY-----'))
+    assert m.ssh_blocked_reason() is None
