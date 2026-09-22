@@ -282,10 +282,24 @@ def verify_transport_host_key(transport, hostname, paramiko, port=22):
         raise paramiko.SSHException(
             "strict host-key checking: unknown SSH host key for "
             f"{hostname} ({keytype}); seed config/.ssh_known_hosts first")
-    hostkeys.add(lookup_name, keytype, key)
+    # MK Sep 2026 - the lock used to cover only the save, and `hostkeys` was loaded far
+    # above, before the lookup. Adding to that stale copy and writing the whole set back
+    # erased any pin another writer recorded in between - and losing a pin puts the host
+    # back on the TOFU path, which is the MitM window this function exists to close.
+    # persist_host_keys() already does it the right way; do the same here: re-read inside
+    # the lock, add only the key we just verified, save that.
     try:
         with _persist_lock:
-            hostkeys.save(_KNOWN_HOSTS)
+            fresh = paramiko.hostkeys.HostKeys()
+            try:
+                if os.path.exists(_KNOWN_HOSTS):
+                    fresh.load(_KNOWN_HOSTS)
+            except Exception:
+                # unreadable on disk: fall back to what we hold rather than dropping
+                # this key too, same call as persist_host_keys makes
+                fresh = hostkeys
+            fresh.add(lookup_name, keytype, key)
+            fresh.save(_KNOWN_HOSTS)
     except Exception:
         pass
     try:
