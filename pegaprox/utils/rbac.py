@@ -300,6 +300,11 @@ def save_tenants(tenants: dict):
 # tenant cache - reloaded on changes
 tenants_db = {}
 
+# No tenant id can contain a NUL, so this never collides with a real one. It is a
+# tenant that does not exist on purpose — see the ambiguity branch below.
+_AMBIGUOUS_ROLE_TENANT = '\x00ambiguous'
+
+
 def _tenant_defining_role(role: str, tenant_id: str) -> str:
     """The tenant whose custom-role table defines `role`, or `tenant_id` unchanged.
 
@@ -311,12 +316,37 @@ def _tenant_defining_role(role: str, tenant_id: str) -> str:
 
     Deliberately narrow, matching the remap it is factored out of: only a caller sitting in
     the DEFAULT tenant is remapped. A user placed in tenant A keeps tenant A's answer even if
-    some other tenant happens to define a role by the same name."""
+    some other tenant happens to define a role by the same name. A name defined by two or
+    more tenants has no single answer and is refused outright rather than guessed at."""
     if not role or role in BUILTIN_ROLES or tenant_id != DEFAULT_TENANT_ID:
         return tenant_id
-    for tid, roles in get_custom_roles().get('tenants', {}).items():
-        if role in roles:
-            return tid
+    owners = [tid for tid, roles in get_custom_roles().get('tenants', {}).items()
+              if role in roles]
+    if len(owners) == 1:
+        return owners[0]
+    if owners:
+        # MK Sep 2026 — more than one tenant defines this name, so "the tenant that
+        # defines it" has no answer. The loop this replaces took whichever one dict
+        # iteration happened to reach first, which made both the caller's permissions
+        # and their cluster list depend on insertion order: the same account could
+        # resolve into tenant A today and tenant B after a restart. Two tenants each
+        # having an "ops" role is an ordinary thing for an MSP to do, so this is a
+        # configuration to report, not a case to guess at.
+        #
+        # Answering with the DEFAULT tenant would be the wrong direction: an empty
+        # cluster list there means "all clusters", so the ambiguous caller would come
+        # out wider than either candidate. Hand back an id no tenant can hold instead —
+        # the role then fails to resolve (get_role_permissions_for_user grants nothing
+        # and says so) and the cluster lookup lands on the non-default empty branch,
+        # which is []. The operator's fix is to put the account in the tenant they
+        # meant; that takes the early return above and resolves cleanly.
+        logging.warning(
+            f"[RBAC] custom role {role!r} is defined by {len(owners)} tenants "
+            f"({', '.join(sorted(owners))}) — refusing to guess which one a "
+            f"default-tenant caller meant. Granting nothing; place the account in "
+            f"the intended tenant to resolve it."
+        )
+        return _AMBIGUOUS_ROLE_TENANT
     return tenant_id
 
 
@@ -392,6 +422,26 @@ def get_user_permissions(user: dict, tenant_id: str = None) -> list:
 
     return base_perms
 
+def _admin_is_capped_in_own_tenant(user: dict) -> bool:
+    """True when a tenant override governs this caller's own tenant and downgrades them.
+
+    tenant_permissions is written by the LDAP group mappings (utils/ldap.py), so an
+    account whose global role is admin really can be mapped down to viewer or a custom
+    role inside the tenant it lives in. get_user_permissions has always honoured that —
+    it defaults tenant_id to the caller's own tenant and takes the override branch. The
+    two admin fast paths below never looked, so the two disagreed: the permission list
+    said viewer while the yes/no gate in front of it said admin, and the gate is the one
+    routes actually ask. Same for the cluster scope. Only skip the shortcut when the
+    override genuinely lowers them — an override that re-states admin is not a downgrade,
+    and an account with no override at all (nearly all of them) takes the same path it
+    always did. MK Sep 2026, Aikido 700487698.
+    """
+    tp = (user.get('tenant_permissions') or {}).get(user.get('tenant_id', DEFAULT_TENANT_ID))
+    if not isinstance(tp, dict):
+        return False
+    return tp.get('role', user.get('role')) != ROLE_ADMIN
+
+
 def has_permission(user: dict, permission: str, tenant_id: str = None) -> bool:
     """check if user has a specific permission
     
@@ -399,8 +449,10 @@ def has_permission(user: dict, permission: str, tenant_id: str = None) -> bool:
     """
     if not user:
         return False
-    # admin always has access (safety net) - unless checking tenant-specific
-    if user.get('effective_role', user.get('role')) == ROLE_ADMIN and not tenant_id:
+    # admin always has access (safety net) - unless checking tenant-specific, or a
+    # tenant override has downgraded them where they live
+    if (user.get('effective_role', user.get('role')) == ROLE_ADMIN and not tenant_id
+            and not _admin_is_capped_in_own_tenant(user)):
         return True
     return permission in get_user_permissions(user, tenant_id)
 
@@ -435,8 +487,10 @@ def get_user_clusters(user: dict, include_pools: bool = True) -> list:
         tenants_db = load_tenants()
     
     # admin sees all — honor the token-scoped effective_role (#491) so an admin-owned API token
-    # restricted to viewer/user doesn't inherit the owner's all-cluster access.
-    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+    # restricted to viewer/user doesn't inherit the owner's all-cluster access, and the LDAP
+    # tenant override for the same reason (see _admin_is_capped_in_own_tenant).
+    if (user.get('effective_role', user.get('role')) == ROLE_ADMIN
+            and not _admin_is_capped_in_own_tenant(user)):
         return None  # None means all clusters
 
     # MK Sep 2026 - we could not read the tenant table, so we do not know what this caller
