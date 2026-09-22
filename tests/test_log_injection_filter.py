@@ -151,9 +151,129 @@ def test_a_non_string_message_is_left_alone(captured):
 # --- the wiring ----------------------------------------------------------------------
 
 def test_the_app_installs_it():
+    """Both neutralisers are wired up where logging is configured.
+
+    The window is deliberately generous - it exists to catch the call drifting off to
+    some unrelated part of app.py, not to police comment length. The record sanitiser
+    matters more than the handler filter: the filter only reaches handlers that already
+    exist, and the per-cluster loggers in core/manager.py and core/xcpng.py attach theirs
+    much later. See test_a_logger_created_after_startup_is_still_sanitised.
+    """
     import inspect
     import pegaprox.app as app
 
     src = inspect.getsource(app)
     i = src.index('logging.basicConfig(')
-    assert 'install_log_injection_filter()' in src[i:i + 1200]
+    window = src[i:i + 2500]
+    assert 'install_log_record_sanitizer()' in window, \
+        'the record sanitiser is not installed with the logging setup'
+    assert 'install_log_injection_filter()' in window, \
+        'the handler filter is not installed with the logging setup'
+
+
+# --- follow-up: the sink we missed -----------------------------------------------
+# The handler filter was written to sit "at the sink instead of at seventy-five call
+# sites". It sits on HANDLERS, and install_log_injection_filter() only walks the ones
+# that exist when it runs. core/manager.py and core/xcpng.py give each cluster its own
+# logger with its own file+console handler, attached when that cluster is constructed -
+# after startup. A cluster logger emits through its own handlers BEFORE propagating to
+# root, so the per-cluster log file kept the raw line while the main log got the clean
+# one. install_log_record_sanitizer() moves the work to record construction. MK
+
+import io
+import logging
+
+
+def _sanitizer():
+    """The record sanitiser if this build has one, otherwise a no-op.
+
+    Deliberately not a bare import: against a build without it, these tests must fail on
+    what reaches the handler, not on a missing name. An ImportError would be red for the
+    wrong reason and would prove nothing about the defect.
+    """
+    try:
+        from pegaprox.utils.sanitization import install_log_record_sanitizer
+        return install_log_record_sanitizer
+    except ImportError:
+        return lambda: None
+
+
+def _isolated_root():
+    buf = io.StringIO()
+    h = logging.StreamHandler(buf)
+    h.setFormatter(logging.Formatter('%(message)s'))
+    root = logging.getLogger()
+    old = root.handlers[:]
+    root.handlers = [h]
+    return buf, root, old
+
+
+def test_a_logger_created_after_startup_is_still_sanitised():
+    """The property: a handler attached later must not receive a forgeable record.
+
+    Drives the real shape - install first, create the cluster logger afterwards, and
+    read what THAT handler wrote, not what root wrote.
+    """
+    from pegaprox.utils.sanitization import install_log_injection_filter
+    _root_buf, root, old = _isolated_root()
+    try:
+        _sanitizer()()
+        install_log_injection_filter()
+
+        later = io.StringIO()
+        lh = logging.StreamHandler(later)
+        lh.setFormatter(logging.Formatter('%(message)s'))
+        clog = logging.getLogger('PegaProx_test_cluster_after_startup')
+        clog.handlers = [lh]
+        clog.setLevel(logging.INFO)
+
+        clog.warning("vm rename to %s",
+                     "harmless\r\n2026-01-01 00:00:00 ADMIN deleted all backups")
+        written = later.getvalue()
+
+        assert '\r' not in written and written.count('\n') == 1, (
+            f'a forged line reached the per-cluster handler: {written!r}')
+        assert 'ADMIN deleted all backups' in written, \
+            'the value was dropped entirely instead of neutralised'
+    finally:
+        root.handlers = old
+
+
+def test_escape_sequences_do_not_reach_a_late_handler():
+    _root_buf, root, old = _isolated_root()
+    try:
+        _sanitizer()()
+        later = io.StringIO()
+        lh = logging.StreamHandler(later)
+        lh.setFormatter(logging.Formatter('%(message)s'))
+        clog = logging.getLogger('PegaProx_test_cluster_esc')
+        clog.handlers = [lh]
+        clog.setLevel(logging.INFO)
+
+        clog.info("iface %s up", "eth0\x1b[2K\x1b]0;pwned\x07")
+        written = later.getvalue()
+        leftover = [c for c in written if ord(c) < 32 and c != '\n']
+        assert not leftover, f'control characters survived: {[hex(ord(c)) for c in leftover]}'
+    finally:
+        root.handlers = old
+
+
+def test_a_traceback_keeps_its_newlines():
+    """The mirror. Sanitising records must not flatten tracebacks - they are ours, not
+    the caller's, and a one-line traceback helps nobody."""
+    _root_buf, root, old = _isolated_root()
+    try:
+        _sanitizer()()
+        buf = io.StringIO()
+        h = logging.StreamHandler(buf)
+        h.setFormatter(logging.Formatter('%(message)s'))
+        lg = logging.getLogger('PegaProx_test_tb')
+        lg.handlers = [h]
+        lg.setLevel(logging.ERROR)
+        try:
+            1 / 0
+        except ZeroDivisionError:
+            lg.exception("boom")
+        assert buf.getvalue().count('\n') > 2, 'the traceback was flattened'
+    finally:
+        root.handlers = old

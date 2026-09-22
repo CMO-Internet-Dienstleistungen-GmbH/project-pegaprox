@@ -450,6 +450,15 @@ def _tcp_listener(host, port):
                     break
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
+                    # MK Sep 2026 - the guard above only fires while no terminator has
+                    # arrived, so a peer could still frame one oversized line and have it
+                    # parsed and queued. The queue's byte budget bounds the damage either
+                    # way, but a 64 KB "syslog line" is not syslog; drop it here too so
+                    # the cap means the same thing on both paths.
+                    if len(line) > _MAX_LINE:
+                        logging.warning(f"[Syslog] {addr[0]} sent a {len(line)}-byte line - "
+                                        f"over the {_MAX_LINE}-byte cap, dropping it")
+                        continue
                     message = line.decode(errors="ignore").strip()
                     if message:
                         hostname, facility, severity, severity_text, msg = parse_syslog(message)

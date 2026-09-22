@@ -382,9 +382,58 @@ class LogInjectionFilter(logging.Filter):
 
 
 def install_log_injection_filter(logger=None):
-    """Attach the filter to a logger's handlers (root by default). Idempotent."""
+    """Attach the filter to a logger's handlers (root by default). Idempotent.
+
+    Covers only the handlers that exist WHEN IT RUNS - see
+    install_log_record_sanitizer() for why that was not enough.
+    """
     target = logger if logger is not None else logging.getLogger()
     for handler in target.handlers:
         if not any(isinstance(f, LogInjectionFilter) for f in handler.filters):
             handler.addFilter(LogInjectionFilter())
     return target
+
+
+_RECORD_FACTORY_INSTALLED = False
+
+
+def install_log_record_sanitizer():
+    """Neutralise control characters when the record is BUILT, not when it is handled.
+
+    MK Sep 2026 (follow-up) - the handler filter above was meant to be "at the sink
+    instead of at seventy-five call sites", and it missed a sink. A logging Filter lives
+    on a HANDLER, and install_log_injection_filter() walks the handlers that exist at the
+    moment it runs. core/manager.py and core/xcpng.py give every cluster its own logger
+    with its own file and console handler, added when that cluster is constructed - long
+    after startup. Those handlers carry no filter, and a cluster logger emits through its
+    own handlers BEFORE propagating to root, so the per-cluster log file got the raw line
+    while the main log got the clean one. Measured, not assumed: a VM rename containing
+    CR/LF produced a forged, correctly-timestamped line in the cluster file.
+
+    The record factory runs once per record, before any handler or propagation, so it
+    covers every logger in the process including ones added later. Chains whatever
+    factory is already installed rather than replacing it, and is idempotent.
+
+    Same deliberate scope as the filter: `msg` and `args` only. A traceback arrives via
+    exc_info and is rendered by the formatter, so it keeps its newlines.
+    """
+    global _RECORD_FACTORY_INSTALLED
+    if _RECORD_FACTORY_INSTALLED:
+        return
+    previous = logging.getLogRecordFactory()
+
+    def _sanitising_factory(*args, **kwargs):
+        record = previous(*args, **kwargs)
+        if isinstance(record.msg, str):
+            record.msg = sanitize_log_message(record.msg)
+        if record.args:
+            if isinstance(record.args, dict):
+                record.args = {k: (sanitize_log_message(v) if isinstance(v, str) else v)
+                               for k, v in record.args.items()}
+            elif isinstance(record.args, tuple):
+                record.args = tuple(sanitize_log_message(a) if isinstance(a, str) else a
+                                    for a in record.args)
+        return record
+
+    logging.setLogRecordFactory(_sanitising_factory)
+    _RECORD_FACTORY_INSTALLED = True
