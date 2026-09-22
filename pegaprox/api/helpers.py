@@ -385,11 +385,18 @@ def check_cluster_access(cluster_id):
     # so an admin-owned scoped token can't reach clusters outside its scope. Done inline (a copy,
     # not mutating g.current_user) to avoid the whole-table load_users() this hot path deliberately
     # skips; get_user_clusters now honors effective_role.
+    #
+    # MK Sep 2026 - this used to be its own inline copy of that floor, and it collapsed a
+    # tenant CUSTOM role to a builtin level - the very thing removed from build_authz_user
+    # in Aug 2026. require_auth stashes the RAW stored record in g.current_user, with no
+    # effective_role on it, so the branch ran on every token request: the custom role became
+    # 'viewer', get_user_clusters saw a builtin and skipped its custom-role -> tenant remap,
+    # the caller fell back to the default tenant, and an empty cluster list there means ALL
+    # clusters. A token scoped below its owner read every cluster on the installation.
+    # apply_token_role is the shared decision now; it does not load the users table either.
     if request.session.get('api_token') and isinstance(user, dict) and 'effective_role' not in user:
-        from pegaprox.models.permissions import ROLE_ADMIN, ROLE_USER, ROLE_VIEWER
-        _h = {ROLE_ADMIN: 3, ROLE_USER: 2, ROLE_VIEWER: 1}
-        _eff = min(_h.get(request.session.get('role'), 1), _h.get(user.get('role'), 1))
-        user = {**user, 'effective_role': next((r for r, lvl in _h.items() if lvl == _eff), ROLE_VIEWER)}
+        from pegaprox.utils.auth import apply_token_role
+        user = apply_token_role(user, request.session.get('role'))
     allowed = get_user_clusters(user)
     if allowed is not None and cluster_id not in allowed:
         # #248: check VM ACLs as fallback — users with VM-level access can reach the cluster
