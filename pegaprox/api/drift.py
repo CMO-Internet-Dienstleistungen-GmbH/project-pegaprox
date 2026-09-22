@@ -532,7 +532,10 @@ def acknowledge_event(eid):
         from pegaprox.api.helpers import check_cluster_access
         ok, err = check_cluster_access(ev['cluster_id'])
         if not ok:
-            return err
+            # NS Sep 2026 (audit) — returning the cluster-access refusal here answers a
+            # question the caller was not allowed to ask: it says the event id exists.
+            # A drift event they may not touch is, to them, an event that is not there.
+            return jsonify({'error': 'not found'}), 404
         # acknowledging - and especially promoting, which rewrites the baseline the next
         # scan compares against - is a whole-cluster act for the same reason
         _cerr = require_unconfined(ev['cluster_id'])
