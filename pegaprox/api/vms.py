@@ -6055,6 +6055,13 @@ def snapshots_overview():
                 results.append({
                     "vmid": vmid, "vm_name": vm_name, "vm_type": vm_type, "node": node,
                     "snapshot_name": snap_name, "snapshot_date": snap_dt.strftime('%Y-%m-%d %H:%M'),
+                    # MK Sep 2026 (#939) — hand over the raw epoch as well. Formatting the
+                    # time server-side in UTC and printing that string meant this overview
+                    # disagreed with the per-VM snapshot list, which renders browser-local;
+                    # in CEST the same snapshot showed two different times depending on
+                    # which page you opened. snapshot_date stays for older frontends and
+                    # because the table sorts on it.
+                    "snapshot_ts": int(snap_ts),
                     "age": age, "cluster_id": cid
                 })
             return results
