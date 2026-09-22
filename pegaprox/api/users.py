@@ -596,10 +596,12 @@ def unlock_user(username):
 @require_auth(perms=['security.lockout.manage'])
 def unlock_all_ips():
     """Unlock all IP addresses (admin only)"""
-    global login_attempts_by_ip
-    
+    # MK: clear() the store, never rebind it. `global` here names THIS module's
+    # copy of the import, so `= {}` left api/auth.py — the module the login path
+    # reads — holding the old dict with every lockout still in it, and pointed the
+    # listing and single-unlock routes at a detached empty one.
     count = len(login_attempts_by_ip)
-    login_attempts_by_ip = {}
+    login_attempts_by_ip.clear()
     
     logging.info(f"Admin manually unlocked all IPs ({count} entries cleared)")
     log_audit(request.session.get('user', 'admin'), 'security.unlock_all_ips', f"Cleared all {count} locked IPs")
@@ -614,10 +616,8 @@ def unlock_all_users():
     
     MK: New endpoint for clearing all username lockouts
     """
-    global login_attempts_by_user
-    
     count = len(login_attempts_by_user)
-    login_attempts_by_user = {}
+    login_attempts_by_user.clear()
     
     logging.info(f"Admin manually unlocked all users ({count} entries cleared)")
     log_audit(request.session.get('user', 'admin'), 'security.unlock_all_users', f"Cleared all {count} locked users")
