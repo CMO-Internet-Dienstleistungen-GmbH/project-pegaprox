@@ -9694,8 +9694,11 @@ echo "AGENT_INSTALLED_OK"
             self.logger.info(f"Remote migrating {vm_type}/{vmid} from {node} to target cluster (target vmid: {actual_target_vmid})")
             # NS Jul 2026 (pentest HIGH) — data['target-endpoint'] carries a cleartext,
             # full-rights, non-expiring PVEAPIToken secret; never write it to the log.
-            _safe_data = {k: ('***REDACTED***' if k == 'target-endpoint' else v) for k, v in data.items()}
-            self.logger.debug(f"Migration data: {_safe_data}")
+            # MK Sep 2026 — was a comprehension for that one key. The storage-create route
+            # had the same problem with `password` and went on leaking for months because
+            # this fix reached one line; both now go through the shared rule.
+            from pegaprox.utils.sanitization import redact_secrets
+            self.logger.debug(f"Migration data: {redact_secrets(data)}")
             response = self._api_post(url, data=data)
             
             if response.status_code == 200:

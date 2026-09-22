@@ -297,6 +297,53 @@ _SECRET_PARAM_HINTS = ('token', 'key', 'secret', 'password', 'passwd', 'pwd',
                        'sig', 'signature', 'credential', 'auth')
 
 
+# Extra hints that only make sense for a MAPPING key, not for a URL query parameter.
+# `target-endpoint` is PVE's remote-migration field and carries a full-rights API token
+# inside its value; it matches none of the hints above, which is why folding the old
+# per-key redaction in core/manager.py into the shared rule needed this line. Keeping them
+# separate leaves redact_url()'s behaviour exactly as it was.
+_SECRET_KEY_EXTRA_HINTS = ('endpoint', 'apitoken', 'bindpw', 'passphrase', 'privatekey')
+
+
+def redact_secrets(mapping, _depth=0):
+    """Return a copy of a mapping with credential-bearing values replaced.
+
+    For the case where a handler wants to log a request body or a backend config
+    whole. The storage-create route did exactly that at DEBUG level, and for a PBS
+    or CIFS target that payload carries `password` verbatim — `--debug` is an
+    ordinary thing to be running. core/manager.py had already been bitten by this
+    once (a cleartext PVEAPIToken in a migration payload) and fixed it with a dict
+    comprehension for the single key it knew about, which is why the storage route
+    went on leaking: the fix was correct and reached one line.
+
+    Key names are matched case-insensitively as substrings against
+    _SECRET_PARAM_HINTS — the same list redact_url() applies to query parameters,
+    so adding a hint covers every caller — plus _SECRET_KEY_EXTRA_HINTS for the
+    field names that only ever appear as mapping keys. It over-matches slightly
+    (PVE's `keyboard` contains `key`), which is the right direction for a log
+    line. An empty or absent value is left alone so "not set" does not start
+    reading as "set". A matching key is redacted whatever it holds, including a
+    whole sub-mapping — `credentials: {...}` has already told you what is in
+    there, and walking in to publish it a leaf at a time because the leaf names
+    do not match would be the wrong way round. Sub-mappings under a NON-matching
+    key are walked; other values pass through, so this is not a deep sanitiser —
+    it is what you call instead of interpolating a dict into a format string. NS
+    """
+    if not isinstance(mapping, dict):
+        return mapping
+    if _depth > 4:
+        return '***TRUNCATED***'
+    out = {}
+    for k, v in mapping.items():
+        if any(h in str(k).lower() for h in _SECRET_PARAM_HINTS + _SECRET_KEY_EXTRA_HINTS):
+            out[k] = '***REDACTED***' if v not in (None, '') else v
+        elif isinstance(v, dict):
+            out[k] = redact_secrets(v, _depth + 1)
+        else:
+            out[k] = v
+    return out
+
+
 def redact_url(value):
     """Make a URL safe to write into a log line.
 

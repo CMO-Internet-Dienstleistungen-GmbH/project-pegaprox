@@ -6,7 +6,7 @@ import json
 import time
 import logging
 from pegaprox.utils.sanitization import sanitize_log_message as _sl  # CWE-117 tainted-log sanitiser
-from pegaprox.utils.sanitization import redact_url
+from pegaprox.utils.sanitization import redact_url, redact_secrets
 import threading
 import uuid
 import hashlib
@@ -1518,7 +1518,10 @@ def create_storage(cluster_id):
         pve_data['type'] = storage_type
         
         logging.info(f"Creating storage {storage_id} of type {storage_type}")
-        logging.debug(f"Storage data: {pve_data}")
+        # MK Sep 2026 (audit) — pve_data is a verbatim copy of the request body, and for a
+        # pbs/cifs target that includes `password` (pbs even requires it, see required_fields
+        # above). This line wrote it to the log in the clear at DEBUG.
+        logging.debug(f"Storage data: {redact_secrets(pve_data)}")
         
         # NS May 2026 — bumped to 60s. PVE blocks the create call while it
         # verifies remote target (especially PBS — it pulls the cert + auths

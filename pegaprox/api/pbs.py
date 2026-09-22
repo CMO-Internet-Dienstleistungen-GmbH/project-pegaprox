@@ -154,6 +154,29 @@ def update_pbs_server(pbs_id):
         return err
     data = request.json or {}
 
+    # MK Sep 2026 (audit) — linked_clusters is the authorization list check_pbs_access reads,
+    # and an EMPTY one means "reachable by everybody" (the backward-compatibility arm). Omitting
+    # the field was already made safe at the storage layer, but sending it EXPLICITLY empty was
+    # not: any user who reached this server through one of its links could hand the whole backup
+    # server — every tenant's snapshots on it — to every tenant, in one PUT. Widening the list is
+    # the same move at half speed, so a non-admin may only ever narrow it, and only to clusters
+    # they can reach themselves.
+    if 'linked_clusters' in data:
+        from pegaprox.utils.auth import build_authz_user as _bau
+        from pegaprox.utils.rbac import get_user_clusters as _guc
+        _caller = _bau(request.session.get('user', ''), request.session)
+        if _caller.get('effective_role', _caller.get('role')) != ROLE_ADMIN:
+            _new_links = list(data.get('linked_clusters') or [])
+            if not _new_links:
+                return jsonify({'error': 'Access denied: only a global admin may unlink a PBS '
+                                         'server from every cluster'}), 403
+            _reachable = _guc(_caller)
+            if _reachable is not None:
+                _beyond = [c for c in _new_links if c not in set(_reachable)]
+                if _beyond:
+                    return jsonify({'error': 'Access denied: cannot link this PBS server to '
+                                             + ', '.join(_beyond)}), 403
+
     # Resolve the CURRENT stored config (in-memory manager preferred, else DB row) so we can detect
     # a host/port change BEFORE persisting anything.
     old_mgr = pbs_managers.get(pbs_id)
