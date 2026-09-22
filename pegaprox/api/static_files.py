@@ -142,6 +142,24 @@ def _authorize_pool_assignment(cluster_id, pool_id, vmid, vm_type=None):
                                                         user.get('groups', [])) or {}).items() if perms}
     if pool_id not in _granted:
         return False, (jsonify({'error': 'Access denied to this pool'}), 403)
+    # MK Sep 2026 (Aikido 700487364) — the source side. Seeing a guest is enough to add it to
+    # the pool it is ALREADY in (that is #766's own case and a no-op for authorization), but
+    # not to MOVE it somewhere else. A caller holding a read-only grant on the pool a guest
+    # sits in, plus a managing grant on another pool, passed the vm.view floor above and could
+    # re-pool the guest into the wider pool — handing themselves exactly the rights check (1)
+    # exists to withhold. For a real move, ask for a management permission on the guest.
+    #
+    # An unresolvable current pool counts as a move and so fails CLOSED. That is safe rather
+    # than disruptive here: a pool-scoped caller's access to the guest comes from the same
+    # membership data, so if it cannot be read they were already refused by the vm.view check
+    # above; and admins and cluster-wide operators returned earlier and never reach this.
+    from pegaprox.utils.rbac import get_pool_membership_cache
+    _members = get_pool_membership_cache(cluster_id) or {}
+    _current = _members.get(f"{_vid}:{vm_type or 'qemu'}")
+    if _current != pool_id and not user_can_access_vm(user, cluster_id, _vid, 'vm.config', vm_type):
+        return False, (jsonify({
+            'error': 'You can see this VM but not manage it, so it cannot be moved between pools'
+        }), 403)
     return True, None
 
 
