@@ -981,7 +981,12 @@ def _destroy_guest():
     # drop the stale VM-ACL row so a recycled VMID doesn't inherit this grant.
     try:
         from pegaprox.core.db import get_db
-        get_db().delete_vm_acl(cluster_id, vmid_int)
+        if get_db().delete_vm_acl(cluster_id, vmid_int):
+            # MK Sep 2026 - the row went but the cached snapshot did not: load_vm_acls
+            # keeps a 30s TTL copy and every write path is supposed to invalidate it, so
+            # until this the grant outlived the row it was read from.
+            from pegaprox.utils.rbac import invalidate_vm_acls_cache
+            invalidate_vm_acls_cache()
     except Exception as e:
         # ACL cleanup failed AFTER the guest was already purged (irreversible). A
         # lingering vm_acls row would grant the old owner access if PVE recycles this
