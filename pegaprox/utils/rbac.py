@@ -1024,7 +1024,7 @@ def invalidate_vm_acls_cache():
     _vm_acls_cache = None
     _vm_acls_cache_time = 0
 
-def user_can_access_vm(user: dict, cluster_id: str, vmid: int, permission: str = 'vm.view', vm_type: str = None) -> bool:
+def _user_can_access_vm_uncapped(user: dict, cluster_id: str, vmid: int, permission: str = 'vm.view', vm_type: str = None) -> bool:
     """Check if user can access a specific VM
     
     NS: Dec 2025 - VM ACLs are ADDITIVE, not restrictive
@@ -1183,6 +1183,48 @@ def user_can_access_vm(user: dict, cluster_id: str, vmid: int, permission: str =
     result = has_permission(user, permission)
     logging.debug(f"[VM-ACL] Fallback to general permission check for {permission}: {result}")
     return result
+
+
+def _within_token_role(user: dict, permission: str) -> bool:
+    """An API token must not exceed its own role through an object grant.
+
+    NS Sep 2026 (audit) — effective_role exists only for API-token auth
+    (utils/auth.build_authz_user sets it under `if session.get('api_token')`), and it is
+    the role the token was minted with, floored to the owner's. Object grants ignored it:
+    a VM ACL row or a pool grant on the OWNER's account returned True for vm.delete even
+    on a token the owner had deliberately scoped to viewer. The token's whole point is
+    being weaker than the account, and the ACL handed the difference straight back.
+
+    Deliberately a no-op for anything that is not a reduced token. VM ACLs are ADDITIVE by
+    design — that is the documented model — so capping an ordinary session by its role
+    would delete the feature rather than fix a hole. Only a token whose effective_role
+    differs from the stored role is capped, and only to what that role grants.
+    """
+    eff = user.get('effective_role')
+    if not eff or eff == user.get('role'):
+        return True
+    allowed = get_role_permissions_for_user({'role': eff, 'tenant_id': user.get('tenant_id')},
+                                            user.get('tenant_id'))
+    return permission in (allowed or [])
+
+
+def user_can_access_vm(user: dict, cluster_id: str, vmid: int, permission: str = 'vm.view', vm_type: str = None) -> bool:
+    """Per-VM authorization, with the API-token ceiling applied to the result.
+
+    The decision itself lives in _user_can_access_vm_uncapped. The cap is applied HERE,
+    once, rather than at each of its five grant points — the #941 follow-up was a lesson
+    in what happens when a guard is added to the path you happened to read instead of to
+    the place every path passes through.
+    """
+    if not _user_can_access_vm_uncapped(user, cluster_id, vmid, permission, vm_type):
+        return False
+    if not _within_token_role(user, permission):
+        logging.debug(f"[TOKEN-CEILING] {user.get('username','')} denied {permission} on "
+                      f"{cluster_id}/{vmid}: token role {user.get('effective_role')!r} "
+                      f"does not carry it")
+        return False
+    return True
+
 
 def get_user_vms(user: dict, cluster_id: str) -> list:
     """Get list of VMIDs user can access in a cluster
