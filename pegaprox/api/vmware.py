@@ -108,23 +108,41 @@ def update_vmware_server(vmware_id):
     # MK May 2026 (#469 port) — cred-exfil guard. If host changes WHILE the
     # password is preserved (came in as ********), don't auto-connect — that
     # would ship the saved credential to a potentially attacker-controlled host.
+    #
+    # NS Aug 2026 (Aikido pentest) — never persist the preserved password against a CHANGED
+    # host: the saved row is reused verbatim by diagnose / Test Connection / the boot-time
+    # auto-connect, any of which would ship the secret to the new (possibly attacker-chosen)
+    # host. Require a full password whenever the host changes.
     credentials_preserved = False
     host_changed = False
 
-    if vmware_id in vmware_managers:
-        old_mgr = vmware_managers[vmware_id]
-        if (data.get('host') and data.get('host') != old_mgr.host) or \
-           (data.get('port') and int(data.get('port', 443)) != old_mgr.port):
+    # MK Sep 2026 (Aikido 700489023) — two ways past that guard, both closed here.
+    #
+    # First, it hung off vmware_managers, and load_vmware_servers only loads `enabled = 1`.
+    # A DISABLED server is therefore absent from that dict and the whole block was skipped:
+    # disable, repoint the host, re-enable, and the boot-time auto-connect hands the saved
+    # credential to the new destination. The stored ROW is the authority for what gets
+    # reused, so compare against it.
+    _row = get_db().conn.cursor().execute(
+        "SELECT host, port FROM vmware_servers WHERE id = ?", (vmware_id,)).fetchone()
+    if _row is not None:
+        if (data.get('host') and data.get('host') != _row['host']) or \
+           (data.get('port') and int(data.get('port', 443)) != int(_row['port'] or 443)):
             host_changed = True
-        if data.get('password') == '********':
-            # NS Aug 2026 (Aikido pentest) — never persist the preserved password against a CHANGED
-            # host: the saved row is reused verbatim by diagnose / Test Connection / the boot-time
-            # auto-connect, any of which would ship the secret to the new (possibly attacker-chosen)
-            # host. Require a full password whenever the host changes.
-            if host_changed:
-                return jsonify({'error': 'Re-enter the password when changing the VMware host.'}), 400
-            data['password'] = old_mgr.password
-            credentials_preserved = True
+
+    # Second, "keep the password" has three spellings and the guard knew one.
+    # save_vmware_server writes `pass_encrypted or <the stored one>`, so an OMITTED or an
+    # EMPTY password preserves the credential exactly as the UI's ******** sentinel does —
+    # and only the sentinel was checked. Leaving the field out walked straight past it and
+    # the row ended up holding the real credential against the caller's new host.
+    _pw = data.get('password')
+    if _pw is None or _pw == '' or _pw == '********':
+        if host_changed:
+            return jsonify({
+                'error': 'Re-enter the password when changing the VMware host or port.'}), 400
+        credentials_preserved = True
+        if _pw == '********' and vmware_id in vmware_managers:
+            data['password'] = vmware_managers[vmware_id].password
 
     save_vmware_server(vmware_id, data)
 
