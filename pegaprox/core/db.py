@@ -51,6 +51,16 @@ try:
 except ImportError:
     pass
 
+# MK Sep 2026 (audit) — a pool_permissions row whose permission list is empty grants
+# nothing inside the pool, but this query returned its cluster anyway, and the #555
+# fallback in check_cluster_access turns "holds a pool grant here" into cluster reach.
+# So an emptied grant kept the door open while the UI showed no permissions at all.
+# rbac.user_has_any_pool_access already gets this right (`any(p for p in perms.values())`),
+# which is what makes the difference a bug rather than a decision. Empty is stored as
+# '[]' by the write path and as NULL/'' by older rows.
+_NON_EMPTY_GRANT = " AND permissions IS NOT NULL AND TRIM(permissions) NOT IN ('', '[]')"
+
+
 def _group_grant_spellings(group):
     """Every spelling a pool grant might plausibly use for one directory group.
 
@@ -4260,11 +4270,13 @@ class PegaProxDB:
                 _ph = ','.join('?' * len(_spellings))
                 cursor.execute(
                     "SELECT DISTINCT cluster_id FROM pool_permissions "
-                    f"WHERE subject_type = 'group' AND LOWER(subject_id) IN ({_ph})",
+                    f"WHERE subject_type = 'group' AND LOWER(subject_id) IN ({_ph})"
+                    + _NON_EMPTY_GRANT,
                     tuple(v.lower() for v in _spellings))
             else:
                 cursor.execute(
-                    "SELECT DISTINCT cluster_id FROM pool_permissions WHERE subject_type = ? AND subject_id = ?",
+                    "SELECT DISTINCT cluster_id FROM pool_permissions "
+                    "WHERE subject_type = ? AND subject_id = ?" + _NON_EMPTY_GRANT,
                     (stype, sid))
             for row in cursor.fetchall():
                 out.add(row[0])

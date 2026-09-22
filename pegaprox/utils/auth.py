@@ -866,8 +866,11 @@ def create_api_token(username: str, token_name: str, role: str = None,
             'expires_at': expires_at
         }
     except Exception as e:
+        # MK Sep 2026 (audit) — the caller gets this straight back as the JSON body, so a
+        # persistence error handed the client raw backend text. The detail is already in
+        # the log line above; the response only needs to say it did not work.
         logging.error(f"[APIToken] Failed to create token: {e}")
-        return {'error': str(e)}
+        return {'error': 'Failed to create API token'}
 
 
 def revoke_user_api_tokens(username: str) -> int:

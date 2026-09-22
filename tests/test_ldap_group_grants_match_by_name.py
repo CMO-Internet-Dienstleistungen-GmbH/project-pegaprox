@@ -120,3 +120,31 @@ def test_user_grants_are_untouched(db, seed):
 
     assert 'pool_a' in db.get_user_pool_permissions(CLUSTER, 'alice', [])
     assert db.get_user_pool_permissions(CLUSTER, 'ALICE', []) == {}
+
+
+# ------------------------------------------- an empty grant grants nothing
+
+def test_an_empty_grant_does_not_buy_cluster_reach(db, seed):
+    """#700487672 — a pool_permissions row with no permissions in it grants nothing
+    inside the pool, but get_user_pool_clusters returned its cluster regardless, and
+    check_cluster_access's #555 fallback turns "holds a pool grant here" into reach
+    over the whole cluster. So emptying a grant left the door open while the UI
+    showed no permissions at all. rbac.user_has_any_pool_access already ignored
+    empty grants, which is what makes this a bug rather than a decision."""
+    seed.pool(CLUSTER, 'pool_a', 'alice', [], subject_type='user')
+
+    assert db.get_user_pool_clusters('alice', []) == []
+    assert db.get_user_pool_permissions(CLUSTER, 'alice', []) in ({}, {'pool_a': []})
+
+
+def test_a_real_grant_still_buys_cluster_reach(db, seed):
+    """The mirror — the #555 fallback exists for a reason."""
+    seed.pool(CLUSTER, 'pool_a', 'alice', ['pool.view'], subject_type='user')
+
+    assert CLUSTER in db.get_user_pool_clusters('alice', [])
+
+
+def test_an_empty_group_grant_does_not_buy_reach_either(db, seed):
+    seed.pool(CLUSTER, 'pool_a', 'PVE-Admins', [], subject_type='group')
+
+    assert db.get_user_pool_clusters('someone', [DN]) == []
