@@ -216,9 +216,25 @@ def get_role_permissions_for_user(user: dict, tenant_id: str = None) -> list:
     global_roles = custom.get('global', {})
     if role in global_roles:
         return global_roles[role].get('permissions', []).copy()
-    
-    # fallback to viewer
-    return ROLE_PERMISSIONS[ROLE_VIEWER].copy()
+
+    # NS Sep 2026 (audit) — this used to fall back to the ROLE_VIEWER set, which is 31
+    # permissions covering vm.view, cluster.view, node.view and the whole PBS read
+    # surface. A custom role exists precisely because somebody wanted something NARROWER
+    # than that, so an unresolvable role handed its holders MORE than the role ever
+    # granted: delete a role that allowed only vm.view and its accounts silently gained
+    # thirty permissions. Deleting a role means "revoke this", never "promote them".
+    #
+    # Both ways of getting here deserve the same answer. A genuinely deleted role is
+    # gone, and an unreadable role store is a failure we must not resolve in the
+    # caller's favour - store_unavailable() keeps that case out of the cache so it
+    # retries, and until it succeeds nobody should be inheriting a default.
+    logging.warning(
+        f"[RBAC] role {role!r} did not resolve for "
+        f"{user.get('username', '?')!r} (tenant={tenant_id!r}) - granting nothing. "
+        f"Either the role was deleted while accounts still held it, or the custom-role "
+        f"store could not be read."
+    )
+    return []
 
 # =============================================================================
 # MULTI-TENANCY
@@ -938,8 +954,16 @@ def user_has_any_pool_access(user: dict, cluster_id: str) -> bool:
     try:
         perms = _pool_perms_for(cluster_id, username, user.get('groups', []))
     except Exception as e:
+        # NS Sep 2026 (audit) — this used to answer False, and False here does not mean
+        # "no pool grant", it means "not confined by a pool". helpers.caller_is_scoped
+        # asks this question to decide whether the caller is a plain cluster-wide
+        # operator, and it wraps the call in its own try/except precisely so a failure
+        # falls closed — but swallowing the error in here meant that except never fired
+        # and an unreadable pool-permission table silently promoted every pool-scoped
+        # caller to unconfined. Let it out; the caller is the one that knows what a
+        # failure should mean.
         logging.error(f"[POOL] any-access check failed for {username}@{cluster_id}: {e}")
-        return False
+        raise
     return any(p for p in perms.values())
 
 
