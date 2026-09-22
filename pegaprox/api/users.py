@@ -974,6 +974,14 @@ def update_user(username):
             return jsonify({'error': 'Cannot assign a role with higher privileges than your own'}), 403
         if not _caller_can_grant_role(data['role']):
             return jsonify({'error': 'Cannot assign a role that grants permissions beyond your own'}), 403
+        # MK Sep 2026 (audit) — and the caller has to outrank the target AS IT STANDS, not as
+        # it will stand. Disabling an account already asks this question; re-roling one is the
+        # stronger operation and asked nothing, so a delegate could demote an administrator it
+        # could not touch and then reset that account's password on the next request. The same
+        # gap in one request: the `enabled` branch below calls _caller_can_manage_user on the
+        # dict this block has already mutated, and so does the last-admin check under it.
+        if not _caller_can_manage_user(user):
+            return jsonify({'error': 'Access denied: target has privileges beyond your own'}), 403
         # Prevent last admin from losing admin role
         if user['role'] == ROLE_ADMIN and data['role'] != ROLE_ADMIN:
             admin_count = sum(1 for u in users_db.values() if u['role'] == ROLE_ADMIN and u.get('enabled', True))
