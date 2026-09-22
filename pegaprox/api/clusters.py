@@ -249,6 +249,7 @@ def export_cluster_config(cluster_id):
         'dry_run': c.dry_run,
         'cluster_type': getattr(mgr, 'cluster_type', 'proxmox'),
         'vnc_tunnel': bool(getattr(c, 'vnc_tunnel', False)),  # MK Apr 2026
+        'ssh_disabled': bool(getattr(c, 'ssh_disabled', False)),  # MK Sep 2026 (#941)
         # secrets intentionally omitted: pass, ssh_key, api_token_secret
     })
 
@@ -1267,6 +1268,7 @@ ALLOWED_CONFIG_FIELDS = {
     'balance_cpu_weight', 'balance_mem_weight', 'balance_io_weight',
     'cpu_baseline',
     'vnc_tunnel',  # MK Apr 2026 — SSH-tunnel-mode for VNC console
+    'ssh_disabled',  # MK Sep 2026 (#941) — no SSH to this cluster's nodes at all
     'proxlb_tags_enabled',  # MK Jul 2026 (#426) — derive placement from ProxLB VM tags
     'node_ui_suffix',  # MK Aug 2026 (#689) — FQDN suffix for "Open in Proxmox" node links
 }

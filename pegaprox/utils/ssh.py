@@ -492,7 +492,10 @@ def _pve_node_exec(pve_mgr, node, cmd, timeout=600, use_controlmaster=True,
             _diag = pve_mgr.ssh_diagnose(node)
         except Exception:
             pass   # older managers without the classifier — behave as before
-        if _diag and _diag[0] == 'SSH_NO_CREDENTIALS':
+        # MK Sep 2026 (#941) — SSH_DISABLED belongs here too. There are two ways out of
+        # this process to a node: paramiko via manager._ssh_connect, and this shell-out.
+        # An off switch that only closed one of them would be worth nothing.
+        if _diag and _diag[0] in ('SSH_NO_CREDENTIALS', 'SSH_DISABLED'):
             return 1, '', _diag[1]
 
         _ssh_user = getattr(pve_mgr.config, 'ssh_user', '') or 'root'
