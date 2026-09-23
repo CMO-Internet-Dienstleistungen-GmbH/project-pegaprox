@@ -113,7 +113,12 @@ migration. PegaProx installs them only when they are missing.
 
 The conversion runs as `LIBGUESTFS_BACKEND=direct`, since a PVE node carries
 `libvirt0` but no libvirt daemon. A Ceph volume on a storage without krbd is
-mapped with `rbd map` for the conversion and released again on every path.
+mapped with `rbd map -o notrim` for the conversion and released again on every
+path. `notrim` because virt-v2v runs `fstrim` over every guest filesystem first and
+cannot be told not to; on an HDD-backed pool that trim ran at about 6 MB/s and was
+still going after 26 minutes on a 150 GiB guest. Without discard the trim ends at once
+and virt-v2v continues. A storage the node maps with krbd itself (`/dev/rbd-pve/…`)
+still trims.
 
 ## The VirtIO driver ISO
 
