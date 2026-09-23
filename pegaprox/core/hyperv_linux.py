@@ -97,7 +97,13 @@ def disk_source(path: str) -> dict:
 
 
 def _rbd_map_command(source: dict) -> str:
-    parts = ['rbd', 'map']
+    # `notrim`: virt-v2v 2.6 runs fstrim over every guest filesystem before converting,
+    # to shrink a copy that an in-place run never makes, and it cannot be switched off
+    # (`--no-trim` "now does nothing"). On an HDD-backed Ceph pool that trim discarded at
+    # about 6 MB/s — measured on a 150 GiB guest, still trimming after 26 minutes, where
+    # the same guest on NVMe took 150 s. A mapping without discard makes the trim fail at
+    # once, which virt-v2v reports as a warning and continues past.
+    parts = ['rbd', 'map', '-o', 'notrim']
     if source.get('id'):
         parts += ['--id', source['id']]
     if source.get('keyring'):
