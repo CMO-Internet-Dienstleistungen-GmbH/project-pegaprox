@@ -112,7 +112,8 @@ class TestTheScriptOnOneDisk:
         assert calls[1].startswith('v2v --block-driver virtio-scsi --run-command ')
         assert calls[1].endswith(' -i disk -if raw /dev/rbd0')
         assert 'backend=direct' in calls
-        assert calls[-1] == 'rbd unmap /dev/rbd0'
+        assert [c for c in calls if c.startswith('rbd unmap')] == ['rbd unmap /dev/rbd0']
+        assert calls[-1] == 'rbd showmapped'
         assert f'{linux.MARK_EXIT}0' in done.stdout
 
     def test_a_failed_conversion_still_releases_the_device(self, node):
@@ -120,8 +121,34 @@ class TestTheScriptOnOneDisk:
         done, calls = node(script, V2V_RC='1')
 
         assert done.returncode == 1
-        assert calls[-1] == 'rbd unmap /dev/rbd0'
+        assert [c for c in calls if c.startswith('rbd unmap')] == ['rbd unmap /dev/rbd0']
+        assert calls[-1] == 'rbd showmapped'
         assert linux.read_result(done.stdout)['exit'] == 1
+
+    def test_a_device_still_busy_is_unmapped_on_a_later_try(self, node, tmp_path):
+        """virt-v2v leaves on a signal before nbdkit lets go; the first unmap is EBUSY."""
+        busy = tmp_path / 'busy'
+        busy.write_text('2')
+        script = linux.conversion_script([linux.disk_source(RBD_URL)])
+        script = script.replace('sleep 3', 'sleep 0')
+        # The stand-in refuses the first two unmaps, as a device nbdkit still holds does.
+        wrapper = (f'rbd() {{ if [ "$1" = unmap ] && [ "$(cat {busy})" -gt 0 ]; then '
+                   f'echo $(( $(cat {busy}) - 1 )) > {busy}; command rbd "$@" >/dev/null; return 1; fi; '
+                   f'command rbd "$@"; }}\n')
+        done, calls = node(wrapper + script)
+
+        assert done.returncode == 0
+        assert [c for c in calls if c.startswith('rbd unmap')] == ['rbd unmap /dev/rbd0'] * 3
+        assert linux.MARK_UNMAP_FAILED not in done.stdout
+
+    def test_a_device_that_stays_mapped_is_reported(self, node):
+        script = linux.conversion_script([linux.disk_source(RBD_URL)]).replace('sleep 3', 'sleep 0')
+        wrapper = ('rbd() { if [ "$1" = unmap ]; then return 1; fi; '
+                   'if [ "$1" = showmapped ]; then echo "0 vm-pool  vm-120-disk-1 - /dev/rbd0"; return 0; fi; '
+                   'command rbd "$@"; }\n')
+        done, _ = node(wrapper + script)
+
+        assert linux.read_result(done.stdout)['left_mapped'] == ['/dev/rbd0']
 
     def test_a_disk_that_cannot_be_mapped_is_not_converted(self, node):
         script = linux.conversion_script([linux.disk_source(RBD_URL)])
@@ -165,7 +192,8 @@ class TestTheScriptOnSeveralDisks:
         assert '<source dev="/dev/pve/vm-120-disk-2"/><target dev=\'sdb\'' in xml
         assert ("<driver name='qemu' type='qcow2'/>"
                 '<source file="/var/lib/vz/images/120/vm-120-disk-3.qcow2"/>') in xml
-        assert calls[-1] == 'rbd unmap /dev/rbd0'
+        assert [c for c in calls if c.startswith('rbd unmap')] == ['rbd unmap /dev/rbd0']
+        assert calls[-1] == 'rbd showmapped'
 
     def test_the_description_does_not_outlive_the_run(self, node, tmp_path):
         sources = [linux.disk_source('/dev/pve/vm-120-disk-1'),
