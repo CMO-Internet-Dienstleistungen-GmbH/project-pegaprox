@@ -155,7 +155,16 @@ def _authorize_pool_assignment(cluster_id, pool_id, vmid, vm_type=None):
     # above; and admins and cluster-wide operators returned earlier and never reach this.
     from pegaprox.utils.rbac import get_pool_membership_cache
     _members = get_pool_membership_cache(cluster_id) or {}
-    _current = _members.get(f"{_vid}:{vm_type or 'qemu'}")
+    _current = _members.get(f"{_vid}:{vm_type}") if vm_type else None
+    if _current is None:
+        # remove_pool_member has no vm_type to give us — its route is
+        # DELETE /pools/<pool>/members/<vmid>, no type in the path — and a container is
+        # keyed "<vmid>:lxc". Defaulting the lookup to qemu therefore read every LXC as
+        # "in no pool", i.e. as a move, and a pool-scoped caller lost the ability to take
+        # their own container out of their own pool. VMIDs are unique per cluster, so the
+        # type is not needed to identify the guest.
+        _current = next((_p for _k, _p in _members.items()
+                         if _k.split(':', 1)[0] == str(_vid)), None)
     if _current != pool_id and not user_can_access_vm(user, cluster_id, _vid, 'vm.config', vm_type):
         return False, (jsonify({
             'error': 'You can see this VM but not manage it, so it cannot be moved between pools'
