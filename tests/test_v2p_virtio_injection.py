@@ -556,6 +556,21 @@ def test_no_storage_driver_registered_is_not_a_success(resolved_node):
     assert any('no way to reach its disk' in line for line in task.lines)
 
 
+def test_a_disk_without_ntfs_says_so_in_the_log(resolved_node):
+    """The marker is followed by the partition listing, which on a Linux disk is long
+    enough to push it out of the tail logged on failure. The Hyper-V direction reads it
+    off the log to keep a Linux guest on VirtIO instead of moving it to SATA."""
+    calls, answers = resolved_node
+    listing = ''.join(f'/dev/loop0p{n}: UUID="{"0" * 36}" TYPE="xfs" PARTUUID="{n}"\n'
+                      for n in range(1, 9))
+    answers['bash /tmp/v2p-virtio-inject'] = (
+        5, f'NO_NTFS_FOUND\npartitions seen:\nblkid output:\n{listing}', '')
+    task = _Task()
+
+    assert v2p._inject_virtio_drivers(_Manager(), task) is False
+    assert '[VirtIO] NO_NTFS_FOUND' in task.lines
+
+
 class TestTheHibernationOnlyModeReachesItsOwnWork:
     """The script that mode generates, read rather than assumed.
 
