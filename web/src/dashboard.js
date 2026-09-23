@@ -8304,10 +8304,12 @@
                 source_cluster: '', source_node: '', source_vmid: '',
                 target_cluster: '', target_node: '', target_storage: '',
                 network_map: {}, vlan_map: {}, start_after: true, remove_source: false,
-                // Fork patch #15 — on by default: prepare the guest for VirtIO during the
-                // migration (inject the drivers, create the VM on VirtIO hardware) rather
-                // than importing on compatible hardware and converting by hand afterwards.
-                prepare_virtio: true,
+                // Fork patch #15 — how the guest is prepared for VirtIO during the
+                // migration: 'windows' injects the drivers from an ISO, 'linux' rebuilds the
+                // guest's initramfs with virt-v2v on the node, 'none' builds the VM on the
+                // compatible hardware instead. Preselected from the OS type the plan found,
+                // and moved along whenever the OS type is changed.
+                drivers: 'none',
                 // Fork patch #15 — preflight warnings a person has confirmed. The API
                 // refuses to start a migration with an unconfirmed one, so this travels
                 // with the request rather than only gating the button.
@@ -12828,6 +12830,7 @@
                                                  sockets: d.sockets ?? '',
                                                  memory_mb: d.memory_mb ?? '',
                                                  ostype: d.ostype || 'other',
+                                                 drivers: d.drivers || hvDriversForOstype(d.ostype),
                                                  bios: d.bios || '',
                                                  machine: d.machine || '',
                                                  scsihw: d.scsihw || '',
@@ -12879,9 +12882,10 @@
                 setXhmLoading(true);
                 try {
                     const body = { ...xhmForm };
-                    // target_hardware() on the server reads `hardware`; the checkbox is the
-                    // wizard's word for the same decision.
-                    body.hardware = xhmForm.prepare_virtio ? 'virtio' : 'compatible';
+                    // target_hardware() on the server reads `drivers`. `hardware` goes
+                    // along for a server that predates the Linux choice.
+                    body.drivers = xhmForm.drivers;
+                    body.hardware = xhmForm.drivers === 'none' ? 'compatible' : 'virtio';
                     // Fork patch #15 — an option this direction refuses must not be sent
                     // just because the form still carries its default. A Hyper-V plan
                     // hides both checkboxes and explains in prose that the VM is not
@@ -12987,7 +12991,7 @@
                 setHvPreflightBusy(true);
                 hvRefreshPreflight({
                     apiUrl: API_URL, authFetch, plan: xhmPlan,
-                    form: { ...xhmForm, hardware: xhmForm.prepare_virtio ? 'virtio' : 'compatible' },
+                    form: { ...xhmForm, hardware: xhmForm.drivers === 'none' ? 'compatible' : 'virtio' },
                 })
                     .then(report => { if (!dropped && report) setHvPreflight(report); })
                     .finally(() => { if (!dropped) setHvPreflightBusy(false); });
@@ -12997,10 +13001,10 @@
                 // DNS name and says so only when it creates the VM — which happens after
                 // the disks have been converted.
                 xhmForm.target_name,
-                // The hardware choice belongs here too: one of the checks answers whether
-                // this guest needs a VirtIO driver, and without this the list goes on
-                // saying "sata controller" while the box above it says VirtIO.
-                xhmForm.prepare_virtio,
+                // The preparation belongs here too: one of the checks answers whether this
+                // guest needs a VirtIO driver and another whether the choice fits the
+                // guest, and without this the list goes on answering for the old choice.
+                xhmForm.drivers,
                 // Starting the copy is reported as a warning, so ticking it changes the list.
                 xhmForm.start_after,
                 JSON.stringify(xhmForm.network_map), JSON.stringify(xhmForm.vlan_map)]);
@@ -23579,7 +23583,8 @@
                                                                     <div>
                                                                         <label className="text-[10px] text-gray-500 block mb-0.5">{t('hvOsType') || 'OS type'}</label>
                                                                         <select value={xhmForm.ostype}
-                                                                                onChange={e => setXhmForm({...xhmForm, ostype: e.target.value})}
+                                                                                onChange={e => setXhmForm({...xhmForm, ostype: e.target.value,
+                                                                                                           drivers: hvDriversForOstype(e.target.value)})}
                                                                                 className={field}>
                                                                             {HV_OSTYPES.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                                                                         </select>
@@ -23772,14 +23777,20 @@
                                                                belongs here rather than in the other branch: a Hyper-V plan
                                                                never reaches that one. */
                                                             <div className="space-y-2">
-                                                                <label className="flex items-center gap-1.5 text-xs text-gray-400 cursor-pointer"
-                                                                       title={t('hvPrepareVirtioHint')
-                                                                           || 'Off: the VM is created with a SATA controller and an e1000 network card — hardware Windows starts on without any added driver. The switch to VirtIO is then a manual step afterwards.'}>
-                                                                    <input type="checkbox" checked={xhmForm.prepare_virtio}
-                                                                           onChange={e => setXhmForm({...xhmForm, prepare_virtio: e.target.checked})}
-                                                                           className="rounded border-gray-600" />
-                                                                    {t('hvPrepareVirtio') || 'Install VirtIO drivers and create on VirtIO hardware'}
-                                                                </label>
+                                                                <div className="space-y-1">
+                                                                    <label className="text-[10px] text-gray-500 block"
+                                                                           title={t('hvPrepareVirtioHint')
+                                                                               || 'Windows: the VirtIO drivers are written in from a driver ISO. Linux: virt-v2v rebuilds the guest\'s initramfs on the target node. No: the VM is created with a SATA controller and an e1000 network card, and the switch to VirtIO is a manual step afterwards.'}>
+                                                                        {t('hvPrepareVirtio') || 'Prepare for VirtIO hardware'}
+                                                                    </label>
+                                                                    <select value={xhmForm.drivers}
+                                                                            onChange={e => setXhmForm({...xhmForm, drivers: e.target.value})}
+                                                                            className="w-full px-2 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-white text-xs">
+                                                                        <option value="none">{t('hvDriversNone') || 'No'}</option>
+                                                                        <option value="windows">{t('hvDriversWindows') || 'Windows'}</option>
+                                                                        <option value="linux">{t('hvDriversLinux') || 'Linux'}</option>
+                                                                    </select>
+                                                                </div>
                                                                 {/* Fork patch #15 — which driver ISO, chosen rather than found.
                                                                     The import used to take the first file called virtio-win.iso
                                                                     on the node, whatever release it was. Windows Server 2012 R2
@@ -23792,7 +23803,7 @@
                                                                     The list carries every ISO the node has, not only the driver
                                                                     ones, plus an entry per release the node could fetch for
                                                                     itself. Preselected is what fits the guest on the disk. */}
-                                                                {xhmForm.prepare_virtio && (() => {
+                                                                {xhmForm.drivers === 'windows' && (() => {
                                                                     const build = hvGuestBuild(xhmPlan);
                                                                     const version = hvGuestVersion(xhmPlan);
                                                                     const fetchable = (hvIsos?.available_releases || []);
