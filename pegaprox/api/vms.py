@@ -63,6 +63,7 @@ VNC_PVE_CONNECT_TIMEOUT = int(os.environ.get('PEGAPROX_VNC_CONNECT_TIMEOUT', '15
 # offloaded PVE socket calls burn VNC_PVE_CONNECT_TIMEOUT instead of connecting. Route to_thread
 # through gevent once, process-wide; no-op when gevent isn't patched in (e.g. under pytest).
 from pegaprox.utils.concurrent import install_gevent_to_thread, gevent_listen_socket
+from pegaprox.utils.vnc_pve_io import pve_write
 from pegaprox.utils.ssh import read_capped as _read_capped
 install_gevent_to_thread()
 
@@ -8308,7 +8309,7 @@ def handle_vnc_websocket(ws, cluster_id, node, vm_type, vmid):
                 if data:
                     bytes_sent += len(data)
                     with _pve_io_lock:
-                        pve_ws.send(data)
+                        pve_write(pve_ws, pve_ws.send, data)
             except Exception as e:
                 if running:
                     err_str = str(e)
@@ -8771,15 +8772,15 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
 
             def _pve_send(msg):
                 with _pve_io_lock:
-                    pve_ws.send(msg)
+                    pve_write(pve_ws, pve_ws.send, msg)
 
             def _pve_send_binary(msg):
                 with _pve_io_lock:
-                    pve_ws.send_binary(msg)
+                    pve_write(pve_ws, pve_ws.send_binary, msg)
 
             def _pve_ping():
                 with _pve_io_lock:
-                    pve_ws.ping()
+                    pve_write(pve_ws, pve_ws.ping)
 
             async def proxmox_to_client():
                 """Forward data from Proxmox to browser (blocking recv handled in thread).
@@ -8813,7 +8814,7 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                         break
                     except Exception as e:
                         if running:
-                            logging.debug(f"[VNC] PVE->Client: {e}")
+                            logging.warning(f"[VNC] PVE->Client ended the session: {type(e).__name__}: {e}")
                         running = False
                         break
                 stop_evt.set()
@@ -8854,7 +8855,7 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                         await asyncio.to_thread(_pve_send, message)
                 except Exception as e:
                     if running and 'close' not in str(e).lower():
-                        logging.debug(f"[VNC] Client->PVE: {e}")
+                        logging.warning(f"[VNC] Client->PVE ended the session: {type(e).__name__}: {e}")
                 finally:
                     running = False
                     stop_evt.set()
@@ -8896,7 +8897,8 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                     # WS-layer ping (cheap, keeps any websocket-aware intermediary happy)
                     try:
                         await asyncio.to_thread(_pve_ping)
-                    except Exception:
+                    except Exception as e:
+                        logging.warning(f"[VNC] PVE ping ended the session: {type(e).__name__}: {e}")
                         break
                     # RFB-layer keepalive (keeps pveproxy/qemu from declaring the session idle)
                     now = _time.monotonic()
@@ -8905,7 +8907,7 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                             await asyncio.to_thread(_pve_send_binary, RFB_FB_UPDATE_REQUEST)
                             next_rfb_at = now + rfb_interval
                         except Exception as e:
-                            logging.debug(f"[VNC] RFB keepalive send failed: {e}")
+                            logging.warning(f"[VNC] RFB keepalive ended the session: {type(e).__name__}: {e}")
                             break
 
             task1 = asyncio.create_task(proxmox_to_client())
@@ -9309,7 +9311,7 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
                 if data:
                     bytes_sent += len(data)
                     with _pve_io_lock:
-                        pve_ws.send(data)
+                        pve_write(pve_ws, pve_ws.send, data)
             except TimeoutError:
                 gsleep(0.01)
             except Exception as e:

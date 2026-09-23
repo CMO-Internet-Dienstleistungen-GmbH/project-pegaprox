@@ -21,6 +21,7 @@ SSH tunnel, after a customer reported their WSS was killed at the security
 boundary even with both prior layers active.
 """
 from pegaprox.constants import VNC_PVE_RECV_SLICE
+from pegaprox.utils.vnc_pve_io import pve_write
 import base64
 import logging
 import secrets
@@ -132,7 +133,7 @@ class VncPollSession:
         # send_binary on websocket-client = ws frame opcode 0x2. #713 — under the
         # shared lock so it never overlaps the pump's SSL_read on the same pve_ws.
         with self._pve_io_lock:
-            self.pve_ws.send_binary(raw)
+            pve_write(self.pve_ws, self.pve_ws.send_binary, raw)
         return len(raw)
 
     def recv(self, max_wait: float = RECV_LONG_POLL_DEFAULT) -> list:

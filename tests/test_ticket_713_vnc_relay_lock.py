@@ -20,6 +20,7 @@ class FakePveWs:
     def __init__(self):
         self._in = 0; self.maxc = 0; self.frames = [b"F"*16 for _ in range(8)]
     def settimeout(self, t): pass
+    def gettimeout(self): return 0.01
     def _op(self):
         self._in += 1; self.maxc = max(self.maxc, self._in)
         gevent.sleep(0.003)          # hold the "SSL op" to open an overlap window
