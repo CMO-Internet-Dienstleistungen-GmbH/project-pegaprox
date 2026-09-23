@@ -59,6 +59,7 @@ CONVERSION_TIMEOUT = 3600
 #: Written by the script so the caller can tell the stages apart without parsing prose.
 MARK_EXIT = 'V2V_EXIT='
 MARK_MAP_FAILED = 'RBD_MAP_FAILED'
+MARK_UNMAP_FAILED = 'RBD_UNMAP_FAILED'
 
 _RBD_OPTION = re.compile(r':(conf|id|keyring|mon_host)=([^:]*)')
 _FILE_FORMATS = {'.raw': 'raw', '.qcow2': 'qcow2', '.img': 'raw'}
@@ -137,9 +138,15 @@ def conversion_script(sources: list[dict], guest_name: str = 'guest') -> str:
     if len(sources) > 26:
         raise UnsupportedVolume('More than 26 disks cannot be named for the conversion')
 
+    # The unmap is retried: virt-v2v leaves on a signal before its nbdkit has let go of the
+    # device, and one `rbd unmap` a moment later fails with EBUSY. Measured after a SIGTERM
+    # on PVE 9.2: the device stayed mapped; unmapped by hand seconds later it went at once.
     lines = ['set -u', 'MAPPED=""', 'XML=""',
-             'cleanup() { for d in $MAPPED; do rbd unmap "$d" >/dev/null 2>&1 || true; done; '
-             '[ -n "$XML" ] && rm -f "$XML"; }',
+             'cleanup() { for d in $MAPPED; do '
+             'for i in 1 2 3 4 5 6 7 8 9 10; do rbd unmap "$d" >/dev/null 2>&1 && break; '
+             'sleep 3; done; '
+             f'rbd showmapped 2>/dev/null | grep -q " $d\\$" && echo "{MARK_UNMAP_FAILED} $d"; '
+             'done; [ -n "$XML" ] && rm -f "$XML"; }',
              'trap cleanup EXIT']
     exprs = []
     for index, source in enumerate(sources):
@@ -189,7 +196,8 @@ def read_result(output: str) -> dict:
         exit_code = int(found[-1])
     lines = [line.rstrip() for line in text.splitlines()
              if line.startswith('[') or line.startswith('virt-v2v')
-             or line.startswith(MARK_MAP_FAILED)]
+             or line.startswith(MARK_MAP_FAILED) or line.startswith(MARK_UNMAP_FAILED)]
     return {'exit': exit_code, 'lines': lines,
             'map_failed': MARK_MAP_FAILED in text,
+            'left_mapped': re.findall(rf'^{MARK_UNMAP_FAILED} (\S+)', text, re.M),
             'uefi': 'requires UEFI on the target' in text}

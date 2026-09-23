@@ -2075,6 +2075,11 @@ def _run_linux_conversion(task, target, run_on_node, ordered, new_vmid):
     result = hyperv_linux.read_result(out)
     for line in result['lines']:
         task.log(f'[virt-v2v] {line}')
+    for device in result['left_mapped']:
+        # Named, because a kernel mapping of the guest's disk left on the node keeps the
+        # volume busy for the VM and for anybody cleaning up after this migration.
+        task.log(f'{device} could not be unmapped on {node} after the conversion; release it '
+                 f'with `rbd unmap {device}` before starting or removing the VM.')
     if result['map_failed']:
         return 'The Ceph volume could not be mapped on the node for the conversion'
     if result['exit'] != 0 or rc != 0:
