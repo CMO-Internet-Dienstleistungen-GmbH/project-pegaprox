@@ -51,6 +51,10 @@ completes with errors that name the cause.
 - CentOS 7.7, 150 GiB, Ceph RBD on PVE 9.2: conversion 191 s; the VM booted to its login
   prompt on virtio-scsi; a second run on the converted disk (with the guest-agent edit)
   took 173 s and changed nothing else; the agent then reported no command disabled.
+- On an HDD-backed Ceph pool virt-v2v's unconditional `fstrim` discarded at about 6 MB/s
+  and was still running after 26 minutes on the same guest. The volume is therefore mapped
+  with `rbd map -o notrim`; measured on a Debian 12 guest, the trim step then takes under a
+  second and the conversion exits 0.
 - `apt-get install --no-install-recommends virt-v2v libguestfs-xfs` beside `pve-qemu-kvm`:
   nothing removed or upgraded. `mdadm` comes with it and rebuilds the node's initramfs and
   grub configuration once — see `docs/hyperv-target-node-requirements.md`.

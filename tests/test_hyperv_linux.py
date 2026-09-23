@@ -107,7 +107,7 @@ class TestTheScriptOnOneDisk:
         done, calls = node(script)
 
         assert done.returncode == 0
-        assert calls[0] == ('rbd map --id admin --keyring /etc/pve/priv/ceph/vm-pool.keyring '
+        assert calls[0] == ('rbd map -o notrim --id admin --keyring /etc/pve/priv/ceph/vm-pool.keyring '
                             '-c /etc/pve/ceph.conf vm-pool/vm-120-disk-1')
         assert calls[1].startswith('v2v --block-driver virtio-scsi --run-command ')
         assert calls[1].endswith(' -i disk -if raw /dev/rbd0')
