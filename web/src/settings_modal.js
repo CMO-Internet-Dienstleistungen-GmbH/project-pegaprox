@@ -1604,7 +1604,8 @@
                             force_2fa: data.force_2fa || false,
                             force_2fa_exclude_admins: data.force_2fa_exclude_admins || false,
                             // Session
-                            session_timeout: data.session_timeout || 86400
+                            session_timeout: data.session_timeout || 86400,
+                            hyperv_default_vlan: data.hyperv_default_vlan ?? 1006
                         }));
                         // MK: Feb 2026 - Load LDAP settings
                         setLdapConfig(prev => ({
@@ -1779,6 +1780,7 @@
                     formData.append('domain', serverSettings.domain);
                     formData.append('port', serverSettings.port);
                     formData.append('http_redirect_port', serverSettings.http_redirect_port || 0);
+                    formData.append('hyperv_default_vlan', serverSettings.hyperv_default_vlan ?? 1006);
                     formData.append('ssl_enabled', serverSettings.ssl_enabled);
                     formData.append('acme_enabled', serverSettings.acme_enabled ? 'true' : 'false');
                     formData.append('acme_provider', serverSettings.acme_provider || 'letsencrypt');
@@ -5896,6 +5898,20 @@
                                                     className="w-full px-3 py-2 bg-proxmox-darker border border-proxmox-border rounded-lg text-white text-sm focus:outline-none focus:border-proxmox-orange"
                                                 />
                                                 <p className="text-xs text-gray-500 mt-1">{t('httpRedirectPortHint') || '0 = auto (80 if root), -1 = disabled'}</p>
+                                            </div>
+                                            {/* Fork patch #15 — the VLAN a Hyper-V import lands on when the
+                                                source adapter names none. */}
+                                            <div>
+                                                <label className="block text-sm text-gray-400 mb-1">{t('hvDefaultVlan') || 'Default VLAN for Hyper-V imports'}</label>
+                                                <input
+                                                    type="number"
+                                                    value={serverSettings.hyperv_default_vlan ?? 1006}
+                                                    onChange={e => setServerSettings({...serverSettings, hyperv_default_vlan: parseInt(e.target.value)})}
+                                                    min="0"
+                                                    max="4094"
+                                                    className="w-full px-3 py-2 bg-proxmox-darker border border-proxmox-border rounded-lg text-white text-sm focus:outline-none focus:border-proxmox-orange"
+                                                />
+                                                <p className="text-xs text-gray-500 mt-1">{t('hvDefaultVlanHint') || 'Prefilled per adapter in the migration wizard when the Hyper-V adapter has no VLAN of its own. 0 = leave such adapters untagged.'}</p>
                                             </div>
                                         </div>
                                     </div>

@@ -128,6 +128,19 @@ def get_datacenter_status(cluster_id):
         return error
 
     # MK: XCP-ng clusters build status from their own cached data
+    # A source that is not Proxmox has no Proxmox REST API to aggregate from, and this
+    # route is nothing but that aggregation. Asking the manager whether it can answer is
+    # better than listing the types that cannot: it covers every such source, including
+    # ones added later.
+    #
+    # This branch was removed once, on the assumption that a migration source never reaches
+    # this route. It does - sources live in the manager registry and appear in the cluster
+    # list exactly like an ESXi host - and the page then failed with a stack trace about a
+    # missing REST API.
+    if (getattr(manager, 'cluster_type', 'proxmox') != 'proxmox'
+            and hasattr(manager, 'datacenter_status')):
+        return jsonify(manager.datacenter_status())
+
     if getattr(manager, 'cluster_type', 'proxmox') == 'xcpng':
         try:
             st = manager.get_cluster_status()
@@ -649,6 +662,12 @@ def get_datastores(cluster_id):
         return error
 
     # XCP-ng: return SR list as datastores
+    if getattr(manager, 'cluster_type', 'proxmox') == 'hyperv':
+        # Its disks are found through the VM that owns them, never through a host-wide
+        # storage list, so there is nothing honest to put here. Removed once on the wrong
+        # assumption that a source never reaches this route; it does.
+        return jsonify({'shared': [], 'local': {}})
+
     if getattr(manager, 'cluster_type', 'proxmox') == 'xcpng':
         storages = manager.get_storages()
         return jsonify({'shared': storages, 'local': {}})
@@ -3640,6 +3659,13 @@ def vm_action_api(cluster_id, node, vm_type, vmid, action):
     except Exception as e:
         logging.warning(f"[VM-ACTION] Error parsing body: {e}")
     
+    # CMO fork patch #15: an imported VM and its Hyper-V original are one machine twice.
+    if action in ('start', 'resume'):
+        from pegaprox.core.hyperv_xhm import refuse_target_start
+        _refused = refuse_target_start(cluster_id, vmid)
+        if _refused:
+            return jsonify({'error': _refused}), 409
+
     logging.info(f"[VM-ACTION] Executing {action} with force={force}")
     manager = cluster_managers[cluster_id]
     try:

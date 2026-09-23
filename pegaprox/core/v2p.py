@@ -19,6 +19,8 @@ from pegaprox.globals import cluster_managers, vmware_managers, _v2p_migrations
 from pegaprox.utils.ssh import _ssh_exec, _pve_node_exec
 from pegaprox.utils.realtime import broadcast_sse
 from pegaprox.utils.audit import log_audit
+from pegaprox.core import hyperv_drivers
+from pegaprox.core.virtio_firstboot import (FIRST_BOOT_SCRIPT_NAME, FIRST_BOOT_SERVICE, FIRST_BOOT_SERVICE_COMMAND, first_boot_script_staging as _first_boot_script_staging)  # Fork patch #15
 
 
 class V2PCutoverCancelled(Exception):
@@ -2068,14 +2070,15 @@ def _register_uefi_fallback_loader(pve_mgr, task):
 
 # NS Apr 2026 — Offline VirtIO driver injection. Opt-in. Lifted from virt-v2v's
 # approach but slimmed down for our pipeline: we already have the disks materialized
-# as Proxmox LVs by this point, so we losetup+kpartx them, ntfs-3g mount the largest
-# NTFS partition, copy the right SYS/INF/CAT files out of virtio-win.iso, and merge
+# as Proxmox LVs by this point, so we losetup+kpartx them, ntfs-3g mount the NTFS
+# partition that holds Windows, copy the right SYS/INF/CAT files out of virtio-win.iso, and merge
 # a registry stub into the SYSTEM hive that flags the storage drivers as boot-critical.
 # After this, the user can switch scsihw to virtio-scsi-pci (or net0 to virtio) without
 # Windows BSODing on next boot.
 #
-# Tools needed on the Proxmox node: kpartx, ntfs-3g, libhivex-bin (hivexregedit),
-# losetup. We auto-apt-install if missing (one-time cost ~5s).
+# Tools needed on the Proxmox node: kpartx, ntfs-3g, losetup, python3-hivex for the
+# registry merge and libhivex-bin for hivexsh, which reads the guest's Windows version.
+# We auto-apt-install if missing (one-time cost ~5s).
 #
 # Source ISO: looked up in standard PVE template paths first, then user-configured path.
 # User can drop virtio-win.iso into /var/lib/vz/template/iso/ or any pvesm-managed iso storage.
@@ -2120,13 +2123,32 @@ def _detect_windows_driver_subdir(version_str, build_str):
     return 'w11/amd64'
 
 
-def _inject_virtio_drivers(pve_mgr, task):
+def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only=False):
     """Offline-inject VirtIO drivers into the boot disk's Windows install.
 
     Touches only the first attached disk (assumed boot). Returns True on success.
-    On any error we log + return False — never aborts the migration."""
-    if not getattr(task, 'install_virtio_drivers', False):
+    On any error we log + return False — never aborts the migration.
+
+    `node_exec` replaces the way commands reach the node, with the same signature as
+    `_pve_node_exec`. It exists because that function logs in as `root` with the cluster's
+    password, and a cluster registered the other way PegaProx supports — an API token plus
+    an SSH key for a non-root account — then has no working route to its own node: the
+    tool probe and the apt call both come back with a non-zero code and no output at all.
+    A caller that already holds a working connection passes it here rather than leaving
+    the injection to fail silently. Default unchanged, so the VMware direction is
+    untouched.
+
+    `clear_hibernation_only` runs the first half alone: resolve the disk, find the Windows
+    volume, ntfsfix it and mount with `remove_hiberfile`, then stop. That is what clears a
+    Fast Startup hybrid shutdown, and it is needed on any import that changes the platform
+    under the guest — not only on one that also installs drivers. Without it a guest that
+    shut down hybrid resumes its saved kernel session on hardware that is not the hardware
+    it was saved on. The driver half needs virtio-win.iso and hivex; this half needs
+    neither, so both are skipped for it. (Fork issue #15.)
+    """
+    if not clear_hibernation_only and not getattr(task, 'install_virtio_drivers', False):
         return False
+    run_on_node = node_exec or _pve_node_exec
 
     node = task.target_node
     # NS Apr 2026 — guard: if the Proxmox VM is already running we'd be writing
@@ -2151,29 +2173,43 @@ def _inject_virtio_drivers(pve_mgr, task):
     # libhivex-bin for hivexsh, which the version probe below shells out to.
     # ceph-common (for `rbd map`) only installed on-demand inside the script
     # when STYPE=rbd, since most clusters don't use Ceph.
-    #
-    # MK Sep 2026 — this list used to carry qemu-utils and the probe used to require
-    # qemu-nbd. On PVE that package conflicts with pve-qemu-kvm, so apt proposes to
-    # remove it and takes proxmox-ve with it; pve-apt-hook aborts the whole run, which
-    # is the only reason nodes survived this and also why python3-hivex and ntfs-3g
-    # never got installed either. The #520 preflight 1700 lines up already tells
-    # operators not to do exactly this — that fix never reached this call site. PVE
-    # ships qemu-nbd via pve-qemu-kvm anyway, and the one branch that needs it checks
-    # for it itself (file-based storage, below), so neither belongs here.
-    #
-    # hivexsh went the other way: used, never installed, and its failure swallowed by
-    # 2>/dev/null — so VER_BUILD came back empty, the build table matched nothing and
-    # every guest silently got the w11 driver variant with INJECTION_OK on top.
-    rc, _, _ = _pve_node_exec(pve_mgr, node,
-        "python3 -c 'import hivex' 2>/dev/null && command -v ntfs-3g >/dev/null "
-        "&& command -v ntfsfix >/dev/null",
-        timeout=10)
+    # qemu-nbd is deliberately absent from both the probe and the install list.
+    # On PVE it ships with pve-qemu-kvm; the package that would carry it on plain
+    # Debian is qemu-utils, and that one conflicts with pve-qemu-kvm — apt answers
+    # the conflict by offering to remove proxmox-ve, pve-apt-hook aborts the whole
+    # run, and python3-hivex and ntfs-3g are then not installed either. Measured on
+    # PVE 9.2: the injection reported `apt install failed` with an empty message and
+    # the node was one confirmation away from losing proxmox-ve. The same reasoning
+    # already stands in the qemu-img preflight above (#520). qemu-nbd is needed for
+    # file-based storages only, and the script reports it missing where it needs it.
+    # hivexsh comes from libhivex-bin. The script below reads the guest's Windows
+    # version with it, and a node without it does not fail -- VER_NAME and VER_BUILD
+    # come back empty, the build table finds no match, and every guest is treated as
+    # the w11/amd64 default. Measured on a Windows Server 2022 guest: build 20348 with
+    # hivexsh present, nothing without it, so the drivers copied in were the wrong
+    # variant while the log said the injection had succeeded.
+    if clear_hibernation_only:
+        rc, _, _ = run_on_node(pve_mgr, node,
+            "command -v ntfs-3g >/dev/null && command -v ntfsfix >/dev/null",
+            timeout=10)
+    else:
+        rc, _, _ = run_on_node(pve_mgr, node,
+            "python3 -c 'import hivex' 2>/dev/null && command -v ntfs-3g >/dev/null "
+            "&& command -v ntfsfix >/dev/null",
+            timeout=10)
     if rc != 0:
-        task.log("[VirtIO] Installing python3-hivex / ntfs-3g / libhivex-bin (one-time)...")
-        rc_apt, out_apt, _ = _pve_node_exec(pve_mgr, node,
-            "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "
-            "python3-hivex ntfs-3g libhivex-bin 2>&1 | tail -25",
-            timeout=180)
+        if clear_hibernation_only:
+            task.log("[VirtIO] Installing ntfs-3g (one-time)...")
+            rc_apt, out_apt, _ = run_on_node(pve_mgr, node,
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "
+                "ntfs-3g 2>&1 | tail -25",
+                timeout=180)
+        else:
+            task.log("[VirtIO] Installing python3-hivex / ntfs-3g / libhivex-bin (one-time)...")
+            rc_apt, out_apt, _ = run_on_node(pve_mgr, node,
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "
+                "python3-hivex ntfs-3g libhivex-bin 2>&1 | tail -25",
+                timeout=180)
         if rc_apt != 0:
             # tail -5 used to cut the reason off — an apt refusal on PVE is several
             # lines of hook output and the operator got "✗ apt install failed:" with
@@ -2181,57 +2217,73 @@ def _inject_virtio_drivers(pve_mgr, task):
             task.log(f"[VirtIO] ✗ apt install failed: {str(out_apt or '').strip()[-600:]}")
             return False
 
-    # hivexsh is checked separately and is NOT fatal. It only feeds the version probe,
-    # and the script falls back to a driver variant without it — which for a Windows 11
-    # guest is even the right one. Making it a hard requirement would abort migrations
-    # on air-gapped nodes that worked before. Try to fetch it, then let the script say
-    # NO_HIVEXSH and pick a fallback if it is still missing.
-    rc_hv, _, _ = _pve_node_exec(pve_mgr, node, "command -v hivexsh >/dev/null", timeout=10)
-    if rc_hv != 0:
-        task.log("[VirtIO] hivexsh missing — installing libhivex-bin for the version probe...")
-        rc_hv2, out_hv, _ = _pve_node_exec(pve_mgr, node,
-            "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "
-            "libhivex-bin 2>&1 | tail -25",
-            timeout=180)
-        if rc_hv2 != 0:
-            task.log("[VirtIO] ! libhivex-bin not installed — the guest's Windows build "
-                     "can't be read, so the driver variant is a guess: "
-                     f"{str(out_hv or '').strip()[-300:]}")
+    # hivexsh is checked separately and is NOT fatal, and skipped entirely to clear a
+    # hibernation file — that path never reads the guest's Windows version. It only
+    # feeds the version probe otherwise, and the script falls back to a driver variant
+    # without it — which for a Windows 11 guest is even the right one. Making it a hard
+    # requirement would abort migrations on air-gapped nodes that worked before. Try to
+    # fetch it, then let the script say NO_HIVEXSH and pick a fallback if still missing.
+    if not clear_hibernation_only:
+        rc_hv, _, _ = run_on_node(pve_mgr, node, "command -v hivexsh >/dev/null", timeout=10)
+        if rc_hv != 0:
+            task.log("[VirtIO] hivexsh missing — installing libhivex-bin for the version probe...")
+            rc_hv2, out_hv, _ = run_on_node(pve_mgr, node,
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "
+                "libhivex-bin 2>&1 | tail -25",
+                timeout=180)
+            if rc_hv2 != 0:
+                task.log("[VirtIO] ! libhivex-bin not installed — the guest's Windows build "
+                         "can't be read, so the driver variant is a guess: "
+                         f"{str(out_hv or '').strip()[-300:]}")
 
-    # 2) Locate ISO. User-set path wins.
+    # 2) Locate ISO. User-set path wins. Not needed to clear a hibernation file, and a
+    # node without the ISO must not fail that.
+    iso_path = ''
     iso_candidates = []
-    if getattr(task, 'virtio_iso_path', ''):
-        iso_candidates.append(task.virtio_iso_path)
-    iso_candidates += [
-        "/var/lib/vz/template/iso/virtio-win.iso",
-        f"/mnt/pve/{task.target_storage}/template/iso/virtio-win.iso",
-        "/var/lib/pegaprox/virtio-win.iso",
-    ]
-    iso_path = None
-    for p in iso_candidates:
-        rc, _, _ = _pve_node_exec(pve_mgr, node, f"test -f {shlex.quote(p)}", timeout=5)
+    chosen_iso = getattr(task, 'virtio_iso_path', '')
+    if chosen_iso:
+        # Fork issue #15 — an ISO that was chosen is the only one used. Falling back to
+        # whatever else is lying on the node defeats the choice: which release a guest may
+        # be given is a decision (Server 2012 R2 takes 0.1.189 and nothing else), and
+        # silently substituting a different file is how the wrong drivers get installed
+        # with nothing reporting it.
+        iso_candidates.append(chosen_iso)
+    else:
+        iso_candidates += [
+            "/var/lib/vz/template/iso/virtio-win.iso",
+            f"/mnt/pve/{task.target_storage}/template/iso/virtio-win.iso",
+            "/var/lib/pegaprox/virtio-win.iso",
+        ]
+    for p in ([] if clear_hibernation_only else iso_candidates):
+        rc, _, _ = run_on_node(pve_mgr, node, f"test -f {shlex.quote(p)}", timeout=5)
         if rc == 0:
             iso_path = p
             break
-    if not iso_path:
-        task.log("[VirtIO] ⚠ virtio-win.iso not found — skipping. Searched: " + ", ".join(iso_candidates))
-        task.log("[VirtIO]   Hint: drop virtio-win.iso into /var/lib/vz/template/iso/ or set virtio_iso_path")
+    if not iso_path and not clear_hibernation_only:
+        if chosen_iso:
+            task.log(f"[VirtIO] ✗ The chosen driver ISO is not on the node: {chosen_iso}")
+            task.log("[VirtIO]   No other ISO is used in its place — which release this "
+                     "guest may be given is a decision, not a search.")
+        else:
+            task.log("[VirtIO] ⚠ virtio-win.iso not found — skipping. Searched: " + ", ".join(iso_candidates))
+            task.log("[VirtIO]   Hint: drop virtio-win.iso into /var/lib/vz/template/iso/ or set virtio_iso_path")
         return False
-    task.log(f"[VirtIO] ISO: {iso_path}")
+    task.log(f"[VirtIO] ISO: {iso_path}" if iso_path
+             else "[VirtIO] Clearing a Fast Startup hibernation file; no ISO needed.")
 
     # 3) Build a single shell script — easier to follow + we get one rc back.
     # NS Apr 2026 — storage-type-aware: lvm/iSCSI/zfs are already block devices,
     # rbd needs `rbd map`, file-based (dir/nfs/cifs/cephfs/glusterfs/btrfs with qcow2)
     # needs `qemu-nbd --connect`. After that, losetup -b 512 -fP wraps for 512b sectors.
     vol_id = f"{task.target_storage}:vm-{task.proxmox_vmid}-disk-0"
-    rc, vol_path, _ = _pve_node_exec(pve_mgr, node,
+    rc, vol_path, _ = run_on_node(pve_mgr, node,
         f"pvesm path {shlex.quote(vol_id)} 2>/dev/null", timeout=10)
     vol_path = str(vol_path or '').strip()
     if not vol_path:
         task.log("[VirtIO] ✗ Could not resolve boot disk path")
         return False
     # Detect storage type so the script knows which exposure path to take
-    rc_st, st_out, _ = _pve_node_exec(pve_mgr, node,
+    rc_st, st_out, _ = run_on_node(pve_mgr, node,
         f"pvesm status --storage {shlex.quote(task.target_storage)} 2>/dev/null | tail -n +2 | awk '{{print $2}}'",
         timeout=10)
     storage_type = (str(st_out or '').strip().splitlines() or [''])[0].strip().lower()
@@ -2246,6 +2298,9 @@ def _inject_virtio_drivers(pve_mgr, task):
         f"STYPE={shlex.quote(storage_type)}\n"
         f"ISO={shlex.quote(iso_path)}\n"
         f"DRIVERS=\"{drivers_arg}\"\n"
+        # Fork issue #15 — 1 stops after the Windows volume is mounted, which is all that
+        # is needed to clear a Fast Startup hibernation file.
+        f"CLEAN_ONLY={1 if clear_hibernation_only else 0}\n"
         "TMP=$(mktemp -d /tmp/v2p-virtio-XXXXXX)\n"
         "ISO_MNT=\"$TMP/iso\"; WIN_MNT=\"$TMP/win\"; mkdir -p \"$ISO_MNT\" \"$WIN_MNT\"\n"
         "LOOP=\"\"; NBD=\"\"; RBD=\"\"\n"
@@ -2261,7 +2316,12 @@ def _inject_virtio_drivers(pve_mgr, task):
         "  rm -rf \"$TMP\"; "
         "}\n"
         "trap cleanup EXIT\n"
-        "mount -o ro,loop \"$ISO\" \"$ISO_MNT\" || { echo 'ISO_MOUNT_FAILED'; exit 3; }\n"
+        # Fork issue #15 — the hibernation half has no ISO and needs none. Without this
+        # guard it mounts the empty string, exits 3, and never reaches the ntfsfix and
+        # remove_hiberfile two blocks down that are the entire point of that mode.
+        "if [ \"$CLEAN_ONLY\" != 1 ]; then\n"
+        "  mount -o ro,loop \"$ISO\" \"$ISO_MNT\" || { echo 'ISO_MOUNT_FAILED'; exit 3; }\n"
+        "fi\n"
         # ── Expose target disk as a partitioned block device (BLK) ──
         "BLK=\"\"\n"
         "case \"$STYPE\" in\n"
@@ -2306,29 +2366,58 @@ def _inject_virtio_drivers(pve_mgr, task):
         "[ -b \"$LOOP\" ] || { echo \"LOSETUP_FAILED:$LOOP\"; exit 4; }\n"
         # Wait briefly for partition nodes to materialize
         "for i in 1 2 3 4 5; do ls -1 ${LOOP}p* 2>/dev/null | head -1 >/dev/null && break; sleep 1; done\n"
-        # Find largest NTFS partition (Windows volume)
-        "WIN_PART=$(for p in ${LOOP}p*; do "
+        # Every NTFS partition, largest first.
+        "NTFS_PARTS=$(for p in ${LOOP}p*; do "
         "[ -b \"$p\" ] || continue; "
         "FT=$(blkid -s TYPE -o value \"$p\" 2>/dev/null); "
         "[ \"$FT\" = ntfs ] || continue; "
         "SZ=$(blockdev --getsize64 \"$p\" 2>/dev/null); "
         "echo \"$SZ $p\"; "
-        "done | sort -rn | head -1 | awk '{print $2}')\n"
-        "[ -n \"$WIN_PART\" ] || { echo 'NO_NTFS_FOUND'; "
+        "done | sort -rn | awk '{print $2}')\n"
+        "[ -n \"$NTFS_PARTS\" ] || { echo 'NO_NTFS_FOUND'; "
         "echo 'partitions seen:'; ls -la ${LOOP}p* 2>/dev/null; "
         "echo 'blkid output:'; for p in ${LOOP}p*; do blkid \"$p\" 2>/dev/null; done; "
         "exit 5; }\n"
+        # Fork issue #15 — the Windows volume is the one that holds Windows, not the largest
+        # one. A disk with a 100 GB system partition and a 700 GB data partition used to
+        # have the data partition mounted, and the injection ended in NO_WINDOWS_DIR.
+        # Each candidate is looked at read-only first: nothing is written to a partition
+        # until it is known to be the right one, and ntfs-3g mounts a hibernated or
+        # uncleanly dismounted volume read-only where it refuses read-write.
+        "WIN_PART=\"\"\n"
+        "for p in $NTFS_PARTS; do "
+        "mount -t ntfs-3g -o ro \"$p\" \"$WIN_MNT\" 2>/dev/null || continue; "
+        "for d in Windows WINDOWS windows; do "
+        "[ -d \"$WIN_MNT/$d/System32/config\" ] && { WIN_PART=\"$p\"; break; }; "
+        "done; "
+        "umount \"$WIN_MNT\" 2>/dev/null||true; "
+        "[ -n \"$WIN_PART\" ] && break; "
+        "done\n"
+        # None of them showed a Windows directory read-only: keep the old choice, so the
+        # run ends where it always did and says so, rather than somewhere new.
+        "[ -n \"$WIN_PART\" ] || { WIN_PART=$(echo \"$NTFS_PARTS\" | head -1); "
+        "echo 'WINDOWS_PARTITION_NOT_IDENTIFIED'; }\n"
         "echo \"WIN_PART=$WIN_PART\"\n"
         # NS Apr 2026 — Windows guests almost always leave NTFS in "Fast Startup
         # hibrid hibernated" state after a "clean" shutdown (Win10/11 default).
         # ntfsfix clears the journal + dirty bit so ntfs-3g will RW-mount.
         # Safe here: VM is offline, Windows recovers on next boot anyway.
         "ntfsfix \"$WIN_PART\" >/tmp/ntfsfix.log 2>&1 || echo \"ntfsfix exit=$?\"\n"
+        # Fork issue #15 — ntfsfix names hibernation explicitly ("Windows is hibernated,
+        # refused to mount"), and the mount below then silently discards it. A saved kernel
+        # session is a guest's state; throwing it away is right here, but doing it without
+        # telling anybody is not.
+        "grep -qi 'hibernated' /tmp/ntfsfix.log && echo 'GUEST_WAS_HIBERNATED'\n"
         "mount -t ntfs-3g -o rw,recover,remove_hiberfile \"$WIN_PART\" \"$WIN_MNT\" || "
         "{ echo 'NTFS_MOUNT_FAILED'; cat /tmp/ntfsfix.log; exit 6; }\n"
         # Sanity check that we actually got RW
         "touch \"$WIN_MNT/.pegaprox-rw-test\" 2>/dev/null && rm -f \"$WIN_MNT/.pegaprox-rw-test\" || "
         "{ echo 'NTFS_NOT_RW'; exit 6; }\n"
+        # Fork issue #15 — the hibernation half stops here. The mount above carried
+        # `remove_hiberfile`, so by this line the saved kernel session is already gone and
+        # the guest will boot cold on whatever hardware it now has. The trap unwinds the
+        # mount and the loop device on the way out.
+        "[ \"$CLEAN_ONLY\" = 1 ] && { echo 'HIBERNATION_CLEARED'; exit 0; }\n"
         # Find Windows directory (case-sensitive on ntfs-3g)
         "WDIR=\"\"; for d in Windows WINDOWS windows; do "
         "[ -d \"$WIN_MNT/$d/System32/config\" ] && { WDIR=\"$d\"; break; }; "
@@ -2352,12 +2441,18 @@ def _inject_virtio_drivers(pve_mgr, task):
         ")\n"
         "echo \"VER_NAME=$VER_NAME\"\n"
         "echo \"VER_BUILD=$VER_BUILD\"\n"
+        # Fork issue #15 — an out-of-support Windows accepts a narrower set of driver
+        # signatures than a current one, and a driver it rejects is not reported: it is
+        # simply not loaded, and the VM stops at 0xc0000428 naming viostor.sys. Which
+        # release a build may be driven by is decided in hyperv_drivers; this renders the
+        # refusal for the ISO that was actually chosen, and is empty whenever it fits.
+        + hyperv_drivers.guard_snippet(iso_path) +
         # NS May 2026 (#222) — pick subdir from actual VER_BUILD; some isos
         # ship Server 2025 vioscsi only under 2k25/, w11/ might be missing it.
         # Try multiple subdirs per driver; first hit wins.
         "case \"$VER_BUILD\" in\n"
-        "  26100|26200|26300|26400|26500) PRIMARY=\"2k25/amd64\"; FALLBACKS=\"w11/amd64\" ;;\n"
-        "  20348)                          PRIMARY=\"2k22/amd64\"; FALLBACKS=\"w11/amd64\" ;;\n"
+        "  26100|26200|26300|26400|26500) PRIMARY=\"2k25/amd64\"; FALLBACKS=\"2k22/amd64 w11/amd64\" ;;\n"
+        "  20348)                          PRIMARY=\"2k22/amd64\"; FALLBACKS=\"w11/amd64 2k19/amd64\" ;;\n"
         "  17763)                          PRIMARY=\"2k19/amd64\"; FALLBACKS=\"w10/amd64\" ;;\n"
         "  14393)                          PRIMARY=\"2k16/amd64\"; FALLBACKS=\"w10/amd64\" ;;\n"
         "  9600)                           PRIMARY=\"2k12R2/amd64\"; FALLBACKS=\"w8.1/amd64\" ;;\n"
@@ -2380,11 +2475,17 @@ def _inject_virtio_drivers(pve_mgr, task):
         "echo \"SUBDIR=$SUBDIR\"\n"
         # Copy SYS / INF / CAT for each driver — try PRIMARY first, then FALLBACKS
         "DRV_DEST=\"$WIN_MNT/$WDIR/System32/drivers\"\n"
-        "INF_DEST=\"$WIN_MNT/$WDIR/INF\"\n"
-        # Windows reads .cat from the catalogue store, not from beside the .sys. The
-        # GUID is the driver-package class store and is fixed.
-        "CAT_DEST=\"$WIN_MNT/$WDIR/System32/CatRoot/"
-        "{F750E6C3-38EE-11D1-85E5-00C04FC295EE}\"\n"
+        # Resolved rather than assumed: Windows spells this directory INF on some releases
+        # and Inf on others (Server 2012 R2 uses Inf, Server 2022 uses INF), and ntfs-3g,
+        # unlike Windows, is case-sensitive. Hard-coding one spelling silently dropped the
+        # .inf files on every release using the other - silently, because the copy below
+        # discards its own errors.
+        "INF_DEST=$(ls -d \"$WIN_MNT/$WDIR\"/[Ii][Nn][Ff] 2>/dev/null | head -1)\n"
+        "[ -n \"$INF_DEST\" ] || INF_DEST=\"$WIN_MNT/$WDIR/INF\"\n"
+        # A driver catalogue is read from the catalogue store, never from the directory
+        # holding the .sys file. The GUID names the store Windows keeps its own
+        # driver catalogues in and is the same on every supported version.
+        "CAT_DEST=\"$WIN_MNT/$WDIR/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}\"\n"
         "mkdir -p \"$INF_DEST\" \"$CAT_DEST\" 2>/dev/null||true\n"
         "COPIED=0\n"
         "for D in $DRIVERS; do "
@@ -2409,9 +2510,10 @@ def _inject_virtio_drivers(pve_mgr, task):
         # NS Apr 2026 — using python3-hivex (well-supported on Debian/Proxmox) instead of
         # hivexregedit which Debian's libhivex-bin doesn't ship.
         "SYSTEM_HIVE=\"$WIN_MNT/$WDIR/System32/config/SYSTEM\"\n"
-        "python3 - \"$SYSTEM_HIVE\" << 'PYEOF' || { echo 'HIVEX_MERGE_FAILED'; exit 9; }\n"
+        "python3 - \"$SYSTEM_HIVE\" \"$SUBDIR\" << 'PYEOF' || { echo 'HIVEX_MERGE_FAILED'; exit 9; }\n"
         "import sys, hivex\n"
-        "from hivex.hive_types import REG_DWORD, REG_SZ, REG_EXPAND_SZ\n"
+        "from hivex.hive_types import (REG_BINARY, REG_DWORD, REG_EXPAND_SZ,\n"
+        "                              REG_MULTI_SZ, REG_SZ)\n"
         "h = hivex.Hivex(sys.argv[1], write=True)\n"
         "def navigate(parent, parts):\n"
         "    n = parent\n"
@@ -2430,24 +2532,110 @@ def _inject_virtio_drivers(pve_mgr, task):
         "def set_expand_sz(node, key, val):\n"
         "    h.node_set_value(node, {'key': key, 't': REG_EXPAND_SZ,\n"
         "        'value': (val + '\\u0000').encode('utf-16-le')})\n"
+        "def set_binary(node, key, val):\n"
+        "    h.node_set_value(node, {'key': key, 't': REG_BINARY, 'value': val})\n"
+        "def set_multi_sz(node, key, values):\n"
+        "    blob = ''.join(v + '\\u0000' for v in values) + '\\u0000'\n"
+        "    h.node_set_value(node, {'key': key, 't': REG_MULTI_SZ,\n"
+        "        'value': blob.encode('utf-16-le')})\n"
         # NS May 2026 — only register drivers whose .sys actually got copied.
         # Setting Start=0 for a missing miniport bricks Windows boot
         # (BSOD INACCESSIBLE_BOOT_DEVICE before usermode), so we skip any
         # service whose backing file isn't present on the target FS.
-        "import os\n"
+        "import os, struct\n"
         "drv_root = os.path.dirname(sys.argv[1]) + '/../drivers'\n"
-        "have_viostor = os.path.exists(drv_root + '/viostor.sys')\n"
-        "have_vioscsi = os.path.exists(drv_root + '/vioscsi.sys')\n"
+        # A driver the loader will refuse must not be made boot-critical. winload checks a
+        # boot-start driver's signature before the kernel exists, stops with 0xc0000428 and
+        # the guest never starts -- strictly worse than leaving it on the controller it
+        # arrived on, which boots. Measured on Windows Server 2012 R2 against virtio-win
+        # 0.1.271: the boot manager names \Windows\system32\drivers\viostor.sys, and that
+        # file's certificate table holds only 'virtio-win / Red Hat Inc.'. Red Hat stopped
+        # getting the legacy variants signed through Microsoft once those Windows versions
+        # went out of support; 0.1.208 was the last release whose 2k12R2 drivers carried a
+        # cross-certificate at all, and 0.1.189 is the release to use for that version --
+        # its 2k12R2 drivers chain to Microsoft Code Verification Root and a guest built
+        # from them reaches its login screen on virtio-scsi. The 2k16 and newer variants
+        # are unaffected.
+        #
+        # Read from the file rather than guessed from the Windows version: an operator who
+        # supplies an older ISO for an old guest has a driver that does load, and a rule
+        # based on the build number would refuse it.
+        "_ACCEPTED_SIGNERS = (b'Microsoft Code Verification Root',\n"
+        "                     b'Microsoft Windows Third Party Component CA',\n"
+        "                     b'Microsoft Windows Hardware Compatibility Publisher')\n"
+        "def boot_signable(path):\n"
+        "    \"\"\"Whether the PE certificate table names a signer the loader accepts.\"\"\"\n"
+        "    try:\n"
+        "        with open(path, 'rb') as fh:\n"
+        "            data = fh.read()\n"
+        "        if data[:2] != b'MZ':\n"
+        "            return False\n"
+        "        pe = struct.unpack_from('<I', data, 0x3C)[0]\n"
+        "        if data[pe:pe + 2] != b'PE':\n"
+        "            return False\n"
+        "        optional = pe + 24\n"
+        "        magic = struct.unpack_from('<H', data, optional)[0]\n"
+        # The certificate table is data directory 4, and the directories start at a
+        # different offset for PE32+ than for PE32.
+        "        directories = optional + (112 if magic == 0x20B else 96)\n"
+        "        offset, size = struct.unpack_from('<II', data, directories + 32)\n"
+        "        if not offset or not size:\n"
+        "            return False\n"
+        "        blob = data[offset:offset + size]\n"
+        "    except Exception:\n"
+        "        return False\n"
+        "    return any(signer in blob for signer in _ACCEPTED_SIGNERS)\n"
+        "_present = {n: os.path.exists(drv_root + '/' + n + '.sys')\n"
+        "            for n in ('viostor', 'vioscsi')}\n"
+        "_signable = {n: (present and boot_signable(drv_root + '/' + n + '.sys'))\n"
+        "             for n, present in _present.items()}\n"
+        "for _name in ('viostor', 'vioscsi'):\n"
+        "    if _present[_name] and not _signable[_name]:\n"
+        "        print('BOOT_SIGNATURE_MISSING ' + _name)\n"
+        "have_viostor = _signable['viostor']\n"
+        "have_vioscsi = _signable['vioscsi']\n"
         "print(f'HIVEX have_viostor={have_viostor} have_vioscsi={have_vioscsi}')\n"
         "root = h.root()\n"
-        "cs = navigate(root, ['ControlSet001'])\n"
-        "services = navigate(cs, ['Services'])\n"
-        "control = navigate(cs, ['Control'])\n"
-        "cdb = navigate(control, ['CriticalDeviceDatabase'])\n"
+        "control_sets = [h.node_name(c) for c in h.node_children(root)\n"
+        "                if h.node_name(c).lower().startswith('controlset')\n"
+        "                and h.node_name(c)[len('controlset'):].isdigit()]\n"
+        "control_sets = control_sets or ['ControlSet001']\n"
+        "print('HIVEX control sets: ' + ', '.join(control_sets))\n"
         "_svcs = []\n"
-        "if have_viostor: _svcs.append(('viostor', 0x58, 'system32\\\\drivers\\\\viostor.sys'))\n"
-        "if have_vioscsi: _svcs.append(('vioscsi', 0x59, 'system32\\\\drivers\\\\vioscsi.sys'))\n"
-        "for svc, tag, img in _svcs:\n"
+        "if have_viostor: _svcs.append(('viostor', 0x58, 'system32\\\\drivers\\\\viostor.sys', 0x01))\n"
+        "if have_vioscsi: _svcs.append(('vioscsi', 0x59, 'system32\\\\drivers\\\\vioscsi.sys', 0x0A))\n"
+        "GUID = '{4D36E97B-E325-11CE-BFC1-08002BE10318}'\n"
+        # The same GUID as sixteen raw bytes, which is how the driver database stores it.
+        "GUID_BYTES = bytes.fromhex('7be9364d25e3ce11bfc108002be10318')\n"
+        # Per driver, the device IDs in the spelling Windows itself keeps them in. The
+        # transitional device answers with REV_00 and the modern one with REV_01, and a
+        # guest may present either depending on the machine type it was built with.
+        "_devices = {}\n"
+        "if have_viostor:\n"
+        "    _devices['viostor'] = ['VEN_1AF4&DEV_1001&REV_00', 'VEN_1AF4&DEV_1042&REV_01']\n"
+        "if have_vioscsi:\n"
+        "    _devices['vioscsi'] = ['VEN_1AF4&DEV_1004&REV_00', 'VEN_1AF4&DEV_1048&REV_01']\n"
+        "_pci = []\n"
+        "if have_viostor:\n"
+        "    _pci += [('pci#ven_1af4&dev_1001', 'viostor'),\n"
+        "             ('pci#ven_1af4&dev_1001&rev_00', 'viostor'),\n"
+        "             ('pci#ven_1af4&dev_1042&rev_01', 'viostor'),\n"
+        "             ('pci#ven_1af4&dev_1001&subsys_00021af4&rev_00', 'viostor')]\n"
+        "if have_vioscsi:\n"
+        "    _pci += [('pci#ven_1af4&dev_1004', 'vioscsi'),\n"
+        "             ('pci#ven_1af4&dev_1004&rev_00', 'vioscsi'),\n"
+        "             ('pci#ven_1af4&dev_1048&rev_01', 'vioscsi'),\n"
+        "             ('pci#ven_1af4&dev_1004&subsys_00081af4', 'vioscsi'),\n"
+        # The modern VirtIO SCSI id is 1048; 1041 is VirtIO NET and never matches this
+        # controller. vioscsi.inf lists exactly PCI\\VEN_1AF4&DEV_1004 and
+        # PCI\\VEN_1AF4&DEV_1048 as the hardware it supports.
+        "             ('pci#ven_1af4&dev_1048', 'vioscsi'),\n"
+        "             ('pci#ven_1af4&dev_1048&subsys_11001af4&rev_01', 'vioscsi')]\n"
+        "for cs_name in control_sets:\n"
+        "  cs = navigate(root, [cs_name])\n"
+        "  services = navigate(cs, ['Services'])\n"
+        "  cdb = navigate(navigate(cs, ['Control']), ['CriticalDeviceDatabase'])\n"
+        "  for svc, tag, img, bus_type in _svcs:\n"
         "    svc_node = navigate(services, [svc])\n"
         "    set_expand_sz(svc_node, 'ImagePath', img)\n"
         "    set_dword(svc_node, 'Type', 1)\n"
@@ -2456,22 +2644,67 @@ def _inject_virtio_drivers(pve_mgr, task):
         "    set_dword(svc_node, 'ErrorControl', 1)\n"
         "    set_dword(svc_node, 'Tag', tag)\n"
         "    params = navigate(svc_node, ['Parameters'])\n"
-        "    set_dword(params, 'BusType', 1)\n"
+        # The value differs per driver, and one value for both is wrong for one of them.
+        # The evidence is the driver's own INF, checked against every variant the virtio-win
+        # ISO ships, 2k8 through 2k25: viostor.inf writes 0x00000001 and vioscsi.inf writes
+        # 0x0000000A, without exception. Whether a guest boots depends on more than this
+        # value -- a self-signed driver is refused before it is ever consulted -- so this is
+        # a correctness fix against the INF, not a claim that it is sufficient on its own.
+        # A guest on VirtIO Block was never affected, which is why it went unnoticed.
+        "    set_dword(params, 'BusType', bus_type)\n"
+        "    set_dword(params, 'DmaRemappingCompatible', 0)\n"
         "    pnp = navigate(params, ['PnpInterface'])\n"
         "    set_dword(pnp, '5', 1)\n"
-        "GUID = '{4D36E97B-E325-11CE-BFC1-08002BE10318}'\n"
-        "_pci = []\n"
-        "if have_viostor:\n"
-        "    _pci += [('pci#ven_1af4&dev_1001', 'viostor'),\n"
-        "             ('pci#ven_1af4&dev_1001&subsys_00021af4&rev_00', 'viostor')]\n"
-        "if have_vioscsi:\n"
-        "    _pci += [('pci#ven_1af4&dev_1004', 'vioscsi'),\n"
-        "             ('pci#ven_1af4&dev_1004&subsys_00081af4', 'vioscsi'),\n"
-        "             ('pci#ven_1af4&dev_1041', 'vioscsi')]\n"
-        "for pci_id, svc in _pci:\n"
+        "  for pci_id, svc in _pci:\n"
         "    cd = navigate(cdb, [pci_id])\n"
         "    set_sz(cd, 'ClassGUID', GUID)\n"
         "    set_sz(cd, 'Service', svc)\n"
+        # Windows 8 and Server 2012 and everything after them do not read the
+        # CriticalDeviceDatabase any more. They bind a boot device through
+        # HKLM\SYSTEM\DriverDatabase, and a guest whose disk driver is only registered the
+        # old way loads the driver and then cannot attach it to the controller, which the
+        # kernel reports as INACCESSIBLE_BOOT_DEVICE. Measured on freshly installed Server
+        # 2016, 2022 and 2025, each with the service entry, the driver file and the
+        # CriticalDeviceDatabase all correct: all three opened the recovery environment,
+        # and all three reach the login screen once this is written. Server 2012 R2 never
+        # got that far - its driver carries no signature the loader accepts, which stops it
+        # at the boot manager before any of this is consulted. The database is written in
+        # the shape libguestfs writes it, which is the implementation this was read off.
+        #
+        # The old entries stay: a guest without a DriverDatabase branch - Windows 7 and
+        # Server 2008 R2 - still needs them, and on a newer guest they are simply unread.
+        "ddb = h.node_get_child(root, 'DriverDatabase')\n"
+        "if ddb is None:\n"
+        "    print('HIVEX no DriverDatabase - pre-Windows 8 guest, CriticalDeviceDatabase only')\n"
+        "else:\n"
+        # The package is named after this product, not after the driver, so it cannot
+        # collide with one the guest already has. A Server 2025 image was found carrying a
+        # virtio catalogue of its own, and an entry under the driver's real INF name would
+        # replace whatever that belongs to with something assembled here. libguestfs does
+        # the same for the same reason.
+        "    arch = 'x86' if sys.argv[2].lower().endswith('x86') else 'amd64'\n"
+        "    for svc, pci_ids in _devices.items():\n"
+        "        inf = 'pegaprox_' + svc + '.inf'\n"
+        "        label = inf + '_' + arch + '_0000000000000000'\n"
+        "        config = svc + '_conf'\n"
+        "        inf_files = navigate(ddb, ['DriverInfFiles', inf])\n"
+        "        set_multi_sz(inf_files, '', [label])\n"
+        "        set_sz(inf_files, 'Active', label)\n"
+        "        set_multi_sz(inf_files, 'Configurations', [config])\n"
+        "        package = navigate(ddb, ['DriverPackages', label])\n"
+        # Windows-Kernel-Pnp on Windows 10 and Server 2016 refuses a package without this.
+        "        set_binary(package, 'Version',\n"
+        "                   b'\\x00\\xff\\x09\\x00\\x00\\x00\\x00\\x00'\n"
+        "                   + GUID_BYTES + bytes(24))\n"
+        "        configuration = navigate(package, ['Configurations', config])\n"
+        "        set_dword(configuration, 'ConfigFlags', 0)\n"
+        "        set_sz(configuration, 'Service', svc)\n"
+        "        for pci_id in pci_ids:\n"
+        "            set_binary(navigate(ddb, ['DeviceIds', 'PCI', pci_id]), inf,\n"
+        "                       b'\\x01\\xff\\x00\\x00')\n"
+        "            set_sz(navigate(package, ['Descriptors', 'PCI', pci_id]),\n"
+        "                   'Configuration', config)\n"
+        "        print('HIVEX DriverDatabase ' + svc + ': ' + ', '.join(pci_ids))\n"
         "h.commit(None)\n"
         "print('hivex commit OK')\n"
         "PYEOF\n"
@@ -2483,7 +2716,7 @@ def _inject_virtio_drivers(pve_mgr, task):
         # ran into "registry corrupt" because RunOnce executes with the
         # logged-in user's standard token (no elevation), even for admins.
         # SYSTEM service has full token, no UAC.
-        "PEGADIR=\"$WIN_MNT/$WDIR/../PegaProx\"\n"
+        "PEGADIR=\"$WIN_MNT/$WDIR/../qemu\"\n"
         "mkdir -p \"$PEGADIR\"\n"
         "MSI_OK=0\n"
         # Pick the right MSI by host arch — almost always x64 these days
@@ -2496,20 +2729,30 @@ def _inject_virtio_drivers(pve_mgr, task):
         "  fi; "
         "done\n"
         "[ \"$MSI_OK\" -eq 1 ] || echo 'MSI_MISSING (skipping bulk install)'\n"
-        # Register the one-shot service in the SYSTEM hive.
-        # ImagePath runs as LocalSystem at next boot; cmd /c chains:
-        #   msiexec /quiet → sc delete self → del MSI
-        # Service stays disabled-by-failure if msiexec doesn't exit 0,
-        # so user can investigate via msi.log. Self-deletion needs the
-        # service to have already returned, hence the trailing & chain.
+        # Fork patch #15 — the guest agent is not in virtio-win-gt-x64.msi, whatever the
+        # note above says. Checked against virtio-win 0.1.302: the driver MSI names
+        # vioscsi and blnsvr and never qemu-ga, which ships as guest-agent/qemu-ga-x86_64.msi
+        # of its own. Without it a migrated guest has drivers and no agent, and Proxmox
+        # cannot shut it down cleanly, freeze it for a backup or read its addresses.
+        "if [ -f \"$ISO_MNT/guest-agent/qemu-ga-x86_64.msi\" ]; then "
+        "  cp -f \"$ISO_MNT/guest-agent/qemu-ga-x86_64.msi\" \"$PEGADIR/qemu-ga-x86_64.msi\" "
+        "    && echo 'AGENT_STAGED qemu-ga-x86_64.msi'; "
+        "else echo 'AGENT_MISSING (no guest-agent/qemu-ga-x86_64.msi on the ISO)'; fi\n"
+        # Fork patch #15 — the first-boot install is a script of its own; see virtio_firstboot.
+        "if [ \"$MSI_OK\" -eq 1 ]; then " + _first_boot_script_staging('PEGADIR') + "fi\n"
+        # Register the one-shot service in the SYSTEM hive. It runs as LocalSystem at
+        # next boot and only launches firstboot.ps1, which installs, arms the boot
+        # drivers and deletes the service.
         "SYSTEM_HIVE=\"$WIN_MNT/$WDIR/System32/config/SYSTEM\"\n"
-        "python3 - \"$SYSTEM_HIVE\" \"$MSI_OK\" << 'PYSV' || { echo 'SVC_FAILED (non-fatal)'; }\n"
-        "import sys, hivex\n"
+        "python3 - \"$SYSTEM_HIVE\" \"$MSI_OK\" \"$PEGADIR\" << 'PYSV' || { echo 'SVC_FAILED (non-fatal)'; }\n"
+        "import os, sys, hivex\n"
         "from hivex.hive_types import REG_DWORD, REG_SZ, REG_EXPAND_SZ\n"
         "h = hivex.Hivex(sys.argv[1], write=True)\n"
         "msi_ok = int(sys.argv[2])\n"
         "if msi_ok == 0:\n"
         "    print('skipping service — no MSI'); sys.exit(0)\n"
+        "if not os.path.isfile(os.path.join(sys.argv[3], '" + FIRST_BOOT_SCRIPT_NAME + "')):\n"
+        "    print('skipping service — no first-boot script'); sys.exit(0)\n"
         "def fc(p, n): return h.node_get_child(p, n)\n"
         "def navigate(parent, parts):\n"
         "    n = parent\n"
@@ -2524,27 +2767,15 @@ def _inject_virtio_drivers(pve_mgr, task):
         "    h.node_set_value(node, {'key': k, 't': REG_SZ, 'value': (v + chr(0)).encode('utf-16-le')})\n"
         "def set_exp(node, k, v):\n"
         "    h.node_set_value(node, {'key': k, 't': REG_EXPAND_SZ, 'value': (v + chr(0)).encode('utf-16-le')})\n"
-        # NS May 2026 — after MSI install, also flip vioscsi/viostor to Start=0
-        # (boot-critical). MSI registers them as Start=3 (manual), which means
-        # if the user later switches scsihw to virtio-scsi-*, Windows boot
-        # loader can't find a boot-time storage driver → INACCESSIBLE_BOOT_DEVICE.
-        # Pre-arming Start=0 means the controller switch "just works" without
-        # any manual `sc config` step on the customer side.
-        "cmdline = (\n"
-        "    'cmd.exe /c '\n"
-        "    '(msiexec /i \"C:\\\\PegaProx\\\\virtio-win-gt-x64.msi\" '\n"
-        "    'ADDLOCAL=ALL /quiet /norestart /l*v \"C:\\\\PegaProx\\\\msi.log\") & '\n"
-        "    '(sc config vioscsi start= boot >> \"C:\\\\PegaProx\\\\bootarm.log\" 2>&1) & '\n"
-        "    '(sc config viostor start= boot >> \"C:\\\\PegaProx\\\\bootarm.log\" 2>&1) & '\n"
-        "    '(sc delete PegaProxFirstBoot >> \"C:\\\\PegaProx\\\\service.log\" 2>&1) & '\n"
-        "    '(del \"C:\\\\PegaProx\\\\virtio-win-gt-x64.msi\" 2>nul)'\n"
-        ")\n"
-        "for cs_name in ['ControlSet001','ControlSet002']:\n"
-        "    cs = fc(h.root(), cs_name)\n"
-        "    if cs is None: continue\n"
+        "cmdline = " + repr(FIRST_BOOT_SERVICE_COMMAND) + "\n"
+        # Same reasoning as the driver registration above: the set that will be active is
+        # not knowable here, so every set that exists gets the entry.
+        "for cs in [c for c in h.node_children(h.root())\n"
+        "           if h.node_name(c).lower().startswith('controlset')\n"
+        "           and h.node_name(c)[len('controlset'):].isdigit()]:\n"
         "    services = fc(cs, 'Services')\n"
         "    if services is None: continue\n"
-        "    svc = navigate(services, ['PegaProxFirstBoot'])\n"
+        "    svc = navigate(services, [" + repr(FIRST_BOOT_SERVICE) + "])\n"
         "    set_sz(svc, 'DisplayName', 'PegaProx First-Boot Driver Install')\n"
         "    set_dword(svc, 'Type', 0x10)\n"
         "    set_dword(svc, 'Start', 2)\n"
@@ -2558,7 +2789,7 @@ def _inject_virtio_drivers(pve_mgr, task):
     )
 
     sf = f"/tmp/v2p-virtio-inject-{task.proxmox_vmid}.sh"
-    _pve_node_exec(pve_mgr, node,
+    run_on_node(pve_mgr, node,
         f"cat > {sf} << 'EOFSCRIPT'\n{script}EOFSCRIPT\nchmod +x {sf}",
         timeout=15)
 
@@ -2588,20 +2819,76 @@ def _inject_virtio_drivers(pve_mgr, task):
         subdir_hint = '2k19/amd64'
 
     env_prefix = f"VIRTIO_SUBDIR={shlex.quote(subdir_hint)} " if subdir_hint else ""
-    rc, out, _ = _pve_node_exec(pve_mgr, node,
+    rc, out, _ = run_on_node(pve_mgr, node,
         f"{env_prefix}bash {sf} 2>&1; rc=$?; rm -f {sf}; exit $rc",
         timeout=300)
     out_str = str(out or '')
     # Surface the interesting lines — keep the log compact.
     # Most markers are once-per-run; COPIED/SKIP/COPY_FAILED are per-driver
     # so we log all of them (otherwise we'd hide which drivers actually staged).
-    _multi = ('COPIED ', 'SKIP ', 'COPY_FAILED ')
-    for marker in ['WIN_PART=', 'WDIR=', 'VER_NAME=', 'VER_BUILD=', 'SUBDIR_PRIMARY=', 'SUBDIR_FALLBACKS=', 'SUBDIR=', 'COPIED ', 'SKIP ', 'COPY_FAILED ', 'MSI_STAGED ', 'MSI_MISSING', 'SVC_REGISTERED', 'SVC_FAILED', 'INJECTION_OK']:
+    _multi = ('COPIED ', 'SKIP ', 'COPY_FAILED ', 'BOOT_SIGNATURE_MISSING ')
+    for marker in ['WIN_PART=', 'WINDOWS_PARTITION_NOT_IDENTIFIED', 'WDIR=', 'VER_NAME=', 'VER_BUILD=', 'SUBDIR_PRIMARY=', 'SUBDIR_FALLBACKS=', 'SUBDIR=', 'COPIED ', 'SKIP ', 'COPY_FAILED ', 'MSI_STAGED ', 'MSI_MISSING', 'AGENT_STAGED ', 'AGENT_MISSING', 'FIRSTBOOT_STAGED ', 'FIRSTBOOT_FAILED ', 'SVC_REGISTERED', 'SVC_FAILED', 'BOOT_SIGNATURE_MISSING ', 'HIVEX have_', 'INJECTION_OK']:
         for line in out_str.splitlines():
             if marker in line:
                 task.log(f"[VirtIO] {line.strip()}")
                 if marker not in _multi:
                     break
+
+    if 'GUEST_WAS_HIBERNATED' in out_str:
+        task.log('[VirtIO] The guest was hibernated or had shut down with Fast Startup. '
+                 'Its saved session has been discarded, so it will boot cold on the target '
+                 '— which is the only way it can come up on hardware it was not saved on. '
+                 'Anything that was open in that session is gone.')
+
+    # Fork issue #15 — the guard above stopped before a single file was copied, because
+    # this guest's Windows version may not be given the release that was chosen. Nothing
+    # was changed on the volume; the remedy is a different ISO, and the line says which.
+    for line in out_str.splitlines():
+        if 'REFUSED_DRIVER_RELEASE=' in line:
+            task.log('[VirtIO] ✗ ' + line.split('REFUSED_DRIVER_RELEASE=', 1)[1].strip())
+            task.log('[VirtIO]   No drivers were written; the VM stays on the hardware it '
+                     'was imported on and boots.')
+            return False
+
+    #: The caller needs to tell this apart from any other failure: the files are staged and
+    #: correct, and the remedy is a different driver release rather than a retry.
+    unsignable = sorted({line.strip().split()[-1] for line in out_str.splitlines()
+                         if line.strip().startswith('BOOT_SIGNATURE_MISSING ')})
+    if unsignable and 'vioscsi' in unsignable:
+        # Registering it anyway would produce a VM that stops at 0xc0000428 before the
+        # kernel starts. Reporting failure here leaves the guest on the controller it
+        # arrived on, which boots, with the drivers staged for a proper install.
+        named = ' and '.join(unsignable) if len(unsignable) < 3 else (
+            ', '.join(unsignable[:-1]) + ' and ' + unsignable[-1])
+        verb = 'carries' if len(unsignable) == 1 else 'carry'
+        task.log(f"[VirtIO] ✗ {named} {verb} no signature the Windows loader accepts for a "
+                 f"boot driver, so {'it was' if len(unsignable) == 1 else 'they were'} not "
+                 f"registered as one.")
+        task.log("[VirtIO]   This affects the driver variants for Windows versions that are "
+                 "out of support: virtio-win stopped having them signed through Microsoft "
+                 "after release 0.1.208.")
+        task.log("[VirtIO]   Point virtio_iso_path at a release that still carries a "
+                 "cross-signed driver for this guest — for Windows Server 2012 R2 that is "
+                 "virtio-win 0.1.189 — or leave the VM on its compatible controller and "
+                 "install the drivers from inside the guest.")
+        return False
+
+    #: Neither storage driver registered is not a success, whatever else was copied. The
+    #: run above counts every driver it staged, so a pass that found only the network card
+    #: in the chosen subdirectory would otherwise report a tick and hand over a VM with no
+    #: way to reach its disk.
+    if 'HIVEX have_viostor=False have_vioscsi=False' in out_str:
+        task.log("[VirtIO] ✗ Neither storage driver was registered, so the VM has no way to "
+                 "reach its disk on VirtIO hardware. The driver ISO has no usable variant "
+                 "for this guest's Windows version.")
+        return False
+
+    if clear_hibernation_only:
+        if rc == 0 and 'HIBERNATION_CLEARED' in out_str:
+            task.log('[VirtIO] ✓ Windows volume prepared; no drivers were installed.')
+            return True
+        task.log(f"[VirtIO] ✗ Could not prepare the Windows volume: rc={rc} {out_str[-300:]}")
+        return False
 
     if rc == 0 and 'INJECTION_OK' in out_str:
         task.log("[VirtIO] ✓ Drivers staged + registry merged.")
@@ -2626,6 +2913,19 @@ def _inject_virtio_drivers(pve_mgr, task):
         # so user can switch manually after a successful first boot.
         # If we ever want to re-enable: gate behind explicit task.config opt-in
         # AND verify the OS isn't Win11/Server2025-class.
+        #
+        # Fork patch #15 — that cause is now known, and it was not the boot path. A guest
+        # registered only in the CriticalDeviceDatabase cannot bind its controller at all
+        # on Windows 8 and newer, which is what produced the stop described above; the
+        # DriverDatabase entries written further up are what was missing, and with them
+        # Server 2016, 2022 and 2025 reach a login screen on virtio-scsi-single.
+        #
+        # The switch stays off all the same, and deliberately. Re-enabling it decides for
+        # an operator what their VM's hardware is, on the strength of a check this function
+        # cannot make from outside the guest, and the direction that wants it asks for it
+        # explicitly instead: the Hyper-V migration builds the VM on VirtIO up front when
+        # the wizard's box is ticked. Changing the VMware direction's behaviour belongs to
+        # whoever owns that direction.
         task.log("[VirtIO]   scsihw left untouched — switch manually after first boot if desired")
         return True
     task.log(f"[VirtIO] ✗ Injection failed (rc={rc}). Last 400 chars of output:")
