@@ -208,8 +208,8 @@ patches:
 # web/index.html.original + web/src/*.js) and conflicts on every backport
 # because upstream ships a bundle built from a different tree.
   # Upstream issue #713 (console drops, pveproxy logs "tlsv1 alert decode error") is
-  # still open. Deployed as an experiment before a fork issue exists, at the user's
-  # request; requested_by is filled in once the issue is written.
+  # still open. This patch did not end the drops (ssl-error-queue did); it stays for
+  # the write-splice fix and the session-end warnings, at the user's decision.
   - name: vnc-pve-write-timeout
     branch: fix/vnc-pve-write-timeout
     base: main
@@ -217,12 +217,11 @@ patches:
     upstream_pr:
     summary: 'Writes to pveproxy on the console relay get their own deadline instead of the 10 ms read slice, and the relay logs why a session ended'
     commit_message: 'fix(vnc): give writes to pveproxy their own deadline'
-    requested_by:
+    requested_by: 48
 
   # The real cause behind upstream #713: CPython leaves OpenSSL's per-thread error
   # queue dirty, and under gevent one client's failed TLS write is raised on another
-  # connection's read - usually the console relay's. Ships ahead of its fork issue at
-  # the user's request; requested_by is filled in once the issue is written.
+  # connection's read - usually the console relay's.
   - name: ssl-error-queue
     branch: fix/ssl-error-queue
     base: main
@@ -230,7 +229,7 @@ patches:
     upstream_pr:
     summary: "Clear the OpenSSL error queue before every TLS call, so one connection's failed write is never raised on another"
     commit_message: 'fix(ssl): stop one connection''s TLS error surfacing on another'
-    requested_by:
+    requested_by: 47
 
 generated_files:
   - path: web/index.html
