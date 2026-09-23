@@ -2145,6 +2145,61 @@ class TestAGuestWhoseDriverTheLoaderRefuses:
         assert 'Linux' not in note
         assert task.completion_problem
 
+    def _no_ntfs(self, monkeypatch, guest_windows):
+        def fake_injection(_target, view, node_exec=None):
+            view.log('[VirtIO] NO_NTFS_FOUND')
+            view.log('[VirtIO] ✗ Injection failed (rc=5). Last 400 chars of output:')
+            return False
+
+        monkeypatch.setattr('pegaprox.core.v2p._inject_virtio_drivers', fake_injection)
+        target = FakeTarget()
+        task = FakeTask()
+        task.config = {'hardware': 'virtio'}
+        task.target_node = 'node-a'
+        task.target_storage = 'vmstorage'
+        task.guest_windows = guest_windows
+        note = hyperv_xhm._inject_drivers_if_asked(task, target, 120, self._volumes(),
+                                                   {'generation': 2})
+        return task, target, note
+
+    def test_a_disk_without_ntfs_keeps_its_virtio_hardware(self, monkeypatch):
+        """Reported on a CentOS 7 import: the source could not tell what the guest was,
+        the injection found no NTFS partition, the run moved the VM to SATA, and the guest
+        no longer found its boot partition. A disk without NTFS holds no Windows."""
+        task, target, note = self._no_ntfs(monkeypatch, guest_windows=None)
+
+        assert not any('sata0' in payload for _, payload in target.posts)
+        assert 'no NTFS partition' in note
+        assert not getattr(task, 'completion_problem', None)
+        assert not getattr(task, 'target_unbootable', False)
+
+    def test_a_windows_guest_without_ntfs_is_still_moved_to_sata(self, monkeypatch):
+        """The source saw Windows on this VM. A disk that shows no NTFS contradicts that,
+        and SATA is the side that boots a Windows guest without drivers."""
+        task, target, _ = self._no_ntfs(monkeypatch, guest_windows=True)
+
+        assert any('sata0' in payload for _, payload in target.posts)
+        assert task.completion_problem
+
+    def test_a_guest_known_not_to_be_windows_is_not_injected_at_all(self, monkeypatch):
+        """Nothing to inject into, and running it only produced a failure to recover from."""
+        calls = []
+        monkeypatch.setattr('pegaprox.core.v2p._inject_virtio_drivers',
+                            lambda *a, **kw: calls.append(a) or False)
+        target = FakeTarget()
+        task = FakeTask()
+        task.config = {'hardware': 'virtio'}
+        task.target_node = 'node-a'
+        task.target_storage = 'vmstorage'
+        task.guest_windows = False
+        note = hyperv_xhm._inject_drivers_if_asked(task, target, 120, self._volumes(),
+                                                   {'generation': 2})
+
+        assert calls == []
+        assert not target.posts
+        assert 'VirtIO' in note
+        assert not getattr(task, 'completion_problem', None)
+
     def test_a_volume_that_cannot_be_re_attached_is_named(self, monkeypatch):
         """After the detach it is on no controller at all, so it is gone from the VM.
 

@@ -2833,7 +2833,10 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
     # Most markers are once-per-run; COPIED/SKIP/COPY_FAILED are per-driver
     # so we log all of them (otherwise we'd hide which drivers actually staged).
     _multi = ('COPIED ', 'SKIP ', 'COPY_FAILED ', 'BOOT_SIGNATURE_MISSING ')
-    for marker in ['WIN_PART=', 'WINDOWS_PARTITION_NOT_IDENTIFIED', 'WDIR=', 'VER_NAME=', 'VER_BUILD=', 'SUBDIR_PRIMARY=', 'SUBDIR_FALLBACKS=', 'SUBDIR=', 'COPIED ', 'SKIP ', 'COPY_FAILED ', 'MSI_STAGED ', 'MSI_MISSING', 'AGENT_STAGED ', 'AGENT_MISSING', 'FIRSTBOOT_STAGED ', 'FIRSTBOOT_FAILED ', 'SVC_REGISTERED', 'SVC_FAILED', 'BOOT_SIGNATURE_MISSING ', 'HIVEX have_', 'INJECTION_OK']:
+    # Fork issue #15 — NO_NTFS_FOUND is followed by the partition listing, which pushes it
+    # out of the 400-character tail logged on failure; a Linux guest then read as a
+    # failed injection instead of as a disk without Windows.
+    for marker in ['NO_NTFS_FOUND', 'WIN_PART=', 'WINDOWS_PARTITION_NOT_IDENTIFIED', 'WDIR=', 'VER_NAME=', 'VER_BUILD=', 'SUBDIR_PRIMARY=', 'SUBDIR_FALLBACKS=', 'SUBDIR=', 'COPIED ', 'SKIP ', 'COPY_FAILED ', 'MSI_STAGED ', 'MSI_MISSING', 'AGENT_STAGED ', 'AGENT_MISSING', 'FIRSTBOOT_STAGED ', 'FIRSTBOOT_FAILED ', 'SVC_REGISTERED', 'SVC_FAILED', 'BOOT_SIGNATURE_MISSING ', 'HIVEX have_', 'INJECTION_OK']:
         for line in out_str.splitlines():
             if marker in line:
                 task.log(f"[VirtIO] {line.strip()}")
