@@ -141,7 +141,14 @@ def update_vmware_server(vmware_id):
             return jsonify({
                 'error': 'Re-enter the password when changing the VMware host or port.'}), 400
         credentials_preserved = True
-        if _pw == '********' and vmware_id in vmware_managers:
+        # Hand the in-memory manager the credential it is keeping. save_vmware_server
+        # falls back to the stored row either way, but VMwareManager is rebuilt from
+        # `data` a few lines down and then reconnected — without this it comes up with an
+        # empty password and the live connection stays broken until a restart, while the
+        # row it was built from still holds the secret. Pre-dates the omitted/empty arm;
+        # it only ever hydrated the ******** spelling. Host changes returned 400 above,
+        # so this can only ever re-supply a credential to the destination it already had.
+        if vmware_id in vmware_managers:
             data['password'] = vmware_managers[vmware_id].password
 
     save_vmware_server(vmware_id, data)
