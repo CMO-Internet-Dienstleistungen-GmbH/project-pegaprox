@@ -1281,8 +1281,19 @@ def _within_token_role(user: dict, permission: str) -> bool:
     eff = user.get('effective_role')
     if not eff or eff == user.get('role'):
         return True
-    allowed = get_role_permissions_for_user({'role': eff, 'tenant_id': user.get('tenant_id')},
-                                            user.get('tenant_id'))
+    # MK Sep 2026 — resolve a CUSTOM effective_role the same way everything else does. This
+    # asked get_role_permissions_for_user for the caller's own tenant, while
+    # get_user_permissions asks _tenant_defining_role first; for a token minted with a
+    # tenant custom role whose holder sits in the default tenant the two then disagreed
+    # outright. Measured: the permission list resolved 'ops' to vm.view/vm.start/vm.config
+    # while this ceiling resolved it to nothing, so the route gate said yes and the object
+    # gate said no to every per-VM operation — a custom-role token could touch no guest at
+    # all. Fails closed, so it read as "tokens are broken" rather than as a hole, but the
+    # two must give one answer. The owner ceiling still applies on top (_token_owner_capped
+    # in get_user_permissions), so this cannot lift a token above the account that minted it.
+    _tid = user.get('tenant_id')
+    allowed = get_role_permissions_for_user({'role': eff, 'tenant_id': _tid},
+                                            _tenant_defining_role(eff, _tid))
     return permission in (allowed or [])
 
 
