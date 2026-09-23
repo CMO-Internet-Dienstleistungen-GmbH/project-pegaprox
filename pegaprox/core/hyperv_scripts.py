@@ -354,6 +354,7 @@ if ($vm.State -ne 'Off') {
 foreach ($d in @(Get-VMHardDiskDrive -VM $vm)) {
     $entry = [ordered]@{
         Path = $d.Path; Mounted = $false; Error = ''; AttachedAfter = $null; Volumes = @()
+        Partitions = @()
     }
     try {
         if ((Get-VHD -Path $d.Path -ErrorAction Stop).Attached) {
@@ -371,6 +372,15 @@ foreach ($d in @(Get-VMHardDiskDrive -VM $vm)) {
         $mounted = Mount-VHD -Path $d.Path -ReadOnly -Passthru -ErrorAction Stop
         $entry.Mounted = $true
         Start-Sleep -Seconds 2
+        # The partition types, which Windows reads on any disk: a Linux guest's XFS, ext4
+        # or LVM carries no volume Windows can open, but its partitions say what they are.
+        foreach ($part in @($mounted | Get-Disk | Get-Partition)) {
+            $mbr = 0
+            if ($null -ne $part.MbrType) { $mbr = [int]$part.MbrType }
+            $entry.Partitions += [pscustomobject]@{
+                GptType = "$($part.GptType)"; MbrType = $mbr; Size = [int64]$part.Size
+            }
+        }
         foreach ($vol in ($mounted | Get-Disk | Get-Partition | Get-Volume)) {
             $root = if ($vol.DriveLetter) { "$($vol.DriveLetter):" } else { "$($vol.Path)".TrimEnd('\') }
             $row = [ordered]@{

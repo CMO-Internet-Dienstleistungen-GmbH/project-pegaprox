@@ -170,9 +170,15 @@ def normalise_disk_inspection(raw: dict) -> dict:
                 'revision': vol.get('UBR') or '',
                 'display_version': vol.get('DisplayVersion') or '',
             })
+        partitions = [{
+            'gpt_type': str(part.get('GptType') or '').strip('{}').lower(),
+            'mbr_type': int(part.get('MbrType') or 0),
+            'size': int(part.get('Size') or 0),
+        } for part in (entry.get('Partitions') or [])]
         disks.append({
             'path': entry.get('Path') or '',
             'mounted': bool(entry.get('Mounted')),
+            'partitions': partitions,
             'error': entry.get('Error') or '',
             'attached_after': entry.get('AttachedAfter'),
             'volumes': volumes,

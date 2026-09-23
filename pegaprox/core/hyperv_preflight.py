@@ -501,11 +501,18 @@ def check_bitlocker(bitlocker_state: str | None, vtpm_enabled: bool | None) -> F
 
 
 def check_virtio_drivers(driver_state: str | None, controller: str,
-                         drivers_injected: bool = False) -> Finding:
+                         drivers_injected: bool = False,
+                         linux_conversion: bool = False) -> Finding:
     """A Windows guest without VirtIO drivers will not see a VirtIO disk."""
     if controller not in ('virtio', 'scsi'):
         return Finding('virtio_drivers', OK,
                        f'The target uses a {controller} controller, which needs no VirtIO driver.')
+    if linux_conversion:
+        return Finding('virtio_drivers', OK,
+                       'virt-v2v prepares the guest for VirtIO before the VM is started.',
+                       'Should the conversion fail, the VM is not started and the migration '
+                       'log says why: a guest prepared on Hyper-V does not find its disk on '
+                       'SATA either.')
     if driver_state == 'present':
         return Finding('virtio_drivers', OK, 'VirtIO drivers are reported as present in the guest.')
     if drivers_injected:
@@ -621,7 +628,8 @@ def run_preflight(vm: dict, target: dict, options: dict | None = None) -> Prefli
     # Absent when the caller could not ask; each check says so rather than passing.
     images = options.get('guest_images')
     injecting = bool(options.get('drivers_injected'))
-    report.add(check_guest_windows(images, injecting))
+    report.add(check_guest_windows(images, injecting,
+                                   linux=options.get('drivers') == 'linux'))
     report.add(check_driver_release(images, options.get('virtio_iso'), injecting))
     report.add(check_guest_architecture(images, injecting))
     report.add(check_disk_in_use(images))
@@ -629,9 +637,10 @@ def run_preflight(vm: dict, target: dict, options: dict | None = None) -> Prefli
     # What is inside the disks. Everything here is invisible from outside them and every
     # one of these findings is a migration that fails late — after the copy, on the target.
     inspection = options.get('disk_inspection')
+    report.add(check_preparation(images, inspection, options.get('drivers')))
     report.add(check_guest_registry(inspection, injecting))
     report.add(check_guest_hibernated(inspection))
-    report.add(check_guest_filesystem(inspection))
+    report.add(check_guest_filesystem(inspection, linux=options.get('drivers') == 'linux'))
     report.add(check_inspection_released_the_disks(inspection))
 
     disks = vm.get('disks') or []
@@ -659,7 +668,8 @@ def run_preflight(vm: dict, target: dict, options: dict | None = None) -> Prefli
     # the same document.
     report.add(check_virtio_drivers(vm.get('virtio_driver_state'),
                                     options.get('controller') or DEFAULT_TARGET_CONTROLLER,
-                                    bool(options.get('drivers_injected'))))
+                                    bool(options.get('drivers_injected')),
+                                    linux_conversion=options.get('drivers') == 'linux'))
     report.add(check_source_file_access(options.get('reachable_paths') or {},
                                        probed=options.get('source_access_probed', True),
                                        host_check=options.get('host_transfer_check')))
@@ -728,13 +738,21 @@ def windows_disk(images: list[dict] | None) -> dict | None:
     return None
 
 
-def check_guest_windows(images: list[dict] | None, injecting: bool = True) -> Finding:
+def check_guest_windows(images: list[dict] | None, injecting: bool = True,
+                        linux: bool = False) -> Finding:
     """Which Windows is on this VM, read off the disk without starting it.
 
     Not a formality: the answer decides which virtio-win release may be injected, and an
     out-of-support Windows refuses drivers from a newer one *silently* — the boot manager
     then stops at 0xc0000428 and the migration reads as a failed conversion.
+
+    With the Linux preparation none of that applies, and "no Windows found" is the answer
+    that choice expects; `check_preparation` is what warns when Windows is found after all.
     """
+    if linux and not windows_disk(images or []):
+        return Finding('guest_windows', OK,
+                       'No Windows installation on the disks, as the Linux preparation '
+                       'expects.')
     if not images:
         # Nothing was read. That is only worth a warning where the answer decides
         # something: an import that injects no drivers does not care which Windows this
@@ -820,6 +838,60 @@ def inspected_volumes(inspection: dict | None) -> list[dict]:
             for vol in (disk.get('volumes') or [])]
 
 
+#: Partition types only Linux uses: filesystem data, LVM, swap and software RAID, as GPT
+#: type GUIDs and as MBR type bytes. Windows reads these on any disk, including one whose
+#: filesystems it cannot open, which is the only kind of evidence a Hyper-V host can give
+#: about a Linux guest before it is copied.
+LINUX_GPT_TYPES = frozenset({
+    '0fc63daf-8483-4772-8e79-3d69d8477de4',   # Linux filesystem data
+    'e6d6d379-f507-44c2-a23c-238f2a3df928',   # Linux LVM
+    '0657fd6d-a4ab-43c4-84e5-0933c84b4f4f',   # Linux swap
+    'a19d880f-05fc-4d3b-a006-743f0f84911e',   # Linux RAID
+    '4f68bce3-e8cd-4db1-96e7-fbcaf984b709',   # Linux root (x86-64)
+    'bc13c2ff-59e6-4262-a352-b275fd6f7172',   # Linux extended boot
+})
+LINUX_MBR_TYPES = frozenset({0x83, 0x8E, 0x82, 0xFD})
+
+
+def linux_partitions(inspection: dict | None) -> bool:
+    """Whether any inspected disk carries a partition only Linux uses."""
+    for disk in ((inspection or {}).get('disks') or []):
+        for part in (disk.get('partitions') or []):
+            if (part.get('gpt_type') in LINUX_GPT_TYPES
+                    or int(part.get('mbr_type') or 0) in LINUX_MBR_TYPES):
+                return True
+    return False
+
+
+def check_preparation(images: list[dict] | None, inspection: dict | None,
+                      drivers: str | None) -> Finding:
+    """Does the chosen VirtIO preparation fit the guest on the disks?
+
+    Each preparation works for one kind of guest only. The Windows one writes into a
+    registry a Linux guest does not have, and leaves its initramfs as Hyper-V built it;
+    the Linux one does not install Windows drivers. Asked here, because the wrong choice
+    only shows once the copy is done and the VM does not find its disk.
+    """
+    found_windows = bool(windows_disk(images or [])) or any(
+        v.get('windows') for v in inspected_volumes(inspection))
+    found_linux = linux_partitions(inspection)
+    if drivers == 'windows' and found_linux and not found_windows:
+        return Finding('preparation', WARNING,
+                       'The Windows preparation is chosen, but the disks carry Linux '
+                       'partitions and no Windows.',
+                       'Choose "Linux" so the guest\'s initramfs is rebuilt for VirtIO.')
+    if drivers == 'linux' and found_windows:
+        return Finding('preparation', WARNING,
+                       'The Linux preparation is chosen, but Windows was found on the disks.',
+                       'Choose "Windows" so the VirtIO drivers are written in.')
+    if drivers == 'linux':
+        return Finding('preparation', OK,
+                       'virt-v2v rebuilds the guest\'s initramfs and boot configuration for '
+                       'VirtIO on the target node before the VM is started.',
+                       'PegaProx installs virt-v2v on the node when it is missing.')
+    return Finding('preparation', OK, 'The chosen preparation fits what the disks show.')
+
+
 def check_guest_hibernated(inspection: dict | None) -> Finding:
     """Did this guest hibernate, or shut down with Fast Startup?
 
@@ -854,18 +926,27 @@ def check_guest_hibernated(inspection: dict | None) -> Finding:
                    'hybrid shutdown) and migrate afterwards.')
 
 
-def check_guest_filesystem(inspection: dict | None) -> Finding:
+def check_guest_filesystem(inspection: dict | None, linux: bool = False) -> Finding:
     """Was every volume dismounted cleanly?
 
     A dirty NTFS is one Windows intends to check on its next boot. Copying it copies the
     condition, and the driver injection then edits registry hives with unreplayed
     transaction logs — which hivex refuses outright with "Operation not supported".
+
+    On a Linux guest the only volumes Windows can open are its FAT partitions, the EFI
+    system partition above all, and Linux leaves their dirty flag set routinely. No registry
+    is edited on that path, so the flag decides nothing there.
     """
     volumes = inspected_volumes(inspection)
     if not volumes:
         return Finding('guest_filesystem', OK, 'The file systems were not inspected.')
 
     dirty = [v for v in volumes if v.get('dirty')]
+    if linux and not any(v.get('windows') for v in volumes):
+        return Finding('guest_filesystem', OK,
+                       (f'{len(dirty)} FAT volume(s) carry a dirty flag; the Linux '
+                        f'preparation edits no registry, so it does not matter here.')
+                       if dirty else 'Every volume was dismounted cleanly.')
     if not dirty:
         unknown = [v for v in volumes if v.get('dirty') is None]
         if unknown and len(unknown) == len(volumes):

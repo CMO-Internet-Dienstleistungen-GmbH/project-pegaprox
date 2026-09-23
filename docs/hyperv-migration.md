@@ -108,13 +108,26 @@ choosing a VM out of a list; it is not evidence about a disk. See
 ## The order of a migration
 
 1. **Prepare the guest — but not with drivers.** Nothing has to be installed
-   inside the guest before a migration. The import writes the VirtIO drivers
-   into the copied disk itself, before anything starts the VM, so a Windows
-   guest comes up on VirtIO SCSI without having been touched on the Hyper-V
-   side. Clearing that box in the wizard puts the VM on hardware every guest
-   already has drivers for instead, and the switch to VirtIO is then a step of
-   its own afterwards (see *After the import*). Preparing still means the steps
-   below: shut it down, and remove its checkpoints.
+   inside the guest before a migration. The import prepares the copied disk for
+   VirtIO itself, before anything starts the VM, and the wizard offers how:
+   - **Windows** writes the VirtIO drivers from a virtio-win ISO into the guest's
+     registry, so the guest comes up on VirtIO SCSI without having been touched
+     on the Hyper-V side.
+   - **Linux** runs `virt-v2v-in-place` on the target node. A Linux guest that
+     ran on Hyper-V boots from an initramfs built for `hv_storvsc`; its kernel
+     has the VirtIO modules, but that image does not load them, so it finds its
+     root device on neither VirtIO nor SATA. virt-v2v rebuilds the initramfs with
+     the guest's own tools, adjusts the boot loader and relabels for SELinux. It
+     also lifts the RHEL-family default that switches off `guest-exec` in
+     `/etc/sysconfig/qemu-ga`. See `adr/0008-a-linux-guest-is-prepared-with-virt-v2v.md`.
+   - **No** builds the VM on hardware every guest already has drivers for, and
+     the switch to VirtIO is then a step of its own afterwards (see *After the
+     import*).
+
+   The choice is preselected from the OS type the disks show — Windows from the
+   image, Linux from partition types only Linux uses — and follows the OS type
+   field whenever that is changed. Preparing still means the steps below: shut it
+   down, and remove its checkpoints.
 2. **Shut the VM down.** This is an offline migration. A running VM's disks are
    being written to while they are read, and the copy would be a crash image of
    an unknown moment.
