@@ -2119,12 +2119,12 @@ class TestAGuestWhoseDriverTheLoaderRefuses:
         return task, target, note
 
     def test_a_guest_that_is_not_windows_keeps_its_virtio_hardware(self, monkeypatch):
-        """A Linux guest has VirtIO in its kernel and wants what it was given."""
+        """SATA is no rescue for a Linux guest, and the choice that prepares it is named."""
         task, target, note = self._no_windows_dir(monkeypatch, guest_windows=False)
 
         assert 'No Windows installation' in note
         assert not any('sata0' in payload for _, payload in target.posts)
-        assert not getattr(task, 'completion_problem', None)
+        assert '"Linux"' in task.completion_problem
 
     def test_a_windows_guest_whose_windows_was_not_found_is_moved_to_sata(self, monkeypatch):
         """Measured: a 100 GB Windows partition beside a 700 GB data partition. The
@@ -2170,7 +2170,9 @@ class TestAGuestWhoseDriverTheLoaderRefuses:
 
         assert not any('sata0' in payload for _, payload in target.posts)
         assert 'no NTFS partition' in note
-        assert not getattr(task, 'completion_problem', None)
+        # Not a clean success: nothing rebuilt this guest's initramfs. But not blocked
+        # either -- many Linux guests boot from VirtIO as they are.
+        assert '"Linux"' in task.completion_problem
         assert not getattr(task, 'target_unbootable', False)
 
     def test_a_windows_guest_without_ntfs_is_still_moved_to_sata(self, monkeypatch):
@@ -2198,7 +2200,7 @@ class TestAGuestWhoseDriverTheLoaderRefuses:
         assert calls == []
         assert not target.posts
         assert 'VirtIO' in note
-        assert not getattr(task, 'completion_problem', None)
+        assert '"Linux"' in task.completion_problem
 
     def test_a_volume_that_cannot_be_re_attached_is_named(self, monkeypatch):
         """After the detach it is on no controller at all, so it is gone from the VM.
