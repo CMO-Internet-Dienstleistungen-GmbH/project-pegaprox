@@ -219,6 +219,19 @@ patches:
     commit_message: 'fix(vnc): give writes to pveproxy their own deadline'
     requested_by:
 
+  # The real cause behind upstream #713: CPython leaves OpenSSL's per-thread error
+  # queue dirty, and under gevent one client's failed TLS write is raised on another
+  # connection's read - usually the console relay's. Ships ahead of its fork issue at
+  # the user's request; requested_by is filled in once the issue is written.
+  - name: ssl-error-queue
+    branch: fix/ssl-error-queue
+    base: main
+    kind: fix
+    upstream_pr:
+    summary: "Clear the OpenSSL error queue before every TLS call, so one connection's failed write is never raised on another"
+    commit_message: 'fix(ssl): stop one connection''s TLS error surfacing on another'
+    requested_by:
+
 generated_files:
   - path: web/index.html
     rebuild: web/Dev/build.sh
