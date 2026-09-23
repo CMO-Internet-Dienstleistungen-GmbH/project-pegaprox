@@ -85,6 +85,36 @@ Windows Server 2022 guest, that means the wrong driver variant is copied in.
 `ceph-common` is installed on demand as well, and only when the target storage
 is RBD.
 
+### For the Linux preparation: `virt-v2v`
+
+Only when a migration's VirtIO preparation is **Linux**, and only once per node:
+
+```
+apt-get install --no-install-recommends virt-v2v libguestfs-xfs
+```
+
+`virt-v2v-in-place` rebuilds the guest's initramfs and boot configuration inside
+a libguestfs appliance, so the guest's volume groups are never activated on the
+node. `libguestfs-xfs` is only a recommendation of libguestfs and is named
+because RHEL-family guests put `/boot` on XFS. Recommends stay off because
+`supermin` recommends a Debian kernel image.
+
+What the install does to the node, measured on PVE 9.2 (trixie):
+
+| | |
+|---|---|
+| Packages | 74–80 new, **none upgraded, none removed**. `pve-qemu-kvm` stays: it provides `qemu-system-x86` and `qemu-utils`, which libguestfs asks for without a version. |
+| `mdadm` | A hard dependency of `libguestfs0t64`. Its install writes `/etc/mdadm/mdadm.conf`, **rebuilds the initramfs of the newest kernel and regenerates the grub configuration** (through `proxmox-boot-tool` where the node uses it). On a node without md arrays the file lists none and nothing else changes; check with `grep -c '^ARRAY' /etc/mdadm/mdadm.conf`. |
+| Size | about 36 MB downloaded, 225 MB installed. |
+
+Because of the `mdadm` step, a fleet is better given the packages in a
+maintenance window, through configuration management, than on the first Linux
+migration. PegaProx installs them only when they are missing.
+
+The conversion runs as `LIBGUESTFS_BACKEND=direct`, since a PVE node carries
+`libvirt0` but no libvirt daemon. A Ceph volume on a storage without krbd is
+mapped with `rbd map` for the conversion and released again on every path.
+
 ## The VirtIO driver ISO
 
 Injection is opt-in. A migration without it produces a VM that needs its

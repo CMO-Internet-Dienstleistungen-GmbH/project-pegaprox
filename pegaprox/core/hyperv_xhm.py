@@ -27,7 +27,8 @@ import shlex
 import threading
 import time
 
-from pegaprox.core import hyperv_cpu, hyperv_db, hyperv_preflight, hyperv_transfer
+from pegaprox.core import (hyperv_cpu, hyperv_db, hyperv_linux, hyperv_preflight,
+                           hyperv_transfer)
 from pegaprox.core.hyperv import format_mac
 from pegaprox.core.hyperv_errors import HyperVError
 from pegaprox.core.hyperv_transfer import TransferError
@@ -78,27 +79,57 @@ DEFAULT_SCSIHW = 'virtio-scsi-single'
 DEFAULT_CONTROLLER = COMPATIBLE_CONTROLLER
 DEFAULT_HARDWARE = 'compatible'
 
+#: How the guest is prepared for VirtIO, as the wizard offers it. `windows` writes the
+#: drivers from a virtio-win ISO into the registry; `linux` rebuilds the guest's initramfs
+#: and boot configuration with virt-v2v; `none` prepares nothing and builds the VM on the
+#: compatible hardware instead.
+DRIVERS_NONE = 'none'
+DRIVERS_WINDOWS = 'windows'
+DRIVERS_LINUX = 'linux'
+DRIVER_MODES = (DRIVERS_NONE, DRIVERS_WINDOWS, DRIVERS_LINUX)
+
+
+def drivers_for_ostype(ostype) -> str:
+    """The preparation the wizard preselects for a Proxmox `ostype`.
+
+    Mirrored by `hvDriversForOstype` in web/src/hyperv.js; a test holds the two together.
+    Anything that is neither Windows nor Linux prepares nothing: the compatible hardware
+    is the one choice that does not depend on knowing what the guest is.
+    """
+    value = str(ostype or '').lower()
+    if value.startswith('win') or value in ('wxp', 'w2k', 'w2k3', 'w2k8', 'wvista'):
+        return DRIVERS_WINDOWS
+    if value in ('l24', 'l26'):
+        return DRIVERS_LINUX
+    return DRIVERS_NONE
+
 
 def target_hardware(config) -> dict:
-    """The disk controller and NIC model this migration will actually create.
+    """The disk controller, NIC model and guest preparation this migration will create.
 
     One function so the preflight warning and the created hardware cannot disagree: both
-    ask this. `hardware` is what the wizard offers; `controller` is still read for a caller
-    that names the controller directly.
+    ask this. `drivers` is what the wizard offers. `hardware` is what it sent before the
+    choice had a Linux entry, and what a recorded migration and the injection retry still
+    carry, so it keeps meaning what it meant: `virtio` is the Windows injection.
+    `controller` is still read for a caller that names the controller directly.
     """
-    choice = (config or {}).get('hardware') or DEFAULT_HARDWARE
-    if choice not in ('compatible', 'virtio'):
-        choice = DEFAULT_HARDWARE
-    named = (config or {}).get('controller')
-    if named in ('sata', 'scsi'):
+    config = config or {}
+    drivers = config.get('drivers')
+    if drivers not in DRIVER_MODES:
+        hardware = config.get('hardware') or DEFAULT_HARDWARE
+        drivers = DRIVERS_WINDOWS if hardware == 'virtio' else DRIVERS_NONE
+    named = config.get('controller')
+    if named == COMPATIBLE_CONTROLLER:
         # An explicitly named controller decides, and the NIC follows it rather than
         # staying on VirtIO while the disk is on SATA.
-        choice = 'virtio' if named == VIRTIO_CONTROLLER else 'compatible'
-    if choice == 'virtio':
-        return {'hardware': 'virtio', 'controller': VIRTIO_CONTROLLER,
-                'nic_model': VIRTIO_NIC_MODEL}
-    return {'hardware': 'compatible', 'controller': COMPATIBLE_CONTROLLER,
-            'nic_model': COMPATIBLE_NIC_MODEL}
+        drivers = DRIVERS_NONE
+    elif named == VIRTIO_CONTROLLER and drivers == DRIVERS_NONE:
+        drivers = DRIVERS_WINDOWS
+    if drivers == DRIVERS_NONE:
+        return {'hardware': 'compatible', 'drivers': DRIVERS_NONE,
+                'controller': COMPATIBLE_CONTROLLER, 'nic_model': COMPATIBLE_NIC_MODEL}
+    return {'hardware': 'virtio', 'drivers': drivers, 'controller': VIRTIO_CONTROLLER,
+            'nic_model': VIRTIO_NIC_MODEL}
 
 # Proxmox refuses more than this many of either, and a source with more needs a decision
 # rather than a silently truncated VM.
@@ -254,6 +285,10 @@ def plan_hyperv_to_pve(source_cluster_id, source_vmid, target_cluster_id) -> dic
         logger.warning('Could not inspect the disks of %s', source_vmid, exc_info=True)
         inspection = {}
 
+    # The preparation the wizard will preselect, so the plan's own findings describe the
+    # same import the form shows before anything in it has been touched.
+    plan_drivers = drivers_for_ostype(ostype_for(images, inspection))
+
     report = hyperv_preflight.run_preflight(
         detail,
         # Capacity is unknown until a storage is chosen, and the check says so. The plan is
@@ -262,8 +297,8 @@ def plan_hyperv_to_pve(source_cluster_id, source_vmid, target_cluster_id) -> dic
         # The controller the plan below announces, so the driver warning and the disk row
         # describe the same import. They disagreed before: the plan said 'sata' and the
         # warning asked for drivers the SATA path does not need.
-        # The plan is rendered before the operator has ticked anything, so it describes
-        # the default: the compatible controller, and therefore no injection.
+        # The plan is rendered before the operator has chosen anything, so it describes
+        # the preparation the wizard preselects for the OS type the disks showed.
         {'network_map': {}, 'source_access_probed': False,
          'guest_images': images,
          'disk_inspection': inspection,
@@ -271,8 +306,9 @@ def plan_hyperv_to_pve(source_cluster_id, source_vmid, target_cluster_id) -> dic
          # from a question nobody can answer here into a dated fact -- or into a blocker,
          # when the measurement failed.
          'host_transfer_check': getattr(source, 'transfer_check', None) or None,
-         'controller': DEFAULT_CONTROLLER,
-         'drivers_injected': DEFAULT_HARDWARE == 'virtio'})
+         'controller': target_hardware({'drivers': plan_drivers})['controller'],
+         'drivers': plan_drivers,
+         'drivers_injected': plan_drivers == DRIVERS_WINDOWS})
 
     from pegaprox.core.xhm import _get_pve_targets
 
@@ -329,7 +365,7 @@ def plan_hyperv_to_pve(source_cluster_id, source_vmid, target_cluster_id) -> dic
         # from the source. The wizard renders one field per entry: what the migration is
         # about to do has to be visible before it runs, not reconstructed from the result.
         'target_defaults': target_defaults(detail, source_vmid, _plan_next_vmid(target),
-                                           images),
+                                           images, inspection),
         # What the disks said. The wizard renders the guest's Windows version beside the
         # driver ISO field, so the release it has to pick is on screen with the choice.
         'guest_images': images,
@@ -1293,7 +1329,8 @@ def _preflight_gate(task, source, target, detail, guid):
          # have been converted, which is where Proxmox itself raises it.
          'target_name': chosen_target_name(task),
          'controller': target_hardware(task.config)['controller'],
-         'drivers_injected': target_hardware(task.config)['hardware'] == 'virtio',
+         'drivers': target_hardware(task.config)['drivers'],
+         'drivers_injected': target_hardware(task.config)['drivers'] == DRIVERS_WINDOWS,
          # The share is mounted and each file probed further down, before anything is
          # allocated. Claiming it was probed here would be a claim about a mount that does
          # not exist yet.
@@ -1903,15 +1940,17 @@ def _inject_drivers_if_asked(task, target, new_vmid, volumes, detail):
             _clear_hibernation(task, target, new_vmid)
         return None
 
+    if target_hardware(task.config)['drivers'] == DRIVERS_LINUX:
+        return _convert_linux_guest(task, target, new_vmid, volumes)
+
     known = getattr(task, 'guest_windows', None)
     if known is False:
         # The source already found no Windows on these disks, so there is nothing to inject
         # into. Running the injection anyway only produced a failure that the fallback below
         # read as "move to SATA" -- and a Linux guest whose initramfs carries no SATA driver
         # then stops at its boot partition.
-        return ('No Windows installation was found on this VM\'s disks by the checks '
-                'before the copy, so no drivers were injected. The VM keeps the VirtIO hardware it '
-                'was created with, which a Linux guest boots from.')
+        return _not_windows(task, 'No Windows installation was found on this VM\'s disks by '
+                                  'the checks before the copy, so no drivers were injected')
 
     view, ok = _run_offline_injection(task, target, new_vmid)
     if ok:
@@ -1922,9 +1961,8 @@ def _inject_drivers_if_asked(task, target, new_vmid, volumes, detail):
         # one. That is positive evidence on its own, which the pre-copy checks often cannot
         # give for a Linux guest: Windows mounts its partitions but reads no volume on XFS or
         # LVM. Moving such a guest to SATA is what left it unbootable.
-        return ('The disk carries no NTFS partition, so it holds no Windows installation and '
-                'no drivers were injected. The VM keeps the VirtIO hardware it was created '
-                'with, which a Linux guest boots from.')
+        return _not_windows(task, 'The disk carries no NTFS partition, so it holds no Windows '
+                                  'installation and no drivers were injected')
 
     # The VM was built on VirtIO because that is what was asked for, and the drivers that
     # would let it start from VirtIO are not in it. Whatever the reason, the machine as
@@ -1957,6 +1995,94 @@ def _inject_drivers_if_asked(task, target, new_vmid, volumes, detail):
     return (f'{reason}, and the VM could not be moved back to the compatible controller. '
             f'It will not start as configured - change the disk controller to SATA before '
             f'starting it.')
+
+
+def _not_windows(task, finding):
+    """The Windows preparation was chosen for a guest that is not Windows.
+
+    The VM keeps its VirtIO hardware: moving it to SATA is what left a Linux guest without
+    a driver for its disk. But nothing rebuilt that guest's initramfs either, and one built
+    on Hyper-V finds its disk on VirtIO no better than on SATA. So the run is not reported
+    as a clean success, and the note names the choice that would have prepared it.
+    """
+    task.completion_problem = (f'{finding}. If this is a Linux guest, it was not prepared '
+                               f'for VirtIO: choose "Linux" as the preparation')
+    return (f'{finding}. The VM keeps the VirtIO hardware it was created with. A Linux guest '
+            f'boots from it only if its initramfs already carries the VirtIO drivers; '
+            f'the "Linux" preparation rebuilds it with virt-v2v.')
+
+
+def _convert_linux_guest(task, target, new_vmid, volumes):
+    """Prepare a Linux guest for VirtIO with virt-v2v, on the node, before anything starts it.
+
+    There is no fallback onto the compatible controller here, and deliberately: a Linux
+    guest whose initramfs was built on Hyper-V has no SATA driver in it either, so moving
+    it to SATA only exchanges one controller it cannot boot from for another. And
+    virt-v2v's own contract for a failed in-place run is a disk "in an unknown, possibly
+    corrupted state". Either way the VM must not be started, and the log says why.
+
+    Returns None on success, or a line for the log.
+    """
+    ordered = sorted(volumes, key=lambda volume: volume['index'])
+    task.log('Preparing the Linux guest for VirtIO with virt-v2v. This runs on the node and '
+             'can take several minutes.')
+    began = time.monotonic()
+    try:
+        with _node_session(task, target, min_timeout=hyperv_linux.CONVERSION_TIMEOUT) \
+                as run_on_node:
+            if run_on_node is None:
+                from pegaprox.core.v2p import _pve_node_exec as run_on_node
+            reason = _run_linux_conversion(task, target, run_on_node, ordered, new_vmid)
+    except Exception as exc:                                   # noqa: BLE001
+        reason = f'The Linux conversion could not be run: {exc}'
+    task.log(f'The Linux conversion ended after {time.monotonic() - began:.0f} s.')
+    if reason is None:
+        return None
+    task.completion_problem = reason
+    task.target_unbootable = True
+    return (f'{reason}. The VM stays on VirtIO and was not started: a guest prepared on '
+            f'Hyper-V finds its disk on neither VirtIO nor SATA until its initramfs is '
+            f'rebuilt. Fix the cause and run virt-v2v-in-place on its disk, or migrate '
+            f'again.')
+
+
+def _run_linux_conversion(task, target, run_on_node, ordered, new_vmid):
+    """The steps of the Linux conversion. Returns None on success, or why it failed."""
+    node = task.target_node
+    rc, _, _ = run_on_node(target, node, hyperv_linux.TOOL_PROBE, timeout=30)
+    if rc != 0:
+        task.log(f'Installing {" ".join(hyperv_linux.PACKAGES)} on {node} (one-time). mdadm '
+                 f'comes with it and rebuilds the node\'s initramfs once.')
+        rc, out, _ = run_on_node(target, node, hyperv_linux.INSTALL_COMMAND, timeout=900)
+        if rc != 0:
+            return f'virt-v2v could not be installed on {node}: {str(out or "").strip()[-400:]}'
+
+    sources = []
+    for volume in ordered:
+        rc, out, err = run_on_node(target, node,
+                                   f'pvesm path {shlex.quote(volume["volume"])}', timeout=30)
+        path = str(out or '').strip().splitlines()[-1] if out else ''
+        if rc != 0 or not path:
+            return (f'Proxmox could not name a path for {volume["volume"]}: '
+                    f'{str(err or "").strip()[:200]}')
+        try:
+            sources.append(hyperv_linux.disk_source(path))
+        except hyperv_linux.UnsupportedVolume as exc:
+            return str(exc)
+
+    script = hyperv_linux.conversion_script(sources, guest_name=f'vm-{int(new_vmid)}')
+    rc, out, _ = run_on_node(target, node, script, timeout=hyperv_linux.CONVERSION_TIMEOUT)
+    result = hyperv_linux.read_result(out)
+    for line in result['lines']:
+        task.log(f'[virt-v2v] {line}')
+    if result['map_failed']:
+        return 'The Ceph volume could not be mapped on the node for the conversion'
+    if result['exit'] != 0 or rc != 0:
+        return (f'virt-v2v-in-place ended with exit code '
+                f'{result["exit"] if result["exit"] is not None else rc}')
+    task.log('The guest was prepared for VirtIO: initramfs, boot loader and SELinux labels '
+             'by virt-v2v, and guest-exec enabled for the QEMU guest agent.')
+    return None
 
 
 class _InjectionView:
@@ -2466,7 +2592,8 @@ TARGET_FIELDS = ('name', 'vmid', 'cores', 'sockets', 'memory_mb', 'ostype', 'bio
                  'machine')
 
 
-def target_defaults(detail, source_vmid, next_vmid=None, images=None) -> dict:
+def target_defaults(detail, source_vmid, next_vmid=None, images=None,
+                    inspection=None) -> dict:
     """What the wizard prefills the target fields with.
 
     Read off the source wherever the source has an answer. The two that it does not have
@@ -2486,7 +2613,10 @@ def target_defaults(detail, source_vmid, next_vmid=None, images=None) -> dict:
         # devices Proxmox gives the VM, and a Windows guest left on 'other' runs
         # measurably worse with nothing about it looking wrong. Still a field: a disk
         # nobody could read leaves it at 'other', and that is a suggestion, not a verdict.
-        'ostype': ostype_for(images),
+        'ostype': ostype_for(images, inspection),
+        # The VirtIO preparation that goes with that OS type. The wizard preselects it and
+        # moves it along when the OS type is changed; hvDriversForOstype mirrors the rule.
+        'drivers': drivers_for_ostype(ostype_for(images, inspection)),
         'bios': GENERATION_BIOS.get(generation, 'seabios'),
         'machine': GENERATION_MACHINE.get(generation, DEFAULT_MACHINE),
         'generation': generation,
@@ -2531,15 +2661,17 @@ _OSTYPE_BY_VERSION = {
 _WIN11_FROM_BUILD = 20348
 
 
-def ostype_for(images=None) -> str:
+def ostype_for(images=None, inspection=None) -> str:
     """The Proxmox `ostype` for the guest found on these disks, or 'other'.
 
-    'other' is what a disk nobody could read leaves behind, and it is also right for a
-    Linux guest — the two are not distinguished here, and neither is guessed at.
+    Windows is read off the image itself. A Linux guest is recognised by its partition
+    types, which the disk inspection reads while the VM is off; `l26` covers every kernel
+    from 2.6 on. 'other' is what a disk nobody could read leaves behind, and it is not
+    guessed past.
     """
     disk = hyperv_preflight.windows_disk(images or [])
     if not disk:
-        return 'other'
+        return 'l26' if hyperv_preflight.linux_partitions(inspection) else 'other'
 
     parts = str(disk.get('version') or '').split('.')
     try:
