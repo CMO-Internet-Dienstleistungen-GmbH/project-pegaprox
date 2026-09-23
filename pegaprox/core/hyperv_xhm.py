@@ -1903,18 +1903,28 @@ def _inject_drivers_if_asked(task, target, new_vmid, volumes, detail):
             _clear_hibernation(task, target, new_vmid)
         return None
 
+    known = getattr(task, 'guest_windows', None)
+    if known is False:
+        # The source already found no Windows on these disks, so there is nothing to inject
+        # into. Running the injection anyway only produced a failure that the fallback below
+        # read as "move to SATA" -- and a Linux guest whose initramfs carries no SATA driver
+        # then stops at its boot partition.
+        return ('No Windows installation was found on this VM\'s disks by the checks '
+                'before the copy, so no drivers were injected. The VM keeps the VirtIO hardware it '
+                'was created with, which a Linux guest boots from.')
+
     view, ok = _run_offline_injection(task, target, new_vmid)
     if ok:
         return None
 
-    known = getattr(task, 'guest_windows', None)
-    if view.guest_is_not_windows and known is False:
-        # Nothing was injected because there was nothing to inject into, and the source said
-        # the same before the copy. A Linux guest has VirtIO in its kernel, so the hardware
-        # it was given is the hardware it wants.
-        return ('No Windows installation was found on the disk, and the checks before the '
-                'copy found none either, so no drivers were injected. The VM keeps the '
-                'VirtIO hardware it was created with, which a Linux guest boots from.')
+    if view.no_ntfs_partition and not known:
+        # The disk has no NTFS partition at all, and Windows cannot boot from a disk without
+        # one. That is positive evidence on its own, which the pre-copy checks often cannot
+        # give for a Linux guest: Windows mounts its partitions but reads no volume on XFS or
+        # LVM. Moving such a guest to SATA is what left it unbootable.
+        return ('The disk carries no NTFS partition, so it holds no Windows installation and '
+                'no drivers were injected. The VM keeps the VirtIO hardware it was created '
+                'with, which a Linux guest boots from.')
 
     # The VM was built on VirtIO because that is what was asked for, and the drivers that
     # would let it start from VirtIO are not in it. Whatever the reason, the machine as
@@ -1970,6 +1980,9 @@ class _InjectionView:
         #: wrong partition was mounted. Which of the two is decided by the caller, against
         #: what the source said before the copy.
         self.guest_is_not_windows = False
+        #: The disk had no NTFS partition at all. Unlike NO_WINDOWS_DIR this cannot be the
+        #: wrong partition having been mounted: there was none that Windows could live on.
+        self.no_ntfs_partition = False
         #: The partition the injection mounted, for the message that has to name it.
         self.windows_partition = ''
         self._inner = inner
@@ -1985,6 +1998,8 @@ class _InjectionView:
             self.refused_for_signature = True
         if 'NO_WINDOWS_DIR' in text:
             self.guest_is_not_windows = True
+        if 'NO_NTFS_FOUND' in text:
+            self.no_ntfs_partition = True
         found = re.search(r'WIN_PART=(\S+)', text)
         if found:
             self.windows_partition = found.group(1)
