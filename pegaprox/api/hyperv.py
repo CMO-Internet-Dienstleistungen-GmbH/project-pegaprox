@@ -839,7 +839,10 @@ def hyperv_vm_preflight(cluster_id, vmid):
         'controller': target_hardware(data)['controller'],
         # Whether the migration will write the drivers in. Read from the same function, so
         # the box the operator ticked and the risk the list names cannot disagree.
-        'drivers_injected': target_hardware(data)['hardware'] == 'virtio',
+        'drivers_injected': target_hardware(data)['drivers'] == 'windows',
+        # Which preparation was chosen, so a Linux conversion is not reported as a VirtIO
+        # VM with no drivers, and a choice that does not fit the guest is named.
+        'drivers': target_hardware(data)['drivers'],
         # The file-share transport is not wired into this route. Saying so explicitly is
         # what keeps the result honest: the check becomes a warning somebody has to
         # confirm, rather than an OK that was never earned or a blocker on a VM that is
