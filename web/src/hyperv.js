@@ -148,6 +148,18 @@
             { value: 'solaris', label: 'Solaris' },
         ];
 
+        // Which VirtIO preparation goes with an `ostype`, mirrored from
+        // `hyperv_xhm.drivers_for_ostype`; a test holds the two together. Neither Windows
+        // nor Linux prepares nothing, and the VM is built on the compatible hardware.
+        function hvDriversForOstype(ostype) {
+            const value = String(ostype || '').toLowerCase();
+            if (value.startsWith('win') || ['wxp', 'w2k', 'w2k3', 'w2k8', 'wvista'].includes(value)) {
+                return 'windows';
+            }
+            if (value === 'l24' || value === 'l26') return 'linux';
+            return 'none';
+        }
+
         //: The SCSI controller models Proxmox offers. `virtio-scsi-single` is what the
         //: import suggests; an older guest may need a model it has a driver for.
         //: The CPU models the import offers, mirrored from `hyperv_cpu.CPU_TYPES`. The
@@ -382,6 +394,10 @@
                             // machine the wizard is not about to create, so the list can
                             // say "sata controller" while the box above it says VirtIO.
                             hardware: form.hardware || '',
+                            // Which preparation: the Windows driver injection, the Linux
+                            // conversion with virt-v2v, or none. The route derives the
+                            // hardware from it and checks that it fits the guest.
+                            drivers: form.drivers || '',
                             // Whether the copy is started at the end, so the warning about
                             // the original's hostname and MAC appears exactly when it applies.
                             start_after: form.start_after !== false,
