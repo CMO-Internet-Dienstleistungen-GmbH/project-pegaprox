@@ -52,6 +52,25 @@ GUEST_AGENT_UNLOCK = (
     "sed -i -e 's/^BLACKLIST_RPC=.*/BLACKLIST_RPC=/' "
     "-e 's/^FILTER_RPC_ARGS=.*/FILTER_RPC_ARGS=/' /etc/sysconfig/qemu-ga; fi")
 
+#: The name the SELinux module is installed under inside the guest. `semodule -l` lists it,
+#: and `semodule -r pegaprox_qemu_ga_permissive` takes it out again.
+SELINUX_MODULE = 'pegaprox_qemu_ga_permissive'
+
+#: Every guest in this estate lets the node run commands through the guest agent, and on a
+#: RHEL-family guest with SELinux enforcing the agent runs confined as virt_qemu_ga_t: it
+#: may not run `ip`, write under /etc or talk to NetworkManager, so guest-exec answers but
+#: cannot do its work. This marks that one domain permissive -- the rest of the guest stays
+#: enforcing, and denials are still logged -- which gives the agent the rights it has on
+#: every guest without SELinux. It is the module `semanage permissive -a` would write, as
+#: CIL through `semodule`, because semanage is not installed on a minimal RHEL 7.
+#: A guest with no SELinux configuration, or with SELinux disabled, is left alone. Any other
+#: failure fails the command, and with it the conversion. It runs before virt-v2v's own
+#: SELinux relabel.
+GUEST_AGENT_SELINUX = (
+    "if [ -f /etc/selinux/config ] && ! grep -qE '^SELINUX=disabled' /etc/selinux/config; "
+    f"then printf '(typepermissive virt_qemu_ga_t)\\n' > /tmp/{SELINUX_MODULE}.cil "
+    f"&& semodule -i /tmp/{SELINUX_MODULE}.cil && rm -f /tmp/{SELINUX_MODULE}.cil; fi")
+
 #: How long a conversion may take. Measured 191 s for 150 GiB, most of it spent marking
 #: unused areas; the ceiling leaves room for a guest several times that size.
 CONVERSION_TIMEOUT = 3600
@@ -161,7 +180,8 @@ def conversion_script(sources: list[dict], guest_name: str = 'guest') -> str:
             exprs.append((var, source['kind'], source['format']))
 
     common = (f'LIBGUESTFS_BACKEND=direct virt-v2v-in-place --block-driver {BLOCK_DRIVER} '
-              f'--run-command {shlex.quote(GUEST_AGENT_UNLOCK)}')
+              f'--run-command {shlex.quote(GUEST_AGENT_UNLOCK)} '
+              f'--run-command {shlex.quote(GUEST_AGENT_SELINUX)}')
     if len(exprs) == 1:
         var, _kind, fmt = exprs[0]
         lines.append(f'{common} -i disk -if {fmt} "${var}"')
@@ -195,9 +215,17 @@ def read_result(output: str) -> dict:
     if found:
         exit_code = int(found[-1])
     lines = [line.rstrip() for line in text.splitlines()
-             if line.startswith('[') or line.startswith('virt-v2v')
-             or line.startswith(MARK_MAP_FAILED) or line.startswith(MARK_UNMAP_FAILED)]
-    return {'exit': exit_code, 'lines': lines,
+             if line.startswith(('[', 'virt-v2v', MARK_MAP_FAILED, MARK_UNMAP_FAILED,
+                                 # What semodule said when the SELinux step failed.
+                                 # Measured: virt-v2v's own error line only repeats the
+                                 # command and "command exited with an error".
+                                 'semodule', 'libsemanage'))]
+    # virt-v2v names the failed command in its error line, and only this step's command
+    # carries the module's type rule.
+    selinux_failed = any(line.startswith('virt-v2v') and 'error:' in line
+                         and 'typepermissive virt_qemu_ga_t' in line
+                         for line in text.splitlines())
+    return {'exit': exit_code, 'lines': lines, 'selinux_failed': selinux_failed,
             'map_failed': MARK_MAP_FAILED in text,
             'left_mapped': re.findall(rf'^{MARK_UNMAP_FAILED} (\S+)', text, re.M),
             'uefi': 'requires UEFI on the target' in text}
