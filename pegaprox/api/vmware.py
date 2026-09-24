@@ -125,10 +125,18 @@ def update_vmware_server(vmware_id):
     # reused, so compare against it.
     _row = get_db().conn.cursor().execute(
         "SELECT host, port FROM vmware_servers WHERE id = ?", (vmware_id,)).fetchone()
-    if _row is not None:
-        if (data.get('host') and data.get('host') != _row['host']) or \
-           (data.get('port') and int(data.get('port', 443)) != int(_row['port'] or 443)):
-            host_changed = True
+    if _row is None:
+        # MK Sep 2026 — no stored row means we cannot tell what the destination is today,
+        # so we cannot tell whether this request moves it. The guard below only refuses a
+        # preserved credential when host_changed is True, so leaving it False on a failed
+        # read would wave an UNKNOWN destination through with the stored secret attached.
+        # "Cannot tell" has to mean "changed" here; the cost is re-typing the password.
+        # The 404 above only runs when the id is absent from vmware_managers, so a manager
+        # without a row reaches this line.
+        host_changed = True
+    elif (data.get('host') and data.get('host') != _row['host']) or \
+         (data.get('port') and int(data.get('port', 443)) != int(_row['port'] or 443)):
+        host_changed = True
 
     # Second, "keep the password" has three spellings and the guard knew one.
     # save_vmware_server writes `pass_encrypted or <the stored one>`, so an OMITTED or an
