@@ -1379,7 +1379,7 @@ def _guest_images_now(source, task):
 def _inspection_now(source, task):
     """What is inside the disks, read again at the moment of starting. Never raises."""
     try:
-        return source.inspect_disks(task.source_vmid)
+        return source.inspect_disks(task.source_vmid, max_age=0)
     except Exception:
         logger.warning('[XHM:%s] could not inspect the source disks', task.id,
                        exc_info=True)
