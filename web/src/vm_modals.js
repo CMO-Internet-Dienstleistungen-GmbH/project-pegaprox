@@ -1812,22 +1812,28 @@
 
             // Fetch VM hardware config
             useEffect(() => {
-                if (!isQemu) { setVmHwInfo(null); return; }
+                let cancelled = false;
+                setVmHwInfo(null);
+                if (!isQemu) return;
                 authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}/config`)
                     .then(r => r && r.ok ? r.json() : null)
                     .then(cfg => {
+                        if (cancelled) return;
                         if (!cfg) { setVmHwInfo(null); return; }
                         const raw = cfg.raw || cfg;
                         setVmHwInfo({
+                            vmid: vm.vmid,
                             machine: raw.machine || 'i440fx', bios: raw.bios || 'seabios',
                             cpu: raw.cpu || 'kvm64', scsihw: raw.scsihw || 'lsi',
                             cores: raw.cores || 1, sockets: raw.sockets || 1,
                             ostype: raw.ostype,
                             net: (() => { const nk = Object.keys(raw).find(k => k.startsWith('net')); return nk ? raw[nk].split(',')[0].split('=')[0] : null; })(),
                             agent: raw.agent,
+                            description: typeof raw.description === 'string' ? raw.description : '',
                         });
                     })
-                    .catch(() => setVmHwInfo(null));
+                    .catch(() => { if (!cancelled) setVmHwInfo(null); });
+                return () => { cancelled = true; };
             }, [vm.vmid, clusterId]);
 
             // Fetch HA status
@@ -2086,6 +2092,7 @@
                                             <tr><td>{t('qemuAgent') || 'QEMU Agent'}</td><td className="flex items-center gap-1.5">{isQemu && isRunning ? (guestInfo ? <><span className="w-1.5 h-1.5 rounded-full inline-block" style={{background: '#60b515'}}></span> {t('running')}</> : <><span className="w-1.5 h-1.5 rounded-full inline-block" style={{background: '#f54f47'}}></span> {t('notInstalled') || 'Not installed'}</>) : <span style={{color: '#728b9a'}}>-</span>}</td></tr>
                                             <tr><td>IP</td><td style={{fontFamily: 'monospace', fontSize: '12px'}}>{guestInfo?.ip_addresses?.join(', ') || '-'}</td></tr>
                                             {guestInfo?.hostname && <tr><td>{t('hostname')}</td><td>{guestInfo.hostname}</td></tr>}
+                                            {vmHwInfo?.vmid === vm.vmid && vmHwInfo.description?.trim() && <tr><td>{t('description')}</td><td className="whitespace-pre-wrap" style={{overflowWrap: 'anywhere'}}>{vmHwInfo.description}</td></tr>}
                                             {vm.tags && <tr><td>Tags</td><td><div className="flex flex-wrap gap-1">{(Array.isArray(vm.tags) ? vm.tags : vm.tags.split(';')).map(tag => (
                                                 <span key={tag} className="px-1.5 py-0.5 text-[11px]" style={{background: 'rgba(73, 175, 217, 0.12)', color: '#49afd9', border: '1px solid rgba(73, 175, 217, 0.25)'}}>{tag}</span>
                                             ))}</div></td></tr>}
