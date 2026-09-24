@@ -12989,13 +12989,16 @@
                 if (!hvIsHyperVPlan(xhmPlan)) { setHvPreflight(null); setHvPreflightBusy(false); return; }
                 let dropped = false;
                 setHvPreflightBusy(true);
-                hvRefreshPreflight({
-                    apiUrl: API_URL, authFetch, plan: xhmPlan,
-                    form: { ...xhmForm, hardware: xhmForm.drivers === 'none' ? 'compatible' : 'virtio' },
-                })
-                    .then(report => { if (!dropped && report) setHvPreflight(report); })
-                    .finally(() => { if (!dropped) setHvPreflightBusy(false); });
-                return () => { dropped = true; };
+                // Asked once the form has stopped changing, not once per keystroke.
+                const timer = setTimeout(() => {
+                    hvRefreshPreflight({
+                        apiUrl: API_URL, authFetch, plan: xhmPlan,
+                        form: { ...xhmForm, hardware: xhmForm.drivers === 'none' ? 'compatible' : 'virtio' },
+                    })
+                        .then(report => { if (!dropped && report) setHvPreflight(report); })
+                        .finally(() => { if (!dropped) setHvPreflightBusy(false); });
+                }, HV_PREFLIGHT_DEBOUNCE_MS);
+                return () => { dropped = true; clearTimeout(timer); };
             }, [xhmPlan, xhmForm.target_node, xhmForm.target_storage,
                 // The name is checked by the preflight, because Proxmox validates it as a
                 // DNS name and says so only when it creates the VM — which happens after

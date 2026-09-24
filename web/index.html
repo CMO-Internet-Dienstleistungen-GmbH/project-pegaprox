@@ -6319,7 +6319,10 @@ function hvGuestBuild(plan){const disk=(plan?.guest_images||[]).find(i=>i.window
 function hvGuestVersion(plan){const volume=(plan?.disk_inspection?.disks||[]).flatMap(d=>d.volumes||[]).find(v=>v.windows&&v.hive_readable&&v.product_name);if(volume){const revision=volume.revision?`.${volume.revision}`:'';return`${volume.product_name} (Build ${volume.build}${revision})`;}const disk=(plan?.guest_images||[]).find(i=>i.windows);return disk?`Windows ${disk.version}`:'';}// ───────────────────────────────────────────────
 // Preflight
 // ───────────────────────────────────────────────
-const HV_SEVERITY_STYLE={blocking:{dot:'bg-red-400',text:'text-red-400',box:'border-red-500/30 bg-red-500/5'},warning:{dot:'bg-amber-400',text:'text-amber-400',box:'border-yellow-500/30 bg-yellow-500/10'},ok:{dot:'bg-green-400',text:'text-green-400',box:'border-proxmox-border bg-proxmox-dark/40'}};// Reading order: what stops the migration first, then what has to be confirmed,
+// How long the wizard waits after the last change before it asks the preflight
+// again. Typing a name is one change per key, and each question used to reach the
+// Hyper-V host; the answer is only wanted for what the operator stopped at.
+const HV_PREFLIGHT_DEBOUNCE_MS=500;const HV_SEVERITY_STYLE={blocking:{dot:'bg-red-400',text:'text-red-400',box:'border-red-500/30 bg-red-500/5'},warning:{dot:'bg-amber-400',text:'text-amber-400',box:'border-yellow-500/30 bg-yellow-500/10'},ok:{dot:'bg-green-400',text:'text-green-400',box:'border-proxmox-border bg-proxmox-dark/40'}};// Reading order: what stops the migration first, then what has to be confirmed,
 // then what is fine. Somebody preparing a VM works down that list, and burying a
 // blocker under twelve green rows is how a wizard wastes an afternoon.
 const HV_SEVERITY_ORDER={blocking:0,warning:1,ok:2};/**
@@ -8037,7 +8040,8 @@ if(!sidebarClusterData[cid]?.metrics&&cid!==selectedCluster?.id){fetchSidebarClu
 useEffect(()=>{if(!xhmForm.source_cluster||!xhmForm.source_vmid||!xhmForm.target_cluster)return;if(hvType(clusters.find(c=>c.id===xhmForm.source_cluster))!=='hyperv')return;fetchXhmPlan();},[xhmForm.source_cluster,xhmForm.source_vmid,xhmForm.target_cluster]);// Fork patch #15 — re-ask the Hyper-V preflight whenever a target choice
 // changes. Two of its checks cannot be answered at plan time, and a wizard
 // that never re-asks shows a blocker nothing in it can clear.
-const[hvPreflightBusy,setHvPreflightBusy]=useState(false);useEffect(()=>{if(!hvIsHyperVPlan(xhmPlan)){setHvPreflight(null);setHvPreflightBusy(false);return;}let dropped=false;setHvPreflightBusy(true);hvRefreshPreflight({apiUrl:API_URL,authFetch,plan:xhmPlan,form:{...xhmForm,hardware:xhmForm.drivers==='none'?'compatible':'virtio'}}).then(report=>{if(!dropped&&report)setHvPreflight(report);}).finally(()=>{if(!dropped)setHvPreflightBusy(false);});return()=>{dropped=true;};},[xhmPlan,xhmForm.target_node,xhmForm.target_storage,// The name is checked by the preflight, because Proxmox validates it as a
+const[hvPreflightBusy,setHvPreflightBusy]=useState(false);useEffect(()=>{if(!hvIsHyperVPlan(xhmPlan)){setHvPreflight(null);setHvPreflightBusy(false);return;}let dropped=false;setHvPreflightBusy(true);// Asked once the form has stopped changing, not once per keystroke.
+const timer=setTimeout(()=>{hvRefreshPreflight({apiUrl:API_URL,authFetch,plan:xhmPlan,form:{...xhmForm,hardware:xhmForm.drivers==='none'?'compatible':'virtio'}}).then(report=>{if(!dropped&&report)setHvPreflight(report);}).finally(()=>{if(!dropped)setHvPreflightBusy(false);});},HV_PREFLIGHT_DEBOUNCE_MS);return()=>{dropped=true;clearTimeout(timer);};},[xhmPlan,xhmForm.target_node,xhmForm.target_storage,// The name is checked by the preflight, because Proxmox validates it as a
 // DNS name and says so only when it creates the VM — which happens after
 // the disks have been converted.
 xhmForm.target_name,// The preparation belongs here too: one of the checks answers whether this

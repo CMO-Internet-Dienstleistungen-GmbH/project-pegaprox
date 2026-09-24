@@ -243,6 +243,11 @@
         // Preflight
         // ───────────────────────────────────────────────
 
+        // How long the wizard waits after the last change before it asks the preflight
+        // again. Typing a name is one change per key, and each question used to reach the
+        // Hyper-V host; the answer is only wanted for what the operator stopped at.
+        const HV_PREFLIGHT_DEBOUNCE_MS = 500;
+
         const HV_SEVERITY_STYLE = {
             blocking: { dot: 'bg-red-400', text: 'text-red-400', box: 'border-red-500/30 bg-red-500/5' },
             warning: { dot: 'bg-amber-400', text: 'text-amber-400', box: 'border-yellow-500/30 bg-yellow-500/10' },

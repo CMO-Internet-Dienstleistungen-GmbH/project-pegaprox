@@ -2829,3 +2829,15 @@ class TestTheSidebarCanLeaveAHypervHost:
         views = ('sidebarXHM', 'sidebarTopology', 'sidebarWorldmap', 'sidebarMultiSdn')
         assert any(all(v in body and v in deps for v in views) for body, deps in effects), (
             'no effect clears the Hyper-V host when a sidebar view is chosen')
+
+
+class TestTheWizardAsksThePreflightOnceTypingStops:
+    """Every preflight used to reach the Hyper-V host, one per keystroke in the name field."""
+
+    _dashboard = staticmethod(TestTheSidebarCanLeaveAHypervHost._dashboard)
+
+    def test_the_refresh_waits_for_the_form_to_settle(self):
+        web = self._dashboard()
+        start = web.index('re-ask the Hyper-V preflight whenever a target choice')
+        effect = web[start:web.index('HV_PREFLIGHT_DEBOUNCE_MS', start) + 200]
+        assert 'setTimeout(' in effect and 'clearTimeout(timer)' in effect
