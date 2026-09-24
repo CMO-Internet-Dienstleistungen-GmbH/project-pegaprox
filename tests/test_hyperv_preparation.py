@@ -10,6 +10,7 @@ how the wizard's default is derived from the disks.
 """
 
 import contextlib
+import shlex
 
 import pytest
 
@@ -240,6 +241,16 @@ class TestTheLinuxConversionRuns:
         assert 'virt-v2v-in-place --block-driver virtio-scsi' in script
         assert any('guest-exec enabled' in line for line in task.log_lines)
 
+    def test_the_guest_agent_leaves_selinux_confinement_in_the_conversion(self, node):
+        """Red as soon as the conversion stops marking virt_qemu_ga_t permissive: an
+        enforcing RHEL guest would then arrive with a guest-exec that cannot run `ip`."""
+        calls, _ = node
+        task = _Task()
+        hyperv_xhm._inject_drivers_if_asked(task, _Target(), 120, VOLUMES, {})
+        script = calls[-1]
+        assert f'--run-command {shlex.quote(hyperv_linux.GUEST_AGENT_SELINUX)}' in script
+        assert any('permissive' in line for line in task.log_lines)
+
     def test_the_disks_go_in_in_their_order(self, node):
         calls, _ = node
         hyperv_xhm._inject_drivers_if_asked(_Task(), _Target(), 120, VOLUMES, {})
@@ -301,6 +312,22 @@ class TestAFailedConversionIsNotMovedToSata:
         assert 'no route to node-a' in task.completion_problem
 
 
+class TestAFailedSelinuxStepIsNamed:
+
+    def test_the_vm_is_not_started_and_the_reason_says_selinux(self, node):
+        from tests.test_hyperv_linux import SELINUX_FAILURE_OUTPUT
+        _, answers = node
+        answers['script'] = (1, SELINUX_FAILURE_OUTPUT, '')
+        task = _Task()
+        note = hyperv_xhm._inject_drivers_if_asked(task, _Target(), 120, VOLUMES, {})
+
+        assert task.target_unbootable
+        assert 'SELinux' in task.completion_problem
+        assert hyperv_linux.SELINUX_MODULE in task.completion_problem
+        assert 'not started' in note
+        assert any('semodule' in line for line in task.log_lines)
+
+
 class TestTheOtherChoicesAreUnchanged:
 
     def test_none_runs_no_conversion(self, node, monkeypatch):
@@ -309,6 +336,17 @@ class TestTheOtherChoicesAreUnchanged:
         note = hyperv_xhm._inject_drivers_if_asked(_Task('none'), _Target(), 120, VOLUMES,
                                                    {'ostype': 'l26'})
         assert note is None and calls == []
+
+    def test_windows_never_reaches_the_selinux_step(self, monkeypatch):
+        """The permissive module is part of the Linux conversion only."""
+        commands = []
+        monkeypatch.setattr(hyperv_xhm, '_run_offline_injection',
+                            lambda *a, **k: (type('View', (), {'no_ntfs_partition': False})(),
+                                             True))
+        monkeypatch.setattr(hyperv_xhm, '_node_session',
+                            lambda *a, **k: commands.append(a) or pytest.fail('node reached'))
+        hyperv_xhm._inject_drivers_if_asked(_Task('windows'), _Target(), 120, VOLUMES, {})
+        assert commands == []
 
     def test_windows_runs_the_driver_injection(self, monkeypatch):
         ran = []
