@@ -251,6 +251,89 @@ class TestTheGuestAgentIsUnlocked:
         assert '--run-command' in script and 'BLACKLIST_RPC=' in script
 
 
+
+class TestTheGuestAgentIsNotConfinedBySelinux:
+    """On an enforcing RHEL-family guest the agent runs as virt_qemu_ga_t and may not run
+    `ip`, write under /etc or reach NetworkManager. The conversion marks that one domain
+    permissive, so guest-exec can do on these guests what it does on every other."""
+
+    def _run(self, tmp_path, config=None, semodule_exit=0):
+        """Run the step against a stand-in root: the config and the scratch file moved
+        under tmp_path, and a `semodule` that records what it was handed."""
+        root = tmp_path / 'root'
+        (root / 'tmp').mkdir(parents=True)
+        (root / 'etc' / 'selinux').mkdir(parents=True)
+        if config is not None:
+            (root / 'etc' / 'selinux' / 'config').write_text(config)
+        record = tmp_path / 'semodule.calls'
+        _stub(tmp_path, 'semodule',
+              f'echo "$@" >> {record}; cat "$2" >> {record}; exit {semodule_exit}\n')
+        command = (linux.GUEST_AGENT_SELINUX
+                   .replace('/etc/selinux/config', str(root / 'etc/selinux/config'))
+                   .replace('/tmp/', f'{root}/tmp/'))
+        done = subprocess.run(['bash', '-c', command], capture_output=True, text=True,
+                              env={**os.environ, 'PATH': f'{tmp_path}:{os.environ["PATH"]}'})
+        calls = record.read_text() if record.exists() else ''
+        return done, calls, root
+
+    def test_an_enforcing_guest_gets_the_domain_marked_permissive(self, tmp_path):
+        done, calls, root = self._run(tmp_path, 'SELINUX=enforcing\nSELINUXTYPE=targeted\n')
+        assert done.returncode == 0, done.stderr
+        assert f'-i {root}/tmp/{linux.SELINUX_MODULE}.cil' in calls
+        assert '(typepermissive virt_qemu_ga_t)' in calls
+        assert not (root / 'tmp' / f'{linux.SELINUX_MODULE}.cil').exists()
+
+    def test_a_permissive_guest_gets_it_too(self, tmp_path):
+        # Permissive today is enforcing after the next edit of the config.
+        _done, calls, _root = self._run(tmp_path, 'SELINUX=permissive\n')
+        assert '(typepermissive virt_qemu_ga_t)' in calls
+
+    def test_a_guest_with_selinux_disabled_is_left_alone(self, tmp_path):
+        done, calls, _root = self._run(tmp_path, 'SELINUX=disabled\n')
+        assert done.returncode == 0 and calls == ''
+
+    def test_a_guest_without_selinux_is_left_alone(self, tmp_path):
+        done, calls, _root = self._run(tmp_path, None)
+        assert done.returncode == 0 and calls == ''
+
+    def test_a_module_that_cannot_be_installed_fails_the_step(self, tmp_path):
+        # A failed step fails virt-v2v, and the migration leaves the VM unstarted rather
+        # than delivering a guest whose agent cannot do its work.
+        done, _calls, _root = self._run(tmp_path, 'SELINUX=enforcing\n', semodule_exit=1)
+        assert done.returncode != 0
+
+    def test_it_is_part_of_every_conversion_and_runs_after_the_unlock(self):
+        script = linux.conversion_script([linux.disk_source('/dev/pve/vm-1-disk-0')])
+        unlock = script.index('BLACKLIST_RPC=')
+        permissive = script.index('typepermissive virt_qemu_ga_t')
+        assert unlock < permissive < script.index('-i disk')
+
+
+# What virt-v2v-in-place 2.6.0 printed on a CentOS 7.9 guest when semodule failed, with the
+# appliance's debug chatter left out.
+SELINUX_FAILURE_OUTPUT = (
+    "[  44.6] Running: if [ -f /etc/selinux/config ] ... semodule -i /tmp/x.cil ...; fi\n"
+    "libsemanage.map_file: Unable to open /tmp/x.cil\n"
+    " (No such file or directory).\n"
+    "semodule:  Failed on /tmp/x.cil!\n"
+    "virt-v2v-in-place: error: if [ -f /etc/selinux/config ] && ! grep -qE "
+    "'^SELINUX=disabled' /etc/selinux/config; then printf '(typepermissive "
+    "virt_qemu_ga_t)\\n' > /tmp/x.cil && semodule -i /tmp/x.cil; fi: command exited "
+    "with an error\n"
+    "V2V_EXIT=1\n")
+
+
+def test_a_failed_selinux_step_is_recognised_and_its_reason_kept():
+    result = linux.read_result(SELINUX_FAILURE_OUTPUT)
+    assert result['exit'] == 1
+    assert result['selinux_failed']
+    assert any(line.startswith('semodule:  Failed') for line in result['lines'])
+
+
+def test_another_failure_is_not_blamed_on_selinux():
+    result = linux.read_result('virt-v2v-in-place: error: no root device found\nV2V_EXIT=1\n')
+    assert result['exit'] == 1 and not result['selinux_failed']
+
 def test_the_install_reports_apts_own_failure(tmp_path):
     """`apt-get ... | tail` reports tail's success for an install that failed."""
     _stub(tmp_path, 'apt-get', 'echo "E: Unable to locate package"; exit 100\n')
