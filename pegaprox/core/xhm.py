@@ -549,6 +549,11 @@ def _get_pve_targets(pve_mgr):
     nodes = list(pve_mgr.nodes.keys()) if pve_mgr.nodes else []
     node_storages = {}
     node_bridges = {}
+    # Why a node's list is empty when it could not be read. An empty list alone reads as
+    # "this node has none"; a made-up one is worse -- it used to be ['vmbr0'], which offered
+    # a bridge nobody had looked up and hid the failure behind a plausible choice.
+    storage_errors = {}
+    bridge_errors = {}
     for n in nodes:
         try:
             sr = pve_mgr._api_get(f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{n}/storage")
@@ -557,8 +562,10 @@ def _get_pve_targets(pve_mgr):
                                     if s.get('active') and 'images' in s.get('content', '')]
             else:
                 node_storages[n] = []
-        except:
+                storage_errors[n] = f'HTTP {sr.status_code}'
+        except Exception as e:
             node_storages[n] = []
+            storage_errors[n] = str(e) or type(e).__name__
         # bridges
         try:
             nr = pve_mgr._api_get(f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{n}/network")
@@ -566,9 +573,14 @@ def _get_pve_targets(pve_mgr):
                 node_bridges[n] = [iface['iface'] for iface in nr.json().get('data', [])
                                    if iface.get('type') == 'bridge' and iface.get('active')]
             else:
-                node_bridges[n] = ['vmbr0']
-        except:
-            node_bridges[n] = ['vmbr0']
+                node_bridges[n] = []
+                bridge_errors[n] = f'HTTP {nr.status_code}'
+        except Exception as e:
+            node_bridges[n] = []
+            bridge_errors[n] = str(e) or type(e).__name__
+        if n in storage_errors or n in bridge_errors:
+            logger.warning(f"[XHM] could not read the targets of node {n}: "
+                            f"storages={storage_errors.get(n)} bridges={bridge_errors.get(n)}")
 
     targets.append({
         'cluster_id': pve_mgr.id,
@@ -577,6 +589,8 @@ def _get_pve_targets(pve_mgr):
         'nodes': nodes,
         'storages': node_storages,
         'bridges': node_bridges,
+        'storage_errors': storage_errors,
+        'bridge_errors': bridge_errors,
     })
     return targets
 
