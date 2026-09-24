@@ -23692,6 +23692,14 @@
                                                         {(xhmPlan.source.networks || []).length > 0 && (
                                                             <div>
                                                                 <div className="text-xs font-semibold text-gray-400 mb-2">{t('xhmNetworkMapping') || 'Network Mapping'}</div>
+                                                                {/* The node's bridges could not be read, so the lists below are empty
+                                                                    rather than guessed. Said here, with the reason, because an empty
+                                                                    dropdown alone reads as a node without bridges. */}
+                                                                {xhmPlan.targets?.[0]?.bridge_errors?.[xhmForm.target_node] && (
+                                                                    <div className="text-xs text-red-400 mb-2">
+                                                                        {t('xhmBridgesUnreadable') || 'The bridges of this node could not be read'}: {xhmPlan.targets[0].bridge_errors[xhmForm.target_node]}
+                                                                    </div>
+                                                                )}
                                                                 {xhmPlan.source.networks.map((net, i) => (
                                                                     <div key={i} className="flex items-center gap-2 mb-1">
                                                                         {/* Fork patch #15 — two adapters on the same Hyper-V switch
@@ -23725,7 +23733,7 @@
                                                                                     other directions keep the wording they had: there, empty does mean
                                                                                     the default. */}
                                                                                 <option value="">{hvIsHyperVPlan(xhmPlan) ? (t('xhmSelectNetwork') || 'Select network…') : 'vmbr0 (default)'}</option>
-                                                                                {(xhmPlan.targets[0]?.bridges?.[xhmForm.target_node] || ['vmbr0']).map(b => <option key={b} value={b}>{b}</option>)}
+                                                                                {(xhmPlan.targets[0]?.bridges?.[xhmForm.target_node] || (hvIsHyperVPlan(xhmPlan) ? [] : ['vmbr0'])).map(b => <option key={b} value={b}>{b}</option>)}
                                                                             </select>
                                                                         ) : (
                                                                             <select value={xhmForm.network_map[net.bridge || String(i)] || ''} onChange={e => setXhmForm({...xhmForm, network_map: {...xhmForm.network_map, [net.bridge || String(i)]: e.target.value}})} className="flex-1 px-2 py-1 bg-proxmox-dark border border-proxmox-border rounded text-white text-xs">

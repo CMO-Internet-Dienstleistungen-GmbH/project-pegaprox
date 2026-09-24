@@ -2831,6 +2831,23 @@ class TestTheSidebarCanLeaveAHypervHost:
             'no effect clears the Hyper-V host when a sidebar view is chosen')
 
 
+class TestTheWizardNeverGuessesABridge:
+    """A Hyper-V import maps every adapter explicitly. When the target node's bridges could
+    not be read, the list used to fall back to ['vmbr0'], and the source's adapters could
+    be put on a bridge nobody had looked up. The list stays empty and the reason is shown."""
+
+    _dashboard = staticmethod(TestTheSidebarCanLeaveAHypervHost._dashboard)
+
+    def test_a_hyperv_plan_gets_no_invented_bridge(self):
+        web = self._dashboard()
+        assert "(hvIsHyperVPlan(xhmPlan) ? [] : ['vmbr0'])" in web
+
+    def test_the_reason_the_bridges_are_missing_is_shown(self):
+        web = self._dashboard()
+        assert 'bridge_errors?.[xhmForm.target_node]' in web
+        assert "t('xhmBridgesUnreadable')" in web
+
+
 class TestTheWizardAsksThePreflightOnceTypingStops:
     """Every preflight used to reach the Hyper-V host, one per keystroke in the name field."""
 
