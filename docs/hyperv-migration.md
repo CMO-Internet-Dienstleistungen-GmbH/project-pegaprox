@@ -119,7 +119,10 @@ choosing a VM out of a list; it is not evidence about a disk. See
      root device on neither VirtIO nor SATA. virt-v2v rebuilds the initramfs with
      the guest's own tools, adjusts the boot loader and relabels for SELinux. It
      also lifts the RHEL-family default that switches off `guest-exec` in
-     `/etc/sysconfig/qemu-ga`. See `adr/0008-a-linux-guest-is-prepared-with-virt-v2v.md`.
+     `/etc/sysconfig/qemu-ga`, and on a guest with SELinux marks the agent's
+     domain `virt_qemu_ga_t` permissive (module `pegaprox_qemu_ga_permissive`),
+     so guest-exec can run `ip` and write under `/etc` there too. See
+     `adr/0008-a-linux-guest-is-prepared-with-virt-v2v.md`.
    - **No** builds the VM on hardware every guest already has drivers for, and
      the switch to VirtIO is then a step of its own afterwards (see *After the
      import*).
