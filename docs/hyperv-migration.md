@@ -178,8 +178,14 @@ the copy is running. A state that cannot be read refuses too — "I could not
 reach the target" is not "the target is off", and acting on the difference is
 exactly how both end up running.
 
-The imported VM is never started automatically, and the option to do so cannot
-be switched on, not even by a hand-written request.
+The imported VM is started at the end of the migration unless the wizard's
+*Start VM after migration* box is cleared -- the same default every other
+direction has, and an explicit `start_after: false` in a request is honoured.
+The preflight is what makes that safe: it refuses to start a migration while the
+original runs, so at the moment the copy starts the original is off. It is not
+started when the import left it unable to boot as configured -- a failed Linux
+conversion, for instance; the run then completes with errors that name the
+cause. What keeps both from running afterwards is the refusal above.
 
 ## After the import: drivers, then the VM standard
 
