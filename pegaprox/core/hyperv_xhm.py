@@ -2082,11 +2082,17 @@ def _run_linux_conversion(task, target, run_on_node, ordered, new_vmid):
                  f'with `rbd unmap {device}` before starting or removing the VM.')
     if result['map_failed']:
         return 'The Ceph volume could not be mapped on the node for the conversion'
+    if result['selinux_failed']:
+        return ('The QEMU guest agent could not be released from SELinux confinement: '
+                f'installing the module {hyperv_linux.SELINUX_MODULE} in the guest failed, '
+                'and virt-v2v stopped before it finished')
     if result['exit'] != 0 or rc != 0:
         return (f'virt-v2v-in-place ended with exit code '
                 f'{result["exit"] if result["exit"] is not None else rc}')
     task.log('The guest was prepared for VirtIO: initramfs, boot loader and SELinux labels '
-             'by virt-v2v, and guest-exec enabled for the QEMU guest agent.')
+             'by virt-v2v, and guest-exec enabled for the QEMU guest agent. Where SELinux '
+             f'is configured, the agent\'s domain virt_qemu_ga_t is permissive (module '
+             f'{hyperv_linux.SELINUX_MODULE}).')
     return None
 
 
