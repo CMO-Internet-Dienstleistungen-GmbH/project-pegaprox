@@ -562,6 +562,7 @@ def broadcast_sse(update_type: str, data: dict, cluster_id: str = None, target_c
         _vmw_perm_cache = {}      # uname -> bool: holds the vmware.* perm the REST twin requires
         _vmw_vms_frame_cache = {} # uname -> per-VM-filtered ESXi inventory frame (audit)
         _vmw_detail_cache = {}    # uname -> bool: may see THIS watched ESXi guest's detail (audit)
+        _hv_perm_cache = {}       # uname -> bool: holds hyperv.vm.view (fork patch #15)
         _obj_frame_cache = {}     # uname -> bool: may see THIS migration/DR-plan frame (audit)
         # sec/scale (audit): the per-client filtering below does uncached DB work — a single
         # user fetch plus the VM-ACL and pool lookups inside user_can_access_vm — and this loop
@@ -648,6 +649,19 @@ def broadcast_sse(update_type: str, data: dict, cluster_id: str = None, target_c
                         if client_message is _SSE_FILTER_MISSING:
                             client_message = _filtered_vmware_vms_frame(data, uname, timestamp, _eff)
                             _vmw_vms_frame_cache[uname, _eff] = client_message
+                    elif update_type == 'hyperv_inventory' and not client_info.get('is_admin', False):
+                        # Fork patch #15 — mirror the perm gate on the REST twin the client
+                        # is told to ask (/api/hyperv/<id>/vms, hyperv.vm.view). The frame
+                        # itself carries no inventory, only that the host was read and when,
+                        # but every other frame family here gates on its REST permission and
+                        # a custom role that hides Hyper-V should not hear about it either.
+                        uname, _eff = client_info.get('user'), client_info.get('effective_role')
+                        _ok_hv = _hv_perm_cache.get((uname, _eff), _SSE_FILTER_MISSING)
+                        if _ok_hv is _SSE_FILTER_MISSING:
+                            _ok_hv = _sse_user_has_perm(uname, 'hyperv.vm.view', _eff)
+                            _hv_perm_cache[uname, _eff] = _ok_hv
+                        if not _ok_hv:
+                            continue
                     elif update_type == 'vmware_vm_detail' and not client_info.get('is_admin', False):
                         uname, _eff = client_info.get('user'), client_info.get('effective_role')
                         _ok_det = _vmw_detail_cache.get((uname, _eff), _SSE_FILTER_MISSING)

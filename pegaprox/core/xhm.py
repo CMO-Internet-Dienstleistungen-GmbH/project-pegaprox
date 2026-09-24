@@ -285,6 +285,10 @@ class XHMigrationTask:
                 'start_after': self.start_after,
                 'remove_source': self.remove_source,
                 'network_map': self.network_map,
+                # What the VM was built as. It is a choice the operator made in the wizard
+                # and it decides what the guest wakes up on, so reading a finished
+                # migration should not require guessing which way the box was ticked.
+                'hardware': self.config.get('hardware') or '',
             },
         }
 
@@ -545,6 +549,11 @@ def _get_pve_targets(pve_mgr):
     nodes = list(pve_mgr.nodes.keys()) if pve_mgr.nodes else []
     node_storages = {}
     node_bridges = {}
+    # Why a node's list is empty when it could not be read. An empty list alone reads as
+    # "this node has none"; a made-up one is worse -- it used to be ['vmbr0'], which offered
+    # a bridge nobody had looked up and hid the failure behind a plausible choice.
+    storage_errors = {}
+    bridge_errors = {}
     for n in nodes:
         try:
             sr = pve_mgr._api_get(f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{n}/storage")
@@ -553,8 +562,10 @@ def _get_pve_targets(pve_mgr):
                                     if s.get('active') and 'images' in s.get('content', '')]
             else:
                 node_storages[n] = []
-        except:
+                storage_errors[n] = f'HTTP {sr.status_code}'
+        except Exception as e:
             node_storages[n] = []
+            storage_errors[n] = str(e) or type(e).__name__
         # bridges
         try:
             nr = pve_mgr._api_get(f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{n}/network")
@@ -562,9 +573,14 @@ def _get_pve_targets(pve_mgr):
                 node_bridges[n] = [iface['iface'] for iface in nr.json().get('data', [])
                                    if iface.get('type') == 'bridge' and iface.get('active')]
             else:
-                node_bridges[n] = ['vmbr0']
-        except:
-            node_bridges[n] = ['vmbr0']
+                node_bridges[n] = []
+                bridge_errors[n] = f'HTTP {nr.status_code}'
+        except Exception as e:
+            node_bridges[n] = []
+            bridge_errors[n] = str(e) or type(e).__name__
+        if n in storage_errors or n in bridge_errors:
+            logger.warning(f"[XHM] could not read the targets of node {n}: "
+                            f"storages={storage_errors.get(n)} bridges={bridge_errors.get(n)}")
 
     targets.append({
         'cluster_id': pve_mgr.id,
@@ -573,6 +589,8 @@ def _get_pve_targets(pve_mgr):
         'nodes': nodes,
         'storages': node_storages,
         'bridges': node_bridges,
+        'storage_errors': storage_errors,
+        'bridge_errors': bridge_errors,
     })
     return targets
 
@@ -1560,6 +1578,38 @@ def _resolve_pve_node_ip(pve_mgr, node_name):
     return pve_mgr.host
 
 
+def _key_file_for(key):
+    """A file `ssh`/paramiko can read, whether the caller had a path or the key itself.
+
+    CMO fork patch #15. Every caller in this module reads `config.ssh_key` and passes it as
+    `key_path`, but that field holds the key *material* — the cluster form has a textarea
+    and the row is stored encrypted, there is no file anywhere. `os.path.exists()` on a PEM
+    block is False, so key authentication was skipped in silence and the connection fell
+    through to the password. On a node that accepts publickey only — the Proxmox default
+    after hardening — every cross-hypervisor migration therefore failed at its first node
+    command with "Bad authentication type; allowed types: ['publickey']", on a cluster whose
+    key was configured correctly.
+
+    Returns (path, is_temporary). The caller deletes a temporary file when it is done.
+    """
+    if not key:
+        return None, False
+    if os.path.exists(key):
+        return key, False
+    from pegaprox.core.manager import _normalise_private_key
+    material = _normalise_private_key(key)
+    if not material or 'PRIVATE KEY' not in material:
+        return None, False
+    import tempfile
+    handle = tempfile.NamedTemporaryFile('w', suffix='.key', delete=False)
+    try:
+        os.chmod(handle.name, 0o600)
+        handle.write(material)
+    finally:
+        handle.close()
+    return handle.name, True
+
+
 def _connect_ssh(host, user, password, key_path=None, port=22):
     """Connect to SSH with multiple auth methods (matches _ssh_exec behavior).
     Returns connected paramiko.SSHClient or raises Exception."""
@@ -1570,16 +1620,23 @@ def _connect_ssh(host, user, password, key_path=None, port=22):
     apply_host_key_policy(client, paramiko)
 
     # try key-based first
-    if key_path and os.path.exists(key_path):
+    key_file, key_file_is_temporary = _key_file_for(key_path)
+    if key_file:
         try:
             client.connect(host, port=port, username=user,
-                           key_filename=key_path, timeout=30)
+                           key_filename=key_file, timeout=30)
             persist_host_keys(client)
             try: client.get_transport().set_keepalive(30)  # #546: keep the channel alive through long disk transfers
             except Exception: pass
             return client
         except Exception as e:
             logger.debug(f"[SSH] key auth failed for {user}@{host}: {e}")
+        finally:
+            if key_file_is_temporary:
+                try:
+                    os.unlink(key_file)
+                except OSError:
+                    logger.debug('Could not remove the temporary key file', exc_info=True)
 
     # keyboard-interactive via Transport (some hosts require this)
     try:
