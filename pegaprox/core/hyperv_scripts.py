@@ -90,8 +90,11 @@ $disks = @(@(Get-VMHardDiskDrive -VM $vm) | Where-Object { $_ } | ForEach-Object
     $drive = $_
     $vhd = $null
     try { $vhd = Get-VHD -Path $drive.Path -ErrorAction Stop } catch { }
+    $written = $null
+    try { $written = (Get-Item -LiteralPath $drive.Path -ErrorAction Stop).LastWriteTimeUtc.ToString('o') } catch { }
     [pscustomobject]@{
         Path               = $drive.Path
+        LastWriteUtc       = $written
         ControllerType     = $drive.ControllerType.ToString()
         ControllerNumber   = $drive.ControllerNumber
         ControllerLocation = $drive.ControllerLocation

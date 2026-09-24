@@ -93,6 +93,9 @@ def normalise_disk(raw: dict) -> dict:
     """
     return {
         'path': raw.get('Path'),
+        # When the file was last written. Tells whether what was read from inside it
+        # earlier still describes it: booting the guest or merging a checkpoint writes it.
+        'last_write_utc': raw.get('LastWriteUtc'),
         'controller_type': raw.get('ControllerType'),
         'controller_number': raw.get('ControllerNumber'),
         'controller_location': raw.get('ControllerLocation'),

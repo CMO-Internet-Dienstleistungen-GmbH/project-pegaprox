@@ -85,6 +85,149 @@ def _summary(guid, name='synthetic-vm', state='Off', **extra):
     return vm
 
 
+class _InspectingManager(FakeManager):
+    """A manager whose disk inspection is counted, and can be held open by a test."""
+
+    def __init__(self, answer=None, gate=None, **kwargs):
+        super().__init__(vms=[_summary(GUID_1)], **kwargs)
+        self.answer = answer if answer is not None else {'inspected': True, 'disks': []}
+        self.gate = gate
+        self.inspections = 0
+        # The files the VM is attached to, as the detail query reports them.
+        self.disks = [{'path': r'D:\vms\synthetic\disk0.vhdx',
+                       'last_write_utc': '2026-01-01T10:00:00.0000000Z'}]
+
+    def get_vm(self, guid):
+        return {'guid': guid, 'disks': [dict(d) for d in self.disks]}
+
+    def inspect_disks(self, guid):
+        self.inspections += 1
+        if self.gate is not None:
+            self.gate.wait(5)
+        return dict(self.answer)
+
+
+class TestTheDiskInspectionIsReadOncePerWizard:
+    # Each inspection mounts every disk of the VM on the Hyper-V host for seconds, and the
+    # wizard asks the preflight again on every change -- one inspection per keystroke in
+    # the name field, queued behind each other on the host.
+
+    def test_a_merged_checkpoint_is_seen_on_the_next_question(self, db):
+        # Deleting a checkpoint merges the .avhdx and attaches the parent file instead. An
+        # answer kept per VM would describe the old chain for minutes.
+        manager = _InspectingManager()
+        manager.disks = [{'path': r'D:\vms\synthetic\disk0_1A2B.avhdx',
+                          'last_write_utc': '2026-01-01T10:00:00.0000000Z'}]
+        cluster = _cluster(db, manager)
+        vmid = cluster.get_vms()[0]['vmid']
+        cluster.inspect_disks(vmid)
+        manager.disks = [{'path': r'D:\vms\synthetic\disk0.vhdx',
+                          'last_write_utc': '2026-01-01T10:05:00.0000000Z'}]
+        cluster.inspect_disks(vmid)
+        assert manager.inspections == 2
+
+    def test_a_disk_written_since_is_read_again(self, db):
+        # Booting the guest and shutting it down cleanly is what clears a hibernation, and
+        # the preflight asks the operator to do exactly that.
+        manager = _InspectingManager()
+        cluster = _cluster(db, manager)
+        vmid = cluster.get_vms()[0]['vmid']
+        cluster.inspect_disks(vmid)
+        manager.disks[0]['last_write_utc'] = '2026-01-01T11:00:00.0000000Z'
+        cluster.inspect_disks(vmid)
+        assert manager.inspections == 2
+
+    def test_nothing_is_reused_when_the_write_time_is_unknown(self, db):
+        manager = _InspectingManager()
+        manager.disks[0]['last_write_utc'] = None
+        cluster = _cluster(db, manager)
+        vmid = cluster.get_vms()[0]['vmid']
+        cluster.inspect_disks(vmid)
+        cluster.inspect_disks(vmid)
+        assert manager.inspections == 2
+
+    def _vmid(self, cluster):
+        return cluster.get_vms()[0]['vmid']
+
+    def test_a_second_question_takes_the_first_answer(self, db):
+        manager = _InspectingManager()
+        cluster = _cluster(db, manager)
+        vmid = self._vmid(cluster)
+        cluster.inspect_disks(vmid)
+        cluster.inspect_disks(vmid)
+        assert manager.inspections == 1
+
+    def test_the_runner_reads_again_before_it_copies(self, db):
+        # Between the wizard and the start somebody can attach one of the disks.
+        manager = _InspectingManager()
+        cluster = _cluster(db, manager)
+        vmid = self._vmid(cluster)
+        cluster.inspect_disks(vmid)
+        cluster.inspect_disks(vmid, max_age=0)
+        assert manager.inspections == 2
+
+    def test_an_answer_older_than_the_limit_is_read_again(self, db, monkeypatch):
+        manager = _InspectingManager()
+        cluster = _cluster(db, manager)
+        vmid = self._vmid(cluster)
+        cluster.inspect_disks(vmid)
+        later = time.time() + cluster._INSPECTION_MAX_AGE + 1
+        monkeypatch.setattr(hyperv_cluster.time, 'time', lambda: later)
+        cluster.inspect_disks(vmid)
+        assert manager.inspections == 2
+
+    def test_an_inspection_that_could_not_look_inside_is_asked_again(self, db):
+        # "The VM is running" is the answer that changes once the operator shuts it down.
+        manager = _InspectingManager(answer={'inspected': False, 'error': 'VM is running',
+                                             'disks': []})
+        cluster = _cluster(db, manager)
+        vmid = self._vmid(cluster)
+        cluster.inspect_disks(vmid)
+        cluster.inspect_disks(vmid)
+        assert manager.inspections == 2
+
+    def test_questions_that_arrive_together_share_one_inspection(self, db):
+        import threading
+        gate = threading.Event()
+        manager = _InspectingManager(gate=gate)
+        cluster = _cluster(db, manager)
+        vmid = self._vmid(cluster)
+        answers = []
+        threads = [threading.Thread(target=lambda: answers.append(cluster.inspect_disks(vmid)))
+                   for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        deadline = time.time() + 5
+        while manager.inspections == 0 and time.time() < deadline:
+            time.sleep(0.01)
+        gate.set()
+        for thread in threads:
+            thread.join(5)
+        assert manager.inspections == 1
+        assert len(answers) == 3 and all(a.get('inspected') for a in answers)
+
+    def test_a_forced_read_does_not_take_an_answer_that_began_before_it(self, db):
+        # The wizard's inspection was already running when the runner asked; a disk
+        # attached in between is not in it, so the runner mounts the disks once more.
+        import threading
+        gate = threading.Event()
+        manager = _InspectingManager(gate=gate)
+        cluster = _cluster(db, manager)
+        vmid = self._vmid(cluster)
+        first = threading.Thread(target=lambda: cluster.inspect_disks(vmid))
+        first.start()
+        deadline = time.time() + 5
+        while manager.inspections == 0 and time.time() < deadline:
+            time.sleep(0.01)
+        forced = threading.Thread(target=lambda: cluster.inspect_disks(vmid, max_age=0))
+        forced.start()
+        time.sleep(0.05)
+        gate.set()
+        first.join(5)
+        forced.join(5)
+        assert manager.inspections == 2
+
+
 class TestConnecting:
     def test_a_reachable_host_connects(self, db):
         cluster = _cluster(db)
