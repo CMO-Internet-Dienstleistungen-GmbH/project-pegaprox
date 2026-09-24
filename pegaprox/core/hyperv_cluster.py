@@ -171,6 +171,13 @@ class HyperVClusterManager:
         # VM does not change while somebody fills in a wizard, and the read costs seconds
         # per disk on a customer's machine.
         self._image_facts = {}
+        # What is inside each VM's disks, keyed by VM GUID, and one lock per VM around
+        # reading it. The wizard re-asks the preflight on every change, and each inspection
+        # mounts every disk on the host for seconds; the host serialises them per VM, so
+        # without this they queued up and each one mounted the disks again.
+        self._inspections = {}
+        self._inspection_locks = {}
+        self._inspection_locks_guard = threading.Lock()
         # When this host was last read. The cluster list renders it without a guard, and a
         # Hyper-V host is only read on demand, so it stays None until something asks.
         self.last_run = None
@@ -404,13 +411,69 @@ class HyperVClusterManager:
         self._image_facts[guid] = {'facts': facts, 'read_at': time.time()}
         return facts
 
-    def inspect_disks(self, vmid) -> dict:
-        """What is inside this VM's disks. Read-only, and only while the VM is off."""
+    #: How long one disk inspection stays usable while the disks it read are unchanged.
+    _INSPECTION_MAX_AGE = 300
+
+    def inspect_disks(self, vmid, max_age: float | None = None) -> dict:
+        """What is inside this VM's disks. Read-only, and only while the VM is off.
+
+        Cached against the disks themselves, not against the VM: the answer is kept only
+        while the VM is attached to the same files, each last written at the same moment.
+        Deleting a checkpoint merges it and attaches a different file; booting the guest to
+        clear a hibernation writes the file. Either is visible on the next question instead
+        of after the cache has aged out. Reading those two facts is one cheap query; the
+        inspection it saves mounts every disk on the host for seconds.
+
+        Read once however many wizard requests arrive at the same time: whoever waited for
+        a running inspection takes its answer instead of mounting the disks again. Only an
+        inspection that looked inside is kept -- one that could not, because the VM was
+        running or the host refused, is asked again, since that is the answer that changes.
+        `max_age=0` forces a read that begins after the call, which is what the runner does
+        right before it copies anything.
+        """
         guid = self.guid_for(vmid)
         if not guid:
             return {'inspected': False, 'error': f'No Hyper-V VM is known here as {vmid}.',
                     'disks': []}
-        return self.manager.inspect_disks(guid)
+        age = self._INSPECTION_MAX_AGE if max_age is None else max_age
+        asked_at = time.time()
+        with self._inspection_lock(guid):
+            disks = self._disk_identity(guid)
+            cached = self._inspections.get(guid)
+            if (cached and age and disks is not None and cached['disks'] == disks
+                    and asked_at - cached['read_at'] < age):
+                return cached['inspection']
+            # Stamped with when the read began: a disk attached while it ran is not in it.
+            started_at = time.time()
+            inspection = self.manager.inspect_disks(guid)
+            if inspection.get('inspected') and disks is not None:
+                self._inspections[guid] = {'inspection': inspection, 'read_at': started_at,
+                                           'disks': disks}
+            else:
+                self._inspections.pop(guid, None)
+            return inspection
+
+    def _disk_identity(self, guid: str):
+        """Which files the VM is attached to and when each was last written, or None.
+
+        None when the host could not say, or could not say for every disk -- an answer
+        that cannot be compared must not be matched against a cached one.
+        """
+        try:
+            disks = self.manager.get_vm(guid).get('disks') or []
+        except Exception:
+            logger.debug('Could not read the disks of %s for the inspection cache', guid,
+                         exc_info=True)
+            return None
+        identity = tuple(sorted((str(d.get('path') or ''), str(d.get('last_write_utc') or ''))
+                                for d in disks))
+        if any(not path or not written for path, written in identity):
+            return None
+        return identity
+
+    def _inspection_lock(self, guid: str) -> threading.Lock:
+        with self._inspection_locks_guard:
+            return self._inspection_locks.setdefault(guid, threading.Lock())
 
     def get_vm_config(self, node=None, vmid=None, vm_type='qemu') -> dict:
         """One VM for the shared VM dialog, in the shape and envelope it reads.
