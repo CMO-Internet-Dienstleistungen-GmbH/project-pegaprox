@@ -19,6 +19,10 @@ from pegaprox.globals import cluster_managers, vmware_managers, _v2p_migrations
 from pegaprox.utils.ssh import _ssh_exec, _pve_node_exec
 from pegaprox.utils.realtime import broadcast_sse
 from pegaprox.utils.audit import log_audit
+from pegaprox.core.virtio_firstboot import (
+    FIRST_BOOT_SCRIPT_NAME, FIRST_BOOT_SERVICE, FIRST_BOOT_SERVICE_COMMAND,
+    first_boot_script_staging as _first_boot_script_staging,
+)
 
 
 class V2PCutoverCancelled(Exception):
@@ -2482,14 +2486,16 @@ def _inject_virtio_drivers(pve_mgr, task):
         "print('hivex commit OK')\n"
         "PYEOF\n"
         # NS May 2026 — Bulk install via virtio-win-gt-x64.msi.
-        # Cleanest approach: stage the official 4.4 MB MSI, register a
-        # one-shot SYSTEM service that runs msiexec /quiet at first boot.
-        # The MSI itself handles cert import, ALL driver installs, qemu-ga,
-        # balloon service. Earlier we tried offline pnputil + RunOnce — that
+        # Cleanest approach: stage the official MSI, register a one-shot SYSTEM service
+        # that installs it at first boot. The MSI handles cert import, the driver installs
+        # and the balloon service. It does not contain the guest agent: checked against
+        # virtio-win 0.1.302, virtio-win-gt-x64.msi names vioscsi and blnsvr and never
+        # qemu-ga, which ships as guest-agent/qemu-ga-x86_64.msi of its own, so that one
+        # is staged beside it. Earlier we tried offline pnputil + RunOnce — that
         # ran into "registry corrupt" because RunOnce executes with the
         # logged-in user's standard token (no elevation), even for admins.
         # SYSTEM service has full token, no UAC.
-        "PEGADIR=\"$WIN_MNT/$WDIR/../PegaProx\"\n"
+        "PEGADIR=\"$WIN_MNT/$WDIR/../qemu\"\n"
         "mkdir -p \"$PEGADIR\"\n"
         "MSI_OK=0\n"
         # Pick the right MSI by host arch — almost always x64 these days
@@ -2502,20 +2508,25 @@ def _inject_virtio_drivers(pve_mgr, task):
         "  fi; "
         "done\n"
         "[ \"$MSI_OK\" -eq 1 ] || echo 'MSI_MISSING (skipping bulk install)'\n"
-        # Register the one-shot service in the SYSTEM hive.
-        # ImagePath runs as LocalSystem at next boot; cmd /c chains:
-        #   msiexec /quiet → sc delete self → del MSI
-        # Service stays disabled-by-failure if msiexec doesn't exit 0,
-        # so user can investigate via msi.log. Self-deletion needs the
-        # service to have already returned, hence the trailing & chain.
+        "if [ -f \"$ISO_MNT/guest-agent/qemu-ga-x86_64.msi\" ]; then "
+        "  cp -f \"$ISO_MNT/guest-agent/qemu-ga-x86_64.msi\" \"$PEGADIR/qemu-ga-x86_64.msi\" "
+        "    && echo 'AGENT_STAGED qemu-ga-x86_64.msi'; "
+        "else echo 'AGENT_MISSING (no guest-agent/qemu-ga-x86_64.msi on the ISO)'; fi\n"
+        # The first-boot install is a script of its own; see virtio_firstboot.
+        "if [ \"$MSI_OK\" -eq 1 ]; then " + _first_boot_script_staging('PEGADIR') + "fi\n"
+        # Register the one-shot service in the SYSTEM hive. It runs as LocalSystem at
+        # next boot and only launches firstboot.ps1, which installs, arms the boot
+        # drivers and deletes the service.
         "SYSTEM_HIVE=\"$WIN_MNT/$WDIR/System32/config/SYSTEM\"\n"
-        "python3 - \"$SYSTEM_HIVE\" \"$MSI_OK\" << 'PYSV' || { echo 'SVC_FAILED (non-fatal)'; }\n"
-        "import sys, hivex\n"
+        "python3 - \"$SYSTEM_HIVE\" \"$MSI_OK\" \"$PEGADIR\" << 'PYSV' || { echo 'SVC_FAILED (non-fatal)'; }\n"
+        "import os, sys, hivex\n"
         "from hivex.hive_types import REG_DWORD, REG_SZ, REG_EXPAND_SZ\n"
         "h = hivex.Hivex(sys.argv[1], write=True)\n"
         "msi_ok = int(sys.argv[2])\n"
         "if msi_ok == 0:\n"
         "    print('skipping service — no MSI'); sys.exit(0)\n"
+        "if not os.path.isfile(os.path.join(sys.argv[3], '" + FIRST_BOOT_SCRIPT_NAME + "')):\n"
+        "    print('skipping service — no first-boot script'); sys.exit(0)\n"
         "def fc(p, n): return h.node_get_child(p, n)\n"
         "def navigate(parent, parts):\n"
         "    n = parent\n"
@@ -2530,27 +2541,15 @@ def _inject_virtio_drivers(pve_mgr, task):
         "    h.node_set_value(node, {'key': k, 't': REG_SZ, 'value': (v + chr(0)).encode('utf-16-le')})\n"
         "def set_exp(node, k, v):\n"
         "    h.node_set_value(node, {'key': k, 't': REG_EXPAND_SZ, 'value': (v + chr(0)).encode('utf-16-le')})\n"
-        # NS May 2026 — after MSI install, also flip vioscsi/viostor to Start=0
-        # (boot-critical). MSI registers them as Start=3 (manual), which means
-        # if the user later switches scsihw to virtio-scsi-*, Windows boot
-        # loader can't find a boot-time storage driver → INACCESSIBLE_BOOT_DEVICE.
-        # Pre-arming Start=0 means the controller switch "just works" without
-        # any manual `sc config` step on the customer side.
-        "cmdline = (\n"
-        "    'cmd.exe /c '\n"
-        "    '(msiexec /i \"C:\\\\PegaProx\\\\virtio-win-gt-x64.msi\" '\n"
-        "    'ADDLOCAL=ALL /quiet /norestart /l*v \"C:\\\\PegaProx\\\\msi.log\") & '\n"
-        "    '(sc config vioscsi start= boot >> \"C:\\\\PegaProx\\\\bootarm.log\" 2>&1) & '\n"
-        "    '(sc config viostor start= boot >> \"C:\\\\PegaProx\\\\bootarm.log\" 2>&1) & '\n"
-        "    '(sc delete PegaProxFirstBoot >> \"C:\\\\PegaProx\\\\service.log\" 2>&1) & '\n"
-        "    '(del \"C:\\\\PegaProx\\\\virtio-win-gt-x64.msi\" 2>nul)'\n"
-        ")\n"
+        # The installs, and flipping vioscsi/viostor to boot-start afterwards (the MSI
+        # registers them demand-start), run in firstboot.ps1 -- see virtio_firstboot.
+        "cmdline = " + repr(FIRST_BOOT_SERVICE_COMMAND) + "\n"
         "for cs_name in ['ControlSet001','ControlSet002']:\n"
         "    cs = fc(h.root(), cs_name)\n"
         "    if cs is None: continue\n"
         "    services = fc(cs, 'Services')\n"
         "    if services is None: continue\n"
-        "    svc = navigate(services, ['PegaProxFirstBoot'])\n"
+        "    svc = navigate(services, [" + repr(FIRST_BOOT_SERVICE) + "])\n"
         "    set_sz(svc, 'DisplayName', 'PegaProx First-Boot Driver Install')\n"
         "    set_dword(svc, 'Type', 0x10)\n"
         "    set_dword(svc, 'Start', 2)\n"
@@ -2602,7 +2601,7 @@ def _inject_virtio_drivers(pve_mgr, task):
     # Most markers are once-per-run; COPIED/SKIP/COPY_FAILED are per-driver
     # so we log all of them (otherwise we'd hide which drivers actually staged).
     _multi = ('COPIED ', 'SKIP ', 'COPY_FAILED ')
-    for marker in ['WIN_PART=', 'WDIR=', 'VER_NAME=', 'VER_BUILD=', 'SUBDIR_PRIMARY=', 'SUBDIR_FALLBACKS=', 'SUBDIR=', 'COPIED ', 'SKIP ', 'COPY_FAILED ', 'MSI_STAGED ', 'MSI_MISSING', 'SVC_REGISTERED', 'SVC_FAILED', 'INJECTION_OK']:
+    for marker in ['WIN_PART=', 'WDIR=', 'VER_NAME=', 'VER_BUILD=', 'SUBDIR_PRIMARY=', 'SUBDIR_FALLBACKS=', 'SUBDIR=', 'COPIED ', 'SKIP ', 'COPY_FAILED ', 'MSI_STAGED ', 'MSI_MISSING', 'AGENT_STAGED ', 'AGENT_MISSING', 'FIRSTBOOT_STAGED ', 'FIRSTBOOT_FAILED ', 'SVC_REGISTERED', 'SVC_FAILED', 'INJECTION_OK']:
         for line in out_str.splitlines():
             if marker in line:
                 task.log(f"[VirtIO] {line.strip()}")

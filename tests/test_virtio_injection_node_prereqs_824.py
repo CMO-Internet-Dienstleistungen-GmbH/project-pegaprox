@@ -46,6 +46,13 @@ def _injection_node_script():
                            for v in n.values)
         if isinstance(n, ast.BinOp):
             return flatten(n.left) + flatten(n.right)
+        # firstboot.ps1 is staged through a helper instead of a literal, so the
+        # concatenation has a real Call node in it here. Run the one helper this script
+        # calls rather than adding a general call-evaluator for arbitrary code.
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                and n.func.id == '_first_boot_script_staging'):
+            from pegaprox.core.v2p import _first_boot_script_staging
+            return _first_boot_script_staging(*(flatten(a) for a in n.args))
         return ''
 
     best = ''
