@@ -2457,8 +2457,56 @@ def _inject_virtio_drivers(pve_mgr, task):
         # service whose backing file isn't present on the target FS.
         "import os, struct\n"
         "drv_root = os.path.dirname(sys.argv[1]) + '/../drivers'\n"
-        "have_viostor = os.path.exists(drv_root + '/viostor.sys')\n"
-        "have_vioscsi = os.path.exists(drv_root + '/vioscsi.sys')\n"
+        # A driver the loader will refuse must not be made boot-critical either. winload
+        # checks a boot-start driver's signature before the kernel exists, stops with
+        # 0xc0000428 and the guest never starts -- strictly worse than leaving it on the
+        # controller it arrived on, which boots. Measured on Windows Server 2012 R2 against
+        # a current virtio-win: the boot manager names \Windows\system32\drivers\viostor.sys,
+        # and that file's certificate table holds only 'virtio-win / Red Hat Inc.'. The
+        # variants for out-of-support Windows versions stopped being signed through
+        # Microsoft; virtio-win 0.1.189 is a release whose 2k12R2 drivers still chain to
+        # Microsoft Code Verification Root, and a guest built from it reaches its login
+        # screen on virtio-scsi. The 2k16 and newer variants are unaffected.
+        #
+        # Read from the file rather than decided from the Windows version: an operator who
+        # points virtio_iso_path at an older ISO for an old guest has a driver that does
+        # load, and a rule based on the build number would refuse it. Standard library
+        # only -- a PE header walk to data directory 4 -- so nothing has to be installed on
+        # the node for it.
+        "_ACCEPTED_SIGNERS = (b'Microsoft Code Verification Root',\n"
+        "                     b'Microsoft Windows Third Party Component CA',\n"
+        "                     b'Microsoft Windows Hardware Compatibility Publisher')\n"
+        "def boot_signable(path):\n"
+        "    \"\"\"Whether the PE certificate table names a signer the loader accepts.\"\"\"\n"
+        "    try:\n"
+        "        with open(path, 'rb') as fh:\n"
+        "            data = fh.read()\n"
+        "        if data[:2] != b'MZ':\n"
+        "            return False\n"
+        "        pe = struct.unpack_from('<I', data, 0x3C)[0]\n"
+        "        if data[pe:pe + 2] != b'PE':\n"
+        "            return False\n"
+        "        optional = pe + 24\n"
+        "        magic = struct.unpack_from('<H', data, optional)[0]\n"
+        # The certificate table is data directory 4, and the directories start at a
+        # different offset for PE32+ than for PE32.
+        "        directories = optional + (112 if magic == 0x20B else 96)\n"
+        "        offset, size = struct.unpack_from('<II', data, directories + 32)\n"
+        "        if not offset or not size:\n"
+        "            return False\n"
+        "        blob = data[offset:offset + size]\n"
+        "    except Exception:\n"
+        "        return False\n"
+        "    return any(signer in blob for signer in _ACCEPTED_SIGNERS)\n"
+        "_present = {n: os.path.exists(drv_root + '/' + n + '.sys')\n"
+        "            for n in ('viostor', 'vioscsi')}\n"
+        "_signable = {n: (present and boot_signable(drv_root + '/' + n + '.sys'))\n"
+        "             for n, present in _present.items()}\n"
+        "for _name in ('viostor', 'vioscsi'):\n"
+        "    if _present[_name] and not _signable[_name]:\n"
+        "        print('BOOT_SIGNATURE_MISSING ' + _name)\n"
+        "have_viostor = _signable['viostor']\n"
+        "have_vioscsi = _signable['vioscsi']\n"
         "print(f'HIVEX have_viostor={have_viostor} have_vioscsi={have_vioscsi}')\n"
         "root = h.root()\n"
         # Every control set the hive has, not ControlSet001 alone. Which one boots is
@@ -2795,13 +2843,34 @@ def _inject_virtio_drivers(pve_mgr, task):
     # Surface the interesting lines — keep the log compact.
     # Most markers are once-per-run; COPIED/SKIP/COPY_FAILED are per-driver
     # so we log all of them (otherwise we'd hide which drivers actually staged).
-    _multi = ('COPIED ', 'SKIP ', 'COPY_FAILED ', 'INF ', 'DriverDatabase ')
-    for marker in ['WIN_PART=', 'WDIR=', 'HIVEX control sets: ', 'VER_NAME=', 'VER_BUILD=', 'SUBDIR_PRIMARY=', 'SUBDIR_FALLBACKS=', 'SUBDIR=', 'COPIED ', 'SKIP ', 'COPY_FAILED ', 'INF ', 'DriverDatabase ', 'MSI_STAGED ', 'MSI_MISSING', 'SVC_REGISTERED', 'SVC_FAILED', 'INJECTION_OK']:
+    _multi = ('COPIED ', 'SKIP ', 'COPY_FAILED ', 'INF ', 'DriverDatabase ',
+              'BOOT_SIGNATURE_MISSING ')
+    for marker in ['WIN_PART=', 'WDIR=', 'HIVEX control sets: ', 'VER_NAME=', 'VER_BUILD=', 'SUBDIR_PRIMARY=', 'SUBDIR_FALLBACKS=', 'SUBDIR=', 'COPIED ', 'SKIP ', 'COPY_FAILED ', 'INF ', 'DriverDatabase ', 'BOOT_SIGNATURE_MISSING ', 'HIVEX have_', 'MSI_STAGED ', 'MSI_MISSING', 'SVC_REGISTERED', 'SVC_FAILED', 'INJECTION_OK']:
         for line in out_str.splitlines():
             if marker in line:
                 task.log(f"[VirtIO] {line.strip()}")
                 if marker not in _multi:
                     break
+
+    # The storage driver a VirtIO SCSI boot needs carries no signature the loader
+    # accepts. Registering it anyway would produce a VM that stops at 0xc0000428 before
+    # the kernel starts; reporting failure leaves the guest on the controller it arrived
+    # on, which boots, with the drivers staged for an install from inside the guest.
+    unsignable = sorted({line.strip().split()[-1] for line in out_str.splitlines()
+                         if line.strip().startswith('BOOT_SIGNATURE_MISSING ')})
+    if 'vioscsi' in unsignable:
+        named = ' and '.join(unsignable)
+        verb = 'carries' if len(unsignable) == 1 else 'carry'
+        task.log(f"[VirtIO] ✗ {named} {verb} no signature the Windows loader accepts for a "
+                 f"boot driver, so {'it was' if len(unsignable) == 1 else 'they were'} not "
+                 f"registered as one.")
+        task.log("[VirtIO]   This affects the driver variants for Windows versions that are "
+                 "out of support, which virtio-win stopped having signed through Microsoft.")
+        task.log("[VirtIO]   Point virtio_iso_path at a release that still carries a "
+                 "Microsoft-chained driver for this guest -- for Windows Server 2012 R2 that "
+                 "is virtio-win 0.1.189 -- or leave the VM on its compatible controller and "
+                 "install the drivers from inside the guest.")
+        return False
 
     if rc == 0 and 'INJECTION_OK' in out_str:
         task.log("[VirtIO] ✓ Drivers staged + registry merged.")

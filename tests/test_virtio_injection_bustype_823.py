@@ -178,21 +178,37 @@ class _FakeHiveTypes:
     REG_MULTI_SZ = _REG_MULTI_SZ
 
 
-_MACHINE = {'amd64': 0x8664, 'x86': 0x014C, 'arm64': 0xAA64}
+_MACHINE = {'amd64': 0x8664, 'x86': 0x014C, 'arm64': 0xAA64, 'unknown': 0x0EBC}
 
 
-def _pe_stub(arch='amd64'):
-    """Just enough of a PE file for the architecture to be read out of it."""
-    head = bytearray(0x100)
+_SIGNED_BY_MICROSOFT = b'Microsoft Windows Third Party Component CA 2014'
+_SELF_SIGNED = b'virtio-win / Red Hat Inc.'
+
+
+def _pe_stub(arch='amd64', signer=_SIGNED_BY_MICROSOFT, pe32_plus=True):
+    """Just enough of a PE file for the architecture and the signer to be read out of it:
+    the machine field, and a certificate table (data directory 4) holding `signer`."""
+    head = bytearray(0x200)
     head[0:2] = b'MZ'
     head[0x3C:0x40] = (0x80).to_bytes(4, 'little')
     head[0x80:0x84] = b'PE\x00\x00'
     head[0x84:0x86] = _MACHINE[arch].to_bytes(2, 'little')
+    optional = 0x80 + 24
+    head[optional:optional + 2] = (0x20B if pe32_plus else 0x10B).to_bytes(2, 'little')
+    if signer:
+        directories = optional + (112 if pe32_plus else 96)
+        blob_at = 0x180
+        head[directories + 32:directories + 40] = (blob_at.to_bytes(4, 'little')
+                                                   + len(signer).to_bytes(4, 'little'))
+        head[blob_at:blob_at + len(signer)] = signer
     return bytes(head)
 
 
-def _windows_tree(tmp_path, drivers=('viostor.sys', 'vioscsi.sys'), arch='amd64'):
-    """The part of the mounted guest filesystem the program looks at."""
+def _windows_tree(tmp_path, drivers=('viostor.sys', 'vioscsi.sys'), arch='amd64',
+                  signers=None):
+    """The part of the mounted guest filesystem the program looks at. `signers` maps a
+    driver file to the signer its certificate table names; the default is one the Windows
+    loader accepts."""
     config = tmp_path / 'Windows' / 'System32' / 'config'
     config.mkdir(parents=True)
     hive = config / 'SYSTEM'
@@ -200,14 +216,16 @@ def _windows_tree(tmp_path, drivers=('viostor.sys', 'vioscsi.sys'), arch='amd64'
     drv = tmp_path / 'Windows' / 'System32' / 'drivers'
     drv.mkdir(parents=True)
     for name in drivers:
-        (drv / name).write_bytes(_pe_stub(arch))
+        signer = (signers or {}).get(name, _SIGNED_BY_MICROSOFT)
+        (drv / name).write_bytes(_pe_stub(arch, signer))
     return hive
 
 
 def _run_registry_program(script, tmp_path, monkeypatch, argv_extra=(),
                           drivers=('viostor.sys', 'vioscsi.sys'),
-                          driver_database=False, arch='amd64', keys=()):
-    hive_path = _windows_tree(tmp_path, drivers, arch)
+                          driver_database=False, arch='amd64', keys=(), signers=None,
+                          output=None):
+    hive_path = _windows_tree(tmp_path, drivers, arch, signers)
     hives = []
 
     class _Recording(_FakeHive):
@@ -226,7 +244,8 @@ def _run_registry_program(script, tmp_path, monkeypatch, argv_extra=(),
     monkeypatch.setitem(sys.modules, 'hivex.hive_types', _FakeHiveTypes)
     monkeypatch.setattr(sys, 'argv', ['-', str(hive_path), *argv_extra])
 
-    exec(compile(_registry_program(script), '<injection>', 'exec'), {'__name__': '__main__'})
+    exec(compile(_registry_program(script), '<injection>', 'exec'),
+         {'__name__': '__main__', **({'print': output.append} if output is not None else {})})
     assert hives, 'the program never opened the hive'
     assert hives[0].committed, 'the program never committed'
     return hives[0]
@@ -646,10 +665,14 @@ def test_an_x86_driver_keeps_its_architecture_when_no_source_directory_is_known(
                        'Active').endswith('_x86_0000000000000000')
 
 
-def test_an_unreadable_driver_file_falls_back_rather_than_failing(node_script, tmp_path,
-                                                                  monkeypatch):
+def test_an_unknown_architecture_falls_back_rather_than_failing(node_script, tmp_path,
+                                                                monkeypatch):
+    """A file whose signature checks out but whose machine field is not one of the three
+    known ones keeps the amd64 label rather than aborting the registration. (A file that is
+    not a PE image at all never gets this far: its signature cannot be read, so it is not
+    registered -- see the signature tests below.)"""
     hive_path = _windows_tree(tmp_path)
-    (hive_path.parent.parent / 'drivers' / 'vioscsi.sys').write_bytes(b'not a PE file')
+    (hive_path.parent.parent / 'drivers' / 'vioscsi.sys').write_bytes(_pe_stub('unknown'))
     hives = []
 
     class _Recording(_FakeHive):
@@ -780,3 +803,123 @@ def test_the_first_boot_service_is_registered_in_every_control_set(node_script, 
     assert hives and hives[0].committed
     assert hives[0].node(f'{control_set}\\Services\\PegaProxFirstBoot') is not None
     assert hives[0].node('Select\\Services\\PegaProxFirstBoot') is None
+
+
+# ── a driver the loader will refuse is not made boot-critical ─────────────────
+#
+# Server 2012 R2 against a current virtio-win: winload stops at 0xc0000428 naming
+# viostor.sys, whose certificate table holds only a self-signed Red Hat certificate.
+# Registering it as boot-start turns a guest that boots on SATA into one that does not
+# start at all.
+
+_REFUSED = {'viostor.sys': _SELF_SIGNED, 'vioscsi.sys': _SELF_SIGNED}
+
+
+def test_a_self_signed_storage_driver_is_not_registered(node_script, tmp_path, monkeypatch):
+    out = []
+    hive = _run_registry_program(node_script, tmp_path, monkeypatch, signers=_REFUSED,
+                                 output=out)
+    assert hive.node('ControlSet001\\Services\\vioscsi') is None
+    assert hive.node('ControlSet001\\Services\\viostor') is None
+    assert 'BOOT_SIGNATURE_MISSING vioscsi' in out
+    assert 'BOOT_SIGNATURE_MISSING viostor' in out
+
+
+def test_a_self_signed_driver_gets_no_driver_database_entry_either(node_script, tmp_path,
+                                                                    monkeypatch):
+    hive = _run_registry_program(node_script, tmp_path, monkeypatch, signers=_REFUSED,
+                                 driver_database=True)
+    assert hive.node(f'{_DDB}\\DriverInfFiles\\{_INF["vioscsi"]}') is None
+
+
+def test_a_file_that_is_not_a_pe_image_is_refused(node_script, tmp_path, monkeypatch):
+    hive_path = _windows_tree(tmp_path)
+    (hive_path.parent.parent / 'drivers' / 'vioscsi.sys').write_bytes(b'not a PE file')
+    hives = []
+
+    class _Recording(_FakeHive):
+        def __init__(self, path, write=False):
+            super().__init__(path, write)
+            hives.append(self)
+
+    monkeypatch.setitem(sys.modules, 'hivex',
+                        type('m', (), {'Hivex': _Recording, 'hive_types': _FakeHiveTypes})())
+    monkeypatch.setitem(sys.modules, 'hivex.hive_types', _FakeHiveTypes)
+    monkeypatch.setattr(sys, 'argv', ['-', str(hive_path)])
+    exec(compile(_registry_program(node_script), '<injection>', 'exec'), {'__name__': '__main__'})
+    assert hives[0].node('ControlSet001\\Services\\vioscsi') is None
+
+
+def test_a_driver_without_any_certificate_table_is_refused(node_script, tmp_path, monkeypatch):
+    hive = _run_registry_program(node_script, tmp_path, monkeypatch,
+                                 signers={'vioscsi.sys': b''})
+    assert hive.node('ControlSet001\\Services\\vioscsi') is None
+    assert hive.dword('ControlSet001\\Services\\viostor', 'Start') == 0
+
+
+@pytest.mark.parametrize('signer', [b'Microsoft Code Verification Root',
+                                    b'Microsoft Windows Third Party Component CA 2014',
+                                    b'Microsoft Windows Hardware Compatibility Publisher'])
+def test_each_signer_the_loader_accepts_is_accepted(node_script, tmp_path, monkeypatch, signer):
+    """0.1.189's 2k12R2 drivers chain to Code Verification Root, the 2k16+ variants are
+    signed by the Third Party Component CA, WHQL drivers by the Compatibility Publisher."""
+    hive = _run_registry_program(node_script, tmp_path, monkeypatch,
+                                 signers={'vioscsi.sys': signer})
+    assert hive.dword('ControlSet001\\Services\\vioscsi', 'Start') == 0
+
+
+def test_a_pe32_driver_is_read_at_its_own_directory_offset(node_script, tmp_path, monkeypatch):
+    """The data directories start 16 bytes earlier in a 32-bit image."""
+    hive_path = _windows_tree(tmp_path)
+    (hive_path.parent.parent / 'drivers' / 'vioscsi.sys').write_bytes(
+        _pe_stub('x86', _SIGNED_BY_MICROSOFT, pe32_plus=False))
+    hives = []
+
+    class _Recording(_FakeHive):
+        def __init__(self, path, write=False):
+            super().__init__(path, write)
+            hives.append(self)
+
+    monkeypatch.setitem(sys.modules, 'hivex',
+                        type('m', (), {'Hivex': _Recording, 'hive_types': _FakeHiveTypes})())
+    monkeypatch.setitem(sys.modules, 'hivex.hive_types', _FakeHiveTypes)
+    monkeypatch.setattr(sys, 'argv', ['-', str(hive_path)])
+    exec(compile(_registry_program(node_script), '<injection>', 'exec'), {'__name__': '__main__'})
+    assert hives[0].dword('ControlSet001\\Services\\vioscsi', 'Start') == 0
+
+
+def _injection_with_output(monkeypatch, output):
+    task = _Task()
+
+    def fake_exec(pve_mgr, node, cmd, timeout=600, **kwargs):
+        if 'pvesm path' in cmd:
+            return 0, '/dev/zvol/tank/vm-100-disk-0\n', ''
+        if 'pvesm status' in cmd:
+            return 0, 'zfspool\n', ''
+        if cmd.startswith('VIRTIO_SUBDIR=') or cmd.startswith('bash '):
+            return 0, output, ''
+        return 0, '', ''
+
+    monkeypatch.setattr(v2p, '_pve_node_exec', fake_exec)
+    return v2p._inject_virtio_drivers(_Manager(), task), task
+
+
+def test_a_refused_scsi_driver_fails_the_injection_and_says_what_to_do(monkeypatch):
+    ok, task = _injection_with_output(monkeypatch, (
+        'COPIED vioscsi from 2k12R2/amd64\n'
+        'BOOT_SIGNATURE_MISSING viostor\n'
+        'BOOT_SIGNATURE_MISSING vioscsi\n'
+        'HIVEX have_viostor=False have_vioscsi=False\n'
+        'hivex commit OK\nSVC_REGISTERED\nINJECTION_OK\n'))
+    assert ok is False
+    log = '\n'.join(task.lines)
+    assert 'no signature the Windows loader accepts' in log
+    assert '0.1.189' in log
+
+
+def test_a_signed_scsi_driver_still_succeeds(monkeypatch):
+    ok, _task = _injection_with_output(monkeypatch, (
+        'COPIED vioscsi from 2k22/amd64\n'
+        'HIVEX have_viostor=True have_vioscsi=True\n'
+        'hivex commit OK\nSVC_REGISTERED\nINJECTION_OK\n'))
+    assert ok is True
