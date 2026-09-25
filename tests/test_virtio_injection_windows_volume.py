@@ -173,3 +173,38 @@ def test_the_operator_sees_when_no_windows_directory_was_found(monkeypatch):
 def test_the_generated_script_is_valid_shell(node_script):
     done = subprocess.run(['bash', '-n'], input=node_script, text=True, capture_output=True)
     assert done.returncode == 0, done.stderr
+
+
+# ── the INF directory is spelled the way the guest spells it ─────────────────
+#
+# Server 2012 R2 has Windows\Inf, Server 2022 Windows\INF. ntfs-3g is case-sensitive, so
+# with a hard-coded INF the .inf files never arrived in a 2012 R2 guest's Inf directory.
+
+def _inf_destination(script):
+    start = script.index('INF_DEST=')
+    end = script.index('CAT_DEST=', start)
+    return script[start:end]
+
+
+def _resolve_inf_dir(script, tmp_path, existing):
+    win = tmp_path / 'mnt' / 'Windows'
+    win.mkdir(parents=True)
+    if existing:
+        (win / existing).mkdir()
+    done = subprocess.run(
+        ['bash', '-c', _inf_destination(script) + 'printf %s "$INF_DEST"'],
+        capture_output=True, text=True,
+        env={'PATH': '/usr/bin:/bin', 'WIN_MNT': str(tmp_path / 'mnt'), 'WDIR': 'Windows'})
+    return done.stdout
+
+
+@pytest.mark.parametrize('spelling', ['Inf', 'INF', 'inf'])
+def test_the_inf_directory_the_guest_has_is_used(node_script, tmp_path, spelling):
+    # Compared as a string: bash's glob returns the name as it is stored, so this holds on
+    # a case-insensitive filesystem too, where the old hard-coded INF would also "exist".
+    assert _resolve_inf_dir(node_script, tmp_path, spelling) == \
+        f'{tmp_path}/mnt/Windows/{spelling}'
+
+
+def test_a_guest_without_the_directory_gets_the_usual_spelling(node_script, tmp_path):
+    assert _resolve_inf_dir(node_script, tmp_path, None) == f'{tmp_path}/mnt/Windows/INF'

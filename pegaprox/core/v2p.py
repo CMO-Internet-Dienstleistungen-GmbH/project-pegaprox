@@ -2405,7 +2405,13 @@ def _inject_virtio_drivers(pve_mgr, task):
         "echo \"SUBDIR=$SUBDIR\"\n"
         # Copy SYS / INF / CAT for each driver — try PRIMARY first, then FALLBACKS
         "DRV_DEST=\"$WIN_MNT/$WDIR/System32/drivers\"\n"
-        "INF_DEST=\"$WIN_MNT/$WDIR/INF\"\n"
+        # Resolved rather than assumed: Windows spells this directory INF on some releases
+        # and Inf on others (Server 2012 R2 uses Inf, Server 2022 uses INF), and ntfs-3g,
+        # unlike Windows, is case-sensitive. Hard-coding one spelling dropped the .inf files
+        # on every release using the other -- silently, because the copy below discards its
+        # own errors.
+        "INF_DEST=$(ls -d \"$WIN_MNT/$WDIR\"/[Ii][Nn][Ff] 2>/dev/null | head -1)\n"
+        "[ -n \"$INF_DEST\" ] || INF_DEST=\"$WIN_MNT/$WDIR/INF\"\n"
         # Windows reads .cat from the catalogue store, not from beside the .sys. The
         # GUID is the driver-package class store and is fixed.
         "CAT_DEST=\"$WIN_MNT/$WDIR/System32/CatRoot/"
