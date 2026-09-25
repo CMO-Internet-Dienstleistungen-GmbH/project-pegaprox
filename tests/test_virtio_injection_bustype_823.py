@@ -923,3 +923,25 @@ def test_a_signed_scsi_driver_still_succeeds(monkeypatch):
         'HIVEX have_viostor=True have_vioscsi=True\n'
         'hivex commit OK\nSVC_REGISTERED\nINJECTION_OK\n'))
     assert ok is True
+
+
+# ── a run that registered no storage driver is not a success ─────────────────
+
+def test_a_run_that_registered_no_storage_driver_fails(monkeypatch):
+    """COPIED counts the network driver too, so this output used to end in a tick."""
+    ok, task = _injection_with_output(monkeypatch, (
+        'COPIED NetKVM from w11/amd64\n'
+        'SKIP viostor (not in w11/amd64)\n'
+        'SKIP vioscsi (not in w11/amd64)\n'
+        'HIVEX have_viostor=False have_vioscsi=False\n'
+        'hivex commit OK\nSVC_REGISTERED\nINJECTION_OK\n'))
+    assert ok is False
+    assert any('Neither storage driver was registered' in line for line in task.lines)
+
+
+def test_one_storage_driver_is_enough(monkeypatch):
+    ok, _task = _injection_with_output(monkeypatch, (
+        'COPIED viostor from w11/amd64\n'
+        'HIVEX have_viostor=True have_vioscsi=False\n'
+        'hivex commit OK\nSVC_REGISTERED\nINJECTION_OK\n'))
+    assert ok is True

@@ -2872,6 +2872,16 @@ def _inject_virtio_drivers(pve_mgr, task):
                  "install the drivers from inside the guest.")
         return False
 
+    # Neither storage driver registered is not a success, whatever else was copied. The
+    # script counts every driver it staged, so a run that found only the network driver in
+    # the chosen subdirectory used to print INJECTION_OK and hand over a VM with no way to
+    # reach its disk on VirtIO hardware.
+    if 'HIVEX have_viostor=False have_vioscsi=False' in out_str:
+        task.log("[VirtIO] ✗ Neither storage driver was registered, so the VM has no way to "
+                 "reach its disk on VirtIO hardware. The driver ISO has no usable variant "
+                 "for this guest's Windows version.")
+        return False
+
     if rc == 0 and 'INJECTION_OK' in out_str:
         task.log("[VirtIO] ✓ Drivers staged + registry merged.")
         # NS May 2026 — log which drivers actually got staged (per-driver bash output)
