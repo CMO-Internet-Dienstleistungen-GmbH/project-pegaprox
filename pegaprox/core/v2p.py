@@ -2418,8 +2418,8 @@ def _inject_virtio_drivers(pve_mgr, task):
         "fi; "
         "done\n"
         "[ \"$COPIED\" -gt 0 ] || { echo 'NO_DRIVERS_COPIED'; exit 8; }\n"
-        # Inject SYSTEM-hive registry: CriticalDeviceDatabase + Services for storage drivers.
-        # We always target ControlSet001 (the most common; Windows fixes Select on next boot).
+        # Inject SYSTEM-hive registry: CriticalDeviceDatabase + Services for storage drivers,
+        # into every ControlSet### the hive has (see the loop below for why).
         # NS Apr 2026 — using python3-hivex (well-supported on Debian/Proxmox) instead of
         # hivexregedit which Debian's libhivex-bin doesn't ship.
         "SYSTEM_HIVE=\"$WIN_MNT/$WDIR/System32/config/SYSTEM\"\n"
@@ -2461,10 +2461,17 @@ def _inject_virtio_drivers(pve_mgr, task):
         "have_vioscsi = os.path.exists(drv_root + '/vioscsi.sys')\n"
         "print(f'HIVEX have_viostor={have_viostor} have_vioscsi={have_vioscsi}')\n"
         "root = h.root()\n"
-        "cs = navigate(root, ['ControlSet001'])\n"
-        "services = navigate(cs, ['Services'])\n"
-        "control = navigate(cs, ['Control'])\n"
-        "cdb = navigate(control, ['CriticalDeviceDatabase'])\n"
+        # Every control set the hive has, not ControlSet001 alone. Which one boots is
+        # Select\Current, and the one a failed boot falls back to is Select\LastKnownGood --
+        # on the images measured Current=1 and LastKnownGood=2, with no storage driver in
+        # ControlSet002. Writing only 001 meant one failed boot moved the guest into a set
+        # that cannot reach its own disk. Which set will be active is not knowable from
+        # outside the guest, so all of them get the entries; a hive that has none gets 001.
+        "control_sets = [h.node_name(c) for c in h.node_children(root)\n"
+        "                if h.node_name(c).lower().startswith('controlset')\n"
+        "                and h.node_name(c)[len('controlset'):].isdigit()]\n"
+        "control_sets = control_sets or ['ControlSet001']\n"
+        "print('HIVEX control sets: ' + ', '.join(control_sets))\n"
         # The driver's own INF is the source for these values: HKR,"Parameters",...
         # in the same directory the .sys was taken from. Read at injection time, so a
         # virtio-win release that changes one does not need this file changed with it.
@@ -2553,23 +2560,11 @@ def _inject_virtio_drivers(pve_mgr, task):
         "_svcs = []\n"
         "if have_viostor: _svcs.append(('viostor', 0x58, 'system32\\\\drivers\\\\viostor.sys', 0x01))\n"
         "if have_vioscsi: _svcs.append(('vioscsi', 0x59, 'system32\\\\drivers\\\\vioscsi.sys', 0x0A))\n"
-        "for svc, tag, img, bus_type in _svcs:\n"
-        "    svc_node = navigate(services, [svc])\n"
-        "    set_expand_sz(svc_node, 'ImagePath', img)\n"
-        "    set_dword(svc_node, 'Type', 1)\n"
-        "    set_dword(svc_node, 'Start', 0)\n"
-        "    set_sz(svc_node, 'Group', 'SCSI miniport')\n"
-        "    set_dword(svc_node, 'ErrorControl', 1)\n"
-        "    set_dword(svc_node, 'Tag', tag)\n"
-        "    params = navigate(svc_node, ['Parameters'])\n"
         # Both INFs set DmaRemappingCompatible next to BusType; the injection wrote
-        # neither per driver before.
-        "    _p = inf_parameters(svc, {'BusType': bus_type,\n"
-        "                              'DmaRemappingCompatible': 0})\n"
-        "    set_dword(params, 'BusType', _p['BusType'])\n"
-        "    set_dword(params, 'DmaRemappingCompatible', _p['DmaRemappingCompatible'])\n"
-        "    pnp = navigate(params, ['PnpInterface'])\n"
-        "    set_dword(pnp, '5', 1)\n"
+        # neither per driver before. Read once per driver, written into every set.
+        "_params = {svc: inf_parameters(svc, {'BusType': bus_type,\n"
+        "                                     'DmaRemappingCompatible': 0})\n"
+        "           for svc, _tag, _img, bus_type in _svcs}\n"
         "GUID = '{4D36E97B-E325-11CE-BFC1-08002BE10318}'\n"
         # The same GUID as sixteen raw bytes, which is how the driver database stores it.
         "GUID_BYTES = bytes.fromhex('7be9364d25e3ce11bfc108002be10318')\n"
@@ -2605,10 +2600,28 @@ def _inject_virtio_drivers(pve_mgr, task):
         "             ('pci#ven_1af4&dev_1004&subsys_00081af4', 'vioscsi'),\n"
         "             ('pci#ven_1af4&dev_1048', 'vioscsi'),\n"
         "             ('pci#ven_1af4&dev_1048&subsys_11001af4&rev_01', 'vioscsi')]\n"
-        "for pci_id, svc in _pci:\n"
-        "    cd = navigate(cdb, [pci_id])\n"
-        "    set_sz(cd, 'ClassGUID', GUID)\n"
-        "    set_sz(cd, 'Service', svc)\n"
+        "for cs_name in control_sets:\n"
+        "    cs = navigate(root, [cs_name])\n"
+        "    services = navigate(cs, ['Services'])\n"
+        "    cdb = navigate(navigate(cs, ['Control']), ['CriticalDeviceDatabase'])\n"
+        "    for svc, tag, img, bus_type in _svcs:\n"
+        "        svc_node = navigate(services, [svc])\n"
+        "        set_expand_sz(svc_node, 'ImagePath', img)\n"
+        "        set_dword(svc_node, 'Type', 1)\n"
+        "        set_dword(svc_node, 'Start', 0)\n"
+        "        set_sz(svc_node, 'Group', 'SCSI miniport')\n"
+        "        set_dword(svc_node, 'ErrorControl', 1)\n"
+        "        set_dword(svc_node, 'Tag', tag)\n"
+        "        params = navigate(svc_node, ['Parameters'])\n"
+        "        set_dword(params, 'BusType', _params[svc]['BusType'])\n"
+        "        set_dword(params, 'DmaRemappingCompatible',\n"
+        "                  _params[svc]['DmaRemappingCompatible'])\n"
+        "        pnp = navigate(params, ['PnpInterface'])\n"
+        "        set_dword(pnp, '5', 1)\n"
+        "    for pci_id, svc in _pci:\n"
+        "        cd = navigate(cdb, [pci_id])\n"
+        "        set_sz(cd, 'ClassGUID', GUID)\n"
+        "        set_sz(cd, 'Service', svc)\n"
         # Windows 8 and Server 2012 and everything after them do not read the
         # CriticalDeviceDatabase any more. They bind a boot device through
         # HKLM\SYSTEM\DriverDatabase, so a guest whose disk driver is registered only the
@@ -2725,9 +2738,10 @@ def _inject_virtio_drivers(pve_mgr, task):
         "    '(sc delete PegaProxFirstBoot >> \"C:\\\\PegaProx\\\\service.log\" 2>&1) & '\n"
         "    '(del \"C:\\\\PegaProx\\\\virtio-win-gt-x64.msi\" 2>nul)'\n"
         ")\n"
-        "for cs_name in ['ControlSet001','ControlSet002']:\n"
-        "    cs = fc(h.root(), cs_name)\n"
-        "    if cs is None: continue\n"
+        # Every control set present, for the same reason as the driver entries above.
+        "for cs in [c for c in h.node_children(h.root())\n"
+        "           if h.node_name(c).lower().startswith('controlset')\n"
+        "           and h.node_name(c)[len('controlset'):].isdigit()]:\n"
         "    services = fc(cs, 'Services')\n"
         "    if services is None: continue\n"
         "    svc = navigate(services, ['PegaProxFirstBoot'])\n"
@@ -2782,7 +2796,7 @@ def _inject_virtio_drivers(pve_mgr, task):
     # Most markers are once-per-run; COPIED/SKIP/COPY_FAILED are per-driver
     # so we log all of them (otherwise we'd hide which drivers actually staged).
     _multi = ('COPIED ', 'SKIP ', 'COPY_FAILED ', 'INF ', 'DriverDatabase ')
-    for marker in ['WIN_PART=', 'WDIR=', 'VER_NAME=', 'VER_BUILD=', 'SUBDIR_PRIMARY=', 'SUBDIR_FALLBACKS=', 'SUBDIR=', 'COPIED ', 'SKIP ', 'COPY_FAILED ', 'INF ', 'DriverDatabase ', 'MSI_STAGED ', 'MSI_MISSING', 'SVC_REGISTERED', 'SVC_FAILED', 'INJECTION_OK']:
+    for marker in ['WIN_PART=', 'WDIR=', 'HIVEX control sets: ', 'VER_NAME=', 'VER_BUILD=', 'SUBDIR_PRIMARY=', 'SUBDIR_FALLBACKS=', 'SUBDIR=', 'COPIED ', 'SKIP ', 'COPY_FAILED ', 'INF ', 'DriverDatabase ', 'MSI_STAGED ', 'MSI_MISSING', 'SVC_REGISTERED', 'SVC_FAILED', 'INJECTION_OK']:
         for line in out_str.splitlines():
             if marker in line:
                 task.log(f"[VirtIO] {line.strip()}")

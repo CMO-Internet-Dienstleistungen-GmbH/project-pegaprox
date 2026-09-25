@@ -105,6 +105,12 @@ class _FakeHive:
         node.children[name] = child
         return child
 
+    def node_children(self, node):
+        return list(node.children.values())
+
+    def node_name(self, node):
+        return node.name
+
     def node_set_value(self, node, value):
         node.values[value['key']] = (value['t'], value['value'])
 
@@ -200,7 +206,7 @@ def _windows_tree(tmp_path, drivers=('viostor.sys', 'vioscsi.sys'), arch='amd64'
 
 def _run_registry_program(script, tmp_path, monkeypatch, argv_extra=(),
                           drivers=('viostor.sys', 'vioscsi.sys'),
-                          driver_database=False, arch='amd64'):
+                          driver_database=False, arch='amd64', keys=()):
     hive_path = _windows_tree(tmp_path, drivers, arch)
     hives = []
 
@@ -211,6 +217,8 @@ def _run_registry_program(script, tmp_path, monkeypatch, argv_extra=(),
                 # A Windows 8 or newer guest has this branch; older ones do not, and the
                 # program has to tell the two apart by looking.
                 self.node_add_child(self._root, 'DriverDatabase')
+            for key in keys:
+                self.node_add_child(self._root, key)
             hives.append(self)
 
     monkeypatch.setitem(sys.modules, 'hivex',
@@ -699,3 +707,76 @@ def test_a_driver_that_never_arrived_gets_no_database_entry_either(node_script, 
     assert hive.node(f'{_DDB}\\DriverInfFiles\\{_INF["viostor"]}') is not None
     assert hive.node(f'{_DDB}\\DriverInfFiles\\{_INF["vioscsi"]}') is None
     assert hive.node(f'{_DDB}\\DeviceIds\\PCI\\VEN_1AF4&DEV_1048&REV_01') is None
+
+
+# ── every control set, not ControlSet001 alone ───────────────────────────────
+#
+# Select\Current picks the set that boots, Select\LastKnownGood the one a failed boot
+# falls back to. On the images measured those were 1 and 2, and ControlSet002 carried
+# no storage driver, so one failed boot left the guest in a set that cannot reach its
+# disk.
+
+_THREE_SETS = ('ControlSet001', 'ControlSet002', 'ControlSet003', 'Select', 'Setup')
+
+
+@pytest.mark.parametrize('control_set', ['ControlSet001', 'ControlSet002', 'ControlSet003'])
+@pytest.mark.parametrize('driver', ['viostor', 'vioscsi'])
+def test_every_control_set_the_hive_has_gets_the_driver(node_script, tmp_path, monkeypatch,
+                                                         control_set, driver):
+    hive = _run_registry_program(node_script, tmp_path, monkeypatch, keys=_THREE_SETS)
+    svc = f'{control_set}\\Services\\{driver}'
+    assert hive.dword(svc, 'Start') == 0
+    assert hive.dword(f'{svc}\\Parameters', 'BusType') == {'viostor': 0x01,
+                                                            'vioscsi': 0x0A}[driver]
+
+
+@pytest.mark.parametrize('control_set', ['ControlSet001', 'ControlSet002', 'ControlSet003'])
+def test_every_control_set_gets_the_legacy_device_binding(node_script, tmp_path, monkeypatch,
+                                                           control_set):
+    hive = _run_registry_program(node_script, tmp_path, monkeypatch, keys=_THREE_SETS)
+    cdb = f'{control_set}\\Control\\CriticalDeviceDatabase'
+    assert hive.string(f'{cdb}\\pci#ven_1af4&dev_1048', 'Service') == 'vioscsi'
+    assert hive.string(f'{cdb}\\pci#ven_1af4&dev_1042', 'Service') == 'viostor'
+
+
+def test_keys_that_are_not_control_sets_are_left_alone(node_script, tmp_path, monkeypatch):
+    hive = _run_registry_program(node_script, tmp_path, monkeypatch, keys=_THREE_SETS)
+    assert hive.node('Select').children == {}
+    assert hive.node('Setup').children == {}
+
+
+def test_a_hive_without_a_control_set_still_gets_controlset001(written):
+    """The fake hive of the other tests starts empty; a real one never does, but the old
+    target must not be lost when the listing finds nothing."""
+    assert written.dword('ControlSet001\\Services\\vioscsi', 'Start') == 0
+
+
+def _first_boot_program(script):
+    body = script.split("<< 'PYSV'", 1)[1].split('\n', 1)[1]
+    return body.split('\nPYSV\n', 1)[0]
+
+
+@pytest.mark.parametrize('control_set', ['ControlSet001', 'ControlSet002', 'ControlSet003'])
+def test_the_first_boot_service_is_registered_in_every_control_set(node_script, tmp_path,
+                                                                    monkeypatch, control_set):
+    """It used to name ControlSet001 and ControlSet002 by hand -- a third guess at the same
+    question, and one that missed a third set."""
+    hive_path = _windows_tree(tmp_path)
+    hives = []
+
+    class _Recording(_FakeHive):
+        def __init__(self, path, write=False):
+            super().__init__(path, write)
+            for key in _THREE_SETS:
+                self.node_add_child(self.node_add_child(self._root, key), 'Services')
+            hives.append(self)
+
+    monkeypatch.setitem(sys.modules, 'hivex',
+                        type('m', (), {'Hivex': _Recording, 'hive_types': _FakeHiveTypes})())
+    monkeypatch.setitem(sys.modules, 'hivex.hive_types', _FakeHiveTypes)
+    monkeypatch.setattr(sys, 'argv', ['-', str(hive_path), '1'])
+    exec(compile(_first_boot_program(node_script), '<first-boot>', 'exec'),
+         {'__name__': '__main__'})
+    assert hives and hives[0].committed
+    assert hives[0].node(f'{control_set}\\Services\\PegaProxFirstBoot') is not None
+    assert hives[0].node('Select\\Services\\PegaProxFirstBoot') is None
