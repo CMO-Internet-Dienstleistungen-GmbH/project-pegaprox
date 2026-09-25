@@ -2068,8 +2068,8 @@ def _register_uefi_fallback_loader(pve_mgr, task):
 
 # NS Apr 2026 — Offline VirtIO driver injection. Opt-in. Lifted from virt-v2v's
 # approach but slimmed down for our pipeline: we already have the disks materialized
-# as Proxmox LVs by this point, so we losetup+kpartx them, ntfs-3g mount the largest
-# NTFS partition, copy the right SYS/INF/CAT files out of virtio-win.iso, and merge
+# as Proxmox LVs by this point, so we losetup+kpartx them, ntfs-3g mount the NTFS
+# partition that holds Windows, copy the right SYS/INF/CAT files out of virtio-win.iso, and merge
 # a registry stub into the SYSTEM hive that flags the storage drivers as boot-critical.
 # After this, the user can switch scsihw to virtio-scsi-pci (or net0 to virtio) without
 # Windows BSODing on next boot.
@@ -2312,18 +2312,37 @@ def _inject_virtio_drivers(pve_mgr, task):
         "[ -b \"$LOOP\" ] || { echo \"LOSETUP_FAILED:$LOOP\"; exit 4; }\n"
         # Wait briefly for partition nodes to materialize
         "for i in 1 2 3 4 5; do ls -1 ${LOOP}p* 2>/dev/null | head -1 >/dev/null && break; sleep 1; done\n"
-        # Find largest NTFS partition (Windows volume)
-        "WIN_PART=$(for p in ${LOOP}p*; do "
+        # Every NTFS partition, largest first.
+        "NTFS_PARTS=$(for p in ${LOOP}p*; do "
         "[ -b \"$p\" ] || continue; "
         "FT=$(blkid -s TYPE -o value \"$p\" 2>/dev/null); "
         "[ \"$FT\" = ntfs ] || continue; "
         "SZ=$(blockdev --getsize64 \"$p\" 2>/dev/null); "
         "echo \"$SZ $p\"; "
-        "done | sort -rn | head -1 | awk '{print $2}')\n"
-        "[ -n \"$WIN_PART\" ] || { echo 'NO_NTFS_FOUND'; "
+        "done | sort -rn | awk '{print $2}')\n"
+        "[ -n \"$NTFS_PARTS\" ] || { echo 'NO_NTFS_FOUND'; "
         "echo 'partitions seen:'; ls -la ${LOOP}p* 2>/dev/null; "
         "echo 'blkid output:'; for p in ${LOOP}p*; do blkid \"$p\" 2>/dev/null; done; "
         "exit 5; }\n"
+        # The Windows volume is the one that holds Windows, not the largest one. A disk
+        # with a 100 GB system partition and a 700 GB data partition used to have the data
+        # partition mounted, and the injection ended in NO_WINDOWS_DIR. Each candidate is
+        # looked at read-only first: nothing is written to a partition until it is known to
+        # be the right one, and ntfs-3g mounts a hibernated or uncleanly dismounted volume
+        # read-only where it refuses read-write.
+        "WIN_PART=\"\"\n"
+        "for p in $NTFS_PARTS; do "
+        "mount -t ntfs-3g -o ro \"$p\" \"$WIN_MNT\" 2>/dev/null || continue; "
+        "for d in Windows WINDOWS windows; do "
+        "[ -d \"$WIN_MNT/$d/System32/config\" ] && { WIN_PART=\"$p\"; break; }; "
+        "done; "
+        "umount \"$WIN_MNT\" 2>/dev/null||true; "
+        "[ -n \"$WIN_PART\" ] && break; "
+        "done\n"
+        # None of them showed a Windows directory read-only: keep the old choice, so the
+        # run ends where it always did and says so, rather than somewhere new.
+        "[ -n \"$WIN_PART\" ] || { WIN_PART=$(echo \"$NTFS_PARTS\" | head -1); "
+        "echo 'WINDOWS_PARTITION_NOT_IDENTIFIED'; }\n"
         "echo \"WIN_PART=$WIN_PART\"\n"
         # NS Apr 2026 — Windows guests almost always leave NTFS in "Fast Startup
         # hibrid hibernated" state after a "clean" shutdown (Win10/11 default).
@@ -2602,7 +2621,7 @@ def _inject_virtio_drivers(pve_mgr, task):
     # Most markers are once-per-run; COPIED/SKIP/COPY_FAILED are per-driver
     # so we log all of them (otherwise we'd hide which drivers actually staged).
     _multi = ('COPIED ', 'SKIP ', 'COPY_FAILED ')
-    for marker in ['WIN_PART=', 'WDIR=', 'VER_NAME=', 'VER_BUILD=', 'SUBDIR_PRIMARY=', 'SUBDIR_FALLBACKS=', 'SUBDIR=', 'COPIED ', 'SKIP ', 'COPY_FAILED ', 'MSI_STAGED ', 'MSI_MISSING', 'SVC_REGISTERED', 'SVC_FAILED', 'INJECTION_OK']:
+    for marker in ['WIN_PART=', 'WINDOWS_PARTITION_NOT_IDENTIFIED', 'WDIR=', 'VER_NAME=', 'VER_BUILD=', 'SUBDIR_PRIMARY=', 'SUBDIR_FALLBACKS=', 'SUBDIR=', 'COPIED ', 'SKIP ', 'COPY_FAILED ', 'MSI_STAGED ', 'MSI_MISSING', 'SVC_REGISTERED', 'SVC_FAILED', 'INJECTION_OK']:
         for line in out_str.splitlines():
             if marker in line:
                 task.log(f"[VirtIO] {line.strip()}")
