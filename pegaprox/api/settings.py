@@ -4026,12 +4026,19 @@ def check_cluster_updates(cluster_id):
             }
         })
     
-    # SS (Sep 2026): touch only online nodes and validate each name against the same
-    # RFC-ish allow-list the /health fan-out uses: PVE controls these, but a crafted
-    # name like `../foo` must not reach the URL builders.
+    # SS (Sep 2026): validate each node name against an allow-list that permits letters,
+    # digits, dots and hyphens but rejects path separators, so a crafted name like
+    # `../foo` can't reach the URL builders. (node_names is already trimmed to online
+    # nodes upstream — the only thing added here is the name allow-list.)
     import re as _re
-    _SAFE_NODE = _re.compile(r'^[a-zA-Z][a-zA-Z0-9.\-]{0,62}$')
-    safe_node_names = [n for n in node_names if n and _SAFE_NODE.match(n)]
+    _SAFE_NODE = _re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9.\-]{0,62}$')
+    safe_node_names = []
+    unsafe_node_names = []
+    for n in node_names:
+        if n and _SAFE_NODE.match(n):
+            safe_node_names.append(n)
+        else:
+            unsafe_node_names.append(n)
 
     # SS (Sep 2026): Proxmox's GET /nodes/{node}/apt/update only ever returns the
     # output of the LAST `apt update` that ran, and yum's `check-update` reads a local
@@ -4099,7 +4106,20 @@ def check_cluster_updates(cluster_id):
             'updates': [],
             'count': -1,
         }
-    
+
+    # SS (Sep 2026): node names that fail the allow-list are excluded from the concurrent
+    # check above, but we still record them as an explicit unchecked failure (count == -1),
+    # same as a failed read. Otherwise a dropped node reads as "nothing to report" instead
+    # of "we never looked" — and a legal digit-led hostname like `1blade` would vanish.
+    for node_name in unsafe_node_names:
+        results[node_name] = {
+            'success': False,
+            'error': 'Node name failed allow-list validation',
+            'updates': [],
+            'count': -1,
+        }
+        logging.warning(f"[UpdateCheck] rejecting node name outside allow-list: {node_name!r}")
+
     # MK: count > 0 for updates, ignore -1 (failed checks)
     total_updates = sum(max(r.get('count', 0), 0) for r in results.values())
     nodes_with_updates = sum(1 for r in results.values() if r.get('count', 0) > 0)
