@@ -4052,15 +4052,37 @@ def check_cluster_updates(cluster_id):
         # 1) Refresh first (POST for Proxmox, `yum makecache` for XCP-ng). Proxmox
         #    hands back a UPID; wait on that task so the read below is guaranteed fresh.
         #    XCP-ng's makecache has no task to await, so give it a moment to settle.
+        refresh_error = None
         try:
             refreshed = mgr.refresh_node_apt(node_name)
-            task_ref = refreshed.get('task') if isinstance(refreshed, dict) else None
-            if task_ref:
-                mgr._wait_for_task(node_name, task_ref, timeout=120)
+            if not isinstance(refreshed, dict):
+                refresh_error = 'refresh returned an unexpected shape'
+            elif refreshed.get('success') is False:
+                refresh_error = refreshed.get('error') or 'apt refresh failed'
             else:
-                time.sleep(10)
+                task_ref = refreshed.get('task')
+                if task_ref:
+                    if not mgr._wait_for_task(node_name, task_ref, timeout=120):
+                        refresh_error = 'the apt refresh task did not finish cleanly'
+                else:
+                    time.sleep(10)
         except Exception as e:
-            logging.warning(f"[UpdateCheck] refresh failed for {node_name}: {e}")
+            refresh_error = str(e)
+
+        # MK Sep 2026 - a failed refresh must NOT fall through to the read below.
+        # get_node_apt_updates answers from whatever apt last wrote on the node, so
+        # reading after a failed refresh returns stale data that then goes out as
+        # success: True and is held by the 24h update-check cache. "could not
+        # refresh" is not "no updates"; report it with the same count == -1 the
+        # read failures use.
+        if refresh_error:
+            logging.error(f"[UpdateCheck] {node_name} refresh failed: {refresh_error}")
+            return {
+                'success': False,
+                'error': f"apt refresh failed: {refresh_error}",
+                'updates': [],
+                'count': -1,
+            }
 
         # 2) Read the available-updates list, retrying briefly on a transient failure so
         #    one flaky node doesn't sink the whole cluster.
