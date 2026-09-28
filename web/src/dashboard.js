@@ -8489,6 +8489,16 @@
                 if (saved === 'light') document.body.dataset.corpTheme = 'light';
                 return saved === 'light';
             });
+            // LW Sep 2026 (#743 Frisch12) — Corporate hides the theme grid (#742), so the
+            // header toggle is the only place a corporate user can reach the new option.
+            // It cycles system -> light -> dark -> system instead of growing a third control.
+            const [corpMode, setCorpMode] = useState(() => {
+                try {
+                    return localStorage.getItem('pegaprox-theme') === 'system'
+                        ? 'system'
+                        : (localStorage.getItem('corp-theme') === 'light' ? 'light' : 'dark');
+                } catch (_) { return 'dark'; }
+            });
             const [globalSearchResults, setGlobalSearchResults] = useState(null);
             const [globalSearchLoading, setGlobalSearchLoading] = useState(false);
             const [showGlobalSearch, setShowGlobalSearch] = useState(false);
@@ -14218,11 +14228,22 @@
                                     {isCorporate && (
                                         <button
                                             onClick={() => {
-                                                const next = !corpLight;
-                                                document.body.dataset.corpTheme = next ? 'light' : '';
-                                                localStorage.setItem('corp-theme', next ? 'light' : '');
-                                                applyTheme(next ? 'corporateLight' : 'corporateDark');
-                                                setCorpLight(next);
+                                                const order = { system: 'light', light: 'dark', dark: 'system' };
+                                                const next = order[corpMode] || 'system';
+                                                const theme = next === 'system' ? 'system'
+                                                            : (next === 'light' ? 'corporateLight' : 'corporateDark');
+                                                // in system mode applyTheme() owns data-corp-theme and the
+                                                // local toggle must stop claiming to know better
+                                                if (next === 'system') {
+                                                    localStorage.removeItem('corp-theme');
+                                                } else {
+                                                    document.body.dataset.corpTheme = next === 'light' ? 'light' : '';
+                                                    localStorage.setItem('corp-theme', next === 'light' ? 'light' : '');
+                                                }
+                                                applyTheme(theme);
+                                                setCorpMode(next);
+                                                setCorpLight(next === 'light' ||
+                                                    (next === 'system' && document.body.dataset.corpTheme === 'light'));
                                                 // MK May 2026 — also persist on server so checkSession on next
                                                 // F5 doesn't apply a stale user.theme that mismatches the local
                                                 // corp-theme toggle (caused taskbar bg-proxmox-dark/50 to render
@@ -14230,13 +14251,16 @@
                                                 fetch(`${API_URL}/user/preferences`, {
                                                     method: 'PUT', credentials: 'include',
                                                     headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
-                                                    body: JSON.stringify({ theme: next ? 'corporateLight' : 'corporateDark' })
+                                                    body: JSON.stringify({ theme })
                                                 }).catch(() => {});
                                             }}
                                             className="p-1.5 rounded hover:bg-white/10 text-gray-400 hover:text-white transition-colors"
-                                            title={corpLight ? 'Dark Mode' : 'Light Mode'}
+                                            title={corpMode === 'system' ? (t('lightMode') || 'Light Mode')
+                                                 : corpMode === 'light' ? (t('darkMode') || 'Dark Mode')
+                                                 : (t('followSystem') || 'Follow system')}
                                         >
-                                            {corpLight ? <Icons.Moon /> : <Icons.Sun />}
+                                            {corpMode === 'system' ? <Icons.Monitor />
+                                             : corpMode === 'light' ? <Icons.Moon /> : <Icons.Sun />}
                                         </button>
                                     )}
 
@@ -15169,8 +15193,10 @@
                                                 // render when the manifest declared has_frontend AND the
                                                 // server normalised frontend_route to /api/plugins/<id>/...
                                                 // (server-side validation in pegaprox/api/plugins.py).
+                                                // #642 — and only on the clusters it was limited to
                                                 const pluginFrontendTabs = (enabledPlugins || [])
                                                     .filter(p => p && p.has_frontend && p.frontend_route)
+                                                    .filter(p => pluginAppliesToCluster(p, selectedCluster?.id))
                                                     .map(p => ({
                                                         id: `plugin:${p.id}`,
                                                         label: p.name || p.id,  // shown verbatim

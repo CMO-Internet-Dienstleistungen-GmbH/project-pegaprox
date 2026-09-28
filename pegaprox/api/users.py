@@ -306,7 +306,8 @@ def update_user_preferences():
         'highContrast', 'dracula', 'nord', 'monokai', 'matrix', 'sunset',
         'cyberpunk', 'github', 'solarizedDark', 'gruvbox',
         'corporateDark', 'corporateLight', 'enterpriseBlue',  # NS: Corporate themes
-        'cloud'  # NS 2026-06-05: Cloud skin (Preview)
+        'cloud',  # NS 2026-06-05: Cloud skin (Preview)
+        'system'  # LW Sep 2026 (#743): resolves to a real palette in the browser
     ]
     
     if 'theme' in data:

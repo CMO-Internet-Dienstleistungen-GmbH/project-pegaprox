@@ -1594,7 +1594,8 @@ def update_server_settings():
                     'proxmoxDark', 'proxmoxLight', 'midnight', 'forest', 'rose', 'ocean',
                     'highContrast', 'dracula', 'nord', 'monokai', 'matrix', 'sunset',
                     'cyberpunk', 'github', 'solarizedDark', 'gruvbox',
-                    'corporateDark', 'corporateLight', 'enterpriseBlue'  # NS: Corporate themes
+                    'corporateDark', 'corporateLight', 'enterpriseBlue',  # NS: Corporate themes
+                    'cloud', 'system'  # LW Sep 2026 (#743); `cloud` was missing here
                 ]
                 if data['default_theme'] in allowed_themes:
                     settings['default_theme'] = data['default_theme']
@@ -1807,7 +1808,8 @@ def update_server_settings():
                 'proxmoxDark', 'proxmoxLight', 'midnight', 'forest', 'rose', 'ocean',
                 'highContrast', 'dracula', 'nord', 'monokai', 'matrix', 'sunset',
                 'cyberpunk', 'github', 'solarizedDark', 'gruvbox',
-                'corporateDark', 'corporateLight', 'enterpriseBlue'  # NS: Corporate themes
+                'corporateDark', 'corporateLight', 'enterpriseBlue',  # NS: Corporate themes
+                'cloud', 'system'  # LW Sep 2026 (#743); `cloud` was missing here
             ]
             if default_theme in allowed_themes:
                 settings['default_theme'] = default_theme
@@ -4356,6 +4358,15 @@ def start_rolling_update(cluster_id):
     
     mgr = cluster_managers[cluster_id]
     data = request.get_json() or {}
+
+    # MK Sep 2026 (#716 hugobugomugo) — alert channels to tell about this run, so the
+    # on-call monitoring can be muted for its actual duration instead of a guessed
+    # maintenance window. Opt-in: no ids, no traffic.
+    notify_channels = data.get('notify_channels', [])
+    if notify_channels is None:
+        notify_channels = []
+    if not isinstance(notify_channels, list) or not all(isinstance(c, str) for c in notify_channels):
+        return jsonify({'error': 'notify_channels must be a list of channel ids'}), 400
     
     # Configuration options
     include_reboot = data.get('include_reboot', False)
@@ -4461,9 +4472,16 @@ def start_rolling_update(cluster_id):
 
     # Start the rolling update in a background thread
     def run_rolling_update():
+        from pegaprox.utils.webhooks import notify_lifecycle   # #716
         try:
             logging.info(f"[RollingUpdate] Starting rolling update for cluster, nodes: {nodes_to_update}")
             _log("Rolling update started")
+            # #716 — the signal the monitoring mutes on
+            notify_lifecycle('rolling_update.started',
+                             f"Rolling update started on {mgr.config.name}",
+                             f"{len(nodes_to_update)} node(s) queued: {', '.join(nodes_to_update)}"
+                             + (" · reboots included" if include_reboot else ""),
+                             cluster_id=cluster_id, channel_ids=notify_channels)
             _log(f"Settings: skip_up_to_date={skip_up_to_date}, skip_evacuation={skip_evacuation}, evacuation_timeout={evacuation_timeout}s, reboot_timeout={reboot_timeout}s, allow_local_disks={allow_local_disks}, ceph_health_gate={ceph_health_gate}")
 
             if skip_evacuation:
@@ -4930,13 +4948,26 @@ def start_rolling_update(cluster_id):
             mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] === Rolling update completed ===")
             mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Summary: {completed} updated, {skipped} skipped (up-to-date), {failed} failed")
             logging.info(f"[RollingUpdate] Rolling update completed: {completed} updated, {skipped} skipped, {failed} failed")
-            
+            # #716 — un-mute, and say whether anyone needs to look
+            notify_lifecycle('rolling_update.finished',
+                             f"Rolling update finished on {mgr.config.name}",
+                             f"{completed} updated, {skipped} skipped (up-to-date), {failed} failed",
+                             cluster_id=cluster_id,
+                             severity='warning' if failed else 'info',
+                             channel_ids=notify_channels)
+
         except Exception as e:
             logging.error(f"[RollingUpdate] Rolling update failed with exception: {e}")
             mgr._rolling_update['status'] = 'failed'
             mgr._rolling_update['completed_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
             mgr._rolling_update['error'] = str(e)
             mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Rolling update failed: {e}")
+            # #716 — a run that died is exactly when the on-call wants to be un-muted
+            notify_lifecycle('rolling_update.finished',
+                             f"Rolling update FAILED on {mgr.config.name}",
+                             f"The run stopped with an error: {e}",
+                             cluster_id=cluster_id, severity='critical',
+                             channel_ids=notify_channels)
     
     import threading
     update_thread = threading.Thread(target=run_rolling_update, daemon=True)

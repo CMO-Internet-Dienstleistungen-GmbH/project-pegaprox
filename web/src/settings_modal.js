@@ -6652,6 +6652,45 @@
                                                             {plugin.author && <p className="text-xs text-gray-500">{t('pluginAuthor') || 'by'} {plugin.author}</p>}
                                                             {plugin.description && <p className="text-xs text-gray-400 mt-0.5">{plugin.description}</p>}
                                                             {plugin.error && <p className="text-xs text-red-400 mt-0.5">{plugin.error}</p>}
+                                                            {/* MK Sep 2026 (#642 maxilee) — which clusters this plugin belongs to.
+                                                                Nothing ticked = every cluster, which is where plugins start and
+                                                                what the reporter's standalone nodes were seeing. */}
+                                                            {clusters.length > 1 && (
+                                                                <div className="mt-1.5 flex items-center gap-2 flex-wrap">
+                                                                    <span className="text-xs text-gray-500">
+                                                                        {t('showOnClusters') || 'Show on'}:
+                                                                    </span>
+                                                                    {(plugin.clusters || []).length === 0 && (
+                                                                        <span className="text-xs text-gray-400">
+                                                                            {t('allClusters') || 'All clusters'}
+                                                                        </span>
+                                                                    )}
+                                                                    {clusters.map(c => {
+                                                                        const on = (plugin.clusters || []).indexOf(c.id) >= 0;
+                                                                        return (
+                                                                            <button key={c.id} type="button"
+                                                                                onClick={async () => {
+                                                                                    const cur = plugin.clusters || [];
+                                                                                    const next = on ? cur.filter(x => x !== c.id) : cur.concat([c.id]);
+                                                                                    try {
+                                                                                        const r = await fetch(`${API_URL}/plugins/${plugin.id}/clusters`, {
+                                                                                            method: 'PUT', credentials: 'include',
+                                                                                            headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+                                                                                            body: JSON.stringify({ clusters: next })
+                                                                                        });
+                                                                                        if (r && r.ok) fetchPlugins();
+                                                                                        else addToast((await r.json().catch(() => ({}))).error || 'Failed', 'error');
+                                                                                    } catch (e) { addToast('Error', 'error'); }
+                                                                                }}
+                                                                                className={`text-xs px-1.5 py-0.5 rounded border transition-colors ${
+                                                                                    on ? 'border-proxmox-orange text-proxmox-orange'
+                                                                                       : 'border-proxmox-border text-gray-500 hover:text-gray-300'}`}>
+                                                                                {c.name || c.id}
+                                                                            </button>
+                                                                        );
+                                                                    })}
+                                                                </div>
+                                                            )}
                                                         </div>
                                                         <div className="flex items-center gap-2">
                                                             <div className={`toggle-switch ${plugin.enabled ? 'active' : ''}`} onClick={() => togglePlugin(plugin.id, plugin.enabled)} />

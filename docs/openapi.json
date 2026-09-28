@@ -39283,6 +39283,62 @@
         ]
       }
     },
+    "/api/plugins/{plugin_id}/clusters": {
+      "put": {
+        "operationId": "plugins.set_plugin_clusters_put",
+        "tags": [
+          "plugins"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Limit a plugin to specific clusters (#642 maxilee).",
+        "description": "An empty list puts it back on every cluster, which is where every plugin starts.\nIds are not checked against the live cluster list on purpose: a cluster can be\noffline or added later, and dropping its id here would silently widen the scope\nback to everything the next time somebody saved.",
+        "parameters": [
+          {
+            "name": "plugin_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "plugins.manage"
+        ]
+      }
+    },
     "/api/plugins/{plugin_id}/config": {
       "get": {
         "operationId": "plugins.get_plugin_config_get",

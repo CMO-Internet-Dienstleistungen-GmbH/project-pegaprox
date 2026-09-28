@@ -48,7 +48,7 @@ schema is worse than an absent one, so bodies are described as generic JSON
 objects. These are being filled in per resource group by hand. If you are
 building against a specific endpoint and need its shape pinned down, open an
 issue and say which one; that is a much better use of the effort than
-speculatively documenting all 838 operations.
+speculatively documenting all 839 operations.
 
 ## Authentication
 
