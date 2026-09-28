@@ -4,6 +4,22 @@
         // ═══════════════════════════════════════════════
         const translations = {
             de: {
+                // ESXi infrastructure view (PR #776) - EN/PL came with the PR, rest backfilled
+                admissionControlEnabled: 'Admission Control aktiv',
+                backToDatastores: 'Zurück zu den Datenspeichern',
+                capacity: 'Kapazität',
+                clusterHosts: 'Cluster-Hosts',
+                computeClustersManagementOnly: 'Cluster gibt es nur auf verbundenen Verwaltungsservern, nicht auf einzelnen Hosts',
+                connectedHosts: 'Verbundene Hosts ({count})',
+                drsFullName: 'DRS (Distributed Resource Scheduler)',
+                fullyAutomated: 'Vollautomatisch',
+                haFullName: 'HA (Hochverfügbarkeit)',
+                hosts: 'Hosts',
+                noComputeClusters: 'Keine Compute-Cluster gefunden',
+                noHostsFound: 'Keine Hosts gefunden',
+                noVmsOnDatastore: 'Keine VMs auf diesem Datenspeicher',
+                partiallyAutomated: 'Teilautomatisch',
+                vmsOnDatastore: 'VMs auf {datastore} ({count})',
                 // tenant limits — NS Sep 2026
                 maxDiskGb: 'Max. Disk (GB)',
                 vmidRangeStart: 'VMID von',
@@ -9150,6 +9166,22 @@
                 allAttributes: 'All attributes',
             },
             zh: {
+                // ESXi infrastructure view (PR #776) - EN/PL came with the PR, rest backfilled
+                admissionControlEnabled: 'Admission Control 已启用',
+                backToDatastores: '返回数据存储',
+                capacity: '容量',
+                clusterHosts: '集群主机',
+                computeClustersManagementOnly: '集群仅在已连接的管理服务器上可用，独立主机不提供',
+                connectedHosts: '已连接主机 ({count})',
+                drsFullName: 'DRS (分布式资源调度)',
+                fullyAutomated: '全自动',
+                haFullName: 'HA (高可用性)',
+                hosts: '主机',
+                noComputeClusters: '未找到计算集群',
+                noHostsFound: '未找到主机',
+                noVmsOnDatastore: '此数据存储上没有虚拟机',
+                partiallyAutomated: '半自动',
+                vmsOnDatastore: '{datastore} 上的虚拟机 ({count})',
                 // tenant limits — NS Sep 2026
                 maxDiskGb: '最大磁盘 (GB)',
                 vmidRangeStart: 'VMID 起始',
@@ -17302,6 +17334,22 @@
             // French translations by @IMNotMax (PR #186)
             // Falls back to EN for missing keys
             fr: {
+                // ESXi infrastructure view (PR #776) - EN/PL came with the PR, rest backfilled
+                admissionControlEnabled: 'Admission Control activé',
+                backToDatastores: 'Retour aux stockages de données',
+                capacity: 'Capacité',
+                clusterHosts: 'Hôtes du cluster',
+                computeClustersManagementOnly: 'Les clusters ne sont disponibles que sur les serveurs de gestion connectés, pas sur les hôtes autonomes',
+                connectedHosts: 'Hôtes connectés ({count})',
+                drsFullName: 'DRS (Distributed Resource Scheduler)',
+                fullyAutomated: 'Entièrement automatisé',
+                haFullName: 'HA (haute disponibilité)',
+                hosts: 'Hôtes',
+                noComputeClusters: 'Aucun cluster de calcul trouvé',
+                noHostsFound: 'Aucun hôte trouvé',
+                noVmsOnDatastore: 'Aucune VM sur ce datastore',
+                partiallyAutomated: 'Partiellement automatisé',
+                vmsOnDatastore: 'VM sur {datastore} ({count})',
                 // tenant limits — NS Sep 2026
                 maxDiskGb: 'Disque max (Go)',
                 vmidRangeStart: 'VMID de',
@@ -21705,6 +21753,22 @@
                 zoomOut: 'Zoom arrière',
             },
             es: {
+                // ESXi infrastructure view (PR #776) - EN/PL came with the PR, rest backfilled
+                admissionControlEnabled: 'Admission Control activado',
+                backToDatastores: 'Volver a los datastores',
+                capacity: 'Capacidad',
+                clusterHosts: 'Hosts del clúster',
+                computeClustersManagementOnly: 'Los clústeres solo están disponibles en servidores de gestión conectados, no en hosts independientes',
+                connectedHosts: 'Hosts conectados ({count})',
+                drsFullName: 'DRS (Distributed Resource Scheduler)',
+                fullyAutomated: 'Totalmente automatizado',
+                haFullName: 'HA (alta disponibilidad)',
+                hosts: 'Hosts',
+                noComputeClusters: 'No se encontraron clústeres de cómputo',
+                noHostsFound: 'No se encontraron hosts',
+                noVmsOnDatastore: 'No hay VM en este datastore',
+                partiallyAutomated: 'Parcialmente automatizado',
+                vmsOnDatastore: 'VM en {datastore} ({count})',
                 // tenant limits — NS Sep 2026
                 maxDiskGb: 'Disco máx. (GB)',
                 vmidRangeStart: 'VMID desde',
@@ -26124,6 +26188,22 @@
                 zoomOut: 'Alejar',
             },
             pt: {
+                // ESXi infrastructure view (PR #776) - EN/PL came with the PR, rest backfilled
+                admissionControlEnabled: 'Admission Control ativado',
+                backToDatastores: 'Voltar aos datastores',
+                capacity: 'Capacidade',
+                clusterHosts: 'Hosts do cluster',
+                computeClustersManagementOnly: 'Os clusters só estão disponíveis em servidores de gestão ligados, não em hosts autónomos',
+                connectedHosts: 'Hosts ligados ({count})',
+                drsFullName: 'DRS (Distributed Resource Scheduler)',
+                fullyAutomated: 'Totalmente automatizado',
+                haFullName: 'HA (alta disponibilidade)',
+                hosts: 'Hosts',
+                noComputeClusters: 'Nenhum cluster de computação encontrado',
+                noHostsFound: 'Nenhum host encontrado',
+                noVmsOnDatastore: 'Sem VMs neste datastore',
+                partiallyAutomated: 'Parcialmente automatizado',
+                vmsOnDatastore: 'VMs em {datastore} ({count})',
                 // tenant limits — NS Sep 2026
                 maxDiskGb: 'Disco máx. (GB)',
                 vmidRangeStart: 'VMID de',
@@ -30387,6 +30467,22 @@
                 zoomOut: 'Afastar',
             },
             ko: {
+                // ESXi infrastructure view (PR #776) - EN/PL came with the PR, rest backfilled
+                admissionControlEnabled: 'Admission Control 사용',
+                backToDatastores: '데이터 저장소로 돌아가기',
+                capacity: '용량',
+                clusterHosts: '클러스터 호스트',
+                computeClustersManagementOnly: '클러스터는 연결된 관리 서버에서만 사용할 수 있으며 독립 실행형 호스트에서는 제공되지 않습니다',
+                connectedHosts: '연결된 호스트 ({count})',
+                drsFullName: 'DRS (분산 리소스 스케줄러)',
+                fullyAutomated: '완전 자동',
+                haFullName: 'HA (고가용성)',
+                hosts: '호스트',
+                noComputeClusters: '컴퓨트 클러스터를 찾을 수 없습니다',
+                noHostsFound: '호스트를 찾을 수 없습니다',
+                noVmsOnDatastore: '이 데이터 저장소에 VM이 없습니다',
+                partiallyAutomated: '부분 자동',
+                vmsOnDatastore: '{datastore}의 VM ({count})',
                 // tenant limits — NS Sep 2026
                 maxDiskGb: '최대 디스크 (GB)',
                 vmidRangeStart: 'VMID 시작',
@@ -34882,6 +34978,22 @@
                 zoomOut: '축소',
             },
             it: {
+                // ESXi infrastructure view (PR #776) - EN/PL came with the PR, rest backfilled
+                admissionControlEnabled: 'Admission Control attivo',
+                backToDatastores: 'Torna ai datastore',
+                capacity: 'Capacità',
+                clusterHosts: 'Host del cluster',
+                computeClustersManagementOnly: 'I cluster sono disponibili solo sui server di gestione collegati, non sugli host autonomi',
+                connectedHosts: 'Host collegati ({count})',
+                drsFullName: 'DRS (Distributed Resource Scheduler)',
+                fullyAutomated: 'Completamente automatizzato',
+                haFullName: 'HA (alta disponibilità)',
+                hosts: 'Host',
+                noComputeClusters: 'Nessun cluster di calcolo trovato',
+                noHostsFound: 'Nessun host trovato',
+                noVmsOnDatastore: 'Nessuna VM in questo datastore',
+                partiallyAutomated: 'Parzialmente automatizzato',
+                vmsOnDatastore: 'VM su {datastore} ({count})',
                 // tenant limits — NS Sep 2026
                 maxDiskGb: 'Disco max (GB)',
                 vmidRangeStart: 'VMID da',
