@@ -1705,6 +1705,18 @@
         body[data-corp-theme="light"] button.bg-proxmox-card:hover { color: #0072a3 !important; background: #e8f0f4 !important; }
         /* active tab styling already lands via bg-proxmox-orange → leave it */
 
+        /* MK Sep 2026 (#727 nvaert1986) - xterm 5.3.0 parks its width cache on <body>:
+           a `position: absolute; top: -50000px; width: 50000px` div that lives as long as
+           a terminal does. Vertically it is out of sight, but it makes the DOCUMENT 50000px
+           wide, and in Firefox a page that wide pans sideways on a drag - which is the
+           report: part of the layout slides off-screen after the shell has been opened.
+           Taking it out of flow removes the overflow at its source; the div keeps its own
+           width, so xterm still measures what it measured before.
+           Not `overflow-x: hidden` on the page root: that stops the pan too, but it turns
+           the root into a scroll box and the sticky header stops sticking (measured at
+           top -314 instead of 0). The phone block below says the same thing in prose. */
+        body > div[style*="-50000px"] { position: fixed !important; }
+
         /* NS: xterm.js terminal must not inherit corporate spacing/font overrides */
         body[data-layout="corporate"] .xterm,
         body[data-layout="corporate"] .xterm * {
