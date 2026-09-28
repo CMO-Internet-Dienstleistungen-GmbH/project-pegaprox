@@ -158,6 +158,13 @@ def check_and_send_alerts():
         target_type = alert.get('target_type', 'cluster')  # cluster, node, vm
         target_id = alert.get('target_id', '')  # node name or vmid
 
+        # Rolling-update reboots are event-driven.  They are evaluated by the
+        # update worker when the reboot is issued, never by this metric poll.
+        if metric == 'rolling_update':
+            _record_eval(alert_id, reason='event-driven rolling-update alarm',
+                         cluster_id=cluster_id, metric=metric, target_type=target_type)
+            continue
+
         # Check cooldown
         # NS May 2026: include alert_id so a warning rule and a critical rule
         # on the same metric don't poison each other's cooldown.
@@ -765,6 +772,70 @@ def _emit_node_status_event(cluster_id, node, new_status, message, severity, rec
         logging.debug(f"[NodeWatch] webhook dispatch failed: {e}")
 
 
+def emit_rolling_update_reboot_event(cluster_id, node):
+    """Publish an informational alert when a rolling update reboots a node.
+
+    The update worker calls this only after it has successfully handed the reboot
+    command to the node.  Keeping the event here sends it through the same
+    notification-handler pipeline as regular alerts, which includes the alerts
+    menu/browser notification inbox, while preserving cluster access scoping.
+    """
+    rules = []
+    try:
+        for rule in load_alerts_config().get('alerts', []):
+            if (rule.get('enabled', True) and rule.get('metric') == 'rolling_update'
+                    and rule.get('cluster_id') == cluster_id):
+                # Cluster-wide alarms apply to every reboot. A node-targeted
+                # alarm applies only to its named node; other targets cannot
+                # describe a node reboot event.
+                if rule.get('target_type', 'cluster') == 'cluster' or (
+                        rule.get('target_type') == 'node' and str(rule.get('target_id')) == str(node)):
+                    rules.append(rule)
+    except Exception as e:
+        logging.debug(f"[RollingUpdate] could not load alarm rules: {e}")
+        return False
+
+    if not rules:
+        return False
+
+    for rule in rules:
+        alert_data = {
+            'alert_name': rule.get('name') or 'Rolling update reboot',
+            'metric': 'rolling_update',
+            'target_type': 'node',
+            'target_name': node,
+            'cluster_id': cluster_id,
+            'severity': rule.get('severity') if rule.get('severity') not in (None, 'auto') else 'info',
+            'current_value': 'rebooting',
+            'timestamp': datetime.now().isoformat(),
+            'message': f"Node {node} is rebooting as part of a rolling update on cluster {cluster_id}",
+        }
+        logging.info("[RollingUpdate] %s", alert_data['message'])
+
+        try:
+            _upsert_active_alert(
+                f"{rule.get('id', 'rolling_update')}:{cluster_id}:node:{node}:rolling_update",
+                rule.get('id', 'rolling_update'), alert_data, 1, 0, 'event', node)
+        except Exception as e:
+            logging.debug(f"[RollingUpdate] active alert persist failed: {e}")
+
+        for handler in list(_notification_handlers):
+            try:
+                handler(alert_data)
+            except Exception as e:
+                logging.debug(f"[RollingUpdate] notification handler failed: {e}")
+
+        selected = rule.get('channels') if isinstance(rule.get('channels'), list) else []
+        webhook_ids = [str(c) for c in selected if c not in ('email', 'log', '__all_webhooks__')]
+        if webhook_ids or '__all_webhooks__' in selected:
+            try:
+                from pegaprox.utils.webhooks import send_to_channels
+                send_to_channels(alert_data, channel_ids=None if '__all_webhooks__' in selected else webhook_ids)
+            except Exception as e:
+                logging.debug(f"[RollingUpdate] webhook dispatch failed: {e}")
+    return True
+
+
 _SESSION_CLEANUP_INTERVAL = 6 * 60 * 60   # every 6 hours
 _last_session_cleanup_at = 0.0
 
@@ -959,6 +1030,3 @@ def start_alert_thread():
         _alert_thread = threading.Thread(target=alert_check_loop, daemon=True)
         _alert_thread.start()
         logging.info("Alert monitoring thread started")
-
-
-

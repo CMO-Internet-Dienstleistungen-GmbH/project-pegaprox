@@ -23875,8 +23875,8 @@
                                         target_type: form.target_type.value,
                                         target_id: form.target_id.value || null,
                                         metric: form.metric.value,
-                                        operator: form.operator.value,
-                                        threshold: parseInt(form.threshold.value),
+                                        operator: alertMetricSel === 'rolling_update' ? 'event' : form.operator.value,
+                                        threshold: alertMetricSel === 'rolling_update' ? 1 : parseInt(form.threshold.value),
                                         channels,
                                         severity: form.severity.value,  // NS #501
                                         escalation: escSteps.filter(s => s.after_minutes > 0),  // NS #501
@@ -23916,12 +23916,18 @@
                                                 <option value="cpu">CPU</option>
                                                 <option value="memory">Memory</option>
                                                 <option value="disk">Disk</option>
+                                                <option value="rolling_update">{t('rollingUpdates') || 'Rolling Updates'}</option>
                                                 <option value="temperature">{t('temperatureC') || 'Temperature (°C)'}</option>
                                                 <option value="hardware_health">{t('hardwareHealth') || 'Hardware health'}</option>
                                                 <option value="backup_sla_breached_pct">{t('backupSlaBreachedPct') || 'Backup SLA breached %'}</option>
                                                 <option value="backup_sla_compliance_pct">{t('backupSlaCompliancePct') || 'Backup SLA compliance %'}</option>
                                             </select>
                                         </div>
+                                        {alertMetricSel === 'rolling_update' ? (
+                                            <div className="col-span-2 rounded-lg border border-proxmox-border bg-proxmox-dark px-3 py-2 text-sm text-gray-400">
+                                                {t('rollingUpdateAlarmHelp') || 'Fires when a selected node is rebooted during a rolling update.'}
+                                            </div>
+                                        ) : <>
                                         <div>
                                             <label className="block text-sm text-gray-400 mb-1">{t('condition') || 'Condition'}</label>
                                             <select name="operator" defaultValue={editingAlert ? editingAlert.operator : '>'} className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg">
@@ -23941,6 +23947,7 @@
                                                 <input name="threshold" type="number" min="0" max={alertMetricSel === 'temperature' ? 150 : 100} defaultValue={editingAlert ? editingAlert.threshold : 80} required className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg" />
                                             )}
                                         </div>
+                                        </>}
                                     </div>
                                     <div>
                                         <label className="block text-sm text-gray-400 mb-1">{t('notifyVia') || 'Notify via'}</label>
