@@ -39,3 +39,33 @@ def test_reboot_event_is_silent_without_an_enabled_rolling_update_alarm(monkeypa
     monkeypatch.setattr(alerts, '_upsert_active_alert', lambda *args: (_ for _ in ()).throw(AssertionError()))
 
     assert alerts.emit_rolling_update_reboot_event('cluster_1', 'pve-01') is False
+
+
+# NS Sep 2026 — added on merge of #960. The two new strings in the alert dialog were
+# written as `t('rollingUpdates') || 'Rolling Updates'`, which reads like a safe
+# fallback and is not: t() is `translations[lang]?.[key] || translations['en']?.[key]
+# || key`, so a missing key comes back as the KEY, which is truthy, and the `||` never
+# fires. Without the entries below the dialog shows the literal `rollingUpdates`.
+
+import os
+import re
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _translations():
+    return open(os.path.join(_ROOT, 'web', 'src', 'translations.js'), encoding='utf-8').read()
+
+
+def test_the_alert_dialog_strings_exist_in_every_language():
+    body = _translations()
+    for key in ('rollingUpdates', 'rollingUpdateAlarmHelp'):
+        found = len(re.findall(rf'^\s*{key}:', body, re.M))
+        assert found == 9, f'{key} is in {found} of 9 language blocks - the UI would show the key'
+
+
+def test_the_option_reached_the_built_bundle():
+    """web/index.html is generated from web/src; a src-only change ships nothing."""
+    built = open(os.path.join(_ROOT, 'web', 'index.html'), encoding='utf-8').read()
+    # the bundle is Babel output, so the JSX is gone - match the compiled element
+    assert 'React.createElement("option",{value:"rolling_update"}' in built
