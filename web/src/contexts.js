@@ -262,7 +262,7 @@
                             // in sync; reading the toggle avoids a stale server value overriding it on F5.
                             let userTheme = d.user?.theme || d.default_theme || 'proxmoxDark';
                             try {
-                                // LW Sep 2026 (#743) — 'system' is a deliberate choice and outranks
+                                // LW Sep 2026 (#743) - 'system' is a deliberate choice and outranks
                                 // the local toggle; reading corp-theme here would turn "follow my
                                 // desktop" into whatever the toggle was last set to.
                                 if (d.user?.ui_layout === 'corporate' && userTheme !== 'system') {
@@ -506,7 +506,7 @@
             useEffect(() => {
                 document.body.setAttribute('data-layout', layout);
                 if (isCorporate) {
-                    // LW Sep 2026 (#743) — applyTheme('system') resolves and sets the
+                    // LW Sep 2026 (#743) - applyTheme('system') resolves and sets the
                     // corp gate itself, so the stored choice wins over the local toggle
                     // here too. Anything else keeps the old path unchanged.
                     if (localStorage.getItem('pegaprox-theme') === 'system') {

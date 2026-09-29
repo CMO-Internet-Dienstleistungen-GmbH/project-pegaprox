@@ -692,7 +692,7 @@
                     success: '#2dd4a7', warning: '#f5b945', error: '#f87171', info: '#38bdf8'
                 }
             },
-            // LW Sep 2026 (#743 Frisch12) — not a palette of its own: it borrows whichever
+            // LW Sep 2026 (#743) - not a palette of its own: it borrows whichever
             // one resolveSystemTheme() picks right now. Keeping it an ordinary entry means
             // the server whitelist, session restore and both theme grids need no special
             // case, and the card in the picker previews the palette it would actually apply.
@@ -705,7 +705,7 @@
             }
         };
 
-        // LW Sep 2026 (#743) — the one place where "system" becomes a real palette.
+        // LW Sep 2026 (#743) - the one place where "system" becomes a real palette.
         // corporateLight is the only light palette the frontend defines, so both layout
         // families share it; dark differs, because Corporate deliberately does not wear
         // the orange chrome. No preference at all stays dark, which is what every user
@@ -732,7 +732,7 @@
 
         // Apply theme by setting CSS variables
         function applyTheme(themeName) {
-            // #743 — store what the user asked for, paint what it resolves to. Writing the
+            // #743 - store what the user asked for, paint what it resolves to. Writing the
             // resolved name back would freeze the app on whatever the OS happened to be at
             // the moment of the click, and the next OS switch would do nothing.
             const requested = PEGAPROX_THEMES[themeName] ? themeName : 'proxmoxDark';
@@ -759,7 +759,7 @@
                     document.body.classList.add('dark-theme');
                     document.body.classList.remove('light-theme');
                 }
-                // #743 — data-corp-theme gates every light override in the corporate
+                // #743 - data-corp-theme gates every light override in the corporate
                 // stylesheet (#296). The header toggle used to be the only thing that
                 // set it; the OS-change listener has no toggle to go through, so the
                 // gate has to follow the palette we just painted or Corporate ends up
@@ -778,7 +778,7 @@
             const saved = localStorage.getItem('pegaprox-theme') || 'proxmoxDark';
             console.log('[Theme] Initial load from localStorage:', saved);
             // Apply CSS variables immediately (works on documentElement)
-            // #743 — resolve here as well; this block runs before applyTheme() does and
+            // #743 - resolve here as well; this block runs before applyTheme() does and
             // would otherwise paint `system` (which has no palette of its own) as the
             // proxmoxDark fallback for a beat on a light desktop.
             const theme = PEGAPROX_THEMES[saved === 'system' ? resolveSystemTheme() : saved]
@@ -796,7 +796,7 @@
                 applyTheme(saved);
             }
 
-            // #743 — follow the OS live. Only repaints while "system" is the stored
+            // #743 - follow the OS live. Only repaints while "system" is the stored
             // choice, so an explicit theme is never yanked out from under the user.
             // addListener is the Safari <14 spelling and costs one line to keep.
             try {
@@ -1766,7 +1766,7 @@
         body[data-corp-theme="light"] button.bg-proxmox-card:hover { color: #0072a3 !important; background: #e8f0f4 !important; }
         /* active tab styling already lands via bg-proxmox-orange → leave it */
 
-        /* MK Sep 2026 (#727 nvaert1986) - xterm 5.3.0 parks its width cache on <body>:
+        /* MK Sep 2026 (#727) - xterm 5.3.0 parks its width cache on <body>:
            a `position: absolute; top: -50000px; width: 50000px` div that lives as long as
            a terminal does. Vertically it is out of sight, but it makes the DOCUMENT 50000px
            wide, and in Firefox a page that wide pans sideways on a drag - which is the

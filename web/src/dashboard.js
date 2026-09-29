@@ -8489,7 +8489,7 @@
                 if (saved === 'light') document.body.dataset.corpTheme = 'light';
                 return saved === 'light';
             });
-            // LW Sep 2026 (#743 Frisch12) — Corporate hides the theme grid (#742), so the
+            // LW Sep 2026 (#743) - Corporate hides the theme grid (#742), so the
             // header toggle is the only place a corporate user can reach the new option.
             // It cycles system -> light -> dark -> system instead of growing a third control.
             const [corpMode, setCorpMode] = useState(() => {
@@ -15193,7 +15193,7 @@
                                                 // render when the manifest declared has_frontend AND the
                                                 // server normalised frontend_route to /api/plugins/<id>/...
                                                 // (server-side validation in pegaprox/api/plugins.py).
-                                                // #642 — and only on the clusters it was limited to
+                                                // #642 - and only on the clusters it was limited to
                                                 const pluginFrontendTabs = (enabledPlugins || [])
                                                     .filter(p => p && p.has_frontend && p.frontend_route)
                                                     .filter(p => pluginAppliesToCluster(p, selectedCluster?.id))

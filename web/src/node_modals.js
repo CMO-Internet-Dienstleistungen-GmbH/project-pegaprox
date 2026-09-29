@@ -3977,7 +3977,7 @@
             // Shift for us, so paste has to do the same: hold Shift_L, tap the *base* key on that
             // physical key, release Shift_L — exactly what pressing it by hand does. Uppercase
             // already works (qemu shifts A-Z itself), so leave those on the plain path.
-            // MK Sep 2026 #959 (grupoaxium) - and only while the datacenter runs a US keymap.
+            // MK Sep 2026 #959 - and only while the datacenter runs a US keymap.
             // With `keyboard: es` set, qemu maps the keysym to the Spanish layout itself, so
             // holding Shift over the US base key produced '"' where the reporter pasted '@'.
             // An unset keymap stays on this path: qemu assumes en-us when it is given none,

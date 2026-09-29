@@ -1940,7 +1940,7 @@
         function CloudPlugins({ clusterId, t }) {
             const { data, loading, err, reload } = useCloudData('/api/plugins');
             const mut = useCloudMutate(reload);
-            // #642 — a plugin limited to other clusters has nothing to say about this one
+            // #642 - a plugin limited to other clusters has nothing to say about this one
             const list = (Array.isArray(data) ? data : [])
                 .filter(p => p && p.enabled)
                 .filter(p => pluginAppliesToCluster(p, clusterId));
