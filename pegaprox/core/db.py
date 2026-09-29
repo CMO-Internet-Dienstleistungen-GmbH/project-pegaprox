@@ -2018,6 +2018,55 @@ class PegaProxDB:
         except Exception as e:
             logging.error(f"Error creating multi_cluster_vnets table: {e}")
 
+        # MK Sep 2026 — automated installations: answer files plus the runs the
+        # prepared ISOs report back. The answer file is stored encrypted, it holds
+        # the root password of every machine built from it.
+        try:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS auto_install_profiles (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT DEFAULT '',
+                    answer_encrypted TEXT NOT NULL,
+                    target_cluster_id TEXT DEFAULT '',
+                    callback_url TEXT DEFAULT '',
+                    callback_fingerprint TEXT DEFAULT '',
+                    token_hash TEXT NOT NULL,
+                    token_hint TEXT DEFAULT '',
+                    enabled INTEGER DEFAULT 1,
+                    max_uses INTEGER DEFAULT 0,
+                    uses INTEGER DEFAULT 0,
+                    expires_at TEXT DEFAULT '',
+                    created_at TEXT,
+                    created_by TEXT DEFAULT '',
+                    updated_at TEXT,
+                    updated_by TEXT DEFAULT ''
+                )
+            ''')
+            cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_auto_install_token '
+                           'ON auto_install_profiles(token_hash)')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS auto_install_runs (
+                    id TEXT PRIMARY KEY,
+                    profile_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'installing',
+                    fingerprint TEXT DEFAULT '',
+                    hostname TEXT DEFAULT '',
+                    product TEXT DEFAULT '',
+                    version TEXT DEFAULT '',
+                    system_info TEXT DEFAULT '{}',
+                    message TEXT DEFAULT '',
+                    client_ip TEXT DEFAULT '',
+                    started_at TEXT,
+                    updated_at TEXT
+                )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_auto_install_runs_profile '
+                           'ON auto_install_runs(profile_id, started_at DESC)')
+            logging.info("Ensured auto_install tables exist")
+        except Exception as e:
+            logging.error(f"Error creating auto_install tables: {e}")
+
         conn.commit()
         logging.info("DB schema initialized")
     
@@ -4474,7 +4523,12 @@ class PegaProxDB:
             # someone re-entered the passwords. Same shape as the server_settings gap below.
             for _tbl, _cols in (('pbs_servers', ('pass_encrypted', 'api_token_secret_encrypted',
                                                  'ssh_key_encrypted')),
-                                ('vmware_servers', ('pass_encrypted',))):
+                                ('vmware_servers', ('pass_encrypted',)),
+                                # MK Sep 2026 — an auto-install answer file holds the root
+                                # password of the host it builds. Missing here would mean a
+                                # rotation leaves every stored profile unreadable and the
+                                # next ISO fetch answering 500.
+                                ('auto_install_profiles', ('answer_encrypted',))):
                 try:
                     cursor.execute(f"SELECT id, {', '.join(_cols)} FROM {_tbl}")
                     for _r in cursor.fetchall():

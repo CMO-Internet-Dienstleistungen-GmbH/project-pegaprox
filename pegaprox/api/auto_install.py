@@ -371,7 +371,11 @@ def _public_profile(profile, answer=None):
     out = dict(profile)
     out.pop('answer', None)
     cluster = cluster_managers.get(out.get('target_cluster_id') or '')
-    out['target_cluster_name'] = getattr(getattr(cluster, 'config', None), 'name', '') if cluster else ''
+    # str() rather than trusting the attribute: a registry entry can be a stand-in
+    # during tests, and jsonify dies on a non-string with a message that points
+    # nowhere near here.
+    label = getattr(getattr(cluster, 'config', None), 'name', '') if cluster else ''
+    out['target_cluster_name'] = label if isinstance(label, str) else ''
     if answer is not None:
         out['answer'] = answer
     return out
@@ -682,6 +686,20 @@ def _machine_fingerprint(info):
     return ''
 
 
+def _bounded_json(info):
+    """The inventory a stranger's installer sends, small enough to keep.
+
+    Truncating the dumped string would store something that is no longer JSON, and
+    the run list parses it back — so an oversized payload would come out as an empty
+    object with nobody the wiser. Drop it for a note instead, and say so.
+    """
+    raw = json.dumps(info)
+    if len(raw) <= _MAX_SYSTEM_INFO:
+        return raw
+    return json.dumps({'truncated': True, 'bytes': len(raw),
+                       'keys': sorted(info.keys())[:40]})
+
+
 def _summarise_system(info):
     """(hostname, product, version) for the run list, pulled defensively — this is
     whatever a stranger's installer decided to send."""
@@ -724,7 +742,7 @@ def serve_answer():
         info = request.get_json(silent=True)
         if not isinstance(info, dict):
             info = {}
-        raw = json.dumps(info)[:_MAX_SYSTEM_INFO]
+        raw = _bounded_json(info)
         hostname, product, version = _summarise_system(info)
         fingerprint = _machine_fingerprint(info)
 
@@ -760,7 +778,7 @@ def serve_answer():
         log_audit('installer', 'autoinstall.answer_served',
                   f"profile '{profile.get('name')}' -> {product or 'unknown hardware'}",
                   ip_address=get_client_ip())
-        return Response(body, mimetype='text/plain; charset=utf-8')
+        return Response(body, mimetype='text/plain')
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Could not serve the answer file')}), 500
 
@@ -819,6 +837,11 @@ def installer_progress():
                           ORDER BY started_at DESC LIMIT 1''', (profile['id'], fingerprint))
             row = c.fetchone()
         if not row:
+            # No usable machine id in the webhook body, so fall back to the newest
+            # run still marked installing. With two machines building from one
+            # profile at the same time and neither reporting DMI this can credit the
+            # wrong row - which is why max_uses exists and why one profile per
+            # machine is the shape the UI nudges people towards.
             c.execute('''SELECT id FROM auto_install_runs WHERE profile_id = ? AND status = 'installing'
                           ORDER BY started_at DESC LIMIT 1''', (profile['id'],))
             row = c.fetchone()

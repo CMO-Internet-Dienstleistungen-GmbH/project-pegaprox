@@ -114,7 +114,7 @@ def test_the_installer_gets_the_answer_file_without_a_session(api, seed):
     r = _fetch(api, token)
     assert r.status_code == 200, r.data
     body = r.data.decode()
-    assert 'text/plain' in r.headers['Content-Type']
+    assert r.headers['Content-Type'] == 'text/plain; charset=utf-8', r.headers['Content-Type']
     assert 'pve01.lab.example.com' in body
     assert body.count('[global]') == 1
 
@@ -220,6 +220,20 @@ def test_two_machines_on_one_profile_are_two_runs(api, seed):
     other['dmi']['system']['serial'] = 'OTHER-9'
     _fetch(api, token, info=other)
     assert len(c.get('/api/auto-install/runs').get_json()) == 2
+
+
+def test_an_oversized_inventory_is_kept_readable(api, seed):
+    """Cutting the JSON string in half stores something the run list cannot parse,
+    so the whole inventory silently becomes {} - worse than saying it was dropped."""
+    c = _admin(api, seed)
+    token = _create(c)['token']
+    fat = dict(SYSINFO)
+    fat['dmesg'] = 'x' * 200000
+    _fetch(api, token, info=fat)
+    run = c.get('/api/auto-install/runs').get_json()[0]
+    assert run['system_info'].get('truncated') is True, run['system_info']
+    assert 'dmesg' in run['system_info']['keys']
+    assert run['product'] == 'Dell Inc. PowerEdge R660'      # the summary still works
 
 
 def test_hardware_with_no_usable_serial_falls_back_to_the_mac(api, seed):

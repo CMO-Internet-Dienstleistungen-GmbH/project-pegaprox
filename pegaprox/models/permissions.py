@@ -180,6 +180,10 @@ PERMISSIONS = {
 
     # Telemetry - MK Sep 2026 (#818 falschgeldkind)
     'metrics.view': 'Scrape the Prometheus endpoint (/api/metrics)',
+
+    # Automated installations - MK Sep 2026
+    'autoinstall.view': 'View automated installation profiles and runs',
+    'autoinstall.manage': 'Create, edit and revoke automated installation profiles',
 }
 
 # MK Sep 2026 (#818) — permissions whose scope is wider than their name suggests.
@@ -192,6 +196,12 @@ PERMISSION_WARNINGS = {
         'installation knows - node status, quorum, CPU, VM counts - regardless of '
         'which clusters or tenants the holder is otherwise limited to. Grant it to '
         'a dedicated monitoring account, not to a tenant role.'
+    ),
+    'autoinstall.manage': (
+        'Answer files carry the root password of every host installed from them, '
+        'and the fetch token is handed out in clear text once. This permission is '
+        'the ability to define what a new Proxmox host boots into - treat it like '
+        'physical access to the rack.'
     ),
 }
 

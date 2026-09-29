@@ -179,6 +179,11 @@ def create_app():
             '/api/health',
             '/api/webauthn/auth/begin',
             '/api/webauthn/auth/finish',
+            # MK Sep 2026 — the automated installer is not a browser: it carries no
+            # session to protect and cannot be made to send Origin or X-Requested-With.
+            # Both of these are gated by the installation token instead.
+            '/api/auto-install/answer',
+            '/api/auto-install/progress',
         )
         if (request.method in ('POST', 'PUT', 'PATCH', 'DELETE')
                 and request.path.startswith('/api/')

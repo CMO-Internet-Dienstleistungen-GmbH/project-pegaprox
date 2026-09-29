@@ -42692,6 +42692,479 @@
         ]
       }
     },
+    "/api/auto-install/profiles": {
+      "get": {
+        "operationId": "auto_install.list_profiles_get",
+        "tags": [
+          "auto_install"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Metadata only. The answer file is a separate read because it carries the root password of every machine built from it.",
+        "description": "can_manage rides along so the UI can grey out the buttons it would only get a\n403 from — the frontend has the session's role, not its permission list.",
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "autoinstall.view"
+        ]
+      },
+      "post": {
+        "operationId": "auto_install.create_profile_post",
+        "tags": [
+          "auto_install"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "The token is returned exactly here and never again — it is stored hashed.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "autoinstall.manage"
+        ]
+      }
+    },
+    "/api/auto-install/profiles/{profile_id}": {
+      "get": {
+        "operationId": "auto_install.get_profile_get",
+        "tags": [
+          "auto_install"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "The answer file comes back redacted unless the caller may also edit it.",
+        "parameters": [
+          {
+            "name": "profile_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "autoinstall.view"
+        ]
+      },
+      "put": {
+        "operationId": "auto_install.update_profile_put",
+        "tags": [
+          "auto_install"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "parameters": [
+          {
+            "name": "profile_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "autoinstall.manage"
+        ]
+      },
+      "delete": {
+        "operationId": "auto_install.delete_profile_delete",
+        "tags": [
+          "auto_install"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "parameters": [
+          {
+            "name": "profile_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "autoinstall.manage"
+        ]
+      }
+    },
+    "/api/auto-install/profiles/{profile_id}/token": {
+      "post": {
+        "operationId": "auto_install.rotate_token_post",
+        "tags": [
+          "auto_install"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Rotating invalidates every ISO already prepared from this profile. That is the point — it is the revoke button.",
+        "parameters": [
+          {
+            "name": "profile_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "autoinstall.manage"
+        ]
+      }
+    },
+    "/api/auto-install/validate": {
+      "post": {
+        "operationId": "auto_install.validate_endpoint_post",
+        "tags": [
+          "auto_install"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "autoinstall.manage"
+        ]
+      }
+    },
+    "/api/auto-install/runs": {
+      "get": {
+        "operationId": "auto_install.list_runs_get",
+        "tags": [
+          "auto_install"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "autoinstall.view"
+        ]
+      }
+    },
+    "/api/auto-install/runs/{run_id}": {
+      "delete": {
+        "operationId": "auto_install.delete_run_delete",
+        "tags": [
+          "auto_install"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "autoinstall.manage"
+        ]
+      }
+    },
+    "/api/auto-install/answer": {
+      "post": {
+        "operationId": "auto_install.serve_answer_post",
+        "tags": [
+          "auto_install"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          }
+        },
+        "summary": "The endpoint the prepared ISO talks to. Returns the answer file as plain text, which is what proxmox-auto-install-assistant expects on the wire.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "inline",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ]
+      }
+    },
+    "/api/auto-install/progress": {
+      "post": {
+        "operationId": "auto_install.installer_progress_post",
+        "tags": [
+          "auto_install"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          }
+        },
+        "summary": "[post-installation-webhook] target. Same token as the answer fetch.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "inline",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ]
+      }
+    },
     "/api/clusters/{cluster_id}/nodes/{node}/shellws": {
       "get": {
         "operationId": "__flask_sock.node_shell_websocket_proxy_get",

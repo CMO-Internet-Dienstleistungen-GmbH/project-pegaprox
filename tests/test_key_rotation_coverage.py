@@ -35,6 +35,10 @@ def seeded(db):
         "INSERT OR REPLACE INTO vmware_servers (id, name, host, port, username, pass_encrypted) "
         "VALUES (?, ?, ?, ?, ?, ?)",
         ('esxi1', 'esxi1', 'h', 443, 'root', db._encrypt('esxipw')))
+    db.conn.execute(
+        "INSERT OR REPLACE INTO auto_install_profiles (id, name, answer_encrypted, token_hash) "
+        "VALUES (?, ?, ?, ?)",
+        ('ai1', 'rack-7', db._encrypt('[global]\nroot-password = "in the rack"\n'), 'deadbeef'))
     db.save_server_setting('ldap_bind_password', db._encrypt('bindpw'))
     db.save_server_setting(VAPID, {'private_pem': db._encrypt('-----BEGIN PRIVATE KEY-----'),
                                    'public_b64': 'pub'})
@@ -57,6 +61,11 @@ def test_every_secret_survives_a_rotation(seeded):
     assert seeded._decrypt(_col(seeded, 'pbs_servers', 'api_token_secret_encrypted', 'pbs1')) == 'pbstoken'
     assert seeded._decrypt(_col(seeded, 'pbs_servers', 'ssh_key_encrypted', 'pbs1')) == 'pbskey'
     assert seeded._decrypt(_col(seeded, 'vmware_servers', 'pass_encrypted', 'esxi1')) == 'esxipw'
+    # MK Sep 2026 — the source-level guard below is satisfied by a mention, so the
+    # answer file needs a real round trip: unreadable here means the next prepared
+    # ISO gets a 500 instead of an install.
+    assert 'in the rack' in seeded._decrypt(
+        _col(seeded, 'auto_install_profiles', 'answer_encrypted', 'ai1'))
     settings = seeded.get_server_settings()
     assert seeded._decrypt(settings['ldap_bind_password']) == 'bindpw'
     assert seeded._decrypt(settings[VAPID]['private_pem']).startswith('-----BEGIN')

@@ -33,7 +33,10 @@ import sys
 # checked for the helpers that actually establish an identity.
 _INLINE_AUTH = ('_require_session', 'validate_session(', 'validate_api_token(',
                 'validate_ws_token', 'validate_sse_token', 'WS_INTERNAL_SECRET',
-                '_metrics_token', 'metrics_public')
+                '_metrics_token', 'metrics_public',
+                # MK Sep 2026 - the automated installer presents an installation
+                # token; it has no session and never will, but it is not public.
+                '_profile_for_token')
 
 _CONVERTER_TYPES = {
     'int': ('integer', None),

@@ -20,6 +20,8 @@
             vmware:        { order: 150, title: 'ESXi',       icon: '📡' },
             xapi:          { order: 160, title: 'XCP-ng',               icon: '🔶' },
             plugins:       { order: 170, title: 'Plugins',              icon: '🧩' },
+            autoinstall:   { order: 175, title: 'Automated Installs',   icon: '💿' },
+            metrics:       { order: 180, title: 'Telemetry',            icon: '📈' },
             admin:         { order: 999, title: 'Administration',       icon: '⚙️' },
         };
 
@@ -571,6 +573,441 @@
                             </div>
                         </div>
                     )}
+                </div>
+            );
+        }
+
+
+        // MK Sep 2026 — Automated installations. PegaProx hands answer files to the
+        // Proxmox auto-installer and shows which machines are currently building.
+        // The fetch token is returned exactly once by the server, so the reveal box
+        // below is the only chance to copy it — hence the whole prepare-iso command
+        // sitting there ready, rather than just the bare token.
+        const AUTOINSTALL_TEMPLATE = [
+            '[global]',
+            'keyboard = "de"',
+            'country = "de"',
+            'fqdn = "pve01.example.com"',
+            'mailto = "root@example.com"',
+            'timezone = "Europe/Berlin"',
+            '# openssl passwd -6 — better than the clear-text root-password key',
+            'root-password-hashed = "$6$...replace me..."',
+            '',
+            '[network]',
+            'source = "from-dhcp"',
+            '',
+            '[disk-setup]',
+            'filesystem = "ext4"',
+            'disk-list = ["sda"]',
+            ''
+        ].join('\n');
+
+        function AutoInstallPanel({ t, addToast, getAuthHeaders, clusters }) {
+            const [profiles, setProfiles] = useState([]);
+            const [canManage, setCanManage] = useState(false);
+            const [runs, setRuns] = useState([]);
+            const [loading, setLoading] = useState(false);
+            const [editing, setEditing] = useState(null);
+            const [check, setCheck] = useState(null);      // {valid, errors, warnings}
+            const [reveal, setReveal] = useState(null);    // {token, name} - shown once
+            const [busy, setBusy] = useState(false);
+
+            const load = async () => {
+                setLoading(true);
+                try {
+                    const [p, r] = await Promise.all([
+                        fetch(`${API_URL}/auto-install/profiles`, { credentials: 'include', headers: getAuthHeaders() }),
+                        fetch(`${API_URL}/auto-install/runs`, { credentials: 'include', headers: getAuthHeaders() })
+                    ]);
+                    if (p.ok) {
+                        const data = await p.json();
+                        setProfiles(data.profiles || []);
+                        setCanManage(!!data.can_manage);
+                    }
+                    if (r.ok) setRuns(await r.json());
+                } catch (e) { console.error('auto-install load:', e); }
+                setLoading(false);
+            };
+            useEffect(() => { load(); }, []);
+
+            // Poll while something is installing. An install runs for minutes, so 15s
+            // is plenty and keeps this off the dashboard's refresh budget.
+            useEffect(() => {
+                if (!runs.some(r => r.status === 'installing')) return;
+                const h = setInterval(load, 15000);
+                return () => clearInterval(h);
+            }, [runs]);
+
+            const fetchUrl = (hint) => `${window.location.origin}/api/auto-install/answer?token=${hint}`;
+            const prepareCmd = (token) =>
+                `proxmox-auto-install-assistant prepare-iso proxmox-ve.iso \\\n    --fetch-from http \\\n    --url '${fetchUrl(token)}'`;
+
+            const copy = (text, what) => {
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(text)
+                        .then(() => addToast?.(what + ' ' + (t('copied') || 'copied'), 'success'))
+                        .catch(() => addToast?.(t('copyFailed') || 'Copy failed', 'error'));
+                } else {
+                    addToast?.(t('copyFailed') || 'Copy failed', 'error');
+                }
+            };
+
+            const startNew = () => {
+                setCheck(null);
+                setEditing({ id: null, name: '', description: '', answer: AUTOINSTALL_TEMPLATE,
+                             target_cluster_id: '', callback_url: '', max_uses: 0,
+                             expires_at: '', enabled: true });
+            };
+
+            const startEdit = async (p) => {
+                setCheck(null);
+                try {
+                    const r = await fetch(`${API_URL}/auto-install/profiles/${p.id}`,
+                                          { credentials: 'include', headers: getAuthHeaders() });
+                    if (r.ok) { setEditing(await r.json()); return; }
+                } catch (e) { /* fall through to the list row */ }
+                setEditing({ ...p, answer: '' });
+            };
+
+            const validate = async () => {
+                try {
+                    const r = await fetch(`${API_URL}/auto-install/validate`, {
+                        method: 'POST', credentials: 'include',
+                        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ answer: editing.answer })
+                    });
+                    if (r.ok) setCheck(await r.json());
+                } catch (e) { addToast?.(e.message, 'error'); }
+            };
+
+            const save = async () => {
+                setBusy(true);
+                const isNew = !editing.id;
+                const body = {
+                    name: editing.name, description: editing.description,
+                    target_cluster_id: editing.target_cluster_id,
+                    callback_url: editing.callback_url,
+                    max_uses: Number(editing.max_uses) || 0,
+                    expires_at: editing.expires_at, enabled: !!editing.enabled
+                };
+                // An unchanged file comes back redacted from the server; sending it
+                // would write "********" over the real root password.
+                if (!editing.answer_redacted) body.answer = editing.answer;
+                try {
+                    const r = await fetch(
+                        isNew ? `${API_URL}/auto-install/profiles` : `${API_URL}/auto-install/profiles/${editing.id}`,
+                        { method: isNew ? 'POST' : 'PUT', credentials: 'include',
+                          headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                          body: JSON.stringify(body) });
+                    const data = await r.json().catch(() => ({}));
+                    if (r.ok) {
+                        if (data.token) setReveal({ token: data.token, name: data.name });
+                        setEditing(null); setCheck(null); load();
+                        addToast?.(t('autoInstallSaved') || 'Installation profile saved', 'success');
+                    } else {
+                        addToast?.(data.error || 'Save failed', 'error');
+                    }
+                } catch (e) { addToast?.(e.message || 'Save failed', 'error'); }
+                setBusy(false);
+            };
+
+            const rotate = async (p) => {
+                if (!window.confirm((t('autoInstallRotateConfirm') ||
+                    'Rotating the token invalidates every ISO already prepared from this profile. Continue?'))) return;
+                try {
+                    const r = await fetch(`${API_URL}/auto-install/profiles/${p.id}/token`,
+                                          { method: 'POST', credentials: 'include', headers: getAuthHeaders() });
+                    const data = await r.json().catch(() => ({}));
+                    if (r.ok) { setReveal({ token: data.token, name: p.name }); load(); }
+                    else addToast?.(data.error || 'Rotate failed', 'error');
+                } catch (e) { addToast?.(e.message, 'error'); }
+            };
+
+            const remove = async (p) => {
+                if (!window.confirm(`${t('autoInstallDeleteConfirm') || 'Delete installation profile'} "${p.name}"?`)) return;
+                const r = await fetch(`${API_URL}/auto-install/profiles/${p.id}`,
+                                      { method: 'DELETE', credentials: 'include', headers: getAuthHeaders() });
+                if (r.ok) { addToast?.(t('autoInstallDeleted') || 'Installation profile deleted', 'success'); load(); }
+                else addToast?.('Delete failed', 'error');
+            };
+
+            const clearRun = async (run) => {
+                const r = await fetch(`${API_URL}/auto-install/runs/${run.id}`,
+                                      { method: 'DELETE', credentials: 'include', headers: getAuthHeaders() });
+                if (r.ok) load();
+            };
+
+            const STATUS_STYLE = {
+                installing: 'bg-blue-500/20 text-blue-300 border-blue-500/40',
+                installed: 'bg-green-500/20 text-green-300 border-green-500/40',
+                failed: 'bg-red-500/20 text-red-300 border-red-500/40'
+            };
+            const statusLabel = (s) => ({
+                installing: t('autoInstallStatusInstalling') || 'Installing',
+                installed: t('autoInstallStatusInstalled') || 'Installed',
+                failed: t('autoInstallStatusFailed') || 'Failed'
+            }[s] || s);
+
+            const when = (iso) => {
+                if (!iso) return '—';
+                try { return new Date(iso).toLocaleString(); } catch (e) { return iso; }
+            };
+
+            return (
+                <div className="space-y-4">
+                    <div className="flex items-start justify-between gap-4">
+                        <div>
+                            <h3 className="text-lg font-semibold text-white flex items-center gap-2">
+                                <Icons.Disc className="w-5 h-5" />
+                                {t('autoInstall') || 'Automated Installations'}
+                            </h3>
+                            <p className="text-sm text-gray-400 mt-1 max-w-3xl">
+                                {t('autoInstallIntro') ||
+                                 'Store answer files here and prepare a Proxmox VE ISO that fetches one at boot. Each profile carries its own token, and machines report back while they install.'}
+                            </p>
+                        </div>
+                        {canManage && (
+                            <button onClick={startNew}
+                                className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm font-medium transition-colors whitespace-nowrap">
+                                <Icons.Plus />
+                                {t('autoInstallNewProfile') || 'New profile'}
+                            </button>
+                        )}
+                    </div>
+
+                    {reveal && (
+                        <div className="bg-yellow-500/10 border border-yellow-500/40 rounded-xl p-4 space-y-3">
+                            <div className="flex items-center justify-between">
+                                <h4 className="font-medium text-yellow-200 flex items-center gap-2">
+                                    <Icons.Key className="w-4 h-4" />
+                                    {t('autoInstallTokenOnce') || 'This token is shown once'}
+                                </h4>
+                                <button onClick={() => setReveal(null)} className="text-gray-400 hover:text-white">
+                                    <Icons.X />
+                                </button>
+                            </div>
+                            <div className="flex items-center gap-2">
+                                <code className="flex-1 px-3 py-2 bg-black/40 rounded text-sm text-yellow-100 break-all">{reveal.token}</code>
+                                <button onClick={() => copy(reveal.token, t('autoInstallToken') || 'Token')}
+                                    className="px-3 py-2 bg-proxmox-card border border-proxmox-border rounded hover:border-gray-500 text-gray-300">
+                                    <Icons.Copy className="w-4 h-4" />
+                                </button>
+                            </div>
+                            <div>
+                                <div className="text-xs text-gray-400 mb-1">{t('autoInstallPrepareIso') || 'Prepare the ISO with:'}</div>
+                                <div className="flex items-start gap-2">
+                                    <pre className="flex-1 px-3 py-2 bg-black/40 rounded text-xs text-gray-200 overflow-x-auto whitespace-pre">{prepareCmd(reveal.token)}</pre>
+                                    <button onClick={() => copy(prepareCmd(reveal.token), t('autoInstallCommand') || 'Command')}
+                                        className="px-3 py-2 bg-proxmox-card border border-proxmox-border rounded hover:border-gray-500 text-gray-300">
+                                        <Icons.Copy className="w-4 h-4" />
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {editing && (
+                        <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-4 space-y-3">
+                            <h4 className="font-medium text-white">
+                                {editing.id ? (t('autoInstallEditProfile') || 'Edit profile') : (t('autoInstallNewProfile') || 'New profile')}
+                            </h4>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <div>
+                                    <label className="block text-xs text-gray-400 mb-1">{t('name') || 'Name'}</label>
+                                    <input value={editing.name} onChange={e => setEditing({ ...editing, name: e.target.value })}
+                                        className="w-full px-3 py-2 bg-proxmox-card border border-proxmox-border rounded text-sm text-white" />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-gray-400 mb-1">{t('description') || 'Description'}</label>
+                                    <input value={editing.description || ''} onChange={e => setEditing({ ...editing, description: e.target.value })}
+                                        className="w-full px-3 py-2 bg-proxmox-card border border-proxmox-border rounded text-sm text-white" />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-gray-400 mb-1">{t('autoInstallTargetCluster') || 'Joins cluster (optional)'}</label>
+                                    <select value={editing.target_cluster_id || ''} onChange={e => setEditing({ ...editing, target_cluster_id: e.target.value })}
+                                        className="w-full px-3 py-2 bg-proxmox-card border border-proxmox-border rounded text-sm text-white">
+                                        <option value="">—</option>
+                                        {(clusters || []).map(c => <option key={c.id} value={c.id}>{c.name || c.id}</option>)}
+                                    </select>
+                                </div>
+                                <div className="grid grid-cols-2 gap-3">
+                                    <div>
+                                        <label className="block text-xs text-gray-400 mb-1">{t('autoInstallMaxUses') || 'Max fetches'}</label>
+                                        <input type="number" min="0" value={editing.max_uses || 0}
+                                            onChange={e => setEditing({ ...editing, max_uses: e.target.value })}
+                                            className="w-full px-3 py-2 bg-proxmox-card border border-proxmox-border rounded text-sm text-white" />
+                                        <div className="text-[11px] text-gray-500 mt-1">{t('autoInstallUnlimited') || '0 = unlimited'}</div>
+                                    </div>
+                                    <div>
+                                        <label className="block text-xs text-gray-400 mb-1">{t('autoInstallExpires') || 'Expires'}</label>
+                                        <input type="datetime-local" value={(editing.expires_at || '').slice(0, 16)}
+                                            onChange={e => setEditing({ ...editing, expires_at: e.target.value })}
+                                            className="w-full px-3 py-2 bg-proxmox-card border border-proxmox-border rounded text-sm text-white" />
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div>
+                                <div className="flex items-center justify-between mb-1">
+                                    <label className="text-xs text-gray-400">{t('autoInstallAnswerFile') || 'Answer file (TOML)'}</label>
+                                    <button onClick={validate} className="text-xs px-2 py-1 bg-proxmox-card border border-proxmox-border rounded hover:border-gray-500 text-gray-300">
+                                        {t('autoInstallValidate') || 'Check'}
+                                    </button>
+                                </div>
+                                {editing.answer_redacted && (
+                                    <div className="mb-2 text-xs text-yellow-300 flex items-center gap-1.5">
+                                        <Icons.Lock className="w-3.5 h-3.5" />
+                                        {t('autoInstallRedacted') || 'Passwords are hidden for your role — saving keeps the stored file unchanged.'}
+                                    </div>
+                                )}
+                                <textarea rows={14} spellCheck={false} disabled={!!editing.answer_redacted}
+                                    value={editing.answer || ''} onChange={e => { setEditing({ ...editing, answer: e.target.value }); setCheck(null); }}
+                                    className="w-full px-3 py-2 bg-proxmox-card border border-proxmox-border rounded font-mono text-xs text-white disabled:opacity-60" />
+                            </div>
+
+                            {check && (
+                                <div className={`rounded-lg p-3 text-xs border ${check.valid ? 'bg-green-500/10 border-green-500/40 text-green-200' : 'bg-red-500/10 border-red-500/40 text-red-200'}`}>
+                                    <div className="font-medium mb-1">
+                                        {check.valid ? (t('autoInstallAnswerOk') || 'The installer will accept this file.')
+                                                     : (t('autoInstallAnswerBad') || 'The installer would stop on this file.')}
+                                    </div>
+                                    {(check.errors || []).map((e, i) => <div key={`e${i}`}>• {e}</div>)}
+                                    {(check.warnings || []).map((w, i) => <div key={`w${i}`} className="text-yellow-300">• {w}</div>)}
+                                </div>
+                            )}
+
+                            <div>
+                                <label className="block text-xs text-gray-400 mb-1">{t('autoInstallCallbackUrl') || 'Callback URL (optional)'}</label>
+                                <input value={editing.callback_url || ''} placeholder={editing.callback_effective_url || ''}
+                                    onChange={e => setEditing({ ...editing, callback_url: e.target.value })}
+                                    className="w-full px-3 py-2 bg-proxmox-card border border-proxmox-border rounded text-sm text-white" />
+                                <div className="text-[11px] text-gray-500 mt-1">
+                                    {t('autoInstallCallbackHint') || 'Leave empty to use the address the installer reached PegaProx on. Set it when a reverse proxy or a second network is in the way.'}
+                                </div>
+                            </div>
+
+                            <div className="flex items-center justify-between pt-1">
+                                <label className="flex items-center gap-2 text-sm text-gray-300">
+                                    <input type="checkbox" checked={!!editing.enabled}
+                                        onChange={e => setEditing({ ...editing, enabled: e.target.checked })} />
+                                    {t('enabled') || 'Enabled'}
+                                </label>
+                                <div className="flex gap-2">
+                                    <button onClick={() => { setEditing(null); setCheck(null); }}
+                                        className="px-4 py-2 bg-proxmox-card border border-proxmox-border rounded-lg text-sm text-gray-300 hover:border-gray-500">
+                                        {t('cancel') || 'Cancel'}
+                                    </button>
+                                    <button onClick={save} disabled={busy || !editing.name}
+                                        className="px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm font-medium disabled:opacity-50">
+                                        {t('save') || 'Save'}
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    <div className="bg-proxmox-dark border border-proxmox-border rounded-xl overflow-hidden">
+                        <table className="w-full text-sm">
+                            <thead className="bg-proxmox-card/60 text-gray-400 text-xs uppercase">
+                                <tr>
+                                    <th className="text-left px-4 py-2">{t('name') || 'Name'}</th>
+                                    <th className="text-left px-4 py-2">{t('autoInstallTargetCluster') || 'Joins cluster'}</th>
+                                    <th className="text-left px-4 py-2">{t('autoInstallToken') || 'Token'}</th>
+                                    <th className="text-left px-4 py-2">{t('autoInstallUses') || 'Fetches'}</th>
+                                    <th className="text-right px-4 py-2"></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {profiles.length === 0 && (
+                                    <tr><td colSpan="5" className="px-4 py-6 text-center text-gray-500">
+                                        {loading ? (t('loading') || 'Loading…') : (t('autoInstallNoProfiles') || 'No installation profiles yet.')}
+                                    </td></tr>
+                                )}
+                                {profiles.map(p => (
+                                    <tr key={p.id} className="border-t border-proxmox-border/60">
+                                        <td className="px-4 py-2">
+                                            <div className="text-white flex items-center gap-2">
+                                                {p.name}
+                                                {!p.enabled && <span className="text-[10px] px-1.5 py-0.5 border border-gray-600 text-gray-400 rounded">{t('disabled') || 'disabled'}</span>}
+                                            </div>
+                                            {p.description && <div className="text-xs text-gray-500">{p.description}</div>}
+                                        </td>
+                                        <td className="px-4 py-2 text-gray-300">{p.target_cluster_name || p.target_cluster_id || '—'}</td>
+                                        <td className="px-4 py-2 font-mono text-xs text-gray-400">{p.token_hint}…</td>
+                                        <td className="px-4 py-2 text-gray-300">
+                                            {p.uses}{p.max_uses ? ` / ${p.max_uses}` : ''}
+                                        </td>
+                                        <td className="px-4 py-2">
+                                            <div className="flex items-center justify-end gap-1">
+                                                {canManage && (
+                                                    <button onClick={() => startEdit(p)} title={t('edit') || 'Edit'}
+                                                        className="p-1.5 text-gray-400 hover:text-white"><Icons.Edit className="w-4 h-4" /></button>
+                                                )}
+                                                {canManage && (
+                                                    <button onClick={() => rotate(p)} title={t('autoInstallRotate') || 'Rotate token'}
+                                                        className="p-1.5 text-gray-400 hover:text-white"><Icons.RefreshCw className="w-4 h-4" /></button>
+                                                )}
+                                                {canManage && (
+                                                    <button onClick={() => remove(p)} title={t('delete') || 'Delete'}
+                                                        className="p-1.5 text-gray-400 hover:text-red-400"><Icons.Trash2 className="w-4 h-4" /></button>
+                                                )}
+                                                {!canManage && <span className="text-xs text-gray-600">{t('readOnly') || 'read-only'}</span>}
+                                            </div>
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div>
+                        <h4 className="font-medium text-white mb-2 flex items-center gap-2">
+                            <Icons.Activity className="w-4 h-4" />
+                            {t('autoInstallRuns') || 'Installations'}
+                        </h4>
+                        <div className="bg-proxmox-dark border border-proxmox-border rounded-xl overflow-hidden">
+                            <table className="w-full text-sm">
+                                <thead className="bg-proxmox-card/60 text-gray-400 text-xs uppercase">
+                                    <tr>
+                                        <th className="text-left px-4 py-2">{t('autoInstallMachine') || 'Machine'}</th>
+                                        <th className="text-left px-4 py-2">{t('profile') || 'Profile'}</th>
+                                        <th className="text-left px-4 py-2">{t('status') || 'Status'}</th>
+                                        <th className="text-left px-4 py-2">{t('autoInstallStarted') || 'Started'}</th>
+                                        <th className="text-right px-4 py-2"></th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {runs.length === 0 && (
+                                        <tr><td colSpan="5" className="px-4 py-6 text-center text-gray-500">
+                                            {t('autoInstallNoRuns') || 'No machine has fetched an answer file yet.'}
+                                        </td></tr>
+                                    )}
+                                    {runs.map(r => (
+                                        <tr key={r.id} className="border-t border-proxmox-border/60">
+                                            <td className="px-4 py-2">
+                                                <div className="text-white">{r.product || r.hostname || r.fingerprint || '—'}</div>
+                                                <div className="text-[11px] text-gray-500 font-mono">{r.fingerprint || r.client_ip}</div>
+                                            </td>
+                                            <td className="px-4 py-2 text-gray-300">{r.profile_name || '—'}</td>
+                                            <td className="px-4 py-2">
+                                                <span className={`px-2 py-0.5 text-xs rounded-full border ${STATUS_STYLE[r.status] || 'border-gray-600 text-gray-400'}`}>
+                                                    {statusLabel(r.status)}
+                                                </span>
+                                                {r.message && <div className="text-[11px] text-gray-500 mt-0.5">{r.message}</div>}
+                                            </td>
+                                            <td className="px-4 py-2 text-gray-400 text-xs">{when(r.started_at)}</td>
+                                            <td className="px-4 py-2 text-right">
+                                                {canManage && (
+                                                    <button onClick={() => clearRun(r)} title={t('clear') || 'Clear'}
+                                                        className="p-1.5 text-gray-400 hover:text-red-400"><Icons.X /></button>
+                                                )}
+                                            </td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
                 </div>
             );
         }
@@ -2625,6 +3062,18 @@
                                 {updateInfo?.update_available && (
                                     <span className="px-1.5 py-0.5 text-xs bg-green-500 text-white rounded-full">NEW</span>
                                 )}
+                            </button>
+                            <button
+                                onClick={() => setActiveTab('autoinstall')}
+                                className={`flex items-center gap-2 ${isCorporate ? 'px-3 py-1.5 text-[13px]' : 'px-4 py-2.5 text-sm'} font-medium transition-colors whitespace-nowrap ${
+                                    activeTab === 'autoinstall'
+                                        ? (isCorporate ? 'text-white border-b-2 border-[#49afd9] font-medium' : 'text-proxmox-orange border-b-2 border-proxmox-orange bg-proxmox-dark/50')
+                                        : 'text-gray-400 hover:text-white hover:bg-proxmox-dark/30'
+                                }`}
+                            >
+                                <Icons.Disc className="w-4 h-4" />
+                                <span className="hidden sm:inline">{t('autoInstall')}</span>
+                                <span className="sm:hidden">{t('autoInstallShort')}</span>
                             </button>
                             <button
                                 onClick={() => setActiveTab('about')}
@@ -7514,6 +7963,10 @@
                             )}
                             
                             {/* About Tab - LW styled this */}
+                            {activeTab === 'autoinstall' && (
+                                <AutoInstallPanel t={t} addToast={addToast}
+                                    getAuthHeaders={getAuthHeaders} clusters={clusters} />
+                            )}
                             {activeTab === 'about' && (
                                 <div className="space-y-6">
                                     {/* Version Info */}
