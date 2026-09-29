@@ -128,7 +128,7 @@ def _node_hw_summary_redfish(mgr, cluster_id, node):
     return _compact_hw(res)
 
 
-def load_metrics_history():
+def load_metrics_history(days=None):
     """Load historical metrics from SQLite database.
 
     NS 2026-06-05 (#528 scaling): this SELECTed up to 1000 snapshot rows and
@@ -136,8 +136,17 @@ def load_metrics_history():
     freeze per report (reports.py calls this up to 3× per report). Now the fetch
     + parse run off-hub via run_heavy_read, with a short TTL cache so the repeated
     calls within a report (and back-to-back reports) coalesce onto one query.
+
+    `days` bounds the read by TIME. The flat LIMIT 1000 covers ~3.5 days at the
+    5-min cadence and a good deal less when snapshots land more often, so a
+    caller asking for a week got "the newest 1000 rows" and no way to tell the
+    difference. That is why the reports page showed the same window for
+    "Last 24h" and "Last Week". Callers that know their window pass it, and the
+    windowed read comes back oldest-first, which is the order a timeline wants.
+    days=None keeps the old row-capped (newest-first) behaviour.
     """
     try:
+        from datetime import timedelta
         from pegaprox.core.dbcrypto import run_heavy_read
 
         def _parse(rows):
@@ -151,9 +160,28 @@ def load_metrics_history():
                     pass
             return out
 
-        snapshots = run_heavy_read(
-            'SELECT timestamp, data FROM metrics_history ORDER BY timestamp DESC LIMIT 1000',
-            cache_key='mh_reports_1000', transform=_parse)
+        if days:
+            cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+            # Same decimation policy as helpers.load_metrics_window: a week of
+            # 5-min rows is ~2000 blobs to decrypt + parse, and every consumer
+            # either averages or feeds a chart that decimates to 200 points
+            # anyway. `id % stride = 0` is answered from the timestamp index,
+            # so the rows we skip are never decrypted.
+            stride = 1 if days <= 2 else 3
+            if stride > 1:
+                sql = ('SELECT timestamp, data FROM metrics_history '
+                       'WHERE timestamp >= ? AND id % ? = 0 ORDER BY timestamp ASC')
+                params = (cutoff, stride)
+            else:
+                sql = ('SELECT timestamp, data FROM metrics_history '
+                       'WHERE timestamp >= ? ORDER BY timestamp ASC')
+                params = (cutoff,)
+            snapshots = run_heavy_read(
+                sql, params, cache_key=f'mh_reports_d{days}', transform=_parse)
+        else:
+            snapshots = run_heavy_read(
+                'SELECT timestamp, data FROM metrics_history ORDER BY timestamp DESC LIMIT 1000',
+                cache_key='mh_reports_1000', transform=_parse)
         return {'snapshots': snapshots, 'last_cleanup': None}
     except Exception as e:
         logging.error(f"Error loading metrics history from database: {e}")
