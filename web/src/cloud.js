@@ -370,7 +370,7 @@
         }
 
         // ── side nav (collapsible, grouped) ────────────────────────
-        function CloudSideNav({ active, onSelect, isAdmin, collapsed, onToggle }) {
+        function CloudSideNav({ active, onSelect, isAdmin, canAutoInstall, collapsed, onToggle }) {
             const groups = [
                 { label: 'DASHBOARD', items: [{ id: 'overview', label: 'Overview', icon: 'Grid' }] },
                 { label: 'COMPUTE', items: [
@@ -405,6 +405,7 @@
                 { label: 'INFRASTRUCTURE', items: [
                     { id: 'clusters', label: 'Clusters', icon: 'Cloud' },
                     { id: 'nodes', label: 'Hosts', icon: 'Cpu' },
+                    ...(canAutoInstall ? [{ id: 'autoinstall', label: 'Automated Installs', icon: 'Disc' }] : []),
                     { id: 'ha', label: 'High Availability', icon: 'Shield' },
                     { id: 'updates', label: 'Update Manager', icon: 'Download' },
                 ] },
@@ -2210,6 +2211,8 @@
 
             const safeClusters = Array.isArray(clusters) ? clusters : [];
             const safeResources = Array.isArray(clusterResources) ? clusterResources : [];
+            // server-computed, already false for tenant/cluster-confined users
+            const canAutoInstall = !!(currentUser && currentUser.autoinstall_access);
 
             // PegaProx t() ECHOES the key back on a miss, so `t('cloud.x') || 'Fallback'`
             // would render the raw key. treat key-echo as "no translation". -- NS
@@ -2288,6 +2291,7 @@
                 siem: T('siem') || 'SIEM',
                 alerts: T('alertChannels') || 'Alert Channels',
                 updates: T('updateManager') || 'Update Manager',
+                autoinstall: T('autoInstall') || 'Automated Installations',
                 plugins: T('plugins') || 'Plugins',
                 scripts: T('customScripts') || 'Scripts',
                 schedules: T('scheduledActions') || 'Schedules',
@@ -2425,6 +2429,13 @@
                     case 'alerts':
                         body = <div className="cloud-mounted"><AlertChannelsPanel t={T} addToast={addToast} getAuthHeaders={() => ({})} /></div>;
                         break;
+                    case 'autoinstall':
+                        // raw t on purpose: T gives undefined on a miss, and the panel strings
+                        // t() results together into confirms and labels
+                        body = canAutoInstall
+                            ? <div className="cloud-mounted"><AutoInstallPanel t={t} addToast={addToast} getAuthHeaders={() => ({})} clusters={safeClusters} /></div>
+                            : <CloudDashboard clusters={safeClusters} resources={safeResources} metrics={clusterMetrics} dcStatus={dcStatus} tasks={tasks} onNav={selectSection} t={T} />;
+                        break;
                     case 'updates':
                         body = <div className="cloud-mounted"><UpdateManagerSection clusterId={cid} addToast={addToast} /></div>;
                         break;
@@ -2456,7 +2467,7 @@
 
             return (
                 <div className="cloud-shell">
-                    <CloudSideNav active={section} onSelect={selectSection} isAdmin={!!isAdmin} collapsed={collapsed} onToggle={() => setCollapsed(c => !c)} />
+                    <CloudSideNav active={section} onSelect={selectSection} isAdmin={!!isAdmin} canAutoInstall={canAutoInstall} collapsed={collapsed} onToggle={() => setCollapsed(c => !c)} />
                     <div className="cloud-content">
                         <CloudTopbar
                             crumbs={crumbs}

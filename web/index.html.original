@@ -3334,6 +3334,8 @@
         body[data-layout="cloud"] .cloud-mounted .text-blue-400, body[data-layout="cloud"] .cloud-mounted .text-blue-500 { color: var(--cloud-accent) !important; }
         body[data-layout="cloud"] .cloud-mounted .border-blue-500, body[data-layout="cloud"] .cloud-mounted .border-blue-600 { border-color: var(--cloud-accent) !important; }
         body[data-layout="cloud"] .cloud-mounted .hover\:bg-blue-700:hover { background: var(--cloud-accent-hover) !important; }
+        /* orange primaries (bg-proxmox-orange hover:bg-orange-600) flashed orange on hover */
+        body[data-layout="cloud"] .cloud-mounted .hover\:bg-orange-600:hover { background: var(--cloud-accent-hover) !important; }
 
         /* icon button */
         .cloud-icon-btn { display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; border-radius:var(--radius-md); background:transparent; border:1px solid transparent; color:var(--cloud-text-secondary); cursor:pointer; flex:0 0 auto; transition:background .12s, color .12s; }

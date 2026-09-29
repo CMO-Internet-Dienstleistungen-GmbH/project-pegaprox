@@ -7994,6 +7994,9 @@
             const { t } = useTranslation();
             const { user, sessionId, logout, getAuthHeaders, isAdmin, passwordExpiry, updatePreferences } = useAuth();
             const can = (permission) => isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes(permission));
+            // not can(): the auto-install routes also refuse tenant/cluster-confined callers
+            // (capped admins included), the server folds that into this flag for us
+            const canAutoInstall = !!user?.autoinstall_access;
             const { isCorporate, isCloud } = useLayout(); // LW: Feb 2026 - corporate layout / NS 2026-06: + cloud (Preview)
             const [clusters, setClusters] = useState([]);
             const [clusterGroups, setClusterGroups] = useState([]); // NS Jan 2026 - for grouping
@@ -8226,6 +8229,8 @@
             // LW: Mar 2026 - Cross-Hypervisor Migration (XHM) state
             const [sidebarXHM, setSidebarXHM] = useState(false);
             const [sidebarMultiSdn, setSidebarMultiSdn] = useState(false); // #612 — Multi-Cluster EVPN view
+            const [sidebarAutoInstall, setSidebarAutoInstall] = useState(false);
+            const [autoInstallIntent, setAutoInstallIntent] = useState(null); // {wizard, target_cluster_id} handed to the panel once
             const [xhmMigrations, setXhmMigrations] = useState([]);
             const [xhmSelectedMigration, setXhmSelectedMigration] = useState(null);
             const [xhmMigrationDetail, setXhmMigrationDetail] = useState(null);
@@ -8292,7 +8297,16 @@
             };
 
             // NS: auto-clear topology/xhm sidebar when navigating to something else
-            useEffect(() => { if (selectedCluster || selectedPBS || selectedVMware || selectedGroup) { setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); } }, [selectedCluster, selectedPBS, selectedVMware, selectedGroup]);
+            useEffect(() => { if (selectedCluster || selectedPBS || selectedVMware || selectedGroup) { setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); setSidebarAutoInstall(false); } }, [selectedCluster, selectedPBS, selectedVMware, selectedGroup]);
+
+            // All Clusters used to check only XHM, so it stayed lit next to World Map / EVPN
+            const onGlobalView = sidebarTopology || sidebarWorldmap || sidebarXHM || sidebarMultiSdn || sidebarAutoInstall;
+            // one way in for every auto-install shortcut, intent opens the wizard on arrival
+            const openAutoInstall = (intent = null) => {
+                setSidebarAutoInstall(true); setSidebarTopology(false); setSidebarWorldmap(false); setSidebarXHM(false); setSidebarMultiSdn(false);
+                setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null);
+                setAutoInstallIntent(intent);
+            };
 
             // track selected XHM migration in ref for SSE updates
             useEffect(() => { xhmSelectedMigrationRef.current = xhmSelectedMigration; }, [xhmSelectedMigration]);
@@ -8429,6 +8443,8 @@
             useEffect(() => { setMobileSidebarOpen(false); }, [
                 selectedGroup, selectedCluster, selectedPBS, selectedVMware,
                 selectedSidebarVm, selectedSidebarNode, selectedSidebarDatastore, activeTab,
+                // the global views set no selection, so they never closed the drawer
+                sidebarTopology, sidebarWorldmap, sidebarXHM, sidebarMultiSdn, sidebarAutoInstall,
             ]);
             const sidebarResizing = useRef(false);
             const wsRef = useRef(null);
@@ -14607,30 +14623,41 @@
                                             >
                                                 {t('addFirstCluster')}
                                             </button>
+                                            {/* bare-metal first: the global entry below is hidden until a cluster
+                                                exists, so this is the way in - a manager straight into the wizard,
+                                                a view-only account onto the page to watch the runs */}
+                                            {canAutoInstall && (
+                                                <button
+                                                    onClick={() => openAutoInstall(user?.autoinstall_access === 'manage' ? { wizard: true } : null)}
+                                                    className="block mx-auto mt-2 text-xs text-gray-400 hover:text-proxmox-orange hover:underline"
+                                                >
+                                                    {user?.autoinstall_access === 'manage' ? t('autoInstallFirstHost') : t('autoInstall')}
+                                                </button>
+                                            )}
                                         </div>
                                     ) : (
                                         <div className="space-y-3">
                                             {/* MK: overview button, LW: compact for corporate */}
                                             <button
-                                                onClick={() => { setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); }}
+                                                onClick={() => { setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); setSidebarAutoInstall(false); }}
                                                 className={`w-full flex items-center ${
                                                     isCorporate
                                                         ? 'gap-1.5 pl-1 pr-2 py-0.5 text-[13px] leading-5'
                                                         : `gap-3 px-3 py-2.5 rounded-xl transition-all ${
-                                                            !selectedCluster && !selectedPBS && !selectedVMware && !selectedGroup && !sidebarXHM
+                                                            !selectedCluster && !selectedPBS && !selectedVMware && !selectedGroup && !onGlobalView
                                                                 ? 'bg-gradient-to-r from-proxmox-orange/20 to-orange-600/10 border border-proxmox-orange/30 text-white'
                                                                 : 'bg-proxmox-card border border-proxmox-border hover:border-proxmox-orange/30 text-gray-300 hover:text-white'
                                                           }`
                                                 }`}
-                                                style={isCorporate ? (!selectedCluster && !selectedPBS && !selectedVMware && !selectedGroup && !sidebarTopology && !sidebarXHM ? {background: 'rgba(73,175,217,0.10)', borderLeft: '2px solid var(--corp-accent)', color: 'var(--color-text)'} : {color: 'var(--corp-text-secondary)'}) : undefined}
-                                                onMouseEnter={isCorporate ? (e) => { if (selectedCluster || selectedPBS || selectedVMware || selectedGroup || sidebarTopology || sidebarXHM) { e.currentTarget.style.background = 'var(--color-hover)'; e.currentTarget.style.color = 'var(--color-text)'; }} : undefined}
-                                                onMouseLeave={isCorporate ? (e) => { if (selectedCluster || selectedPBS || selectedVMware || selectedGroup || sidebarTopology || sidebarXHM) { e.currentTarget.style.background = ''; e.currentTarget.style.color = 'var(--corp-text-secondary)'; }} : undefined}
+                                                style={isCorporate ? (!selectedCluster && !selectedPBS && !selectedVMware && !selectedGroup && !onGlobalView ? {background: 'rgba(73,175,217,0.10)', borderLeft: '2px solid var(--corp-accent)', color: 'var(--color-text)'} : {color: 'var(--corp-text-secondary)'}) : undefined}
+                                                onMouseEnter={isCorporate ? (e) => { if (selectedCluster || selectedPBS || selectedVMware || selectedGroup || onGlobalView) { e.currentTarget.style.background = 'var(--color-hover)'; e.currentTarget.style.color = 'var(--color-text)'; }} : undefined}
+                                                onMouseLeave={isCorporate ? (e) => { if (selectedCluster || selectedPBS || selectedVMware || selectedGroup || onGlobalView) { e.currentTarget.style.background = ''; e.currentTarget.style.color = 'var(--corp-text-secondary)'; }} : undefined}
                                             >
                                                 {isCorporate ? (
                                                     <Icons.Database className="w-4 h-4 flex-shrink-0" style={{color: 'var(--corp-accent)'}} />
                                                 ) : (
                                                     <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
-                                                        !selectedCluster && !selectedPBS && !selectedVMware && !selectedGroup && !sidebarXHM ? 'bg-proxmox-orange/20' : 'bg-proxmox-dark'
+                                                        !selectedCluster && !selectedPBS && !selectedVMware && !selectedGroup && !onGlobalView ? 'bg-proxmox-orange/20' : 'bg-proxmox-dark'
                                                     }`}>
                                                         <Icons.Grid className="w-4 h-4" />
                                                     </div>
@@ -14643,7 +14670,7 @@
                                                         </div>
                                                     )}
                                                 </span>
-                                                {!isCorporate && !selectedCluster && !selectedPBS && !selectedVMware && !selectedGroup && !sidebarXHM && (
+                                                {!isCorporate && !selectedCluster && !selectedPBS && !selectedVMware && !selectedGroup && !onGlobalView && (
                                                     <div className="w-2 h-2 rounded-full bg-proxmox-orange" />
                                                 )}
                                             </button>
@@ -14651,7 +14678,7 @@
                                             {/* NS: Mar 2026 - Topology sidebar entry (#142) */}
                                             {isCorporate && (
                                                 <button
-                                                    onClick={() => { setSidebarTopology(true); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); setSidebarWorldmap(false); setSidebarXHM(false); setSidebarMultiSdn(false); }}
+                                                    onClick={() => { setSidebarTopology(true); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); setSidebarWorldmap(false); setSidebarXHM(false); setSidebarMultiSdn(false); setSidebarAutoInstall(false); }}
                                                     className="w-full flex items-center gap-1.5 pl-5 pr-2 py-0.5 text-[13px] leading-5"
                                                     style={sidebarTopology ? {background: 'rgba(73,175,217,0.10)', borderLeft: '2px solid var(--corp-accent)', color: 'var(--color-text)'} : {color: 'var(--corp-text-secondary)'}}
                                                     onMouseEnter={(e) => { if (!sidebarTopology) { e.currentTarget.style.background = 'var(--color-hover)'; e.currentTarget.style.color = 'var(--color-text)'; }}}
@@ -14664,7 +14691,7 @@
 
                                             {/* MK May 2026 — Worldmap sidebar entry (offline cluster geo-view) */}
                                             <button
-                                                onClick={() => { setSidebarWorldmap(true); setSidebarTopology(false); setSidebarXHM(false); setSidebarMultiSdn(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); }}
+                                                onClick={() => { setSidebarWorldmap(true); setSidebarTopology(false); setSidebarXHM(false); setSidebarMultiSdn(false); setSidebarAutoInstall(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); }}
                                                 className={isCorporate
                                                     ? 'w-full flex items-center gap-1.5 pl-5 pr-2 py-0.5 text-[13px] leading-5'
                                                     : `w-full flex items-center gap-3 px-3 py-2 rounded-xl transition-all mt-1 ${
@@ -14694,10 +14721,47 @@
                                                 </span>
                                             </button>
 
+                                            {/* LW Sep 2026 - automated installs, next to World Map because that row is always there once a cluster exists; the empty-sidebar card above covers the rest */}
+                                            {canAutoInstall && (
+                                                <button
+                                                    onClick={() => openAutoInstall()}
+                                                    className={isCorporate
+                                                        ? 'w-full flex items-center gap-1.5 pl-5 pr-2 py-0.5 text-[13px] leading-5'
+                                                        : `w-full flex items-center gap-3 px-3 py-2 rounded-xl transition-all mt-1 ${
+                                                            sidebarAutoInstall
+                                                                ? 'bg-gradient-to-r from-emerald-500/20 to-green-600/10 border border-emerald-500/30 text-white'
+                                                                : 'bg-proxmox-card border border-proxmox-border hover:border-emerald-500/30 text-gray-300 hover:text-white'
+                                                          }`
+                                                    }
+                                                    style={isCorporate ? (sidebarAutoInstall ? {background: 'rgba(73,175,217,0.10)', borderLeft: '2px solid var(--corp-accent)', color: 'var(--color-text)'} : {color: 'var(--corp-text-secondary)'}) : undefined}
+                                                    onMouseEnter={isCorporate ? (e) => { if (!sidebarAutoInstall) { e.currentTarget.style.background = 'var(--color-hover)'; e.currentTarget.style.color = 'var(--color-text)'; }} : undefined}
+                                                    onMouseLeave={isCorporate ? (e) => { if (!sidebarAutoInstall) { e.currentTarget.style.background = ''; e.currentTarget.style.color = 'var(--corp-text-secondary)'; }} : undefined}
+                                                >
+                                                    {isCorporate ? (
+                                                        // Disc has no style prop, the colour comes in through currentColor
+                                                        <span className="flex flex-shrink-0" style={{color: sidebarAutoInstall ? 'var(--corp-accent)' : 'var(--corp-text-muted)'}}>
+                                                            <Icons.Disc className="w-4 h-4" />
+                                                        </span>
+                                                    ) : (
+                                                        <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${sidebarAutoInstall ? 'bg-emerald-500/20' : 'bg-proxmox-dark'}`}>
+                                                            <Icons.Disc className="w-4 h-4 text-emerald-400" />
+                                                        </div>
+                                                    )}
+                                                    <span className={isCorporate ? 'flex-1 text-left truncate' : 'flex-1 text-left'}>
+                                                        {isCorporate ? t('autoInstall') : (
+                                                            <div>
+                                                                <div className="text-sm font-medium">{t('autoInstall')}</div>
+                                                                <div className="text-xs text-gray-500">{t('autoInstallHint')}</div>
+                                                            </div>
+                                                        )}
+                                                    </span>
+                                                </button>
+                                            )}
+
                                             {/* LW: Mar 2026 - XHM sidebar (only when both PVE + XCP-ng clusters exist) */}
                                             {clusters.some(c => c.type === 'xcpng' || c.cluster_type === 'xcpng') && clusters.some(c => c.type !== 'xcpng' && c.cluster_type !== 'xcpng') && (
                                                 <button
-                                                    onClick={() => { setSidebarXHM(true); setSidebarTopology(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); }}
+                                                    onClick={() => { setSidebarXHM(true); setSidebarTopology(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); setSidebarAutoInstall(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); }}
                                                     className={isCorporate
                                                         ? 'w-full flex items-center gap-1.5 pl-5 pr-2 py-0.5 text-[13px] leading-5'
                                                         : `w-full flex items-center gap-3 px-3 py-2 rounded-xl transition-all mt-1 ${
@@ -14724,7 +14788,7 @@
                                             {/* #612: Multi-Cluster EVPN sidebar (only when ≥2 clusters exist) */}
                                             {clusters.length >= 2 && (
                                                 <button
-                                                    onClick={() => { setSidebarMultiSdn(true); setSidebarXHM(false); setSidebarTopology(false); setSidebarWorldmap(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); }}
+                                                    onClick={() => { setSidebarMultiSdn(true); setSidebarXHM(false); setSidebarTopology(false); setSidebarWorldmap(false); setSidebarAutoInstall(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); }}
                                                     className={isCorporate
                                                         ? 'w-full flex items-center gap-1.5 pl-5 pr-2 py-0.5 text-[13px] leading-5'
                                                         : `w-full flex items-center gap-3 px-3 py-2 rounded-xl transition-all mt-1 ${
@@ -22614,6 +22678,28 @@
                                             canManage={isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes('sdn.manage') && user.permissions.includes('admin.settings'))}
                                         />
                                     </div>
+                                ) : sidebarAutoInstall ? (
+                                    <div className={isCorporate ? '' : 'space-y-4'}>
+                                        {isCorporate && (
+                                            <div className="corp-content-header">
+                                                <div className="flex items-center gap-2">
+                                                    <span className="flex" style={{color: 'var(--corp-accent)'}}><Icons.Disc className="w-4 h-4" /></span>
+                                                    <span className="corp-header-title">{t('autoInstall')}</span>
+                                                </div>
+                                            </div>
+                                        )}
+                                        <div className={isCorporate ? 'p-3' : ''}>
+                                            <AutoInstallPanel
+                                                t={t}
+                                                addToast={addToast}
+                                                getAuthHeaders={getAuthHeaders}
+                                                clusters={clusters}
+                                                heading={!isCorporate}
+                                                intent={autoInstallIntent}
+                                                onIntentConsumed={() => setAutoInstallIntent(null)}
+                                            />
+                                        </div>
+                                    </div>
                                 ) : (
                                     <AllClustersOverview
                                         clusters={clusters}
@@ -22630,6 +22716,7 @@
                                             setActiveTab('resources');
                                             setResourcesSubTab('management');
                                         }}
+                                        onAutoInstall={user?.autoinstall_access === 'manage' ? () => openAutoInstall({ wizard: true }) : undefined}
                                     />
                                 )}
                             </div>

@@ -589,7 +589,7 @@
             'fqdn = "pve01.example.com"',
             'mailto = "root@example.com"',
             'timezone = "Europe/Berlin"',
-            '# mkpasswd -m sha-512, so the password is not stored in clear text',
+            '# the hash button above the editor writes this line (or: mkpasswd -m sha-512)',
             'root-password-hashed = "$6$...replace me..."',
             '',
             '[network]',
@@ -600,6 +600,105 @@
             'disk-list = ["sda"]',
             ''
         ].join('\n');
+
+        // What the installer itself accepts. These mirror the checks in
+        // pegaprox/api/auto_install.py (keep them in step - the patterns below are the
+        // same regexes); the server repeats all of it, this only saves a round trip.
+        const AUTOINSTALL_KEYBOARDS = [
+            ['de', 'German'], ['de-ch', 'Swiss-German'], ['dk', 'Danish'], ['en-gb', 'United Kingdom'],
+            ['en-us', 'U.S. English'], ['es', 'Spanish'], ['fi', 'Finnish'], ['fr', 'French'],
+            ['fr-be', 'Belgium-French'], ['fr-ca', 'Canada-French'], ['fr-ch', 'Swiss-French'],
+            ['hu', 'Hungarian'], ['is', 'Icelandic'], ['it', 'Italian'], ['jp', 'Japanese'],
+            ['lt', 'Lithuanian'], ['mk', 'Macedonian'], ['nl', 'Dutch'], ['no', 'Norwegian'],
+            ['pl', 'Polish'], ['pt', 'Portuguese'], ['pt-br', 'Portuguese (Brazil)'], ['se', 'Swedish'],
+            ['si', 'Slovenian'], ['tr', 'Turkish']
+        ];
+        // ISO 3166-1 alpha-2, lowercase like the installer wants it
+        const AUTOINSTALL_COUNTRIES = (
+            'ad ae af ag ai al am ao aq ar as at au aw ax az ba bb bd be bf bg bh bi bj bl bm bn bo bq br bs bt ' +
+            'bv bw by bz ca cc cd cf cg ch ci ck cl cm cn co cr cu cv cw cx cy cz de dj dk dm do dz ec ee eg eh ' +
+            'er es et fi fj fk fm fo fr ga gb gd ge gf gg gh gi gl gm gn gp gq gr gs gt gu gw gy hk hm hn hr ht ' +
+            'hu id ie il im in io iq ir is it je jm jo jp ke kg kh ki km kn kp kr kw ky kz la lb lc li lk lr ls ' +
+            'lt lu lv ly ma mc md me mf mg mh mk ml mm mn mo mp mq mr ms mt mu mv mw mx my mz na nc ne nf ng ni ' +
+            'nl no np nr nu nz om pa pe pf pg ph pk pl pm pn pr ps pt pw py qa re ro rs ru rw sa sb sc sd se sg ' +
+            'sh si sj sk sl sm sn so sr ss st sv sx sy sz tc td tf tg th tj tk tl tm tn to tr tt tv tw tz ua ug ' +
+            'um us uy uz va vc ve vg vi vn vu wf ws ye yt za zm zw'
+        ).split(' ');
+        // minimum disk count per level, same table as the backend
+        const AUTOINSTALL_RAID_MIN = {
+            zfs: { raid0: 1, raid1: 2, raid10: 4, 'raidz-1': 3, 'raidz-2': 4, 'raidz-3': 5 },
+            btrfs: { raid0: 1, raid1: 2, raid10: 4 }
+        };
+        const AUTOINSTALL_DISK_KEYS = ['ID_SERIAL', 'ID_SERIAL_SHORT', 'ID_WWN', 'ID_MODEL', 'DEVNAME'];
+        // sha-512, sha-256, yescrypt, bcrypt. The charset also keeps ':' and newlines
+        // out, which would break the chpasswd line the installer writes.
+        const AUTOINSTALL_CRYPT_RE = [
+            /^\$6\$(rounds=[0-9]{1,9}\$)?[./0-9A-Za-z]{0,16}\$[./0-9A-Za-z]{86}$/,
+            /^\$5\$(rounds=[0-9]{1,9}\$)?[./0-9A-Za-z]{0,16}\$[./0-9A-Za-z]{43}$/,
+            /^\$y\$[./0-9A-Za-z]+\$[./0-9A-Za-z]{1,86}\$[./0-9A-Za-z]{43}$/,
+            /^\$2[aby]\$[0-9]{2}\$[./0-9A-Za-z]{53}$/
+        ];
+        const AUTOINSTALL_CTRL_RE = /[\x00-\x1f\x7f]/;
+        const AUTOINSTALL_SSH_KEY_RE = /^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/]+={0,3}( [^\x00-\x1f\x7f]*)?$/;
+        const AUTOINSTALL_GLOB_RE = /^[A-Za-z0-9_.:+\-\/*?\[\]!]{1,128}$/;
+        const AUTOINSTALL_DISK_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.:\-\/]{0,63}$/;
+        // disk-list wants the installer's raw names; a by-id path never matches (_is_disk_path)
+        const aiDiskNameOk = (n) => AUTOINSTALL_DISK_NAME_RE.test(n) && !n.startsWith('disk/');
+
+        const aiCryptOk = (v) => AUTOINSTALL_CRYPT_RE.some(re => re.test(v || ''));
+
+        // returns a translation key, '' when fine. domainOnly = the DHCP fallback domain
+        function aiFqdnError(v, domainOnly) {
+            const s = String(v || '');
+            if (s.length > 253) return 'autoInstallErrFqdnLong';
+            const labels = s.split('.');
+            if (!domainOnly && labels.length < 2) return 'autoInstallErrFqdnDomain';
+            if (labels.some(l => !/^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(l))) return 'autoInstallErrFqdnLabel';
+            if (!domainOnly && /^[0-9]+$/.test(labels[0])) return 'autoInstallErrFqdnDigits';
+            return '';
+        }
+
+        const aiIpv4 = (v) => /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/.test(v);
+        // 4, 6 or 0. The URL parser is the cheapest full IPv6 check a browser has.
+        function aiIpFamily(v) {
+            const s = String(v || '');
+            if (aiIpv4(s)) return 4;
+            if (!s.includes(':') || !/^[0-9A-Fa-f:.]+$/.test(s)) return 0;
+            try { new URL(`http://[${s}]/`); return 6; } catch (e) { return 0; }
+        }
+
+        function aiCidrError(v) {
+            const m = String(v || '').match(/^([^/\s]+)\/(\d{1,3})$/);
+            if (!m) return 'autoInstallErrCidr';
+            const fam = aiIpFamily(m[1]);
+            const max = fam === 4 ? 32 : (fam === 6 ? 128 : -1);
+            if (max < 0 || Number(m[2]) > max || (m[2].length > 1 && m[2][0] === '0')) return 'autoInstallErrCidr';
+            return '';
+        }
+
+        // bit string of an address, only used for the gateway-in-subnet hint
+        function aiIpBits(v) {
+            if (aiIpv4(v)) return v.split('.').map(o => Number(o).toString(2).padStart(8, '0')).join('');
+            const h = new URL(`http://[${v}]/`).hostname.slice(1, -1);
+            const [head, tail] = h.split('::');
+            const a = head ? head.split(':') : [];
+            const b = tail ? tail.split(':') : [];
+            const groups = tail === undefined ? a : a.concat(Array(8 - a.length - b.length).fill('0'), b);
+            return groups.map(g => parseInt(g, 16).toString(2).padStart(16, '0')).join('');
+        }
+        const aiSameNet = (cidr, ip) => {
+            try {
+                const [addr, pfx] = cidr.split('/');
+                const n = Number(pfx);
+                return aiIpBits(addr).slice(0, n) === aiIpBits(ip).slice(0, n);
+            } catch (e) { return true; }
+        };
+
+        // the HTML5 type=email pattern, which is what the installer checks against
+        const aiMailOk = (v) => /^[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/.test(v || '')
+            && v !== 'mail@example.invalid';
+        // the installer only knows its own zone table plus the literal UTC, so Etc/UTC fails at the rack
+        const aiTimezoneOk = (v) => /^[A-Za-z][A-Za-z0-9_+\-]*(?:\/[A-Za-z0-9_+\-]+){0,2}$/.test(v || '') && !v.startsWith('Etc/');
 
         // datetime-local speaks browser time, the server stores UTC
         const utcToLocalInput = (iso) => {
@@ -615,7 +714,79 @@
             return isNaN(d.getTime()) ? v : d.toISOString();
         };
 
-        function AutoInstallPanel({ t, addToast, getAuthHeaders, clusters }) {
+        function autoInstallPrepareCmd(token, fp) {
+            const answerUrl = `${window.location.origin}/api/auto-install/answer`;
+            return [
+                'proxmox-auto-install-assistant prepare-iso proxmox-ve.iso',
+                '    --fetch-from http',
+                `    --url '${answerUrl}'`,
+                `    --answer-auth-token 'pegaprox:${token}'`
+            ].concat(fp ? [`    --cert-fingerprint '${fp}'`] : []).join(' \\\n');
+        }
+
+        // Drops every root password line in [global] and puts the hash right under the
+        // header. Deliberately line based, a TOML round trip would eat the user's comments.
+        function aiSetRootHash(answer, hash) {
+            const line = `root-password-hashed = "${hash}"`;
+            const out = [];
+            let inGlobal = false, at = -1;
+            for (const raw of String(answer || '').split('\n')) {
+                const s = raw.trim();
+                if (s.startsWith('[')) {
+                    inGlobal = /^\[\s*global\s*\]/.test(s);
+                    out.push(raw);
+                    if (inGlobal && at < 0) at = out.length;
+                    continue;
+                }
+                if (inGlobal && /^root[-_]password([-_]hashed)?\s*=/.test(s)) continue;
+                out.push(raw);
+            }
+            if (at < 0) return `[global]\n${line}\n\n` + out.join('\n');
+            out.splice(at, 0, line);
+            return out.join('\n');
+        }
+
+        // The one-time token plus the finished prepare-iso command. Shared by the
+        // editor's reveal box and the wizard's last page so both print the same thing.
+        // CopyButton has the textarea fallback, so this also copies over plain http.
+        function AutoInstallTokenBox({ t, reveal, onCopied, onDismiss }) {
+            const cmd = autoInstallPrepareCmd(reveal.token, reveal.fp);
+            const copyBtn = (value) => (
+                <span className="shrink-0 inline-flex" onClickCapture={() => onCopied && onCopied()}>
+                    <CopyButton value={value} size="md" title={t('copy')}
+                        className="w-8 h-8 border border-proxmox-border hover:border-gray-500" />
+                </span>
+            );
+            return (
+                <div className="bg-yellow-500/10 border border-yellow-500/40 rounded-xl p-4 space-y-3">
+                    <div className="flex items-center justify-between">
+                        <h4 className="font-medium text-yellow-200 flex items-center gap-2">
+                            <Icons.Key className="w-4 h-4" />
+                            {t('autoInstallTokenOnce')}
+                        </h4>
+                        {onDismiss && (
+                            <button onClick={onDismiss} aria-label={t('close')} className="text-gray-400 hover:text-white">
+                                <Icons.X />
+                            </button>
+                        )}
+                    </div>
+                    <div className="flex items-center gap-2">
+                        <code className="flex-1 px-3 py-2 bg-black/40 rounded text-sm text-yellow-200 break-all">{reveal.token}</code>
+                        {copyBtn(reveal.token)}
+                    </div>
+                    <div>
+                        <div className="text-xs text-gray-400 mb-1">{t('autoInstallPrepareIso')}</div>
+                        <div className="flex items-start gap-2">
+                            <pre className="flex-1 px-3 py-2 bg-black/40 rounded text-xs text-gray-200 overflow-x-auto whitespace-pre">{cmd}</pre>
+                            {copyBtn(cmd)}
+                        </div>
+                        <div className="text-[11px] text-gray-500 mt-1">{t('autoInstallOldIsoHint')}</div>
+                    </div>
+                </div>
+            );
+        }
+
+        function AutoInstallPanel({ t, addToast, getAuthHeaders, clusters, heading = true, intent, onIntentConsumed }) {
             const [profiles, setProfiles] = useState([]);
             const [canManage, setCanManage] = useState(false);
             const [runs, setRuns] = useState([]);
@@ -625,6 +796,13 @@
             const [check, setCheck] = useState(null);      // {valid, errors, warnings}
             const [reveal, setReveal] = useState(null);    // {token, name, fp}, shown once
             const [busy, setBusy] = useState(false);
+            const [loaded, setLoaded] = useState(false);
+            const [wizardOpen, setWizardOpen] = useState(false);
+            const [wizardPreset, setWizardPreset] = useState(null);
+            const [hashOpen, setHashOpen] = useState(false);
+            const [hashPw, setHashPw] = useState('');
+            const [hashPw2, setHashPw2] = useState('');
+            const [hashMsg, setHashMsg] = useState(null);  // {ok, text}
 
             const load = async () => {
                 setLoading(true);
@@ -649,6 +827,7 @@
                     setLoadError(t('autoInstallLoadFailed'));
                 }
                 setLoading(false);
+                setLoaded(true);
             };
             useEffect(() => { load(); }, []);
 
@@ -659,22 +838,68 @@
                 return () => clearInterval(h);
             }, [runs]);
 
-            const answerUrl = `${window.location.origin}/api/auto-install/answer`;
-            const prepareCmd = (token, fp) => [
-                'proxmox-auto-install-assistant prepare-iso proxmox-ve.iso',
-                '    --fetch-from http',
-                `    --url '${answerUrl}'`,
-                `    --answer-auth-token 'pegaprox:${token}'`
-            ].concat(fp ? [`    --cert-fingerprint '${fp}'`] : []).join(' \\\n');
-
-            const copy = (text, what) => {
-                const done = () => addToast?.(t('autoInstallCopied').replace('{what}', what), 'success');
-                const fail = () => addToast?.(t('copyFailed'), 'error');
-                if (navigator.clipboard && navigator.clipboard.writeText) {
-                    navigator.clipboard.writeText(text).then(done).catch(fail);
-                } else {
-                    fail();
+            // a shortcut elsewhere asked for the wizard. Wait for the first load, a
+            // view-only reader just lands on the page.
+            useEffect(() => {
+                if (!intent || !loaded) return;
+                if (intent.wizard && canManage) {
+                    setWizardPreset({ target_cluster_id: intent.target_cluster_id || '' });
+                    setWizardOpen(true);
                 }
+                onIntentConsumed?.();
+            }, [intent, loaded, canManage]);
+
+            const openWizard = () => { setWizardPreset(null); setWizardOpen(true); };
+
+            // a typed password must not outlive the form it was typed into
+            const editingKey = editing ? (editing.id || 'new') : '';
+            useEffect(() => {
+                setHashOpen(false); setHashPw(''); setHashPw2(''); setHashMsg(null);
+            }, [editingKey]);
+
+            // wizard -> editor. expires_local, not expires_at: the form reads the local one
+            const openInEditor = (d, res) => {
+                setWizardOpen(false);
+                setReveal(null);
+                setCheck(res ? { valid: !!res.valid, errors: res.errors || [], warnings: res.warnings || [] } : null);
+                setEditing({ id: null, name: d.name || '', description: d.description || '',
+                             answer: (res && res.answer) || AUTOINSTALL_TEMPLATE,
+                             target_cluster_id: d.target_cluster_id || '', callback_url: d.callback_url || '',
+                             max_uses: d.max_uses || 0, expires_local: d.expires_local || '',
+                             enabled: d.enabled !== false });
+            };
+
+            const hashIntoAnswer = async () => {
+                setHashMsg(null);
+                const bytes = new TextEncoder().encode(hashPw).length;
+                if (hashPw.length < 8 || hashPw.length > 64 || bytes < 8 || AUTOINSTALL_CTRL_RE.test(hashPw)) {
+                    setHashMsg({ ok: false, text: t('autoInstallErrPwLength') });
+                    return;
+                }
+                if (hashPw !== hashPw2) {
+                    setHashMsg({ ok: false, text: t('passwordsDoNotMatch') });
+                    return;
+                }
+                setBusy(true);
+                try {
+                    const r = await fetch(`${API_URL}/auto-install/password-hash`, {
+                        method: 'POST', credentials: 'include',
+                        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ password: hashPw })
+                    });
+                    const data = await r.json().catch(() => ({}));
+                    if (r.ok && aiCryptOk(data.hash)) {
+                        setEditing(ed => ed && ({ ...ed, answer: aiSetRootHash(ed.answer, data.hash) }));
+                        setCheck(null);
+                        setHashPw(''); setHashPw2('');
+                        setHashMsg({ ok: true, text: t('autoInstallHashInserted') });
+                    } else {
+                        setHashMsg({ ok: false, text: data.error || t('autoInstallHashFailed') });
+                    }
+                } catch (e) {
+                    setHashMsg({ ok: false, text: t('autoInstallHashFailed') });
+                }
+                setBusy(false);
             };
 
             const startNew = () => {
@@ -798,20 +1023,29 @@
 
             return (
                 <div className="space-y-4">
-                    <div className="flex items-start justify-between gap-4">
+                    <div className="flex flex-wrap items-start justify-between gap-4">
                         <div>
-                            <h3 className="text-lg font-semibold text-white flex items-center gap-2">
-                                <Icons.Disc className="w-5 h-5" />
-                                {t('autoInstall')}
-                            </h3>
-                            <p className="text-sm text-gray-400 mt-1 max-w-3xl">{t('autoInstallIntro')}</p>
+                            {heading && (
+                                <h3 className="text-lg font-semibold text-white flex items-center gap-2 mb-1">
+                                    <Icons.Disc className="w-5 h-5" />
+                                    {t('autoInstall')}
+                                </h3>
+                            )}
+                            <p className="text-sm text-gray-400 max-w-3xl">{t('autoInstallIntro')}</p>
                         </div>
                         {canManage && (
-                            <button onClick={startNew}
-                                className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm font-medium transition-colors whitespace-nowrap">
-                                <Icons.Plus />
-                                {t('autoInstallNewProfile')}
-                            </button>
+                            <div className="flex flex-wrap items-center gap-2">
+                                <button onClick={openWizard}
+                                    className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange hover:bg-proxmox-orange/90 rounded-lg text-sm font-medium transition-colors whitespace-nowrap">
+                                    <Icons.Plus />
+                                    {t('autoInstallGuided')}
+                                </button>
+                                <button onClick={startNew}
+                                    className="flex items-center gap-2 px-4 py-2 bg-proxmox-card border border-proxmox-border rounded-lg text-sm text-gray-300 hover:border-gray-500 whitespace-nowrap">
+                                    <Icons.FileText />
+                                    {t('autoInstallEditor')}
+                                </button>
+                            </div>
                         )}
                     </div>
 
@@ -822,37 +1056,7 @@
                         </div>
                     )}
 
-                    {reveal && (
-                        <div className="bg-yellow-500/10 border border-yellow-500/40 rounded-xl p-4 space-y-3">
-                            <div className="flex items-center justify-between">
-                                <h4 className="font-medium text-yellow-200 flex items-center gap-2">
-                                    <Icons.Key className="w-4 h-4" />
-                                    {t('autoInstallTokenOnce')}
-                                </h4>
-                                <button onClick={() => setReveal(null)} className="text-gray-400 hover:text-white">
-                                    <Icons.X />
-                                </button>
-                            </div>
-                            <div className="flex items-center gap-2">
-                                <code className="flex-1 px-3 py-2 bg-black/40 rounded text-sm text-yellow-200 break-all">{reveal.token}</code>
-                                <button onClick={() => copy(reveal.token, t('autoInstallToken'))}
-                                    className="px-3 py-2 bg-proxmox-card border border-proxmox-border rounded hover:border-gray-500 text-gray-300">
-                                    <Icons.Copy className="w-4 h-4" />
-                                </button>
-                            </div>
-                            <div>
-                                <div className="text-xs text-gray-400 mb-1">{t('autoInstallPrepareIso')}</div>
-                                <div className="flex items-start gap-2">
-                                    <pre className="flex-1 px-3 py-2 bg-black/40 rounded text-xs text-gray-200 overflow-x-auto whitespace-pre">{prepareCmd(reveal.token, reveal.fp)}</pre>
-                                    <button onClick={() => copy(prepareCmd(reveal.token, reveal.fp), t('autoInstallCommand'))}
-                                        className="px-3 py-2 bg-proxmox-card border border-proxmox-border rounded hover:border-gray-500 text-gray-300">
-                                        <Icons.Copy className="w-4 h-4" />
-                                    </button>
-                                </div>
-                                <div className="text-[11px] text-gray-500 mt-1">{t('autoInstallOldIsoHint')}</div>
-                            </div>
-                        </div>
-                    )}
+                    {reveal && <AutoInstallTokenBox t={t} reveal={reveal} onDismiss={() => setReveal(null)} />}
 
                     {editing && (
                         <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-4 space-y-3">
@@ -899,11 +1103,47 @@
                                 <div className="flex items-center justify-between mb-1">
                                     <label className="text-xs text-gray-400">{t('autoInstallAnswerFile')}</label>
                                     {!readOnly && (
-                                        <button onClick={validate} className="text-xs px-2 py-1 bg-proxmox-card border border-proxmox-border rounded hover:border-gray-500 text-gray-300">
-                                            {t('autoInstallValidate')}
-                                        </button>
+                                        <div className="flex items-center gap-2">
+                                            {!editing.answer_redacted && (
+                                                <button onClick={() => { setHashOpen(!hashOpen); setHashMsg(null); }} aria-expanded={hashOpen}
+                                                    className="text-xs px-2 py-1 bg-proxmox-card border border-proxmox-border rounded hover:border-gray-500 text-gray-300 flex items-center gap-1">
+                                                    <Icons.Lock className="w-3.5 h-3.5" />
+                                                    {t('autoInstallHashPassword')}
+                                                </button>
+                                            )}
+                                            <button onClick={validate} className="text-xs px-2 py-1 bg-proxmox-card border border-proxmox-border rounded hover:border-gray-500 text-gray-300">
+                                                {t('autoInstallValidate')}
+                                            </button>
+                                        </div>
                                     )}
                                 </div>
+                                {hashOpen && !readOnly && !editing.answer_redacted && (
+                                    // the clear password goes to the server once and only the hash comes back into the file
+                                    // a div, not a form: a submitted form that then clears or goes away is what makes
+                                    // browsers offer to save the node's root password as the PegaProx login
+                                    <div className="mb-2 p-3 bg-proxmox-card border border-proxmox-border rounded-lg space-y-2"
+                                        onKeyDown={e => { if (e.key === 'Enter' && !e.defaultPrevented && e.target.tagName === 'INPUT') { e.preventDefault(); if (!busy && hashPw) hashIntoAnswer(); } }}>
+                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                            <input type="password" autoComplete="new-password" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" value={hashPw} placeholder={t('password')}
+                                                aria-label={t('password')} onChange={e => { setHashPw(e.target.value); setHashMsg(null); }}
+                                                className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded text-sm text-white" />
+                                            <input type="password" autoComplete="new-password" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" value={hashPw2} placeholder={t('confirmPassword')}
+                                                aria-label={t('confirmPassword')} onChange={e => { setHashPw2(e.target.value); setHashMsg(null); }}
+                                                className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded text-sm text-white" />
+                                        </div>
+                                        <div className="flex flex-wrap items-center justify-between gap-2">
+                                            <span className="text-[11px] text-gray-500">{t('autoInstallPwHint')}</span>
+                                            <button type="button" onClick={() => hashIntoAnswer()} disabled={busy || !hashPw}
+                                                className="text-xs px-3 py-1.5 bg-proxmox-orange hover:bg-proxmox-orange/90 rounded disabled:opacity-50 flex items-center gap-1.5">
+                                                {busy && <Icons.RotateCw />}
+                                                {t('autoInstallHashInsert')}
+                                            </button>
+                                        </div>
+                                        {hashMsg && (
+                                            <div className={`text-xs ${hashMsg.ok ? 'text-green-400' : 'text-red-400'}`}>{hashMsg.text}</div>
+                                        )}
+                                    </div>
+                                )}
                                 {editing.answer_redacted && (
                                     <div className="mb-2 text-xs text-yellow-300 flex items-center gap-1.5">
                                         <Icons.Lock className="w-3.5 h-3.5" />
@@ -969,11 +1209,39 @@
                                 </tr>
                             </thead>
                             <tbody>
-                                {profiles.length === 0 && !loadError && (
+                                {profiles.length === 0 && !loadError && (canManage && !editing && !loading ? (
+                                    // first visit: offer both ways in instead of an empty table
+                                    <tr><td colSpan="5" className="p-4">
+                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                            <button onClick={openWizard}
+                                                className="text-left p-4 rounded-xl border border-proxmox-border bg-proxmox-card hover:border-proxmox-orange transition-colors">
+                                                <div className="flex items-center gap-2 text-white font-medium">
+                                                    <Icons.Disc className="w-5 h-5 text-proxmox-orange" />
+                                                    {t('autoInstallChoiceGuided')}
+                                                </div>
+                                                <div className="text-xs text-gray-400 mt-1">{t('autoInstallChoiceGuidedHint')}</div>
+                                            </button>
+                                            <button onClick={startNew}
+                                                className="text-left p-4 rounded-xl border border-proxmox-border bg-proxmox-card hover:border-gray-500 transition-colors">
+                                                <div className="flex items-center gap-2 text-white font-medium">
+                                                    <Icons.FileText />
+                                                    {t('autoInstallChoiceEditor')}
+                                                </div>
+                                                <div className="text-xs text-gray-400 mt-1">{t('autoInstallChoiceEditorHint')}</div>
+                                            </button>
+                                        </div>
+                                        <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-500">
+                                            <span className="text-gray-400 font-medium">{t('autoInstallHowItWorks')}:</span>
+                                            <span>1. {t('autoInstallHow1')}</span>
+                                            <span>2. {t('autoInstallHow2')}</span>
+                                            <span>3. {t('autoInstallHow3')}</span>
+                                        </div>
+                                    </td></tr>
+                                ) : (
                                     <tr><td colSpan="5" className="px-4 py-6 text-center text-gray-500">
                                         {loading ? t('loading') : t('autoInstallNoProfiles')}
                                     </td></tr>
-                                )}
+                                ))}
                                 {profiles.map(p => (
                                     <tr key={p.id} className="border-t border-proxmox-border/50">
                                         <td className="px-4 py-2">
@@ -1061,7 +1329,1131 @@
                             </table>
                         </div>
                     </div>
+
+                    {wizardOpen && (
+                        <AutoInstallWizard isOpen onClose={() => setWizardOpen(false)} onCreated={load}
+                            onOpenInEditor={openInEditor} clusters={clusters} addToast={addToast}
+                            initialTargetClusterId={wizardPreset?.target_cluster_id} />
+                    )}
                 </div>
+            );
+        }
+
+        // LW Sep 2026 - the guided way to a profile. Six short steps collect the fields,
+        // the server writes the TOML from them (/compose) and Create goes through the
+        // same POST /profiles as the editor. Whatever the wizard does not ask for
+        // (lvm/zfs tuning, filter-match, first-boot...) is one click away in the editor.
+        function AutoInstallWizard({ isOpen, onClose, onCreated, onOpenInEditor, clusters, addToast, initialTargetClusterId }) {
+            const { t, language } = useTranslation();
+            const { getAuthHeaders } = useAuth();
+            const { isCorporate, isCloud } = useLayout();
+
+            const [activeStep, setActiveStep] = useState(0);
+            // the Corporate stepper scrolls sideways with a hidden scrollbar; keep the
+            // current step in view so the last ones never look cut off
+            const stepperRef = useRef(null);
+            useEffect(() => {
+                const cur = stepperRef.current && stepperRef.current.querySelector('.corp-vm-step.active');
+                if (cur && cur.scrollIntoView) cur.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+            }, [activeStep]);
+            const [stepErrors, setStepErrors] = useState({});
+            const [draft, setDraft] = useState(() => {
+                // guess keyboard and country from the browser, the admin mostly sits
+                // in front of the same kind of keyboard the rack has
+                const langs = (navigator.languages && navigator.languages.length) ? navigator.languages : [navigator.language || ''];
+                const kbAlias = { da: 'dk', ja: 'jp', sv: 'se', sl: 'si', nb: 'no', nn: 'no', en: 'en-us' };
+                let keyboard = '', country = '';
+                for (const raw of langs) {
+                    const l = String(raw || '').toLowerCase();
+                    const base = l.split('-')[0];
+                    if (!keyboard) keyboard = [l, kbAlias[base] || base].find(k => AUTOINSTALL_KEYBOARDS.some(x => x[0] === k)) || '';
+                    const m = l.match(/^[a-z]{2,3}(?:-[a-z]{4})?-([a-z]{2})(?:-|$)/);
+                    if (!country && m && AUTOINSTALL_COUNTRIES.includes(m[1])) country = m[1];
+                }
+                let tz = '';
+                try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) {}
+                return {
+                    name: '', description: '', target_cluster_id: initialTargetClusterId || '',
+                    servers: 'one', several: '5', expires_local: '',
+                    country, keyboard: keyboard || 'en-us', timezone: aiTimezoneOk(tz) ? tz : 'UTC',
+                    host_mode: 'fixed', host_touched: false, fqdn: '', dhcp_domain: '', mailto: '',
+                    pw_mode: 'set', root_password_hashed: '', pasted_hash: '', ssh_keys: '',
+                    net_mode: 'dhcp', cidr: '', gateway: '', dns: '', nic_by: 'mac', nic_mac: '', nic_name: '',
+                    filesystem: 'ext4', raid: '', disk_by: 'name', disks: [], filter_key: 'ID_SERIAL', filter_glob: '',
+                    wipe_ack: false, enabled: true, callback_url: ''
+                };
+            });
+            const [dirty, setDirty] = useState(false);
+            // the clear password lives here and nowhere else, and only until Next
+            const [pw, setPw] = useState('');
+            const [pw2, setPw2] = useState('');
+            const [diskInput, setDiskInput] = useState('');
+            const [compose, setCompose] = useState(null);   // server result + the fields it was built from
+            const [composeError, setComposeError] = useState('');
+            const [createError, setCreateError] = useState('');
+            const [busy, setBusy] = useState(false);
+            const [creating, setCreating] = useState(false);
+            const [result, setResult] = useState(null);     // {token, name, fp}
+            const [copied, setCopied] = useState(false);
+            const [showAdvanced, setShowAdvanced] = useState(false);
+            const composeSeq = useRef(0);
+
+            const countryOptions = useMemo(() => {
+                let dn = null;
+                try { dn = new Intl.DisplayNames([language || 'en', 'en'], { type: 'region' }); } catch (e) { dn = null; }
+                return AUTOINSTALL_COUNTRIES.map(c => {
+                    let name = '';
+                    try { name = dn ? dn.of(c.toUpperCase()) : ''; } catch (e) { name = ''; }
+                    return [c, name && name.toLowerCase() !== c ? `${name} (${c})` : c];
+                }).sort((a, b) => a[1].localeCompare(b[1]));
+            }, [language]);
+
+            const steps = [t('general'), t('autoInstallStepSystem'), t('autoInstallStepRoot'), t('network'), t('disks'), t('summary')];
+            const lastStep = steps.length - 1;
+            const multi = draft.servers !== 'one';
+            const zfsLike = draft.filesystem === 'zfs' || draft.filesystem === 'btrfs';
+            const maxUses = (d) => d.servers === 'one' ? 1 : (d.servers === 'unlimited' ? 0 : (parseInt(d.several, 10) || 0));
+            const sshLines = (txt) => String(txt || '').split('\n').map(s => s.trim()).filter(Boolean);
+            const macHex = (v) => String(v || '').trim().replace(/[:\-]/g, '').toLowerCase();
+
+            const set = (patch) => {
+                setDraft(d => ({ ...d, ...patch }));
+                setDirty(true);
+                const hit = Object.keys(patch).filter(k => stepErrors[k]);
+                if (hit.length) setStepErrors(e => { const n = { ...e }; hit.forEach(k => delete n[k]); return n; });
+            };
+            // switching a card makes the old field errors meaningless
+            const pick = (patch) => { set(patch); setStepErrors({}); };
+            const clearErr = (...keys) => {
+                if (keys.some(k => stepErrors[k])) setStepErrors(e => { const n = { ...e }; keys.forEach(k => delete n[k]); return n; });
+            };
+            const pickServers = (v) => pick({ servers: v, ...(draft.host_touched ? {} : { host_mode: v === 'one' ? 'fixed' : 'dhcp' }) });
+
+            // the /compose body. Nothing in here is ever the clear password.
+            const buildFields = (d) => {
+                const g = {
+                    keyboard: d.keyboard, country: d.country, timezone: d.timezone.trim(), mailto: d.mailto.trim(),
+                    fqdn: d.host_mode === 'fixed' ? d.fqdn.trim()
+                        : (d.dhcp_domain.trim() ? { source: 'from-dhcp', domain: d.dhcp_domain.trim() } : { source: 'from-dhcp' }),
+                    root_password_hashed: d.pw_mode === 'paste' ? d.pasted_hash.trim() : d.root_password_hashed
+                };
+                const keys = sshLines(d.ssh_keys);
+                if (keys.length) g.root_ssh_keys = keys;
+                // from-dhcp must carry nothing else, the installer refuses unknown fields there
+                const network = d.net_mode === 'dhcp' ? { source: 'from-dhcp' } : {
+                    source: 'from-answer', cidr: d.cidr.trim(), gateway: d.gateway.trim(), dns: d.dns.trim(),
+                    filter: d.nic_by === 'mac' ? { ID_NET_NAME_MAC: '*' + macHex(d.nic_mac) } : { ID_NET_NAME: d.nic_name.trim() }
+                };
+                const disk = { filesystem: d.filesystem };
+                if (d.filesystem === 'zfs' || d.filesystem === 'btrfs') disk.raid = d.raid;
+                if (d.disk_by === 'name') disk.disk_list = d.disks;
+                else disk.filter = { [d.filter_key]: d.filter_glob.trim() };
+                return { global: g, network, disk };
+            };
+
+            // same idea as CreateVmModal: check on Next only, mark the field, clear on change
+            const validateStep = (step, d = draft) => {
+                const errs = {};
+                const ctrl = (k, v) => { if (!errs[k] && AUTOINSTALL_CTRL_RE.test(v || '')) errs[k] = t('autoInstallErrControl'); };
+                if (step === 0) {
+                    const name = d.name.trim();
+                    if (!name) errs.name = t('required');
+                    else if (name.length > 120) errs.name = t('autoInstallErrTooLong').replace('{n}', '120');
+                    ctrl('name', d.name);
+                    if (d.description.trim().length > 500) errs.description = t('autoInstallErrTooLong').replace('{n}', '500');
+                    ctrl('description', d.description);
+                    if (d.servers === 'several') {
+                        const s = String(d.several).trim();
+                        if (!/^\d+$/.test(s) || Number(s) < 2 || Number(s) > 10000) errs.several = t('autoInstallErrServers');
+                    }
+                    if (d.expires_local) {
+                        const when = new Date(d.expires_local).getTime();
+                        if (isNaN(when) || when <= Date.now()) errs.expires_local = t('autoInstallErrExpiry');
+                    }
+                }
+                if (step === 1) {
+                    if (!AUTOINSTALL_COUNTRIES.includes(d.country)) errs.country = d.country ? t('autoInstallErrCountry') : t('required');
+                    if (!AUTOINSTALL_KEYBOARDS.some(k => k[0] === d.keyboard)) errs.keyboard = t('autoInstallErrKeyboard');
+                    const tz = d.timezone.trim();
+                    if (!tz) errs.timezone = t('required');
+                    else if (!aiTimezoneOk(tz)) errs.timezone = t('autoInstallErrTimezone');
+                    if (d.host_mode === 'fixed') {
+                        const f = d.fqdn.trim();
+                        if (!f) errs.fqdn = t('required');
+                        else if (aiFqdnError(f)) errs.fqdn = t(aiFqdnError(f));
+                    } else if (d.dhcp_domain.trim() && aiFqdnError(d.dhcp_domain.trim(), true)) {
+                        errs.dhcp_domain = t(aiFqdnError(d.dhcp_domain.trim(), true));
+                    }
+                    const mail = d.mailto.trim();
+                    if (!mail) errs.mailto = t('required');
+                    else if (!aiMailOk(mail)) errs.mailto = t('autoInstallErrMail');
+                }
+                if (step === 2) {
+                    if (d.pw_mode === 'paste') {
+                        const h = d.pasted_hash.trim();
+                        if (!h) errs.pasted_hash = t('required');
+                        else if (!aiCryptOk(h)) errs.pasted_hash = t('autoInstallErrHash');
+                    } else if (!(d.root_password_hashed && !pw && !pw2)) {
+                        const bytes = new TextEncoder().encode(pw).length;
+                        if (!pw) errs.pw = t('required');
+                        else if (pw.length < 8 || pw.length > 64 || bytes < 8) errs.pw = t('autoInstallErrPwLength');
+                        else if (AUTOINSTALL_CTRL_RE.test(pw)) errs.pw = t('autoInstallErrControl');
+                        else if (pw !== pw2) errs.pw2 = t('passwordsDoNotMatch');
+                    }
+                    const lines = String(d.ssh_keys || '').split('\n');
+                    const bad = lines.findIndex(l => l.trim() && !AUTOINSTALL_SSH_KEY_RE.test(l.trim()));
+                    if (sshLines(d.ssh_keys).length > 50) errs.ssh_keys = t('autoInstallErrSshCount');
+                    else if (bad >= 0) errs.ssh_keys = t('autoInstallErrSshKey').replace('{n}', String(bad + 1));
+                }
+                if (step === 3 && d.net_mode === 'static') {
+                    const cidr = d.cidr.trim();
+                    const fam = cidr && !aiCidrError(cidr) ? aiIpFamily(cidr.split('/')[0]) : 0;
+                    if (!cidr) errs.cidr = t('required');
+                    else if (!fam) errs.cidr = t('autoInstallErrCidr');
+                    const ipCheck = (k, v) => {
+                        if (!v) errs[k] = t('required');
+                        else if (!aiIpFamily(v)) errs[k] = t('autoInstallErrIp');
+                        else if (fam && aiIpFamily(v) !== fam) errs[k] = t('autoInstallErrFamily');
+                    };
+                    ipCheck('gateway', d.gateway.trim());
+                    ipCheck('dns', d.dns.trim());
+                    if (d.nic_by === 'mac') {
+                        if (!d.nic_mac.trim()) errs.nic_mac = t('required');
+                        else if (!/^[0-9a-f]{12}$/.test(macHex(d.nic_mac))) errs.nic_mac = t('autoInstallErrMac');
+                    } else {
+                        const g = d.nic_name.trim();
+                        if (!g) errs.nic_name = t('required');
+                        else if (!AUTOINSTALL_GLOB_RE.test(g)) errs.nic_name = t('autoInstallErrPattern');
+                    }
+                }
+                if (step === 4) {
+                    const levels = AUTOINSTALL_RAID_MIN[d.filesystem];
+                    if (levels && !levels[d.raid]) errs.raid = t('autoInstallErrRaid');
+                    if (d.disk_by === 'name') {
+                        const list = d.disks;
+                        const min = levels && levels[d.raid] ? levels[d.raid] : 1;
+                        const bad = list.find(x => !aiDiskNameOk(x));
+                        const dup = list.find((x, i) => list.indexOf(x) !== i);
+                        if (!list.length) errs.disks = t('required');
+                        else if (bad) errs.disks = `${bad}: ${t('autoInstallErrDiskName')}`;
+                        else if (dup) errs.disks = t('autoInstallErrDiskDup').replace('{name}', dup);
+                        else if (!levels && list.length !== 1) errs.disks = t('autoInstallErrDiskOne');
+                        else if (levels && list.length < min) errs.disks = t('autoInstallErrDiskFew').replace('{n}', String(min));
+                        else if (d.raid === 'raid10' && list.length % 2) errs.disks = t('autoInstallErrDiskEven');
+                    } else {
+                        const g = d.filter_glob.trim();
+                        if (!AUTOINSTALL_DISK_KEYS.includes(d.filter_key)) errs.filter_key = t('required');
+                        if (!g) errs.filter_glob = t('required');
+                        else if (!AUTOINSTALL_GLOB_RE.test(g)) errs.filter_glob = t('autoInstallErrPattern');
+                        if (levels && !d.wipe_ack) errs.wipe_ack = t('autoInstallErrAck');
+                    }
+                }
+                setStepErrors(errs);
+                return Object.keys(errs).length === 0;
+            };
+
+            // chips: Enter, space or comma adds. /dev/ is dropped, by-id paths are not
+            // what the installer matches on, so those stay an error.
+            const addDisks = (d = draft) => {
+                const names = diskInput.split(/[\s,]+/).map(s => s.replace(/^\/dev\//, '')).filter(Boolean);
+                if (!names.length) return d;
+                const bad = names.find(n => !aiDiskNameOk(n));
+                if (bad) {
+                    setStepErrors(e => ({ ...e, disks: `${bad}: ${t('autoInstallErrDiskName')}` }));
+                    return null;
+                }
+                const next = { ...d, disks: d.disks.concat(names.filter((n, i) => !d.disks.includes(n) && names.indexOf(n) === i)) };
+                setDraft(next);
+                setDirty(true);
+                setDiskInput('');
+                clearErr('disks');
+                return next;
+            };
+
+            const hashPassword = async () => {
+                setBusy(true);
+                try {
+                    const r = await fetch(`${API_URL}/auto-install/password-hash`, {
+                        method: 'POST', credentials: 'include',
+                        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ password: pw })
+                    });
+                    const data = await r.json().catch(() => ({}));
+                    if (r.ok && aiCryptOk(data.hash)) {
+                        setDraft(d => ({ ...d, root_password_hashed: data.hash }));
+                        setPw(''); setPw2('');
+                        return data.hash;
+                    }
+                    setStepErrors({ pw: data.error || t('autoInstallHashFailed') });
+                } catch (e) {
+                    setStepErrors({ pw: t('autoInstallHashFailed') });
+                } finally {
+                    setBusy(false);
+                }
+                return '';
+            };
+
+            const runCompose = async (d) => {
+                const fields = buildFields(d);
+                const seq = ++composeSeq.current;
+                setCompose(null); setComposeError(''); setCreateError('');
+                setBusy(true);
+                try {
+                    const r = await fetch(`${API_URL}/auto-install/compose`, {
+                        method: 'POST', credentials: 'include',
+                        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ fields })
+                    });
+                    const data = await r.json().catch(() => ({}));
+                    if (seq !== composeSeq.current) return;
+                    if (r.ok && typeof data.answer === 'string') setCompose({ ...data, key: JSON.stringify(fields) });
+                    else setComposeError(data.error || t('autoInstallRenderFailed'));
+                } catch (e) {
+                    if (seq === composeSeq.current) setComposeError(t('autoInstallRenderFailed'));
+                } finally {
+                    if (seq === composeSeq.current) setBusy(false);
+                }
+            };
+
+            const goNext = async () => {
+                if (busy || result || activeStep >= lastStep) return;
+                let d = draft;
+                if (activeStep === 4 && diskInput.trim()) {
+                    d = addDisks(d);
+                    if (!d) return;
+                }
+                if (!validateStep(activeStep, d)) return;
+                if (activeStep === 2 && d.pw_mode === 'set' && pw) {
+                    const hash = await hashPassword();
+                    if (!hash) return;
+                    d = { ...d, root_password_hashed: hash };
+                }
+                setActiveStep(activeStep + 1);
+                setStepErrors({});
+                if (activeStep + 1 === lastStep) runCompose(d);
+            };
+            const goTo = (i) => {
+                if (busy || i < 0 || i > activeStep) return;
+                setActiveStep(i);
+                setStepErrors({});
+            };
+
+            // compose field_errors come back keyed like 'global.fqdn'; this is where each one lives
+            const fieldTarget = (key) => ({
+                'global.keyboard': [1, 'keyboard'], 'global.country': [1, 'country'], 'global.timezone': [1, 'timezone'],
+                'global.mailto': [1, 'mailto'], 'global.fqdn': [1, draft.host_mode === 'fixed' ? 'fqdn' : 'dhcp_domain'],
+                'global.root_password_hashed': [2, draft.pw_mode === 'paste' ? 'pasted_hash' : 'pw'],
+                'global.root_ssh_keys': [2, 'ssh_keys'],
+                'network.source': [3, 'net_mode'], 'network.cidr': [3, 'cidr'], 'network.gateway': [3, 'gateway'],
+                'network.dns': [3, 'dns'], 'network.filter': [3, draft.nic_by === 'mac' ? 'nic_mac' : 'nic_name'],
+                'disk.filesystem': [4, 'filesystem'], 'disk.raid': [4, 'raid'], 'disk.disk_list': [4, 'disks'],
+                'disk.filter': [4, 'filter_glob']
+            })[key] || null;
+            const fieldErrors = (compose && compose.field_errors) || {};
+            const badSteps = new Set(Object.keys(fieldErrors).map(k => (fieldTarget(k) || [])[0]).filter(i => i !== undefined));
+            const fixField = (key) => {
+                const tg = fieldTarget(key);
+                if (!tg) return;
+                setActiveStep(tg[0]);
+                setStepErrors({ [tg[1]]: fieldErrors[key] });
+            };
+
+            // anything changed after the render means the file on screen is not what Create would save
+            const stale = !!compose && activeStep === lastStep && compose.key !== JSON.stringify(buildFields(draft));
+            const canCreate = !!compose && compose.valid && !stale && !busy;
+
+            const profileDraft = () => ({
+                name: draft.name.trim(), description: draft.description.trim(),
+                target_cluster_id: draft.target_cluster_id, callback_url: draft.callback_url.trim(),
+                max_uses: maxUses(draft), expires_local: draft.expires_local, enabled: !!draft.enabled
+            });
+
+            const create = async () => {
+                if (!canCreate) return;
+                const cb = draft.callback_url.trim();
+                if (cb && (!/^https?:\/\//.test(cb) || cb.length > 500 || AUTOINSTALL_CTRL_RE.test(cb))) {
+                    setShowAdvanced(true);
+                    setStepErrors({ callback_url: t('autoInstallCallbackBad') });
+                    return;
+                }
+                setBusy(true); setCreating(true); setCreateError('');
+                try {
+                    const r = await fetch(`${API_URL}/auto-install/profiles`, {
+                        method: 'POST', credentials: 'include',
+                        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            name: draft.name.trim(), description: draft.description.trim(), answer: compose.answer,
+                            target_cluster_id: draft.target_cluster_id, callback_url: cb, max_uses: maxUses(draft),
+                            expires_at: localInputToUtc(draft.expires_local), enabled: !!draft.enabled
+                        })
+                    });
+                    const data = await r.json().catch(() => ({}));
+                    if (r.ok) {
+                        // the hash and the rendered file have done their job
+                        setDraft(d => ({ ...d, root_password_hashed: '', pasted_hash: '' }));
+                        setCompose(null);
+                        onCreated && onCreated();
+                        if (data.token) {
+                            setResult({ token: data.token, name: data.name || draft.name.trim(), fp: data.fetch_fingerprint || '' });
+                        } else {
+                            addToast?.(t('autoInstallSaved'), 'success');
+                            onClose();
+                        }
+                    } else {
+                        setCreateError(data.error || t('autoInstallSaveFailed'));
+                    }
+                } catch (e) {
+                    setCreateError(e.message || t('autoInstallSaveFailed'));
+                }
+                setBusy(false); setCreating(false);
+            };
+
+            // X, Cancel, Done and Escape all come through here. The token cannot be
+            // shown again (only rotated, which kills every ISO built so far), so ask.
+            const requestClose = () => {
+                if (creating) return;
+                if (result) {
+                    if (!copied && !window.confirm(t('autoInstallTokenNotCopied'))) return;
+                } else if (dirty && !window.confirm(t('autoInstallDiscard'))) {
+                    return;
+                }
+                onClose();
+            };
+            const closeRef = useRef(requestClose);
+            closeRef.current = requestClose;
+            useEffect(() => {
+                if (!isOpen) return;
+                // capture phase: the dialog stops keydown from bubbling (the dashboard's
+                // single-key shortcuts), so a bubbling listener would never see Escape
+                const onKey = (e) => {
+                    if (e.key !== 'Escape') return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    closeRef.current();
+                };
+                window.addEventListener('keydown', onKey, true);
+                return () => window.removeEventListener('keydown', onKey, true);
+            }, [isOpen]);
+
+            if (!isOpen) return null;
+
+            const labelCls = 'block text-sm text-gray-400 mb-1';
+            const inputCls = (k) => `w-full px-3 py-2 bg-proxmox-dark border rounded-lg text-white ${stepErrors[k] ? 'border-red-500' : 'border-proxmox-border'}`;
+            const aria = (k) => stepErrors[k] ? { 'aria-invalid': true, 'aria-describedby': `aiw-err-${k}` } : {};
+            const errLine = (k) => stepErrors[k] ? <p id={`aiw-err-${k}`} className="text-xs text-red-400 mt-1">{stepErrors[k]}</p> : null;
+            const hint = (text) => <p className="text-xs text-gray-500 mt-1">{text}</p>;
+            const warn = (text, action, onAction) => (
+                <div className="rounded-lg p-3 text-xs border bg-yellow-500/10 border-yellow-500/30 text-yellow-300 flex items-start gap-2">
+                    <Icons.AlertTriangle />
+                    <div className="flex-1">
+                        {text}
+                        {action && <button type="button" onClick={onAction} className="ml-2 font-medium underline hover:text-white">{action}</button>}
+                    </div>
+                </div>
+            );
+            const choice = (on, onPick, title, sub, key) => (
+                <button key={key} type="button" onClick={onPick} aria-pressed={on}
+                    className={`text-left p-3 rounded-lg border transition-colors ${on ? 'border-proxmox-orange bg-proxmox-orange/10' : 'border-proxmox-border bg-proxmox-dark hover:border-gray-500'}`}>
+                    <div className={`text-sm font-medium ${on ? 'text-white' : 'text-gray-300'}`}>{title}</div>
+                    {sub && <div className="text-xs text-gray-500 mt-0.5">{sub}</div>}
+                </button>
+            );
+            const countryLabel = (c) => (countryOptions.find(x => x[0] === c) || [c, c])[1];
+
+            const renderStepContent = () => {
+                switch (activeStep) {
+                    case 0:
+                        return (
+                            <div className="space-y-4">
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    <div>
+                                        <label htmlFor="aiw-name" className={labelCls}>{t('name')}</label>
+                                        <input id="aiw-name" autoFocus value={draft.name} placeholder="rack-a"
+                                            onChange={e => set({ name: e.target.value })} className={inputCls('name')} {...aria('name')} />
+                                        {errLine('name')}
+                                    </div>
+                                    <div>
+                                        <label htmlFor="aiw-cluster" className={labelCls}>{t('autoInstallTargetCluster')}</label>
+                                        <select id="aiw-cluster" value={draft.target_cluster_id}
+                                            onChange={e => set({ target_cluster_id: e.target.value })} className={inputCls('target_cluster_id')}>
+                                            <option value="">-</option>
+                                            {(clusters || []).map(c => <option key={c.id} value={c.id}>{c.display_name || c.name || c.id}</option>)}
+                                            {/* a preset for a cluster that is not in the list yet */}
+                                            {draft.target_cluster_id && !(clusters || []).some(c => c.id === draft.target_cluster_id) && (
+                                                <option value={draft.target_cluster_id}>{draft.target_cluster_id}</option>
+                                            )}
+                                        </select>
+                                    </div>
+                                </div>
+                                <div>
+                                    <label htmlFor="aiw-desc" className={labelCls}>{t('description')}</label>
+                                    <input id="aiw-desc" value={draft.description} onChange={e => set({ description: e.target.value })}
+                                        className={inputCls('description')} {...aria('description')} />
+                                    {errLine('description')}
+                                </div>
+                                <div>
+                                    <div className={labelCls}>{t('autoInstallHowMany')}</div>
+                                    <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                                        {choice(draft.servers === 'one', () => pickServers('one'), t('autoInstallOneServer'), t('autoInstallOneServerHint'))}
+                                        {choice(draft.servers === 'several', () => pickServers('several'), t('autoInstallSeveralServers'), t('autoInstallSeveralHint'))}
+                                        {choice(draft.servers === 'unlimited', () => pickServers('unlimited'), t('autoInstallUnlimitedServers'), t('autoInstallUnlimitedHint'))}
+                                    </div>
+                                    {draft.servers === 'several' && (
+                                        <div className="mt-2 max-w-xs">
+                                            <label htmlFor="aiw-several" className={labelCls}>{t('autoInstallServerCount')}</label>
+                                            <input id="aiw-several" type="number" min="2" max="10000" value={draft.several}
+                                                onChange={e => set({ several: e.target.value })} className={inputCls('several')} {...aria('several')} />
+                                            {errLine('several')}
+                                        </div>
+                                    )}
+                                </div>
+                                <div>
+                                    <label htmlFor="aiw-expires" className={labelCls}>{t('autoInstallExpires')}</label>
+                                    <div className="flex flex-wrap items-center gap-2">
+                                        <input id="aiw-expires" type="datetime-local" value={draft.expires_local}
+                                            onChange={e => set({ expires_local: e.target.value })}
+                                            className={`px-3 py-2 bg-proxmox-dark border rounded-lg text-white ${stepErrors.expires_local ? 'border-red-500' : 'border-proxmox-border'}`}
+                                            {...aria('expires_local')} />
+                                        {[[0, t('none')], [24, `24 ${t('hours')}`], [24 * 7, `7 ${t('days')}`], [24 * 30, `30 ${t('days')}`]].map(([h, label]) => (
+                                            <button key={h} type="button"
+                                                onClick={() => set({ expires_local: h ? utcToLocalInput(new Date(Date.now() + h * 3600000).toISOString()) : '' })}
+                                                className={`px-2.5 py-1 text-xs rounded-full border transition-colors ${!h && !draft.expires_local ? 'border-proxmox-orange text-white' : 'border-proxmox-border text-gray-300 hover:border-gray-500'}`}>
+                                                {label}
+                                            </button>
+                                        ))}
+                                    </div>
+                                    {errLine('expires_local')}
+                                </div>
+                                {draft.servers === 'unlimited' && !draft.expires_local && warn(t('autoInstallNoLimitWarn'))}
+                            </div>
+                        );
+                    case 1:
+                        return (
+                            <div className="space-y-4">
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    <div>
+                                        <label htmlFor="aiw-country" className={labelCls}>{t('autoInstallCountry')}</label>
+                                        <select id="aiw-country" autoFocus value={draft.country}
+                                            onChange={e => set({ country: e.target.value })} className={inputCls('country')} {...aria('country')}>
+                                            <option value="">-</option>
+                                            {countryOptions.map(([code, label]) => <option key={code} value={code}>{label}</option>)}
+                                        </select>
+                                        {errLine('country') || hint(t('autoInstallCountryHint'))}
+                                    </div>
+                                    <div>
+                                        <label htmlFor="aiw-kb" className={labelCls}>{t('autoInstallKeyboard')}</label>
+                                        <select id="aiw-kb" value={draft.keyboard}
+                                            onChange={e => set({ keyboard: e.target.value })} className={inputCls('keyboard')} {...aria('keyboard')}>
+                                            {AUTOINSTALL_KEYBOARDS.map(([code, label]) => <option key={code} value={code}>{label} ({code})</option>)}
+                                        </select>
+                                        {errLine('keyboard')}
+                                    </div>
+                                    <div>
+                                        <label htmlFor="aiw-tz" className={labelCls}>{t('timezone')}</label>
+                                        <input id="aiw-tz" list="aiw-tz-list" value={draft.timezone}
+                                            onChange={e => set({ timezone: e.target.value })} className={inputCls('timezone')} {...aria('timezone')} />
+                                        <datalist id="aiw-tz-list">
+                                            {TIMEZONES.map(z => <option key={z} value={z} />)}
+                                        </datalist>
+                                        {errLine('timezone')}
+                                    </div>
+                                    <div>
+                                        <label htmlFor="aiw-mail" className={labelCls}>{t('autoInstallMailto')}</label>
+                                        <input id="aiw-mail" type="email" value={draft.mailto} placeholder="root@example.com"
+                                            onChange={e => set({ mailto: e.target.value })} className={inputCls('mailto')} {...aria('mailto')} />
+                                        {errLine('mailto')}
+                                    </div>
+                                </div>
+                                <div>
+                                    <div className={labelCls}>{t('autoInstallHostName')}</div>
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                        {choice(draft.host_mode === 'fixed', () => pick({ host_mode: 'fixed', host_touched: true }), t('autoInstallHostFixed'), t('autoInstallHostFixedHint'))}
+                                        {choice(draft.host_mode === 'dhcp', () => pick({ host_mode: 'dhcp', host_touched: true }), t('autoInstallHostDhcp'), t('autoInstallHostDhcpHint'))}
+                                    </div>
+                                    <div className="mt-2">
+                                        {draft.host_mode === 'fixed' ? (
+                                            <>
+                                                <label htmlFor="aiw-fqdn" className={labelCls}>{t('autoInstallFqdn')}</label>
+                                                <input id="aiw-fqdn" value={draft.fqdn} placeholder="pve01.example.com"
+                                                    onChange={e => set({ fqdn: e.target.value })} className={inputCls('fqdn')} {...aria('fqdn')} />
+                                                {errLine('fqdn')}
+                                            </>
+                                        ) : (
+                                            <>
+                                                <label htmlFor="aiw-domain" className={labelCls}>{t('autoInstallDhcpDomain')}</label>
+                                                <input id="aiw-domain" value={draft.dhcp_domain} placeholder="example.com"
+                                                    onChange={e => set({ dhcp_domain: e.target.value })} className={inputCls('dhcp_domain')} {...aria('dhcp_domain')} />
+                                                {errLine('dhcp_domain') || hint(t('autoInstallDhcpNameHint'))}
+                                            </>
+                                        )}
+                                    </div>
+                                </div>
+                                {draft.host_mode === 'fixed' && multi &&
+                                    warn(t('autoInstallSameNameWarn'), t('autoInstallUseDhcp'), () => pick({ host_mode: 'dhcp', host_touched: true }))}
+                            </div>
+                        );
+                    case 2:
+                        return (
+                            <div className="space-y-4">
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                    {choice(draft.pw_mode === 'set', () => pick({ pw_mode: 'set' }), t('autoInstallSetPassword'), t('autoInstallPwHint'))}
+                                    {choice(draft.pw_mode === 'paste', () => pick({ pw_mode: 'paste' }), t('autoInstallPasteHash'), t('autoInstallPasteHashHint'))}
+                                </div>
+                                {draft.pw_mode === 'paste' ? (
+                                    <div>
+                                        <label htmlFor="aiw-hash" className={labelCls}>{t('autoInstallHashLabel')}</label>
+                                        <input id="aiw-hash" autoFocus spellCheck={false} value={draft.pasted_hash} placeholder="$6$..."
+                                            onChange={e => set({ pasted_hash: e.target.value })}
+                                            className={`${inputCls('pasted_hash')} font-mono text-xs`} {...aria('pasted_hash')} />
+                                        {errLine('pasted_hash')}
+                                    </div>
+                                ) : draft.root_password_hashed ? (
+                                    // only the hash is kept; coming back never shows the password
+                                    <div>
+                                        <div className="flex items-center gap-2 text-sm text-green-400">
+                                            <Icons.CheckCircle />
+                                            <span>{t('autoInstallPwSet')}</span>
+                                            <span className="text-gray-500">·</span>
+                                            <button type="button" onClick={() => set({ root_password_hashed: '' })}
+                                                className="text-proxmox-orange hover:underline">{t('autoInstallPwChange')}</button>
+                                        </div>
+                                        {errLine('pw')}
+                                    </div>
+                                ) : (
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                        <div>
+                                            <label htmlFor="aiw-pw" className={labelCls}>{t('password')}</label>
+                                            <input id="aiw-pw" type="password" autoFocus autoComplete="new-password" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" value={pw}
+                                                onChange={e => { setPw(e.target.value); setDirty(true); clearErr('pw', 'pw2'); }}
+                                                className={inputCls('pw')} {...aria('pw')} />
+                                            {errLine('pw')}
+                                        </div>
+                                        <div>
+                                            <label htmlFor="aiw-pw2" className={labelCls}>{t('confirmPassword')}</label>
+                                            <input id="aiw-pw2" type="password" autoComplete="new-password" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" value={pw2}
+                                                onChange={e => { setPw2(e.target.value); clearErr('pw2'); }}
+                                                className={inputCls('pw2')} {...aria('pw2')} />
+                                            {errLine('pw2')}
+                                        </div>
+                                        {/[^\x00-\x7f]/.test(pw) && <div className="md:col-span-2">{warn(t('autoInstallPwNonAscii'))}</div>}
+                                    </div>
+                                )}
+                                <div>
+                                    <label htmlFor="aiw-ssh" className={labelCls}>{t('autoInstallSshKeys')}</label>
+                                    <textarea id="aiw-ssh" rows={3} spellCheck={false} value={draft.ssh_keys}
+                                        placeholder="ssh-ed25519 AAAA... admin@laptop"
+                                        onChange={e => set({ ssh_keys: e.target.value })}
+                                        className={`${inputCls('ssh_keys')} font-mono text-xs`} {...aria('ssh_keys')} />
+                                    {errLine('ssh_keys') || hint(t('autoInstallSshKeysHint'))}
+                                </div>
+                            </div>
+                        );
+                    case 3: {
+                        const cidr = draft.cidr.trim(), gw = draft.gateway.trim();
+                        const fam = cidr && !aiCidrError(cidr) ? aiIpFamily(cidr.split('/')[0]) : 0;
+                        const gwOutside = fam && aiIpFamily(gw) === fam && !aiSameNet(cidr, gw);
+                        return (
+                            <div className="space-y-4">
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                    {choice(draft.net_mode === 'dhcp', () => pick({ net_mode: 'dhcp' }), t('autoInstallNetDhcp'), t('autoInstallNetDhcpHint'))}
+                                    {choice(draft.net_mode === 'static', () => pick({ net_mode: 'static' }), t('autoInstallNetStatic'), t('autoInstallNetStaticHint'))}
+                                </div>
+                                {errLine('net_mode')}
+                                {draft.net_mode === 'static' && (
+                                    <>
+                                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                            <div>
+                                                <label htmlFor="aiw-cidr" className={labelCls}>{t('autoInstallCidr')}</label>
+                                                <input id="aiw-cidr" autoFocus value={draft.cidr} placeholder="192.168.1.10/24"
+                                                    onChange={e => set({ cidr: e.target.value })} className={inputCls('cidr')} {...aria('cidr')} />
+                                                {errLine('cidr')}
+                                            </div>
+                                            <div>
+                                                <label htmlFor="aiw-gw" className={labelCls}>{t('gateway')}</label>
+                                                <input id="aiw-gw" value={draft.gateway} placeholder="192.168.1.1"
+                                                    onChange={e => set({ gateway: e.target.value })} className={inputCls('gateway')} {...aria('gateway')} />
+                                                {errLine('gateway')}
+                                            </div>
+                                            <div>
+                                                <label htmlFor="aiw-dns" className={labelCls}>{t('dnsServer')}</label>
+                                                <input id="aiw-dns" value={draft.dns} placeholder="192.168.1.1"
+                                                    onChange={e => set({ dns: e.target.value })} className={inputCls('dns')} {...aria('dns')} />
+                                                {errLine('dns') || hint(t('autoInstallDnsHint'))}
+                                            </div>
+                                        </div>
+                                        {gwOutside && warn(t('autoInstallGatewayOutside'))}
+                                        <div>
+                                            <div className={labelCls}>{t('autoInstallNic')}</div>
+                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                                {choice(draft.nic_by === 'mac', () => pick({ nic_by: 'mac' }), t('autoInstallNicByMac'))}
+                                                {choice(draft.nic_by === 'name', () => pick({ nic_by: 'name' }), t('autoInstallNicByName'))}
+                                            </div>
+                                            <div className="mt-2">
+                                                {draft.nic_by === 'mac' ? (
+                                                    <>
+                                                        <input id="aiw-mac" value={draft.nic_mac} placeholder="3c:ec:ef:12:34:56" aria-label={t('autoInstallNicByMac')}
+                                                            onChange={e => set({ nic_mac: e.target.value })}
+                                                            className={`${inputCls('nic_mac')} font-mono`} {...aria('nic_mac')} />
+                                                        {errLine('nic_mac')}
+                                                    </>
+                                                ) : (
+                                                    <>
+                                                        <input id="aiw-nic" value={draft.nic_name} placeholder="enp1s0*" aria-label={t('autoInstallNicByName')}
+                                                            onChange={e => set({ nic_name: e.target.value })}
+                                                            className={`${inputCls('nic_name')} font-mono`} {...aria('nic_name')} />
+                                                        {errLine('nic_name') || hint(t('autoInstallNicNameHint'))}
+                                                    </>
+                                                )}
+                                            </div>
+                                        </div>
+                                        {multi && warn(t('autoInstallSameIpWarn'), t('autoInstallSwitchDhcp'), () => pick({ net_mode: 'dhcp' }))}
+                                    </>
+                                )}
+                            </div>
+                        );
+                    }
+                    case 4: {
+                        const levels = AUTOINSTALL_RAID_MIN[draft.filesystem];
+                        const need = levels && levels[draft.raid];
+                        return (
+                            <div className="space-y-4">
+                                <div>
+                                    <div className={labelCls}>{t('autoInstallFilesystem')}</div>
+                                    <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                                        {[['ext4', 'ext4'], ['xfs', 'xfs'], ['zfs', 'ZFS'], ['btrfs', 'Btrfs']].map(([fs, label]) => choice(
+                                            draft.filesystem === fs,
+                                            // keep the raid level when it exists on the other filesystem too
+                                            () => pick({ filesystem: fs, raid: AUTOINSTALL_RAID_MIN[fs] && AUTOINSTALL_RAID_MIN[fs][draft.raid] ? draft.raid : '' }),
+                                            label, null, fs))}
+                                    </div>
+                                    {errLine('filesystem')}
+                                </div>
+                                {levels && (
+                                    <div className="max-w-xs">
+                                        <label htmlFor="aiw-raid" className={labelCls}>{t('autoInstallRaid')}</label>
+                                        <select id="aiw-raid" value={draft.raid} onChange={e => set({ raid: e.target.value })}
+                                            className={inputCls('raid')} {...aria('raid')}>
+                                            <option value="">-</option>
+                                            {Object.keys(levels).map(l => <option key={l} value={l}>{`${l} (≥${levels[l]})`}</option>)}
+                                        </select>
+                                        {errLine('raid') || (need ? hint((draft.raid === 'raid10' ? t('autoInstallRaidNeedsEven') : t('autoInstallRaidNeeds')).replace('{n}', String(need))) : null)}
+                                    </div>
+                                )}
+                                <div>
+                                    <div className={labelCls}>{t('autoInstallTargetDisks')}</div>
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                        {choice(draft.disk_by === 'name', () => pick({ disk_by: 'name' }), t('autoInstallDisksByName'), t('autoInstallDisksByNameHint'))}
+                                        {choice(draft.disk_by === 'filter', () => pick({ disk_by: 'filter' }), t('autoInstallDisksByFilter'), t('autoInstallDisksByFilterHint'))}
+                                    </div>
+                                    <div className="mt-2">
+                                        {draft.disk_by === 'name' ? (
+                                            <>
+                                                <div className={`flex flex-wrap items-center gap-2 px-2 py-1.5 bg-proxmox-dark border rounded-lg ${stepErrors.disks ? 'border-red-500' : 'border-proxmox-border'}`}>
+                                                    {draft.disks.map(n => (
+                                                        <span key={n} className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-proxmox-card border border-proxmox-border text-xs text-white font-mono">
+                                                            {n}
+                                                            <button type="button" aria-label={`${t('remove')} ${n}`}
+                                                                onClick={() => set({ disks: draft.disks.filter(x => x !== n) })}
+                                                                className="text-gray-400 hover:text-red-400">&times;</button>
+                                                        </span>
+                                                    ))}
+                                                    <input id="aiw-disk" autoFocus value={diskInput} placeholder={draft.disks.length ? '' : 'sda'}
+                                                        aria-label={t('autoInstallDisksByName')} {...aria('disks')}
+                                                        onChange={e => { setDiskInput(e.target.value); clearErr('disks'); }}
+                                                        onKeyDown={e => {
+                                                            // Enter on an empty input still means Next
+                                                            if (!['Enter', ' ', ','].includes(e.key)) return;
+                                                            if (diskInput.trim()) { e.preventDefault(); addDisks(); }
+                                                            else if (e.key !== 'Enter') e.preventDefault();
+                                                        }}
+                                                        className="flex-1 py-1 bg-transparent text-sm text-white font-mono focus:outline-none" style={{ minWidth: '6rem' }} />
+                                                    <button type="button" onClick={() => addDisks()} disabled={!diskInput.trim()}
+                                                        className="text-xs px-2 py-1 border border-proxmox-border rounded text-gray-300 hover:border-gray-500 disabled:opacity-50">
+                                                        {t('add')}
+                                                    </button>
+                                                </div>
+                                                {errLine('disks')}
+                                            </>
+                                        ) : (
+                                            <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                                                <div>
+                                                    <select value={draft.filter_key} aria-label={t('autoInstallFilterKey')}
+                                                        onChange={e => set({ filter_key: e.target.value })} className={inputCls('filter_key')} {...aria('filter_key')}>
+                                                        {AUTOINSTALL_DISK_KEYS.map(k => <option key={k} value={k}>{k}</option>)}
+                                                    </select>
+                                                    {errLine('filter_key')}
+                                                </div>
+                                                <div className="md:col-span-2">
+                                                    <input id="aiw-glob" autoFocus value={draft.filter_glob} placeholder="Samsung_SSD_870*"
+                                                        aria-label={t('autoInstallFilterGlob')}
+                                                        onChange={e => set({ filter_glob: e.target.value })}
+                                                        className={`${inputCls('filter_glob')} font-mono`} {...aria('filter_glob')} />
+                                                    {errLine('filter_glob')}
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                                {zfsLike && draft.disk_by === 'filter' && (
+                                    <div className="rounded-lg p-3 text-sm border bg-red-500/10 border-red-500/30 text-red-300 space-y-2">
+                                        <div className="flex items-start gap-2">
+                                            <Icons.AlertTriangle />
+                                            <span>{t('autoInstallWipeWarn')}</span>
+                                        </div>
+                                        <label className="flex items-center gap-2 cursor-pointer">
+                                            <input type="checkbox" checked={draft.wipe_ack} onChange={e => set({ wipe_ack: e.target.checked })} {...aria('wipe_ack')} />
+                                            <span>{t('autoInstallWipeAck')}</span>
+                                        </label>
+                                        {errLine('wipe_ack')}
+                                    </div>
+                                )}
+                                {hint(t('autoInstallTuneInEditor'))}
+                            </div>
+                        );
+                    }
+                    default:
+                        return renderReview();
+                }
+            };
+
+            const summaryRows = () => {
+                const d = draft;
+                const cl = (clusters || []).find(c => c.id === d.target_cluster_id);
+                const servers = d.servers === 'one' ? t('autoInstallOneServer')
+                    : (d.servers === 'unlimited' ? t('autoInstallUnlimitedServers') : `${t('autoInstallServerCount')}: ${d.several}`);
+                const kb = (AUTOINSTALL_KEYBOARDS.find(k => k[0] === d.keyboard) || [d.keyboard, d.keyboard])[1];
+                const keys = sshLines(d.ssh_keys).length;
+                return [
+                    [0, [d.name.trim(), servers, cl ? (cl.display_name || cl.name || cl.id) : d.target_cluster_id,
+                         d.expires_local ? `${t('autoInstallExpires')} ${new Date(d.expires_local).toLocaleString()}` : '']],
+                    [1, [countryLabel(d.country), kb, d.timezone.trim(),
+                         d.host_mode === 'fixed' ? d.fqdn.trim() : `${t('autoInstallHostDhcp')}${d.dhcp_domain.trim() ? ` (${d.dhcp_domain.trim()})` : ''}`,
+                         d.mailto.trim()]],
+                    [2, [d.pw_mode === 'paste' ? t('autoInstallPasteHash') : t('autoInstallPwSet'),
+                         keys ? t('autoInstallSshKeyCount').replace('{n}', String(keys)) : '']],
+                    [3, d.net_mode === 'dhcp' ? [t('autoInstallNetDhcp')]
+                        : [d.cidr.trim(), `${t('gateway')} ${d.gateway.trim()}`, `${t('dnsServer')} ${d.dns.trim()}`,
+                           d.nic_by === 'mac' ? `MAC ${d.nic_mac.trim()}` : d.nic_name.trim()]],
+                    [4, [({ ext4: 'ext4', xfs: 'xfs', zfs: 'ZFS', btrfs: 'Btrfs' })[d.filesystem] + (zfsLike ? ` ${d.raid}` : ''),
+                         d.disk_by === 'name' ? d.disks.join(', ') : `${d.filter_key} = ${d.filter_glob.trim()}`]]
+                ];
+            };
+
+            const renderReview = () => {
+                const fieldMsgs = Object.values(fieldErrors);
+                return (
+                    <div className="space-y-4">
+                        {busy && !compose && (
+                            <div className="flex items-center gap-2 text-sm text-gray-400">
+                                <Icons.RotateCw />
+                                {t('autoInstallRendering')}
+                            </div>
+                        )}
+                        {composeError && (
+                            <div className="rounded-lg p-3 text-sm border bg-red-500/10 border-red-500/30 text-red-300 flex flex-wrap items-center justify-between gap-2">
+                                <span>{composeError}</span>
+                                <button type="button" onClick={() => runCompose(draft)} disabled={busy} className="text-xs underline hover:text-white">
+                                    {t('autoInstallRenderAgain')}
+                                </button>
+                            </div>
+                        )}
+                        {compose && (
+                            <div className={`rounded-lg p-3 text-xs border ${compose.valid ? 'bg-green-500/10 border-green-500/30 text-green-300' : 'bg-red-500/10 border-red-500/30 text-red-200'}`}>
+                                <div className="font-medium mb-1">
+                                    {compose.valid ? t('autoInstallAnswerOk') : t('autoInstallAnswerBad')}
+                                </div>
+                                {Object.keys(fieldErrors).map(k => (
+                                    <div key={`f${k}`} className="flex flex-wrap items-center gap-2">
+                                        <span>• {fieldErrors[k]}</span>
+                                        {fieldTarget(k) && (
+                                            <button type="button" onClick={() => fixField(k)} className="font-medium underline hover:text-white">
+                                                {t('autoInstallFix')}
+                                            </button>
+                                        )}
+                                    </div>
+                                ))}
+                                {(compose.errors || []).filter(e => !fieldMsgs.includes(e)).map((e, i) => <div key={`e${i}`}>• {e}</div>)}
+                                {(compose.warnings || []).map((w, i) => <div key={`w${i}`} className="text-yellow-300">• {w}</div>)}
+                            </div>
+                        )}
+                        {stale && (
+                            <div className="rounded-lg p-3 text-xs border bg-yellow-500/10 border-yellow-500/30 text-yellow-300 flex flex-wrap items-center justify-between gap-2">
+                                <span>{t('autoInstallRenderStale')}</span>
+                                <button type="button" onClick={() => runCompose(draft)} className="font-medium underline hover:text-white">
+                                    {t('autoInstallRenderAgain')}
+                                </button>
+                            </div>
+                        )}
+
+                        <dl className="border border-proxmox-border rounded-lg">
+                            {summaryRows().map(([i, parts]) => (
+                                <div key={i} className={`flex items-start gap-3 px-3 py-2 text-sm ${i ? 'border-t border-proxmox-border' : ''}`}>
+                                    <dt className={`w-28 shrink-0 ${badSteps.has(i) ? 'text-red-400' : 'text-gray-400'}`}>{steps[i]}</dt>
+                                    <dd className="flex-1 min-w-0 text-white break-all">{parts.filter(Boolean).join(' · ')}</dd>
+                                    <button type="button" onClick={() => goTo(i)} disabled={busy}
+                                        className="text-xs text-proxmox-orange hover:underline disabled:opacity-50">{t('edit')}</button>
+                                </div>
+                            ))}
+                        </dl>
+
+                        {compose && compose.answer && (
+                            <div>
+                                <div className="text-xs text-gray-400 mb-1">{t('autoInstallAnswerFile')}</div>
+                                <pre className="max-h-64 overflow-auto px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-xs text-gray-200 font-mono">{compose.answer}</pre>
+                            </div>
+                        )}
+
+                        <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                            <input type="checkbox" checked={!!draft.enabled} onChange={e => set({ enabled: e.target.checked })} />
+                            {t('enabled')}
+                        </label>
+
+                        <div>
+                            <button type="button" onClick={() => setShowAdvanced(!showAdvanced)} aria-expanded={showAdvanced}
+                                className="flex items-center gap-1 text-xs text-gray-400 hover:text-white">
+                                <Icons.ChevronRight className={`w-3.5 h-3.5 transition-transform ${showAdvanced ? 'rotate-90' : ''}`} />
+                                {t('advanced')}
+                            </button>
+                            {showAdvanced && (
+                                <div className="mt-2">
+                                    <label htmlFor="aiw-cb" className={labelCls}>{t('autoInstallCallbackUrl')}</label>
+                                    <input id="aiw-cb" value={draft.callback_url} placeholder="https://"
+                                        onChange={e => set({ callback_url: e.target.value })} className={inputCls('callback_url')} {...aria('callback_url')} />
+                                    {errLine('callback_url') || hint(t('autoInstallCallbackHint'))}
+                                </div>
+                            )}
+                        </div>
+
+                        <p className="flex items-center gap-2 text-xs text-gray-500">
+                            <Icons.Info />
+                            {t('autoInstallIsoMin')}
+                        </p>
+
+                        {createError && (
+                            <div className="rounded-lg p-3 text-sm border bg-red-500/10 border-red-500/30 text-red-300 flex items-center gap-2">
+                                <Icons.AlertTriangle />
+                                {createError}
+                            </div>
+                        )}
+                    </div>
+                );
+            };
+
+            const renderResult = () => (
+                <div className="space-y-4">
+                    <div className="flex items-center gap-2 text-sm text-green-400 font-medium">
+                        <Icons.CheckCircle />
+                        <span>{t('autoInstallCreated')}: <span className="text-white">{result.name}</span></span>
+                    </div>
+                    <AutoInstallTokenBox t={t} reveal={result} onCopied={() => setCopied(true)} />
+                    <div>
+                        <h4 className="text-sm font-medium text-white mb-2">{t('autoInstallNextSteps')}</h4>
+                        <ol className="space-y-2 text-sm text-gray-300">
+                            {[t('autoInstallNextStep1'), t('autoInstallNextStep2'), t('autoInstallNextStep3')].map((s, i) => (
+                                <li key={i} className="flex items-start gap-2">
+                                    <span className="w-5 h-5 shrink-0 rounded-full bg-proxmox-orange/20 text-proxmox-orange text-xs flex items-center justify-center">{i + 1}</span>
+                                    <span>{s}</span>
+                                </li>
+                            ))}
+                        </ol>
+                    </div>
+                </div>
+            );
+
+            // Enter in a field means Next. Deliberately not a <form>: the root step holds a
+            // password pair, and a submitted form that disappears makes browsers offer to
+            // save it as the PegaProx login. Textareas (SSH keys) keep their newlines.
+            const body = result ? renderResult() : (
+                <div onKeyDown={e => {
+                    // a field that handled Enter itself (the disk chips) called preventDefault,
+                    // which is also what stops a real form from submitting
+                    if (e.key === 'Enter' && !e.defaultPrevented && e.target.tagName === 'INPUT'
+                            && e.target.type !== 'checkbox' && e.target.type !== 'radio') {
+                        e.preventDefault();
+                        goNext();
+                    }
+                }}>
+                    {renderStepContent()}
+                </div>
+            );
+            const stepMeta = result ? result.name : `${t('step')} ${activeStep + 1} / ${steps.length}`;
+            // clicks and keys stay inside: React bubbles through portals, and the
+            // dashboard has single-letter shortcuts on document
+            const contain = { onClick: e => e.stopPropagation(), onKeyDown: e => e.stopPropagation() };
+
+            if (isCorporate) {
+                return ReactDOM.createPortal(
+                    <div className="corp-vm-modal-overlay" style={{ zIndex: 70 }} {...contain}>
+                        <div className="corp-vm-modal" style={{ maxWidth: '820px' }} role="dialog" aria-modal="true" aria-labelledby="aiw-title">
+                            <div className="corp-vm-modal-header">
+                                <div className="corp-vm-modal-header-left">
+                                    <span className="corp-vm-type-pill">PVE</span>
+                                    <div className="corp-vm-modal-title-block">
+                                        <h2 id="aiw-title" className="corp-vm-modal-title">{t('autoInstallGuided')}</h2>
+                                        <div className="corp-vm-modal-meta">
+                                            <span>{t('autoInstall')}</span>
+                                            <span className="corp-meta-sep">·</span>
+                                            <span>{stepMeta}</span>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div className="corp-vm-modal-actions">
+                                    <button onClick={requestClose} disabled={creating} className="corp-vm-btn corp-vm-btn-ghost">
+                                        {t('close')}
+                                    </button>
+                                </div>
+                            </div>
+
+                            {!result && (
+                                <div className="corp-vm-stepper" ref={stepperRef}>
+                                    {steps.map((s, i) => {
+                                        const cls = i === activeStep ? 'active' : (i < activeStep ? 'done' : 'todo');
+                                        const bad = badSteps.has(i) && i !== activeStep;
+                                        return (
+                                            <button key={i} type="button" onClick={() => goTo(i)} className={`corp-vm-step ${cls}`}
+                                                disabled={i > activeStep} aria-current={i === activeStep ? 'step' : undefined}>
+                                                <span className="corp-vm-step-num"
+                                                    style={bad ? { background: '#c92100', borderColor: '#c92100', color: '#fff' } : undefined}>
+                                                    {bad ? '!' : (i < activeStep ? '✓' : i + 1)}
+                                                </span>
+                                                <span className="corp-vm-step-label">{s}</span>
+                                                {i < steps.length - 1 && <span className="corp-vm-step-line" />}
+                                            </button>
+                                        );
+                                    })}
+                                </div>
+                            )}
+
+                            <div className="corp-vm-modal-body" style={{ minHeight: '320px' }}>
+                                {body}
+                            </div>
+
+                            <div className="corp-vm-modal-footer">
+                                {result ? <span /> : (
+                                    <button onClick={requestClose} disabled={creating} className="corp-vm-btn corp-vm-btn-ghost">
+                                        {t('cancel')}
+                                    </button>
+                                )}
+                                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                                    {result ? (
+                                        <button onClick={requestClose} className="corp-vm-btn corp-vm-btn-primary">{t('done')}</button>
+                                    ) : (
+                                        <>
+                                            <button onClick={() => goTo(activeStep - 1)} disabled={activeStep === 0 || busy}
+                                                className="corp-vm-btn corp-vm-btn-ghost">
+                                                {t('back')}
+                                            </button>
+                                            {activeStep < lastStep ? (
+                                                <button onClick={goNext} disabled={busy} className="corp-vm-btn corp-vm-btn-primary">
+                                                    {busy && <Icons.RotateCw />}
+                                                    {t('next')}
+                                                </button>
+                                            ) : (
+                                                <>
+                                                    <button onClick={() => onOpenInEditor(profileDraft(), compose)} disabled={!compose || !compose.answer || stale || busy}
+                                                        className="corp-vm-btn corp-vm-btn-ghost">
+                                                        {t('autoInstallOpenInEditor')}
+                                                    </button>
+                                                    <button onClick={create} disabled={!canCreate} className="corp-vm-btn corp-vm-btn-create">
+                                                        {creating && <Icons.RotateCw />}
+                                                        {t('autoInstallCreateProfile')}
+                                                    </button>
+                                                </>
+                                            )}
+                                        </>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    </div>,
+                    document.body
+                );
+            }
+
+            return ReactDOM.createPortal(
+                <div className={`fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/80${isCloud ? ' cloud-mounted' : ''}`} {...contain}>
+                    <div className="w-full max-w-2xl max-h-[90vh] flex flex-col bg-proxmox-card border border-proxmox-border rounded-xl shadow-2xl overflow-hidden"
+                        role="dialog" aria-modal="true" aria-labelledby="aiw-title">
+                        <div className="flex items-center justify-between border-b border-proxmox-border bg-proxmox-dark px-6 py-4">
+                            <div className="flex items-center gap-3 min-w-0">
+                                <div className="p-2 rounded-lg bg-proxmox-orange/10 text-proxmox-orange">
+                                    <Icons.Disc className="w-5 h-5" />
+                                </div>
+                                <div className="min-w-0">
+                                    <h2 id="aiw-title" className="font-semibold text-white">{t('autoInstallGuided')}</h2>
+                                    <div className="text-xs text-gray-500 truncate">{stepMeta}</div>
+                                </div>
+                            </div>
+                            <button onClick={requestClose} disabled={creating} aria-label={t('close')}
+                                className="p-2 hover:bg-proxmox-hover rounded-lg text-gray-400 hover:text-white">
+                                <Icons.X />
+                            </button>
+                        </div>
+
+                        {!result && (
+                            <div className="flex border-b border-proxmox-border bg-proxmox-dark/50 overflow-x-auto">
+                                {steps.map((s, i) => (
+                                    <button key={i} type="button" onClick={() => goTo(i)} disabled={i > activeStep}
+                                        aria-current={i === activeStep ? 'step' : undefined}
+                                        className={`flex-1 px-3 py-3 text-xs font-medium whitespace-nowrap transition-colors disabled:cursor-not-allowed ${
+                                            i === activeStep
+                                                ? 'text-proxmox-orange border-b-2 border-proxmox-orange'
+                                                : (badSteps.has(i) ? 'text-red-400' : (i < activeStep ? 'text-gray-300 hover:text-white' : 'text-gray-500'))
+                                        }`}>
+                                        {i + 1}. {s}
+                                    </button>
+                                ))}
+                            </div>
+                        )}
+
+                        <div className="flex-1 overflow-y-auto p-6 min-h-[300px]">
+                            {body}
+                        </div>
+
+                        <div className="flex items-center justify-between gap-3 px-6 py-4 border-t border-proxmox-border bg-proxmox-dark">
+                            {result ? <span /> : (
+                                <button onClick={requestClose} disabled={creating} className="px-4 py-2 text-gray-300 hover:text-white">
+                                    {t('cancel')}
+                                </button>
+                            )}
+                            <div className="flex flex-wrap justify-end gap-3">
+                                {result ? (
+                                    <button onClick={requestClose}
+                                        className="px-4 py-2 bg-proxmox-orange hover:bg-proxmox-orange/90 rounded-lg text-white">
+                                        {t('done')}
+                                    </button>
+                                ) : (
+                                    <>
+                                        <button onClick={() => goTo(activeStep - 1)} disabled={activeStep === 0 || busy}
+                                            className="px-4 py-2 text-gray-400 hover:text-white disabled:opacity-50 disabled:cursor-not-allowed">
+                                            {t('back')}
+                                        </button>
+                                        {activeStep < lastStep ? (
+                                            <button onClick={goNext} disabled={busy}
+                                                className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange hover:bg-proxmox-orange/90 rounded-lg text-white disabled:opacity-50">
+                                                {busy && <Icons.RotateCw />}
+                                                {t('next')}
+                                            </button>
+                                        ) : (
+                                            <>
+                                                <button onClick={() => onOpenInEditor(profileDraft(), compose)} disabled={!compose || !compose.answer || stale || busy}
+                                                    className="px-4 py-2 border border-proxmox-border rounded-lg text-gray-300 hover:text-white hover:border-gray-500 disabled:opacity-50">
+                                                    {t('autoInstallOpenInEditor')}
+                                                </button>
+                                                <button onClick={create} disabled={!canCreate}
+                                                    className="flex items-center gap-2 px-4 py-2 bg-green-600 rounded-lg text-white hover:bg-green-700 disabled:opacity-50">
+                                                    {creating && <Icons.RotateCw />}
+                                                    {t('autoInstallCreateProfile')}
+                                                </button>
+                                            </>
+                                        )}
+                                    </>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+                </div>,
+                document.body
             );
         }
 
@@ -3115,18 +4507,6 @@
                                 {updateInfo?.update_available && (
                                     <span className="px-1.5 py-0.5 text-xs bg-green-500 text-white rounded-full">NEW</span>
                                 )}
-                            </button>
-                            <button
-                                onClick={() => setActiveTab('autoinstall')}
-                                className={`flex items-center gap-2 ${isCorporate ? 'px-3 py-1.5 text-[13px]' : 'px-4 py-2.5 text-sm'} font-medium transition-colors whitespace-nowrap ${
-                                    activeTab === 'autoinstall'
-                                        ? (isCorporate ? 'text-white border-b-2 border-[#49afd9] font-medium' : 'text-proxmox-orange border-b-2 border-proxmox-orange bg-proxmox-dark/50')
-                                        : 'text-gray-400 hover:text-white hover:bg-proxmox-dark/30'
-                                }`}
-                            >
-                                <Icons.Disc className="w-4 h-4" />
-                                <span className="hidden sm:inline">{t('autoInstall')}</span>
-                                <span className="sm:hidden">{t('autoInstallShort')}</span>
                             </button>
                             <button
                                 onClick={() => setActiveTab('about')}
@@ -8016,10 +9396,6 @@
                             )}
                             
                             {/* About Tab - LW styled this */}
-                            {activeTab === 'autoinstall' && (
-                                <AutoInstallPanel t={t} addToast={addToast}
-                                    getAuthHeaders={getAuthHeaders} clusters={clusters} />
-                            )}
                             {activeTab === 'about' && (
                                 <div className="space-y-6">
                                     {/* Version Info */}

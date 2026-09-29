@@ -5130,7 +5130,7 @@
 
         // LW: All Clusters Overview - GitHub Feature Request #16
         // added a bunch of stuff here - storage, sparklines, sorting etc
-        function AllClustersOverview({ clusters, allMetrics, clusterGroups = [], topGuests = [], allClusterGuests = {}, pbsServers = [], onSelectCluster, onSelectVm, topologyOnly = false }) {
+        function AllClustersOverview({ clusters, allMetrics, clusterGroups = [], topGuests = [], allClusterGuests = {}, pbsServers = [], onSelectCluster, onSelectVm, topologyOnly = false, onAutoInstall }) {
             const { t } = useTranslation();
             const { isCorporate } = useLayout();
             const [sortBy, setSortBy] = useState('name');
@@ -5822,6 +5822,13 @@
                             <div className="py-8 text-center text-[13px]" style={{color: '#728b9a'}}>
                                 <Icons.Server className="w-6 h-6 mx-auto mb-2" style={{color: 'var(--corp-border-medium)'}} />
                                 {t('noClustersConfigured') || 'No clusters configured'}
+                                {onAutoInstall && (
+                                    <div className="mt-2">
+                                        <button onClick={onAutoInstall} className="hover:underline" style={{color: 'var(--corp-accent)'}}>
+                                            {t('autoInstallFirstHost')}
+                                        </button>
+                                    </div>
+                                )}
                             </div>
                         )}
                     </div>
@@ -6063,6 +6070,16 @@
                             </div>
                             <h3 className="text-lg font-semibold text-white mb-2">{t('noClustersConfigured') || 'No clusters configured'}</h3>
                             <p className="text-gray-500 text-sm">{t('addClusterToStart') || 'Add a cluster to get started'}</p>
+                            {/* no PVE box yet? the dashboard only passes this to managers */}
+                            {onAutoInstall && (
+                                <button
+                                    onClick={onAutoInstall}
+                                    className="mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-proxmox-dark border border-proxmox-border hover:border-emerald-500/30 text-sm text-gray-300 hover:text-white transition-colors"
+                                >
+                                    <Icons.Disc className="w-4 h-4 text-emerald-400" />
+                                    {t('autoInstallFirstHost')}
+                                </button>
+                            )}
                         </div>
                     )}
                 </div>
