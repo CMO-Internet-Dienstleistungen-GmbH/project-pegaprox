@@ -998,16 +998,16 @@ window.pDeleteSnap=function(c,v,snapname){const vm=S.vms.find(x=>x.cluster_id===
 // against window, found nothing, and threw ReferenceError — the +Container / Destroy buttons did
 // nothing for everyone with those features enabled. Export them like every other inline handler.
 window.pCreateCt=pCreateCt;window.submitCreateCt=submitCreateCt;window.pDestroy=pDestroy;window.submitDestroy=submitDestroy;
-// #810 (GreyChame1eon) — same shape, found four months later: the portal's SSO
-// button carries onclick="startOidcLogin()" and the function is in-IIFE, so it
-// threw ReferenceError and the button did nothing. It was the only inline handler
-// in the file without an export.
+// #810 - same shape: the SSO button carries onclick="startOidcLogin()" and the
+// function lives inside the IIFE, so every click threw ReferenceError. That has
+// been the case since the button went in (April), and it was the only inline
+// handler in the file without an export.
 window.startOidcLogin=startOidcLogin;
-// Same family again, found by the handler/export guard rather than by a user: the
-// New Container, Destroy and Mount ISO modals closed via onclick="S.modal=null;
-// render()", and neither S nor render is global either - so their x and their
-// backdrop both threw and the only way out of those three dialogs was a page
-// reload. They route through closeModal() now like the other eight sites do, which
+// Same family, found by the handler/export test rather than by a user: the New
+// Container, Destroy and Mount ISO dialogs closed via S.modal=null;render(), and
+// neither S nor render is global, so their close button and the backdrop threw and
+// only a page reload got you out - Mount ISO since April, the other two since #765
+// made them open. They go through closeModal() now like the other eight sites, which
 // also tears down a live noVNC session instead of orphaning it (#396).
 window.pBackToLogin=function(){S.pending2fa=null;S.err=null;render();};
 window.closeModal=function(){

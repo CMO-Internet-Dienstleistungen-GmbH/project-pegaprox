@@ -1,6 +1,6 @@
 """simple-websocket writes frames with send(), which may write only part of them.
 
-#945.5 — a console behind a reverse proxy streamed about 1.6 MB and then closed
+#945.5 - a console behind a reverse proxy streamed about 1.6 MB and then closed
 with 1002 Protocol Error after a black screen. `self.sock.send(out_data)` is
 allowed to write fewer bytes than asked and report how many; simple-websocket
 1.1.0 does not loop, so under load the tail of a large framebuffer update is

@@ -1427,7 +1427,7 @@ def get_cluster_creds_internal(cluster_id):
     # NS 2026-06-05 (C-1): the termproxy WS proxy gets the PVE session cookie
     # from here (server-side) instead of the browser. Mint fresh; None for
     # token-only clusters. Other consumers (SSH) ignore the field.
-    # MK Sep 2026 (#956) — the termproxy subprocess builds its own wss:// URL to PVE and
+    # MK Sep 2026 (#956) - the termproxy subprocess builds its own wss:// URL to PVE and
     # used to pin 8006. One port per cluster is all PegaProx models, so a multi-node cluster
     # reached on a non-default port needs the same port on every node; that is still better
     # than the literal, which was wrong for every node at once.

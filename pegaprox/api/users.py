@@ -307,7 +307,7 @@ def update_user_preferences():
         'cyberpunk', 'github', 'solarizedDark', 'gruvbox',
         'corporateDark', 'corporateLight', 'enterpriseBlue',  # NS: Corporate themes
         'cloud',  # NS 2026-06-05: Cloud skin (Preview)
-        'system'  # LW Sep 2026 (#743): resolves to a real palette in the browser
+        'system'  # MK Sep 2026 (#743): resolves to a real palette in the browser
     ]
     
     if 'theme' in data:
@@ -1556,7 +1556,7 @@ def get_all_permissions():
             'permission': perm,
             'description': desc,
             'category': category,
-            # MK Sep 2026 (#818) — '' for almost everything; the grid only renders a
+            # MK Sep 2026 (#818) - '' for almost everything; the grid only renders a
             # warning line when there is one to render.
             'warning': PERMISSION_WARNINGS.get(perm, ''),
         })

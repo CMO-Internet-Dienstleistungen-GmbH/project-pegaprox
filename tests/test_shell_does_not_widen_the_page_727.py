@@ -1,4 +1,4 @@
-"""#727 (nvaert1986) - with the node shell open, a sideways drag pans the whole page
+"""#727 - with the node shell open, a sideways drag pans the whole page
 and clips part of the layout off-screen. Firefox only; Chrome does not pan on that
 gesture, which is why it looked unreproducible for six weeks.
 

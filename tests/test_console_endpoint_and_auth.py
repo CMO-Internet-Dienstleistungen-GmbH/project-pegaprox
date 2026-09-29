@@ -172,7 +172,7 @@ def test_the_api_port_variable_is_never_reassigned_in_a_console_handler():
 #
 # The VNC handlers were the visible part. The termproxy path builds its own PVE
 # websocket URL inside the generated subprocess script, and that one still pinned
-# 8006 - so on grupoaxium's tunnel (X:18006 open, X:8006 closed) the LXC terminal
+# 8006 - so on the reporter's tunnel (X:18006 open, X:8006 closed) the LXC terminal
 # would keep failing after the console started working.
 
 def _vms_source():

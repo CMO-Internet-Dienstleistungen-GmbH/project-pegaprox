@@ -2018,7 +2018,7 @@ class PegaProxDB:
         except Exception as e:
             logging.error(f"Error creating multi_cluster_vnets table: {e}")
 
-        # MK Sep 2026 — automated installations: answer files plus the runs the
+        # MK Sep 2026 - automated installations: answer files plus the runs the
         # prepared ISOs report back. The answer file is stored encrypted, it holds
         # the root password of every machine built from it.
         try:
@@ -4531,7 +4531,7 @@ class PegaProxDB:
             for _tbl, _cols in (('pbs_servers', ('pass_encrypted', 'api_token_secret_encrypted',
                                                  'ssh_key_encrypted')),
                                 ('vmware_servers', ('pass_encrypted',)),
-                                # MK Sep 2026 — an auto-install answer file holds the root
+                                # MK Sep 2026 - an auto-install answer file holds the root
                                 # password of the host it builds. Missing here would mean a
                                 # rotation leaves every stored profile unreadable and the
                                 # next ISO fetch answering 500.

@@ -1,4 +1,4 @@
-"""#818 (falschgeldkind) - a granular permission for the Prometheus endpoint.
+"""#818 - a granular permission for the Prometheus endpoint.
 
 Today /api/metrics takes an admin-role API token or `metrics_public: true`, and
 nothing in between, so a Prometheus job needs an admin token. The permission is

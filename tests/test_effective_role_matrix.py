@@ -92,7 +92,7 @@ def test_a_global_custom_role_resolves_to_its_own_permissions(roles):
 
 
 def _builtin_size(role):
-    """MK Sep 2026 (#818) — admin is `list(PERMISSIONS.keys())`, so a literal here turns
+    """MK Sep 2026 (#818) - admin is `list(PERMISSIONS.keys())`, so a literal here turns
     every new permission into a failure of a test about something else entirely. Derive it.
 
     Viewer stays a hand-written literal on purpose: its list is hand-maintained, and a

@@ -1,10 +1,10 @@
 """Two things the SSH-websocket subprocess got wrong about its own host.
 
-#957 — it validates every session against PEGAPROX_URL, which was pinned to
+#957 - it validates every session against PEGAPROX_URL, which was pinned to
        127.0.0.1. Bind the app to one LAN address (the "Proxy Bind Address"
        setting) and loopback is not listening, so every terminal died with
        "Auth server unreachable" and close code 1011.
-#958 — on a package install the script is written somewhere writable, and the
+#958 - on a package install the script is written somewhere writable, and the
        fallback was the shared temp dir. An executable under a predictable name
        in a world-writable directory is not where we want to be.
 

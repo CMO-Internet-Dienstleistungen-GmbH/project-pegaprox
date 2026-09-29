@@ -1595,7 +1595,7 @@ def update_server_settings():
                     'highContrast', 'dracula', 'nord', 'monokai', 'matrix', 'sunset',
                     'cyberpunk', 'github', 'solarizedDark', 'gruvbox',
                     'corporateDark', 'corporateLight', 'enterpriseBlue',  # NS: Corporate themes
-                    'cloud', 'system'  # LW Sep 2026 (#743); `cloud` was missing here
+                    'cloud', 'system'  # MK Sep 2026 (#743); `cloud` was missing here
                 ]
                 if data['default_theme'] in allowed_themes:
                     settings['default_theme'] = data['default_theme']
@@ -1809,7 +1809,7 @@ def update_server_settings():
                 'highContrast', 'dracula', 'nord', 'monokai', 'matrix', 'sunset',
                 'cyberpunk', 'github', 'solarizedDark', 'gruvbox',
                 'corporateDark', 'corporateLight', 'enterpriseBlue',  # NS: Corporate themes
-                'cloud', 'system'  # LW Sep 2026 (#743); `cloud` was missing here
+                'cloud', 'system'  # MK Sep 2026 (#743); `cloud` was missing here
             ]
             if default_theme in allowed_themes:
                 settings['default_theme'] = default_theme
@@ -4359,7 +4359,7 @@ def start_rolling_update(cluster_id):
     mgr = cluster_managers[cluster_id]
     data = request.get_json() or {}
 
-    # MK Sep 2026 (#716 hugobugomugo) — alert channels to tell about this run, so the
+    # MK Sep 2026 (#716) - alert channels to tell about this run, so the
     # on-call monitoring can be muted for its actual duration instead of a guessed
     # maintenance window. Opt-in: no ids, no traffic.
     notify_channels = data.get('notify_channels', [])
@@ -4476,7 +4476,7 @@ def start_rolling_update(cluster_id):
         try:
             logging.info(f"[RollingUpdate] Starting rolling update for cluster, nodes: {nodes_to_update}")
             _log("Rolling update started")
-            # #716 — the signal the monitoring mutes on
+            # #716 - the signal the monitoring mutes on
             notify_lifecycle('rolling_update.started',
                              f"Rolling update started on {mgr.config.name}",
                              f"{len(nodes_to_update)} node(s) queued: {', '.join(nodes_to_update)}"
@@ -4948,7 +4948,7 @@ def start_rolling_update(cluster_id):
             mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] === Rolling update completed ===")
             mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Summary: {completed} updated, {skipped} skipped (up-to-date), {failed} failed")
             logging.info(f"[RollingUpdate] Rolling update completed: {completed} updated, {skipped} skipped, {failed} failed")
-            # #716 — un-mute, and say whether anyone needs to look
+            # #716 - un-mute, and say whether anyone needs to look
             notify_lifecycle('rolling_update.finished',
                              f"Rolling update finished on {mgr.config.name}",
                              f"{completed} updated, {skipped} skipped (up-to-date), {failed} failed",
@@ -4962,7 +4962,7 @@ def start_rolling_update(cluster_id):
             mgr._rolling_update['completed_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
             mgr._rolling_update['error'] = str(e)
             mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Rolling update failed: {e}")
-            # #716 — a run that died is exactly when the on-call wants to be un-muted
+            # #716 - a run that died is exactly when the on-call wants to be un-muted
             notify_lifecycle('rolling_update.finished',
                              f"Rolling update FAILED on {mgr.config.name}",
                              f"The run stopped with an error: {e}",

@@ -1,6 +1,6 @@
 """Exactly one party may perform the websocket handshake.
 
-#945.3 — geventwebsocket's handler upgrades every request carrying
+#945.3 - geventwebsocket's handler upgrades every request carrying
 `Upgrade: websocket`, at the WSGI layer, before Flask routes anything. Three of
 our endpoints are flask-sock, and simple_websocket handshakes them itself once
 reached. The client got two 101 responses back to back, read the second as a

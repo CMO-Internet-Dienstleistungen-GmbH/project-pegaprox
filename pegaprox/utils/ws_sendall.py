@@ -4,8 +4,8 @@
 `simple_websocket` 1.1.0 writes every outbound frame with `self.sock.send(...)`
 in five places. `send()` is allowed to write fewer bytes than it was given and
 report how many; it is the caller's job to loop. simple-websocket does not, so
-whenever a single write does not drain — which is what happens under load, and a
-VNC framebuffer update is exactly that — the rest of the frame is dropped. The
+whenever a single write does not drain - which is what happens under load, and a
+VNC framebuffer update is exactly that - the rest of the frame is dropped. The
 stream stays open but is now misaligned, the client decodes garbage, and the
 session ends with 1002 Protocol Error after a black screen.
 

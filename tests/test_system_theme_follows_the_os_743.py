@@ -1,4 +1,4 @@
-"""#743 (Frisch12) - a "System" entry in the theme picker that follows the OS
+"""#743 - a "System" entry in the theme picker that follows the OS
 light/dark preference and switches live, without a reload.
 
 The shape is the reporter's: `system` is an ordinary theme value, so the server

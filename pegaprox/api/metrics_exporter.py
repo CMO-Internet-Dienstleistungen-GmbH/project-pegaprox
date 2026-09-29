@@ -120,7 +120,7 @@ def _node_apt_updates_available(cid, mgr, node):
     return available
 
 
-# MK Sep 2026 (#818) — tokens we have already said the warning about, so a 15-second
+# MK Sep 2026 (#818) - tokens we have already said the warning about, so a 15-second
 # scrape interval does not turn one warning into 5 760 a day. Keyed by the token id
 # from our own table, so nothing a caller invents lands in here, and it is rebuilt on
 # restart which is exactly when an operator wants to see it again.
@@ -132,7 +132,7 @@ def _auth_ok():
 
       (a) metrics_public = true
       (b) the bearer token is an ADMIN-role token whose owner is still an enabled admin
-      (c) MK Sep 2026 (#818) — the token carries `metrics.view`
+      (c) MK Sep 2026 (#818) - the token carries `metrics.view`
 
     NS Aug 2026 (Aikido pentest): /api/metrics emits cluster-wide, cross-tenant infra gauges
     (node status, quorum, CPU, VM counts across every cluster). Mere token validity is not
@@ -141,7 +141,7 @@ def _auth_ok():
 
     (c) does not weaken that: it is a permission nobody holds unless an admin grants it, it is
     in no builtin role, and the UI says out loud at the point of granting that it is not
-    tenant-scoped. What it buys is the thing #818 asked for — a monitoring account that can
+    tenant-scoped. What it buys is the thing #818 asked for - a monitoring account that can
     scrape and do nothing else, instead of an admin token in a Prometheus config file.
 
     The permission is resolved through build_authz_user(), not off the stored account: a token
@@ -166,13 +166,13 @@ def _auth_ok():
                 except Exception:
                     owner = None
                 if not (owner and owner.get('enabled', True)):
-                    logging.warning(f"[metrics] rejected token for '{info.get('user')}' — "
+                    logging.warning(f"[metrics] rejected token for '{info.get('user')}' - "
                                     "account is gone or disabled")
                     return False
                 if info.get('role') == ROLE_ADMIN:
                     if owner.get('role') == ROLE_ADMIN:
                         return True
-                    logging.warning(f"[metrics] rejected admin token for '{info.get('user')}' — "
+                    logging.warning(f"[metrics] rejected admin token for '{info.get('user')}' - "
                                     "owner is no longer admin")
                     return False
                 # (c) #818
@@ -183,7 +183,7 @@ def _auth_ok():
                             _metrics_perm_announced.add(tid)
                             logging.warning(
                                 f"[metrics] token '{info.get('token_name')}' of "
-                                f"'{info.get('user')}' scrapes /api/metrics via metrics.view — "
+                                f"'{info.get('user')}' scrapes /api/metrics via metrics.view - "
                                 "this endpoint is NOT tenant-scoped and exposes every cluster")
                         return True
                 except Exception as e:
@@ -197,7 +197,7 @@ def _auth_ok():
 def prometheus_metrics():
     if not _auth_ok():
         return Response(
-            '# unauthorized — use an admin API token, a token with the metrics.view '
+            '# unauthorized - use an admin API token, a token with the metrics.view '
             'permission, or enable metrics_public\n',
             status=401, mimetype='text/plain; version=0.0.4'
         )

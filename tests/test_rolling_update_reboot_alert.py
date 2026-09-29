@@ -41,7 +41,7 @@ def test_reboot_event_is_silent_without_an_enabled_rolling_update_alarm(monkeypa
     assert alerts.emit_rolling_update_reboot_event('cluster_1', 'pve-01') is False
 
 
-# NS Sep 2026 — added on merge of #960. The two new strings in the alert dialog were
+# NS Sep 2026 - added on merge of #960. The two new strings in the alert dialog were
 # written as `t('rollingUpdates') || 'Rolling Updates'`, which reads like a safe
 # fallback and is not: t() is `translations[lang]?.[key] || translations['en']?.[key]
 # || key`, so a missing key comes back as the KEY, which is truthy, and the `||` never

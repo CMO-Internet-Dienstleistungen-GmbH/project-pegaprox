@@ -1439,7 +1439,7 @@ def save_processed_vm(vmid):
         f.write(f"{{vmid}}\\n")
 
 def get_current_smbios(vmid):
-    """read smbios from conf file directly — no perl overhead.
+    """read smbios from conf file directly - no perl overhead.
 
     Section-aware: `qm set` on a RUNNING vm writes into the conf's
     [PENDING] section (applied at the next vm start), so a pending

@@ -1,4 +1,4 @@
-"""#642 (maxilee) - a plugin enabled for a cluster also shows up while a standalone
+"""#642 - a plugin enabled for a cluster also shows up while a standalone
 node is selected, and the other way round.
 
 The reporter runs one cluster plus three standalone PVE nodes in the same PegaProx.

@@ -800,7 +800,7 @@ def emit_rolling_update_reboot_event(cluster_id, node):
 
     for rule in rules:
         alert_data = {
-            # NS Sep 2026 — named after the node, not after the rule: a six-node run
+            # NS Sep 2026 - named after the node, not after the rule: a six-node run
             # otherwise sends six notifications with an identical subject and the node
             # only in the body. _emit_node_status_event above does the same, and this
             # is the same kind of thing - a node lifecycle event, not a threshold breach.
@@ -817,7 +817,7 @@ def emit_rolling_update_reboot_event(cluster_id, node):
             'message': f"Node {node} is rebooting as part of a rolling update on cluster {cluster_id}",
         }
         logging.info("[RollingUpdate] %s", alert_data['message'])
-        # NS Sep 2026 — the metric poll records this rule as skipped on every pass, so
+        # NS Sep 2026 - the metric poll records this rule as skipped on every pass, so
         # without this the diagnostics endpoint keeps reporting it as never evaluated
         # even right after it fired, which is the first thing anybody looks at when a
         # notification does not arrive.

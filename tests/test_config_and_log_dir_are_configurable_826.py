@@ -1,4 +1,4 @@
-"""#826 (avsdev-cw) - let the config and log directories live somewhere else.
+"""#826 - let the config and log directories live somewhere else.
 
 The reporter keeps container logs on volatile storage that is not backed up, and
 backs the state directory up on a different schedule. Today both are relative

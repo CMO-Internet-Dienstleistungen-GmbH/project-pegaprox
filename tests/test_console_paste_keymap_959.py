@@ -1,4 +1,4 @@
-"""#959 (grupoaxium) - pasting into the console typed US symbols on a Spanish keyboard.
+"""#959 - pasting into the console typed US symbols on a Spanish keyboard.
 
 The paste path emulates a keyboard: for every shifted symbol it holds Shift_L and taps
 the *base* key of the US layout (MK added that for #653, where symbols arrived unshifted).
@@ -104,7 +104,7 @@ def test_en_gb_counts_as_foreign(press):
 # --- what must not regress ---------------------------------------------------
 
 def test_the_us_table_from_653_still_fires_on_a_us_keymap(press):
-    """#653 (dcodner24): without this, '@' arrives as a bare '2'."""
+    """#653: without this, '@' arrives as a bare '2'."""
     keys = press({'at': ('@', 'en-us')})['at']
     assert _shift_dance(keys), "#653 is back: no Shift held around the base key"
     assert keys[1][0] == 0x32, keys

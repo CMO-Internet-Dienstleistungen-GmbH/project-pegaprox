@@ -410,7 +410,7 @@ def get_join_info(cluster_id):
                         data['fingerprint'] = node_entry['pve_fp']
                         break
             # Still no fingerprint? Get from SSL cert.
-            # MK Sep 2026 (#956) — on the cluster's own API port. This read the cert from a
+            # MK Sep 2026 (#956) - on the cluster's own API port. This read the cert from a
             # literal 8006 two lines after unpacking manager.api_port for the request above,
             # so a cluster reached on any other port silently produced no fingerprint and the
             # join command could not be built.
@@ -3801,7 +3801,7 @@ def clone_vm_api(cluster_id, node, vm_type, vmid):
         return jsonify({'error': result['error']}), 500
 
 
-# MK Sep 2026 (#959, grupoaxium) - the console answer carries the datacenter keymap so the
+# MK Sep 2026 (#959) - the console answer carries the datacenter keymap so the
 # browser can stop emulating a US keyboard when the cluster is not running one. /cluster/options
 # is a value nobody touches twice in a year, and the console path has its own latency history
 # (#713/#777/#782), so it gets a short TTL instead of a round trip per console open.
@@ -4021,7 +4021,7 @@ def _screenshot_via_rfb(mgr, node, vm_type, vmid, max_width=480, timeout=10):
     vnc_port = vnc_data['port']
 
     # optional SSH tunnel for clusters where the API port isn't directly reachable
-    # MK Sep 2026 (#956) — was a literal 8006 and broke the screenshot tile for any
+    # MK Sep 2026 (#956) - was a literal 8006 and broke the screenshot tile for any
     # cluster reachable on a forwarded port, the same way the console did.
     _api_port = getattr(mgr, 'api_port', 8006) or 8006
     tunnel_endpoint = None
@@ -8346,7 +8346,7 @@ def handle_vnc_websocket(ws, cluster_id, node, vm_type, vmid):
         pve_port_q = request.args.get('pve_port')
         pve_ticket_q = request.args.get('pve_ticket')
         _ppt_ok, _ppt_port = _safe_vnc_passthrough(pve_port_q, pve_ticket_q)
-        # MK Sep 2026 (#945, #956) — the vncproxy port goes in its OWN variable. It
+        # MK Sep 2026 (#945, #956) - the vncproxy port goes in its OWN variable. It
         # used to overwrite `port`, which still had to be the API port for the URL
         # authority two steps down, so the upgrade was dialled against :5900 and got
         # ECONNREFUSED. Reusing the browser's ticket also means the upgrade has to
@@ -8371,7 +8371,7 @@ def handle_vnc_websocket(ws, cluster_id, node, vm_type, vmid):
                 vnc_result = json.loads(response.read().decode('utf-8'))
             vnc_ticket = vnc_result['data']['ticket']
             vnc_port = vnc_result['data']['port']
-            print(f"Got VNC ticket, port={vnc_port} (no JS pass-through — PVE 9.1.x users may hit issue #352)")
+            print(f"Got VNC ticket, port={vnc_port} (no JS pass-through - PVE 9.1.x users may hit issue #352)")
         
         # Step 3: Connect to Proxmox WebSocket
         print(f"Step 3: Connect to Proxmox...")
@@ -8753,7 +8753,7 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                 vnc_result = json.loads(vnc_body.decode('utf-8'))
                 vnc_ticket = vnc_result['data']['ticket']
                 vnc_port = vnc_result['data']['port']
-                logging.warning(f"[VNC] no pve_port/pve_ticket in URL — issued fresh vncproxy (port={vnc_port}). Update the frontend to pass JS-issued ticket through to avoid PVE 9.1.x password-mismatch (issue #352).")
+                logging.warning(f"[VNC] no pve_port/pve_ticket in URL - issued fresh vncproxy (port={vnc_port}). Update the frontend to pass JS-issued ticket through to avoid PVE 9.1.x password-mismatch (issue #352).")
 
             pve_ws_path = _pve_console_ws_path(node, vm_type, vmid, vnc_port, vnc_ticket)
 
@@ -8766,7 +8766,7 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
             # Multi-user: each session gets its own ephemeral local port.
             tunnel_endpoint = None
             tunnel_target_host = host
-            # MK Sep 2026 (#956) — the cluster's API port, not a literal 8006. A
+            # MK Sep 2026 (#956) - the cluster's API port, not a literal 8006. A
             # cluster reachable on a forwarded port worked everywhere except here.
             tunnel_target_port = port
             try:
@@ -9339,7 +9339,7 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
         pve_port_q = request.args.get('pve_port')
         pve_ticket_q = request.args.get('pve_ticket')
         _ppt_ok, _ppt_port = _safe_vnc_passthrough(pve_port_q, pve_ticket_q)
-        # MK Sep 2026 (#945, #956) — the vncproxy port goes in its OWN variable. It
+        # MK Sep 2026 (#945, #956) - the vncproxy port goes in its OWN variable. It
         # used to overwrite `port`, which still had to be the API port for the URL
         # authority two steps down, so the upgrade was dialled against :5900 and got
         # ECONNREFUSED. Reusing the browser's ticket also means the upgrade has to
@@ -9364,7 +9364,7 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
                 vnc_result = json.loads(response.read().decode('utf-8'))
             vnc_ticket = vnc_result['data']['ticket']
             vnc_port = vnc_result['data']['port']
-            print(f"Got VNC ticket, port={vnc_port} (no JS pass-through — PVE 9.1.x users may hit issue #352)")
+            print(f"Got VNC ticket, port={vnc_port} (no JS pass-through - PVE 9.1.x users may hit issue #352)")
         
         # Step 3: Connect to Proxmox WebSocket
         print(f"Step 3: Connect to Proxmox...")
@@ -9431,7 +9431,7 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
             try:
                 data = ws.receive(timeout=0.1)
                 if data is None:
-                    # MK Sep 2026 (#945.4) — simple-websocket returns None for BOTH
+                    # MK Sep 2026 (#945.4) - simple-websocket returns None for BOTH
                     # "timed out with nothing to read" and "the peer is gone", and
                     # this read times out ten times a second by design. Treating it
                     # as a disconnect ended the session ~0.1s after it opened unless
@@ -10076,7 +10076,7 @@ async def termproxy_handler(client_ws, query, m_term, ws_token, session_id):
     # certs and most labs run them. Admins toggle on once they've installed
     # a real cert + the cluster's `ssl_verify` config field is true.
     verify_pve_tls = bool(ctx.get('verify_pve_tls', False))
-    # MK Sep 2026 (#956) — the API port of this cluster. 8006 stays the default for a
+    # MK Sep 2026 (#956) - the API port of this cluster. 8006 stays the default for a
     # context built before this field existed.
     try:
         pve_api_port = int(ctx.get('api_port') or 8006)
@@ -10271,7 +10271,7 @@ if __name__ == '__main__':
     pkg_base = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if not os.access(script_dir, os.W_OK):
-        # MK Sep 2026 (#958) — CONFIG_DIR before the shared temp dir. On a package
+        # MK Sep 2026 (#958) - CONFIG_DIR before the shared temp dir. On a package
         # install the fallback above put an executable under a predictable name in
         # a world-writable directory; CONFIG_DIR is the service's own (created 0700
         # next to the database), so nobody else can pre-create or swap the file.
@@ -10314,7 +10314,7 @@ if __name__ == '__main__':
             except:
                 pass  # Neither fuser nor lsof available, hope for the best
         
-        # MK Sep 2026 (#958) — O_NOFOLLOW so a symlink planted at script_path is an
+        # MK Sep 2026 (#958) - O_NOFOLLOW so a symlink planted at script_path is an
         # error rather than a write through it, O_EXCL so a plain file somebody else
         # got there first is refused instead of written into (O_NOFOLLOW alone only
         # covers the symlink half, and O_TRUNC would have handed us their inode to

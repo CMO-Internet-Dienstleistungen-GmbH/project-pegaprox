@@ -5,10 +5,11 @@ while an `onclick="foo()"` attribute resolves against the global scope and nothi
 else. A handler that is never re-exported therefore throws ReferenceError and the
 button silently does nothing - no error state in the UI, just a dead control.
 
-This has now happened twice: #765 (grobe0ba) for the container create/destroy
-buttons, and #810 (GreyChame1eon) for the SSO button, which sat broken from April
-to September because nobody clicked it with the console open. Counting the two
-lists by hand found it both times; this does the counting.
+It happened with #765 for the container create/destroy buttons and with #810 for
+the SSO button, which sat broken from April to September. Writing this test then
+found seven more: the close buttons of three portal dialogs, dead since they could
+first be opened. Counting the two lists by hand is how it was found each time; this
+does the counting.
 """
 import os
 import re

@@ -339,7 +339,7 @@ def update_cluster_alert(cluster_id, alert_id):
                 alert['operator'] = 'event'
                 alert['threshold'] = 1
             elif alert.get('operator') == 'event':
-                # MK Sep 2026 (scan) — this rule WAS a rolling-update rule and has just
+                # MK Sep 2026 (scan) - this rule WAS a rolling-update rule and has just
                 # been moved to a metric that is compared against a number. 'event' is
                 # not a comparison, so the poll would stop skipping the rule and then
                 # never match anything: a rule that looks configured and silently never

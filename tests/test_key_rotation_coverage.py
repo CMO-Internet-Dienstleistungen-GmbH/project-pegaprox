@@ -61,7 +61,7 @@ def test_every_secret_survives_a_rotation(seeded):
     assert seeded._decrypt(_col(seeded, 'pbs_servers', 'api_token_secret_encrypted', 'pbs1')) == 'pbstoken'
     assert seeded._decrypt(_col(seeded, 'pbs_servers', 'ssh_key_encrypted', 'pbs1')) == 'pbskey'
     assert seeded._decrypt(_col(seeded, 'vmware_servers', 'pass_encrypted', 'esxi1')) == 'esxipw'
-    # MK Sep 2026 — the source-level guard below is satisfied by a mention, so the
+    # MK Sep 2026 - the source-level guard below is satisfied by a mention, so the
     # answer file needs a real round trip: unreadable here means the next prepared
     # ISO gets a 500 instead of an install.
     assert 'in the rack' in seeded._decrypt(

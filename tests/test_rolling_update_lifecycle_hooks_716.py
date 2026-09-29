@@ -1,4 +1,4 @@
-"""#716 (hugobugomugo) - fire a webhook around a rolling update so the on-call
+"""#716 - fire a webhook around a rolling update so the on-call
 monitoring can be muted for the duration.
 
 The reporter's actual problem is not "no webhook", it is that a static maintenance

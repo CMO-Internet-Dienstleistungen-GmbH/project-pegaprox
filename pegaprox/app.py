@@ -179,7 +179,7 @@ def create_app():
             '/api/health',
             '/api/webauthn/auth/begin',
             '/api/webauthn/auth/finish',
-            # MK Sep 2026 — the automated installer is not a browser: it carries no
+            # MK Sep 2026 - the automated installer is not a browser: it carries no
             # session to protect and cannot be made to send Origin or X-Requested-With.
             # Both of these are gated by the installation token instead.
             '/api/auto-install/answer',
@@ -1546,7 +1546,7 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
     print(f"Starting PegaProx with Gevent WSGIServer ({workers} greenlets)", flush=True)
     print("Mode: Production (async I/O optimized)", flush=True)
 
-    # #945.5 — simple-websocket writes frames with a bare send(), which is allowed
+    # #945.5 - simple-websocket writes frames with a bare send(), which is allowed
     # to write only part of one. Has to happen before the first websocket is served.
     try:
         from pegaprox.utils.ws_sendall import apply_sendall_patch
@@ -1652,7 +1652,7 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
     # These happen when users close browser tabs - totally normal
     if use_websocket_handler:
         class QuietWebSocketHandler(WebSocketHandler):
-            # MK Sep 2026 (#945.3) — geventwebsocket upgrades EVERY request that
+            # MK Sep 2026 (#945.3) - geventwebsocket upgrades EVERY request that
             # carries `Upgrade: websocket`, at the WSGI layer, before Flask routes
             # anything. Three of our routes are flask-sock (`@sock.route`), and
             # simple_websocket.Server performs its own handshake once it is reached.

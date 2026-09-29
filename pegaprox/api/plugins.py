@@ -117,7 +117,7 @@ def _discover_plugins():
     return found
 
 
-# MK Sep 2026 (#642) — a cluster id as it appears in the URL of every cluster route.
+# MK Sep 2026 (#642) - a cluster id as it appears in the URL of every cluster route.
 _SAFE_CLUSTER_ID = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
 
 
@@ -347,7 +347,7 @@ def list_plugins():
             'trusted': plugin.get('author', '').startswith('PegaProx'),
             'has_frontend': has_frontend,
             'frontend_route': frontend_route,
-            # #642 — empty list = every cluster; the frontend filters on this
+            # #642 - empty list = every cluster; the frontend filters on this
             'clusters': state.get('clusters') or [],
         })
 
@@ -479,7 +479,7 @@ def _safe_plugin_path(plugin_id, filename='config.json'):
 @bp.route('/api/plugins/<plugin_id>/clusters', methods=['PUT'])
 @require_auth(perms=['plugins.manage'])
 def set_plugin_clusters(plugin_id):
-    """Limit a plugin to specific clusters (#642 maxilee).
+    """Limit a plugin to specific clusters (#642).
 
     An empty list puts it back on every cluster, which is where every plugin starts.
     Ids are not checked against the live cluster list on purpose: a cluster can be

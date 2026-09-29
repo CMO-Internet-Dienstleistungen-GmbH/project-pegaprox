@@ -418,7 +418,7 @@ def validate_ws_token_api():
                         'host': cluster_host,
                         'node_ips': node_ips,
                         'ssh_port': getattr(cfg, 'ssh_port', 22) or 22,
-                        # MK Sep 2026 (#956) — the termproxy's PVE upgrade port. Both context
+                        # MK Sep 2026 (#956) - the termproxy's PVE upgrade port. Both context
                         # sources have to carry it or the bug survives on one of the two flows.
                         'api_port': int(getattr(mgr, 'api_port', 8006) or 8006),
                         # NS Aug 2026 (AI-pentest) — carry the per-cluster TLS-verify flag to the

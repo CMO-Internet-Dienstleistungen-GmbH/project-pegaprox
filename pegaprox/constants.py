@@ -12,13 +12,13 @@ PEGAPROX_VERSION = "1.2.0"
 PEGAPROX_BUILD = "2026.09.20"
 
 # File Paths & Directories
-# MK Sep 2026 (#826 avsdev-cw): both directories are resolvable from the environment.
+# MK Sep 2026 (#826): both directories are resolvable from the environment.
 # They used to be relative to the working directory, which is /opt/PegaProx, /var/lib/
-# pegaprox or /app depending on how you installed — so "keep the state somewhere else"
+# pegaprox or /app depending on how you installed - so "keep the state somewhere else"
 # meant moving the whole install. Everything below derives from CONFIG_DIR, so setting
 # it here is enough; read it before anything is joined onto it.
-#   PEGAPROX_CONFIG_DIR — database, master key, settings, TLS pair, branding
-#   PEGAPROX_LOG_DIR    — the per-cluster log files
+#   PEGAPROX_CONFIG_DIR - database, master key, settings, TLS pair, branding
+#   PEGAPROX_LOG_DIR    - the per-cluster log files
 # Unset or blank keeps today's relative paths, which is what every install has.
 def _dir_from_env(var, default):
     raw = os.environ.get(var, '')

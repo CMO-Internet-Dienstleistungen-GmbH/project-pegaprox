@@ -1,4 +1,4 @@
-"""#813 (Frisch12) - show a QEMU VM's description in the Corporate summary.
+"""#813 - show a QEMU VM's description in the Corporate summary.
 
 The detail view already fetches the VM config for machine / BIOS / CPU / SCSI /
 network, and `raw.description` rides along in the same response, so this costs no

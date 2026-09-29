@@ -1,6 +1,6 @@
 """Generate an OpenAPI 3.1 description of the PegaProx HTTP API.
 
-MK Sep 2026 (#104, #693) — external tooling (an Ansible collection, a community
+MK Sep 2026 (#104, #693) - external tooling (an Ansible collection, a community
 Terraform provider) kept stalling on the same thing: there is no machine-readable
 description of the API. Hand-writing one for 800-odd routes would be stale the
 week after, so this reads the live Flask url_map instead and is regenerated from
@@ -161,7 +161,7 @@ def build(app):
 def _place(app, paths, path, method, op, endpoint):
     """Write one operation, resolving a doubly-registered URL the way the app does.
 
-    MK Sep 2026 (daily scan) — seven URLs carry two registrations from two
+    MK Sep 2026 (daily scan) - seven URLs carry two registrations from two
     blueprints. An OpenAPI document can hold one operation per path+method, and
     a plain assignment kept whichever iter_rules() yielded last. For two of the
     seven that is a different handler with a different permission, so the

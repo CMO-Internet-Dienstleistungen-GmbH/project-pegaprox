@@ -178,7 +178,7 @@ PERMISSIONS = {
     'xapi.template.view': 'View XCP-ng VM templates',
     'xapi.template.manage': 'Create/delete XCP-ng VM templates',
 
-    # Telemetry - MK Sep 2026 (#818 falschgeldkind)
+    # Telemetry - MK Sep 2026 (#818)
     'metrics.view': 'Scrape the Prometheus endpoint (/api/metrics)',
 
     # Automated installations - MK Sep 2026
@@ -186,7 +186,7 @@ PERMISSIONS = {
     'autoinstall.manage': 'Create, edit and revoke automated installation profiles',
 }
 
-# MK Sep 2026 (#818) — permissions whose scope is wider than their name suggests.
+# MK Sep 2026 (#818) - permissions whose scope is wider than their name suggests.
 # The UI shows this next to the checkbox, because the moment somebody ticks it is
 # the moment they need to know. Keep these short and factual: an alarming tone on a
 # permission people legitimately need gets read as boilerplate and then ignored.
