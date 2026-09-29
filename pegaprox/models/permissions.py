@@ -197,11 +197,16 @@ PERMISSION_WARNINGS = {
         'which clusters or tenants the holder is otherwise limited to. Grant it to '
         'a dedicated monitoring account, not to a tenant role.'
     ),
+    'autoinstall.view': (
+        'Not tenant-scoped. Shows every installation profile and every machine that '
+        'fetched one - hardware serials, MAC and IP addresses - across all tenants. '
+        'Only takes effect for accounts that see every cluster.'
+    ),
     'autoinstall.manage': (
-        'Answer files carry the root password of every host installed from them, '
-        'and the fetch token is handed out in clear text once. This permission is '
-        'the ability to define what a new Proxmox host boots into - treat it like '
-        'physical access to the rack.'
+        'Not tenant-scoped. Answer files carry the root password of every host '
+        'installed from them, and this is the ability to decide what a new Proxmox '
+        'host boots into - treat it like physical access to the rack. Only takes '
+        'effect for accounts that see every cluster.'
     ),
 }
 

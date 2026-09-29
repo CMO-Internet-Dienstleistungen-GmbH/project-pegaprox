@@ -2057,12 +2057,19 @@ class PegaProxDB:
                     system_info TEXT DEFAULT '{}',
                     message TEXT DEFAULT '',
                     client_ip TEXT DEFAULT '',
+                    callback_token_hash TEXT DEFAULT '',
                     started_at TEXT,
                     updated_at TEXT
                 )
             ''')
+            # the first cut of this table (Testing only) had no callback token
+            run_cols = [r[1] for r in cursor.execute("PRAGMA table_info(auto_install_runs)").fetchall()]
+            if 'callback_token_hash' not in run_cols:
+                cursor.execute("ALTER TABLE auto_install_runs ADD COLUMN callback_token_hash TEXT DEFAULT ''")
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_auto_install_runs_profile '
                            'ON auto_install_runs(profile_id, started_at DESC)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_auto_install_runs_callback '
+                           'ON auto_install_runs(callback_token_hash)')
             logging.info("Ensured auto_install tables exist")
         except Exception as e:
             logging.error(f"Error creating auto_install tables: {e}")

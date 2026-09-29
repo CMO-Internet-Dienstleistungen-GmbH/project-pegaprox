@@ -401,6 +401,28 @@ def redact_url(value):
         _one, text)
 
 
+def redact_request_line(line):
+    """An access-log line with credential-looking query values blanked.
+
+    redact_url() wants a scheme and so never matches `POST /x?token=... HTTP/1.1`.
+    Some callers can only send a credential in the query string (an auto-installer
+    ISO too old for a header token), and the request line is logged at INFO."""
+    if not isinstance(line, str) or '?' not in line:
+        return line
+
+    def _query(m):
+        parts = []
+        for pair in m.group(1).split('&'):
+            name, eq, _val = pair.partition('=')
+            if eq and any(h in name.lower() for h in _SECRET_PARAM_HINTS):
+                parts.append(f'{name}=[REDACTED]')
+            else:
+                parts.append(pair)
+        return '?' + '&'.join(parts)
+
+    return re.sub(r'\?([^\s"#]*)', _query, line)
+
+
 class LogInjectionFilter(logging.Filter):
     """Neutralise control characters on every log record, at the sink.
 

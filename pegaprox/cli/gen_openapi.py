@@ -36,7 +36,11 @@ _INLINE_AUTH = ('_require_session', 'validate_session(', 'validate_api_token(',
                 '_metrics_token', 'metrics_public',
                 # MK Sep 2026 - the automated installer presents an installation
                 # token; it has no session and never will, but it is not public.
-                '_profile_for_token')
+                '_profile_for_token', '_run_for_callback_token')
+
+# ...and those two take that token only, so advertising apiToken/sessionId on them
+# sends an integrator straight into a 403.
+_INSTALL_TOKEN_AUTH = ('_profile_for_token', '_run_for_callback_token')
 
 _CONVERTER_TYPES = {
     'int': ('integer', None),
@@ -82,6 +86,14 @@ def _auth_kind(fn, decorated):
     except (OSError, TypeError):
         return 'unknown'
     return 'inline' if any(tok in src for tok in _INLINE_AUTH) else 'public'
+
+
+def _uses(fn, markers):
+    try:
+        src = inspect.getsource(inspect.unwrap(fn))
+    except (OSError, TypeError):
+        return False
+    return any(tok in src for tok in markers)
 
 
 def _doc(fn):
@@ -130,6 +142,10 @@ def build(app):
             if kind in ('decorator', 'inline'):
                 op['security'] = [{'apiToken': []}, {'sessionId': []}]
                 op['responses']['401'] = {'description': 'Not authenticated'}
+            if kind == 'inline' and _uses(fn, _INSTALL_TOKEN_AUTH):
+                op['security'] = [{'installToken': []}]
+                op['responses'].pop('401', None)
+                op['responses']['403'] = {'description': 'Unknown, revoked or spent token'}
             if auth is not None:
                 if auth['perms'] or auth['roles']:
                     op['responses']['403'] = {'description': 'Insufficient permissions'}
@@ -229,6 +245,12 @@ def spec(app, version):
                     'type': 'http', 'scheme': 'bearer', 'bearerFormat': 'pgx_*',
                     'description': 'An API token from Settings > API Tokens. '
                                    'Send as: Authorization: Bearer pgx_...',
+                },
+                'installToken': {
+                    'type': 'http', 'scheme': 'bearer', 'bearerFormat': 'pgxai_*',
+                    'description': 'An automated-installation token. The installer sends it '
+                                   'as Authorization: Bearer <name>:<token> '
+                                   '(--answer-auth-token); ?token=<token> works too.',
                 },
                 'sessionId': {
                     'type': 'apiKey', 'in': 'header', 'name': 'X-Session-ID',

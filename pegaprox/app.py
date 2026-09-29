@@ -1683,6 +1683,12 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
                 if 'ssl' in str(msg).lower() or 'eof' in str(msg).lower():
                     return
                 super().log_error(msg, *args)
+
+            def format_request(self):
+                # the access line carries the whole query string, and a token can
+                # only travel there for some callers (an older auto-install ISO)
+                from pegaprox.utils.sanitization import redact_request_line
+                return redact_request_line(super().format_request())
     else:
         QuietWebSocketHandler = None
 
