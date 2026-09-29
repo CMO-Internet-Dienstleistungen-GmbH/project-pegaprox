@@ -338,6 +338,21 @@ def update_cluster_alert(cluster_id, alert_id):
             elif alert.get('metric') == 'rolling_update':
                 alert['operator'] = 'event'
                 alert['threshold'] = 1
+            elif alert.get('operator') == 'event':
+                # MK Sep 2026 (scan) — this rule WAS a rolling-update rule and has just
+                # been moved to a metric that is compared against a number. 'event' is
+                # not a comparison, so the poll would stop skipping the rule and then
+                # never match anything: a rule that looks configured and silently never
+                # fires.
+                # The operator is reset unconditionally. Guarding on "the caller did not
+                # send one" reads careful and is dead: the copy loop above has already
+                # written any operator from the request, so reaching here at all means
+                # the value IS 'event' - either left over or sent that way, and neither
+                # belongs on a metric that gets compared. The threshold is different: a
+                # caller-supplied number is meaningful, so only a leftover 1 is replaced.
+                alert['operator'] = '>'
+                if 'threshold' not in data:
+                    alert['threshold'] = 80
             # ensure cluster_id is always present for older rows
             alert.setdefault('cluster_id', cluster_id)
             save_cluster_alerts(alerts)

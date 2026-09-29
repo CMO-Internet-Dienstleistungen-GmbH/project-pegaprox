@@ -134,9 +134,51 @@ def build(app):
                     op['x-pegaprox-permissions'] = auth['perms']
                 if auth['roles']:
                     op['x-pegaprox-roles'] = auth['roles']
-            paths.setdefault(path, {})[method.lower()] = op
+            _place(app, paths, path, method.lower(), op, rule.endpoint)
     _dedupe_operation_ids(paths)
     return paths
+
+
+def _place(app, paths, path, method, op, endpoint):
+    """Write one operation, resolving a doubly-registered URL the way the app does.
+
+    MK Sep 2026 (daily scan) — seven URLs carry two registrations from two
+    blueprints. An OpenAPI document can hold one operation per path+method, and
+    a plain assignment kept whichever iter_rules() yielded last. For two of the
+    seven that is a different handler with a different permission, so the
+    document named a permission the app does not enforce: /ha GET advertised
+    cluster.view while the served handler demands ha.view. Anyone provisioning a
+    token from the document got a 403.
+
+    werkzeug's own matcher decides, because it is what answers the request. The
+    loser is recorded rather than dropped - a second registration on a live URL
+    is worth seeing, and silently hiding it is how it stayed unnoticed.
+    """
+    slot = paths.setdefault(path, {})
+    previous = slot.get(method)
+    if previous is None:
+        slot[method] = op
+        return
+    served = _served_endpoint(app, path, method)
+    keep, drop = (op, previous) if served == endpoint else (previous, op)
+    shadowed = list(keep.get('x-pegaprox-shadowed-by', []))
+    for other in (drop.get('operationId', '').rsplit('_', 1)[0],):
+        if other and other not in shadowed:
+            shadowed.append(other)
+    keep['x-pegaprox-shadowed-by'] = shadowed
+    slot[method] = keep
+
+
+_PLACEHOLDER = re.compile(r'\{[^}]+\}')
+
+
+def _served_endpoint(app, path, method):
+    """Which endpoint werkzeug picks for this path+method, or None."""
+    probe = _PLACEHOLDER.sub('x1', path)
+    try:
+        return app.url_map.bind('localhost').match(probe, method=method.upper())[0]
+    except Exception:
+        return None
 
 
 def _dedupe_operation_ids(paths):

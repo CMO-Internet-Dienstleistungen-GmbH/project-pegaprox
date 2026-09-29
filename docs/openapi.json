@@ -2306,9 +2306,9 @@
         ]
       },
       "post": {
-        "operationId": "static_files.create_pool_post",
+        "operationId": "users.create_pool_api_post",
         "tags": [
-          "static_files"
+          "users"
         ],
         "responses": {
           "200": {
@@ -2324,7 +2324,6 @@
             "description": "Insufficient permissions"
           }
         },
-        "summary": "Create a new resource pool in Proxmox",
         "parameters": [
           {
             "name": "cluster_id",
@@ -2356,6 +2355,9 @@
         ],
         "x-pegaprox-permissions": [
           "admin.users"
+        ],
+        "x-pegaprox-shadowed-by": [
+          "static_files.create_pool"
         ]
       }
     },
@@ -4758,9 +4760,9 @@
     },
     "/api/clusters/{cluster_id}/ha": {
       "get": {
-        "operationId": "nodes.get_pool_ha_api_get",
+        "operationId": "clusters.get_ha_status_get",
         "tags": [
-          "nodes"
+          "clusters"
         ],
         "responses": {
           "200": {
@@ -4796,7 +4798,10 @@
           }
         ],
         "x-pegaprox-permissions": [
-          "cluster.view"
+          "ha.view"
+        ],
+        "x-pegaprox-shadowed-by": [
+          "nodes.get_pool_ha_api"
         ]
       },
       "put": {
@@ -4899,9 +4904,9 @@
     },
     "/api/clusters/{cluster_id}/ha/enable": {
       "post": {
-        "operationId": "nodes.enable_pool_ha_api_post",
+        "operationId": "clusters.enable_ha_post",
         "tags": [
-          "nodes"
+          "clusters"
         ],
         "responses": {
           "200": {
@@ -4948,14 +4953,17 @@
         ],
         "x-pegaprox-permissions": [
           "ha.config"
+        ],
+        "x-pegaprox-shadowed-by": [
+          "nodes.enable_pool_ha_api"
         ]
       }
     },
     "/api/clusters/{cluster_id}/ha/disable": {
       "post": {
-        "operationId": "nodes.disable_pool_ha_api_post",
+        "operationId": "clusters.disable_ha_post",
         "tags": [
-          "nodes"
+          "clusters"
         ],
         "responses": {
           "200": {
@@ -5002,6 +5010,9 @@
         ],
         "x-pegaprox-permissions": [
           "ha.config"
+        ],
+        "x-pegaprox-shadowed-by": [
+          "nodes.disable_pool_ha_api"
         ]
       }
     },
@@ -32348,9 +32359,9 @@
     },
     "/api/clusters/{cluster_id}/affinity-rules": {
       "get": {
-        "operationId": "history.get_affinity_rules_get__api_clusters_cluster_id_affinity_rules",
+        "operationId": "alerts.get_cluster_affinity_rules_get",
         "tags": [
-          "history"
+          "alerts"
         ],
         "responses": {
           "200": {
@@ -32361,12 +32372,9 @@
           },
           "401": {
             "description": "Not authenticated"
-          },
-          "403": {
-            "description": "Insufficient permissions"
           }
         },
-        "summary": "Get affinity rules, optionally filtered by cluster",
+        "summary": "Get affinity rules for a specific cluster",
         "parameters": [
           {
             "name": "cluster_id",
@@ -32386,14 +32394,14 @@
             "sessionId": []
           }
         ],
-        "x-pegaprox-permissions": [
-          "cluster.view"
+        "x-pegaprox-shadowed-by": [
+          "history.get_affinity_rules"
         ]
       },
       "post": {
-        "operationId": "history.create_affinity_rule_post__api_clusters_cluster_id_affinity_rules",
+        "operationId": "alerts.create_cluster_affinity_rule_post",
         "tags": [
-          "history"
+          "alerts"
         ],
         "responses": {
           "200": {
@@ -32409,7 +32417,7 @@
             "description": "Insufficient permissions"
           }
         },
-        "summary": "Create a new affinity rule",
+        "summary": "Create a new affinity rule for a cluster",
         "parameters": [
           {
             "name": "cluster_id",
@@ -32439,16 +32447,19 @@
             "sessionId": []
           }
         ],
-        "x-pegaprox-roles": [
-          "admin"
+        "x-pegaprox-permissions": [
+          "cluster.config"
+        ],
+        "x-pegaprox-shadowed-by": [
+          "history.create_affinity_rule"
         ]
       }
     },
     "/api/clusters/{cluster_id}/affinity-rules/{rule_id}": {
       "delete": {
-        "operationId": "history.delete_affinity_rule_delete__api_clusters_cluster_id_affinity_rules_rule_id",
+        "operationId": "alerts.delete_cluster_affinity_rule_delete",
         "tags": [
-          "history"
+          "alerts"
         ],
         "responses": {
           "200": {
@@ -32492,8 +32503,11 @@
             "sessionId": []
           }
         ],
-        "x-pegaprox-roles": [
-          "admin"
+        "x-pegaprox-permissions": [
+          "cluster.config"
+        ],
+        "x-pegaprox-shadowed-by": [
+          "history.delete_affinity_rule"
         ]
       },
       "put": {
@@ -34269,7 +34283,7 @@
     },
     "/api/affinity-rules": {
       "get": {
-        "operationId": "history.get_affinity_rules_get__api_affinity_rules",
+        "operationId": "history.get_affinity_rules_get",
         "tags": [
           "history"
         ],
@@ -34302,7 +34316,7 @@
         ]
       },
       "post": {
-        "operationId": "history.create_affinity_rule_post__api_affinity_rules",
+        "operationId": "history.create_affinity_rule_post",
         "tags": [
           "history"
         ],
@@ -34400,7 +34414,7 @@
         ]
       },
       "delete": {
-        "operationId": "history.delete_affinity_rule_delete__api_affinity_rules_rule_id",
+        "operationId": "history.delete_affinity_rule_delete",
         "tags": [
           "history"
         ],

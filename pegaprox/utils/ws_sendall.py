@@ -62,8 +62,13 @@ def apply_sendall_patch():
         return False
 
     base = getattr(_ws, 'Base', None)
-    if base is None or getattr(base, '_pegaprox_sendall', False):
+    if base is None:
         return False
+    if getattr(base, '_pegaprox_sendall', False):
+        # already wrapped by another import of this module: the docstring promises
+        # "True if simple-websocket is now write-complete", and it is. MK Sep 2026 (scan)
+        _PATCHED = True
+        return True
 
     original_init = base.__init__
 
