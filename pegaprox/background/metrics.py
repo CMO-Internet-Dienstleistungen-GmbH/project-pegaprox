@@ -128,6 +128,13 @@ def _node_hw_summary_redfish(mgr, cluster_id, node):
     return _compact_hw(res)
 
 
+# Upper bound on a windowed history read. A week at the 5-min cadence and
+# stride 3 is ~670 rows, so this only bites where snapshots land far more often
+# than they should, and there it stops one report from dragging tens of
+# thousands of encrypted blobs through the parser.
+_WINDOW_ROW_CAP = 4000
+
+
 def load_metrics_history(days=None):
     """Load historical metrics from SQLite database.
 
@@ -161,21 +168,35 @@ def load_metrics_history(days=None):
             return out
 
         if days:
+            # One decimation policy for every history consumer rather than a
+            # second copy of it here. A week of 5-min rows is ~2000 blobs to
+            # decrypt + parse, and every consumer either averages or feeds a
+            # chart that decimates to 200 points anyway, so the skipped rows are
+            # never decrypted: the modulo is answered from the timestamp index.
+            from pegaprox.api.helpers import _history_stride
             cutoff = (datetime.now() - timedelta(days=days)).isoformat()
-            # Same decimation policy as helpers.load_metrics_window: a week of
-            # 5-min rows is ~2000 blobs to decrypt + parse, and every consumer
-            # either averages or feeds a chart that decimates to 200 points
-            # anyway. `id % stride = 0` is answered from the timestamp index,
-            # so the rows we skip are never decrypted.
-            stride = 1 if days <= 2 else 3
+            stride = _history_stride(days)
             if stride > 1:
-                sql = ('SELECT timestamp, data FROM metrics_history '
-                       'WHERE timestamp >= ? AND id % ? = 0 ORDER BY timestamp ASC')
+                # Anchored on the newest row instead of a bare `id % stride = 0`.
+                # A plain modulo keeps the last snapshot only when its id happens
+                # to divide, so two times out of three the newest sample is
+                # dropped and a report's `current` is silently a stride older
+                # than the data it was read from.
+                where = ('WHERE timestamp >= ? AND '
+                         '((SELECT MAX(id) FROM metrics_history) - id) % ? = 0')
                 params = (cutoff, stride)
             else:
-                sql = ('SELECT timestamp, data FROM metrics_history '
-                       'WHERE timestamp >= ? ORDER BY timestamp ASC')
+                where = 'WHERE timestamp >= ?'
                 params = (cutoff,)
+            # The old flat LIMIT was also the only thing bounding the work. A
+            # window is a time span, so on an install writing far more often than
+            # the 5-min cadence a week is unbounded decrypt + parse. Keep a
+            # backstop, and trim it from the OLD end so the recent resolution the
+            # charts are about survives.
+            sql = ('SELECT timestamp, data FROM ('
+                   'SELECT id, timestamp, data FROM metrics_history '
+                   f'{where} ORDER BY timestamp DESC LIMIT {_WINDOW_ROW_CAP}'
+                   ') ORDER BY timestamp ASC')
             snapshots = run_heavy_read(
                 sql, params, cache_key=f'mh_reports_d{days}', transform=_parse)
         else:

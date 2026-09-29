@@ -58,9 +58,18 @@ def history(monkeypatch):
         got = conn.execute(sql, params).fetchall()
         return transform(got) if transform else got
 
+    def add_snapshot(minutes_ago=1):
+        """One more row, and its (id, timestamp). Used to land a newest row on an
+        id the decimation would otherwise skip."""
+        ts = (now - timedelta(minutes=minutes_ago)).isoformat()
+        cur = conn.execute('INSERT INTO metrics_history (timestamp, data) VALUES (?, ?)',
+                           (ts, _snapshot_blob(0)))
+        conn.commit()
+        return cur.lastrowid, ts
+
     import pegaprox.core.dbcrypto as dbcrypto
     monkeypatch.setattr(dbcrypto, 'run_heavy_read', fake_run_heavy_read)
-    yield types.SimpleNamespace(now=now, rows=rows, seen=seen)
+    yield types.SimpleNamespace(now=now, rows=rows, seen=seen, add_snapshot=add_snapshot)
     conn.close()
 
 
@@ -137,5 +146,40 @@ def test_the_timeline_runs_forward_and_current_is_the_newest_sample(api, seed, h
     assert week['timestamps'] == sorted(week['timestamps'])
     assert week['cpu']['current'] == week['cpu']['samples'][-1]
     newest = datetime.fromisoformat(week['timestamps'][-1])
-    assert (history.now - newest).total_seconds() < 3600, (
-        'the last point is an old one - the series is reversed')
+    assert (history.now - newest).total_seconds() < CADENCE_MIN * 60 + 60, (
+        'the last point is an old one - the series is reversed or decimated past the end')
+
+
+# --- what the decimation must not do -----------------------------------------
+
+def test_the_newest_snapshot_survives_the_decimation(history):
+    """A week is read at stride 3. A bare `id % 3 = 0` keeps the last row only
+    when its id happens to divide, so two times out of three the newest sample is
+    dropped, the chart stops short and the report's `current` is a stride behind
+    the data it was read from."""
+    from pegaprox.background.metrics import load_metrics_history
+    newest_id, newest_ts = history.add_snapshot()
+    assert newest_id % 3 != 0, 'this fixture no longer lands on a row a plain modulo drops'
+    snaps = load_metrics_history(days=7)['snapshots']
+    assert snaps[-1]['timestamp'] == newest_ts
+
+
+def test_a_windowed_read_stays_bounded(history, monkeypatch):
+    """A window is a time span, so the row count is whatever the install wrote in
+    it. The cap is the backstop the old flat LIMIT used to be, and it trims the
+    OLD end so the recent resolution the charts are about survives."""
+    import pegaprox.background.metrics as metrics
+    monkeypatch.setattr(metrics, '_WINDOW_ROW_CAP', 50)
+    _, newest_ts = history.add_snapshot()
+    snaps = metrics.load_metrics_history(days=7)['snapshots']
+    assert len(snaps) == 50
+    assert snaps[-1]['timestamp'] == newest_ts
+
+
+def test_the_week_read_uses_the_shared_decimation_policy(history):
+    """Second copy of the stride policy here is how the two drift apart."""
+    from pegaprox.api.helpers import _history_stride
+    from pegaprox.background.metrics import load_metrics_history
+    snaps = load_metrics_history(days=7)['snapshots']
+    in_window = min(history.rows, 7 * 24 * 60 // CADENCE_MIN)
+    assert len(snaps) == pytest.approx(in_window / _history_stride(7), rel=0.05)
