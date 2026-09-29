@@ -43014,6 +43014,97 @@
         ]
       }
     },
+    "/api/auto-install/password-hash": {
+      "post": {
+        "operationId": "auto_install.password_hash_endpoint_post",
+        "tags": [
+          "auto_install"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Turn a root password into the $6$ hash an answer file carries.",
+        "description": "The only place a clear root password reaches us. It is hashed and dropped: not\nlogged, not audited, not stored, and never repeated in an error.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "autoinstall.manage"
+        ]
+      }
+    },
+    "/api/auto-install/compose": {
+      "post": {
+        "operationId": "auto_install.compose_endpoint_post",
+        "tags": [
+          "auto_install"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "The guided setup's answer file, built from its fields and checked like any other. Nothing is stored: the wizard saves what it showed through the normal create call, so there is one save path and one set of rules.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "autoinstall.manage"
+        ]
+      }
+    },
     "/api/auto-install/runs": {
       "get": {
         "operationId": "auto_install.list_runs_get",

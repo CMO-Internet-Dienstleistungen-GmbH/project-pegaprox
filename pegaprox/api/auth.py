@@ -931,6 +931,11 @@ def auth_login():
     user_theme = user.get('theme', '') or default_theme
     logging.info(f"[LOGIN] User {username} theme from DB: '{user.get('theme', '')}', using: '{user_theme}'")
     
+    # MK Sep 2026 - imported here, not at the top: one blueprint should not load another
+    from pegaprox.utils.auth import active_sessions
+    from pegaprox.api.auto_install import autoinstall_access
+    autoinstall = autoinstall_access(username, active_sessions.get(session_id) or {})
+
     response = jsonify({
         'success': True,
         'user': {
@@ -949,7 +954,8 @@ def auth_login():
             'taskbar_auto_expand': user.get('taskbar_auto_expand', True),  # NS: Feb 2026
             'sidebar_show_vmid': user.get('sidebar_show_vmid', False),  # NS Jul 2026 — corporate sidebar VMIDs
             'layout_chosen': user.get('layout_chosen', False),
-            'portal_only': user.get('portal_only', False)
+            'portal_only': user.get('portal_only', False),
+            'autoinstall_access': autoinstall,  # 'manage' | 'view' | '', same rule as the routes
         },
         'session_id': session_id,
         'portal_only': user.get('portal_only', False),
@@ -1198,6 +1204,7 @@ def auth_check():
         if not has_2fa and not is_external and not (is_admin and exclude_admins):
             requires_2fa_setup = True
     
+    from pegaprox.api.auto_install import autoinstall_access
     return jsonify({
         'authenticated': True,
         'session_id': session_id,
@@ -1217,7 +1224,8 @@ def auth_check():
             'sidebar_show_vmid': user.get('sidebar_show_vmid', False),  # NS Jul 2026 — corporate sidebar VMIDs
             'totp_enabled': user.get('totp_enabled', False),
             'layout_chosen': user.get('layout_chosen', False),
-            'portal_only': user.get('portal_only', False)
+            'portal_only': user.get('portal_only', False),
+            'autoinstall_access': autoinstall_access(session['user'], session),
         },
         'password_expiry': password_expiry,
         'requires_2fa_setup': requires_2fa_setup,

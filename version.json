@@ -142,6 +142,7 @@
     "pegaprox/utils/rbac.py",
     "pegaprox/utils/realtime.py",
     "pegaprox/utils/sanitization.py",
+    "pegaprox/utils/sha512_crypt.py",
     "pegaprox/utils/ssh.py",
     "pegaprox/utils/ssh_pool.py",
     "pegaprox/utils/ssh_security.py",

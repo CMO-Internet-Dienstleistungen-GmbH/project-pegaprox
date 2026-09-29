@@ -29,6 +29,7 @@ import time
 import hashlib
 import secrets
 import logging
+import ipaddress
 import threading
 from datetime import datetime, timezone
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
@@ -40,6 +41,8 @@ from pegaprox.globals import cluster_managers
 from pegaprox.core.db import get_db
 from pegaprox.utils.auth import require_auth, build_authz_user
 from pegaprox.utils.audit import log_audit, get_client_ip
+from pegaprox.utils.ssh import check_auth_action_rate_limit
+from pegaprox.utils.sha512_crypt import sha512_crypt
 from pegaprox.api.helpers import safe_error, load_server_settings, effective_reverse_proxy
 
 bp = Blueprint('auto_install', __name__)
@@ -136,11 +139,115 @@ _KNOWN_GLOBAL = ('keyboard', 'country', 'fqdn', 'mailto', 'timezone', 'root-pass
 _WEBHOOK_HEADER = re.compile(r'^\s*\[\s*post-installation-webhook\s*\]\s*$')
 _ANY_TABLE = re.compile(r'^\s*\[')
 
+# The rules below are shared by validate_answer and build_answer, so a file the
+# guided setup writes is judged exactly like one typed into the editor. They come
+# from the installer's own types (proxmox-installer-types, proxmox-network-types).
+# Every pattern is used with fullmatch: a bare '$' would let a trailing newline in.
+_KEYBOARDS = ('de', 'de-ch', 'dk', 'en-gb', 'en-us', 'es', 'fi', 'fr', 'fr-be', 'fr-ca', 'fr-ch',
+              'hu', 'is', 'it', 'jp', 'lt', 'mk', 'nl', 'no', 'pl', 'pt', 'pt-br', 'se', 'si', 'tr')
+# least number of disks per raid level; raid10 also needs an even count
+_RAID_MIN = {'zfs': {'raid0': 1, 'raid1': 2, 'raid10': 4, 'raidz-1': 3, 'raidz-2': 4, 'raidz-3': 5},
+             'btrfs': {'raid0': 1, 'raid1': 2, 'raid10': 4}}
+# the one options table each filesystem may carry
+_FS_OPTIONS = {'ext4': 'lvm', 'xfs': 'lvm', 'zfs': 'zfs', 'btrfs': 'btrfs'}
+
+# What `chpasswd --encrypted` on the new node can verify: sha512-crypt, sha256-crypt,
+# yescrypt, bcrypt. The value lands in /etc/shadow unchecked, so anything else is a
+# root account nobody can log in to. The alphabet also keeps ':' and newlines out,
+# which would break the chpasswd line.
+_CRYPT_RE = re.compile(r'\$6\$(?:rounds=[0-9]{1,9}\$)?[./0-9A-Za-z]{0,16}\$[./0-9A-Za-z]{86}'
+                       r'|\$5\$(?:rounds=[0-9]{1,9}\$)?[./0-9A-Za-z]{0,16}\$[./0-9A-Za-z]{43}'
+                       r'|\$y\$[./0-9A-Za-z]+\$[./0-9A-Za-z]{1,86}\$[./0-9A-Za-z]{43}'
+                       r'|\$2[aby]\$[0-9]{2}\$[./0-9A-Za-z]{53}')
+# the <input type="email"> pattern, which is what the installer checks against
+_EMAIL_RE = re.compile(r"[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
+                       r"(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*")
+_MAIL_PLACEHOLDER = 'mail@example.invalid'
+_COUNTRY_RE = re.compile(r'[a-z]{2}')
+_TZ_RE = re.compile(r'[A-Za-z][A-Za-z0-9_+\-]*(?:/[A-Za-z0-9_+\-]+){0,2}')
+_LABEL_RE = re.compile(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?')
+
+
+def _unprintable(value):
+    return any(ch < ' ' or ch == '\x7f' or '\ud800' <= ch <= '\udfff' for ch in value)
+
+
+def _fqdn_problem(name, host=True):
+    """Why the installer's Fqdn parser would refuse `name`, or None. host=False is
+    for fqdn.domain, which only gets the DHCP host name put in front of it."""
+    if len(name) > 253:
+        return 'is longer than 253 characters'
+    labels = name.split('.')
+    if not all(_LABEL_RE.fullmatch(label) for label in labels):
+        return ('may only use letters, digits and hyphens, in dot-separated parts '
+                'that do not start or end with a hyphen')
+    if host and len(labels) < 2:
+        return 'must be fully qualified (host.domain.tld)'
+    if host and labels[0].isdigit():
+        return 'must not have an all-numeric host name'
+    return None
+
+
+def _keyboard_problem(value):
+    return None if value in _KEYBOARDS else 'is not a keyboard layout the installer knows (de, en-us, fr-ch, ...)'
+
+
+def _country_problem(value):
+    if isinstance(value, str) and _COUNTRY_RE.fullmatch(value):
+        return None
+    return 'must be a two-letter country code in lower case (de, at, us, ...)'
+
+
+def _timezone_problem(value):
+    if not isinstance(value, str) or not _TZ_RE.fullmatch(value):
+        return 'must be a time zone name such as Europe/Berlin'
+    if value.startswith('Etc/'):
+        # not in the installer's zone table; plain "UTC" is
+        return 'must be a regional zone such as Europe/Berlin, or UTC - the installer refuses Etc/ zones'
+    return None
+
+
+def _mailto_problem(value):
+    if not isinstance(value, str) or not _EMAIL_RE.fullmatch(value):
+        return 'does not look like an e-mail address'
+    if value == _MAIL_PLACEHOLDER:
+        return "is the installer's placeholder address"
+    return None
+
+
+def _hashed_problem(value):
+    if isinstance(value, str) and _CRYPT_RE.fullmatch(value):
+        return None
+    return 'is not a password hash - use the hash button above the editor, or mkpasswd -m sha-512'
+
+
+def _raid_level(fs, value):
+    """The level in lower case, or None. The installer takes raid1 and RAID1, not Raid1."""
+    if not isinstance(value, str) or value not in (value.lower(), value.upper()):
+        return None
+    level = value.lower()
+    return level if level in _RAID_MIN.get(fs, {}) else None
+
+
+def _disk_list_problem(fs, level, disks):
+    if len(set(disks)) != len(disks):
+        return 'names the same disk twice'
+    if fs in ('ext4', 'xfs') and len(disks) > 1:
+        return f'can hold only one disk for {fs} - use zfs or btrfs for more'
+    if level:
+        need = _RAID_MIN[fs][level]
+        if len(disks) < need:
+            return f'needs at least {need} disks for {fs} {level}, got {len(disks)}'
+        if level == 'raid10' and len(disks) % 2:
+            return f'needs an even number of disks for {fs} raid10, got {len(disks)}'
+    return None
+
 
 def validate_answer(text):
     """(errors, warnings) for an answer file, checked the way the installer checks it.
 
-    Errors are what the installer refuses. Warnings work but are usually a mistake.
+    Errors are what the installer refuses. Warnings work but are usually a mistake,
+    and unknown keys stay warnings on purpose: a newer ISO may know them.
     """
     errors, warnings = [], []
     if not isinstance(text, str) or not text.strip():
@@ -156,9 +263,14 @@ def validate_answer(text):
     if not isinstance(g, dict):
         errors.append('Missing [global] section')
         g = {}
-    for key in ('keyboard', 'country', 'mailto', 'timezone'):
+    for key, check in (('keyboard', _keyboard_problem), ('country', _country_problem),
+                       ('mailto', _mailto_problem), ('timezone', _timezone_problem)):
         if not g.get(key):
             errors.append(f'[global] is missing "{key}"')
+            continue
+        problem = check(g[key])
+        if problem:
+            errors.append(f'[global] "{key}" {problem}')
 
     unknown = sorted(k for k in data if k not in _KNOWN_SECTIONS)
     if unknown:
@@ -172,9 +284,15 @@ def validate_answer(text):
         # fqdn.source = "from-dhcp", optionally with fqdn.domain as the fallback
         if fqdn.get('source') != 'from-dhcp':
             errors.append('[global] fqdn.source must be "from-dhcp"')
+        domain = fqdn.get('domain')
+        if domain:      # the installer reads '' as unset
+            problem = _fqdn_problem(domain, host=False) if isinstance(domain, str) else 'must be text'
+            if problem:
+                errors.append(f'[global] fqdn.domain {problem}')
     elif isinstance(fqdn, str) and fqdn:
-        if '.' not in fqdn:
-            errors.append('[global] "fqdn" must be fully qualified (host.domain.tld)')
+        problem = _fqdn_problem(fqdn)
+        if problem:
+            errors.append(f'[global] "fqdn" {problem}')
     else:
         errors.append('[global] is missing "fqdn" (a name, or fqdn.source = "from-dhcp")')
 
@@ -184,6 +302,14 @@ def validate_answer(text):
         errors.append('[global] needs either "root-password" or "root-password-hashed"')
     elif plain and hashed:
         errors.append('[global] has both "root-password" and "root-password-hashed" - pick one')
+    elif plain:
+        # the installer counts bytes, not characters
+        if not isinstance(plain, str) or len(plain.encode('utf-8', 'replace')) < 8:
+            errors.append('[global] "root-password" must be at least 8 bytes long')
+    else:
+        problem = _hashed_problem(hashed)
+        if problem:
+            errors.append(f'[global] "root-password-hashed" {problem}')
 
     net = data.get('network')
     if not isinstance(net, dict):
@@ -196,23 +322,56 @@ def validate_answer(text):
             for key in ('cidr', 'dns', 'gateway', 'filter'):
                 if not net.get(key):
                     errors.append(f'[network] source=from-answer also needs "{key}"')
+        else:
+            static = [k for k in ('cidr', 'dns', 'gateway', 'filter') if k in net]
+            if static:
+                errors.append('[network] source=from-dhcp takes no ' + ', '.join(static)
+                              + ' - the installer refuses the file')
 
     disk = data.get('disk-setup')
     if not isinstance(disk, dict):
         errors.append('Missing [disk-setup] section')
     else:
         fs = disk.get('filesystem')
+        known = fs if isinstance(fs, str) and fs in _FS_OPTIONS else None
         if not fs:
             errors.append('[disk-setup] is missing "filesystem"')
-        elif fs not in ('ext4', 'xfs', 'zfs', 'btrfs'):
+        elif not known:
             warnings.append(f'[disk-setup] filesystem "{fs}" is not one the installer normally offers')
-        if not disk.get('disk-list') and not disk.get('filter'):
+
+        disks, flt = disk.get('disk-list'), disk.get('filter')
+        if not disks and not flt:
             errors.append('[disk-setup] needs "disk-list" or "filter" so the installer knows where to write')
+        elif disks and flt:
+            errors.append('[disk-setup] has both "disk-list" and "filter" - the installer takes one')
+        if disks and not (isinstance(disks, list) and all(isinstance(d, str) and d for d in disks)):
+            errors.append('[disk-setup] "disk-list" must be a list of disk names')
+            disks = None
+        elif disks and any(_is_disk_path(d) for d in disks):
+            errors.append('[disk-setup] "disk-list" takes raw disk names such as sda or nvme0n1, '
+                          'not /dev/disk/by-* paths - use a filter to select by ID')
+
+        level = None
         # zfs.raid = "raid1" is a dotted key, so it parses to {'zfs': {'raid': ...}}
-        if fs in ('zfs', 'btrfs'):
-            sub = disk.get(fs)
-            if not (isinstance(sub, dict) and sub.get('raid')):
-                warnings.append(f'[disk-setup] {fs} without {fs}.raid installs whatever the installer defaults to')
+        if known in _RAID_MIN:
+            sub = disk.get(known)
+            raid = sub.get('raid') if isinstance(sub, dict) else None
+            if not raid:
+                errors.append(f'[disk-setup] {known} needs {known}.raid ('
+                              + ', '.join(_RAID_MIN[known]) + ') - the installer refuses the file without it')
+            else:
+                level = _raid_level(known, raid)
+                if not level:
+                    errors.append(f'[disk-setup] {known}.raid must be one of ' + ', '.join(_RAID_MIN[known]))
+        if known:
+            wrong = [t for t in ('lvm', 'zfs', 'btrfs') if t != _FS_OPTIONS[known] and t in disk]
+            if wrong:
+                errors.append('[disk-setup] ' + ', '.join(f'{t}.*' for t in wrong)
+                              + f' options do not apply to {known}')
+        if disks:
+            problem = _disk_list_problem(known, level, disks)
+            if problem:
+                errors.append(f'[disk-setup] "disk-list" {problem}')
 
     if 'post-installation-webhook' in data:
         if any(_WEBHOOK_HEADER.match(line) for line in text.splitlines()):
@@ -227,6 +386,310 @@ def validate_answer(text):
         warnings.append('This answer file stores the root password in clear text. '
                         '"root-password-hashed" is the better habit.')
     return errors, warnings
+
+
+# --- guided setup: fields -> answer file -----------------------------------------
+
+class ComposeRefused(Exception):
+    """The fields are not in the shape the guided setup sends. A 400 rather than a
+    field error; the message may name a key but never a value."""
+
+
+# exactly what the wizard sends; everything else is refused
+_COMPOSE_SHAPE = {
+    'global': ('keyboard', 'country', 'timezone', 'mailto', 'fqdn', 'root_password_hashed', 'root_ssh_keys'),
+    'network': ('source', 'cidr', 'gateway', 'dns', 'filter'),
+    'disk': ('filesystem', 'raid', 'disk_list', 'filter'),
+}
+_FQDN_TABLE_KEYS = ('source', 'domain')
+_NIC_FILTER_KEYS = ('ID_NET_NAME_MAC', 'ID_NET_NAME')
+_DISK_FILTER_KEYS = ('ID_SERIAL', 'ID_SERIAL_SHORT', 'ID_WWN', 'ID_MODEL', 'DEVNAME')
+# a clear password only ever goes to /password-hash
+_PLAINTEXT_KEYS = ('root_password', 'root-password')
+
+_MAX_FIELD = 255
+_MAX_SSH_KEYS = 50
+_SSH_KEY_RE = re.compile(r'(?:ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)|sk-ssh-ed25519@openssh\.com'
+                         r'|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/]+={0,3}(?: [^\x00-\x1f\x7f]*)?')
+_MAC_GLOB_RE = re.compile(r'\*[0-9a-f]{12}')
+_GLOB_RE = re.compile(r'[A-Za-z0-9_.:+\-/*?\[\]!]{1,128}')
+_DISK_NAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:\-/]{0,63}')
+
+
+def _is_disk_path(name):
+    """/dev/disk/by-id/... and friends. disk-list takes the installer's raw disk
+    names (sda, nvme0n1, cciss/c0d0), so a by-* path never matches anything and the
+    install stops at the rack with no disk found."""
+    n = name[5:] if name.startswith('/dev/') else name
+    return n.startswith('disk/')
+_IP_RE = re.compile(r'[0-9A-Fa-f.:]{2,45}')
+_CIDR_RE = re.compile(r'[0-9A-Fa-f.:]{2,45}/[0-9]{1,3}')
+
+_TOML_ESCAPES = {'\\': '\\\\', '"': '\\"', '\b': '\\b', '\t': '\\t', '\n': '\\n', '\f': '\\f', '\r': '\\r'}
+
+
+def _toml_str(value):
+    """A TOML basic string with everything escaped that the spec says must be.
+    _toml_escape only does backslash and quote, which is enough for our own URL but
+    not for text somebody typed."""
+    out = []
+    for ch in str(value):
+        if ch in _TOML_ESCAPES:
+            out.append(_TOML_ESCAPES[ch])
+        elif ch < ' ' or ch == '\x7f':
+            out.append('\\u%04x' % ord(ch))
+        else:
+            out.append(ch)
+    return '"' + ''.join(out) + '"'
+
+
+def _emit_toml(model):
+    """Sections holding strings, lists of strings and one level of sub-tables, the
+    latter as dotted keys the way the Proxmox wiki writes them."""
+    def val(v):
+        return _toml_str(v) if isinstance(v, str) else '[' + ', '.join(_toml_str(x) for x in v) + ']'
+
+    lines = []
+    for section, table in model.items():
+        lines.append(f'[{section}]')
+        for key, value in table.items():
+            if isinstance(value, dict):
+                lines.extend(f'{key}.{sub} = {val(v)}' for sub, v in value.items())
+            else:
+                lines.append(f'{key} = {val(value)}')
+        lines.append('')
+    return '\n'.join(lines)
+
+
+def _has_plaintext_key(node):
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            if any(k in _PLAINTEXT_KEYS for k in cur):
+                return True
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+    return False
+
+
+def _table(where, value, allowed):
+    """The dict at `where`, or ComposeRefused. {} when it was left out."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ComposeRefused(f'{where} must be an object')
+    unknown = sorted(str(k)[:64] for k in value if k not in allowed)
+    if unknown:
+        raise ComposeRefused(f'Unknown field in {where}: ' + ', '.join(unknown[:5]))
+    return value
+
+
+def _cidr_problem(value):
+    try:
+        if _CIDR_RE.fullmatch(value):
+            ipaddress.ip_interface(value)
+            return None
+    except ValueError:
+        pass
+    return 'must be an address with its prefix length, e.g. 192.0.2.10/24'
+
+
+def _ip_problem(value):
+    try:
+        if _IP_RE.fullmatch(value):
+            ipaddress.ip_address(value)
+            return None
+    except ValueError:
+        pass
+    return 'must be a single IP address'
+
+
+def build_answer(fields):
+    """(text, field_errors) for the guided setup. Pure: nothing is stored or logged.
+
+    Takes exactly the shape the wizard sends. Anything else, and any clear-text
+    password key anywhere in it, raises ComposeRefused. A bad value comes back in
+    field_errors under its dotted key ('disk.raid'), and then text is '' - nothing
+    half-built gets shown. The file is written from a model and parsed back, and
+    the two have to agree; if they ever do not, that is our bug and it raises.
+    """
+    if not isinstance(fields, dict):
+        raise ComposeRefused('fields must be an object')
+    if _has_plaintext_key(fields):
+        raise ComposeRefused('Compose takes root_password_hashed only. Send the password to '
+                             '/api/auto-install/password-hash first.')
+    _table('fields', fields, tuple(_COMPOSE_SHAPE))
+    g = _table('global', fields.get('global'), _COMPOSE_SHAPE['global'])
+    net = _table('network', fields.get('network'), _COMPOSE_SHAPE['network'])
+    disk = _table('disk', fields.get('disk'), _COMPOSE_SHAPE['disk'])
+    # filter keys are checked even where the value ends up unused
+    nic_filter = _table('network.filter', net.get('filter'), _NIC_FILTER_KEYS)
+    disk_filter = _table('disk.filter', disk.get('filter'), _DISK_FILTER_KEYS)
+    fqdn = g.get('fqdn')
+    if isinstance(fqdn, dict):
+        _table('global.fqdn', fqdn, _FQDN_TABLE_KEYS)
+
+    errs = {}
+
+    def need(key, value, check):
+        """A required single-line string, or None with its field error set."""
+        name = key.split('.', 1)[1].replace('_', '-')
+        if value is None or value == '':
+            errs[key] = f'"{name}" is required'
+        elif not isinstance(value, str):
+            errs[key] = f'"{name}" must be text'
+        elif _unprintable(value):
+            errs[key] = f'"{name}" must not contain control characters'
+        elif len(value) > _MAX_FIELD:
+            errs[key] = f'"{name}" is too long'
+        else:
+            problem = check(value)
+            if not problem:
+                return value
+            errs[key] = f'"{name}" {problem}'
+        return None
+
+    def one_filter(key, filters, check_value, hint):
+        """The single {property: glob} a filter may hold, or None."""
+        if len(filters) != 1:
+            errs[key] = 'Give exactly one property to match on'
+            return None
+        (prop, pattern), = filters.items()
+        if not isinstance(pattern, str) or _unprintable(pattern) or not check_value(prop, pattern):
+            errs[key] = hint
+            return None
+        return {prop: pattern}
+
+    # [global]
+    out_g = {}
+    for key, check in (('keyboard', _keyboard_problem), ('country', _country_problem)):
+        value = need(f'global.{key}', g.get(key), check)
+        if value:
+            out_g[key] = value
+    if isinstance(fqdn, dict):
+        if fqdn.get('source') != 'from-dhcp':
+            errs['global.fqdn'] = 'fqdn.source must be "from-dhcp"'
+        else:
+            table = {'source': 'from-dhcp'}
+            domain = fqdn.get('domain')
+            if domain not in (None, ''):
+                if not isinstance(domain, str) or _unprintable(domain):
+                    errs['global.fqdn'] = 'The fallback domain must be plain text'
+                else:
+                    problem = _fqdn_problem(domain, host=False)
+                    if problem:
+                        errs['global.fqdn'] = f'The fallback domain {problem}'
+                    else:
+                        table['domain'] = domain
+            out_g['fqdn'] = table
+    else:
+        value = need('global.fqdn', fqdn, _fqdn_problem)
+        if value:
+            out_g['fqdn'] = value
+    for key, check in (('mailto', _mailto_problem), ('timezone', _timezone_problem)):
+        value = need(f'global.{key}', g.get(key), check)
+        if value:
+            out_g[key] = value
+    value = need('global.root_password_hashed', g.get('root_password_hashed'), _hashed_problem)
+    if value:
+        out_g['root-password-hashed'] = value
+
+    ssh_keys = g.get('root_ssh_keys')
+    if ssh_keys not in (None, []):
+        if not isinstance(ssh_keys, list) or not all(isinstance(k, str) for k in ssh_keys):
+            errs['global.root_ssh_keys'] = 'root-ssh-keys must be a list of public keys'
+        else:
+            ssh_keys = [k for k in ssh_keys if k]      # a blank line in the textarea is no key
+            if len(ssh_keys) > _MAX_SSH_KEYS:
+                errs['global.root_ssh_keys'] = f'At most {_MAX_SSH_KEYS} SSH keys'
+            elif any(_unprintable(k) for k in ssh_keys):
+                errs['global.root_ssh_keys'] = 'Each SSH key goes on one line, without control characters'
+            elif not all(len(k) <= 16384 and _SSH_KEY_RE.fullmatch(k) for k in ssh_keys):
+                errs['global.root_ssh_keys'] = 'Not an OpenSSH public key (ssh-ed25519 AAAA... comment)'
+            elif ssh_keys:
+                out_g['root-ssh-keys'] = ssh_keys
+
+    # [network]
+    out_net = {}
+    source = net.get('source')
+    if source == 'from-dhcp':
+        # leftovers from the static form are dropped: the installer refuses them here
+        out_net['source'] = 'from-dhcp'
+    elif source == 'from-answer':
+        out_net['source'] = 'from-answer'
+        for key, check in (('cidr', _cidr_problem), ('dns', _ip_problem), ('gateway', _ip_problem)):
+            value = need(f'network.{key}', net.get(key), check)
+            if value:
+                out_net[key] = value
+        if not nic_filter:
+            errs['network.filter'] = 'Pick the network port, by its MAC address or its interface name'
+        else:
+            by_mac = lambda prop, v: bool((_MAC_GLOB_RE if prop == 'ID_NET_NAME_MAC' else _GLOB_RE).fullmatch(v))
+            picked = one_filter('network.filter', nic_filter, by_mac,
+                                'Match the port by MAC (*e43d1afa379a, 12 lower-case hex digits) '
+                                'or by name (letters, digits and * ? [ ])')
+            if picked:
+                out_net['filter'] = picked
+    elif source in (None, ''):
+        errs['network.source'] = '"source" is required'
+    else:
+        errs['network.source'] = '"source" must be "from-dhcp" or "from-answer"'
+
+    # [disk-setup]
+    out_disk = {}
+    fs, level = disk.get('filesystem'), None
+    if fs in (None, ''):
+        errs['disk.filesystem'] = '"filesystem" is required'
+    elif not (isinstance(fs, str) and fs in _FS_OPTIONS):
+        errs['disk.filesystem'] = '"filesystem" must be ext4, xfs, zfs or btrfs'
+        fs = None
+    else:
+        out_disk['filesystem'] = fs
+        if fs in _RAID_MIN:
+            # a raid left over from an earlier zfs pick means nothing for ext4/xfs
+            raid = disk.get('raid')
+            if raid in (None, ''):
+                errs['disk.raid'] = f'{fs} needs a raid level'
+            elif not (isinstance(raid, str) and raid in _RAID_MIN[fs]):
+                errs['disk.raid'] = f'The raid level for {fs} is one of ' + ', '.join(_RAID_MIN[fs])
+            else:
+                level = raid
+                out_disk[fs] = {'raid': raid}
+
+    disks = disk.get('disk_list')
+    if disks is not None and not isinstance(disks, list):
+        raise ComposeRefused('disk.disk_list must be a list')
+    if disks and disk_filter:
+        errs['disk.disk_list'] = 'Pick the disks by name or with a filter, not both'
+    elif disks:
+        if (len(disks) > 64 or not all(isinstance(d, str) and _DISK_NAME_RE.fullmatch(d)
+                                       and not _is_disk_path(d) for d in disks)):
+            errs['disk.disk_list'] = 'Disks are named the way the kernel does, e.g. sda or nvme0n1, not /dev/disk/by-* paths'
+        else:
+            problem = _disk_list_problem(fs, level, disks)
+            if problem:
+                errs['disk.disk_list'] = f'The disk list {problem}'
+            else:
+                out_disk['disk-list'] = disks
+    elif disk_filter:
+        picked = one_filter('disk.filter', disk_filter, lambda prop, v: bool(_GLOB_RE.fullmatch(v)),
+                            'The filter value may use letters, digits, _ . : + - / and the wildcards * ? [ ]')
+        if picked:
+            out_disk['filter'] = picked
+    else:
+        errs['disk.disk_list'] = 'Pick the disks, by name or with a filter'
+
+    if errs:
+        return '', errs
+
+    model = {'global': out_g, 'network': out_net, 'disk-setup': out_disk}
+    text = _emit_toml(model)
+    parsed, err = _parse_toml(text)
+    if err or parsed != model:
+        raise RuntimeError('the composed answer file does not parse back to its fields')
+    return text, {}
 
 
 def _strip_webhook_section(text):
@@ -495,6 +958,18 @@ def _profile_usable(profile):
 
 # --- admin API --------------------------------------------------------------
 
+def _sees_every_cluster(user):
+    """The scope rule behind both the route gate and the UI flag, kept in one place
+    so the two cannot drift apart."""
+    from pegaprox.utils.rbac import get_user_clusters
+    return get_user_clusters(user, include_pools=False) is None
+
+
+def _caller():
+    session = getattr(request, 'session', None) or {}
+    return build_authz_user(session.get('user', ''), session)
+
+
 def _refuse_confined_caller():
     """403 unless the caller sees every cluster.
 
@@ -502,15 +977,12 @@ def _refuse_confined_caller():
     and it carries that host's root password, so a tenant-confined role holding
     autoinstall.* would otherwise read and rewrite every other tenant's files.
     """
-    from pegaprox.utils.rbac import get_user_clusters
-    session = getattr(request, 'session', None) or {}
     try:
-        scope = get_user_clusters(build_authz_user(session.get('user', ''), session),
-                                  include_pools=False)
+        unconfined = _sees_every_cluster(_caller())
     except Exception as e:
         logging.warning(f"[autoinstall] could not resolve the caller's cluster scope: {e}")
-        scope = []
-    if scope is not None:
+        unconfined = False
+    if not unconfined:
         return jsonify({'error': 'Automated installations are only available to accounts '
                                  'that are not limited to a tenant or to specific clusters'}), 403
     return None
@@ -518,8 +990,29 @@ def _refuse_confined_caller():
 
 def _may_manage():
     from pegaprox.utils.rbac import has_permission
-    session = getattr(request, 'session', None) or {}
-    return has_permission(build_authz_user(session.get('user'), session), 'autoinstall.manage')
+    return has_permission(_caller(), 'autoinstall.manage')
+
+
+def autoinstall_access(username, session):
+    """'manage', 'view' or '' - whether the UI shows the page, and with which buttons.
+
+    MK Sep 2026 - the permission list the browser holds cannot answer this: can()
+    is true for every admin, but an admin capped in their own tenant is still turned
+    away by the gate above. '' unless the account holds autoinstall.view (the list
+    and run routes need it, manage alone does not reach them) and sees every
+    cluster. Fails closed.
+    """
+    from pegaprox.utils.rbac import has_permission
+    try:
+        user = build_authz_user(username or '', session or {})
+        if not has_permission(user, 'autoinstall.view'):
+            return ''
+        if not _sees_every_cluster(user):
+            return ''
+        return 'manage' if has_permission(user, 'autoinstall.manage') else 'view'
+    except Exception as e:
+        logging.warning(f"[autoinstall] could not resolve access for {username!r}: {e}")
+        return ''
 
 
 def _public_profile(profile, answer=None):
@@ -789,6 +1282,102 @@ def validate_endpoint():
     data = request.get_json(silent=True) or {}
     errors, warnings = validate_answer(data.get('answer'))
     return jsonify({'valid': not errors, 'errors': errors, 'warnings': warnings})
+
+
+# PAM on the node checks this hash at every root login, so it has to stay cheap
+# there (~70 ms in libcrypt); here it is ~150 ms of pure Python per call
+_ROOT_HASH_ROUNDS = 100000
+_ROOT_HASH_SEM = None
+
+
+def _hash_root_password(pw):
+    """sha512_crypt in the threadpool, one at a time.
+
+    Not through the login's _pw_hash_offload: that semaphore admits eight and is
+    sized for argon2, which lets go of the GIL. This loop does not (every update is
+    far below hashlib's release threshold), so eight of them together starved the
+    hub for seconds and queued everybody's login behind them. With one slot the
+    throughput is the same and the hub keeps breathing.
+    """
+    global _ROOT_HASH_SEM
+    try:
+        from gevent import get_hub
+        from gevent.lock import BoundedSemaphore
+    except Exception:
+        return sha512_crypt(pw, None, _ROOT_HASH_ROUNDS)
+    if _ROOT_HASH_SEM is None:
+        _ROOT_HASH_SEM = BoundedSemaphore(1)
+    with _ROOT_HASH_SEM:
+        return get_hub().threadpool.apply(sha512_crypt, (pw, None, _ROOT_HASH_ROUNDS))
+
+
+def _root_password_problem(pw):
+    if not isinstance(pw, str):
+        return 'A password is required'
+    # the installer's minimum is 8 bytes, Proxmox's own schema caps it at 64
+    if not 8 <= len(pw) <= 64 or len(pw.encode('utf-8', 'replace')) < 8:
+        return 'The password must be 8 to 64 characters long'
+    if _unprintable(pw):
+        return 'The password must not contain control characters'
+    return None
+
+
+@bp.route('/api/auto-install/password-hash', methods=['POST'])
+@require_auth(perms=['autoinstall.manage'])
+def password_hash_endpoint():
+    """Turn a root password into the $6$ hash an answer file carries.
+
+    The only place a clear root password reaches us. It is hashed and dropped: not
+    logged, not audited, not stored, and never repeated in an error.
+    """
+    denied = _refuse_confined_caller()
+    if denied:
+        return denied
+    user = request.session.get('user', '')
+    # literal budget: the limiter keeps one window per distinct pair
+    if not check_auth_action_rate_limit(f'autoinstall_hash:{user}', max_attempts=20, window=300):
+        resp = jsonify({'error': 'Too many attempts. Try again in 5 minutes.'})
+        resp.headers['Retry-After'] = '300'
+        return resp, 429
+    data = request.get_json(silent=True)
+    pw = data.get('password') if isinstance(data, dict) else None
+    problem = _root_password_problem(pw)
+    if problem:
+        return jsonify({'error': problem}), 400
+    try:
+        hashed = _hash_root_password(pw)
+    except Exception as e:
+        logging.error(f"[autoinstall] hashing a root password failed: {type(e).__name__}")
+        return jsonify({'error': 'Could not hash the password'}), 500
+    resp = jsonify({'hash': hashed})
+    # the app sets this for every /api/ answer anyway; this one should not depend on that
+    resp.headers['Cache-Control'] = 'no-store'
+    resp.headers['Pragma'] = 'no-cache'
+    return resp
+
+
+@bp.route('/api/auto-install/compose', methods=['POST'])
+@require_auth(perms=['autoinstall.manage'])
+def compose_endpoint():
+    """The guided setup's answer file, built from its fields and checked like any
+    other. Nothing is stored: the wizard saves what it showed through the normal
+    create call, so there is one save path and one set of rules."""
+    denied = _refuse_confined_caller()
+    if denied:
+        return denied
+    data = request.get_json(silent=True)
+    try:
+        text, field_errors = build_answer(data.get('fields') if isinstance(data, dict) else None)
+    except ComposeRefused as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Could not compose the answer file')}), 500
+    if field_errors:
+        return jsonify({'answer': '', 'valid': False, 'errors': list(field_errors.values()),
+                        'warnings': [], 'field_errors': field_errors})
+    errors, warnings = validate_answer(text)
+    return jsonify({'answer': text, 'valid': not errors, 'errors': errors,
+                    'warnings': warnings, 'field_errors': {}})
 
 
 @bp.route('/api/auto-install/runs', methods=['GET'])

@@ -14,10 +14,13 @@ installer away. The payloads are the ones documented on the Proxmox wiki
 """
 import copy
 import json
+import re
 import tomllib
 from urllib.parse import urlsplit
 
 import pytest
+
+from pegaprox.utils.sha512_crypt import sha512_crypt
 
 
 ANSWER = """\
@@ -345,6 +348,23 @@ def test_an_undecryptable_answer_is_a_500_and_costs_no_use(api, seed):
     assert _runs(c) == []
 
 
+def test_a_stored_placeholder_hash_is_a_500_and_costs_no_use(api, seed):
+    """Saved before the hash check existed, or written behind the API's back. Served,
+    it installs a host whose root account nobody can log in to."""
+    c = _admin(api, seed)
+    created = _create(c, max_uses=1)
+    from pegaprox.core.db import get_db
+    bad = ANSWER.replace('root-password = "hunter2-in-the-rack"', 'root-password-hashed = "$6$...replace me..."')
+    get_db().conn.execute('UPDATE auto_install_profiles SET answer_encrypted = ? WHERE id = ?',
+                          (get_db()._encrypt(bad), created['id']))
+    get_db().conn.commit()
+    r = _fetch(api, created['token'])
+    assert r.status_code == 500
+    assert b'replace me' not in r.data
+    assert _profile_row(created['id'])['uses'] == 0
+    assert _runs(c) == []
+
+
 # --- runs and the webhook ----------------------------------------------------------
 
 def test_a_fetch_shows_up_as_an_installing_machine(api, seed):
@@ -499,21 +519,24 @@ def test_view_only_sees_the_shape_of_the_file_not_the_password(api, seed):
 
 
 SECRET = 'S3cr3t-Pa55-9f2c'
+# a real hash: a stored value that only looks like a password no longer saves, and
+# the hash is still nothing a view-only reader should get to crack offline
+HASHED = sha512_crypt(SECRET, 'rackseven0123456')
 SPELLINGS = [
-    ('quoted key', '"root-password" = "%s"'),
-    ('single-quoted key', "'root-password' = '%s'"),
-    ('snake_case alias', 'root_password = "%s"'),
-    ('multi-line string', 'root-password = """\n%s"""'),
-    ('hashed, inline', 'root-password-hashed = "%s"'),
+    ('quoted key', '"root-password" = "%s"', SECRET),
+    ('single-quoted key', "'root-password' = '%s'", SECRET),
+    ('snake_case alias', 'root_password = "%s"', SECRET),
+    ('multi-line string', 'root-password = """\n%s"""', SECRET),
+    ('hashed, inline', 'root-password-hashed = "%s"', HASHED),
 ]
 
 
-@pytest.mark.parametrize('label,line', SPELLINGS, ids=[s[0] for s in SPELLINGS])
-def test_no_spelling_of_the_password_reaches_a_view_only_reader(api, seed, label, line):
-    answer = ANSWER.replace('root-password = "hunter2-in-the-rack"', line % SECRET)
+@pytest.mark.parametrize('label,line,secret', SPELLINGS, ids=[s[0] for s in SPELLINGS])
+def test_no_spelling_of_the_password_reaches_a_view_only_reader(api, seed, label, line, secret):
+    answer = ANSWER.replace('root-password = "hunter2-in-the-rack"', line % secret)
     created = _create(_admin(api, seed), answer=answer)
     body = _viewer(api, seed).get(f"/api/auto-install/profiles/{created['id']}").get_json()
-    assert SECRET not in body['answer'], (label, body['answer'])
+    assert secret not in body['answer'], (label, body['answer'])
 
 
 @pytest.mark.parametrize('form', [
@@ -575,6 +598,8 @@ def test_a_tenant_confined_holder_is_turned_away_everywhere(api, seed):
         t.delete(f'/api/auto-install/profiles/{pid}'),
         t.get('/api/auto-install/runs'),
         t.post('/api/auto-install/profiles', json={'name': 'x', 'answer': ANSWER}),
+        t.post('/api/auto-install/password-hash', json={'password': 'long-enough-9'}),
+        t.post('/api/auto-install/compose', json={'fields': FIELDS}),
     ]
     for r in calls:
         assert r.status_code == 403, (r.request.path, r.status_code, r.data)
@@ -591,6 +616,41 @@ def test_a_tenant_confined_holder_is_turned_away_everywhere(api, seed):
     (ANSWER.replace('source = "from-dhcp"', 'source = "magic"'), 'from-dhcp'),
     (ANSWER.replace('fqdn = "pve01.lab.example.com"', 'fqdn = "pve01"'), 'fully qualified'),
     (ANSWER.replace('fqdn = "pve01.lab.example.com"', 'fqdn.source = "from-magic"'), 'fqdn.source'),
+    # everything below used to pass here and fail at the rack
+    (ANSWER.replace('filesystem = "ext4"', 'filesystem = "zfs"'), 'zfs.raid'),
+    (ANSWER.replace('filesystem = "ext4"', 'filesystem = "btrfs"'), 'btrfs.raid'),
+    (ANSWER.replace('filesystem = "ext4"', 'filesystem = "zfs"\nzfs.raid = "raid5"'), 'must be one of'),
+    # the editor's own template placeholder: saved as is, root could never log in
+    (ANSWER.replace('root-password = "hunter2-in-the-rack"', 'root-password-hashed = "$6$...replace me..."'),
+     'not a password hash'),
+    (ANSWER.replace('root-password = "hunter2-in-the-rack"', 'root-password-hashed = "S3cr3t-Pa55-9f2c"'),
+     'not a password hash'),
+    # a newline after a real hash would write a second line into chpasswd
+    (ANSWER.replace('root-password = "hunter2-in-the-rack"', f'root-password-hashed = "{HASHED}\\n"'),
+     'not a password hash'),
+    (ANSWER.replace('root-password = "hunter2-in-the-rack"', 'root-password = "hunter7"'), '8 bytes'),
+    (ANSWER.replace('disk-list = ["sda"]', 'disk-list = ["sda"]\nfilter.ID_SERIAL = "*S3Z*"'), 'both'),
+    (ANSWER.replace('disk-list = ["sda"]', 'disk-list = ["sda", "sdb"]'), 'only one disk'),
+    (ANSWER.replace('filesystem = "ext4"\ndisk-list = ["sda"]',
+                    'filesystem = "zfs"\nzfs.raid = "raidz-2"\ndisk-list = ["sda", "sdb", "sdc"]'), 'at least 4'),
+    (ANSWER.replace('filesystem = "ext4"\ndisk-list = ["sda"]',
+                    'filesystem = "zfs"\nzfs.raid = "raid10"\ndisk-list = ["sda", "sdb", "sdc"]'), 'at least 4'),
+    (ANSWER.replace('filesystem = "ext4"\ndisk-list = ["sda"]',
+                    'filesystem = "btrfs"\nbtrfs.raid = "raid10"\ndisk-list = ["sda", "sdb", "sdc", "sdd", "sde"]'),
+     'even number'),
+    (ANSWER.replace('filesystem = "ext4"\ndisk-list = ["sda"]',
+                    'filesystem = "zfs"\nzfs.raid = "raid1"\ndisk-list = ["sda", "sda"]'), 'same disk twice'),
+    (ANSWER.replace('filesystem = "ext4"', 'filesystem = "ext4"\nzfs.ashift = 12'), 'do not apply to ext4'),
+    (ANSWER.replace('source = "from-dhcp"', 'source = "from-dhcp"\ncidr = "192.0.2.10/24"'), 'from-dhcp takes no'),
+    (ANSWER.replace('keyboard = "de"', 'keyboard = "xx"'), 'keyboard layout'),
+    (ANSWER.replace('country = "de"', 'country = "DE"'), 'two-letter'),
+    (ANSWER.replace('timezone = "Europe/Berlin"', 'timezone = "Etc/UTC"'), 'Etc/'),
+    (ANSWER.replace('mailto = "root@example.com"', 'mailto = "mail@example.invalid"'), 'placeholder'),
+    (ANSWER.replace('mailto = "root@example.com"', 'mailto = "root at example"'), 'e-mail address'),
+    (ANSWER.replace('fqdn = "pve01.lab.example.com"', 'fqdn = "123.example.com"'), 'all-numeric'),
+    (ANSWER.replace('fqdn = "pve01.lab.example.com"', 'fqdn = "pve_01.lab.local"'), 'hyphens'),
+    (ANSWER.replace('fqdn = "pve01.lab.example.com"',
+                    'fqdn.source = "from-dhcp"\nfqdn.domain = "lab_1.local"'), 'fqdn.domain'),
 ])
 def test_the_validator_catches_what_the_installer_would_refuse(api, seed, answer, needle):
     body = _admin(api, seed).post('/api/auto-install/validate', json={'answer': answer}).get_json()
@@ -612,14 +672,26 @@ def test_the_dhcp_form_of_fqdn_is_accepted(api, seed):
     assert body['valid'] is True, body
 
 
-def test_the_raid_warning_reads_the_dotted_key(api, seed):
-    zfs = ANSWER.replace('filesystem = "ext4"', 'filesystem = "zfs"\nzfs.raid = "raid1"')
+def test_a_missing_raid_level_is_an_error_and_the_dotted_key_counts(api, seed):
+    """The installer refuses zfs without zfs.raid. This was only a warning, and
+    the test here pinned the warning - a profile saved that way stopped at the rack."""
+    zfs = ANSWER.replace('filesystem = "ext4"\ndisk-list = ["sda"]',
+                         'filesystem = "zfs"\nzfs.raid = "raid1"\ndisk-list = ["sda", "sdb"]')
     c = _admin(api, seed)
     with_raid = c.post('/api/auto-install/validate', json={'answer': zfs}).get_json()
     without = c.post('/api/auto-install/validate',
                      json={'answer': zfs.replace('zfs.raid = "raid1"\n', '')}).get_json()
-    assert not any('raid' in w for w in with_raid['warnings']), with_raid['warnings']
-    assert any('raid' in w for w in without['warnings']), without['warnings']
+    assert with_raid['valid'] is True, with_raid
+    assert not any('raid' in m for m in with_raid['errors'] + with_raid['warnings']), with_raid
+    assert without['valid'] is False
+    assert any('raid' in e for e in without['errors']), without['errors']
+
+
+def test_upper_case_raid_levels_are_what_the_installer_also_takes(api, seed):
+    zfs = ANSWER.replace('filesystem = "ext4"\ndisk-list = ["sda"]',
+                         'filesystem = "zfs"\nzfs.raid = "RAIDZ-1"\ndisk-list = ["sda", "sdb", "sdc"]')
+    body = _admin(api, seed).post('/api/auto-install/validate', json={'answer': zfs}).get_json()
+    assert body['valid'] is True, body
 
 
 def test_an_invalid_answer_file_cannot_be_saved(api, seed):
@@ -697,6 +769,418 @@ def test_deleting_a_profile_takes_its_runs_with_it(api, seed):
     assert _report(api, served).status_code == 403
 
 
+# --- guided setup: hashing the root password -----------------------------------------
+
+@pytest.fixture(autouse=True)
+def _fresh_hash_budget():
+    """The hash limiter is process-wide and every test here hashes as 'root'."""
+    import pegaprox.utils.ssh as ssh
+    win = ssh._auth_action_windows.get((20, 300))
+    if win is not None:
+        win.reset()
+    yield
+
+
+def _hash(client, password):
+    return client.post('/api/auto-install/password-hash', json={'password': password})
+
+
+def test_the_password_comes_back_as_a_sha512_crypt_hash(api, seed):
+    r = _hash(_admin(api, seed), 'Correct-Horse-9')
+    assert r.status_code == 200, r.data
+    h = r.get_json()['hash']
+    assert re.fullmatch(r'\$6\$rounds=100000\$[./0-9A-Za-z]{16}\$[./0-9A-Za-z]{86}', h), h
+    assert sha512_crypt('Correct-Horse-9', h.split('$')[3], 100000) == h
+    assert 'no-store' in r.headers['Cache-Control']
+
+
+@pytest.mark.parametrize('password', [
+    'Short-7',              # 7 characters
+    'x' * 65,
+    'abcdefg',              # 7 bytes of ASCII
+    'eight\x00chars',
+    'eight\nchars',
+    'tab\there-too',
+    12345678,
+    None,
+], ids=['7 chars', '65 chars', '7 bytes', 'NUL', 'newline', 'tab', 'number', 'missing'])
+def test_a_bad_password_is_refused_without_repeating_it(api, seed, password):
+    r = _hash(_admin(api, seed), password)
+    assert r.status_code == 400, r.data
+    assert 'hash' not in r.get_json()
+    if isinstance(password, str):
+        assert password not in r.get_data(as_text=True)
+
+
+def test_hashing_stays_off_the_login_semaphore(api, seed, monkeypatch):
+    """sha512_crypt holds the GIL, argon2 does not. Queued behind the login's
+    semaphore, twenty of these starved the hub and stalled everybody's login for
+    seconds, so the endpoint has a one-slot semaphore of its own."""
+    import pegaprox.utils.auth as auth
+    import pegaprox.api.auto_install as ai
+
+    class Forbidden:
+        def __enter__(self):
+            raise AssertionError('root-password hashing went through the login semaphore')
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(auth, '_PW_HASH_SEM', Forbidden())
+    r = _hash(_admin(api, seed), 'Correct-Horse-9')
+    assert r.status_code == 200, r.data
+    sem = ai._ROOT_HASH_SEM
+    if sem is not None:                        # None only when gevent is missing
+        assert sem.counter == 1 and not sem.locked()
+
+
+def test_hashing_needs_the_manage_permission(api, seed):
+    assert _hash(_viewer(api, seed), 'Correct-Horse-9').status_code == 403
+
+
+def test_hashing_is_rate_limited(api, seed):
+    c = _admin(api, seed)
+    # refusals count too, so the budget cannot be probed for free with junk
+    codes = [_hash(c, 'short').status_code for _ in range(20)]
+    assert set(codes) == {400}
+    r = _hash(c, 'Correct-Horse-9')
+    assert r.status_code == 429
+    assert 'hash' not in r.get_json()
+
+
+def test_the_clear_password_is_kept_nowhere(api, seed, caplog):
+    import logging
+    from pegaprox.core.db import get_db
+    caplog.set_level(logging.DEBUG)
+    pw = 'Leak-Canary-7f3e9'
+    c = _admin(api, seed)
+    r = _hash(c, pw)
+    assert r.status_code == 200
+    created = _create(c, answer=ANSWER.replace('root-password = "hunter2-in-the-rack"',
+                                               f'root-password-hashed = "{r.get_json()["hash"]}"'))
+    refused = _hash(c, pw + '\n')
+    assert refused.status_code == 400
+
+    assert pw not in r.get_data(as_text=True) + refused.get_data(as_text=True)
+    cur = get_db().conn.cursor()
+    row = _profile_row(created['id'])
+    assert pw not in ' '.join(str(row[k]) for k in row.keys())
+    assert pw not in get_db()._decrypt(row['answer_encrypted'])
+    audit = cur.execute('SELECT * FROM audit_log').fetchall()
+    assert audit, 'the create is audited, so the table was looked at'
+    assert pw not in ' '.join(str(v) for a in audit for v in tuple(a))
+    assert pw not in caplog.text
+
+
+# --- guided setup: fields -> answer file -----------------------------------------------
+
+FIELDS = {
+    'global': {'keyboard': 'de', 'country': 'de', 'timezone': 'Europe/Berlin',
+               'mailto': 'root@example.com', 'fqdn': 'pve01.lab.example.com',
+               'root_password_hashed': HASHED},
+    'network': {'source': 'from-dhcp'},
+    'disk': {'filesystem': 'ext4', 'disk_list': ['sda']},
+}
+
+# pinned here rather than read from the module, so a slip in the table shows up
+ZFS_MIN = {'raid0': 1, 'raid1': 2, 'raid10': 4, 'raidz-1': 3, 'raidz-2': 4, 'raidz-3': 5}
+BTRFS_MIN = {'raid0': 1, 'raid1': 2, 'raid10': 4}
+DISKS = ([('ext4', None, 1), ('xfs', None, 1)]
+         + [('zfs', level, n) for level, n in ZFS_MIN.items()]
+         + [('btrfs', level, n) for level, n in BTRFS_MIN.items()])
+NETWORKS = [
+    {'source': 'from-dhcp'},
+    {'source': 'from-answer', 'cidr': '192.0.2.10/24', 'gateway': '192.0.2.1', 'dns': '192.0.2.53',
+     'filter': {'ID_NET_NAME_MAC': '*e43d1afa379a'}},
+    {'source': 'from-answer', 'cidr': '2001:db8::10/64', 'gateway': '2001:db8::1', 'dns': '2001:db8::53',
+     'filter': {'ID_NET_NAME': 'enp*s0'}},
+]
+FQDNS = ['pve01.lab.example.com', {'source': 'from-dhcp'},
+         {'source': 'from-dhcp', 'domain': 'lab.example.com'}]
+
+
+def _compose(client, fields):
+    r = client.post('/api/auto-install/compose', json={'fields': fields})
+    assert r.status_code == 200, r.data
+    return r.get_json()
+
+
+def _expected(fields):
+    """The file the fields should turn into, spelled out by hand: kebab-case keys,
+    raid as a dotted sub-table, and nothing the installer would refuse."""
+    g, net, disk = fields['global'], fields['network'], fields['disk']
+    exp_g = {'keyboard': g['keyboard'], 'country': g['country'], 'fqdn': g['fqdn'],
+             'mailto': g['mailto'], 'timezone': g['timezone'],
+             'root-password-hashed': g['root_password_hashed']}
+    exp_net = {'source': net['source']}
+    if net['source'] == 'from-answer':
+        exp_net.update({k: net[k] for k in ('cidr', 'gateway', 'dns', 'filter')})
+    exp_disk = {'filesystem': disk['filesystem']}
+    if disk.get('raid'):
+        exp_disk[disk['filesystem']] = {'raid': disk['raid']}
+    if disk.get('disk_list'):
+        exp_disk['disk-list'] = disk['disk_list']
+    else:
+        exp_disk['filter'] = disk['filter']
+    return {'global': exp_g, 'network': exp_net, 'disk-setup': exp_disk}
+
+
+@pytest.mark.parametrize('select', ['disk-list', 'filter'])
+@pytest.mark.parametrize('fs,level,n', DISKS, ids=[f'{d[0]}-{d[1] or "single"}' for d in DISKS])
+def test_every_wizard_combination_composes_a_file_the_installer_takes(api, seed, fs, level, n, select):
+    c = _admin(api, seed)
+    for net in NETWORKS:
+        for fqdn in FQDNS:
+            f = copy.deepcopy(FIELDS)
+            f['global']['fqdn'] = copy.deepcopy(fqdn)
+            f['network'] = copy.deepcopy(net)
+            f['disk'] = {'filesystem': fs}
+            if level:
+                f['disk']['raid'] = level
+            if select == 'disk-list':
+                f['disk']['disk_list'] = [f'sd{chr(97 + i)}' for i in range(n)]
+            else:
+                f['disk']['filter'] = {'ID_SERIAL': '*SAMSUNG_MZ7L3*'}
+            body = _compose(c, f)
+            case = (fs, level, select, net['source'], fqdn)
+            assert body['valid'] is True, (case, body)
+            assert body['errors'] == [] and body['field_errors'] == {}, (case, body)
+            assert tomllib.loads(body['answer']) == _expected(f), (case, body['answer'])
+            assert 'post-installation-webhook' not in body['answer']
+            assert '_' not in ''.join(k for k in tomllib.loads(body['answer'])['global']), 'kebab-case only'
+
+
+def test_from_dhcp_writes_only_the_source(api, seed):
+    """The form keeps its static values when someone switches back to DHCP. Next to
+    from-dhcp the installer refuses every one of them."""
+    f = copy.deepcopy(FIELDS)
+    f['network'] = {'source': 'from-dhcp', 'cidr': '192.0.2.10/24', 'gateway': '192.0.2.1',
+                    'dns': '192.0.2.53', 'filter': {'ID_NET_NAME': 'eno1'}}
+    body = _compose(_admin(api, seed), f)
+    assert body['valid'] is True, body
+    assert tomllib.loads(body['answer'])['network'] == {'source': 'from-dhcp'}
+
+
+def test_a_raid_left_over_from_zfs_is_dropped_for_ext4(api, seed):
+    f = copy.deepcopy(FIELDS)
+    f['disk']['raid'] = 'raid1'
+    body = _compose(_admin(api, seed), f)
+    assert body['valid'] is True, body
+    assert tomllib.loads(body['answer'])['disk-setup'] == {'filesystem': 'ext4', 'disk-list': ['sda']}
+
+
+def test_ssh_keys_are_written_and_a_quote_in_a_comment_stays_in_its_string(api, seed):
+    keys = ['ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGq0 ops "laptop" \\ x = 1',
+            'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC7==', '']
+    f = copy.deepcopy(FIELDS)
+    f['global']['root_ssh_keys'] = keys
+    body = _compose(_admin(api, seed), f)
+    assert body['valid'] is True, body
+    parsed = tomllib.loads(body['answer'])
+    assert parsed['global']['root-ssh-keys'] == keys[:2], 'blank lines are no keys'
+    assert set(parsed['global']) == set(_expected(FIELDS)['global']) | {'root-ssh-keys'}
+
+
+def _set(fields, path, value):
+    node = fields
+    for key in path[:-1]:
+        node = node[key]
+    node[path[-1]] = value
+
+
+@pytest.mark.parametrize('path,value,key', [
+    (('global', 'mailto'), 'root@example.com\nkeyboard = "us"', 'global.mailto'),
+    (('global', 'mailto'), 'root@exa\x00mple.com', 'global.mailto'),
+    (('global', 'mailto'), 'ro"ot@example.com', 'global.mailto'),
+    (('global', 'fqdn'), {'source': 'from-dhcp', 'domain': 'lab.example.com\n[network]'}, 'global.fqdn'),
+    (('global', 'fqdn'), {'source': 'from-dhcp', 'domain': 'lab\x00.example.com'}, 'global.fqdn'),
+    (('global', 'fqdn'), {'source': 'from-dhcp', 'domain': 'lab".example.com'}, 'global.fqdn'),
+    (('network',), {'source': 'from-answer', 'cidr': '192.0.2.10/24', 'gateway': '192.0.2.1',
+                    'dns': '192.0.2.53', 'filter': {'ID_NET_NAME': 'eno1"\nsource = "x'}}, 'network.filter'),
+    (('network',), {'source': 'from-answer', 'cidr': '192.0.2.10/24', 'gateway': '192.0.2.1',
+                    'dns': '192.0.2.53', 'filter': {'ID_NET_NAME': 'eno\x001'}}, 'network.filter'),
+    (('disk',), {'filesystem': 'ext4', 'filter': {'ID_SERIAL': 'S3Z\n[first-boot]'}}, 'disk.filter'),
+    (('disk',), {'filesystem': 'ext4', 'filter': {'ID_SERIAL': 'S3Z"'}}, 'disk.filter'),
+    (('global', 'root_ssh_keys'), ['ssh-ed25519 AAAA\nssh-rsa AAAB'], 'global.root_ssh_keys'),
+    (('global', 'root_ssh_keys'), ['ssh-ed25519 AAAA \x00'], 'global.root_ssh_keys'),
+    (('global', 'root_ssh_keys'), ['ssh-ed25519 AAAA"B'], 'global.root_ssh_keys'),
+])
+def test_control_characters_and_quotes_become_field_errors(api, seed, path, value, key):
+    f = copy.deepcopy(FIELDS)
+    _set(f, path, value)
+    body = _compose(_admin(api, seed), f)
+    assert body['valid'] is False
+    assert key in body['field_errors'], body
+    assert body['answer'] == '', 'nothing half-built goes back'
+
+
+@pytest.mark.parametrize('path,value,key', [
+    (('global', 'keyboard'), 'xx', 'global.keyboard'),
+    (('global', 'country'), 'DE', 'global.country'),
+    (('global', 'timezone'), 'Etc/UTC', 'global.timezone'),
+    (('global', 'mailto'), 'mail@example.invalid', 'global.mailto'),
+    (('global', 'fqdn'), '123.example.com', 'global.fqdn'),
+    (('global', 'fqdn'), 'pve01', 'global.fqdn'),
+    (('global', 'fqdn'), {'source': 'from-magic'}, 'global.fqdn'),
+    (('global', 'root_password_hashed'), '$6$...replace me...', 'global.root_password_hashed'),
+    (('global', 'root_password_hashed'), HASHED + '\n', 'global.root_password_hashed'),
+    (('global', 'root_password_hashed'), '', 'global.root_password_hashed'),
+    (('global', 'root_ssh_keys'), 'ssh-ed25519 AAAA', 'global.root_ssh_keys'),
+    (('network', 'source'), 'magic', 'network.source'),
+    (('network',), {'source': 'from-answer', 'cidr': '192.0.2.10', 'gateway': '192.0.2.1',
+                    'dns': '192.0.2.53', 'filter': {'ID_NET_NAME': 'eno1'}}, 'network.cidr'),
+    (('network',), {'source': 'from-answer', 'cidr': '192.0.2.10/24', 'gateway': 'fe80::1%eth0',
+                    'dns': '192.0.2.53', 'filter': {'ID_NET_NAME': 'eno1'}}, 'network.gateway'),
+    (('network',), {'source': 'from-answer', 'cidr': '192.0.2.10/24', 'gateway': '192.0.2.1',
+                    'dns': '192.0.2.53, 192.0.2.54', 'filter': {'ID_NET_NAME': 'eno1'}}, 'network.dns'),
+    (('network',), {'source': 'from-answer', 'cidr': '192.0.2.10/24', 'gateway': '192.0.2.1',
+                    'dns': '192.0.2.53', 'filter': {'ID_NET_NAME_MAC': 'e4:3d:1a:fa:37:9a'}}, 'network.filter'),
+    (('network',), {'source': 'from-answer', 'cidr': '192.0.2.10/24', 'gateway': '192.0.2.1',
+                    'dns': '192.0.2.53'}, 'network.filter'),
+    (('network',), {'source': 'from-answer', 'cidr': '192.0.2.10/24', 'gateway': '192.0.2.1',
+                    'dns': '192.0.2.53', 'filter': {'ID_NET_NAME': 'eno1', 'ID_NET_NAME_MAC': '*e43d1afa379a'}},
+     'network.filter'),
+    (('disk',), {'filesystem': 'zfs', 'disk_list': ['sda', 'sdb']}, 'disk.raid'),
+    (('disk',), {'filesystem': 'zfs', 'raid': 'raid5', 'disk_list': ['sda', 'sdb']}, 'disk.raid'),
+    (('disk',), {'filesystem': 'zfs', 'raid': 'raid1', 'disk_list': ['sda']}, 'disk.disk_list'),
+    (('disk',), {'filesystem': 'btrfs', 'raid': 'raid10', 'disk_list': ['a', 'b', 'c', 'd', 'e']}, 'disk.disk_list'),
+    (('disk',), {'filesystem': 'ext4', 'disk_list': ['sda', 'sdb']}, 'disk.disk_list'),
+    (('disk',), {'filesystem': 'zfs', 'raid': 'raid1', 'disk_list': ['sda', 'sda']}, 'disk.disk_list'),
+    (('disk',), {'filesystem': 'ext4', 'disk_list': ['sda'], 'filter': {'ID_SERIAL': '*'}}, 'disk.disk_list'),
+    (('disk',), {'filesystem': 'ext4'}, 'disk.disk_list'),
+    (('disk',), {'filesystem': 'ntfs', 'disk_list': ['sda']}, 'disk.filesystem'),
+])
+def test_a_bad_value_is_reported_against_its_field(api, seed, path, value, key):
+    f = copy.deepcopy(FIELDS)
+    _set(f, path, value)
+    body = _compose(_admin(api, seed), f)
+    assert body['valid'] is False
+    assert key in body['field_errors'], body
+    assert body['errors'], 'the general error list is not empty while valid is False'
+
+
+@pytest.mark.parametrize('where', ['top', 'global', 'network', 'fqdn'])
+@pytest.mark.parametrize('key', ['root_password', 'root-password'])
+def test_a_clear_text_password_is_refused_outright(api, seed, where, key):
+    """Plain text only ever goes to /password-hash, so it can never end up in a
+    rendered file, a stored profile or a request log line of this route."""
+    f = copy.deepcopy(FIELDS)
+    if where == 'fqdn':
+        f['global']['fqdn'] = {'source': 'from-dhcp', key: 'hunter2-in-the-rack'}
+    else:
+        (f if where == 'top' else f[where])[key] = 'hunter2-in-the-rack'
+    r = _admin(api, seed).post('/api/auto-install/compose', json={'fields': f})
+    assert r.status_code == 400, r.data
+    assert 'password-hash' in r.get_json()['error']
+    assert b'hunter2' not in r.data
+
+
+@pytest.mark.parametrize('path,value,name', [
+    (('first_boot',), {'source': 'from-url'}, 'first_boot'),
+    (('global', 'subscription_key'), 'pve2c-0123456789', 'subscription_key'),
+    (('global', 'root-password-hashed'), HASHED, 'root-password-hashed'),
+    (('network', 'interface_name_pinning'), {'enabled': True}, 'interface_name_pinning'),
+    (('disk', 'zfs_ashift'), 12, 'zfs_ashift'),
+    (('disk', 'filter'), {'ID_VENDOR': 'ATA'}, 'ID_VENDOR'),
+    (('global', 'fqdn'), {'source': 'from-dhcp', 'hostname': 'x'}, 'hostname'),
+])
+def test_an_unknown_field_is_refused_by_name(api, seed, path, value, name):
+    f = copy.deepcopy(FIELDS)
+    _set(f, path, value)
+    r = _admin(api, seed).post('/api/auto-install/compose', json={'fields': f})
+    assert r.status_code == 400, r.data
+    assert name in r.get_json()['error']
+
+
+@pytest.mark.parametrize('body', [None, {}, {'fields': 'x'}, {'fields': {'global': []}}, ['fields']])
+def test_a_body_that_is_not_the_shape_is_a_400(api, seed, body):
+    r = _admin(api, seed).post('/api/auto-install/compose', json=body)
+    assert r.status_code == 400, r.data
+
+
+def test_compose_stores_nothing(api, seed):
+    c = _admin(api, seed)
+    assert _compose(c, FIELDS)['valid'] is True
+    assert c.get('/api/auto-install/profiles').get_json()['profiles'] == []
+
+
+def test_compose_needs_the_manage_permission(api, seed):
+    r = _viewer(api, seed).post('/api/auto-install/compose', json={'fields': FIELDS})
+    assert r.status_code == 403
+
+
+def test_a_composed_file_saves_and_serves(api, seed):
+    """The wizard saves what compose showed through the normal create call."""
+    c = _admin(api, seed)
+    answer = _compose(c, FIELDS)['answer']
+    created = _create(c, answer=answer)
+    served = _fetch(api, created['token'])
+    assert served.status_code == 200, served.data
+    parsed = tomllib.loads(served.data.decode())
+    assert parsed['global']['root-password-hashed'] == HASHED
+    assert 'url' in parsed['post-installation-webhook']
+
+
+# --- who sees the page -------------------------------------------------------------------
+
+def _flag(api, user):
+    body = api.as_user(user).get('/api/auth/check').get_json()
+    return body['user']['autoinstall_access']
+
+
+def test_the_flag_follows_the_same_rule_as_the_routes(api, seed):
+    seed.tenant('acme', ['cluster_acme'])
+    seed.tenant('globex', ['cluster_globex'])
+    both = ['autoinstall.view', 'autoinstall.manage']
+    cases = [
+        (seed.user('root', role='admin'), 'manage'),
+        # admin globally, mapped down to viewer inside its own tenant: the gate
+        # refuses it, so the page must not be offered either
+        (seed.user('capped', role='admin', tenant_id='acme',
+                   tenant_permissions={'acme': {'role': 'viewer', 'extra': both}}), ''),
+        (seed.user('watcher', role='viewer', permissions=['autoinstall.view']), 'view'),
+        (seed.user('ops', role='user', permissions=both), 'manage'),
+        (seed.user('globex_admin', role='user', tenant_id='globex', permissions=both), ''),
+        (seed.user('nobody', role='user'), ''),
+        # manage does not imply view, and the list route needs view
+        (seed.user('manage_only', role='user', permissions=['autoinstall.manage']), ''),
+    ]
+    for user, expected in cases:
+        assert _flag(api, user) == expected, user['username']
+        # and what the flag promises holds at the routes
+        status = api.as_user(user).get('/api/auto-install/profiles').status_code
+        assert (status == 200) == bool(expected), (user['username'], status)
+
+
+def test_the_flag_fails_closed(api, seed, monkeypatch):
+    import pegaprox.utils.rbac as rbac
+    admin = seed.user('root', role='admin')
+
+    def broken(*a, **k):
+        raise RuntimeError('tenant table unreadable')
+    monkeypatch.setattr(rbac, 'get_user_clusters', broken)
+    assert _flag(api, admin) == ''
+
+
+@pytest.mark.parametrize('role,perms,expected', [
+    ('admin', [], 'manage'),
+    ('viewer', ['autoinstall.view'], 'view'),
+    ('user', [], ''),
+])
+def test_the_login_answer_carries_the_flag(api, db, tmp_path, monkeypatch, role, perms, expected):
+    import pegaprox.utils.auth as authmod
+    from pegaprox.utils.auth import hash_password
+    marker = tmp_path / '.admin_initialized'
+    marker.write_text('x')
+    monkeypatch.setattr(authmod, 'ADMIN_INITIALIZED_FILE', str(marker))
+    salt, pw_hash = hash_password('C0rrect!horse9')
+    db.save_user('ops', {'password_salt': salt, 'password_hash': pw_hash, 'role': role,
+                         'enabled': True, 'auth_source': 'local', 'permissions': perms})
+    r = api.anon().post('/api/auth/login', json={'username': 'ops', 'password': 'C0rrect!horse9'})
+    assert r.status_code == 200, r.data
+    assert r.get_json()['user']['autoinstall_access'] == expected
+
+
 # --- noise and logs -----------------------------------------------------------------
 
 def test_refusals_are_audited_but_not_flooded(api, seed):
@@ -733,3 +1217,16 @@ def test_a_typo_in_an_optional_key_is_flagged(api, seed):
     answer = ANSWER.replace('timezone = "Europe/Berlin"', 'timezone = "Europe/Berlin"\nreboot-on-eror = true')
     body = _admin(api, seed).post('/api/auto-install/validate', json={'answer': answer}).get_json()
     assert any('reboot-on-eror' in w for w in body['warnings']), body['warnings']
+
+
+
+@pytest.mark.parametrize('name', ['/dev/disk/by-id/ata-SAMSUNG_X', 'disk/by-path/pci-0000:00:17.0-ata-1'])
+def test_a_by_id_path_is_not_a_disk_name(api, seed, name):
+    """disk-list takes the installer's raw disk names. A by-* path matches nothing and
+    the install stops at the rack, so neither the editor nor the wizard lets it through."""
+    c = _admin(api, seed)
+    answer = ANSWER.replace('disk-list = ["sda"]', f'disk-list = ["{name}"]')
+    body = c.post('/api/auto-install/validate', json={'answer': answer}).get_json()
+    assert body['valid'] is False and any('by-' in e for e in body['errors']), body
+    assert c.post('/api/auto-install/validate', json={'answer': ANSWER.replace(
+        'disk-list = ["sda"]', 'disk-list = ["cciss/c0d0"]')}).get_json()['valid'] is True
