@@ -17,6 +17,7 @@ from datetime import datetime
 
 from pegaprox.globals import cluster_managers
 from pegaprox.core.db import get_db
+from pegaprox.core import ha
 from pegaprox.utils.audit import log_audit
 
 logger = logging.getLogger('pegaprox.xclb')
@@ -110,6 +111,9 @@ def run_cross_cluster_balance_check(group):
     """Core logic: compare cluster scores within a group, migrate if needed.
     NS: Intentionally conservative - one VM per cycle, dry_run default on.
     """
+    # a standby migrates nothing, from the loop or from the manual trigger
+    if not ha.is_active():
+        return
     group_id = group['id']
     group_name = group.get('name', group_id)
     threshold = group.get('cross_cluster_threshold', 30)

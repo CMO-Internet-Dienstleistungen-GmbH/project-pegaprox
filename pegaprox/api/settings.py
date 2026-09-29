@@ -2278,23 +2278,13 @@ def backup_config():
         # authenticate against the upstream IdP each time. The old code only
         # checked the local hash, so AD-mapped admins always got "Incorrect
         # password" when creating a config backup. Branch on auth_source.
-        auth_source = (user.get('auth_source') if isinstance(user, dict) else None) or 'local'
-        password_ok = False
-        if auth_source == 'ldap':
-            try:
-                from pegaprox.utils.ldap import ldap_authenticate
-                ldap_res = ldap_authenticate(username, user_password)
-                password_ok = bool(ldap_res and ldap_res.get('success'))
-            except Exception as _ldap_err:
-                logging.warning(f"[Backup] LDAP password verification failed for {username}: {_ldap_err}")
-                password_ok = False
-        else:
-            password_salt = user.get('password_salt', '') if isinstance(user, dict) else ''
-            password_hash = user.get('password_hash', '') if isinstance(user, dict) else ''
-            password_ok = verify_password(user_password, password_salt, password_hash)
+        # MK Sep 2026 (#625) - that branch lives in recheck_account_password now, shared
+        # with the standby pairing routes; it audits the failure the same way.
+        from pegaprox.utils.auth import recheck_account_password
+        password_ok, auth_source = recheck_account_password(
+            username, user_password, user, audit_action='config.backup_failed')
 
         if not password_ok:
-            log_audit(username, 'config.backup_failed', f'Password verification failed (auth_source={auth_source})')
             logging.warning(f"[Backup] Password verification failed for {username} (auth_source={auth_source})")
             return jsonify({'error': 'Incorrect password'}), 401
 
@@ -2877,10 +2867,9 @@ def check_ip_allowed(client_ip: str) -> tuple:
     
     # Check blacklist first (always blocks)
     # NS: blacklist is checked before whitelist, security first
-    if _ip_blacklist:
-        for blocked in _ip_blacklist:
-            if _ip_matches(client_ip, blocked):
-                return False, f'IP blacklisted: {blocked}'
+    blocked = _ip_blacklisted(client_ip)
+    if blocked:
+        return False, f'IP blacklisted: {blocked}'
     
     # If whitelist is empty, allow all (only blacklist applies)
     if not _ip_whitelist:
@@ -2892,6 +2881,13 @@ def check_ip_allowed(client_ip: str) -> tuple:
             return True, f'IP allowed: {allowed}'
     
     return False, 'IP not in whitelist'
+
+def _ip_blacklisted(client_ip):
+    """The blacklist entry the address matches, or None."""
+    for blocked in _ip_blacklist:
+        if _ip_matches(_normalize_ip(client_ip), blocked):
+            return blocked
+    return None
 
 def _normalize_ip(ip_str: str) -> str:
     """Strip IPv6-mapped prefix so ::ffff:192.168.1.1 becomes 192.168.1.1
@@ -2956,6 +2952,22 @@ def check_ip_whitelist():
     allowed, reason = check_ip_allowed(client_ip)
     
     if not allowed:
+        # MK Sep 2026 (#625) - the list is synced, so a standby enforces the active's
+        # copy, and nobody lists the active's own address on the active: its watch and
+        # unpair calls to the standby would bounce here. The peer calls carry their own
+        # credential, so a right X-PegaProx-Peer header gets through. A wrong one counts
+        # against the same failure budget as on the peer routes, so the list does not
+        # turn into a free place to try secrets. The pairing call has no peer header
+        # yet and stays behind the list.
+        # A blacklist entry is an explicit no and stays one, peer or not.
+        path = request.path
+        if (path.startswith('/api/ha/peer/') and path != '/api/ha/peer/pair'
+                and not _ip_blacklisted(client_ip)):
+            from pegaprox.core import ha
+            if ha.verify_peer(request.headers.get(ha.PEER_HEADER, '')):
+                return None
+            from pegaprox.api.ha import _peer_failures
+            _peer_failures.allow(client_ip)
         logging.warning(f"IP blocked: {client_ip} - {reason}")
         return jsonify({
             'error': 'Access denied',

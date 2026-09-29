@@ -4352,20 +4352,27 @@ class PegaProxDB:
     # KEY ROTATION (HIPAA/ISO Compliance)
     # ========================================
     
-    def rotate_encryption_key(self) -> dict:
+    def rotate_encryption_key(self, new_key: bytes = None) -> dict:
         """Rotate the AES-256 encryption key and re-encrypt all data
-        
+
         This is required for HIPAA/ISO 27001 compliance (periodic key rotation).
         Process:
         1. Generate new AES-256 key
         2. Decrypt all encrypted data with old key
         3. Re-encrypt with new key
         4. Replace old key file
-        
+
+        MK Sep 2026 (#625) - new_key: take this key instead of a fresh one. A standby
+        adopting its active's key needs exactly what a rotation does for what stays
+        local (the acme_* secrets, the audit signatures); the synced rows are replaced
+        by the first sync anyway.
+
         Returns statistics about the rotation.
         """
         if not ENCRYPTION_AVAILABLE or not self.aesgcm:
             return {'error': 'Encryption not available'}
+        if new_key is not None and (not isinstance(new_key, (bytes, bytearray)) or len(new_key) != 32):
+            return {'error': 'The new key must be 32 bytes'}
         
         aes_key_file = os.path.join(CONFIG_DIR, '.pegaprox_aes256.key')
         
@@ -4375,7 +4382,7 @@ class PegaProxDB:
         old_aesgcm = AESGCM(old_key)
         
         # Generate new key
-        new_key = os.urandom(32)  # 256 bits
+        new_key = bytes(new_key) if new_key is not None else os.urandom(32)  # 256 bits
         new_aesgcm = AESGCM(new_key)
         
         stats = {
@@ -4560,10 +4567,15 @@ class PegaProxDB:
                         # commits per key, which would land every re-encrypted row above while
                         # the new key is still only in memory, and leave step 4's rollback with
                         # nothing to undo. Everything here has to reach the same transaction.
-                        cursor.execute('INSERT OR REPLACE INTO server_settings (key, value) '
-                                       'VALUES (?, ?)',
-                                       (_k, json.dumps(self._encrypt_with_key(
-                                           self._decrypt_with_key(_v, old_aesgcm), new_aesgcm))))
+                        # MK Sep 2026 (#625) - one try per key: a value that does not open
+                        # used to abort the loop and leave every key after it behind
+                        try:
+                            cursor.execute('INSERT OR REPLACE INTO server_settings (key, value) '
+                                           'VALUES (?, ?)',
+                                           (_k, json.dumps(self._encrypt_with_key(
+                                               self._decrypt_with_key(_v, old_aesgcm), new_aesgcm))))
+                        except Exception as e:
+                            stats['errors'].append(f"Server setting {_k}: {e}")
 
                 # the VAPID private key is a setting too, but nested one level down inside the
                 # keypair object, so the loop above walks straight past it. Left behind it fails

@@ -386,6 +386,69 @@ def create_app():
     # Register all API blueprints
     register_blueprints(app)
 
+    # MK Sep 2026 (#625) - a standby takes its configuration from the active instance
+    # and would lose a local change at the next sync, so it refuses writes. Registered
+    # here and not in validate_request: before_request hooks run in registration
+    # order, and the IP allow list is hooked in by the settings blueprint above, so
+    # this runs after the CSRF, rate-limit and IP checks.
+    # Open on a standby: the pairing/promotion routes and signing in and out. A TOTP
+    # code travels inside /api/auth/login; /api/auth/2fa/* is enrolment and stays shut,
+    # like setup, password changes, tokens and preferences.
+    _STANDBY_WRITABLE = (
+        '/api/auth/login',
+        '/api/auth/logout',
+        '/api/auth/oidc/callback',
+        '/api/webauthn/auth/begin',
+        '/api/webauthn/auth/finish',
+    )
+    # Writes that only ever change this instance, so no sync can undo them and nothing
+    # would be lost. Matched on the route that serves the request, not on the path
+    # text, so a parameter or an encoded character cannot stretch an entry.
+    # Not POST /api/settings/server: one body mixes local keys with synced ones.
+    _STANDBY_LOCAL_WRITES = frozenset((
+        # the caller's own session; sessions are per instance and never synced
+        ('DELETE', '/api/user/sessions/<token>'),
+        # short-lived stream and console tokens, in memory, bound to a session here
+        ('POST', '/api/sse/token'),
+        ('POST', '/api/ws/token'),
+        # restarts this process and changes nothing
+        ('POST', '/api/settings/server/restart'),
+        # Not the ACME request and DNS-complete routes and not the hardware-monitoring
+        # consent, although what they mean to change is local: each saves back the whole
+        # settings dict it loaded, so a sync that lands in between (the ACME call waits
+        # 30 s for DNS) is overwritten with the older copy until the active changes
+        # something. Set those before pairing or after promotion.
+        # login lockouts are counters in this process
+        ('DELETE', '/api/security/locked-ips/<ip_address>'),
+        ('DELETE', '/api/security/locked-users/<username>'),
+        ('DELETE', '/api/security/locked-ips'),
+        ('DELETE', '/api/security/locked-users'),
+    ))
+    # A plugin handler serves every method from one function and most never look at
+    # which one it got, so a GET reaches their write paths too. On a standby the whole
+    # proxy is shut, whatever the method.
+    _PLUGIN_PROXY_RULE = '/api/plugins/<plugin_id>/api/<path:subpath>'
+
+    @app.before_request
+    def refuse_writes_on_standby():
+        rule = request.url_rule.rule if request.url_rule is not None else None
+        plugin_call = rule == _PLUGIN_PROXY_RULE
+        if request.method not in ('POST', 'PUT', 'PATCH', 'DELETE') and not plugin_call:
+            return None
+        path = request.path
+        if not path.startswith('/api/') or path.startswith('/api/ha/') or path in _STANDBY_WRITABLE:
+            return None
+        if (request.method, rule) in _STANDBY_LOCAL_WRITES:
+            return None
+        from pegaprox.core import ha
+        if not ha.is_standby():
+            return None
+        return jsonify({
+            'error': 'This is a standby instance. Make changes on the active instance; '
+                     'they arrive here with the next sync.',
+            'code': 'HA_STANDBY',
+        }), 409
+
     # Load enabled plugins
     from pegaprox.api.plugins import load_enabled_plugins
     load_enabled_plugins(app)
@@ -948,6 +1011,25 @@ def main(debug_mode=False):
         # don't take down boot for a non-fatal hiccup — log and continue
         logging.error(f"[DBCRYPTO] auto-encrypt check failed: {_e}", exc_info=True)
 
+    # MK Sep 2026 (#625) - an active that was down while its standby got promoted still
+    # reads "active" from its own state file. Ask the peer once, before anything here
+    # can act on the clusters with the configuration from before the outage: create_app()
+    # below is the first thing that starts threads (importing the blueprints starts the
+    # storage balancer at module import, register_blueprints the drift and multi-SDN
+    # scanners, the SIEM worker and the snapshot scheduler), and the managers and the
+    # other loops come after that. If the peer holds a newer epoch this steps down to
+    # standby without a restart, so the role read further down is already the right one.
+    # An unreachable peer changes nothing: every acting loop started below checks
+    # ha.is_active() on each tick, so it stops the moment the ha loop steps us down.
+    from pegaprox.core import ha
+    try:
+        _ha_boot = ha.check_peer_at_boot(timeout=5)
+    except Exception as e:
+        _ha_boot = f'check failed: {e}'
+    logging.info(f"[HA] boot check: {_ha_boot} (role {ha.role()}, epoch {ha.epoch()})")
+    if ha.role() != ha.ROLE_STANDALONE or ha.peer():
+        print(f"HA role at boot: {ha.role()}, epoch {ha.epoch()} ({_ha_boot})")
+
     # Create Flask app (plugins + push inbox will hit the DB here)
     app = create_app()
 
@@ -993,41 +1075,50 @@ def main(debug_mode=False):
     # Load existing configuration
     config = load_config()
 
+    # MK Sep 2026 (#625) - a standby holds the configuration and acts on none of it.
+    # The role is read once: every role change restarts the process.
+    standby = ha.is_standby()
+
     # Start managers for existing clusters
-    for cluster_id, cluster_data in config.items():
-        config_obj = PegaProxConfig(cluster_data)
-        ctype = cluster_data.get('cluster_type', 'proxmox')
-        if ctype == 'xcpng':
-            from pegaprox.core.xcpng import XcpngManager
-            manager = XcpngManager(cluster_id, config_obj)
-            manager.start()
-            g.cluster_managers[cluster_id] = manager
-            print(f"Started XCP-ng manager for pool: {cluster_data['name']}")
-        else:
-            manager = PegaProxManager(cluster_id, config_obj)
-            manager.start()
-            g.cluster_managers[cluster_id] = manager
-            print(f"Started PegaProx manager for cluster: {cluster_data['name']}")
+    if standby:
+        logging.warning("[HA] standby: no cluster, PBS or ESXi managers are started - "
+                        "they stay down until this instance is promoted")
+    else:
+        for cluster_id, cluster_data in config.items():
+            config_obj = PegaProxConfig(cluster_data)
+            ctype = cluster_data.get('cluster_type', 'proxmox')
+            if ctype == 'xcpng':
+                from pegaprox.core.xcpng import XcpngManager
+                manager = XcpngManager(cluster_id, config_obj)
+                manager.start()
+                g.cluster_managers[cluster_id] = manager
+                print(f"Started XCP-ng manager for pool: {cluster_data['name']}")
+            else:
+                manager = PegaProxManager(cluster_id, config_obj)
+                manager.start()
+                g.cluster_managers[cluster_id] = manager
+                print(f"Started PegaProx manager for cluster: {cluster_data['name']}")
 
     # Start background threads
     start_broadcast_thread()
     print("Started WebSocket live updates broadcast thread")
 
-    try:
-        load_pbs_servers()
-    except Exception as e:
-        logging.warning(f"Failed to load PBS servers at startup: {e}")
+    if not standby:
+        try:
+            load_pbs_servers()
+        except Exception as e:
+            logging.warning(f"Failed to load PBS servers at startup: {e}")
 
-    try:
-        load_vmware_servers()
-        # NS: register ESXi hosts as XHM-capable clusters
-        from pegaprox.core.esxi_cluster import ESXiClusterManager
-        for vmw_id, vmw_mgr in g.vmware_managers.items():
-            if getattr(vmw_mgr, 'server_type', '') == 'esxi':
-                g.cluster_managers[vmw_id] = ESXiClusterManager(vmw_id, vmw_mgr)
-                logging.info(f"Registered ESXi host '{vmw_mgr.name}' as XHM cluster {vmw_id}")
-    except Exception as e:
-        logging.warning(f"Failed to load VMware servers at startup: {e}")
+        try:
+            load_vmware_servers()
+            # NS: register ESXi hosts as XHM-capable clusters
+            from pegaprox.core.esxi_cluster import ESXiClusterManager
+            for vmw_id, vmw_mgr in g.vmware_managers.items():
+                if getattr(vmw_mgr, 'server_type', '') == 'esxi':
+                    g.cluster_managers[vmw_id] = ESXiClusterManager(vmw_id, vmw_mgr)
+                    logging.info(f"Registered ESXi host '{vmw_mgr.name}' as XHM cluster {vmw_id}")
+        except Exception as e:
+            logging.warning(f"Failed to load VMware servers at startup: {e}")
 
     start_alert_thread()
     print("Started alert monitoring thread")
@@ -1056,25 +1147,33 @@ def main(debug_mode=False):
         logging.warning(f"Syslog server failed to start: {e}")
 
     # #238: reset stuck DR plans from a previous crash/restart
-    try:
-        from datetime import datetime as _dt
-        from pegaprox.core.db import get_db
-        _db = get_db()
-        stuck = _db.query("SELECT id, name FROM site_recovery_plans WHERE status IN ('running', 'testing')")
-        for p in (stuck or []):
-            _db.execute("UPDATE site_recovery_plans SET status = 'failed', updated_at = ? WHERE id = ?",
-                        (_dt.now().isoformat(), p['id']))
-            print(f"  Reset stuck DR plan '{p['name']}' → failed")
-    except Exception as e:
-        print(f"  DR plan reset check failed: {e}")
+    # #625: not on a standby - the plans are the active's, and so is any run in flight.
+    # start_heartbeat() stays out too: it repeats that reset (recover_orphan_runs)
+    # before it starts the auto-failover loop.
+    if not standby:
+        try:
+            from datetime import datetime as _dt
+            from pegaprox.core.db import get_db
+            _db = get_db()
+            stuck = _db.query("SELECT id, name FROM site_recovery_plans WHERE status IN ('running', 'testing')")
+            for p in (stuck or []):
+                _db.execute("UPDATE site_recovery_plans SET status = 'failed', updated_at = ? WHERE id = ?",
+                            (_dt.now().isoformat(), p['id']))
+                print(f"  Reset stuck DR plan '{p['name']}' → failed")
+        except Exception as e:
+            print(f"  DR plan reset check failed: {e}")
 
-    from pegaprox.background.site_recovery import start_heartbeat
-    start_heartbeat()
-    print("Started site recovery heartbeat monitor")
+        from pegaprox.background.site_recovery import start_heartbeat
+        start_heartbeat()
+        print("Started site recovery heartbeat monitor")
 
-    # Start plugin background tasks
-    from pegaprox.api.plugins import start_plugin_backgrounds
-    start_plugin_backgrounds()
+        # Start plugin background tasks
+        from pegaprox.api.plugins import start_plugin_backgrounds
+        start_plugin_backgrounds()
+
+    # #625: pulls from the active on a standby, watches the peer on an active,
+    # idles while unpaired
+    ha.start_loop()
 
     # Warm up pool cache
     def warmup_pool_cache():

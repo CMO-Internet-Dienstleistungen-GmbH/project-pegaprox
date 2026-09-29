@@ -36,11 +36,18 @@ _INLINE_AUTH = ('_require_session', 'validate_session(', 'validate_api_token(',
                 '_metrics_token', 'metrics_public',
                 # MK Sep 2026 - the automated installer presents an installation
                 # token; it has no session and never will, but it is not public.
-                '_profile_for_token', '_run_for_callback_token')
+                '_profile_for_token', '_run_for_callback_token',
+                # #625 - the other PegaProx instance of a standby pair
+                '_peer_or_refuse', 'accept_pairing')
 
 # ...and those two take that token only, so advertising apiToken/sessionId on them
 # sends an integrator straight into a 403.
 _INSTALL_TOKEN_AUTH = ('_profile_for_token', '_run_for_callback_token')
+
+# Same for the standby pair: the peer header and nothing else. The pairing route
+# is authenticated by the one-time code in its body, which no scheme describes.
+_HA_PEER_AUTH = ('_peer_or_refuse',)
+_HA_PAIRING_AUTH = ('accept_pairing',)
 
 _CONVERTER_TYPES = {
     'int': ('integer', None),
@@ -146,6 +153,13 @@ def build(app):
                 op['security'] = [{'installToken': []}]
                 op['responses'].pop('401', None)
                 op['responses']['403'] = {'description': 'Unknown, revoked or spent token'}
+            if kind == 'inline' and _uses(fn, _HA_PEER_AUTH):
+                op['security'] = [{'haPeer': []}]
+                op['responses']['401'] = {'description': 'Not the paired instance'}
+            elif kind == 'inline' and _uses(fn, _HA_PAIRING_AUTH):
+                op['security'] = []
+                op['responses'].pop('401', None)
+                op['responses']['403'] = {'description': 'Wrong, expired or spent pairing code'}
             if auth is not None:
                 if auth['perms'] or auth['roles']:
                     op['responses']['403'] = {'description': 'Insufficient permissions'}
@@ -251,6 +265,11 @@ def spec(app, version):
                     'description': 'An automated-installation token. The installer sends it '
                                    'as Authorization: Bearer <name>:<token> '
                                    '(--answer-auth-token); ?token=<token> works too.',
+                },
+                'haPeer': {
+                    'type': 'apiKey', 'in': 'header', 'name': 'X-PegaProx-Peer',
+                    'description': 'Only for the other instance of a standby pair: '
+                                   '<its instance id>:<the secret exchanged at pairing>.',
                 },
                 'sessionId': {
                     'type': 'apiKey', 'in': 'header', 'name': 'X-Session-ID',

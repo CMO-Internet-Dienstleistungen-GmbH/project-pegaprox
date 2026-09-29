@@ -9,6 +9,7 @@ import requests
 from datetime import datetime
 
 from pegaprox.core.db import get_db
+from pegaprox.core import ha
 from pegaprox.globals import cluster_managers
 from pegaprox.utils.audit import log_audit
 from pegaprox.utils.realtime import broadcast_sse
@@ -1055,7 +1056,10 @@ def heartbeat_loop():
 
     while _heartbeat_running:
         try:
-            _heartbeat_check()
+            # no auto-failover from a standby: it has no managers to fail over with, and
+            # two instances deciding the same failover is the worst case there is
+            if ha.is_active():
+                _heartbeat_check()
         except Exception as e:
             logger.error(f"[SR] Heartbeat error: {e}")
         time.sleep(30)
@@ -1074,6 +1078,11 @@ def recover_orphan_runs():
 
     MK May 2026 (#413).
     """
+    # MK Sep 2026 (#625) - a standby resets nothing. The plan rows are the active's
+    # and come back with the next sync; events left from a time as active are
+    # cleaned up at the restart that promotes this instance again.
+    if not ha.is_active():
+        return
     try:
         db = get_db()
     except Exception as e:

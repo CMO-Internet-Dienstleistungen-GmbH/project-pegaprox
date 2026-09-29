@@ -37,6 +37,7 @@ from pegaprox.globals import cluster_managers
 from pegaprox.utils.auth import require_auth
 from pegaprox.api.helpers import check_cluster_access, require_unconfined
 from pegaprox.core.db import get_db
+from pegaprox.core import ha
 from pegaprox.models.permissions import ROLE_ADMIN
 
 bp = Blueprint('drift', __name__)
@@ -401,6 +402,9 @@ def _scanner_loop():
     while _scanner_running:
         try:
             for cid in list(cluster_managers.keys()):
+                # standby: baselines and events are the active instance's business
+                if not ha.is_active():
+                    break
                 try:
                     _scan_cluster(cid, autobaseline=True)
                 except Exception as e:

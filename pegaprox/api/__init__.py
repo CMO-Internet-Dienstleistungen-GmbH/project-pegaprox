@@ -44,6 +44,7 @@ def register_blueprints(app):
     from pegaprox.api.dr_drill import bp as dr_drill_bp
     from pegaprox.api.multi_sdn import bp as multi_sdn_bp, start_scanner as start_multi_sdn_scanner
     from pegaprox.api.auto_install import bp as auto_install_bp
+    from pegaprox.api.ha import bp as ha_bp
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(users_bp)
@@ -82,6 +83,7 @@ def register_blueprints(app):
     app.register_blueprint(dr_drill_bp)
     app.register_blueprint(multi_sdn_bp)
     app.register_blueprint(auto_install_bp)
+    app.register_blueprint(ha_bp)
 
     # Initialize WebSocket support for realtime blueprint
     from pegaprox.api.realtime import sock

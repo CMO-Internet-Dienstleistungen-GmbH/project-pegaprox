@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from pegaprox.constants import SCHEDULED_TASKS_FILE
 from pegaprox.globals import cluster_managers, _scheduler_running, _scheduler_thread
 from pegaprox.core.db import get_db
+from pegaprox.core import ha
 from pegaprox.utils.audit import log_audit
 
 # NS: this was buried somewhere around line 40k in the monolith, nobody could find it
@@ -252,7 +253,9 @@ def scheduler_loop():
     
     while _scheduler_running:
         try:
-            run_scheduled_tasks()
+            # standby: the tasks run on the active instance, not twice
+            if ha.is_active():
+                run_scheduled_tasks()
         except Exception as e:
             logging.error(f"Scheduler error: {e}")
         

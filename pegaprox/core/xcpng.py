@@ -19,6 +19,7 @@ from urllib.parse import urlparse, urlunparse, urlencode
 from pegaprox.constants import LOG_DIR
 from pegaprox import globals as _g
 from pegaprox.core.db import get_db
+from pegaprox.core import ha
 from pegaprox.utils.realtime import broadcast_sse
 from pegaprox.utils.ssh import read_capped as _read_capped
 
@@ -304,7 +305,8 @@ class XcpngManager:
                     now_t = time.time()
                     interval_cfg = getattr(self.config, 'check_interval', 300)
                     auto_migrate = getattr(self.config, 'auto_migrate', False)
-                    if auto_migrate and now_t - self._last_balance_check >= interval_cfg:
+                    # a PegaProx standby does not balance (#625)
+                    if auto_migrate and ha.is_active() and now_t - self._last_balance_check >= interval_cfg:
                         try:
                             self.run_balance_check()
                         except Exception as be:

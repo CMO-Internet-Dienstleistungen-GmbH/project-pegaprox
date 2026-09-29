@@ -30,7 +30,8 @@ from pegaprox.utils.auth import (
     ARGON2_AVAILABLE, TOTP_AVAILABLE,
 )
 from pegaprox.utils.audit import log_audit, get_client_ip
-from pegaprox.utils.ldap import get_ldap_settings, ldap_authenticate, ldap_provision_user
+from pegaprox.utils.ldap import (get_ldap_settings, ldap_authenticate, ldap_provision_user,
+                                 ldap_build_user_row, LDAP_AUTH_SOURCES)
 from pegaprox.utils.oidc import (
     get_oidc_settings, get_oidc_endpoints, oidc_build_auth_url,
     oidc_exchange_code, oidc_decode_id_token, oidc_get_user_info,
@@ -556,6 +557,29 @@ def _totp_replayed(username, code):
     return False
 
 
+def _directory_agrees_with_synced_row(ldap_result, row):
+    """#625 - would a directory login leave this account's access as the row says?
+
+    What a directory login rewrites and what decides access: the global role, the
+    tenant, the extra permissions and the per-tenant overrides. Display name, mail and
+    the ldap_* bookkeeping change nothing a check reads. A missing row (a first sign-in)
+    or one another identity source owns is never a match. MK Sep 2026
+    """
+    if not isinstance(row, dict) or row.get('auth_source', 'local') not in LDAP_AUTH_SOURCES:
+        return False
+    would_be = ldap_build_user_row(ldap_result, row)
+    if would_be is None:
+        return False
+
+    def _perms(u):
+        return sorted(set(u.get('permissions') or []))
+
+    return (would_be.get('role') == row.get('role')
+            and would_be.get('tenant_id') == row.get('tenant_id')
+            and _perms(would_be) == _perms(row)
+            and (would_be.get('tenant_permissions') or {}) == (row.get('tenant_permissions') or {}))
+
+
 @bp.route('/api/auth/login', methods=['POST'])
 def auth_login():
     """login endpoint - MK"""
@@ -707,13 +731,37 @@ def auth_login():
     # =================================================================
     ldap_config = get_ldap_settings()
     ldap_authenticated = False
+    # MK Sep 2026 (#625) - set when a standby let a directory login in on the synced row
+    ldap_row_untouched = False
+    from pegaprox.core import ha
     
     if ldap_config['enabled']:
         ldap_result = ldap_authenticate(username, password)
         
         if ldap_result.get('success'):
             # LW: LDAP auth succeeded - provision/update local user
-            if ldap_config['auto_create_users'] or username in users_db:
+            if (ldap_config['auto_create_users'] or username in users_db) and ha.is_standby():
+                # MK Sep 2026 (#625) - a standby writes no users row: the next sync puts
+                # the active's copy back, and a demotion the directory did here would
+                # be undone with it while the session stays. So only let the sign-in
+                # through when the directory says what the synced row already says.
+                row = users_db.get(username)
+                if isinstance(row, dict) and ldap_build_user_row(ldap_result, row) is None:
+                    # another source owns the account: local auth decides, as on the active
+                    logging.info(f"[LDAP] User '{username}' has local account, skipping LDAP provisioning")
+                elif not _directory_agrees_with_synced_row(ldap_result, row):
+                    logging.warning(f"[LDAP] '{username}' signs in on a standby with directory "
+                                    f"access that differs from the synced account - refused")
+                    return jsonify({
+                        'error': 'Your directory access changed - sign in on the active '
+                                 'instance once; it reaches this standby with the next sync.',
+                        'code': 'HA_STANDBY',
+                    }), 409
+                else:
+                    ldap_authenticated = True
+                    ldap_row_untouched = True
+                    logging.info(f"[LDAP] User '{username}' authenticated via LDAP from {client_ip} (standby, synced row)")
+            elif ldap_config['auto_create_users'] or username in users_db:
                 user = ldap_provision_user(ldap_result)
                 if user is None:
                     # NS: Local account exists - fall through to local auth
@@ -889,7 +937,11 @@ def auth_login():
     
     # NS: Auto-migrate password to Argon2id if using old PBKDF2 format - Jan 2026
     # Only rehash for locally-authenticated users - LDAP passwords must NEVER be stored locally
-    if not ldap_authenticated and needs_password_rehash(user.get('password_salt', ''), user.get('password_hash', '')):
+    # #625: not on a standby. Its users table is the active's copy; a rehash here comes
+    # back as a changed hash with the next sync, and that ends the user's sessions.
+    # The active migrates the hash at the user's next login there.
+    if (not ldap_authenticated and not ha.is_standby()
+            and needs_password_rehash(user.get('password_salt', ''), user.get('password_hash', ''))):
         try:
             new_salt, new_hash = hash_password(password)
             user['password_salt'] = new_salt
@@ -903,9 +955,10 @@ def auth_login():
     remember = data.get('remember', False)
     session_id = create_session(username, user['role'], remember=bool(remember))
     
-    # Update last login
-    user['last_login'] = datetime.now().isoformat()
-    save_single_user(username, user)
+    # Update last login - not on a standby, where no login writes the synced row
+    if not ldap_row_untouched and not ha.is_standby():
+        user['last_login'] = datetime.now().isoformat()
+        save_single_user(username, user)
     
     logging.info(f"User '{username}' logged in successfully")
     log_audit(username, 'user.login', f"User logged in" + (" (with 2FA)" if user.get('totp_enabled') else ""))
@@ -925,7 +978,15 @@ def auth_login():
         is_admin = user.get('role') == ROLE_ADMIN
         exclude_admins = settings.get('force_2fa_exclude_admins', False)
         if not has_2fa and not is_external and not (is_admin and exclude_admins):
-            requires_2fa_setup = True
+            if is_admin and ha.is_standby():
+                # MK Sep 2026 (#625) - enrolment is a write and a standby refuses it, and
+                # the setup screen has no way past it. For an admin that is the way to
+                # the promote button during a failover, so let them in and say so in the
+                # audit trail. Enrolment happens on the active.
+                log_audit(username, 'ha.standby_2fa_skipped',
+                          'Forced 2FA enrolment skipped on a standby for an admin without TOTP')
+            else:
+                requires_2fa_setup = True
     
     # NS: Debug log for theme sync issues
     user_theme = user.get('theme', '') or default_theme
@@ -965,7 +1026,8 @@ def auth_login():
         'requires_2fa_setup': requires_2fa_setup,  # NS: Feb 2026 - Force 2FA
         # NS: Security warning if using default password
         'security_warning': 'DEFAULT_PASSWORD' if (user['role'] == ROLE_ADMIN and password == 'admin') else None,
-        'requires_password_change': bool(user.get('force_password_change'))
+        'requires_password_change': bool(user.get('force_password_change')),
+        'ha': ha.banner(),  # MK Sep 2026 (#625) - role, and on a standby where it follows
     })
     
     # Set session cookie with security flags
@@ -1096,8 +1158,9 @@ def health_check():
 @bp.route('/api/auth/check', methods=['GET'])
 def auth_check():
     """Check if current session is valid"""
+    from pegaprox.core import ha
     session_id = request.headers.get('X-Session-ID') or request.cookies.get('session_id')
-    
+
     session = validate_session(session_id)
     if not session:
         # NS: Feb 2026 - Include LDAP/OIDC status so login page can show indicators
@@ -1115,6 +1178,8 @@ def auth_check():
             'oidc_enabled': oidc_enabled,
             'oidc_button_text': oidc_button_text,
             'login_background': login_background,
+            # the role only; where a standby follows is for signed-in users (#625)
+            'ha_role': ha.role(),
         }), 401
     
     # Get user info - always fresh from database
@@ -1201,7 +1266,9 @@ def auth_check():
         is_admin = fresh_role == ROLE_ADMIN
         exclude_admins = settings.get('force_2fa_exclude_admins', False)
         # skip OIDC/Entra users (they use their IdP's MFA) and optionally admins
-        if not has_2fa and not is_external and not (is_admin and exclude_admins):
+        # #625: and admins on a standby, which refuses the enrolment (see auth_login)
+        if not has_2fa and not is_external and not (is_admin and exclude_admins) \
+                and not (is_admin and ha.is_standby()):
             requires_2fa_setup = True
     
     from pegaprox.api.auto_install import autoinstall_access
@@ -1231,7 +1298,8 @@ def auth_check():
         'requires_2fa_setup': requires_2fa_setup,
         'reverse_proxy_enabled': effective_reverse_proxy(settings),
         'air_gap_mode': settings.get('air_gap_mode', False),
-        'default_theme': default_theme
+        'default_theme': default_theme,
+        'ha': ha.banner(),
     })
 
 

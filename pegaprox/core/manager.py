@@ -54,6 +54,7 @@ from pegaprox.utils.realtime import broadcast_sse, is_cluster_watched
 from pegaprox.utils.ssh import get_ssh_connection_stats, _ssh_track_connection
 from pegaprox.utils.concurrent import GEVENT_PATCHED
 from pegaprox.core.db import get_db
+from pegaprox.core import ha  # PegaProx's own warm standby (#625), not PVE HA
 from pegaprox.utils.ssh import read_capped as _read_capped
 
 # Lazy paramiko import
@@ -1357,7 +1358,9 @@ class PegaProxManager:
                                 self._auto_discover_fallback_hosts()
 
                             # MK: auto-create API token so 2FA won't lock us out later (#110)
-                            if not self.config.api_token_user:
+                            # Never from a standby: that would mint a token on the cluster and
+                            # write it into a clusters row the next sync overwrites.
+                            if not self.config.api_token_user and ha.is_active():
                                 self._try_create_api_token(session, host)
 
                             self._reset_auth_failures()  # MK (#444)
@@ -4277,6 +4280,11 @@ class PegaProxManager:
             self.logger.debug(f"[HA] Error updating fallback hosts: {e}")
     
     def start_ha_monitor(self):
+        # a PegaProx standby never runs the failover monitor, whoever asks for it.
+        # Managers do not start there at all; this is the second lock on that door.
+        if not ha.is_active():
+            self.logger.info("HA monitor not started - this PegaProx instance is a standby")
+            return
         # start HA thread
         if self.ha_thread and self.ha_thread.is_alive():
             self.logger.info("HA monitor already running")
@@ -15485,6 +15493,9 @@ echo "AGENT_INSTALLED_OK"
         After each migration, scores are re-evaluated to avoid over-correcting.
         LW: Number of migrations scales with score difference and cluster size.
         """
+        # standby instance: no migrations from here (defence in depth, see start_ha_monitor)
+        if not ha.is_active():
+            return
         try:
             self.logger.info("=" * 60)
             self.logger.info(f"Starting balance check for cluster: {self.config.name}")

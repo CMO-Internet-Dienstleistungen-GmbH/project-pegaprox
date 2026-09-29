@@ -13,6 +13,7 @@ from pegaprox.constants import *
 from pegaprox.globals import *
 from pegaprox.models.permissions import *
 from pegaprox.core.db import get_db
+from pegaprox.core import ha
 
 from pegaprox.utils.auth import require_auth, load_users, build_authz_user
 from pegaprox.utils.rbac import has_permission
@@ -200,6 +201,11 @@ def check_schedules():
     global _scheduler_running
     
     while _scheduler_running:
+        # a standby keeps ticking but fires nothing: VM actions, scheduled rolling
+        # updates and the 03:00 cleanup all belong to the active instance (#625)
+        if not ha.is_active():
+            _wait_a_minute()
+            continue
         try:
             schedules = load_schedules()
             now = datetime.now()
@@ -272,11 +278,15 @@ def check_schedules():
         except Exception as e:
             logging.error(f"Scheduler error: {e}")
         
-        # Sleep for 60 seconds (check every minute)
-        for _ in range(60):
-            if not _scheduler_running:
-                break
-            time.sleep(1)
+        _wait_a_minute()
+
+
+def _wait_a_minute():
+    # Sleep for 60 seconds (check every minute), in 1s steps so a stop is quick
+    for _ in range(60):
+        if not _scheduler_running:
+            break
+        time.sleep(1)
 
 
 def execute_scheduled_action(action):

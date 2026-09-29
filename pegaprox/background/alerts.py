@@ -22,6 +22,7 @@ from pegaprox.globals import (
     _notification_handlers,
 )
 from pegaprox.core.db import get_db
+from pegaprox.core import ha
 from pegaprox.api.helpers import load_server_settings, save_server_settings
 from pegaprox.utils.email import send_email
 from pegaprox.utils.concurrent import run_concurrent  # H5: parallel backup-store scan
@@ -1009,22 +1010,26 @@ def alert_check_loop():
     _alert_running = True
 
     while _alert_running:
-        try:
-            check_and_send_alerts()
-        except Exception as e:
-            logging.error(f"Alert check error: {e}")
-        try:
-            process_alert_lifecycle()  # NS #501: auto-resolve + escalation
-        except Exception as e:
-            logging.debug(f"Alert lifecycle error: {e}")
-        try:
-            check_node_status_transitions()
-        except Exception as e:
-            logging.debug(f"Node status watcher error: {e}")
-        try:
-            check_update_available_alert()
-        except Exception as e:
-            logging.debug(f"Update alert check error: {e}")
+        # MK Sep 2026 (#625) - a standby sends nothing, the active instance watches the
+        # same clusters and would otherwise mail every alert twice. The two cleanups
+        # below are about this host's own sessions and audit log, those keep running.
+        if ha.is_active():
+            try:
+                check_and_send_alerts()
+            except Exception as e:
+                logging.error(f"Alert check error: {e}")
+            try:
+                process_alert_lifecycle()  # NS #501: auto-resolve + escalation
+            except Exception as e:
+                logging.debug(f"Alert lifecycle error: {e}")
+            try:
+                check_node_status_transitions()
+            except Exception as e:
+                logging.debug(f"Node status watcher error: {e}")
+            try:
+                check_update_available_alert()
+            except Exception as e:
+                logging.debug(f"Update alert check error: {e}")
         try:
             _periodic_session_cleanup()
         except Exception as e:

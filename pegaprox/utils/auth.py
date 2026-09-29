@@ -200,6 +200,40 @@ def dummy_verify_password(password: str) -> None:
     _pw_hash_offload(_dummy_verify_password_sync, (password,))
 
 
+def recheck_account_password(username: str, password: str, user: dict,
+                             audit_action: str = None, context: str = '') -> tuple:
+    """Is `password` this account's own password? Returns (ok, auth_source).
+
+    For actions a session alone must not unlock. An LDAP account is checked with a bind
+    against the directory, every other account against its local hash, so one without
+    a local password never passes here. A failure goes into the audit trail as
+    `audit_action` when one is given.
+
+    MK Sep 2026 (#625) - lifted out of the config backup so the backup and the standby
+    pairing routes ask this the same way and cannot drift apart.
+    """
+    auth_source = (user.get('auth_source') if isinstance(user, dict) else None) or 'local'
+    ok = False
+    if auth_source == 'ldap':
+        # #355 - LDAP accounts have no local hash, the directory is the only judge
+        try:
+            from pegaprox.utils.ldap import ldap_authenticate
+            res = ldap_authenticate(username, password)
+            ok = bool(res and res.get('success'))
+        except Exception as e:
+            logging.warning(f"[AUTH] LDAP password re-check failed for {username}: {e}")
+            ok = False
+    else:
+        salt = user.get('password_salt', '') if isinstance(user, dict) else ''
+        pw_hash = user.get('password_hash', '') if isinstance(user, dict) else ''
+        ok = verify_password(password, salt, pw_hash)
+    if not ok and audit_action:
+        from pegaprox.utils.audit import log_audit
+        detail = f'Password verification failed (auth_source={auth_source})'
+        log_audit(username, audit_action, f'{detail} for {context}' if context else detail)
+    return ok, auth_source
+
+
 def needs_password_rehash(salt_b64: str, hash_b64: str) -> bool:
     """check if pw needs upgrade to argon2"""
     if not ARGON2_AVAILABLE:

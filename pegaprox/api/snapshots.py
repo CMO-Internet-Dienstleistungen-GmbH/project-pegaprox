@@ -42,6 +42,7 @@ from pegaprox.globals import cluster_managers
 from pegaprox.utils.auth import require_auth, load_users, build_authz_user
 from pegaprox.api.helpers import check_cluster_access
 from pegaprox.core.db import get_db
+from pegaprox.core import ha
 from pegaprox.utils.audit import log_audit
 from pegaprox.utils.rbac import user_can_access_vm
 from pegaprox.models.permissions import ROLE_ADMIN
@@ -541,7 +542,8 @@ def _scheduler_loop():
             c.execute("SELECT * FROM snapshot_policies WHERE enabled = 1")
             for row in c.fetchall():
                 p = _row_to_policy(row)
-                if _is_due(p):
+                # a standby takes no snapshots, the policies run on the active instance
+                if _is_due(p) and ha.is_active():
                     try:
                         _execute_policy(p['id'])
                     except Exception as e:

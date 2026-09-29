@@ -14,6 +14,7 @@ import threading
 from datetime import datetime
 
 from pegaprox.core.db import get_db
+from pegaprox.core import ha
 
 logger = logging.getLogger('pegaprox.xcrepl')
 
@@ -109,7 +110,8 @@ def _xcrepl_loop():
     while _xcrepl_running:
         try:
             db = get_db()
-            jobs = db.query('SELECT * FROM cross_cluster_replications WHERE enabled = 1')
+            # a standby starts no job; they are the active instance's to run
+            jobs = db.query('SELECT * FROM cross_cluster_replications WHERE enabled = 1') if ha.is_active() else []
 
             if jobs:
                 now = time.time()

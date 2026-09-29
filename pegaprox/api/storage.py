@@ -19,6 +19,7 @@ from pegaprox.constants import *
 from pegaprox.globals import *
 from pegaprox.models.permissions import *
 from pegaprox.core.db import get_db
+from pegaprox.core import ha
 
 from pegaprox.utils.auth import require_auth, load_users
 from pegaprox.utils.audit import log_audit
@@ -1130,6 +1131,10 @@ def run_auto_storage_balance():
     while True:
         try:
             time.sleep(60)  # Check every minute
+
+            # a standby moves no disks, the active instance balances
+            if not ha.is_active():
+                continue
             
             # Get a snapshot of config
             with _storage_config_lock:

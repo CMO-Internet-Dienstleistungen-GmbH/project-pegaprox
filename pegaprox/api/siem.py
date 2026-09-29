@@ -384,6 +384,11 @@ def _worker_loop():
         except Empty:
             continue
         try:
+            # MK Sep 2026 (#625) - a standby forwards too. Its audit rows are its own
+            # (logins, failed logins, promotion) and the active never sees them, so
+            # holding them back would hide exactly what happens on the standby. The
+            # stats _deliver_one writes into siem_targets get replaced by the next
+            # sync, which is harmless.
             for t in _list_enabled():
                 _deliver_one(t, evt)
         except Exception as e:

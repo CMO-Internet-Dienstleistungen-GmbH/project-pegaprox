@@ -66,6 +66,31 @@ def db():
         _reset_rbac_caches()
 
 
+@pytest.fixture(autouse=True)
+def _ha_state_out_of_the_checkout(tmp_path, monkeypatch):
+    """A checkout whose config/ha_state.json says standby would turn every write in
+    the suite into a 409, and a snapshot applied in a test would write the checkout's
+    known_hosts, branding and plugin configs. Every test gets its own throwaway set;
+    AES_KEY_FILE too, because a .pre-ha backup next to it marks a joined instance."""
+    from pegaprox.core import ha
+    ha_dir = tmp_path / 'ha'
+    ha_dir.mkdir(exist_ok=True)
+    monkeypatch.setattr(ha, 'STATE_FILE', str(ha_dir / 'ha_state.json'))
+    monkeypatch.setattr(ha, 'AES_KEY_FILE', str(ha_dir / '.pegaprox_aes256.key'))
+    monkeypatch.setattr(ha, 'KNOWN_HOSTS_FILE', str(ha_dir / '.ssh_known_hosts'))
+    monkeypatch.setattr(ha, 'BRANDING_DIR', str(ha_dir / 'branding'))
+    monkeypatch.setattr(ha, 'PLUGINS_DIR', str(ha_dir / 'plugins'))
+    # an applied snapshot reloads the IP allow list from that test's database into
+    # module globals; without this a later test in the run meets someone else's list
+    import pegaprox.api.settings as settings_api
+    monkeypatch.setattr(settings_api, '_ip_whitelist_enabled', False)
+    monkeypatch.setattr(settings_api, '_ip_whitelist', set())
+    monkeypatch.setattr(settings_api, '_ip_blacklist', set())
+    ha.reset_for_tests()
+    yield
+    ha.reset_for_tests()
+
+
 def _reset_api_rate_window():
     """Forget every client the API rate limiter has seen. Shared process state, and the
     whole harness looks like one client to it."""
