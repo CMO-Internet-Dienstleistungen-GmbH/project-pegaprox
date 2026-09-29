@@ -607,6 +607,144 @@ def test_a_tenant_confined_holder_is_turned_away_everywhere(api, seed):
     assert _admin(api, seed).get(f'/api/auto-install/profiles/{pid}').get_json()['name'] == 'rack-7 node'
 
 
+# --- every session route against every kind of caller ---------------------------
+
+def _session_routes(pid, rid):
+    """(method, path, body, needs). The tests above pick routes by hand; this list is
+    all of them, so a route added later without a gate shows up here."""
+    return [
+        ('get', '/api/auto-install/profiles', None, 'view'),
+        ('get', f'/api/auto-install/profiles/{pid}', None, 'view'),
+        ('get', '/api/auto-install/runs', None, 'view'),
+        ('post', '/api/auto-install/profiles', {'name': 'x', 'answer': ANSWER}, 'manage'),
+        ('put', f'/api/auto-install/profiles/{pid}', {'name': 'mine now', 'answer': ANSWER}, 'manage'),
+        ('post', f'/api/auto-install/profiles/{pid}/token', None, 'manage'),
+        ('delete', f'/api/auto-install/profiles/{pid}', None, 'manage'),
+        ('post', '/api/auto-install/validate', {'answer': ANSWER}, 'manage'),
+        ('post', '/api/auto-install/password-hash', {'password': 'long-enough-9'}, 'manage'),
+        ('post', '/api/auto-install/compose', {'fields': FIELDS}, 'manage'),
+        ('delete', f'/api/auto-install/runs/{rid}', None, 'manage'),
+    ]
+
+
+def test_the_route_list_above_is_complete(api):
+    listed = {(m.upper(), re.sub(r'<[^>]+>', '<x>', p))
+              for m, p, _b, _n in _session_routes('<x>', '<x>')}
+    served = set()
+    for rule in api.app.url_map.iter_rules():
+        if rule.rule.startswith('/api/auto-install/') and rule.rule not in (
+                '/api/auto-install/answer', '/api/auto-install/progress'):
+            for m in rule.methods - {'HEAD', 'OPTIONS'}:
+                served.add((m, re.sub(r'<[^>]+>', '<x>', rule.rule)))
+    assert served == listed
+
+
+def _one_install(api, seed):
+    a = _admin(api, seed)
+    created = _create(a)
+    served = _fetch(api, created['token']).get_data(as_text=True)
+    return a, created, served, _runs(a)[0]['id']
+
+
+def _send(client, method, path, body, **kw):
+    if body is not None:
+        kw['json'] = body
+    return getattr(client, method)(path, **kw)
+
+
+def _stored(pid):
+    row = _profile_row(pid)
+    return row['name'], row['token_hash'], row['answer_encrypted'], row['enabled']
+
+
+def test_no_session_route_answers_without_a_login(api, seed):
+    a, created, _served, rid = _one_install(api, seed)
+    before = _stored(created['id'])
+    for method, path, body, _needs in _session_routes(created['id'], rid):
+        assert _send(api.anon(), method, path, body).status_code == 401, (method, path)
+    assert _stored(created['id']) == before
+    assert len(_runs(a)) == 1
+
+
+@pytest.mark.parametrize('kind', ['no_permission', 'view_only', 'tenant_user', 'capped_admin'])
+def test_below_manage_nothing_changes(api, seed, kind):
+    """view_only may read, and reads the file blanked. Everyone else gets nothing,
+    and none of the refused writes may have touched the profile or its run."""
+    a, created, _served, rid = _one_install(api, seed)
+    pid = created['id']
+    both = ['autoinstall.view', 'autoinstall.manage']
+    if kind == 'no_permission':
+        c = api.as_user(seed.user('nobody', role='user'))
+    elif kind == 'view_only':
+        c = _viewer(api, seed)
+    elif kind == 'tenant_user':
+        seed.tenant('initech', ['cluster_1'])
+        c = api.as_user(seed.user('ops2', role='user', tenant_id='initech', permissions=both))
+    else:
+        # an admin that an LDAP tenant mapping has lowered where they live
+        seed.tenant('globex', ['cluster_globex'])
+        c = api.as_user(seed.user('gx', role='admin', tenant_id='globex', permissions=both,
+                                  tenant_permissions={'globex': {'role': 'user'}}))
+    before = _stored(pid)
+    for method, path, body, needs in _session_routes(pid, rid):
+        r = _send(c, method, path, body)
+        if kind == 'view_only' and needs == 'view':
+            assert r.status_code == 200, (method, path, r.status_code)
+            assert 'hunter2-in-the-rack' not in r.get_data(as_text=True), path
+        else:
+            assert r.status_code == 403, (kind, method, path, r.status_code, r.data)
+    assert _stored(pid) == before
+    assert len(_runs(a)) == 1
+
+
+def test_an_admins_viewer_token_reaches_none_of_it(api, seed):
+    from pegaprox.utils.auth import create_api_token
+    _a, created, _served, rid = _one_install(api, seed)
+    res = create_api_token('root', 'ci', role='viewer')
+    assert res.get('success'), res
+    auth = {'Authorization': f"Bearer {res['token']}"}
+    for method, path, body, _needs in _session_routes(created['id'], rid):
+        r = _send(api.anon(), method, path, body, headers=auth)
+        assert r.status_code == 403, (method, path, r.status_code)
+
+
+def test_a_callback_token_does_not_fetch_an_answer(api, seed):
+    a, _created, served, _rid = _one_install(api, seed)
+    query = urlsplit(_hook(served)['url']).query
+    callback_token = query.split('=', 1)[1].split('&', 1)[0]
+    assert _fetch(api, callback_token).status_code in (401, 403)
+    assert len(_runs(a)) == 1
+
+
+def test_deleting_a_profile_ends_its_callbacks(api, seed):
+    a, created, served, _rid = _one_install(api, seed)
+    assert a.delete(f"/api/auto-install/profiles/{created['id']}").status_code == 200
+    assert _report(api, served).status_code in (401, 403, 404)
+
+
+@pytest.mark.parametrize('field,value', [
+    ('enabled', 'false'), ('enabled', '0'), ('enabled', 'no'), ('enabled', None), ('enabled', 2),
+    ('max_uses', True),
+])
+def test_enabled_and_max_uses_are_not_read_loosely(api, seed, field, value):
+    """A string "false" is truthy. A script that revoked a profile that way got a
+    200 and a profile that still served its file."""
+    a = _admin(api, seed)
+    created = _create(a)
+    r = a.put(f"/api/auto-install/profiles/{created['id']}", json={field: value})
+    assert r.status_code == 400, (r.status_code, r.data)
+    row = _profile_row(created['id'])
+    assert row['enabled'] == 1 and row['max_uses'] == 0
+
+
+def test_enabled_false_still_revokes(api, seed):
+    a = _admin(api, seed)
+    created = _create(a)
+    assert a.put(f"/api/auto-install/profiles/{created['id']}", json={'enabled': False}).status_code == 200
+    assert _profile_row(created['id'])['enabled'] == 0
+    assert _fetch(api, created['token']).status_code in (401, 403)
+
+
 # --- validation -------------------------------------------------------------------
 
 @pytest.mark.parametrize('answer,needle', [

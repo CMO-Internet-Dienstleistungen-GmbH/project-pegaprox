@@ -1126,8 +1126,16 @@ def _profile_payload(data, existing=None):
     if fp and not re.match(r'^[0-9A-F]{2}(:[0-9A-F]{2}){31}$', fp):
         return None, 'callback_fingerprint must be a SHA-256 fingerprint (32 colon-separated hex bytes)'
 
+    # a string "false" is truthy, so a script revoking a profile that way left it live
+    enabled = pick('enabled', True)
+    if enabled not in (True, False, 0, 1):
+        return None, 'enabled must be true or false'
+
+    raw_uses = pick('max_uses', 0)
+    if isinstance(raw_uses, bool):
+        return None, 'max_uses must be a number'
     try:
-        max_uses = int(pick('max_uses', 0) or 0)
+        max_uses = int(raw_uses or 0)
     except (TypeError, ValueError):
         return None, 'max_uses must be a number'
     if max_uses < 0 or max_uses > 10000:
@@ -1149,7 +1157,7 @@ def _profile_payload(data, existing=None):
         'callback_fingerprint': fp,
         'max_uses': max_uses,
         'expires_at': expires_at,
-        'enabled': 1 if pick('enabled', True) else 0,
+        'enabled': 1 if enabled else 0,
     }, None
 
 
