@@ -140,8 +140,10 @@ def test_the_zero_cluster_card_is_the_way_in_before_any_cluster_exists(sidebar):
     """The sidebar entry only renders once a cluster exists. Before that the empty
     card is the only way in - for a view-only account too, or it could not watch the
     first hosts install. A manager lands in the wizard, as the label promises."""
-    card = sidebar[:sidebar.index(') : (')]
-    assert '{canAutoInstall && (' in card
+    # up to the cluster list; the card has a ternary of its own now (#625: a standby
+    # says why the list is empty instead)
+    card = sidebar[:sidebar.index('<div className="space-y-3">')]
+    assert '{canAutoInstall && !haStandby && (' in card
     assert "openAutoInstall(user?.autoinstall_access === 'manage' ? { wizard: true } : null)" in card
     assert "t('autoInstallFirstHost')" in card and "t('autoInstall')" in card
 
@@ -178,7 +180,7 @@ def test_the_landing_empty_states_render_the_cta_only_when_given():
 
     body = src[start:src.index('function GroupSettingsModal(', start)]
     # Corporate and Modern each have one empty state
-    assert body.count('{onAutoInstall && (') == 2
+    assert body.count('{onAutoInstall && !haStandby && (') == 2   # not on a standby (#625)
     assert body.count('onClick={onAutoInstall}') == 2
     assert body.count("t('autoInstallFirstHost')") == 2
 

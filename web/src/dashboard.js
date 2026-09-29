@@ -776,6 +776,58 @@
             );
         }
 
+        // LW Sep 2026 (#625) - on a standby every page says where its configuration comes
+        // from and that changes belong on the active one. Admins get a way to the HA tab.
+        // Cloud passes cloud so it picks up the shell's own tokens.
+        function HaStandbyBanner({ onOpenHa, cloud = false }) {
+            const { t, language } = useTranslation();
+            const { ha, isAdmin } = useAuth();
+            const [, setTick] = useState(0);
+            const standby = ha?.role === 'standby';
+
+            // "2 minutes ago" has to move on between two /auth/check polls
+            useEffect(() => {
+                if (!standby) return;
+                const h = setInterval(() => setTick(n => n + 1), 30000);
+                return () => clearInterval(h);
+            }, [standby]);
+
+            if (!standby) return null;
+
+            const text = t('pgHaBannerStandby')
+                .replace('{url}', ha.peer_url || '-')
+                .replace('{time}', ha.last_sync_at ? haRelTime(ha.last_sync_at, language) : t('pgHaNotYet'));
+            const button = isAdmin && onOpenHa && (
+                <button onClick={onOpenHa}
+                    className={cloud ? 'cloud-btn cloud-btn-sm' : 'px-3 py-1 rounded-lg text-xs font-medium bg-yellow-600 hover:bg-yellow-700 text-white whitespace-nowrap'}
+                    style={cloud ? { whiteSpace: 'nowrap' } : undefined}>
+                    {t('pgHaTab')}
+                </button>
+            );
+
+            if (cloud) {
+                return (
+                    <div data-ha-banner="cloud" role="status"
+                        style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 16px', fontSize: 13,
+                                 background: 'rgba(245,185,69,0.14)', borderBottom: '1px solid rgba(245,185,69,0.42)',
+                                 color: 'var(--cloud-warning, #e0a82e)' }}>
+                        <span style={{ display: 'inline-flex', flexShrink: 0 }}><Icons.Layers /></span>
+                        <span style={{ flex: '1 1 auto', minWidth: 0 }}>{text}</span>
+                        {button}
+                    </div>
+                );
+            }
+            return (
+                <div data-ha-banner="classic" role="status" className="px-4 py-2 bg-yellow-500/10 border-b border-yellow-500/40">
+                    <div className="flex items-center gap-3 text-sm">
+                        <span className="flex-shrink-0 text-yellow-400"><Icons.Layers /></span>
+                        <span className="flex-1 min-w-0 text-yellow-300">{text}</span>
+                        {button}
+                    </div>
+                </div>
+            );
+        }
+
         // Cluster Sidebar Item Component - NS Jan 2026
         function ClusterSidebarItem({ cluster, idx, selectedCluster, setSelectedCluster, nodeAlerts, clusterGroups, isAdmin, handleDeleteCluster, setShowAssignGroup, setRenamingCluster, setRenameValue, setReconfigureCluster, t, getAuthHeaders, fetchClusters, addToast, isCorporate, expandedSidebarClusters, toggleSidebarCluster, onContextMenu, hwHealth }) {
             const offlineNodesCount = Object.values(nodeAlerts || {})
@@ -7992,7 +8044,9 @@
 
         function PegaProxDashboard() {
             const { t } = useTranslation();
-            const { user, sessionId, logout, getAuthHeaders, isAdmin, passwordExpiry, updatePreferences } = useAuth();
+            const { user, sessionId, logout, getAuthHeaders, isAdmin, passwordExpiry, updatePreferences, ha } = useAuth();
+            // #625: a standby starts no cluster managers, so its cluster list is empty on purpose
+            const haStandby = (ha || {}).role === 'standby';
             const can = (permission) => isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes(permission));
             // not can(): the auto-install routes also refuse tenant/cluster-confined callers
             // (capped admins included), the server folds that into this flag for us
@@ -8036,6 +8090,11 @@
             const [sidebarWorldmap, setSidebarWorldmap] = useState(false);
             const [showUserMenu, setShowUserMenu] = useState(false);
             const [showSettings, setShowSettings] = useState(false);
+            // the modal is always mounted and listens, so the tab switch lands right away
+            const openHaSettings = () => {
+                setShowSettings(true);
+                window.dispatchEvent(new CustomEvent('pegaprox-navigate-ha'));
+            };
             const [showProfile, setShowProfile] = useState(false);
             // LW Apr 2026 — global fuzzy-search palette (Ctrl/Cmd+K)
             const [showCommandPalette, setShowCommandPalette] = useState(false);
@@ -13976,6 +14035,7 @@
                 <div className={`min-h-screen bg-proxmox-darker text-white ${isCorporate ? 'pb-7' : ''}`} style={{ overflowX: 'clip' }}>
                     {/* LW: Password Expiry Warning */}
                     <PasswordExpiryBanner onChangePassword={() => setShowProfile(true)} />
+                    <HaStandbyBanner onOpenHa={openHaSettings} />
                     
                     {/* Node Offline Alert Banner */}
                     <NodeAlertBanner 
@@ -14616,6 +14676,9 @@
                                             <div className="w-12 h-12 mx-auto mb-3 rounded-full bg-proxmox-dark flex items-center justify-center">
                                                 <Icons.Server />
                                             </div>
+                                            {haStandby ? (
+                                                <p className="text-gray-400 text-sm">{t('pgHaNoClustersHere')}</p>
+                                            ) : (<>
                                             <p className="text-gray-400 text-sm">{t('noClusterSelected')}</p>
                                             <button
                                                 onClick={() => setShowAddModal(true)}
@@ -14623,10 +14686,11 @@
                                             >
                                                 {t('addFirstCluster')}
                                             </button>
+                                            </>)}
                                             {/* bare-metal first: the global entry below is hidden until a cluster
                                                 exists, so this is the way in - a manager straight into the wizard,
                                                 a view-only account onto the page to watch the runs */}
-                                            {canAutoInstall && (
+                                            {canAutoInstall && !haStandby && (
                                                 <button
                                                     onClick={() => openAutoInstall(user?.autoinstall_access === 'manage' ? { wizard: true } : null)}
                                                     className="block mx-auto mt-2 text-xs text-gray-400 hover:text-proxmox-orange hover:underline"

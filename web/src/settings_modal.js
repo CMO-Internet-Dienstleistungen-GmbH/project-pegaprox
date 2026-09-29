@@ -2464,7 +2464,7 @@
         // PegaProx Settings Modal with User Management and Audit Log
         function PegaProxSettingsModal({ isOpen, onClose, addToast, onGroupsChanged }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, user: currentUser } = useAuth();
+            const { getAuthHeaders, user: currentUser, isAdmin } = useAuth();
             const { isCorporate } = useLayout(); // LW: Feb 2026 - Corporate styling
             const [activeTab, setActiveTab] = useState('users');
             const [users, setUsers] = useState([]);
@@ -2708,6 +2708,13 @@
                 };
                 window.addEventListener('pegaprox-navigate-updates', handleNavigateUpdates);
                 return () => window.removeEventListener('pegaprox-navigate-updates', handleNavigateUpdates);
+            }, []);
+
+            // the standby banner opens us on the HA tab
+            useEffect(() => {
+                const toHa = () => setActiveTab('ha');
+                window.addEventListener('pegaprox-navigate-ha', toHa);
+                return () => window.removeEventListener('pegaprox-navigate-ha', toHa);
             }, []);
             
             // Fetch password policy - NS Jan 2026
@@ -4460,6 +4467,19 @@
                                 <Icons.Server className="w-4 h-4" />
                                 <span>{t('server') || 'Server'}</span>
                             </button>
+                            {isAdmin && (
+                            <button
+                                onClick={() => setActiveTab('ha')}
+                                className={`flex items-center gap-2 ${isCorporate ? 'px-3 py-1.5 text-[13px]' : 'px-4 py-2.5 text-sm'} font-medium transition-colors whitespace-nowrap ${
+                                    activeTab === 'ha'
+                                        ? (isCorporate ? 'text-white border-b-2 border-[#49afd9] font-medium' : 'text-proxmox-orange border-b-2 border-proxmox-orange bg-proxmox-dark/50')
+                                        : 'text-gray-400 hover:text-white hover:bg-proxmox-dark/30'
+                                }`}
+                            >
+                                <Icons.Layers className="w-4 h-4" />
+                                <span>{t('pgHaTab')}</span>
+                            </button>
+                            )}
                             <button
                                 onClick={() => setActiveTab('syslog')}
                                 className={`flex items-center gap-2 ${isCorporate ? 'px-3 py-1.5 text-[13px]' : 'px-4 py-2.5 text-sm'} font-medium transition-colors whitespace-nowrap ${
@@ -8981,6 +9001,11 @@
                                 </div>
                             )}
 
+                            {/* LW Sep 2026 (#625) - warm standby for PegaProx itself */}
+                            {activeTab === 'ha' && isAdmin && (
+                                <HaPanel t={t} addToast={addToast} getAuthHeaders={getAuthHeaders} />
+                            )}
+
                             {/* MK May 2026 — SIEM Forwarder Tab */}
                             {activeTab === 'siem' && (
                                 <SIEMTab addToast={addToast} t={t} getAuthHeaders={getAuthHeaders} />
@@ -9698,5 +9723,575 @@
                         </div>
                     )}
                 </>
+            );
+        }
+
+        // ═══════════════════════════════════════════════
+        // PegaProx - High Availability (#625)
+        // HaPanel (settings tab), HaRestartOverlay, haRelTime
+        // ═══════════════════════════════════════════════
+
+        // "3 minutes ago" in the UI language. Intl speaks all nine, so no keys for it.
+        // A server clock a little ahead of the browser must not read "in 5 seconds".
+        function haRelTime(iso, language) {
+            if (!iso) return '';
+            const ts = new Date(iso).getTime();
+            if (isNaN(ts)) return '';
+            const sec = Math.min(0, Math.round((ts - Date.now()) / 1000));
+            const abs = Math.abs(sec);
+            const [n, unit] = abs < 60 ? [sec, 'second']
+                : abs < 3600 ? [Math.round(sec / 60), 'minute']
+                : abs < 86400 ? [Math.round(sec / 3600), 'hour']
+                : [Math.round(sec / 86400), 'day'];
+            try {
+                return new Intl.RelativeTimeFormat(language || undefined, { numeric: 'auto' }).format(n, unit);
+            } catch (_) {
+                return fmtDate(iso);
+            }
+        }
+
+        const HA_ROLE_STYLE = {
+            standalone: 'bg-gray-500/20 text-gray-300 border-gray-500/30',
+            active: 'bg-green-500/20 text-green-300 border-green-500/30',
+            standby: 'bg-yellow-500/20 text-yellow-300 border-yellow-500/40',
+        };
+
+        function HaRoleBadge({ role, t }) {
+            const label = { standalone: t('pgHaRoleStandalone'), active: t('pgHaRoleActive'), standby: t('pgHaRoleStandby') }[role] || role || '-';
+            return (
+                <span className={`px-2 py-0.5 rounded-full border text-xs font-medium ${HA_ROLE_STYLE[role] || HA_ROLE_STYLE.standalone}`}>
+                    {label}
+                </span>
+            );
+        }
+
+        // Covers the page while the process restarts into its new role, then reloads.
+        // The old process keeps answering for a second or two after the request, so a
+        // plain "it answers" is not enough: wait until it was gone and came back, or it
+        // answers in the new role after a while. After 120 s reload regardless.
+        function HaRestartOverlay({ t, expectRole }) {
+            useEffect(() => {
+                const started = Date.now();
+                let seenDown = false, stop = false, timer = null;
+                const tick = async () => {
+                    let up = false, role = null;
+                    try {
+                        const r = await fetch(`${API_URL}/auth/check?t=${Date.now()}`, { credentials: 'include', cache: 'no-store' });
+                        if (r.status >= 502) {
+                            seenDown = true;  // a reverse proxy in front answers for the dead backend
+                        } else {
+                            up = true;
+                            const d = await r.json().catch(() => ({}));
+                            role = d.ha_role || (d.ha && d.ha.role) || null;
+                        }
+                    } catch (_) {
+                        seenDown = true;
+                    }
+                    if (stop) return;
+                    const elapsed = Date.now() - started;
+                    if (elapsed >= 120000 || (up && seenDown) || (up && elapsed >= 10000 && role === expectRole)) {
+                        window.location.reload();
+                        return;
+                    }
+                    timer = setTimeout(tick, 2000);
+                };
+                timer = setTimeout(tick, 2000);
+                return () => { stop = true; clearTimeout(timer); };
+            }, []);
+            return ReactDOM.createPortal(
+                <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 p-4" role="alertdialog" aria-live="assertive">
+                    <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-6 max-w-md w-full text-center space-y-3">
+                        <div className="flex justify-center py-2 text-proxmox-orange" style={{ transform: 'scale(1.75)' }}>
+                            <span className="inline-flex animate-spin"><Icons.RefreshCw /></span>
+                        </div>
+                        <div className="text-lg font-semibold text-white">{t('pgHaRestarting')}</div>
+                        <div className="text-sm text-gray-400">{t('pgHaRestartingHint')}</div>
+                    </div>
+                </div>,
+                document.body
+            );
+        }
+
+        function HaPanel({ t, addToast, getAuthHeaders }) {
+            const { language } = useTranslation();
+            const { refreshHa, user, logout } = useAuth();
+            const [status, setStatus] = useState(null);
+            const [loadError, setLoadError] = useState('');
+            const [busy, setBusy] = useState('');
+            const [ownUrl, setOwnUrl] = useState('');
+            const [code, setCode] = useState(null);          // {code, expires_at}, shown once
+            const [now, setNow] = useState(Date.now());
+            const [joinCode, setJoinCode] = useState('');
+            const [joinUrl, setJoinUrl] = useState('');
+            const [joinConfirm, setJoinConfirm] = useState(false);
+            const [joinError, setJoinError] = useState('');
+            const [interval, setIntervalValue] = useState('');
+            const [confirmAction, setConfirmAction] = useState(null);   // 'promote' | 'unpair'
+            const [typed, setTyped] = useState('');
+            const [restarting, setRestarting] = useState(null);         // role we restart into
+            const [passwords, setPasswords] = useState({ code: '', join: '', confirm: '' });
+            const [reauth, setReauth] = useState(null);                 // {form, code, error} of a refused re-auth
+
+            const load = async () => {
+                try {
+                    const r = await fetch(`${API_URL}/ha/status`, { credentials: 'include', headers: getAuthHeaders() });
+                    if (!r.ok) {
+                        setLoadError(await PegaProxApiErrors.message(r, t('pgHaLoadFailed')));
+                        return;
+                    }
+                    const data = await r.json();
+                    setStatus(data);
+                    setLoadError('');
+                    // prefill once, never over something typed
+                    setOwnUrl(v => v || data.suggested_url || '');
+                    setJoinUrl(v => v || data.suggested_url || '');
+                    setIntervalValue(v => v === '' ? String(data.interval || 30) : v);
+                } catch (e) {
+                    setLoadError(t('pgHaLoadFailed'));
+                }
+            };
+            useEffect(() => { load(); }, []);
+
+            // last contact and sync move on their own; the active also learns here that
+            // a standby took its code
+            useEffect(() => {
+                if (restarting) return;
+                const h = setInterval(load, 10000);
+                return () => clearInterval(h);
+            }, [restarting]);
+
+            useEffect(() => {
+                if (!code) return;
+                const h = setInterval(() => setNow(Date.now()), 1000);
+                return () => clearInterval(h);
+            }, [code]);
+
+            const role = status?.role || 'standalone';
+            useEffect(() => { if (role !== 'standalone') setCode(null); }, [role]);
+
+            // POST/PUT to /api/ha/*; the error text comes from the server as is, the
+            // code tells a refused re-auth apart from everything else
+            const send = async (method, path, body, fallback) => {
+                const r = await fetch(`${API_URL}/ha/${path}`, {
+                    method, credentials: 'include',
+                    headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body || {})
+                });
+                if (!r.ok) {
+                    const code = (await r.clone().json().catch(() => null))?.code || '';
+                    return { ok: false, code, error: await PegaProxApiErrors.message(r, fallback || t('pgHaActionFailed')) };
+                }
+                return { ok: true, data: await r.json().catch(() => ({})) };
+            };
+
+            // Pairing, joining, promoting and unpairing hand the deployment over or take
+            // it over, so the server asks for the account's own password once more. SSO
+            // accounts have none here; for them it checks how fresh the sign-in is.
+            const sso = ['oidc', 'entra'].includes(user?.auth_source);
+            const setPassword = (form, value) => setPasswords(p => ({ ...p, [form]: value }));
+            const needsPassword = (form) => !sso && !passwords[form];
+            const withPassword = (form, body) => sso ? body : { ...body, user_password: passwords[form] };
+            // a refused re-auth stays next to its field, and the field is emptied for the next try
+            const reauthRefused = (form, res) => {
+                if (res.code !== 'HA_REAUTH' && res.code !== 'HA_REAUTH_RECENT') return false;
+                setReauth({ form, code: res.code, error: res.error });
+                setPassword(form, '');
+                return true;
+            };
+
+            const run = async (name, fn) => {
+                setBusy(name);
+                try { await fn(); }
+                catch (e) { addToast?.(e.message || t('pgHaActionFailed'), 'error'); }
+                setBusy('');
+            };
+
+            const createCode = () => run('code', async () => {
+                setReauth(null);
+                const url = ownUrl.trim();
+                if (!url.startsWith('https://')) { addToast?.(t('pgHaUrlHttps'), 'error'); return; }
+                const res = await send('POST', 'pairing-code', withPassword('code', { url }));
+                if (!res.ok) { if (!reauthRefused('code', res)) addToast?.(res.error, 'error'); return; }
+                setPassword('code', '');
+                setCode({ code: res.data.code, expires_at: res.data.expires_at });
+                setNow(Date.now());
+                load();
+            });
+
+            const join = () => run('join', async () => {
+                setJoinError('');
+                setReauth(null);
+                const url = joinUrl.trim();
+                if (!url.startsWith('https://')) { setJoinError(t('pgHaUrlHttps')); return; }
+                const res = await send('POST', 'join', withPassword('join', { code: joinCode.trim(), own_url: url, confirm: true }));
+                if (!res.ok) { if (!reauthRefused('join', res)) setJoinError(res.error); return; }
+                setJoinCode('');
+                setPassword('join', '');
+                if (res.data.restarting) setRestarting('standby');
+                else load();
+            });
+
+            const syncNow = () => run('sync', async () => {
+                const res = await send('POST', 'sync-now', {}, t('pgHaSyncFailed'));
+                if (!res.ok) { addToast?.(res.error, 'error'); return; }
+                if (res.data.status) setStatus(s => ({ ...(s || {}), ...res.data.status }));
+                const result = res.data.result;
+                if (result === 'applied') addToast?.(t('pgHaSyncApplied'), 'success');
+                else if (result === 'unchanged') addToast?.(t('pgHaSyncUnchanged'), 'info');
+                else addToast?.((res.data.status?.sync?.last_error) || t('pgHaSyncFailed'), 'error');
+                refreshHa?.();
+            });
+
+            const saveInterval = () => run('interval', async () => {
+                const n = Number(interval);
+                if (!Number.isInteger(n) || n < 5 || n > 3600) { addToast?.(t('pgHaIntervalRange'), 'error'); return; }
+                const res = await send('PUT', 'settings', { interval: n });
+                if (!res.ok) { addToast?.(res.error, 'error'); return; }
+                setIntervalValue(String(res.data.interval || n));
+                addToast?.(t('pgHaIntervalSaved'), 'success');
+                load();
+            });
+
+            const WORD = { promote: 'PROMOTE', unpair: 'UNPAIR' };
+            // null closes the box; either way nothing typed survives into the next one
+            const openConfirm = (what) => {
+                setConfirmAction(what);
+                setTyped('');
+                setPassword('confirm', '');
+                setReauth(null);
+            };
+            const confirmed = () => run(confirmAction, async () => {
+                const what = confirmAction;
+                setReauth(null);
+                const res = await send('POST', what, withPassword('confirm', { confirm: WORD[what] }));
+                if (!res.ok) { if (!reauthRefused('confirm', res)) addToast?.(res.error, 'error'); return; }
+                openConfirm(null);
+                if (res.data.restarting) {
+                    setRestarting(what === 'promote' ? 'active' : 'standalone');
+                } else {
+                    addToast?.(t('pgHaUnpaired'), 'success');
+                    load();
+                }
+            });
+
+            const when = (iso) => iso ? <span title={fmtDate(iso)}>{haRelTime(iso, language)}</span> : <span className="text-gray-500">{t('pgHaNever')}</span>;
+            const countdown = (() => {
+                if (!code) return '';
+                const left = Math.max(0, Math.floor(code.expires_at - now / 1000));
+                return `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`;
+            })();
+            const codeExpired = code && code.expires_at * 1000 <= now;
+
+            const card = 'bg-proxmox-dark border border-proxmox-border rounded-xl p-4 space-y-3';
+            const field = 'px-3 py-2 bg-proxmox-card border border-proxmox-border rounded text-sm text-white disabled:opacity-50';
+            const input = `w-full ${field}`;
+            const btn = 'flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed';
+            const btnGhost = `${btn} bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white hover:border-gray-500`;
+            const row = (label, value) => (
+                <div className="flex items-start justify-between gap-4 text-sm">
+                    <span className="text-gray-400 whitespace-nowrap">{label}</span>
+                    <span className="text-gray-200 text-right min-w-0 break-all">{value}</span>
+                </div>
+            );
+
+            const peer = status?.peer;
+            const sync = status?.sync || {};
+            const skipped = Object.entries(sync.skipped_columns || {}).filter(([, cols]) => cols && cols.length);
+            // an unreadable state file: the server refuses promote and the interval (409),
+            // so the panel offers neither and says why in the red note
+            const broken = !!status?.broken;
+
+            const passwordInput = (form, id) => !sso && (
+                <div>
+                    <label className="block text-xs text-gray-400 mb-1" htmlFor={id}>{t('pgHaPassword')}</label>
+                    <input id={id} type="password" autoComplete="current-password" data-lpignore="true" data-1p-ignore="true" data-bwignore="true"
+                        value={passwords[form]} onChange={e => setPassword(form, e.target.value)}
+                        aria-invalid={reauth?.form === form ? 'true' : undefined}
+                        aria-describedby={reauth?.form === form ? `${id}-error` : undefined} className={input} />
+                </div>
+            );
+            const reauthNote = (form, id) => reauth?.form === form && (
+                <div id={`${id}-error`} data-ha-reauth={reauth.code}
+                    className="rounded-lg p-2 text-sm border bg-red-500/10 border-red-500/30 text-red-300 space-y-2">
+                    <div className="break-all">{reauth.error}</div>
+                    {reauth.code === 'HA_REAUTH_RECENT' && (
+                        <button onClick={() => logout()} className={btnGhost}>
+                            <Icons.LogOut />
+                            {t('pgHaSignInAgain')}
+                        </button>
+                    )}
+                </div>
+            );
+
+            const peerCard = (
+                <div className={card}>
+                    <h4 className="font-medium text-white flex items-center gap-2">
+                        <Icons.Link />
+                        {t('pgHaPeer')}
+                    </h4>
+                    {peer ? (
+                        <div className="space-y-1.5">
+                            {row(t('pgHaPeerUrl'), <span className="font-mono text-xs">{peer.url || '-'}</span>)}
+                            {row(t('pgHaLastContact'), when(peer.last_contact))}
+                            {row(t('pgHaPeerSeen'), <span className="flex items-center justify-end gap-2">
+                                {peer.role_seen ? <HaRoleBadge role={peer.role_seen} t={t} /> : '-'}
+                                <span className="text-xs text-gray-400">{t('pgHaEpoch')} {peer.epoch_seen ?? '-'}</span>
+                            </span>)}
+                            {row(t('pgHaPairedAt'), when(peer.paired_at))}
+                            {peer.last_error && (
+                                <div className="rounded-lg p-2 text-xs border bg-red-500/10 border-red-500/30 text-red-300 break-all">
+                                    {t('pgHaLastError')}: {peer.last_error}
+                                </div>
+                            )}
+                        </div>
+                    ) : (
+                        <p className="text-sm text-gray-400">{t('pgHaNoPeer')}</p>
+                    )}
+                </div>
+            );
+
+            const intervalCard = (
+                <div className={card}>
+                    <label className="block text-sm font-medium text-white" htmlFor="pgha-interval">{t('pgHaInterval')}</label>
+                    <div className="flex items-center gap-2">
+                        <input id="pgha-interval" type="number" min="5" max="3600" value={interval} disabled={broken}
+                            onChange={e => setIntervalValue(e.target.value)} className={`w-32 ${field}`} />
+                        <button onClick={saveInterval} disabled={!!busy || broken} className={btnGhost}>{t('save')}</button>
+                    </div>
+                    <p className="text-xs text-gray-500">{t('pgHaIntervalHint')}</p>
+                </div>
+            );
+
+            // a poll can report the file unreadable while the promote box is open
+            const typedBox = confirmAction && !(confirmAction === 'promote' && broken) && (
+                <div className="rounded-xl p-4 space-y-3 border bg-red-500/10 border-red-500/30">
+                    <p className="text-sm text-red-300">
+                        {confirmAction === 'promote' ? t('pgHaPromoteDesc')
+                            : role === 'standby' ? t('pgHaUnpairStandbyDesc') : t('pgHaUnpairActiveDesc')}
+                    </p>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 max-w-xl">
+                        <div>
+                            <label className="block text-xs text-gray-400 mb-1" htmlFor="pgha-typed">
+                                {t('pgHaTypeToConfirm').replace('{word}', WORD[confirmAction])}
+                            </label>
+                            <input id="pgha-typed" value={typed} onChange={e => setTyped(e.target.value)} autoComplete="off"
+                                spellCheck={false} className={`${input} font-mono`} placeholder={WORD[confirmAction]} />
+                        </div>
+                        {passwordInput('confirm', 'pgha-confirm-password')}
+                    </div>
+                    {reauthNote('confirm', 'pgha-confirm-password')}
+                    <div className="flex flex-wrap items-center gap-2">
+                        <button onClick={confirmed} disabled={typed !== WORD[confirmAction] || needsPassword('confirm') || !!busy}
+                            className={`${btn} bg-red-600 hover:bg-red-700 text-white`}>
+                            {confirmAction === 'promote' ? t('pgHaPromote') : t('pgHaUnpair')}
+                        </button>
+                        <button onClick={() => openConfirm(null)} className={btnGhost}>{t('cancel')}</button>
+                    </div>
+                </div>
+            );
+
+            if (!status) {
+                return (
+                    <div className="space-y-4">
+                        {loadError ? (
+                            <div className="rounded-lg p-3 text-sm border bg-red-500/10 border-red-500/30 text-red-300 flex items-center gap-2">
+                                <Icons.AlertTriangle />
+                                {loadError}
+                            </div>
+                        ) : (
+                            <div className="text-sm text-gray-400 flex items-center gap-2">
+                                <span className="inline-flex animate-spin"><Icons.RefreshCw /></span>
+                                {t('loading')}
+                            </div>
+                        )}
+                    </div>
+                );
+            }
+
+            return (
+                <div className="space-y-4" data-ha-role={role}>
+                    {restarting && <HaRestartOverlay t={t} expectRole={restarting} />}
+
+                    <div className={card}>
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                            <h3 className="text-lg font-semibold text-white flex items-center gap-2">
+                                <Icons.Layers />
+                                {t('pgHaTab')}
+                            </h3>
+                            <HaRoleBadge role={role} t={t} />
+                        </div>
+                        <p className="text-sm text-gray-400 max-w-3xl">{t('pgHaIntro')}</p>
+                        <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-gray-400">
+                            <span>{t('pgHaEpoch')}: <span className="text-gray-200">{status.epoch}</span></span>
+                            <span>{t('pgHaInstanceId')}: <span className="font-mono text-gray-200" title={status.instance_id}>{(status.instance_id || '').slice(0, 8)}</span></span>
+                        </div>
+                        {broken && (
+                            <div className="rounded-lg p-3 text-sm border bg-red-500/10 border-red-500/30 text-red-300 space-y-1" data-ha-broken>
+                                <div>{t('pgHaBroken')} <span className="font-mono text-xs">{status.broken}</span></div>
+                                <div className="text-xs">{t('pgHaBrokenLocked')}</div>
+                            </div>
+                        )}
+                        {loadError && <div className="text-xs text-red-400">{loadError}</div>}
+                    </div>
+
+                    {role === 'standalone' && (
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div className={card}>
+                                <h4 className="font-medium text-white flex items-center gap-2">
+                                    <Icons.Key />
+                                    {t('pgHaMakeActiveTitle')}
+                                </h4>
+                                <p className="text-sm text-gray-400">{t('pgHaMakeActiveDesc')}</p>
+                                <div>
+                                    <label className="block text-xs text-gray-400 mb-1" htmlFor="pgha-own-url">{t('pgHaOwnUrl')}</label>
+                                    <input id="pgha-own-url" value={ownUrl} onChange={e => setOwnUrl(e.target.value)}
+                                        placeholder="https://pegaprox-a.example:5000" className={`${input} font-mono`} />
+                                    <div className="text-[11px] text-gray-500 mt-1">{t('pgHaOwnUrlHint')}</div>
+                                </div>
+                                {passwordInput('code', 'pgha-code-password')}
+                                {reauthNote('code', 'pgha-code-password')}
+                                {status.pairing_open_until && !code && (
+                                    <p className="text-xs text-yellow-300">
+                                        {t('pgHaCodeOpen').replace('{time}', fmtDate(status.pairing_open_until))}
+                                    </p>
+                                )}
+                                <button onClick={createCode} disabled={needsPassword('code') || !!busy}
+                                    className={`${btn} bg-proxmox-orange hover:bg-proxmox-orange/90 text-white`}>
+                                    <Icons.Key />
+                                    {t('pgHaCreateCode')}
+                                </button>
+                                {code && (
+                                    <div className="bg-yellow-500/10 border border-yellow-500/40 rounded-xl p-3 space-y-2" data-ha-code>
+                                        <div className="text-xs font-medium text-yellow-200">{t('pgHaCodeOnce')}</div>
+                                        {codeExpired ? (
+                                            <p className="text-sm text-red-300">{t('pgHaCodeExpired')}</p>
+                                        ) : (
+                                            <>
+                                                <div className="flex items-start gap-2">
+                                                    <code className="flex-1 px-3 py-2 bg-black/40 rounded text-xs text-yellow-200 break-all font-mono select-all">{code.code}</code>
+                                                    <span className="shrink-0 inline-flex">
+                                                        <CopyButton value={code.code} size="md" title={t('copy')}
+                                                            className="w-8 h-8 border border-proxmox-border hover:border-gray-500" />
+                                                    </span>
+                                                </div>
+                                                <div className="flex items-center gap-2 text-xs text-gray-400">
+                                                    <Icons.Clock />
+                                                    <span>{t('pgHaCodeExpiresIn').replace('{time}', countdown)}</span>
+                                                </div>
+                                                <p className="text-xs text-gray-400">{t('pgHaCodeNext')}</p>
+                                            </>
+                                        )}
+                                    </div>
+                                )}
+                            </div>
+
+                            <div className={card}>
+                                <h4 className="font-medium text-white flex items-center gap-2">
+                                    <Icons.Link />
+                                    {t('pgHaJoinTitle')}
+                                </h4>
+                                <p className="text-sm text-gray-400">{t('pgHaJoinDesc')}</p>
+                                <div>
+                                    <label className="block text-xs text-gray-400 mb-1" htmlFor="pgha-join-code">{t('pgHaCode')}</label>
+                                    <textarea id="pgha-join-code" value={joinCode} onChange={e => setJoinCode(e.target.value)} rows={3}
+                                        spellCheck={false} autoComplete="off" placeholder="pgxha1_..."
+                                        className={`${input} font-mono text-xs break-all`} />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-gray-400 mb-1" htmlFor="pgha-join-url">{t('pgHaOwnUrl')}</label>
+                                    <input id="pgha-join-url" value={joinUrl} onChange={e => setJoinUrl(e.target.value)}
+                                        placeholder="https://pegaprox-b.example:5000" className={`${input} font-mono`} />
+                                </div>
+                                <div className="rounded-lg p-3 text-sm border bg-yellow-500/10 border-yellow-500/40 text-yellow-200 flex items-start gap-2">
+                                    <span className="mt-0.5 flex-shrink-0"><Icons.AlertTriangle /></span>
+                                    <span>{t('pgHaJoinWarning')}</span>
+                                </div>
+                                <label className="flex items-start gap-2 text-sm text-gray-300 cursor-pointer">
+                                    <input type="checkbox" checked={joinConfirm} onChange={e => setJoinConfirm(e.target.checked)} className="mt-0.5" />
+                                    <span>{t('pgHaJoinConfirm')}</span>
+                                </label>
+                                {passwordInput('join', 'pgha-join-password')}
+                                {reauthNote('join', 'pgha-join-password')}
+                                {joinError && (
+                                    <div className="rounded-lg p-2 text-sm border bg-red-500/10 border-red-500/30 text-red-300 break-all">{joinError}</div>
+                                )}
+                                <button onClick={join} disabled={!joinConfirm || !joinCode.trim() || needsPassword('join') || !!busy}
+                                    className={`${btn} bg-yellow-600 hover:bg-yellow-700 text-white`}>
+                                    <Icons.Link />
+                                    {busy === 'join' ? t('pgHaJoining') : t('pgHaJoin')}
+                                </button>
+                            </div>
+                        </div>
+                    )}
+
+                    {role === 'active' && (
+                        <>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                {peerCard}
+                                {intervalCard}
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                                <button onClick={() => openConfirm('unpair')} disabled={!!busy} className={btnGhost}>
+                                    <Icons.Unlink />
+                                    {t('pgHaUnpair')}
+                                </button>
+                            </div>
+                            {typedBox}
+                        </>
+                    )}
+
+                    {role === 'standby' && (
+                        <>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                {peerCard}
+                                <div className={card}>
+                                    <h4 className="font-medium text-white flex items-center gap-2">
+                                        <Icons.RefreshCw />
+                                        {t('pgHaSync')}
+                                    </h4>
+                                    <div className="space-y-1.5">
+                                        {row(t('pgHaLastSync'), when(sync.last_ok_at))}
+                                        {row(t('pgHaLastAttempt'), when(sync.last_attempt_at))}
+                                        {sync.rows != null && row(t('pgHaSyncContent'),
+                                            t('pgHaRowsTables').replace('{rows}', sync.rows).replace('{tables}', sync.tables ?? 0))}
+                                    </div>
+                                    {sync.last_error && (
+                                        <div className="rounded-lg p-2 text-xs border bg-red-500/10 border-red-500/30 text-red-300 break-all">
+                                            {t('pgHaLastError')}: {sync.last_error}
+                                        </div>
+                                    )}
+                                    {skipped.length > 0 && (
+                                        <div className="rounded-lg p-2 text-xs border bg-yellow-500/10 border-yellow-500/40 text-yellow-200 space-y-1">
+                                            <div>{t('pgHaSkippedColumns')}</div>
+                                            <ul className="font-mono">
+                                                {skipped.map(([table, cols]) => <li key={table}>{table}: {cols.join(', ')}</li>)}
+                                            </ul>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                            {intervalCard}
+                            <div className="flex flex-wrap gap-2">
+                                <button onClick={syncNow} disabled={!!busy}
+                                    className={`${btn} bg-proxmox-orange hover:bg-proxmox-orange/90 text-white`}>
+                                    <span className={`inline-flex ${busy === 'sync' ? 'animate-spin' : ''}`}><Icons.RefreshCw /></span>
+                                    {t('pgHaSyncNow')}
+                                </button>
+                                {!broken && (
+                                    <button onClick={() => openConfirm('promote')} disabled={!!busy}
+                                        className={`${btn} bg-yellow-600 hover:bg-yellow-700 text-white`}>
+                                        <Icons.Zap />
+                                        {t('pgHaPromote')}
+                                    </button>
+                                )}
+                                <button onClick={() => openConfirm('unpair')} disabled={!!busy} className={btnGhost}>
+                                    <Icons.Unlink />
+                                    {t('pgHaUnpair')}
+                                </button>
+                            </div>
+                            {typedBox}
+                        </>
+                    )}
+                </div>
             );
         }

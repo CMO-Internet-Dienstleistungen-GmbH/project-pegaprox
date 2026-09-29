@@ -2485,6 +2485,11 @@
                             currentUser={currentUser}
                             t={T}
                         />
+                        {/* #625 - same banner as the classic layouts, in the shell's colours */}
+                        <HaStandbyBanner cloud onOpenHa={() => {
+                            onOpenSettings && onOpenSettings();
+                            window.dispatchEvent(new CustomEvent('pegaprox-navigate-ha'));
+                        }} />
                         <div className="cloud-content-scroll">
                             {body}
                             <CloudSponsorFooter t={T} />

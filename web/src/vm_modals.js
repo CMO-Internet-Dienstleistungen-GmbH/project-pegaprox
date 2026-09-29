@@ -5131,6 +5131,8 @@
         // LW: All Clusters Overview - GitHub Feature Request #16
         // added a bunch of stuff here - storage, sparklines, sorting etc
         function AllClustersOverview({ clusters, allMetrics, clusterGroups = [], topGuests = [], allClusterGuests = {}, pbsServers = [], onSelectCluster, onSelectVm, topologyOnly = false, onAutoInstall }) {
+            // #625: on a standby the list is empty on purpose - say so instead of offering to add one
+            const haStandby = ((useAuth() || {}).ha || {}).role === 'standby';
             const { t } = useTranslation();
             const { isCorporate } = useLayout();
             const [sortBy, setSortBy] = useState('name');
@@ -5821,8 +5823,8 @@
                         {clusters.length === 0 && (
                             <div className="py-8 text-center text-[13px]" style={{color: '#728b9a'}}>
                                 <Icons.Server className="w-6 h-6 mx-auto mb-2" style={{color: 'var(--corp-border-medium)'}} />
-                                {t('noClustersConfigured') || 'No clusters configured'}
-                                {onAutoInstall && (
+                                {haStandby ? t('pgHaNoClustersHere') : (t('noClustersConfigured') || 'No clusters configured')}
+                                {onAutoInstall && !haStandby && (
                                     <div className="mt-2">
                                         <button onClick={onAutoInstall} className="hover:underline" style={{color: 'var(--corp-accent)'}}>
                                             {t('autoInstallFirstHost')}
@@ -6069,9 +6071,9 @@
                                 <Icons.Server className="w-8 h-8 text-proxmox-orange" />
                             </div>
                             <h3 className="text-lg font-semibold text-white mb-2">{t('noClustersConfigured') || 'No clusters configured'}</h3>
-                            <p className="text-gray-500 text-sm">{t('addClusterToStart') || 'Add a cluster to get started'}</p>
+                            <p className="text-gray-500 text-sm">{haStandby ? t('pgHaNoClustersHere') : (t('addClusterToStart') || 'Add a cluster to get started')}</p>
                             {/* no PVE box yet? the dashboard only passes this to managers */}
-                            {onAutoInstall && (
+                            {onAutoInstall && !haStandby && (
                                 <button
                                     onClick={onAutoInstall}
                                     className="mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-proxmox-dark border border-proxmox-border hover:border-emerald-500/30 text-sm text-gray-300 hover:text-white transition-colors"

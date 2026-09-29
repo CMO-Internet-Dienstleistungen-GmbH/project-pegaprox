@@ -187,11 +187,40 @@
             // hasn't run the first-admin setup yet. Frontend gates this to render
             // <SetupWizard /> instead of <LoginScreen />.
             const [needsSetup, setNeedsSetup] = useState(false);
+            // LW Sep 2026 (#625) - role of this instance in a warm standby pair, as the
+            // server reports it on login and /auth/check. A standby also sends peer_url
+            // and last_sync_at for the banner.
+            const [ha, setHa] = useState({ role: 'standalone' });
             
             // Check session on mount
             useEffect(() => {
                 checkSession();
             }, []);
+
+            // keeps the old object when nothing changed, so a poll does not re-render
+            // every useAuth() consumer for nothing
+            const applyHa = (next) => {
+                const v = (next && typeof next === 'object' && next.role) ? next : { role: 'standalone' };
+                setHa(prev => JSON.stringify(prev) === JSON.stringify(v) ? prev : v);
+            };
+
+            // re-read only the ha part of /auth/check (last sync time, role after a sync)
+            const refreshHa = useCallback(async () => {
+                try {
+                    const r = await fetch(`${API_URL}/auth/check?t=${Date.now()}`, { credentials: 'include' });
+                    if (!r.ok) return;
+                    const d = await r.json();
+                    if (d.authenticated) applyHa(d.ha);
+                } catch (_) {}
+            }, []);
+
+            // a standby syncs every few seconds; without this the banner would show the
+            // sync time from the moment of login forever
+            useEffect(() => {
+                if (!isAuthenticated || ha.role !== 'standby') return;
+                const h = setInterval(refreshHa, 30000);
+                return () => clearInterval(h);
+            }, [isAuthenticated, ha.role, refreshHa]);
             
             // check if session still valid (cookie is sent automatically)
             const checkSession = async () => {
@@ -278,6 +307,7 @@
                             if (d.reverse_proxy_enabled !== undefined) {
                                 setReverseProxyEnabled(d.reverse_proxy_enabled);
                             }
+                            applyHa(d.ha);
                         } else {
                             logout();
                         }
@@ -285,6 +315,7 @@
                         // NS: Feb 2026 - Capture ldap_enabled from 401 response
                         try {
                             const errData = await r.json();
+                            if (errData.ha_role) applyHa({ role: errData.ha_role });
                             if (errData.ldap_enabled !== undefined) setLdapEnabled(errData.ldap_enabled);
                             if (errData.oidc_enabled !== undefined) { setOidcEnabled(errData.oidc_enabled); setOidcButtonText(errData.oidc_button_text || 'Sign in with SSO'); }
                             if (errData.login_background) setLoginBackground(errData.login_background);
@@ -378,6 +409,7 @@
                         if (data.reverse_proxy_enabled !== undefined) {
                             setReverseProxyEnabled(data.reverse_proxy_enabled);
                         }
+                        applyHa(data.ha);
                         // NS: Security warning for default password
                         if (data.security_warning === 'DEFAULT_PASSWORD') {
                             setTimeout(() => {
@@ -468,6 +500,7 @@
                     if (d.oidc_enabled !== undefined) { setOidcEnabled(d.oidc_enabled); setOidcButtonText(d.oidc_button_text || 'Sign in with SSO'); }
                     if (d.ldap_enabled !== undefined) setLdapEnabled(d.ldap_enabled);
                     if (d.login_background) setLoginBackground(d.login_background);
+                    applyHa(d.ha_role ? { role: d.ha_role } : null);
                 } catch(e) {}
             };
             
@@ -482,7 +515,7 @@
             }, []);
             
             return(
-                <AuthContext.Provider value={{ user, sessionId, isAuthenticated, loading, error, login, logout, getAuthHeaders, isAdmin: user?.role === 'admin', passwordExpiry, requires2FASetup, setRequires2FASetup, updatePreferences, updateCurrentUser, ldapEnabled, oidcEnabled, oidcButtonText, loginBackground, reverseProxyEnabled, needsSetup, setNeedsSetup }}>
+                <AuthContext.Provider value={{ user, sessionId, isAuthenticated, loading, error, login, logout, getAuthHeaders, isAdmin: user?.role === 'admin', passwordExpiry, requires2FASetup, setRequires2FASetup, updatePreferences, updateCurrentUser, ldapEnabled, oidcEnabled, oidcButtonText, loginBackground, reverseProxyEnabled, needsSetup, setNeedsSetup, ha, refreshHa }}>
                     {children}
                 </AuthContext.Provider>
             );
