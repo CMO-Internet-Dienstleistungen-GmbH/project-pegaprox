@@ -1548,13 +1548,17 @@ def delete_tenant(tenant_id):
 @require_auth()
 def get_all_permissions():
     """Get all available permissions"""
+    from pegaprox.models.permissions import PERMISSION_WARNINGS
     result = []
     for perm, desc in PERMISSIONS.items():
         category = perm.split('.')[0]
         result.append({
             'permission': perm,
             'description': desc,
-            'category': category
+            'category': category,
+            # MK Sep 2026 (#818) — '' for almost everything; the grid only renders a
+            # warning line when there is one to render.
+            'warning': PERMISSION_WARNINGS.get(perm, ''),
         })
     return jsonify(result)
 

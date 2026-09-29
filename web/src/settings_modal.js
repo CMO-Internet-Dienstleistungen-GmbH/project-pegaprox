@@ -105,6 +105,16 @@
                                                     <div className="flex-1 min-w-0">
                                                         <div className="font-medium leading-tight">{p.description || p.permission}</div>
                                                         <div className="text-[10px] text-gray-500 font-mono truncate" title={p.permission}>{p.permission}</div>
+                                                        {/* MK Sep 2026 (#818) — a permission whose reach is wider than its
+                                                            name suggests says so here, where somebody is about to tick it.
+                                                            Only metrics.view carries one today; the server sends '' for the
+                                                            rest, so nothing else grows a line. */}
+                                                        {p.warning && (
+                                                            <div className="mt-1 flex items-start gap-1 text-[10px] leading-snug text-yellow-400/90">
+                                                                <Icons.AlertTriangle className="w-3 h-3 flex-shrink-0 mt-px" />
+                                                                <span>{p.warning}</span>
+                                                            </div>
+                                                        )}
                                                     </div>
                                                 </label>
                                             ))}
