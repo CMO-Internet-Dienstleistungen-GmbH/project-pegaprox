@@ -199,11 +199,24 @@ def test_the_cloud_nav_item_is_gated_and_sits_after_hosts(cloud):
 
 
 def test_the_cloud_shell_reads_the_flag_off_the_current_user(cloud):
-    # not on a standby (#625), like the sidebar entry of the other two layouts
-    assert 'const canAutoInstall = !!(currentUser && currentUser.autoinstall_access) && !haReadOnly;' in cloud
+    # not on a standby (#625), like the sidebar entry of the other two layouts. Not on one
+    # that forwards either: the answer URL the page shows would be the standby's own
+    assert 'const canAutoInstall = !!(currentUser && currentUser.autoinstall_access) && !haStandby;' in cloud
     shell = cloud[cloud.index('function CloudShell('):]
-    assert shell.index('const { haReadOnly } = useAuth();') < shell.index('const canAutoInstall =')
+    assert shell.index('const { ha, haStandby } = useAuth();') < shell.index('const canAutoInstall =')
     assert 'canAutoInstall={canAutoInstall}' in cloud
+
+
+def test_every_layout_keeps_the_entry_off_every_standby(dash):
+    """A forwarding standby shows the actions again (haReadOnly is false there), but the
+    automated installs are served from the instance the page runs on, so every gate asks
+    haStandby, the one that holds for every standby."""
+    for gate in ('{canAutoInstall && !haReadOnly && (', '{onAutoInstall && !haReadOnly && ('):
+        assert gate not in dash, gate
+        assert gate not in _read(VM_MODALS), gate
+    assert dash.count('{canAutoInstall && !haStandby && (') == 2
+    assert ("const { user, sessionId, logout, getAuthHeaders, isAdmin, passwordExpiry, updatePreferences, "
+            "ha, haReadOnly, haStandby, refreshHa } = useAuth();") in dash
 
 
 def test_the_cloud_page_hands_the_panel_the_raw_t(cloud):

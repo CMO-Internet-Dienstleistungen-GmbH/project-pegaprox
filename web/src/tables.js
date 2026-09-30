@@ -1298,10 +1298,13 @@
         // NS: filtering + sorting uses useMemo below (lines 1320+)
         function ResourceTable({ resources, clusterId, clusters, sourceCluster, onVmAction, onOpenConsole, onOpenSpice, onOpenConfig, onMigrate, onBulkMigrate, onDelete, onClone, onForceStop, onCrossClusterMigrate, nodes, datastores, onOpenTags, highlightedVm, addToast, pendingVmAction, onPendingActionConsumed, onVmNavigate, backupStatus }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, user, haReadOnly } = useAuth();
+            const { getAuthHeaders, user, haReadOnly, haStandby } = useAuth();
             // #625 v2 - a standby shows the guests live but acts on none of them: no power,
             // console, migrate, clone or delete buttons. Config, metrics and Proxmox links stay.
+            // One that forwards acts through the active again, but a console never runs
+            // on a standby: in its place a link opens the guest's console on the active
             const acts = !haReadOnly;
+            const consoles = !haStandby;
             const { isCorporate } = useLayout(); // LW: Feb 2026 - corporate defaults to table view
             // NS Mar 2026 - per-VM sparkline history for table view
             const vmHistRef = useRef({});
@@ -1969,7 +1972,7 @@
                                                         </button>
                                                     </>
                                                 )}
-                                                {acts && resource.status === 'running' && (
+                                                {consoles && resource.status === 'running' && (
                                                     <button
                                                         onClick={() => onOpenConsole(resource)}
                                                         className="p-1.5 rounded-lg hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
@@ -1978,7 +1981,11 @@
                                                         <Icons.Monitor />
                                                     </button>
                                                 )}
-                                                {acts && resource.status === 'running' && resource.type === 'qemu' && onOpenSpice && (
+                                                {!consoles && resource.status === 'running' && (
+                                                    <HaOnActiveLink vm={resource} clusterId={clusterId} iconOnly
+                                                        className="p-1.5 rounded-lg hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all" />
+                                                )}
+                                                {consoles && resource.status === 'running' && resource.type === 'qemu' && onOpenSpice && (
                                                     <button
                                                         onClick={() => onOpenSpice(resource)}
                                                         className="p-1.5 rounded-lg hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
@@ -2340,10 +2347,13 @@
                                                         </>)}
                                                         {/* management group */}
                                                         <div className="corp-action-group">
-                                                            {acts && resource.status === 'running' && (
+                                                            {consoles && resource.status === 'running' && (
                                                                 <button onClick={() => onOpenConsole(resource)} className="corp-action-btn" title={t('openConsole')}><Icons.Monitor className="w-3.5 h-3.5" /></button>
                                                             )}
-                                                            {acts && resource.status === 'running' && resource.type === 'qemu' && onOpenSpice && (
+                                                            {!consoles && resource.status === 'running' && (
+                                                                <HaOnActiveLink vm={resource} clusterId={clusterId} iconOnly className="corp-action-btn" iconClass="w-3.5 h-3.5" />
+                                                            )}
+                                                            {consoles && resource.status === 'running' && resource.type === 'qemu' && onOpenSpice && (
                                                                 <button onClick={() => onOpenSpice(resource)} className="corp-action-btn" title={t('spiceConsole') || 'SPICE'}><Icons.ExternalLink className="w-3.5 h-3.5" /></button>
                                                             )}
                                                             <button onClick={() => onOpenConfig(resource)} className="corp-action-btn" title={t('configuration')}><Icons.Cog className="w-3.5 h-3.5" /></button>
@@ -2408,7 +2418,7 @@
                                                                 <Icons.Globe />
                                                             </button>
                                                         )}
-                                                        {resource.status === 'running' && (
+                                                        {consoles && resource.status === 'running' && (
                                                             <button
                                                                 onClick={() => onOpenConsole(resource)}
                                                                 className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
@@ -2417,7 +2427,7 @@
                                                                 <Icons.Monitor />
                                                             </button>
                                                         )}
-                                                        {resource.status === 'running' && resource.type === 'qemu' && onOpenSpice && (
+                                                        {consoles && resource.status === 'running' && resource.type === 'qemu' && onOpenSpice && (
                                                             <button
                                                                 onClick={() => onOpenSpice(resource)}
                                                                 className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
@@ -2488,6 +2498,10 @@
                                                             <Icons.Trash />
                                                         </button>
                                                         </>)}
+                                                        {!consoles && resource.status === 'running' && (
+                                                            <HaOnActiveLink vm={resource} clusterId={clusterId} iconOnly
+                                                                className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all" />
+                                                        )}
                                                     </div>
                                                     )}
                                                 </td>

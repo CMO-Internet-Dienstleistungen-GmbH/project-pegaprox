@@ -107,7 +107,7 @@ def test_the_panel_and_its_helpers_exist(panel):
 
 def test_the_tab_is_admin_gated(modal):
     component = _function(modal, 'PegaProxSettingsModal')
-    assert 'const { getAuthHeaders, user: currentUser, isAdmin } = useAuth();' in component
+    assert 'const { getAuthHeaders, user: currentUser, isAdmin, haStandby } = useAuth();' in component
 
     button_at = component.index("onClick={() => setActiveTab('ha')}")
     gate_at = component.rindex('{isAdmin && (', 0, button_at)
@@ -259,7 +259,8 @@ def test_a_restart_blocks_the_page_and_reloads(panel):
 def test_the_banner_shows_on_a_standby_only(banner):
     assert "const standby = ha?.role === 'standby';" in banner
     assert 'if (!standby) return null;' in banner
-    assert "t('pgHaBannerStandby')" in banner
+    # read-only, or carried out on the active while the standby forwards
+    assert "t(ha.forwarding === true ? 'pgHaBannerForwarding' : 'pgHaBannerStandby')" in banner
     assert ".replace('{url}', ha.peer_url || '-')" in banner
     # the HA tab button is for admins
     assert 'const button = isAdmin && onOpenHa && (' in banner
@@ -291,8 +292,13 @@ def test_cloud_renders_it_in_the_shell(cloud):
 
 def _used_keys():
     keys = set()
-    for name in ('settings_modal.js', 'dashboard.js', 'cloud.js'):
-        keys.update(re.findall(r"t\('(pgHa\w+)'\)", _read('web', 'src', name)))
+    for name in sorted(os.listdir(SRC)):
+        if name.endswith('.js') and name != 'translations.js':
+            keys.update(re.findall(r"t\('(pgHa\w+)'\)", _read('web', 'src', name)))
+    # picked by a condition: t(x ? 'a' : 'b'), and the refusal's code-to-key choice
+    dash = _read('web', 'src', 'dashboard.js') + _read('web', 'src', 'settings_modal.js')
+    keys.update(re.findall(r"\? '(pgHa\w+)'", dash))
+    keys.update(re.findall(r": '(pgHa\w+)'\)", dash))
     return sorted(keys)
 
 
@@ -362,7 +368,9 @@ def test_every_class_is_in_the_static_tailwind_build(panel, banner, modal):
     have = {m.group(1).replace('\\', '') for m in re.finditer(r'\.((?:\\.|[A-Za-z0-9_-])+)', css)}
     tab = modal[modal.index("onClick={() => setActiveTab('ha')}"):]
     tab = tab[:tab.index('</button>')]
-    names = _classes(panel) | _classes(banner) | _classes(tab)
+    ui = _read('web', 'src', 'ui.js')
+    names = (_classes(panel) | _classes(banner) | _classes(tab)
+             | _classes(_function(ui, 'HaOnActiveLink')) | _classes(_function(ui, 'HaConsoleOnActive')))
     # JS names that sit inside ${...} or class-string constants
     names -= {'card', 'field', 'input', 'btn', 'btnGhost'}
     missing = sorted(n for n in names if n not in have)
@@ -398,6 +406,8 @@ def _iso_ago(sec):
 
 
 PASSWORD = 'correct horse'
+# what the page posts in the background that a standby keeps to itself (app.py)
+STANDBY_LOCAL = ('/api/sse/token', '/api/sse/subscribe', '/api/snapshots/overview')
 
 
 class _FakeServer:
@@ -411,7 +421,8 @@ class _FakeServer:
     def __init__(self, role='standby', layout='modern', language='en', admin=True,
                  auth_source='local', broken='', sso_stale=False, live_view=True,
                  restart_pending=None, clusters=None, resources=None, refuse_as_standby=False,
-                 autoinstall=None, metrics=None, extra=None, permissions=None, members=None):
+                 autoinstall=None, metrics=None, extra=None, permissions=None, members=None,
+                 forward_writes=False, source_active=True, active_down=False):
         self.role, self.layout, self.language, self.admin = role, layout, language, admin
         self.auth_source, self.broken, self.sso_stale = auth_source, broken, sso_stale
         self.down_until = 0.0
@@ -449,6 +460,16 @@ class _FakeServer:
         # body of the moment they arrived: a poll that was already on its way
         self.hold_status = False
         self.held = []
+        # forwarding: the instance-local switch, whether the instance a standby follows answers
+        # as active (the server forwards only then), and an active that went away after the page
+        # last read the banner: a write then comes back 503, and the next banner says so
+        self.forward_writes = forward_writes
+        self.source_active = source_active
+        self.active_down = active_down
+        self.forwarded = []
+
+    def forwarding(self):
+        return self.role == 'standby' and self.forward_writes and self.source_active
 
     def group(self):
         if self.role not in ('active', 'standby'):
@@ -500,14 +521,16 @@ class _FakeServer:
                 'suggested_url': SELF, 'own_fingerprint': '',
                 'live_view': self.live_view, 'managers_running': self.managers_running,
                 'members': [dict(m) for m in group], 'max_members': 4,
-                'standby_count': self.standby_count(), 'removed': self.removed}
+                'standby_count': self.standby_count(), 'removed': self.removed,
+                'forward_writes': self.forward_writes, 'forwarding': self.forwarding()}
 
     def banner(self):
         if self.role != 'standby':
             return {'role': self.role}
         source = self._source()
         return {'role': 'standby', 'peer_url': source['url'] if source else PEER,
-                'last_sync_at': _iso_ago(90), 'live_view': self.live_view}
+                'last_sync_at': _iso_ago(90), 'live_view': self.live_view,
+                'forwarding': self.forwarding()}
 
     def release(self):
         held, self.held = self.held, []
@@ -624,6 +647,9 @@ class _FakeServer:
         if path == '/api/ha/sync-now':
             return answer({'result': 'applied', 'status': self.status()})
         if path == '/api/ha/settings':
+            if 'forward_writes' in body:
+                self.forward_writes = bool(body['forward_writes'])
+                return answer({'success': True, 'forward_writes': self.forward_writes})
             if 'live_view' in body:
                 changed = bool(body['live_view']) != self.live_view
                 self.live_view = bool(body['live_view'])
@@ -660,6 +686,16 @@ class _FakeServer:
                 # an active takes the whole group apart
                 self.role, self.members = 'standalone', []
             return answer({'success': True, 'restarting': was == 'standby'})
+        # the instance-local writes the real standby lets through are never forwarded
+        if req.method != 'GET' and self.forwarding() and path not in STANDBY_LOCAL:
+            if self.active_down:
+                # the next banner no longer says forwarding
+                self.source_active = False
+                return answer({'code': 'HA_ACTIVE_UNREACHABLE',
+                               'error': 'The active instance cannot be reached - act again once it is '
+                                        'back, or promote this standby'}, 503)
+            self.forwarded.append((req.method, path))
+            return answer({'success': True})
         if req.method != 'GET' and (self.role == 'standby' or self.refuse_as_standby):
             return answer({'error': 'This is a standby instance. Make changes on the active instance; '
                                     'they arrive here with the next sync.', 'code': 'HA_STANDBY'}, 409)
@@ -1089,10 +1125,12 @@ def _block(src, start, end):
 
 
 def test_the_context_derives_one_read_only_flag(ctx):
-    assert "const haReadOnly = ha.role === 'standby';" in ctx
+    # forwarding: read-only only while the standby does not forward; haStandby on every one
+    assert "const haStandby = ha.role === 'standby';" in ctx
+    assert "const haReadOnly = haStandby && ha.forwarding !== true;" in ctx
     provider = ctx[ctx.index('<AuthContext.Provider value={{'):]
     provider = provider[:provider.index('}}>')]
-    assert re.search(r'\bhaReadOnly\b', provider)
+    assert re.search(r'\bhaReadOnly\b', provider) and re.search(r'\bhaStandby\b', provider)
     # isAdmin is left alone: the HA tab, the banner button and promote hang off it
     assert "isAdmin: user?.role === 'admin'," in provider
     helper = _block(ctx, 'function haReadPermission(', '\n        }')
@@ -1146,15 +1184,21 @@ def test_can_answers_as_agreed(ctx, dash):
 def test_one_ha_standby_branch_in_the_dashboard_authfetch(dash):
     body = _block(dash, 'const authFetch = React.useCallback(async (url, opts = {}) => {', '}, [getAuthHeaders]);')
     assert 'const { timeout, quiet, ...rest } = opts;' in body
-    assert 'if (res.status === 409 && haRefusedRef.current) {' in body
-    assert "if (body && body.code === 'HA_STANDBY') {" in body
-    assert 'const error = haRefusedRef.current(quiet);' in body
+    assert 'if ((res.status === 409 || res.status === 503) && haRefusedRef.current) {' in body
+    assert ("if ((res.status === 409 && code === 'HA_STANDBY') || "
+            "(res.status === 503 && code === 'HA_ACTIVE_UNREACHABLE')) {") in body
+    assert 'const error = haRefusedRef.current(quiet, code);' in body
     assert 'return new Response(JSON.stringify({ ...body, error }),' in body
-    # the only place in the dashboard that knows the code
+    assert '{ status: res.status, statusText: res.statusText,' in body
+    # the only place in the dashboard that knows the codes
     assert dash.count("'HA_STANDBY'") == 1
-    setter = _block(dash, 'haRefusedRef.current = (quiet = false) => {', '};')
-    assert "const msg = t('pgHaStandbyRefused');" in setter
+    assert dash.count("'HA_ACTIVE_UNREACHABLE'") == 2    # the check and the key it picks
+    setter = _block(dash, "haRefusedRef.current = (quiet = false, code = '') => {", '};')
+    assert "const msg = t(code === 'HA_ACTIVE_UNREACHABLE' ? 'pgHaActiveUnreachable'" in setter
+    assert ": code === 'console' ? 'pgHaConsoleOnActive' : 'pgHaStandbyRefused');" in setter
     assert "if (!quiet) addToast(msg, 'error');" in setter
+    # a refusal may mean forwarding changed: the banner and the buttons are read again
+    assert "if (!quiet && code !== 'console') refreshHa?.();" in setter
     # reads that go out as a POST in the background stay silent
     for path in ('/snapshots/overview', '/sse/subscribe'):
         at = dash.index('`${API_URL}%s`' % path)
@@ -1179,12 +1223,15 @@ def test_no_optimistic_status_flip_on_a_standby(dash):
 ])
 def test_the_dashboard_refuses_a_console_before_opening_it(dash, handler, first_act):
     body = _block(dash, handler, '\n            };')
-    guard = 'if (haReadOnly) { haRefusedRef.current?.(); return; }'
+    # not haReadOnly: a forwarding standby runs no console either
+    guard = "if (haStandby) { haRefusedRef.current?.(false, 'console'); return; }"
     assert guard in body
     assert body.index(guard) < body.index(first_act)
+    assert 'haReadOnly' not in body
 
 
 READ_HANDLERS = {'openConfig', 'openMetrics', 'configNode', 'openSettings', 'openProfile', 'refresh'}
+CONSOLE_HANDLERS = {'openConsole', 'openSpice', 'openLxcShell'}
 
 
 def test_a_standby_hands_the_cloud_shell_nothing_that_acts(dash):
@@ -1193,10 +1240,15 @@ def test_a_standby_hands_the_cloud_shell_nothing_that_acts(dash):
     bundle = dash[start:dash.index('\n                };', start)]
     keys = set(re.findall(r'^ {20}(\w+):', bundle, re.M))
     assert {'vmAction', 'openConsole', 'refresh'} <= keys
+    # consoles go on every standby, what acts only on one that does not forward
+    consoles = dash[dash.index('if (haStandby) {', start):]
+    consoles = set(re.findall(r"'(\w+)'", consoles[:consoles.index('.forEach(')]))
+    assert consoles == CONSOLE_HANDLERS
     drop = dash[dash.index('if (haReadOnly) {', start):]
     drop = drop[:drop.index('.forEach(')]
     dropped = set(re.findall(r"'(\w+)'", drop))
-    assert dropped == keys - READ_HANDLERS, sorted(dropped ^ (keys - READ_HANDLERS))
+    assert dropped | consoles == keys - READ_HANDLERS, sorted((dropped | consoles) ^ (keys - READ_HANDLERS))
+    assert not dropped & consoles
 
 
 def test_cloud_offers_only_what_it_was_handed(cloud):
@@ -1205,7 +1257,8 @@ def test_cloud_offers_only_what_it_was_handed(cloud):
     for line in items.splitlines():
         if 'onClick: () => act.' not in line or 'act.openMetrics(' in line or 'act.openConfig(' in line:
             continue
-        assert re.match(r'\s+(power && |has\(\')', line), line
+        # the console link is there only when the shell hands it over, on a standby
+        assert re.match(r'\s+(power && |has\(\'|act\.consoleOnActive && )', line), line
     # no divider left at an end or doubled once entries are gone
     assert 'while (out.length && out[out.length - 1].divider) out.pop();' in items
     assert "const primary = !act.has('vmAction') ? [] : running" in cloud
@@ -1220,11 +1273,14 @@ def test_cloud_offers_only_what_it_was_handed(cloud):
 def test_the_node_modal_has_no_shell_and_locks_what_changes_on_a_standby():
     src = _read('web', 'src', 'node_modals.js')
     body = src[src.index('function NodeModal('):src.index('function ConsoleModal(')]
-    assert 'const { getAuthHeaders, haReadOnly } = useAuth();' in body
-    assert "const tabs = haReadOnly ? allTabs.filter(tab => tab.id !== 'shell') : allTabs;" in body
+    assert 'const { getAuthHeaders, haReadOnly, haStandby } = useAuth();' in body
+    # the shell tab stays on every standby and points to the shell on the active
+    assert 'const tabs = allTabs;' in body
     assert "const lockedTab = haReadOnly && !['summary', 'performance', 'tasks'].includes(activeTab);" in body
-    assert "{activeTab === 'shell' && !haReadOnly && (" in body
-    assert '{!haReadOnly && data.shellFullscreen && (' in body
+    assert "{activeTab === 'shell' && haStandby && <HaConsoleOnActive />}" in body
+    assert "{activeTab === 'shell' && !haStandby && (" in body
+    assert '{!haStandby && data.shellFullscreen && (' in body
+    assert body.count('<NodeShellTerminal') == 2
     assert "const haLock = { disabled: lockedTab, 'data-ha-locked': lockedTab ? '' : undefined };" in body
     # (#625 v2 review) no fieldset around all tab bodies any more, it disabled Refresh and
     # SMART too: each tab that changes the node locks its changing parts itself
@@ -1273,7 +1329,7 @@ def test_the_action_surfaces_read_the_flag(name, component):
     body = body[:10 + nxt.start()] if nxt else body
     head = body[:body.index('const acts = !haReadOnly;') + 40]
     assert re.search(r'const \{[^}]*\bhaReadOnly\b[^}]*\} = useAuth\(\);', head)
-    assert body.count('acts &&') + body.count('!acts ?') >= 5
+    assert body.count('acts &&') + body.count('!acts ?') + body.count('consoles &&') >= 5
 
 
 def test_the_corporate_detail_view_leaves_the_node_alone_on_a_standby():
@@ -1281,14 +1337,16 @@ def test_the_corporate_detail_view_leaves_the_node_alone_on_a_standby():
     lvextend there and write the table; a standby reads what is stored."""
     src = _read('web', 'src', 'vm_modals.js')
     body = _block(src, 'function CorporateVmDetailView(', 'function AllClustersOverview(')
-    assert 'if (!isQemu || !isRunning || !acts) { setConsoleShot(null); return; }' in body
-    assert "authFetch(`${base}/efficient-snapshots${acts ? '?refresh=true' : ''}`)" in body
+    # on every standby, forwarding or not: a GET is not forwarded and would run here
+    assert 'const consoles = !haStandby;' in body
+    assert 'if (!isQemu || !isRunning || !consoles) { setConsoleShot(null); return; }' in body
+    assert "authFetch(`${base}/efficient-snapshots${haStandby ? '' : '?refresh=true'}`)" in body
 
 
 def test_the_sidebar_leaves_cluster_changes_to_the_active(dash):
     heading = dash[dash.index("<h2 className=\"text-sm font-semibold text-gray-400 uppercase tracking-wider\">{t('clusters')}</h2>"):]
     heading = heading[:heading.index('{clusters.length === 0 ? (')]
-    assert '{isAdmin && !haStandby && (' in heading
+    assert '{isAdmin && !haReadOnly && (' in heading
     item = _block(dash, 'function ClusterSidebarItem(', 'function TopologyView(')
     assert 'const { haReadOnly } = useAuth();' in item
     actions = item[item.index('{!haReadOnly && ('):]
@@ -1555,7 +1613,15 @@ def test_runtime_the_node_shows_but_does_not_change_on_a_standby(open_app, role)
     page.locator('button[title="Node Configuration"]').first.click()
     page.get_by_text('Proxmox Node').first.wait_for(timeout=5000)
     tabs = page.evaluate('() => Array.from(document.querySelectorAll("button")).map(b => b.innerText.trim())')
-    assert ('Shell' not in tabs) == standby, tabs
+    # the shell tab stays on a standby, and opens the shell on the active instead
+    assert 'Shell' in tabs, tabs
+    if standby:
+        page.locator('button', has_text='Shell').last.click()
+        link = page.locator('[data-ha-console-elsewhere] a[data-ha-on-active]')
+        link.wait_for(timeout=3000)
+        assert link.get_attribute('href') == PEER + '/'
+        assert link.get_attribute('target') == '_blank'
+        assert not [c for c in app.server.calls if 'shell' in c[1] or c[1] == '/api/ws/token']
     # a tab that changes things renders its controls disabled, a reading one does not
     page.locator('button', has_text='System').last.click()
     page.wait_for_timeout(300)
@@ -1590,12 +1656,14 @@ def test_runtime_the_corporate_node_row_offers_no_action_on_a_standby(open_app, 
     menu = page.locator('.corp-context-menu').first
     menu.wait_for(timeout=3000)
     assert ('SSH Console' not in menu.inner_text()) == standby, menu.inner_text()
+    # in its place, the way to the active
+    assert ('Open on the active instance' in menu.inner_text()) == standby, menu.inner_text()
     page.keyboard.press('Escape')
     page.mouse.click(5, 900)
     child.click()
     strip = page.locator('.corp-tab-strip').last
     strip.get_by_text('Configure').wait_for(timeout=5000)
-    assert ('Shell' not in strip.inner_text()) == standby, strip.inner_text()
+    assert 'Shell' in strip.inner_text(), strip.inner_text()
     page.locator('.corp-toolbar button', has_text='Actions').last.click()
     dropdown = page.locator('.corp-dropdown').last.inner_text()
     assert 'Node Settings' in dropdown
@@ -1639,9 +1707,10 @@ def test_the_node_cards_show_but_do_not_change_on_a_standby():
 def test_the_corporate_node_view_shows_but_does_not_change_on_a_standby():
     src = _read('web', 'src', 'node_modals.js')
     body = src[src.index('function CorporateNodeDetailView('):]
-    assert 'const { getAuthHeaders, reverseProxyEnabled, haReadOnly } = useAuth();' in body
-    assert ".filter(tab => !(haReadOnly && tab === 'shell')).map(tab => (" in body
-    assert "{activeDetailTab === 'shell' && !haReadOnly && (" in body
+    assert 'const { getAuthHeaders, reverseProxyEnabled, haReadOnly, haStandby } = useAuth();' in body
+    assert "['summary', 'monitor', 'configure', 'hardware', 'vms', 'shell', 'subscription'].map(tab => (" in body
+    assert "{activeDetailTab === 'shell' && haStandby && <HaConsoleOnActive />}" in body
+    assert "{activeDetailTab === 'shell' && !haStandby && (" in body
     menu = body[body.index('<div className="corp-dropdown absolute right-0 top-full'):]
     assert menu.index('{!haReadOnly && (<>') < menu.index('onMaintenanceToggle(node, !isMaint)')
     assert menu.index("onNodeAction(node, 'shutdown')") < menu.index('</>)}') < menu.index('onOpenNodeConfig(node)')
@@ -1656,21 +1725,25 @@ def test_no_efficient_snapshot_refresh_from_a_standby():
     """GET ?refresh=true runs lvs and maybe lvextend on the node and writes the table."""
     cfg = _read('web', 'src', 'vm_config.js')
     modal = cfg[cfg.index('function ConfigModal('):]
-    assert 'const { getAuthHeaders, haReadOnly } = useAuth();' in modal[:400]
-    assert "efficient-snapshots${haReadOnly ? '' : '?refresh=true'}`" in cfg
+    assert 'const { getAuthHeaders, haReadOnly, haStandby } = useAuth();' in modal[:400]
+    # a GET is not forwarded: a forwarding standby would run it itself
+    assert "efficient-snapshots${haStandby ? '' : '?refresh=true'}`" in cfg
     for name in ('vm_config.js', 'vm_modals.js'):
         assert 'efficient-snapshots?refresh=true' not in _read('web', 'src', name), name
 
 
 def test_a_console_window_on_a_standby_says_why(dash):
     body = _block(dash, 'function StandaloneConsole(', 'function App(')
-    assert 'const { getAuthHeaders, haReadOnly } = useAuth();' in body
-    guard = "if (haReadOnly) {\n                    setState({ status: 'error', error: 'standby' });"
+    assert 'const { getAuthHeaders, haStandby } = useAuth();' in body
+    guard = "if (haStandby) {\n                    setState({ status: 'standby', clusterId, info: null,"
     assert guard in body
-    # before anything is fetched
+    # checked against the same rules as a real window first, and before anything is fetched
+    assert body.index("setState({ status: 'error', error: 'malformed' });") < body.index(guard)
     assert body.index(guard) < body.index('await fetch(')
-    assert '}, [consoleKey, haReadOnly]);' in body
-    assert "state.error === 'standby' ? t('pgHaStandbyRefused')" in body
+    assert '}, [consoleKey, haStandby]);' in body
+    # it offers the same console on the active
+    assert "if (state.status === 'standby') {" in body
+    assert '<HaConsoleOnActive vm={state.vm} clusterId={state.clusterId} />' in body
 
 
 # -- v2 review: the surfaces the first pass missed (#625) -----------------------------------
@@ -1708,14 +1781,15 @@ def test_the_corporate_header_leaves_cluster_changes_to_the_active(dash):
 
 def test_esxi_pbs_and_the_add_buttons_stay_on_the_active(dash):
     """verify:frontend:4"""
-    assert '{!isCorporate && isAdmin && !haStandby && (' in dash                  # header Add Cluster
-    assert '{!isCorporate && pbsServers.length === 0 && isAdmin && !haStandby && (' in dash
-    assert '{!isCorporate && vmwareServers.length === 0 && isAdmin && !haStandby && (' in dash
+    # a forwarding standby adds through the active, so these follow the read-only flag
+    assert '{!isCorporate && isAdmin && !haReadOnly && (' in dash                 # header Add Cluster
+    assert '{!isCorporate && pbsServers.length === 0 && isAdmin && !haReadOnly && (' in dash
+    assert '{!isCorporate && vmwareServers.length === 0 && isAdmin && !haReadOnly && (' in dash
     for opener in ('<button onClick={() => setShowAddPBS(true)} className="p-1',
                    "<button onClick={() => { setEditingVMware(null); setVmwareForm({ name: '', host: '', port: 443, "
                    "username: 'root', password: '', ssl_verify: false, notes: '' }); setShowAddVMware(true); }} className=\"p-1"):
         at = dash.index(opener)
-        assert '{isAdmin && !haStandby && (' in dash[at - 120:at], opener
+        assert '{isAdmin && !haReadOnly && (' in dash[at - 120:at], opener
     # PBS edit/delete, encryption key and auto-verify; ESXi re-configure/delete
     for opener in ('<button onClick={() => { setEditingPBS(selectedPBS);', '<button onClick={() => setShowEncryptionKeyModal(true)}',
                    '<button onClick={() => setShowVerifyScheduleModal(true)}',
@@ -1895,18 +1969,21 @@ def test_compliance_stays_a_reading_tab_on_a_standby(dash):
     assert ('const holds = (permission) => isAdmin || (Array.isArray(user?.permissions) '
             '&& user.permissions.includes(permission));') in dash
     assert "if (tab.id === 'compliance') return holds('admin.audit') || holds('node.maintenance');" in dash
-    # holds() decides this tab and nothing else
-    assert len(re.findall(r'\bholds\(', dash)) == 2
+    # holds() decides this tab, and whether a standby offers a console on the active
+    assert len(re.findall(r'\bholds\(', dash)) == 3
+    assert 'const onActiveItems = (permission, search, disabled = false) => !holds(permission) ? [] : [{' in dash
     drift = _function(dash, 'DriftTab')
     assert 'const canAct = isAdmin && !haReadOnly;' in drift and '{isAdmin && (' not in drift
 
 
-@pytest.mark.parametrize('component', ['PowerCarbonTab', 'CostDashboardTab', 'DriftTab',
-                                       'TemplatesLibraryTab', 'InsightsTab'])
-def test_the_admin_buttons_of_the_report_tabs_follow_the_flag(dash, component):
+@pytest.mark.parametrize('component,flag', [('PowerCarbonTab', 'haReadOnly'), ('CostDashboardTab', 'haReadOnly'),
+                                            ('DriftTab', 'haReadOnly'), ('TemplatesLibraryTab', 'haReadOnly'),
+                                            # its one button writes this instance's own metrics (v3)
+                                            ('InsightsTab', 'haStandby')])
+def test_the_admin_buttons_of_the_report_tabs_follow_the_flag(dash, component, flag):
     body = _function(dash, component)
-    assert 'const { haReadOnly } = useAuth();' in body
-    assert 'const canAct = isAdmin && !haReadOnly;' in body
+    assert re.search(r'const \{ [^}]*\b%s\b[^}]*\} = useAuth\(\);' % flag, body)
+    assert f'const canAct = isAdmin && !{flag};' in body
     assert len(re.findall(r'\bisAdmin\b', body)) == 2        # the prop and canAct
     assert 'canAct' in body.split('const canAct = ', 1)[1]
 
@@ -1925,7 +2002,8 @@ def test_automation_reports_and_settings_leave_acting_to_the_active(dash):
     for toggle in ('onClick={() => toggleScheduleEnabled(schedule.id, !schedule.enabled)}\n',
                    'onClick={() => toggleAlertEnabled(alert.id, !alert.enabled)}\n'):
         assert auto[auto.index(toggle) + len(toggle):].lstrip().startswith('disabled={haReadOnly}'), toggle
-    assert '{!a.acked_at && !haReadOnly && (' in auto
+    # a fired alert is a row of each instance's own: not acked from any standby (v3)
+    assert '{!a.acked_at && !haStandby && (' in auto
     # the scripts' Refresh reads
     at = auto.index('onClick={() => loadCustomScripts(')
     assert '{!haReadOnly' not in auto[at - 200:at]
@@ -1956,13 +2034,19 @@ def test_the_cloud_pages_change_nothing_from_a_standby(cloud):
             assert before.rstrip().endswith('{mut.acts &&') or before.lstrip().startswith('{mut.acts && (<>'), inner[:200]
     assert rows >= 12
     for opener in ("{t('cloud.newRule') || 'New rule'}", "{t('cloud.newScript') || 'New script'}",
-                   "{t('cloud.newSchedule') || 'New schedule'}", "mut.run('rescan'"):
+                   "{t('cloud.newSchedule') || 'New schedule'}"):
         line = cloud[cloud.rindex('\n', 0, cloud.index(opener)):cloud.index(opener)]
         assert '{mut.acts && <button' in line, opener
     assert '{s.pending && mut.acts ? (' in cloud
     assert cloud.count('right: mut.acts ? <button type="button" className="cloud-link-btn" onClick={() => setModal(') == 2
     assert 'right: vnets.length && mut.acts ? <button' in cloud
-    assert 'right: mut.acts && (\n' in cloud                       # plugin reload and disable
+    # plugin rescan, reload and disable: refused on every standby, forwarding or not (v3)
+    plugins = _function(cloud, 'CloudPlugins')
+    assert 'const { haStandby } = useAuth();' in plugins
+    line = plugins[plugins.rindex('\n', 0, plugins.index("mut.run('rescan'")):plugins.index("mut.run('rescan'")]
+    assert '{!haStandby && <button' in line
+    assert 'right: !haStandby && (\n' in plugins
+    assert 'mut.acts' not in plugins
     cve = _function(cloud, 'CloudCVE')
     assert 'const { haReadOnly } = useAuth();' in cve
     assert '{!haReadOnly && <button type="button" className="cloud-btn-primary" onClick={scan}' in cve
@@ -3014,3 +3098,703 @@ def test_a_promote_the_pull_could_not_prepare_asks_once_more():
     tr = _read('web', 'src', 'translations.js')
     for key in ('pgHaPromoteSyncFirst', 'pgHaPromoteSyncFailed', 'pgHaPromoteForce'):
         assert tr.count(f'{key}:') == len(LANGS), key
+
+
+# -- forwarding: a standby hands changes to the active (#625) -------------------------------------
+#
+# With forward_writes on and an active that answers, a standby carries out what its users do
+# through the active, so the page shows the actions again: haReadOnly is "standby and not
+# forwarding". Consoles, shells, SPICE and the console preview still never run on a standby,
+# forwarding or not; where the active shows them, a standby shows "Open on the active instance",
+# the same view on the active's address (peer_url) in a new tab. A 503 HA_ACTIVE_UNREACHABLE is
+# one translated toast, like the 409 HA_STANDBY.
+
+CONSOLE_URL = PEER + '/?console=c1%3Aqemu%3A100%3Apve1'
+ON_ACTIVE = 'Open on the active instance'
+CONSOLE_LABELS = {'Console', 'Open Console', 'SPICE Console', 'SPICE', 'Launch Web Console', 'Console (VMRC)'}
+UNREACHABLE = {'en': 'The active instance cannot be reached. Try again once it is back, or promote this standby.',
+               'de': 'Die aktive Instanz ist nicht erreichbar. Versuchen Sie es erneut, sobald sie wieder da ist, '
+                     'oder stufen Sie diesen Standby hoch.'}
+
+
+def test_the_active_address_and_the_console_key(ctx):
+    """haActiveHref and haConsoleSearch as they are in the source, run in node: https only,
+    a path behind a proxy kept, the console window's key encoded the way #767 reads it."""
+    import shutil
+    import subprocess
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('node is not installed')
+    script = (_block(ctx, 'function haActiveHref(', '\n        }') + '\n        }\n'
+              + _block(ctx, 'function haConsoleSearch(', '\n        }') + '\n        }\n' + """
+    const vm = { vmid: 100, type: 'qemu', node: 'pve1' };
+    console.log(JSON.stringify({
+        root: haActiveHref('https://pegaprox-a.example:5000'),
+        console: haActiveHref('https://pegaprox-a.example:5000/', haConsoleSearch(vm, 'c1')),
+        proxied: haActiveHref(' https://proxy.example/pegaprox ', '?console=x'),
+        own: haConsoleSearch({ ...vm, _clusterId: 'c2' }, 'c1'),
+        ct: haConsoleSearch({ vmid: 7, type: 'lxc', node: 'n-1.lab' }, 'c1'),
+        none: [haConsoleSearch({ vmid: 0, type: 'node', node: 'pve1' }, 'c1'), haConsoleSearch(vm, ''),
+               haConsoleSearch(null, 'c1')],
+        refused: ['http://pegaprox-a.example:5000', 'javascript:alert(1)', '//evil.example', '', null,
+                  undefined, 5, 'https://a b.example', 'https://'].map(u => haActiveHref(u)),
+    }));
+    """)
+    res = subprocess.run([node, '-e', script], capture_output=True, text=True, timeout=30)
+    assert res.returncode == 0, res.stderr
+    out = json.loads(res.stdout)
+    assert out['root'] == PEER + '/'
+    assert out['console'] == CONSOLE_URL
+    assert out['proxied'] == 'https://proxy.example/pegaprox/?console=x'
+    assert out['own'] == '?console=c2%3Aqemu%3A100%3Apve1'
+    assert out['ct'] == '?console=c1%3Alxc%3A7%3An-1.lab'
+    assert out['none'] == ['', '', '']
+    assert out['refused'] == [None] * 9
+
+
+def test_the_link_opens_the_same_view_on_the_active():
+    ui = _read('web', 'src', 'ui.js')
+    link = _function(ui, 'HaOnActiveLink')
+    assert "if (ha?.role !== 'standby') return null;" in link
+    assert "const href = haActiveHref(ha.peer_url, vm ? haConsoleSearch(vm, clusterId) : '');" in link
+    assert 'if (!href) return null;' in link
+    assert 'target="_blank" rel="noopener noreferrer" data-ha-on-active={href}' in link
+    assert "onClick={() => window.open(href, '_blank', 'noopener,noreferrer')}" in link
+    assert "const label = t('pgHaOpenOnActive');" in link
+    box = _function(ui, 'HaConsoleOnActive')
+    assert "{t('pgHaConsoleOnActive')}" in box
+    assert '<HaOnActiveLink vm={vm} clusterId={clusterId}' in box
+    ctx = _read('web', 'src', 'contexts.js')
+    opener = _block(ctx, 'function haOpenOnActive(', '\n        }')
+    assert "if (href) window.open(href, '_blank', 'noopener,noreferrer');" in opener
+
+
+CONSOLE_OPENERS = ('{consoles && ', '{acts && ', '{!acts ? ', '{consoleShot ? (', '{!consoles && ')
+
+
+@pytest.mark.parametrize('name,component,links', [
+    ('tables.js', 'ResourceTable', 3),
+    ('vm_modals.js', 'VmDetailPanel', 1),
+    ('vm_modals.js', 'CorporateVmDetailView', 2),
+])
+def test_every_console_button_asks_the_standby_flag(name, component, links):
+    """Forwarding brings the actions back, not the consoles: each console and SPICE button
+    sits behind consoles (= !haStandby), and each place shows the link instead."""
+    body = _function(_read('web', 'src', name), component)
+    assert 'const consoles = !haStandby;' in body
+    assert re.search(r'const \{[^}]*\bhaStandby\b[^}]*\} = useAuth\(\);', body)
+    calls = list(re.finditer(r'=> (onOpenConsole|onOpenSpice)\(', body))
+    assert len(calls) >= 2, component
+    for m in calls:
+        near = max(CONSOLE_OPENERS, key=lambda o: body.rfind(o, 0, m.start()))
+        assert near in ('{consoles && ', '{consoleShot ? ('), (component, body[m.start() - 240:m.start()])
+    assert body.count('<HaOnActiveLink vm=') == links
+    for m in re.finditer(r'<HaOnActiveLink vm=', body):
+        near = max(CONSOLE_OPENERS, key=lambda o: body.rfind(o, 0, m.start()))
+        assert near == '{!consoles && ', (component, body[m.start() - 240:m.start()])
+
+
+def test_the_dashboard_sends_every_console_to_the_active(dash):
+    # the context menus: node shell and guest console become the way to the active
+    assert "...(haStandby ? onActiveItems('node.shell', '', !online) : [" in dash
+    assert "...(haStandby ? onActiveItems('vm.console', haConsoleSearch(vm), !isRunning) : [" in dash
+    items = _block(dash, 'const onActiveItems = (permission, search, disabled = false) =>', '}];')
+    assert "label: t('pgHaOpenOnActive')" in items
+    assert "if (!haOpenOnActive(ha?.peer_url, search)) haRefusedRef.current?.(false, 'console');" in items
+    # the ESXi console: its button and handler on every standby, the link in its place
+    vmrc = _block(dash, 'const openVmwareConsole = async (vmId) => {', '\n            };')
+    assert vmrc.index("if (haStandby) { haRefusedRef.current?.(false, 'console'); return; }") < vmrc.index('authFetch(')
+    assert '{isOn && !haStandby && (\n' in dash
+    at = dash.index('{isOn && haStandby && (')
+    assert '<HaOnActiveLink iconOnly' in dash[at:at + 200]
+    # the GETs that act on the node stay off every standby: they are not forwarded
+    cfg = _read('web', 'src', 'vm_config.js')
+    assert "efficient-snapshots${haReadOnly" not in cfg
+
+
+def test_the_cloud_shell_offers_the_active_for_a_console(cloud):
+    shell = _function(cloud, 'CloudShell')
+    assert "consoleOnActive: haStandby ? (r) => haOpenOnActive(ha && ha.peer_url, haConsoleSearch(stamp(r))) : null," in shell
+    items = _block(cloud, 'function cloudVmActionItems(', '\n        }')
+    assert ("act.consoleOnActive && { label: t('pgHaOpenOnActive'), icon: 'ExternalLink', "
+            "onClick: () => act.consoleOnActive(r) },") in items
+    detail = _function(cloud, 'CloudInstanceDetail')
+    assert '{act.consoleOnActive && <HaOnActiveLink vm={r} className="cloud-btn" />}' in detail
+    hook = _function(cloud, 'useCloudMutate')
+    assert "b && b.code === 'HA_ACTIVE_UNREACHABLE' ? t('pgHaActiveUnreachable')" in hook
+    assert 'return { busy, run, acts: !haReadOnly };' in hook
+
+
+def test_the_panel_speaks_the_forwarding_contract(panel):
+    body = _function(panel, 'HaPanel')
+    assert 'const forwardWrites = status?.forward_writes !== false;' in body
+    save = body[body.index('const setForwardWrites = (on) =>'):body.index('const applyNow = ')]
+    assert "send('PUT', 'settings', { forward_writes: on })" in save
+    assert "addToast?.(t(on ? 'pgHaForwardOn' : 'pgHaForwardOff'), 'success');" in save
+    # the banner and the buttons follow at once
+    assert 'refreshHa?.();' in save
+    card = body[body.index('const forwardCard = ('):body.index('const restartNote = ')]
+    assert 'role="switch" aria-checked={forwardWrites}' in card
+    assert 'htmlFor="pgha-forward"' in card and 'id="pgha-forward"' in card
+    assert 'disabled={!!busy || broken}' in card
+    assert "{t('pgHaForwardWrites')}" in card and "{t('pgHaForwardWritesHint')}" in card
+    assert 'const forwardPaused = standby && forwardWrites && status?.forwarding === false;' in body
+    assert "{forwardPaused && (" in card and "{t('pgHaForwardPaused')}" in card
+    # next to the live view, in every role
+    standalone = body[body.index("{role === 'standalone' && ("):body.index("{role === 'active' && (")]
+    active = body[body.index("{role === 'active' && ("):body.index("{role === 'standby' && (")]
+    standby = body[body.index("{role === 'standby' && ("):]
+    assert '{liveViewCard}\n                            {forwardCard}' in standalone
+    for part in (active, standby):
+        assert ('<div className="grid grid-cols-1 md:grid-cols-2 gap-4">\n'
+                '                                {liveViewCard}\n'
+                '                                {forwardCard}\n'
+                '                            </div>') in part
+
+
+def test_the_new_strings_say_no_em_dash_and_keep_the_austrian_flag():
+    blocks = _blocks()
+    for key in ('pgHaBannerForwarding', 'pgHaOpenOnActive', 'pgHaConsoleOnActive', 'pgHaActiveUnreachable',
+                'pgHaForwardWrites', 'pgHaForwardWritesHint', 'pgHaForwardOn', 'pgHaForwardOff',
+                'pgHaForwardPaused'):
+        for lang, block in blocks.items():
+            line = re.search(r'^ +%s: (.*),$' % key, block, re.M)
+            assert line, (lang, key)
+            assert '\u2014' not in line.group(1), (lang, key)
+    # German keeps its (Austrian) flag
+    assert "{ code: 'de', flag: '\U0001F1E6\U0001F1F9'," in _read('web', 'src', 'contexts.js')
+
+
+# -- runtime ------------------------------------------------------------------------------------
+
+def _on_active_links(page):
+    """What every visible link or button to the active points at."""
+    return page.evaluate('() => Array.from(document.querySelectorAll("[data-ha-on-active]"))'
+                         '.filter(a => a.offsetParent !== null).map(a => a.getAttribute("data-ha-on-active"))')
+
+
+def _serve_the_active(app):
+    """The new tab the link opens lands on the fake active instead of a failed lookup."""
+    app.ctx.route(PEER + '/**', lambda route: route.fulfill(
+        status=200, body='<html><body>active</body></html>', headers={'Content-Type': 'text/html'}))
+
+
+@pytest.mark.parametrize('role,forward', [('standby', True), ('standby', False), ('active', False)])
+def test_runtime_a_forwarding_standby_acts_and_opens_consoles_on_the_active(open_app, role, forward):
+    app = open_app(role=role, layout='modern', clusters=[CLUSTER], resources=[VM], forward_writes=forward,
+                   autoinstall='manage', extra=SSE_TOKEN)
+    page = app.page
+    page.on('dialog', lambda d: d.accept())
+    standby = role == 'standby'
+    acting = not standby or forward
+    banner = page.locator('[data-ha-banner="classic"]')
+    if standby:
+        assert banner.get_attribute('data-ha-forwarding') == ('on' if forward else 'off')
+        text = banner.inner_text()
+        assert ('What you do here is carried out on the active instance' in text) == forward, text
+        assert ('Read-only view' in text) != forward, text
+    else:
+        assert banner.count() == 0
+    # adding clusters goes through the active; automated installs stay off every standby,
+    # the answer URL they show would be this instance
+    assert (page.locator('button[title="Manage Groups"]').count() > 0) == acting
+    assert (page.get_by_text('Automated Installations').count() > 0) == (not standby)
+
+    _open_resources(app)
+    for view in ('Grid View', 'List View', 'Compact View'):
+        page.locator(f'button[title="{view}"]').first.click()
+        if view == 'Compact View':
+            page.get_by_text('Select a VM from the list').wait_for(timeout=3000)
+            page.locator('div.cursor-pointer', has_text='web01').first.click()
+            page.get_by_text('Quick Actions').wait_for(timeout=3000)
+        page.wait_for_timeout(200)
+        labels = _labels(page)
+        assert ({'Shutdown', 'Migrate'} <= labels) == acting, (view, sorted(labels))
+        links = _on_active_links(page)
+        if standby:
+            assert not labels & CONSOLE_LABELS, (view, sorted(labels & CONSOLE_LABELS))
+            assert links == [CONSOLE_URL], (view, links)
+        else:
+            assert labels & CONSOLE_LABELS, (view, sorted(labels))
+            assert not links, (view, links)
+    if standby:
+        # a real link into a new tab, not a button that runs anything here
+        link = page.locator('a[data-ha-on-active]').first
+        assert link.get_attribute('href') == CONSOLE_URL
+        assert link.get_attribute('target') == '_blank'
+        assert 'noopener' in link.get_attribute('rel')
+    if forward:
+        # the action goes out and nothing refuses it
+        page.locator('button[title="Grid View"]').first.click()
+        page.locator('button[title="Shutdown"]').first.click()
+        assert _wait_for_call(app, ('POST', '/api/clusters/c1/vms/pve1/qemu/100/shutdown'))
+        page.wait_for_timeout(400)
+        assert app.server.forwarded == [('POST', '/api/clusters/c1/vms/pve1/qemu/100/shutdown')]
+        assert not [t for t in _toasts(page) if 'standby' in t.lower()], _toasts(page)
+    # no console, preview or shell ever asked for on a standby
+    if standby:
+        assert not [c for c in app.server.calls
+                    if c[1].endswith(('/console', '/spice', '/screenshot')) or c[1] == '/api/ws/token']
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('role', ['standby', 'active'])
+def test_runtime_corporate_menus_and_detail_send_consoles_to_the_active(open_app, role):
+    app = open_app(role=role, layout='corporate', clusters=[CLUSTER], resources=[VM], forward_writes=True)
+    page = app.page
+    standby = role == 'standby'
+    _serve_the_active(app)
+    page.locator('.corp-tree-item', has_text='Testi').first.click()
+    vm = page.locator('.corp-tree-child', has_text='web01').first
+    vm.wait_for(timeout=5000)
+    vm.click(button='right')
+    menu = page.locator('.corp-context-menu').first
+    menu.wait_for(timeout=3000)
+    lines = [x.strip() for x in menu.inner_text().split('\n') if x.strip()]
+    # the power menu is there on a forwarding standby too, the consoles are not
+    assert 'Power' in lines, lines
+    assert ('Console' not in lines and 'SPICE' not in lines) == standby, lines
+    assert (ON_ACTIVE in lines) == standby, lines
+    if standby:
+        with app.ctx.expect_page() as opened:
+            menu.get_by_text(ON_ACTIVE).click()
+        tab = opened.value
+        tab.wait_for_load_state()
+        assert tab.url == CONSOLE_URL
+        tab.close()
+    else:
+        page.keyboard.press('Escape')
+    page.mouse.click(5, 900)
+
+    _open_resources(app)
+    page.locator('span', has_text='web01').first.click()
+    page.get_by_text('Snapshots').first.wait_for(timeout=3000)
+    page.wait_for_timeout(300)
+    labels = _labels(page)
+    assert {'Shutdown', 'Reboot'} <= labels, sorted(labels)
+    assert bool(labels & CONSOLE_LABELS) != standby, sorted(labels & CONSOLE_LABELS)
+    links = _on_active_links(page)
+    # the toolbar and the preview tile each carry the link
+    assert links == ([CONSOLE_URL, CONSOLE_URL] if standby else []), links
+    shots = [c for c in app.server.calls if c[1].endswith('/screenshot')]
+    assert (not shots) == standby, shots
+    page.get_by_text('Snapshots').first.click()
+    page.wait_for_timeout(500)
+    eff = [u for u in app.server.urls if '/efficient-snapshots' in u]
+    assert eff and all(('refresh=true' in u) != standby for u in eff), eff
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('role', ['standby', 'active'])
+def test_runtime_cloud_forwarding_standby_acts_but_opens_consoles_there(open_app, role):
+    app = open_app(role=role, layout='cloud', clusters=[CLUSTER], resources=[VM], forward_writes=True,
+                   autoinstall='manage')
+    page = app.page
+    standby = role == 'standby'
+    if standby:
+        assert page.locator('[data-ha-banner="cloud"]').get_attribute('data-ha-forwarding') == 'on'
+    # automated installs stay off every standby, forwarding or not
+    assert (page.get_by_text('Automated Installs').count() == 0) == standby
+    page.get_by_text('Virtual Machines').first.click()
+    page.get_by_text('web01').first.wait_for(timeout=5000)
+    assert 'New VM' in _labels(page)
+    page.get_by_text('web01').first.click()
+    bar = page.locator('.cloud-detail-actions')
+    bar.wait_for(timeout=3000)
+    text = bar.inner_text()
+    assert 'Shutdown' in text and 'Reboot' in text, text
+    assert ('SPICE' not in text) == standby, text
+    links = bar.locator('a[data-ha-on-active]')
+    assert links.count() == (1 if standby else 0)
+    if standby:
+        assert links.first.get_attribute('href') == CONSOLE_URL
+        assert ON_ACTIVE in text
+    page.locator('.cloud-detail-actions button', has_text='Actions').click()
+    page.wait_for_timeout(300)
+    menu = page.evaluate('() => Array.from(document.querySelectorAll("[role=menu], .cloud-menu"))'
+                         '.map(m => m.innerText).join("\\n")').split('\n')
+    menu = [x.strip() for x in menu if x.strip()]
+    assert 'Migrate' in menu and 'Delete' in menu, menu
+    assert ('Console' not in menu) == standby, menu
+    assert (ON_ACTIVE in menu) == standby, menu
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('language', ['en', 'de'])
+def test_runtime_the_active_out_of_reach_is_one_translated_toast(open_app, language):
+    """The page reads the banner while the active answers; by the click it no longer does.
+    One toast in the user's language, and the banner is read again, so the page turns
+    read-only without waiting for the next poll."""
+    app = open_app(role='standby', layout='modern', language=language, clusters=[CLUSTER], resources=[VM],
+                   forward_writes=True, active_down=True)
+    page = app.page
+    page.on('dialog', lambda d: d.accept())
+    banner = page.locator('[data-ha-banner="classic"]')
+    assert banner.get_attribute('data-ha-forwarding') == 'on'
+    page.get_by_text('Testi').first.click()
+    page.locator('button', has_text='Ressourcen' if language == 'de' else 'Resources').first.click()
+    page.get_by_text('web01').first.wait_for(timeout=5000)
+    checks = app.server.calls.count(('GET', '/api/auth/check'))
+    shutdown = 'Herunterfahren' if language == 'de' else 'Shutdown'
+    page.locator(f'button[title="{shutdown}"]').first.click()
+    app.see(UNREACHABLE[language], timeout=5000)
+    page.wait_for_timeout(600)
+    assert page.get_by_text(UNREACHABLE[language]).count() == 1
+    assert page.get_by_text('act again once it is back').count() == 0
+    assert ('POST', '/api/clusters/c1/vms/pve1/qemu/100/shutdown') in app.server.calls
+    # read again at once: forwarding is off now, and so are the buttons
+    assert app.server.calls.count(('GET', '/api/auth/check')) > checks
+    page.wait_for_function('() => document.querySelector("[data-ha-banner]")'
+                           '.getAttribute("data-ha-forwarding") === "off"', timeout=5000)
+    page.wait_for_timeout(300)
+    assert page.locator(f'button[title="{shutdown}"]').count() == 0
+    assert not app.errors, app.errors
+
+
+def test_runtime_the_cloud_helper_names_the_active_out_of_reach(open_app):
+    job = {'id': 'backup-1', 'enabled': 1, 'schedule': 'daily', 'storage': 'local', 'mode': 'snapshot',
+           'vmid': '100', 'node': 'pve1'}
+    app = open_app(role='standby', layout='cloud', clusters=[CLUSTER], resources=[VM], forward_writes=True,
+                   active_down=True, extra={('GET', '/api/clusters/c1/datacenter/backup'): (200, [job])})
+    page = app.page
+    said = []
+
+    def dialog(d):
+        said.append(d.message)
+        d.accept()
+    page.on('dialog', dialog)
+    page.locator('.cloud-shell').get_by_text('Backups', exact=True).first.click()
+    page.locator('.cloud-table-row', has_text='daily').first.wait_for(timeout=5000)
+    page.locator('button[title="Run now"]').first.click()
+    deadline = time.time() + 4
+    while time.time() < deadline and not said:
+        page.wait_for_timeout(100)
+    assert said == ['Action failed: ' + UNREACHABLE['en']], said
+    assert ('POST', '/api/clusters/c1/datacenter/backup/backup-1/run') in app.server.calls
+    assert not app.errors, app.errors
+
+
+def test_runtime_the_forward_switch_turns_a_standby_read_only(open_app):
+    app = open_app(role='standby', layout='modern', clusters=[CLUSTER], resources=[VM], forward_writes=True)
+    page = app.page
+    banner = page.locator('[data-ha-banner="classic"]')
+    assert banner.get_attribute('data-ha-forwarding') == 'on'
+    panel = _open_ha(app, 'standby')
+    switch = page.get_by_role('switch', name='Forward actions to the active instance')
+    live = page.get_by_role('switch', name='Connect to the clusters while standing by (read only)')
+    assert switch.get_attribute('aria-checked') == 'true'
+    # next to the live view
+    assert page.evaluate('([a, b]) => document.getElementById(a).closest(".grid") === '
+                         'document.getElementById(b).closest(".grid")', ['pgha-forward', 'pgha-live-view'])
+    assert live.is_visible()
+    assert panel.locator('[data-ha-forward-paused]').count() == 0
+    switch.click()
+    assert _wait_for_toast(page, 'Saved. A standby only shows and acts on nothing.'), _toasts(page)
+    assert app.server.bodies['/api/ha/settings'][-1] == {'forward_writes': False}
+    # no restart for this one, and the banner follows at once
+    assert page.locator('[role="alertdialog"]').count() == 0
+    page.wait_for_function('() => document.querySelector("[data-ha-banner]")'
+                           '.getAttribute("data-ha-forwarding") === "off"', timeout=5000)
+    assert 'Read-only view' in banner.inner_text()
+    page.wait_for_function('() => document.getElementById("pgha-forward").getAttribute("aria-checked") === "false"',
+                           timeout=5000)
+    assert not app.errors, app.errors
+
+
+def test_runtime_the_forward_switch_only_saves_on_an_active(open_app):
+    app = open_app(role='active', layout='modern', forward_writes=False)
+    page = app.page
+    _open_ha(app, 'active')
+    switch = page.get_by_role('switch', name='Forward actions to the active instance')
+    assert switch.get_attribute('aria-checked') == 'false'
+    switch.click()
+    assert _wait_for_toast(page, 'Saved. A standby carries out actions through the active instance.'), _toasts(page)
+    assert app.server.bodies['/api/ha/settings'][-1] == {'forward_writes': True}
+    page.wait_for_function('() => document.getElementById("pgha-forward").getAttribute("aria-checked") === "true"',
+                           timeout=5000)
+    assert page.locator('[data-ha-banner]').count() == 0
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('source_active', [False, True])
+def test_runtime_forwarding_on_without_an_active_says_it_is_paused(open_app, source_active):
+    """The switch is on, but the instance the standby follows does not answer as active: the
+    server does not forward then, the page stays read-only and the panel says why."""
+    app = open_app(role='standby', layout='modern', clusters=[CLUSTER], resources=[VM], forward_writes=True,
+                   source_active=source_active)
+    page = app.page
+    assert page.locator('[data-ha-banner="classic"]').get_attribute('data-ha-forwarding') == \
+        ('on' if source_active else 'off')
+    assert (page.locator('button[title="Manage Groups"]').count() > 0) == source_active
+    panel = _open_ha(app, 'standby')
+    assert page.get_by_role('switch', name='Forward actions to the active instance').get_attribute('aria-checked') == 'true'
+    paused = panel.locator('[data-ha-forward-paused]')
+    assert paused.count() == (0 if source_active else 1)
+    if not source_active:
+        assert 'does not answer as the active instance right now' in paused.inner_text()
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('role', ['standby', 'active'])
+def test_runtime_a_console_window_on_a_standby_offers_the_active(open_app, role):
+    """A console link (#767) opened on a standby, forwarding or not: nothing is asked for
+    here, the window offers the same console on the active."""
+    app = open_app(role=role, layout='modern', clusters=[CLUSTER], resources=[VM], forward_writes=True)
+    page = app.page
+    before = len(app.server.calls)
+    page.goto(BASE + '/?console=c1:qemu:100:pve1', wait_until='load')
+    if role == 'standby':
+        box = page.locator('[data-ha-console-elsewhere]')
+        box.wait_for(timeout=10000)
+        assert 'Consoles and shells only run on the active instance' in box.inner_text()
+        assert box.locator('a[data-ha-on-active]').get_attribute('href') == CONSOLE_URL
+        page.wait_for_timeout(300)
+        assert [c for c in app.server.calls[before:] if c[1] != '/api/auth/check'] == [], app.server.calls[before:]
+        assert not app.errors, app.errors
+    else:
+        # the active opens the console itself: it looks the cluster up, and offers no link
+        assert _wait_for_call(app, ('GET', '/api/clusters'), 10)
+        assert page.locator('[data-ha-console-elsewhere]').count() == 0
+        assert page.locator('[data-ha-on-active]').count() == 0
+
+
+@pytest.mark.parametrize('role', ['standby', 'active'])
+def test_runtime_esxi_on_a_forwarding_standby(open_app, role):
+    app = open_app(role=role, layout='modern', clusters=[CLUSTER], resources=[VM], extra=ESXI_READS,
+                   forward_writes=True)
+    page = app.page
+    standby = role == 'standby'
+    page.get_by_text('esx01').first.wait_for(timeout=8000)
+    # adding goes through the active again
+    assert page.locator('button[title="Add ESXi Server"]').count() == 1
+    page.get_by_text('esx01').first.click()
+    page.get_by_text('legacy01').first.wait_for(timeout=8000)
+    page.get_by_text('legacy01').first.click()
+    page.locator('button', has_text='Snapshots').first.wait_for(timeout=5000)
+    page.wait_for_timeout(300)
+    detail = _labels(page)
+    assert {'Stop', 'Suspend'} & detail, sorted(detail & ESXI_POWER)
+    assert ('Console (VMRC)' not in detail) == standby, sorted(detail & ESXI_POWER)
+    # no deep link into an ESXi console: the active's start page
+    assert _on_active_links(page) == ([PEER + '/'] if standby else [])
+    assert not [c for c in app.server.calls if c[1].endswith('/console')]
+    assert not app.errors, app.errors
+
+
+# -- v3: what no standby carries out, forwarding or not ------------------------------------------
+#
+# app.py keeps some writes refused on every standby (_STANDBY_NOT_FORWARDED): this instance's own
+# settings, the code and the plugins of the process, a security key, and rows of the tables each
+# instance keeps for itself. Their controls ask haStandby, not haReadOnly. A form that would still
+# look editable shows one note in place of its save button, with the link to the active.
+
+def test_the_note_says_why_and_links_the_active():
+    note = _function(_read('web', 'src', 'ui.js'), 'HaSettingsOnActive')
+    assert "{own ? t('pgHaOwnSettingsHere') : t('pgHaSettingsOnActive')}" in note
+    assert "data-ha-settings-on-active={own ? 'own' : 'shared'}" in note
+    assert '<HaOnActiveLink className=' in note
+    # it renders wherever it is put: every caller asks the flag
+    assert 'useAuth' not in note
+
+
+# (file, what the control is found by, the gate in front of it, how far in front at most).
+# Every occurrence counts; the reach keeps the gate of another control further up from passing.
+SAVE_NOTE, OWN_NOTE = '{haStandby ? <HaSettingsOnActive /> : (', '{haStandby ? <HaSettingsOnActive own /> : ('
+STANDBY_GATES = [
+    ('settings_modal.js', 'onClick={saveLdapSettings}', SAVE_NOTE, 300),
+    ('settings_modal.js', 'onClick={saveOidcSettings}', SAVE_NOTE, 300),
+    ('settings_modal.js', 'onClick={handleSaveSMTPSettings}', SAVE_NOTE, 300),
+    ('settings_modal.js', 'syslog_filter_by_selected_cluster: !!serverSettings.syslog_filter_by_selected_cluster,\n',
+     OWN_NOTE, 900),
+    ('settings_modal.js', 'onClick={handleSaveServerSettings}', OWN_NOTE, 300),
+    ('settings_modal.js', 'onClick={handleAcmeRequest}', OWN_NOTE, 300),
+    ('settings_modal.js', 'onClick={handleAcmeDnsComplete}', '{acmeResult?.pending_dns && !haStandby && (', 2300),
+    ('settings_modal.js', 'onClick={performUpdate}', ') : !haStandby && (', 300),
+    ('settings_modal.js', 'onClick={() => { loadBackups(); setShowRollbackModal(true); }}', '{!haStandby && (', 1100),
+    ('settings_modal.js', 'onClick={() => refreshPoolCache(selectedPoolCluster)}',
+     '{selectedPoolCluster && !haStandby && (', 300),
+    ('settings_modal.js', 'await fetch(`${API_URL}/plugins/rescan`', '{!haStandby && <button onClick={async () => {', 300),
+    ('settings_modal.js', '() => togglePlugin(plugin.id, plugin.enabled)', 'onClick={haStandby ? undefined : ', 300),
+    ('settings_modal.js', "await fetch(`${API_URL}/plugins/${plugin.id}`, { method: 'DELETE'",
+     '{!haStandby && <button onClick={async () => {', 400),
+    ('security.js', 'onClick={() => setShowImportModal(true)}', SAVE_NOTE, 300),
+    ('node_modals.js', 'onClick={openWarn}', OWN_NOTE, 300),
+    ('node_modals.js', 'onClick={openRfWarn}', OWN_NOTE, 300),
+    ('create_modals.js', 'onClick={register}', '{!haStandby && (', 300),
+    ('dashboard.js', 'onClick={e => { e.stopPropagation(); ack(ev.id, ', "{canAct && !haStandby && ev.status === 'open' && (", 700),
+    ('dashboard.js', 'onClick={clearInbox}', '{items.length > 0 && !haStandby && (', 300),
+    ('dashboard.js', 'onClick={() => ackAlert(a.id)}', '{!a.acked_at && !haStandby && (', 300),
+    ('vm_modals.js', 'onClick={() => saveAutoReconcile(!autoReconcile)}', '{canAdminSettings && !haStandby && (', 300),
+]
+
+
+@pytest.mark.parametrize('name,anchor,gate,reach', STANDBY_GATES,
+                         ids=[f'{n}:{a[:40]}' for n, a, _, _ in STANDBY_GATES])
+def test_every_control_behind_a_refused_route_asks_the_standby_flag(name, anchor, gate, reach):
+    src = _read('web', 'src', name)
+    spots = [m.start() for m in re.finditer(re.escape(anchor), src)]
+    assert spots, anchor
+    for at in spots:
+        gate_at = src.rfind(gate, 0, at)
+        assert gate_at >= 0 and at - gate_at < reach, (anchor, at - gate_at, src[max(0, at - 300):at])
+
+
+def test_the_forms_that_save_as_you_type_are_locked_on_a_standby():
+    sec = _read('web', 'src', 'security.js')
+    for component, save in (('SecuritySettingsSection', 'saveSettings('),
+                            ('ComplianceSection', 'saveHardeningSettings(')):
+        body = _function(sec, component)
+        assert re.search(r'const \{[^}]*\bhaStandby\b[^}]*\} = useAuth\(\);', body), component
+        view = body[body.index('\n            return (\n'):]
+        start = view.index('<fieldset disabled={haStandby}')
+        end = view.index('</fieldset>', start)
+        calls = [m.start() for m in re.finditer(re.escape(save), view)]
+        assert calls and all(start < c < end for c in calls), component
+        # the note right before the locked part
+        assert '{haStandby && <HaSettingsOnActive />}' in view[start - 120:start], component
+    # the lockouts and the backup export stay: they are this instance's own and go through
+    body = _function(sec, 'SecuritySettingsSection')
+    view = body[body.index('\n            return (\n'):]
+    assert view.index('</fieldset>') < view.index('onClick={unlockAll}')
+    assert view.index('</fieldset>') < view.index('<ConfigBackupSection')
+
+
+# -- runtime ------------------------------------------------------------------------------------
+
+NOTE = '[data-ha-settings-on-active]'
+PLUGIN = {'id': 'hello', 'name': 'Hello', 'version': '1.0', 'enabled': True, 'loaded': True}
+SETTINGS_READS = {('GET', '/api/settings/server'): (200, {'domain': 'pegaprox-b.example', 'port': 5000}),
+                  ('GET', '/api/plugins'): (200, [PLUGIN])}
+# the writes these pages would send and a standby refuses, forwarded or not
+REFUSED_WRITES = ('/api/settings/server', '/api/settings/acme/request', '/api/plugins/rescan',
+                  '/api/plugins/hello/enable', '/api/plugins/hello/disable', '/api/plugins/hello',
+                  '/api/config/restore', '/api/hardware-monitoring/consent',
+                  '/api/hardware-monitoring/redfish-consent', '/api/webauthn/register/begin',
+                  '/api/pegaprox/update/rollback')
+
+
+def _notes(page, kind):
+    return page.locator(f'{NOTE}[data-ha-settings-on-active="{kind}"]')
+
+
+def _settings_tab(app, name):
+    app.page.get_by_role('button', name=name, exact=True).first.click()
+    app.page.wait_for_timeout(300)
+
+
+@pytest.mark.parametrize('role,forward', [('standby', True), ('standby', False), ('active', False)])
+def test_runtime_the_settings_a_standby_never_saves_point_to_the_active(open_app, role, forward):
+    app = open_app(role=role, layout='modern', forward_writes=forward, extra={**SETTINGS_READS, **SSE_TOKEN})
+    page = app.page
+    page.on('dialog', lambda d: d.accept())
+    standby = role == 'standby'
+    app.open_settings()
+
+    _settings_tab(app, 'Server')
+    page.get_by_text('Plugins', exact=True).first.wait_for(timeout=5000)
+    page.get_by_text('Hello', exact=True).first.wait_for(timeout=5000)
+    labels = _labels(page)
+    # the save at the bottom and the certificate request: this instance's own
+    assert ('Save Settings' in labels) != standby, sorted(labels)
+    assert ('Request Certificate' in labels) != standby, sorted(labels)
+    assert _notes(page, 'own').count() == (2 if standby else 0)
+    # SMTP is shared: saved on the active, it arrives with the sync
+    assert _notes(page, 'shared').count() == (1 if standby else 0)
+    assert ('Rescan' in labels) != standby and ('Delete plugin' in labels) != standby, sorted(labels)
+    if standby:
+        # the way to the active, in a new tab
+        link = _notes(page, 'own').first.locator('a[data-ha-on-active]')
+        assert link.get_attribute('href') == PEER + '/'
+        assert link.get_attribute('target') == '_blank'
+        assert 'Change them on the active instance' in _notes(page, 'shared').first.inner_text()
+        assert 'set before pairing or after a promotion' in _notes(page, 'own').first.inner_text()
+    # the plugin switch shows its state, and switches only where the route runs
+    row = page.get_by_text('Hello', exact=True).first.locator('xpath=ancestor::div[contains(@class, "justify-between")][1]')
+    row.locator('.toggle-switch.active').click()
+    page.wait_for_timeout(400)
+    assert (('POST', '/api/plugins/hello/disable') in app.server.calls) != standby
+
+    _settings_tab(app, 'LDAP / AD')
+    assert ('Save LDAP Settings' in _labels(page)) != standby
+    assert _notes(page, 'shared').count() == (1 if standby else 0)
+    _settings_tab(app, 'OIDC / Entra ID')
+    assert ('Save OIDC Settings' in _labels(page)) != standby
+    assert _notes(page, 'shared').count() == (1 if standby else 0)
+    _settings_tab(app, 'Syslog Server')
+    assert _notes(page, 'own').count() == (1 if standby else 0)
+    _settings_tab(app, 'Security Settings')
+    page.get_by_text('Login Protection').first.wait_for(timeout=5000)
+    assert _notes(page, 'shared').count() == (2 if standby else 0)     # the settings and the restore
+    assert ('Restore Backup' in _labels(page)) != standby
+    assert page.evaluate('() => Array.from(document.querySelectorAll("fieldset")).some(f => f.disabled)') == standby
+    # the lockouts are this instance's own: still there
+    assert page.locator('button[title="Refresh"]').first.is_enabled()
+    _settings_tab(app, 'Compliance')
+    page.get_by_text('Compliance & Hardening').first.wait_for(timeout=5000)
+    assert _notes(page, 'shared').count() == (1 if standby else 0)
+    _settings_tab(app, 'Updates')
+    page.get_by_text('Current Version').first.wait_for(timeout=5000)
+    assert ('View Backups' in _labels(page)) != standby
+
+    if standby:
+        assert not [c for c in app.server.calls if c[0] != 'GET' and c[1] in REFUSED_WRITES], app.server.calls
+        assert not [t for t in _toasts(page) if 'standby' in t.lower()], _toasts(page)
+    assert not app.errors, app.errors
+
+
+HW_READS = {('GET', '/api/hardware-monitoring/consent'): (200, {
+                'enabled': False, 'current_version': 1,
+                'warning': {'title': 'Enable hardware monitoring', 'points': ['reads sensors'], 'require_delay_seconds': 0}}),
+            ('GET', '/api/hardware-monitoring/redfish-consent'): (200, {
+                'enabled': False, 'current_version': 1,
+                'warning': {'title': 'Enable out-of-band monitoring', 'points': ['BMC'], 'require_delay_seconds': 0}})}
+
+
+@pytest.mark.parametrize('role,forward', [('standby', True), ('standby', False), ('active', False)])
+def test_runtime_the_hardware_consent_stays_with_each_instance(open_app, role, forward):
+    app = open_app(role=role, layout='modern', clusters=[CLUSTER], resources=[VM], metrics=NODE_METRICS,
+                   forward_writes=forward, extra=HW_READS)
+    page = app.page
+    standby = role == 'standby'
+    page.get_by_text('Testi').first.click()
+    page.locator('button[title="Node Configuration"]').first.wait_for(timeout=5000)
+    page.locator('button[title="Node Configuration"]').first.click()
+    page.get_by_text('Proxmox Node').first.wait_for(timeout=5000)
+    page.locator('button', has_text='Hardware').last.click()
+    page.get_by_text('Out-of-band (Redfish)').first.wait_for(timeout=5000)
+    labels = _labels(page)
+    for consent in ('Enable hardware monitoring', 'Enable out-of-band monitoring'):
+        assert (consent in labels) != standby, (consent, sorted(labels))
+    notes = _notes(page, 'own')
+    assert notes.count() == (2 if standby else 0)
+    if standby:
+        assert notes.first.locator('a[data-ha-on-active]').get_attribute('href') == PEER + '/'
+    else:
+        # the button on the active opens the warning, the consent itself is not asked for yet
+        page.locator('button', has_text='Enable hardware monitoring').first.click()
+        page.get_by_text('reads sensors').first.wait_for(timeout=3000)
+    assert not [c for c in app.server.calls if c[0] != 'GET' and 'hardware-monitoring' in c[1]]
+    assert not app.errors, app.errors
+
+
+KEY_READS = {('GET', '/api/webauthn/available'): (200, {'available': True, 'host_usable': True}),
+             ('GET', '/api/webauthn/credentials'): (200, {'available': True, 'credentials': []})}
+
+
+@pytest.mark.parametrize('role,forward', [('standby', True), ('standby', False), ('active', False)])
+def test_runtime_a_security_key_is_enrolled_on_the_active(open_app, role, forward):
+    app = open_app(role=role, layout='modern', forward_writes=forward, extra=KEY_READS)
+    page = app.page
+    standby = role == 'standby'
+    page.locator('header button', has_text='Admin').first.click()
+    page.get_by_text('My Profile').first.click()
+    page.get_by_role('button', name=re.compile(r'^security$', re.I)).first.click()
+    page.get_by_text('Hardware Keys').first.wait_for(timeout=5000)
+    page.wait_for_timeout(300)
+    assert ('Add Security Key' in _labels(page)) != standby
+    notes = _notes(page, 'shared')
+    assert notes.count() == (1 if standby else 0)
+    if standby:
+        assert notes.first.locator('a[data-ha-on-active]').get_attribute('href') == PEER + '/'
+    assert not [c for c in app.server.calls if 'webauthn/register' in c[1]]
+    assert not app.errors, app.errors

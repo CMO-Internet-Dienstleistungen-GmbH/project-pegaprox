@@ -1054,7 +1054,7 @@
         // LW: I did the UI, Marcus handled the backend websocket stuff
         function NodeModal({ node, clusterId, clusterType, onClose, addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, haReadOnly } = useAuth();  // NS: Fix - need auth!
+            const { getAuthHeaders, haReadOnly, haStandby } = useAuth();  // NS: Fix - need auth!
             const { isCorporate } = useLayout();
             const [activeTab, setActiveTab] = useState('summary');
             const [loading, setLoading] = useState(true);
@@ -1101,9 +1101,11 @@
                 { id: 'subscription', label: 'Subscription', icon: Icons.Shield },
                 { id: 'ceph', label: 'Ceph', icon: Icons.Database },
             ];
-            // #625 v2 - a standby shows the node but changes nothing on it: no shell, and
-            // every tab that can change something renders with its controls disabled
-            const tabs = haReadOnly ? allTabs.filter(tab => tab.id !== 'shell') : allTabs;
+            // #625 v2 - a standby shows the node but changes nothing on it: every tab that can
+            // change something renders with its controls disabled. A forwarding standby
+            // changes it through the active, so only a read-only one locks them. The shell
+            // tab stays on every standby and points to the shell on the active instead.
+            const tabs = allTabs;
             const lockedTab = haReadOnly && !['summary', 'performance', 'tasks'].includes(activeTab);
             // spread on the fieldsets around the parts that change the node; what only reads
             // (Refresh, SMART) sits outside them and keeps working on a standby
@@ -1907,7 +1909,9 @@
                                         </div>
                                     )}
 
-                                    {activeTab === 'shell' && !haReadOnly && (
+                                    {activeTab === 'shell' && haStandby && <HaConsoleOnActive />}
+
+                                    {activeTab === 'shell' && !haStandby && (
                                         <div className="h-full flex flex-col">
                                             <div className="flex items-center justify-between mb-4">
                                                 <div className="flex items-center gap-3">
@@ -3576,7 +3580,7 @@
                     </div>
 
                     {/* Fullscreen Shell Modal */}
-                    {!haReadOnly && data.shellFullscreen && (
+                    {!haStandby && data.shellFullscreen && (
                         <div className="fixed inset-0 z-[70] bg-black flex flex-col">
                             <div className="flex items-center justify-between px-4 py-2 bg-proxmox-dark border-b border-proxmox-border">
                                 <div className="flex items-center gap-3">
@@ -4357,6 +4361,8 @@
         // NodeModal. Theme-adaptive via var(--color-text) + a shared status palette.
         function HardwareMonitoringPanel({ clusterId, node, t, addToast, getAuthHeaders }) {
             const { language } = useTranslation();   // request + record the localized warning (#609 phase 2)
+            // both consents are this instance's own settings: no standby saves them (#625)
+            const { haStandby } = useAuth();
             const [consent, setConsent] = useState(null);   // {enabled, warning, current_version, acknowledged_by, acknowledged_at, ack_lang}
             const [hw, setHw] = useState(null);              // {available, health, sensors, chassis, power_w, fru, events} | {error}
             const [loading, setLoading] = useState(true);
@@ -4520,11 +4526,13 @@
                             <div style={cardHead}><span className="text-[13px] font-medium" style={txt}>{t('hardwareMonitoring') || 'Hardware Monitoring'}</span></div>
                             <div className="p-4 space-y-3">
                                 <p className="text-[13px]" style={sub}>{t('hardwareMonitoringDisabledDesc') || 'In-band hardware monitoring (IPMI) is not enabled. It reads sensors, power, inventory and the hardware event log directly on the node — credential-free, read-only.'}</p>
+                                {haStandby ? <HaSettingsOnActive own /> : (
                                 <button onClick={openWarn}
                                     className="px-3 py-1.5 text-sm rounded flex items-center gap-1.5"
                                     style={{background: '#49afd9', color: '#08131b'}}>
                                     <Icons.Cpu className="w-3.5 h-3.5" />{t('enableHardwareMonitoring') || 'Enable hardware monitoring'}
                                 </button>
+                                )}
                             </div>
                         </div>
                     )}
@@ -4655,9 +4663,11 @@
                                 {!rfConsent.enabled && (
                                     <React.Fragment>
                                         <p className="text-[13px]" style={sub}>{t('redfishOobDesc') || 'Read hardware health over the management network via the BMC Redfish API — a credential-based, out-of-band fallback when in-band IPMI is unavailable.'}</p>
+                                        {haStandby ? <HaSettingsOnActive own /> : (
                                         <button onClick={openRfWarn} className="px-3 py-1.5 text-sm rounded flex items-center gap-1.5" style={{background: '#efc006', color: '#08131b'}}>
                                             <Icons.Server className="w-3.5 h-3.5" />{t('enableRedfish') || 'Enable out-of-band monitoring'}
                                         </button>
+                                        )}
                                     </React.Fragment>
                                 )}
                                 {rfConsent.enabled && (
@@ -4776,9 +4786,11 @@
 
         function CorporateNodeDetailView({ node, clusterId, clusterHost, clusterMetrics, clusterResources, onBack, onOpenNodeConfig, onMaintenanceToggle, onNodeAction, onStartUpdate, onSelectVm, addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, reverseProxyEnabled, haReadOnly } = useAuth();
+            const { getAuthHeaders, reverseProxyEnabled, haReadOnly, haStandby } = useAuth();
             // #625 v2 - a standby shows the node: no power, maintenance or update actions, no
             // shell, and the configure and hardware forms render disabled
+            // A forwarding standby acts through the active again; the shell tab points
+            // to the shell on the active on every standby
             const [activeDetailTab, setActiveDetailTab] = useState('summary');
             const [showActionsMenu, setShowActionsMenu] = useState(false);
             const [configSubTab, setConfigSubTab] = useState('network');
@@ -5076,7 +5088,7 @@
 
                     {/* Tab Strip */}
                     <div className="corp-tab-strip px-4">
-                        {['summary', 'monitor', 'configure', 'hardware', 'vms', 'shell', 'subscription'].filter(tab => !(haReadOnly && tab === 'shell')).map(tab => (
+                        {['summary', 'monitor', 'configure', 'hardware', 'vms', 'shell', 'subscription'].map(tab => (
                             <button key={tab} className={activeDetailTab === tab ? 'active' : ''} onClick={() => setActiveDetailTab(tab)}>
                                 {tab === 'summary' ? t('summary') : tab === 'monitor' ? t('monitor') : tab === 'configure' ? t('configure') : tab === 'hardware' ? (t('hardware') || 'Hardware') : tab === 'vms' ? 'VMs' : tab === 'shell' ? 'Shell' : t('subscriptionInfo')}
                             </button>
@@ -5876,7 +5888,8 @@
                         )}
 
                         {/* Shell Tab */}
-                        {activeDetailTab === 'shell' && !haReadOnly && (
+                        {activeDetailTab === 'shell' && haStandby && <HaConsoleOnActive />}
+                        {activeDetailTab === 'shell' && !haStandby && (
                             // NS #727 — clip (not hidden) so Firefox's selection-autoscroll can't
                             // scroll this panel; hidden boxes stay programmatically scrollable, clip doesn't.
                             <div className="bg-black border border-proxmox-border" style={{height: '500px', overflow: 'clip'}}>

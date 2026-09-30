@@ -251,6 +251,71 @@
             );
         }
 
+        // LW Sep 2026 (#625) - where the active shows a console, shell or SPICE button, a
+        // standby shows this: the same view on the active instance, in a new tab. A plain
+        // link, so the address shows on hover and a middle click works as well. With a vm
+        // it opens that guest's console window there, without one the start page. Nothing
+        // on any other role, or while the address of the active is not known. button: for
+        // a toolbar whose styles are written for buttons only.
+        function HaOnActiveLink({ vm, clusterId, className = '', style, iconOnly = false, iconClass, button = false }) {
+            const { ha } = useAuth();
+            const { t } = useTranslation();
+            if (ha?.role !== 'standby') return null;
+            const href = haActiveHref(ha.peer_url, vm ? haConsoleSearch(vm, clusterId) : '');
+            if (!href) return null;
+            const label = t('pgHaOpenOnActive');
+            const inner = (
+                <>
+                    <Icons.ExternalLink className={iconClass} />
+                    {!iconOnly && <span>{label}</span>}
+                </>
+            );
+            if (button) {
+                return (
+                    <button type="button" onClick={() => window.open(href, '_blank', 'noopener,noreferrer')}
+                        data-ha-on-active={href} className={className} style={style} title={label}
+                        aria-label={iconOnly ? label : undefined}>
+                        {inner}
+                    </button>
+                );
+            }
+            return (
+                <a href={href} target="_blank" rel="noopener noreferrer" data-ha-on-active={href}
+                    className={className} style={style} title={label} aria-label={iconOnly ? label : undefined}>
+                    {inner}
+                </a>
+            );
+        }
+
+        // the node shell tabs and a console window opened on a standby: why there is no
+        // terminal, and the way to the one on the active
+        function HaConsoleOnActive({ vm, clusterId }) {
+            const { t } = useTranslation();
+            return (
+                <div className="flex flex-col items-center justify-center gap-3 py-12 px-4 text-center" data-ha-console-elsewhere="">
+                    <span className="text-gray-500"><Icons.Terminal /></span>
+                    <p className="text-sm text-gray-400 max-w-md">{t('pgHaConsoleOnActive')}</p>
+                    <HaOnActiveLink vm={vm} clusterId={clusterId}
+                        className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium bg-proxmox-orange hover:bg-orange-600 text-white"
+                        iconClass="w-4 h-4" />
+                </div>
+            );
+        }
+
+        // in place of a save button whose route no standby carries out, forwarding or not
+        // (_STANDBY_NOT_FORWARDED in app.py). own: a form that holds this instance's own
+        // settings (address, port, certificate...), which no sync brings either
+        function HaSettingsOnActive({ own = false, className = '' }) {
+            const { t } = useTranslation();
+            return (
+                <div data-ha-settings-on-active={own ? 'own' : 'shared'}
+                    className={`flex flex-wrap items-center gap-x-4 gap-y-1 px-3 py-2 rounded-lg bg-yellow-500/10 border border-yellow-500/30 text-xs text-yellow-400 ${className}`}>
+                    <span className="flex-1 min-w-0">{own ? t('pgHaOwnSettingsHere') : t('pgHaSettingsOnActive')}</span>
+                    <HaOnActiveLink className="inline-flex items-center gap-1 font-medium text-proxmox-orange hover:underline" iconClass="w-3.5 h-3.5" />
+                </div>
+            );
+        }
+
         function _hexToRgb(hex) {
             const r = parseInt(hex.slice(1,3), 16) || 0;
             const g = parseInt(hex.slice(3,5), 16) || 0;

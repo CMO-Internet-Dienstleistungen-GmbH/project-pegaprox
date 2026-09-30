@@ -830,8 +830,9 @@
         // LW: this shows when you click a VM in detail view mode
         function VmDetailPanel({ vm, clusterId, onAction, onOpenConsole, onOpenSpice, onOpenLxcShell, onOpenConfig, onMigrate, onClone, onForceStop, onDelete, onCrossClusterMigrate, showCrossCluster, actionLoading, onShowMetrics, addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, haReadOnly } = useAuth();
+            const { getAuthHeaders, haReadOnly, haStandby } = useAuth();
             const acts = !haReadOnly;  // #625: a standby shows this VM, the active acts on it
+            const consoles = !haStandby;  // forwarding or not, a standby opens the console on the active
             
             // some quick helpers
             const isQemu = vm.type === 'qemu';
@@ -1384,7 +1385,7 @@
                                     </button>
                                 </>
                             )}
-                            {acts && (
+                            {consoles && (
                             <button
                                 onClick={() => onOpenConsole(vm)}
                                 className="flex items-center justify-center gap-2 p-3 bg-blue-500/10 hover:bg-blue-500/20 border border-blue-500/30 rounded-lg text-blue-400 transition-all"
@@ -1393,9 +1394,13 @@
                                 {t('console')}
                             </button>
                             )}
+                            {!consoles && (
+                                <HaOnActiveLink vm={vm} clusterId={clusterId}
+                                    className="flex items-center justify-center gap-2 p-3 bg-blue-500/10 hover:bg-blue-500/20 border border-blue-500/30 rounded-lg text-blue-400 transition-all" />
+                            )}
                             {/* NS May 2026 — VNC↔Term toggle moved inside Console modal. */}
                             {/* MK Aug 2026 — SPICE (virt-viewer .vv) sits next to the web console; QEMU only */}
-                            {acts && isQemu && onOpenSpice && (
+                            {consoles && isQemu && onOpenSpice && (
                                 <button
                                     onClick={() => onOpenSpice(vm)}
                                     title={t('spiceConsoleHint') || 'Download a virt-viewer file (audio / USB / multi-monitor)'}
@@ -1558,10 +1563,13 @@
         // LW: Feb 2026 - Corporate VM Detail View (experimental)
         function CorporateVmDetailView({ vm, clusterId, onAction, onOpenConsole, onOpenSpice, onOpenConfig, onBack, onMigrate, onClone, onForceStop, onDelete, onCrossClusterMigrate, showCrossCluster, actionLoading, onShowMetrics, addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, haReadOnly } = useAuth();
+            const { getAuthHeaders, haReadOnly, haStandby } = useAuth();
             // #625 v2 - on a standby: no power, console, SPICE, snapshot or HA changes, and no
             // console preview either, since the grab runs on the node
+            // A forwarding standby changes things through the active again; consoles, the
+            // preview and the snapshot refresh (it runs lvs on the node) stay off on every one
             const acts = !haReadOnly;
+            const consoles = !haStandby;
             const [activeDetailTab, setActiveDetailTab] = useState('summary');
             const [showActionsMenu, setShowActionsMenu] = useState(false);
             const [snapshots, setSnapshots] = useState([]);
@@ -1591,7 +1599,7 @@
             const [shotLoading, setShotLoading] = useState(false);
             const [shotNonce, setShotNonce] = useState(0);  // bump = force fresh grab
             useEffect(() => {
-                if (!isQemu || !isRunning || !acts) { setConsoleShot(null); return; }
+                if (!isQemu || !isRunning || !consoles) { setConsoleShot(null); return; }
                 // reuse a recent frame on re-mount/poll instead of re-grabbing
                 const cached = _consoleShotCache[shotKey];
                 if (shotNonce === 0 && cached && (Date.now() - cached.ts) < SHOT_REUSE_MS) {
@@ -1616,7 +1624,7 @@
                     .catch(() => { if (!cancelled) setConsoleShot(_consoleShotCache[shotKey]?.url || null); })
                     .finally(() => { if (!cancelled) setShotLoading(false); });
                 return () => { cancelled = true; };
-            }, [vm.vmid, vm.status, clusterId, shotNonce, acts]);
+            }, [vm.vmid, vm.status, clusterId, shotNonce, consoles]);
 
             // LW Apr 2026 (#250) — per-VM web link (browser-local; keyed by cluster:vmid)
             const webLinkKey = `${clusterId}:${vm.vmid}`;
@@ -1660,7 +1668,7 @@
                     const base = `${API_URL}/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}`;
                     const [stdRes, effRes] = await Promise.all([
                         authFetch(`${base}/snapshots`),
-                        authFetch(`${base}/efficient-snapshots${acts ? '?refresh=true' : ''}`)
+                        authFetch(`${base}/efficient-snapshots${haStandby ? '' : '?refresh=true'}`)
                     ]);
                     if (stdRes?.ok) setSnapshots(await stdRes.json());
                     if (effRes?.ok) setEfficientSnapshots(await effRes.json());
@@ -1961,12 +1969,13 @@
                                     </button>
                                 </>
                             )}
-                            {acts && isQemu && isRunning && (
+                            {consoles && isQemu && isRunning && (
                                 <button onClick={() => onOpenConsole(vm)}>
                                     <Icons.Terminal className="w-3 h-3" /> {t('console')}
                                 </button>
                             )}
-                            {acts && isQemu && isRunning && onOpenSpice && (
+                            {!consoles && isRunning && <HaOnActiveLink vm={vm} clusterId={clusterId} button iconClass="w-3 h-3" />}
+                            {consoles && isQemu && isRunning && onOpenSpice && (
                                 <button onClick={() => onOpenSpice(vm)} title={t('spiceConsoleHint') || 'Download a virt-viewer file (audio / USB / multi-monitor)'}>
                                     <Icons.ExternalLink className="w-3 h-3" /> {t('spiceConsole') || 'SPICE'}
                                 </button>
@@ -2047,7 +2056,7 @@
                             <Icons.Settings className="w-3 h-3 inline mr-1" />{t('configure')}
                         </button>
                         {/* LW: Feb 2026 - console tab for QEMU (VNC) and LXC (xterm.js) */}
-                        {acts && isRunning && (
+                        {consoles && isRunning && (
                             <button onClick={() => onOpenConsole(vm)}>
                                 <Icons.Terminal className="w-3 h-3 inline mr-1" />{t('console')}
                             </button>
@@ -2083,20 +2092,25 @@
                                                 }
                                                 <div className="text-[11px]" style={{color: '#728b9a'}}>
                                                     {!isRunning ? (t('vmStopped') || 'VM is powered off')
-                                                        : !acts ? t('running')
+                                                        : !consoles ? t('running')
                                                         : (shotLoading && isQemu ? (t('loadingPreview') || 'Loading preview…')
                                                                                  : (t('consoleAvailable') || 'Console available'))}
                                                 </div>
                                             </div>
                                         )}
                                     </div>
-                                    {acts && isRunning && (
+                                    {consoles && isRunning && (
                                         <button onClick={() => onOpenConsole(vm)} className="w-full mt-1.5 py-1.5 text-[12px] font-medium uppercase tracking-wider flex items-center justify-center gap-1.5" style={{background: 'var(--corp-header-bg)', border: '1px solid var(--corp-border-medium)', color: 'var(--corp-accent)'}}>
                                             <Icons.Terminal className="w-3.5 h-3.5" />
                                             {t('launchWebConsole') || 'Launch Web Console'}
                                         </button>
                                     )}
-                                    {acts && isRunning && isQemu && onOpenSpice && (
+                                    {!consoles && isRunning && (
+                                        <HaOnActiveLink vm={vm} clusterId={clusterId} iconClass="w-3.5 h-3.5"
+                                            className="w-full mt-1.5 py-1.5 text-[12px] font-medium uppercase tracking-wider flex items-center justify-center gap-1.5"
+                                            style={{background: 'var(--corp-header-bg)', border: '1px solid var(--corp-border-medium)', color: 'var(--corp-accent)'}} />
+                                    )}
+                                    {consoles && isRunning && isQemu && onOpenSpice && (
                                         <button onClick={() => onOpenSpice(vm)} title={t('spiceConsoleHint') || 'Download a virt-viewer file (audio / USB / multi-monitor)'} className="w-full mt-1.5 py-1.5 text-[12px] font-medium uppercase tracking-wider flex items-center justify-center gap-1.5" style={{background: 'var(--corp-surface-1)', border: '1px solid var(--corp-border-medium)', color: 'var(--corp-text-secondary)'}}>
                                             <Icons.ExternalLink className="w-3.5 h-3.5" />
                                             {t('spiceConsole') || 'SPICE'}
@@ -3980,6 +3994,9 @@
         // primitive, so this drives the new /api/multi-sdn/* orchestration layer.
         function MultiClusterEvpnView({ clusters = [], authFetch, API_URL, addToast, canAdminSettings = false, canManage = false }) {
             const { t } = useTranslation();
+            // the auto-reconcile switch saves through /settings/server, which no standby
+            // carries out, forwarding or not (#625)
+            const { haStandby } = useAuth();
             const [vnets, setVnets] = useState([]);
             const [loading, setLoading] = useState(false);
             const [expanded, setExpanded] = useState(null);
@@ -4170,7 +4187,7 @@
                             <p className="text-xs text-gray-500 mt-0.5">{t('mcevpnSubtitle') || 'One logical EVPN vNet spanning several clusters that share a BGP ASN. The physical BGP-EVPN underlay must already peer.'}</p>
                         </div>
                         <div className="flex items-center gap-2">
-                            {canAdminSettings && (
+                            {canAdminSettings && !haStandby && (
                                 <button onClick={() => saveAutoReconcile(!autoReconcile)} title={t('mcevpnAutoReconcileHint') || 'When on, the drift scanner re-pushes the desired config to drifted members automatically (cluster-wide SDN apply). Off = detect-only.'} className={`px-2.5 py-1.5 rounded-lg text-xs border flex items-center gap-1.5 ${autoReconcile ? 'bg-amber-500/20 text-amber-300 border-amber-500/40' : 'bg-proxmox-dark text-gray-400 border-proxmox-border hover:text-white'}`}><Icons.RefreshCw className="w-3.5 h-3.5" />{t('mcevpnAutoReconcile') || 'Auto-reconcile'}: {autoReconcile ? (t('enabled') || 'on') : (t('disabled') || 'off')}</button>
                             )}
                             <button onClick={load} className="px-2.5 py-1.5 rounded-lg text-xs bg-proxmox-dark border border-proxmox-border text-gray-300 hover:text-white flex items-center gap-1.5"><Icons.RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />{t('refresh') || 'Refresh'}</button>

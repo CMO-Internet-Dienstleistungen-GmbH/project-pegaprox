@@ -779,6 +779,7 @@
         // LW Sep 2026 (#625) - on a standby every page says where its configuration comes
         // from and that changes belong on the active one. Admins get a way to the HA tab.
         // Cloud passes cloud so it picks up the shell's own tokens.
+        // A standby that forwards says that what is done here is carried out there.
         function HaStandbyBanner({ onOpenHa, cloud = false }) {
             const { t, language } = useTranslation();
             const { ha, isAdmin } = useAuth();
@@ -794,7 +795,7 @@
 
             if (!standby) return null;
 
-            const text = t('pgHaBannerStandby')
+            const text = t(ha.forwarding === true ? 'pgHaBannerForwarding' : 'pgHaBannerStandby')
                 .replace('{url}', ha.peer_url || '-')
                 .replace('{time}', ha.last_sync_at ? haRelTime(ha.last_sync_at, language) : t('pgHaNotYet'));
             const button = isAdmin && onOpenHa && (
@@ -807,7 +808,7 @@
 
             if (cloud) {
                 return (
-                    <div data-ha-banner="cloud" role="status"
+                    <div data-ha-banner="cloud" data-ha-forwarding={ha.forwarding === true ? 'on' : 'off'} role="status"
                         style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 16px', fontSize: 13,
                                  background: 'rgba(245,185,69,0.14)', borderBottom: '1px solid rgba(245,185,69,0.42)',
                                  color: 'var(--cloud-warning, #e0a82e)' }}>
@@ -818,7 +819,7 @@
                 );
             }
             return (
-                <div data-ha-banner="classic" role="status" className="px-4 py-2 bg-yellow-500/10 border-b border-yellow-500/40">
+                <div data-ha-banner="classic" data-ha-forwarding={ha.forwarding === true ? 'on' : 'off'} role="status" className="px-4 py-2 bg-yellow-500/10 border-b border-yellow-500/40">
                     <div className="flex items-center gap-3 text-sm">
                         <span className="flex-shrink-0 text-yellow-400"><Icons.Layers /></span>
                         <span className="flex-1 min-w-0 text-yellow-300">{text}</span>
@@ -4705,7 +4706,8 @@
         // Admin can rescan, set baseline, acknowledge/promote events.
         function DriftTab({ clusterId, clusterName, authFetch, addToast, t, isAdmin }) {
             // the admin buttons here change things: on a standby they are the active's (#625)
-            const { haReadOnly } = useAuth();
+            // Ack names an event row every instance keeps for itself: never from a standby
+            const { haReadOnly, haStandby } = useAuth();
             const canAct = isAdmin && !haReadOnly;
             const [status, setStatus] = React.useState(null);
             const [events, setEvents] = React.useState([]);
@@ -4899,7 +4901,7 @@
                                                 </span>
                                             </div>
                                             <div className="flex items-center gap-2 flex-shrink-0">
-                                                {canAct && ev.status === 'open' && (
+                                                {canAct && !haStandby && ev.status === 'open' && (
                                                     <>
                                                         <button onClick={e => { e.stopPropagation(); ack(ev.id, false); }}
                                                             className="text-[11px] px-2 py-0.5 bg-proxmox-darker border border-proxmox-border rounded text-gray-300 hover:text-white">
@@ -4945,6 +4947,8 @@
         // recent inbox). Subscribes via SW + VAPID, persists subscription on the
         // server. Wake-up pushes hit the SW, which fetches /api/push/inbox.
         function PushBellButton({ authFetch, addToast, t }) {
+            // the inbox is this instance's own: no standby clears it (#625)
+            const { haStandby } = useAuth();
             const [open, setOpen] = React.useState(false);
             const [supported, setSupported] = React.useState(true);
             const [permission, setPermission] = React.useState(typeof Notification !== 'undefined' ? Notification.permission : 'default');
@@ -5094,7 +5098,7 @@
                             <div className="absolute right-0 top-full mt-2 w-80 bg-proxmox-card border border-proxmox-border rounded-xl shadow-xl z-50 overflow-hidden">
                                 <div className="px-3 py-2 border-b border-proxmox-border flex items-center justify-between">
                                     <div className="text-sm font-semibold text-white">{t('notifications') || 'Notifications'}</div>
-                                    {items.length > 0 && (
+                                    {items.length > 0 && !haStandby && (
                                         <button onClick={clearInbox} className="text-[10px] text-gray-500 hover:text-white">
                                             {t('markAllRead') || 'mark read'}
                                         </button>
@@ -5646,9 +5650,10 @@
         // Reads /insights/right-sizing + /insights/forecast endpoints, fed by the
         // 5-min metrics_history collector. Force-snapshot button is admin-only.
         function InsightsTab({ clusterId, clusterName, authFetch, addToast, t, isAdmin }) {
-            // the admin buttons here change things: on a standby they are the active's (#625)
-            const { haReadOnly } = useAuth();
-            const canAct = isAdmin && !haReadOnly;
+            // the admin button here writes this instance's own metrics: no standby takes the
+            // snapshot, forwarding or not (#625)
+            const { haStandby } = useAuth();
+            const canAct = isAdmin && !haStandby;
             const [rs, setRs] = React.useState(null);
             const [fc, setFc] = React.useState(null);
             // LW May 2026 — top-N noisy neighbors card
@@ -8065,9 +8070,10 @@
 
         function PegaProxDashboard() {
             const { t } = useTranslation();
-            const { user, sessionId, logout, getAuthHeaders, isAdmin, passwordExpiry, updatePreferences, ha, haReadOnly } = useAuth();
-            // #625: a standby shows the clusters read-only, or none at all with its live view off
-            const haStandby = (ha || {}).role === 'standby';
+            const { user, sessionId, logout, getAuthHeaders, isAdmin, passwordExpiry, updatePreferences, ha, haReadOnly, haStandby, refreshHa } = useAuth();
+            // #625: a standby shows the clusters read-only, or none at all with its live view off.
+            // Since forwarding, haReadOnly holds only while it does not forward, haStandby on
+            // every standby
             // on a standby only the reading permissions count, for admins too
             const can = (permission) => (!haReadOnly || haReadPermission(permission)) &&
                 (isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes(permission)));
@@ -8733,6 +8739,7 @@
             // stable); setSessionExpired/setConnectionError are stable React setters.
             // #625 v2 - what authFetch does with a 409 HA_STANDBY, set further down once
             // addToast and t exist. A ref, because authFetch keeps one identity for good.
+            // And with the 503 HA_ACTIVE_UNREACHABLE of a forwarding standby
             const haRefusedRef = useRef(null);
             const authFetch = React.useCallback(async (url, opts = {}) => {
                 const { timeout, quiet, ...rest } = opts;
@@ -8760,12 +8767,15 @@
                     // #625 v2 - a standby refuses what acts. One translated toast here, and the
                     // caller gets the same words as err.error, so its own error toast is the
                     // same message and addToast drops it. quiet: a background read sent as a POST.
-                    if (res.status === 409 && haRefusedRef.current) {
+                    // A forwarding standby answers 503 when the active is out of reach; the
+                    // same, in other words.
+                    if ((res.status === 409 || res.status === 503) && haRefusedRef.current) {
                         const body = await res.clone().json().catch(() => null);
-                        if (body && body.code === 'HA_STANDBY') {
-                            const error = haRefusedRef.current(quiet);
+                        const code = body && body.code;
+                        if ((res.status === 409 && code === 'HA_STANDBY') || (res.status === 503 && code === 'HA_ACTIVE_UNREACHABLE')) {
+                            const error = haRefusedRef.current(quiet, code);
                             return new Response(JSON.stringify({ ...body, error }),
-                                { status: 409, statusText: res.statusText, headers: { 'Content-Type': 'application/json' } });
+                                { status: res.status, statusText: res.statusText, headers: { 'Content-Type': 'application/json' } });
                         }
                     }
                     return res;
@@ -8808,12 +8818,25 @@
                 setToasts(prev => prev.filter(toast => toast.id !== id));
             };
 
-            // the words for a standby refusal (#625), fresh every render for the language
-            haRefusedRef.current = (quiet = false) => {
-                const msg = t('pgHaStandbyRefused');
+            // the words for a standby refusal (#625), fresh every render for the language.
+            // The active out of reach has its own, and a console refused on a forwarding
+            // standby too. Either answer may mean forwarding just changed, so the banner and
+            // the buttons are read again.
+            haRefusedRef.current = (quiet = false, code = '') => {
+                const msg = t(code === 'HA_ACTIVE_UNREACHABLE' ? 'pgHaActiveUnreachable'
+                    : code === 'console' ? 'pgHaConsoleOnActive' : 'pgHaStandbyRefused');
                 if (!quiet) addToast(msg, 'error');
+                if (!quiet && code !== 'console') refreshHa?.();
                 return msg;
             };
+
+            // #625 - a context menu entry for where a console or shell entry sits on the
+            // active: the same view there, in a new tab. Only for who holds the permission,
+            // as the entry it replaces; the active checks it again anyway.
+            const onActiveItems = (permission, search, disabled = false) => !holds(permission) ? [] : [{
+                label: t('pgHaOpenOnActive'), icon: <Icons.ExternalLink className="w-3.5 h-3.5" />, disabled,
+                onClick: () => { if (!haOpenOnActive(ha?.peer_url, search)) haRefusedRef.current?.(false, 'console'); },
+            }];
 
             // MK May 2026 — one-time discoverability hint for the new ?-shortcuts.
             // localStorage flag survives reloads; per-browser, not per-user (simple).
@@ -12459,6 +12482,7 @@
 
             // VMware Console Ticket
             const openVmwareConsole = async (vmId) => {
+                if (haStandby) { haRefusedRef.current?.(false, 'console'); return; }  // consoles only on the active (#625)
                 try {
                     const resp = await authFetch(`${API_URL}/vmware/${selectedVMware.id}/vms/${vmId}/console`, { method: 'POST' });
                     if (resp?.ok) {
@@ -13661,7 +13685,7 @@
             const handleOpenSpice = async (resource) => {
                 const cId = resource._clusterId || selectedCluster?.id;
                 if (!cId) return;
-                if (haReadOnly) { haRefusedRef.current?.(); return; }  // consoles only on the active (#625)
+                if (haStandby) { haRefusedRef.current?.(false, 'console'); return; }  // consoles only on the active (#625)
                 try {
                     const r = await authFetch(`${API_URL}/clusters/${cId}/vms/${resource.node}/${resource.type}/${resource.vmid}/spice`);
                     if (!r.ok) {
@@ -13684,7 +13708,7 @@
             const handleOpenConsole = async (resource) => {
                 const cId = resource._clusterId || selectedCluster?.id;
                 if (!cId) return;
-                if (haReadOnly) { haRefusedRef.current?.(); return; }
+                if (haStandby) { haRefusedRef.current?.(false, 'console'); return; }  // a forwarding standby too (#625)
                 // NS: Feb 2026 - Use correct cluster's host for cross-cluster console
                 const cluster = clusters.find(c => c.id === cId) || selectedCluster;
                 const info = {
@@ -13818,7 +13842,9 @@
                                 fetchSidebarClusterData(clusterId);
                             } catch (e) { addToast(t('connectionError'), 'error'); }
                         }, disabled: !online },
+                        ...(haStandby ? onActiveItems('node.shell', '', !online) : [
                         { perm: 'node.shell', label: t('sshConsole') || 'SSH Console', icon: <Icons.Terminal className="w-3.5 h-3.5" />, onClick: () => { selectCluster(); const c = clusters.find(cl => cl.id === clusterId); if (c) { setConsoleInfo({ vmid: 0, node: nodeName, type: 'node', host: c.host }); setConsoleVm({ vmid: 0, node: nodeName, type: 'node', name: nodeName }); } }, disabled: !online },
+                        ]),
                         { separator: true },
                         { label: t('refreshData') || 'Refresh', icon: <Icons.RefreshCw className="w-3.5 h-3.5" />, onClick: () => { fetchSidebarClusterData(clusterId); } },
                     ];
@@ -13880,8 +13906,10 @@
                     const items = [
                         { label: t('power') || 'Power', icon: <Icons.Power className="w-3.5 h-3.5" />, submenu: powerItems },
                         { separator: true },
+                        ...(haStandby ? onActiveItems('vm.console', haConsoleSearch(vm), !isRunning) : [
                         { perm: 'vm.console', label: t('console') || 'Console', icon: <Icons.Terminal className="w-3.5 h-3.5" />, onClick: () => handleOpenConsole(vm), disabled: !isRunning },
                         ...(vm.type === 'qemu' ? [{ perm: 'vm.console', label: t('spiceConsole') || 'SPICE', icon: <Icons.ExternalLink className="w-3.5 h-3.5" />, onClick: () => handleOpenSpice(vm), disabled: !isRunning }] : []),
+                        ]),
                         // NS May 2026 — VNC ↔ Term toggle now lives inside the Console modal,
                         // so the separate Terminal entry was removed (one entry point = clearer UX).
                         { perm: 'vm.config', label: t('editSettings') || 'Settings', icon: <Icons.Settings className="w-3.5 h-3.5" />, onClick: () => handleOpenConfig(vm) },
@@ -14076,8 +14104,12 @@
                 };
                 // #625 v2 - a standby hands the shell what reads and nothing that acts;
                 // cloud.js leaves out every entry whose handler is missing
+                // A forwarding standby hands over the actions again, never a console
+                if (haStandby) {
+                    ['openConsole', 'openSpice', 'openLxcShell'].forEach(k => { delete cloudActions[k]; });
+                }
                 if (haReadOnly) {
-                    ['vmAction', 'forceStop', 'openConsole', 'openSpice', 'openLxcShell', 'migrate', 'clone', 'del',
+                    ['vmAction', 'forceStop', 'migrate', 'clone', 'del',
                      'crossMigrate', 'snapshot', 'createVm', 'nodeAction', 'maintenanceToggle', 'startUpdate']
                         .forEach(k => { delete cloudActions[k]; });
                 }
@@ -14496,8 +14528,8 @@
                                         </div>
                                     )}
 
-                                    {/* Add Cluster Dropdown (corporate: via sidebar or right-click); a standby adds nothing (#625) */}
-                                    {!isCorporate && isAdmin && !haStandby && (
+                                    {/* Add Cluster Dropdown (corporate: via sidebar or right-click); a read-only standby adds nothing (#625) */}
+                                    {!isCorporate && isAdmin && !haReadOnly && (
                                         <div className="relative">
                                             <button
                                                 onClick={() => setShowAddDropdown(!showAddDropdown)}
@@ -14771,7 +14803,7 @@
                                         <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">{t('clusters')}</h2>
                                         <div className="flex items-center gap-1">
                                             {/* #625: cluster and group changes are made on the active instance */}
-                                            {isAdmin && !haStandby && (
+                                            {isAdmin && !haReadOnly && (
                                                 isCorporate ? (
                                                     <>
                                                     <button
@@ -15129,7 +15161,7 @@
                                     <div className="mt-4 pt-4 border-t border-proxmox-border">
                                         <div className="flex items-center justify-between px-1 mb-2">
                                             <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">{t('backupServers') || 'Backup Servers'}</h2>
-                                            {isAdmin && !haStandby && (
+                                            {isAdmin && !haReadOnly && (
                                                 <button onClick={() => setShowAddPBS(true)} className="p-1 text-gray-500 hover:text-proxmox-orange rounded transition-colors" title="Add PBS">
                                                     <Icons.Plus className="w-4 h-4" />
                                                 </button>
@@ -15171,7 +15203,7 @@
                                 )}
                                 
                                 {/* add PBS button - hidden in corporate */}
-                                {!isCorporate && pbsServers.length === 0 && isAdmin && !haStandby && (
+                                {!isCorporate && pbsServers.length === 0 && isAdmin && !haReadOnly && (
                                     <div className="mt-4 pt-4 border-t border-proxmox-border">
                                         <button onClick={() => setShowAddPBS(true)} className="w-full flex items-center gap-2 px-3 py-2 rounded-xl bg-proxmox-card border border-dashed border-proxmox-border text-gray-500 hover:text-blue-400 hover:border-blue-500/30 transition-all text-sm">
                                             <Icons.Shield className="w-4 h-4" />
@@ -15185,7 +15217,7 @@
                                     <div className="mt-4 pt-4 border-t border-proxmox-border">
                                         <div className="flex items-center justify-between px-1 mb-2">
                                             <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">ESXi</h2>
-                                            {isAdmin && !haStandby && (
+                                            {isAdmin && !haReadOnly && (
                                                 <button onClick={() => { setEditingVMware(null); setVmwareForm({ name: '', host: '', port: 443, username: 'root', password: '', ssl_verify: false, notes: '' }); setShowAddVMware(true); }} className="p-1 text-gray-500 hover:text-proxmox-orange rounded transition-colors" title={t('addEsxiServer')}>
                                                     <Icons.Plus className="w-4 h-4" />
                                                 </button>
@@ -15348,7 +15380,7 @@
                                 )}
 
                                 {/* add VMware button - hidden in corporate */}
-                                {!isCorporate && vmwareServers.length === 0 && isAdmin && !haStandby && (
+                                {!isCorporate && vmwareServers.length === 0 && isAdmin && !haReadOnly && (
                                     <div className="mt-4 pt-4 border-t border-proxmox-border">
                                         <button onClick={() => { setEditingVMware(null); setVmwareForm({ name: '', host: '', port: 443, username: 'root', password: '', ssl_verify: false, notes: '' }); setShowAddVMware(true); }} className="w-full flex items-center gap-2 px-3 py-2 rounded-xl bg-proxmox-card border border-dashed border-proxmox-border text-gray-500 hover:text-emerald-400 hover:border-emerald-500/30 transition-all text-sm">
                                             <Icons.Cloud className="w-4 h-4" />
@@ -16828,7 +16860,8 @@
                                                                                 </div>
                                                                             </div>
                                                                         </div>
-                                                                        {!a.acked_at && !haReadOnly && (
+                                                                        {/* a fired alert is a row of this instance's own: never acked from a standby */}
+                                                                        {!a.acked_at && !haStandby && (
                                                                             <button onClick={() => ackAlert(a.id)} className="px-3 py-1.5 text-xs bg-proxmox-dark hover:bg-proxmox-hover border border-proxmox-border rounded-lg shrink-0">
                                                                                 {t('acknowledge') || 'Acknowledge'}
                                                                             </button>
@@ -20834,11 +20867,14 @@
                                                                             </>
                                                                         )}
                                                                         <div className="w-px h-8 bg-proxmox-border mx-1" />
-                                                                        {/* Console */}
-                                                                        {isOn && (
+                                                                        {/* Console; a standby links to the active's start page instead (#625) */}
+                                                                        {isOn && !haStandby && (
                                                                             <button onClick={() => openVmwareConsole(vmwareSelectedVm)} className="p-2 rounded-lg bg-purple-500/10 text-purple-400 hover:bg-purple-500/20" title={t('vmwareConsoleVmrc')}>
                                                                                 <Icons.Terminal className="w-4 h-4" />
                                                                             </button>
+                                                                        )}
+                                                                        {isOn && haStandby && (
+                                                                            <HaOnActiveLink iconOnly iconClass="w-4 h-4" className="p-2 rounded-lg bg-purple-500/10 text-purple-400 hover:bg-purple-500/20" />
                                                                         )}
                                                                         {/* More Actions Dropdown */}
                                                                         <div className="relative group">
@@ -25559,7 +25595,7 @@
         // host, which is one /api/clusters read — the parent window is not involved at all,
         // so the popup survives the opener being closed or navigated away.
         function StandaloneConsole({ consoleKey }) {
-            const { getAuthHeaders, haReadOnly } = useAuth();
+            const { getAuthHeaders, haStandby } = useAuth();
             const { t } = useTranslation();
             const [state, setState] = useState({ status: 'loading', vm: null, info: null, clusterId: null });
 
@@ -25577,9 +25613,11 @@
                     setState({ status: 'error', error: 'malformed' });
                     return;
                 }
-                // consoles are the active's (#625); the server refuses one here anyway
-                if (haReadOnly) {
-                    setState({ status: 'error', error: 'standby' });
+                // consoles are the active's (#625); the server refuses one here anyway.
+                // Forwarding or not; the window offers the same console there instead
+                if (haStandby) {
+                    setState({ status: 'standby', clusterId, info: null,
+                               vm: { vmid: Number(vmid), node, type, _clusterId: clusterId } });
                     return;
                 }
 
@@ -25624,7 +25662,7 @@
                     }
                 })();
                 return () => { cancelled = true; };
-            }, [consoleKey, haReadOnly]);  // eslint-disable-line react-hooks/exhaustive-deps
+            }, [consoleKey, haStandby]);  // eslint-disable-line react-hooks/exhaustive-deps
 
             // window.close() is only allowed for a window script opened. Someone who pasted
             // or bookmarked the link is in an ordinary tab, where it does nothing at all and
@@ -25641,6 +25679,13 @@
                     </div>
                 );
             }
+            if (state.status === 'standby') {
+                return (
+                    <div className="min-h-screen bg-proxmox-darker flex items-center justify-center">
+                        <HaConsoleOnActive vm={state.vm} clusterId={state.clusterId} />
+                    </div>
+                );
+            }
             if (state.status === 'error') {
                 return (
                     <div className="min-h-screen bg-proxmox-darker flex items-center justify-center">
@@ -25649,7 +25694,6 @@
                             <p className="text-gray-500 text-sm">{
                                 state.error === 'malformed' ? t('consoleLinkMalformed')
                                 : state.error === 'noAccess' ? t('consoleNoClusterAccess')
-                                : state.error === 'standby' ? t('pgHaStandbyRefused')
                                 : state.error
                             }</p>
                         </div>

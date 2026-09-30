@@ -358,6 +358,8 @@
                 has('forceStop') && running && { label: t('forceStop') || 'Force stop', icon: 'StopCircle', danger: true, onClick: () => act.forceStop(r) },
                 { divider: true },
                 has('openConsole') && { label: t('console') || 'Console', icon: 'Monitor', onClick: () => act.openConsole(r) },
+                // a standby never runs a console; this opens the guest's console on the active (#625)
+                act.consoleOnActive && { label: t('pgHaOpenOnActive'), icon: 'ExternalLink', onClick: () => act.consoleOnActive(r) },
                 has('openSpice') && (running && !isCt) && { label: t('spiceConsole') || 'SPICE', icon: 'ExternalLink', onClick: () => act.openSpice(r) },
                 has('openLxcShell') && isCt && { label: t('shell') || 'Shell', icon: 'Terminal', onClick: () => act.openLxcShell(r) },
                 has('snapshot') && { label: t('snapshots') || 'Snapshot', icon: 'Camera', onClick: () => act.snapshot(r) },
@@ -904,6 +906,7 @@
                             {act.has('openSpice') && r.status === 'running' && r.type === 'qemu' && (
                                 <button type="button" className="cloud-btn" onClick={() => act.openSpice(r)} title={t('spiceConsoleHint') || 'Download a virt-viewer file (audio / USB / multi-monitor)'}><Icons.ExternalLink /> {t('spiceConsole') || 'SPICE'}</button>
                             )}
+                            {act.consoleOnActive && <HaOnActiveLink vm={r} className="cloud-btn" />}
                             <CloudActionMenu items={cloudVmActionItems(r, act, t)} triggerLabel={t('cloud.actions') || 'Actions'} label="Actions" />
                         </div>
                     </div>
@@ -1304,7 +1307,8 @@
         // NS 2026-06-11 — mutation helper for the cloud sections (phase 3). POST/PUT/
         // DELETE with auth, optional confirm() for destructive ops, reload on success.
         // #625: `acts` is false on a standby, and the pages show their changing buttons
-        // only with it; a refusal that still comes back says why, in the user's language
+        // only with it; a refusal that still comes back says why, in the user's language.
+        // True again on a standby that forwards; the active out of reach says so too
         function useCloudMutate(reload) {
             const { getAuthHeaders, haReadOnly } = useAuth();
             const { t } = useTranslation();
@@ -1316,7 +1320,8 @@
                 if (body !== undefined) opts.body = JSON.stringify(body);
                 fetch(path, opts)
                     .then(r => r.ok ? r.json().catch(() => ({})) : r.json().catch(() => ({})).then(b => Promise.reject(
-                        new Error(b && b.code === 'HA_STANDBY' ? t('pgHaStandbyRefused') : 'HTTP ' + r.status))))
+                        new Error(b && b.code === 'HA_STANDBY' ? t('pgHaStandbyRefused')
+                            : b && b.code === 'HA_ACTIVE_UNREACHABLE' ? t('pgHaActiveUnreachable') : 'HTTP ' + r.status))))
                     .then(() => { setBusy(''); if (reload) reload(); })
                     .catch(e => { setBusy(''); window.alert('Action failed: ' + (e && e.message || e)); });
             }, [reload, t]);
@@ -1971,6 +1976,9 @@
         function CloudPlugins({ clusterId, t }) {
             const { data, loading, err, reload } = useCloudData('/api/plugins');
             const mut = useCloudMutate(reload);
+            // a process loads its own plugins: no standby rescans, reloads or switches them,
+            // forwarding or not (#625)
+            const { haStandby } = useAuth();
             // #642 - a plugin limited to other clusters has nothing to say about this one
             const list = (Array.isArray(data) ? data : [])
                 .filter(p => p && p.enabled)
@@ -1980,7 +1988,7 @@
             return (
                 <div className="cloud-body">
                     <CloudPageHeader title={t('plugins') || 'Plugins'} sub={list.length + ' ' + (t('plugins') || 'plugins')}>
-                        {mut.acts && <button type="button" className="cloud-link-btn" onClick={() => mut.run('rescan', 'POST', '/api/plugins/rescan')}><Icons.Search /> {t('rescan') || 'Rescan'}</button>}
+                        {!haStandby && <button type="button" className="cloud-link-btn" onClick={() => mut.run('rescan', 'POST', '/api/plugins/rescan')}><Icons.Search /> {t('rescan') || 'Rescan'}</button>}
                         <button type="button" className="cloud-link-btn" onClick={reload}><Icons.RefreshCw /> {t('refresh') || 'Refresh'}</button>
                     </CloudPageHeader>
                     <CloudSectionState loading={loading} err={err} empty={!list.length} emptyIcon="Box" emptyTitle={t('noPlugins') || 'No plugins enabled'} emptyText={t('cloud.pluginsHint') || 'Enable plugins in Settings → Plugins.'} t={t}>
@@ -1995,7 +2003,7 @@
                         </div>
                         {cur && (
                             <div className="cloud-card cloud-table-card" style={{ padding: 0, overflow: 'hidden' }}>
-                                {cloudHead({ icon: <Icons.Box />, title: cur.name || cur.id, count: (cur.routes && cur.routes.length) || null, right: mut.acts && (
+                                {cloudHead({ icon: <Icons.Box />, title: cur.name || cur.id, count: (cur.routes && cur.routes.length) || null, right: !haStandby && (
                                     <div style={{ display: 'flex', gap: 4 }}>
                                         <CloudIconBtn icon="RotateCw" title={t('reload') || 'Reload'} onClick={() => mut.run('rl' + cur.id, 'POST', `/api/plugins/${cur.id}/reload`)} />
                                         <CloudIconBtn icon="Power" danger title={t('disable') || 'Disable'} onClick={() => mut.run('ds' + cur.id, 'POST', `/api/plugins/${cur.id}/disable`)} />
@@ -2245,9 +2253,10 @@
             const safeClusters = Array.isArray(clusters) ? clusters : [];
             const safeResources = Array.isArray(clusterResources) ? clusterResources : [];
             // server-computed, already false for tenant/cluster-confined users; a standby
-            // installs nothing (#625), like the sidebar entry in the other two layouts
-            const { haReadOnly } = useAuth();
-            const canAutoInstall = !!(currentUser && currentUser.autoinstall_access) && !haReadOnly;
+            // installs nothing (#625), like the sidebar entry in the other two layouts. Not
+            // even a forwarding one: the answer URL it would show is this instance's own.
+            const { ha, haStandby } = useAuth();
+            const canAutoInstall = !!(currentUser && currentUser.autoinstall_access) && !haStandby;
 
             // PegaProx t() ECHOES the key back on a miss, so `t('cloud.x') || 'Fallback'`
             // would render the raw key. treat key-echo as "no translation". -- NS
@@ -2282,7 +2291,10 @@
                 multiCluster: safeClusters.length > 1,   // gate the cross-cluster migrate item
                 // what the dashboard handed over; a standby leaves out everything that acts (#625)
                 has: (k) => typeof actions?.[k] === 'function',
-            }), [actions, cid, safeClusters.length]);
+                // a standby leaves out the consoles too, forwarding or not; this opens the
+                // guest's console on the active in their place
+                consoleOnActive: haStandby ? (r) => haOpenOnActive(ha && ha.peer_url, haConsoleSearch(stamp(r))) : null,
+            }), [actions, cid, safeClusters.length, haStandby, ha && ha.peer_url]);
 
             const vms = safeResources.filter(r => r && r.type === 'qemu');
             const cts = safeResources.filter(r => r && r.type === 'lxc');

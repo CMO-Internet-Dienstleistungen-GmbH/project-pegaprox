@@ -2464,7 +2464,8 @@
         // PegaProx Settings Modal with User Management and Audit Log
         function PegaProxSettingsModal({ isOpen, onClose, addToast, onGroupsChanged }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, user: currentUser, isAdmin } = useAuth();
+            // haStandby: the saves below that no standby carries out, forwarding or not (#625)
+            const { getAuthHeaders, user: currentUser, isAdmin, haStandby } = useAuth();
             const { isCorporate } = useLayout(); // LW: Feb 2026 - Corporate styling
             const [activeTab, setActiveTab] = useState('users');
             const [users, setUsers] = useState([]);
@@ -6214,7 +6215,7 @@
                                                         <option key={c.id} value={c.id}>{clusterLabel(c)}</option>
                                                     ))}
                                                 </select>
-                                                {selectedPoolCluster && (
+                                                {selectedPoolCluster && !haStandby && (
                                                     <button
                                                         onClick={() => refreshPoolCache(selectedPoolCluster)}
                                                         className="px-3 py-2 bg-proxmox-border hover:bg-gray-600 rounded-lg text-sm"
@@ -7245,10 +7246,12 @@
                                     
                                     {/* Save Button */}
                                     <div className="flex justify-end gap-3">
+                                        {haStandby ? <HaSettingsOnActive /> : (
                                         <button onClick={saveLdapSettings} disabled={loading} className="px-6 py-2 bg-proxmox-orange hover:bg-orange-600 disabled:opacity-50 rounded-lg text-white font-medium flex items-center gap-2">
                                             {loading ? <Icons.Loader className="w-4 h-4 animate-spin" /> : <Icons.Save className="w-4 h-4" />}
                                             Save LDAP Settings
                                         </button>
+                                        )}
                                     </div>
                                 </div>
                             )}
@@ -7558,10 +7561,12 @@
                                     
                                     {/* Save */}
                                     <div className="flex justify-end pt-2">
+                                        {haStandby ? <HaSettingsOnActive /> : (
                                         <button onClick={saveOidcSettings} disabled={loading} className="px-6 py-2 bg-proxmox-orange hover:bg-orange-600 disabled:opacity-50 rounded-lg text-white font-medium flex items-center gap-2">
                                             {loading ? <Icons.Loader className="w-4 h-4 animate-spin" /> : <Icons.Save className="w-4 h-4" />}
                                             Save OIDC Settings
                                         </button>
+                                        )}
                                     </div>
                                 </div>
                             )}
@@ -7615,6 +7620,7 @@
                                         </div>
 
                                         <div className="pt-3 flex justify-end border-t border-proxmox-border">
+                                            {haStandby ? <HaSettingsOnActive own /> : (
                                             <button
                                                 onClick={async () => {
                                                     setServerLoading(true);
@@ -7646,6 +7652,7 @@
                                                 {serverLoading && <Icons.Loader className="w-4 h-4 animate-spin" />}
                                                 {t('saveSettings') || t('save') || 'Save'}
                                             </button>
+                                            )}
                                         </div>
                                     </div>
                                 </div>
@@ -8238,7 +8245,7 @@
                                                     </p>
                                                 </div>
 
-                                                {acmeResult?.pending_dns && (
+                                                {acmeResult?.pending_dns && !haStandby && (
                                                     <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg space-y-3">
                                                         <p className="text-sm text-amber-300">{t('acmeDnsInstructions') || 'Create this TXT record, wait for DNS propagation, then continue validation.'}</p>
                                                         <div>
@@ -8274,6 +8281,7 @@
                                                     </div>
                                                 )}
 
+                                                {haStandby ? <HaSettingsOnActive own /> : (
                                                 <button
                                                     onClick={handleAcmeRequest}
                                                     disabled={acmeLoading || !serverSettings.domain || (serverSettings.acme_provider === 'letsencrypt' && !serverSettings.acme_email) || (serverSettings.acme_provider === 'custom' && !serverSettings.acme_directory_url) || ((serverSettings.acme_challenge_type || 'http-01') === 'dns-01' && (serverSettings.acme_dns_provider || 'manual') === 'rfc2136' && (!serverSettings.acme_dns_rfc2136_nameserver || !serverSettings.acme_dns_rfc2136_zone || !serverSettings.acme_dns_rfc2136_key_name || !serverSettings.acme_dns_rfc2136_secret)) || ((serverSettings.acme_challenge_type || 'http-01') === 'dns-01' && (serverSettings.acme_dns_provider || 'manual') === 'cloudflare' && !serverSettings.acme_dns_cloudflare_token)}
@@ -8281,6 +8289,7 @@
                                                 >
                                                     {acmeLoading ? t('acmeRequesting') : ((serverSettings.acme_challenge_type || 'http-01') === 'dns-01' && (serverSettings.acme_dns_provider || 'manual') === 'manual' ? (t('acmeDnsPrepare') || 'Prepare DNS Challenge') : t('acmeRequest'))}
                                                 </button>
+                                                )}
                                             </div>
                                         </div>
                                     </div>
@@ -8417,6 +8426,7 @@
                                                 
                                                 {/* Save SMTP Button */}
                                                 <div className="pt-3 flex justify-end">
+                                                    {haStandby ? <HaSettingsOnActive /> : (
                                                     <button
                                                         onClick={handleSaveSMTPSettings}
                                                         disabled={smtpLoading}
@@ -8425,6 +8435,7 @@
                                                         {smtpLoading && <Icons.Loader className="w-4 h-4 animate-spin" />}
                                                         {t('saveSmtpSettings') || 'Save SMTP Settings'}
                                                     </button>
+                                                    )}
                                                 </div>
                                             </div>
                                         )}
@@ -8435,6 +8446,7 @@
                                                 <p className="text-xs text-gray-500 mr-auto my-auto">
                                                     {t('enableSmtpHint') || 'Enable SMTP to configure email settings'}
                                                 </p>
+                                                {haStandby ? <HaSettingsOnActive /> : (
                                                 <button
                                                     onClick={handleSaveSMTPSettings}
                                                     disabled={smtpLoading}
@@ -8443,6 +8455,7 @@
                                                     {smtpLoading && <Icons.Loader className="w-4 h-4 animate-spin" />}
                                                     {t('save') || 'Save'}
                                                 </button>
+                                                )}
                                             </div>
                                         )}
                                     </div>
@@ -8534,7 +8547,9 @@
                                                 <Icons.Package className="w-4 h-4" />
                                                 {t('plugins') || 'Plugins'}
                                             </h4>
-                                            <button onClick={async () => {
+                                            {/* a process loads its own plugins: a standby does not switch, rescan
+                                                or delete them, forwarding or not (#625) */}
+                                            {!haStandby && <button onClick={async () => {
                                                 try {
                                                     await fetch(`${API_URL}/plugins/rescan`, { method: 'POST', credentials: 'include', headers: getAuthHeaders() });
                                                     fetchPlugins();
@@ -8543,7 +8558,7 @@
                                             }} className="text-xs text-gray-400 hover:text-white flex items-center gap-1">
                                                 <Icons.RefreshCw className="w-3 h-3" />
                                                 Rescan
-                                            </button>
+                                            </button>}
                                         </div>
                                         <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-3">
                                             <p className="text-xs text-yellow-400">
@@ -8605,7 +8620,8 @@
                                                             )}
                                                         </div>
                                                         <div className="flex items-center gap-2">
-                                                            <div className={`toggle-switch ${plugin.enabled ? 'active' : ''}`} onClick={() => togglePlugin(plugin.id, plugin.enabled)} />
+                                                            <div className={`toggle-switch ${plugin.enabled ? 'active' : ''} ${haStandby ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                                                onClick={haStandby ? undefined : () => togglePlugin(plugin.id, plugin.enabled)} />
                                                             <button onClick={async () => {
                                                                 try {
                                                                     const r = await fetch(`${API_URL}/plugins/${plugin.id}/config`, { credentials: 'include', headers: getAuthHeaders() });
@@ -8622,7 +8638,7 @@
                                                             }} className="text-gray-400/50 hover:text-proxmox-orange transition-colors" title="Edit config.json">
                                                                 <Icons.Edit className="w-4 h-4" />
                                                             </button>
-                                                            <button onClick={async () => {
+                                                            {!haStandby && <button onClick={async () => {
                                                                 if (!confirm(`Delete plugin "${plugin.name}"? This removes all plugin files.`)) return;
                                                                 try {
                                                                     const r = await fetch(`${API_URL}/plugins/${plugin.id}`, { method: 'DELETE', credentials: 'include', headers: getAuthHeaders() });
@@ -8631,7 +8647,7 @@
                                                                 } catch (e) { addToast('Error', 'error'); }
                                                             }} className="text-red-400/50 hover:text-red-400 transition-colors" title="Delete plugin">
                                                                 <Icons.Trash2 className="w-4 h-4" />
-                                                            </button>
+                                                            </button>}
                                                         </div>
                                                     </div>
                                                 ))}
@@ -8704,6 +8720,7 @@
 
                                     {/* Save Button */}
                                     <div className="flex justify-end gap-3">
+                                        {haStandby ? <HaSettingsOnActive own /> : (
                                         <button
                                             onClick={handleSaveServerSettings}
                                             disabled={serverLoading}
@@ -8712,6 +8729,7 @@
                                             {serverLoading ? <Icons.RotateCw /> : <Icons.Save />}
                                             {t('saveSettings')}
                                         </button>
+                                        )}
                                     </div>
 
                                     {/* Restart Server Section */}
@@ -9095,7 +9113,7 @@
                                                             </div>
                                                         )}
                                                     </div>
-                                                ) : (
+                                                ) : !haStandby && (
                                                     <button
                                                         onClick={performUpdate}
                                                         disabled={updateLoading || updateProgress}
@@ -9181,7 +9199,9 @@
                                         </div>
                                     )}
                                     
-                                    {/* Rollback Section - NS Jan 2026 */}
+                                    {/* Rollback Section - NS Jan 2026. Not on a standby: its route refuses
+                                        there, the listing (an empty POST) as well (#625) */}
+                                    {!haStandby && (
                                     <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-6">
                                         <div className="flex items-center justify-between">
                                             <div>
@@ -9203,7 +9223,8 @@
                                             </button>
                                         </div>
                                     </div>
-                                    
+                                    )}
+
                                     {/* Update Instructions */}
                                     {updateInfo?.instructions && (
                                         <div className="bg-blue-500/10 border border-blue-500/30 rounded-xl p-6">
@@ -9733,6 +9754,7 @@
         // v3: groups of up to four - the members table, Remove, more standbys from the active
         // v4: confirmed standbys and member keys, a second step to remove one that is not
         //     confirmed, whether a removed member was told, the note on a removed instance
+        // v5: the switch that has a standby carry out what is done on it through the active
         // ═══════════════════════════════════════════════
 
         // "3 minutes ago" in the UI language. Intl speaks all nine, so no keys for it.
@@ -9990,6 +10012,20 @@
                 load();
             });
 
+            // Forwarding is this instance's own setting too, and takes effect at once: on, a
+            // standby carries out what its users do through the active; off, it only shows.
+            // status.forwarding says whether it does so right now (the active may be away).
+            const forwardWrites = status?.forward_writes !== false;
+            const setForwardWrites = (on) => run('forward', async () => {
+                const res = await send('PUT', 'settings', { forward_writes: on });
+                if (!res.ok) { addToast?.(res.error, 'error'); return; }
+                if (res.data.restarting) { setRestarting('standby'); return; }
+                addToast?.(t(on ? 'pgHaForwardOn' : 'pgHaForwardOff'), 'success');
+                load();
+                // the banner and every button follow the new value
+                refreshHa?.();
+            });
+
             // a changed cluster setup on the active: the standby restarts by itself after a
             // while, this does it now
             const applyNow = () => run('apply', async () => {
@@ -10235,6 +10271,26 @@
                                 : <span className="text-gray-400">{t('pgHaManagersOff')}</span>)}
                             <p className="text-xs text-yellow-300">{t('pgHaLiveViewRestart')}</p>
                         </>
+                    )}
+                </div>
+            );
+
+            // next to the live view in every role; a standby also says when it is on but has
+            // no active to hand things to
+            const forwardPaused = standby && forwardWrites && status?.forwarding === false;
+            const forwardCard = (
+                <div className={card} data-ha-forward={forwardWrites ? 'on' : 'off'}>
+                    <div className="flex items-start justify-between gap-4">
+                        <div className="min-w-0">
+                            <label className="block text-sm font-medium text-white" htmlFor="pgha-forward">{t('pgHaForwardWrites')}</label>
+                            <p className="text-xs text-gray-500 mt-1">{t('pgHaForwardWritesHint')}</p>
+                        </div>
+                        <button id="pgha-forward" type="button" role="switch" aria-checked={forwardWrites}
+                            onClick={() => setForwardWrites(!forwardWrites)} disabled={!!busy || broken}
+                            className={`toggle-switch flex-shrink-0 disabled:opacity-50 disabled:cursor-not-allowed ${forwardWrites ? 'active' : ''}`} />
+                    </div>
+                    {forwardPaused && (
+                        <p className="text-xs text-yellow-300" data-ha-forward-paused>{t('pgHaForwardPaused')}</p>
                     )}
                 </div>
             );
@@ -10504,7 +10560,8 @@
                                     {busy === 'join' ? t('pgHaJoining') : t('pgHaJoin')}
                                 </button>
                             </div>
-                            <div className="md:col-span-2">{liveViewCard}</div>
+                            {liveViewCard}
+                            {forwardCard}
                         </div>
                     )}
 
@@ -10516,7 +10573,10 @@
                                 {pairingCard}
                                 {intervalCard}
                             </div>
-                            {liveViewCard}
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                {liveViewCard}
+                                {forwardCard}
+                            </div>
                             <div className="flex flex-wrap gap-2">
                                 <button onClick={() => openConfirm('unpair')} disabled={!!busy} className={btnGhost}>
                                     <Icons.Unlink />
@@ -10559,7 +10619,10 @@
                                 </div>
                                 {intervalCard}
                             </div>
-                            {liveViewCard}
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                {liveViewCard}
+                                {forwardCard}
+                            </div>
                             <div className="flex flex-wrap gap-2">
                                 <button onClick={syncNow} disabled={!!busy}
                                     className={`${btn} bg-proxmox-orange hover:bg-proxmox-orange/90 text-white`}>

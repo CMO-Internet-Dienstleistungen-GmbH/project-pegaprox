@@ -189,7 +189,8 @@
             const [needsSetup, setNeedsSetup] = useState(false);
             // LW Sep 2026 (#625) - role of this instance in a warm standby pair, as the
             // server reports it on login and /auth/check. A standby also sends peer_url
-            // and last_sync_at for the banner.
+            // and last_sync_at for the banner, and forwarding: true while it hands
+            // changes to the active.
             const [ha, setHa] = useState({ role: 'standalone' });
             
             // Check session on mount
@@ -517,10 +518,15 @@
             // LW Sep 2026 (#625 v2) - a standby may be connected to the clusters, but only the
             // active acts on them. One flag for every place that hides actions; isAdmin stays
             // as it is, the HA tab and the promote flow hang off it.
-            const haReadOnly = ha.role === 'standby';
+            // A standby that forwards hands every change to the active, so it shows the
+            // actions again. It is read-only while it does not (switched off here, or the
+            // active it follows does not answer). haStandby holds on every standby: consoles,
+            // shells, SPICE and the console preview never run on one, forwarding or not.
+            const haStandby = ha.role === 'standby';
+            const haReadOnly = haStandby && ha.forwarding !== true;
 
             return(
-                <AuthContext.Provider value={{ user, sessionId, isAuthenticated, loading, error, login, logout, getAuthHeaders, isAdmin: user?.role === 'admin', passwordExpiry, requires2FASetup, setRequires2FASetup, updatePreferences, updateCurrentUser, ldapEnabled, oidcEnabled, oidcButtonText, loginBackground, reverseProxyEnabled, needsSetup, setNeedsSetup, ha, refreshHa, haReadOnly }}>
+                <AuthContext.Provider value={{ user, sessionId, isAuthenticated, loading, error, login, logout, getAuthHeaders, isAdmin: user?.role === 'admin', passwordExpiry, requires2FASetup, setRequires2FASetup, updatePreferences, updateCurrentUser, ldapEnabled, oidcEnabled, oidcButtonText, loginBackground, reverseProxyEnabled, needsSetup, setNeedsSetup, ha, refreshHa, haReadOnly, haStandby }}>
                     {children}
                 </AuthContext.Provider>
             );
@@ -529,6 +535,38 @@
         // #625 v2 - what a standby still lets through the permission helpers: the *.view ones
         function haReadPermission(permission) {
             return typeof permission === 'string' && permission.endsWith('.view');
+        }
+
+        // #625 - this view on the active instance, for what a standby never runs itself.
+        // peer_url is the active as this standby reaches it (a path behind a proxy stays);
+        // search is '' for its start page or a console window's '?console=...'. Only an
+        // https:// address gives a link, anything else null, and then no link is shown.
+        function haActiveHref(peerUrl, search = '') {
+            if (typeof peerUrl !== 'string' || !/^https:\/\/\S+$/i.test(peerUrl.trim())) return null;
+            try {
+                const u = new URL(peerUrl.trim().replace(/\/*$/, '/'));
+                if (u.protocol !== 'https:') return null;
+                u.search = search || '';
+                u.hash = '';
+                return u.href;
+            } catch (_) {
+                return null;
+            }
+        }
+
+        // the key a console window (#767) takes: cluster, type, vmid, node. Cluster ids are
+        // synced, so the active knows the same one. '' for anything that has no window.
+        function haConsoleSearch(vm, clusterId) {
+            const cid = (vm && vm._clusterId) || clusterId;
+            if (!vm || !cid || (vm.type !== 'qemu' && vm.type !== 'lxc')) return '';
+            return '?console=' + encodeURIComponent(`${cid}:${vm.type}:${vm.vmid}:${vm.node}`);
+        }
+
+        // the same from a click handler; false when there is no address to go to
+        function haOpenOnActive(peerUrl, search = '') {
+            const href = haActiveHref(peerUrl, search);
+            if (href) window.open(href, '_blank', 'noopener,noreferrer');
+            return !!href;
         }
         
         function useAuth() {

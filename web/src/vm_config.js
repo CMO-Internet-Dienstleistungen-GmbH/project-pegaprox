@@ -119,7 +119,7 @@
 
         function ConfigModal({ vm, clusterId, allClusters = [], dashboardAuthFetch, onClose, addToast, isCorporate = false }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, haReadOnly } = useAuth();
+            const { getAuthHeaders, haReadOnly, haStandby } = useAuth();
             const [config, setConfig] = useState(null);
             const [configError, setConfigError] = useState(null);  // MK: Track config load errors
             const [loading, setLoading] = useState(true);
@@ -565,8 +565,9 @@
             // NS: Feb 2026 - Fetch efficient snapshots + capability
             const fetchEfficientSnapshots = async () => {
                 try {
-                    // ?refresh=true runs lvs, maybe lvextend, on the node; a standby reads what is stored (#625)
-                    const response = await authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}/efficient-snapshots${haReadOnly ? '' : '?refresh=true'}`);
+                    // ?refresh=true runs lvs, maybe lvextend, on the node; a standby reads what is stored (#625).
+                    // A GET is not forwarded, so a forwarding standby leaves it out too
+                    const response = await authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}/efficient-snapshots${haStandby ? '' : '?refresh=true'}`);
                     if (response && response.ok) {
                         setEfficientSnapshots(await response.json());
                     }

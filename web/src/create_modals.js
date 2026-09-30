@@ -3568,6 +3568,9 @@
         }
 
         function HardwareKeysPanel({ t, addToast, getAuthHeaders }) {
+            // a key is bound to the host the browser sees: no standby enrols one, forwarding
+            // or not (#625). Removing one goes through like any other change
+            const { haStandby } = useAuth();
             const [available, setAvailable] = useState(true);   // optimistic; will flip if server says no
             const [hostUsable, setHostUsable] = useState(true);
             const [hostReason, setHostReason] = useState(null);
@@ -3683,12 +3686,15 @@
                             <Icons.Key /> {t('hardwareKeys') || 'Hardware Keys'}
                             <span className="text-xs text-gray-500 ml-1">({creds.length})</span>
                         </h3>
+                        {!haStandby && (
                         <button onClick={register} disabled={registering || !hostUsable}
                             className="px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm font-medium disabled:opacity-50 flex items-center gap-2">
                             {registering ? <Icons.RotateCw className="w-3.5 h-3.5 animate-spin" /> : <Icons.Plus className="w-3.5 h-3.5" />}
                             {t('addHardwareKey') || 'Add Security Key'}
                         </button>
+                        )}
                     </div>
+                    {haStandby && <HaSettingsOnActive className="mb-3" />}
                     {!hostUsable && hostReason === 'ip_literal' && (
                         <div className="mb-3 p-3 rounded-lg flex items-start gap-2" style={{background: 'rgba(239, 192, 6, 0.08)', borderLeft: '3px solid #efc006'}}>
                             <Icons.AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" style={{color: '#efc006'}} />

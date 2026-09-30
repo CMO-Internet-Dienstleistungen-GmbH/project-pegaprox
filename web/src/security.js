@@ -6,7 +6,7 @@
         // LW: The locked IPs table was AI-generated (Claude), I just styled it - Oct 2025
         function SecuritySettingsSection({ addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, isAdmin } = useAuth();
+            const { getAuthHeaders, isAdmin, haStandby } = useAuth();
             const { isCorporate } = useLayout();
             const [settings, setSettings] = useState({
                 login_max_attempts: 5,
@@ -239,6 +239,10 @@
                         )}
                     </div>
 
+                    {/* every field here saves on change, and a standby refuses that save,
+                        forwarding or not (#625). The lockouts below are its own. */}
+                    {haStandby && <HaSettingsOnActive />}
+                    <fieldset disabled={haStandby} className="space-y-6 min-w-0">
                     {/* Settings */}
                     <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-4">
                         <h4 className="font-medium text-white mb-4">{t('loginProtection') || 'Login Protection'}</h4>
@@ -641,6 +645,7 @@
                             </div>
                         </label>
                     </div>
+                    </fieldset>
 
                     {/* Locked IPs */}
                     <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-4">
@@ -780,7 +785,7 @@
         // Compliance & Key Management Section (HIPAA/ISO 27001)
         function ComplianceSection({ addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, isAdmin } = useAuth();
+            const { getAuthHeaders, isAdmin, haStandby } = useAuth();
             const [compliance, setCompliance] = useState(null);
             const [auditIntegrity, setAuditIntegrity] = useState(null);
             const [keyInfo, setKeyInfo] = useState(null);
@@ -925,6 +930,9 @@
                             <Icons.Lock /> {t('complianceSettings') || 'Compliance & Hardening'}
                         </h3>
 
+                        {/* both save through /settings/server, which no standby carries out (#625) */}
+                        {haStandby && <HaSettingsOnActive />}
+                        <fieldset disabled={haStandby} className="space-y-5 min-w-0">
                         {/* Audit retention */}
                         <div>
                             <label className="block text-sm font-medium text-gray-200 mb-1">
@@ -975,6 +983,7 @@
                                 </div>
                             )}
                         </div>
+                        </fieldset>
                     </div>
 
                     {/* Compliance Score */}
@@ -1383,7 +1392,7 @@
         // NS: Double password (user + backup) for security
         function ConfigBackupSection({ addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders } = useAuth();
+            const { getAuthHeaders, haStandby } = useAuth();
             const [exporting, setExporting] = useState(false);
             const [importing, setImporting] = useState(false);
             const [includeSecrets, setIncludeSecrets] = useState(false);  // LW: off by default for safety
@@ -1634,13 +1643,16 @@
                                 <span className="text-green-500 text-xs">({t('validateOnly') || 'Validate only, don\'t apply'})</span>
                             </label>
                         </div>
-                        
+
+                        {/* a restore on a standby is refused, forwarding or not (#625) */}
+                        {haStandby ? <HaSettingsOnActive /> : (
                         <button
                             onClick={() => setShowImportModal(true)}
                             className="flex items-center gap-2 px-4 py-2 bg-orange-500/20 text-orange-400 hover:bg-orange-500/30 rounded-lg text-sm font-medium transition-colors"
                         >
                             <Icons.Upload className="w-4 h-4" /> {t('restoreBackup') || 'Restore from Backup'}
                         </button>
+                        )}
                     </div>
 
                     {/* Results */}
