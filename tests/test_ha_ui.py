@@ -134,8 +134,11 @@ def test_the_panel_speaks_the_agreed_contract(panel):
     assert "send('POST', 'join', withPassword('join', { code: joinCode.trim(), own_url: url, confirm: true }))" in body
     assert "send('POST', 'sync-now'" in body
     assert "send('PUT', 'settings', { interval: n })" in body
-    assert "const WORD = { promote: 'PROMOTE', unpair: 'UNPAIR' };" in body
-    assert "send('POST', what, withPassword('confirm', { confirm: WORD[what] }))" in body
+    assert "const WORD = { promote: 'PROMOTE', unpair: 'UNPAIR', remove: 'REMOVE' };" in body
+    # promote and unpair post to their own name, remove to the member it is about
+    assert "const path = what === 'remove' ? `members/${encodeURIComponent(target.instance_id)}/remove` : what;" in body
+    assert "const body = { confirm: WORD[what], ...(shutDownNow ? { shut_down: true } : {}), ...(forceNow ? { force: true } : {}) };" in body
+    assert "send('POST', path, withPassword('confirm', body))" in body
     # the server's own error text, not a fixed string, and its code next to it
     assert 'await PegaProxApiErrors.message(r, fallback' in body
     assert "const code = (await r.clone().json().catch(() => null))?.code || '';" in body
@@ -143,7 +146,8 @@ def test_the_panel_speaks_the_agreed_contract(panel):
 
 def test_typed_confirmation_is_exact(panel):
     body = _function(panel, 'HaPanel')
-    assert "disabled={typed !== WORD[confirmAction] || needsPassword('confirm') || !!busy}" in body
+    assert ("disabled={typed !== WORD[confirmAction] || needsPassword('confirm') || (needShutDown && !shutDown) "
+            "|| (needForce && !forcePromote) || !!busy}") in body
 
 
 def test_join_needs_the_checkbox_and_a_code(panel):
@@ -195,9 +199,11 @@ def test_a_refused_reauth_stays_at_its_field(panel):
     # returns before the box closes
     assert "if (!res.ok) { if (!reauthRefused('code', res)) addToast?.(res.error, 'error'); return; }" in body
     assert "if (!res.ok) { if (!reauthRefused('join', res)) setJoinError(res.error); return; }" in body
-    assert "if (!res.ok) { if (!reauthRefused('confirm', res)) addToast?.(res.error, 'error'); return; }" in body
+    confirm = _block(body, 'const confirmed = () => run(confirmAction, async () => {', 'openConfirm(null);')
+    refused = confirm[confirm.index('if (!res.ok) {'):]
+    assert refused.index("if (reauthRefused('confirm', res)) return;") < refused.index("addToast?.(res.error, 'error');")
     # a stale SSO sign-in gets a way to sign in again
-    note = body[body.index('const reauthNote = '):body.index('const peerCard = (')]
+    note = body[body.index('const reauthNote = '):body.index('const membersCard = (')]
     assert "reauth.code === 'HA_REAUTH_RECENT'" in note
     assert 'onClick={() => logout()}' in note
     assert "{t('pgHaSignInAgain')}" in note
@@ -208,8 +214,8 @@ def test_a_broken_state_file_hides_promote_and_locks_the_interval(panel):
     assert 'const broken = !!status?.broken;' in body
     standby = body[body.index("{role === 'standby' && ("):]
     promote_at = standby.index("openConfirm('promote')")
-    assert standby.rindex('{!broken && (', 0, promote_at) > standby.rindex('<button onClick={syncNow}', 0, promote_at)
-    assert "const typedBox = confirmAction && !(confirmAction === 'promote' && broken) && (" in body
+    assert standby.rindex('{!broken && !status?.removed && (', 0, promote_at) > standby.rindex('<button onClick={syncNow}', 0, promote_at)
+    assert "const typedBox = confirmAction && !(confirmAction === 'promote' && broken) && !removeStale && (" in body
     interval = body[body.index('const intervalCard = ('):body.index('const typedBox = ')]
     assert 'value={interval} disabled={broken}' in interval
     assert 'disabled={!!busy || broken}' in interval
@@ -223,12 +229,17 @@ def test_roles_render_their_own_cards(panel):
     standalone = body[body.index("{role === 'standalone' && ("):body.index("{role === 'active' && (")]
     active = body[body.index("{role === 'active' && ("):body.index("{role === 'standby' && (")]
     standby = body[body.index("{role === 'standby' && ("):]
-    assert "t('pgHaMakeActiveTitle')" in standalone and "t('pgHaJoinTitle')" in standalone
-    assert '{peerCard}' in active and '{intervalCard}' in active and "openConfirm('unpair')" in active
+    assert '{pairingCard}' in standalone and "t('pgHaJoinTitle')" in standalone
+    assert '{membersCard}' not in standalone
+    for needle in ('{membersCard}', '{pairingCard}', '{intervalCard}', "openConfirm('unpair')"):
+        assert needle in active, needle
     assert "openConfirm('promote')" not in active
-    for needle in ('{peerCard}', 'onClick={syncNow}', "openConfirm('promote')", "openConfirm('unpair')",
+    for needle in ('{membersCard}', 'onClick={syncNow}', "openConfirm('promote')", "openConfirm('unpair')",
                    "t('pgHaSkippedColumns')"):
         assert needle in standby, needle
+    assert '{pairingCard}' not in standby
+    pairing = body[body.index('const pairingCard = ('):body.index('if (!status) {')]
+    assert "t('pgHaMakeActiveTitle')" in pairing and "t('pgHaAddStandbyTitle')" in pairing
 
 
 def test_a_restart_blocks_the_page_and_reloads(panel):
@@ -392,15 +403,15 @@ PASSWORD = 'correct horse'
 class _FakeServer:
     """Just enough of the HA contract, /auth/check and a restart that takes a few seconds.
 
-    Pairing code, join, promote and unpair want the account password again, the way
-    the server does: a local account sends user_password, an SSO account sends nothing
-    and is refused when its sign-in is too old (sso_stale).
+    Pairing code, join, promote, unpair and removing a member want the account password
+    again, the way the server does: a local account sends user_password, an SSO account
+    sends nothing and is refused when its sign-in is too old (sso_stale).
     """
 
     def __init__(self, role='standby', layout='modern', language='en', admin=True,
                  auth_source='local', broken='', sso_stale=False, live_view=True,
                  restart_pending=None, clusters=None, resources=None, refuse_as_standby=False,
-                 autoinstall=None, metrics=None, extra=None, permissions=None):
+                 autoinstall=None, metrics=None, extra=None, permissions=None, members=None):
         self.role, self.layout, self.language, self.admin = role, layout, language, admin
         self.auth_source, self.broken, self.sso_stale = auth_source, broken, sso_stale
         self.down_until = 0.0
@@ -426,6 +437,33 @@ class _FakeServer:
         # (method, path) -> (status, body): the reads (and the odd write) a test needs
         self.extra = dict(extra or {})
         self.permissions = list(permissions or [])
+        # v3: everyone else in the group, as /api/ha/status lists them. None: the one
+        # partner of a pair, whichever role this instance has at the time
+        self.members = [dict(m) for m in members] if members is not None else None
+        # the group fixes: the open code the status reports (None once spent or expired), the
+        # members a removal cannot reach, and what this instance learned about its own removal
+        self.pairing_until = None
+        self.unreachable = set()
+        self.removed = None
+        # status requests held back while hold_status is set, answered by release() with the
+        # body of the moment they arrived: a poll that was already on its way
+        self.hold_status = False
+        self.held = []
+
+    def group(self):
+        if self.role not in ('active', 'standby'):
+            return []
+        if self.members is not None:
+            return self.members
+        standby = self.role == 'standby'
+        return [{'instance_id': 'b' * 32, 'url': PEER if standby else SELF, 'fingerprint': '',
+                 'role_seen': 'active' if standby else 'standby', 'epoch_seen': 2,
+                 'last_contact': _iso_ago(12), 'joined_at': _iso_ago(3600), 'is_source': standby,
+                 'last_error': '' if standby else 'Cannot reach the peer: ConnectTimeout'}]
+
+    def standby_count(self):
+        others = sum(1 for m in self.group() if m.get('role_seen') != 'active')
+        return others + (1 if self.role == 'standby' else 0)
 
     def _reauth_refusal(self, body):
         if self.auth_source in ('oidc', 'entra'):
@@ -437,31 +475,44 @@ class _FakeServer:
             return {'error': 'Incorrect password', 'code': 'HA_REAUTH'}
         return None
 
+    def _source(self):
+        return next((m for m in self.group() if m.get('is_source')), None)
+
     def status(self):
+        group = self.group()
+        # "peer" stays for older readers: a standby's source, else the first member
+        first = self._source() if self.role == 'standby' else (group[0] if group else None)
         peer = None
-        if self.role in ('active', 'standby'):
-            peer = {'instance_id': 'b' * 32, 'url': PEER if self.role == 'standby' else SELF,
-                    'fingerprint': '', 'paired_at': _iso_ago(3600),
-                    'role_seen': 'active' if self.role == 'standby' else 'standby',
-                    'epoch_seen': 2, 'last_contact': _iso_ago(12),
-                    'last_error': '' if self.role == 'standby' else 'Cannot reach the peer: ConnectTimeout'}
+        if first:
+            peer = dict({k: first.get(k) for k in ('instance_id', 'url', 'fingerprint', 'role_seen',
+                                                   'epoch_seen', 'last_contact', 'last_error')},
+                        paired_at=first.get('joined_at'))
         sync = {}
         if self.role == 'standby':
             sync = {'last_ok_at': _iso_ago(20), 'last_attempt_at': _iso_ago(20), 'last_error': '',
                     'rows': 1234, 'tables': 41, 'source_epoch': 2, 'etag': None,
                     'skipped_columns': {'clusters': ['new_col']},
                     'restart_pending': self.restart_pending}
+        open_until = self.pairing_until if (self.pairing_until or 0) >= time.time() else None
         return {'role': self.role, 'epoch': 0 if self.role == 'standalone' else 2,
                 'instance_id': 'a' * 32, 'interval': self.interval, 'broken': self.broken,
-                'pairing_open_until': None, 'peer': peer, 'sync': sync,
+                'pairing_open_until': open_until, 'peer': peer, 'sync': sync,
                 'suggested_url': SELF, 'own_fingerprint': '',
-                'live_view': self.live_view, 'managers_running': self.managers_running}
+                'live_view': self.live_view, 'managers_running': self.managers_running,
+                'members': [dict(m) for m in group], 'max_members': 4,
+                'standby_count': self.standby_count(), 'removed': self.removed}
 
     def banner(self):
         if self.role != 'standby':
             return {'role': self.role}
-        return {'role': 'standby', 'peer_url': PEER, 'last_sync_at': _iso_ago(90),
-                'live_view': self.live_view}
+        source = self._source()
+        return {'role': 'standby', 'peer_url': source['url'] if source else PEER,
+                'last_sync_at': _iso_ago(90), 'live_view': self.live_view}
+
+    def release(self):
+        held, self.held = self.held, []
+        for route, data in held:
+            route.fulfill(status=200, body=json.dumps(data), headers={'Content-Type': 'application/json'})
 
     def _restart(self, role):
         self.down_until = time.time() + 4
@@ -523,7 +574,36 @@ class _FakeServer:
             self.logged_out = True
             return answer({'success': True})
         if path == '/api/ha/status':
+            if self.hold_status:
+                self.held.append((route, self.status()))
+                return None
             return answer(self.status())
+        if path == '/api/ha/pairing-code' and self.role == 'active' and self.standby_count() >= 3:
+            return answer({'error': 'This group already has 3 standbys - remove one first'}, 409)
+        removal = re.fullmatch(r'/api/ha/members/([^/]+)/remove', path)
+        if removal:
+            # the order of the real route: the word, active only, a known member, then the password
+            if body.get('confirm') != 'REMOVE':
+                return answer({'error': 'Type REMOVE to confirm'}, 400)
+            if self.role != 'active':
+                return answer({'error': 'Only the active instance removes members'}, 409)
+            if not any(m['instance_id'] == removal.group(1) for m in self.group()):
+                return answer({'error': 'This instance is not a member of the group'}, 404)
+            refusal = self._reauth_refusal(body)
+            if refusal:
+                return answer(refusal, 403)
+            # not a standby under the current epoch: only with the admin's word that it is off
+            target = next(m for m in self.group() if m['instance_id'] == removal.group(1))
+            if target.get('confirmed_standby') is False and body.get('shut_down') is not True:
+                return answer({'code': 'HA_REMOVE_UNCONFIRMED',
+                               'error': 'That instance is not confirmed as a standby under the current '
+                                        'epoch - confirm it is shut down for good'}, 409)
+            self.members = [dict(m) for m in self.group() if m['instance_id'] != removal.group(1)]
+            if not self.members:
+                # the last standby gone: standalone, as the real server does
+                self.role = 'standalone'
+            return answer({'success': True, 'told': removal.group(1) not in self.unreachable,
+                           'members': self.members})
         if path in ('/api/ha/pairing-code', '/api/ha/join', '/api/ha/promote', '/api/ha/unpair'):
             refusal = self._reauth_refusal(body)
             if refusal:
@@ -534,7 +614,8 @@ class _FakeServer:
             if self.fail_pairing_once:
                 self.fail_pairing_once = False
                 return answer({'error': 'This instance is already paired - unpair it first'}, 409)
-            return answer({'code': 'pgxha1_' + 'Q' * 120, 'expires_at': int(time.time()) + 900})
+            self.pairing_until = int(time.time()) + 900
+            return answer({'code': 'pgxha1_' + 'Q' * 120, 'expires_at': self.pairing_until})
         if path == '/api/ha/join':
             if body.get('confirm') is not True or not body.get('code'):
                 return answer({'error': 'confirm missing'}, 400)
@@ -572,10 +653,12 @@ class _FakeServer:
             if body.get('confirm') != 'UNPAIR':
                 return answer({'error': 'type UNPAIR'}, 400)
             was = self.role
+            self.removed = None
             if was == 'standby':
                 self._restart('standalone')
             else:
-                self.role = 'standalone'
+                # an active takes the whole group apart
+                self.role, self.members = 'standalone', []
             return answer({'success': True, 'restarting': was == 'standby'})
         if req.method != 'GET' and (self.role == 'standby' or self.refuse_as_standby):
             return answer({'error': 'This is a standby instance. Make changes on the active instance; '
@@ -815,7 +898,8 @@ def test_runtime_active_interval_and_unpair(open_app):
     assert app.server.interval == 45
 
     panel.get_by_role('button', name='Unpair').first.click()
-    assert 'The standby stops receiving changes' in panel.inner_text()
+    # an active that unpairs takes the whole group apart (v3)
+    assert 'Every standby stops receiving changes' in panel.inner_text()
     page.fill('#pgha-typed', 'UNPAIR')
     page.fill('#pgha-confirm-password', PASSWORD)
     panel.locator('button', has_text='Unpair').last.click()
@@ -2287,3 +2371,646 @@ def test_runtime_cloud_backups_change_nothing_on_a_standby(open_app, role):
         assert (word not in labels) == standby, (word, sorted(labels))
     assert 'Refresh' in ' '.join(labels)
     assert not app.errors, app.errors
+
+
+# -- v3: a group of up to four instances (#625) --------------------------------------------------
+#
+# One active and up to three standbys. The panel lists everyone else in the group, marks the
+# member a standby pulls from, lets the active remove a standby (typed REMOVE and the password,
+# the box promote and unpair use) and keeps handing out codes until the group is full.
+
+def test_the_panel_speaks_the_v3_contract(panel):
+    body = _function(panel, 'HaPanel')
+    assert 'const members = Array.isArray(status?.members) ? status.members : [];' in body
+    assert 'const maxMembers = status?.max_members || 4;' in body
+    assert 'const standbyCount = status?.standby_count || 0;' in body
+    assert 'const groupFull = standbyCount >= maxMembers - 1;' in body
+    # the answer of a removal takes the row away before the next status arrives
+    assert 'if (Array.isArray(res.data.members)) setStatus(s => ({ ...(s || {}), members: res.data.members }));' in body
+    assert "addToast?.(t('pgHaMemberRemoved'), told === false ? 'info' : 'success');" in body
+    # a shown code is gone once the group grows or the role changes
+    assert 'useEffect(() => { setCode(null); }, [role, standbyCount]);' in body
+    # the peer card is gone for good; nothing reads the old single peer any more
+    assert 'peerCard' not in body and 'status?.peer' not in body
+
+
+def test_the_members_table_shows_what_the_contract_carries(panel):
+    body = _function(panel, 'HaPanel')
+    card = body[body.index('const membersCard = ('):body.index('const intervalCard = (')]
+    for needle in ("{t('pgHaInstanceId')}", "{t('pgHaPeerUrl')}", "{t('pgHaPeerSeen')}", "{t('pgHaEpoch')}",
+                   "{t('pgHaLastContact')}", "{t('pgHaLastError')}", "(m.instance_id || '').slice(0, 8)",
+                   "{m.url || '-'}", '<HaRoleBadge role={m.role_seen} t={t} />', "{m.epoch_seen ?? '-'}",
+                   '{when(m.last_contact)}', '{m.last_error}', "{t('pgHaSource')}", "t('pgHaNoMembers')"):
+        assert needle in card, needle
+    assert "data-ha-source={m.is_source ? '' : undefined}" in card
+    assert card.index('{m.is_source && (') < card.index("{t('pgHaSource')}")
+    # this instance counts too
+    assert ".replace('{n}', members.length + 1).replace('{max}', maxMembers)" in card
+    # Remove only on the active, one per row
+    assert "const canRemove = role === 'active';" in body
+    remove_at = card.index("openConfirm('remove', m)")
+    assert card.rindex('{canRemove && (', 0, remove_at) > card.index('{members.map(m => (')
+    assert card.count("openConfirm('remove'") == 1
+
+
+def test_remove_goes_through_the_box_promote_and_unpair_use(panel):
+    body = _function(panel, 'HaPanel')
+    opener = _block(body, 'const openConfirm = (what, member = null) => {', '\n            };')
+    assert 'setRemoving(member);' in opener and "setPassword('confirm', '');" in opener
+    box = body[body.index('const removeStale = '):body.index('const pairingCard = (')]
+    assert ("confirmAction === 'remove'\n                && (role !== 'active' || "
+            "!members.some(m => m.instance_id === removing?.instance_id));") in box
+    assert "t('pgHaRemoveDesc').replace('{name}', removing.url || removing.instance_id.slice(0, 8))" in box
+    assert "passwordInput('confirm', 'pgha-confirm-password')" in box
+    assert "confirmAction === 'remove' ? (needShutDown ? t('pgHaRemoveAnyway') : t('pgHaRemove'))" in box
+    # the remove box sits under the table, the unpair box under its button
+    active = body[body.index("{role === 'active' && ("):body.index("{role === 'standby' && (")]
+    assert active.index('{membersCard}') < active.index("{confirmAction === 'remove' && typedBox}") < active.index('{pairingCard}')
+    assert active.index("openConfirm('unpair')") < active.index("{confirmAction !== 'remove' && typedBox}")
+
+
+def test_the_active_hands_out_codes_until_the_group_is_full(panel):
+    body = _function(panel, 'HaPanel')
+    pairing = body[body.index('const pairingCard = ('):body.index('if (!status) {')]
+    assert "const adding = role === 'active';" in body
+    assert "data-ha-pairing={adding && groupFull ? 'full' : 'open'}" in pairing
+    assert '{adding && groupFull ? (' in pairing
+    full = pairing.index("t('pgHaGroupFull')")
+    # the full group gets the note instead of the form, not next to it
+    assert full < pairing.index(') : (') < pairing.index('<button onClick={createCode}')
+    assert "{adding ? t('pgHaAddStandbyDesc') : t('pgHaMakeActiveDesc')}" in pairing
+    # the card is built before the status is there
+    assert 'status.pairing_open_until && !code' not in pairing
+    assert '{status?.pairing_open_until && !code && (' in pairing
+
+
+def _member(ch, role='standby', error='', source=False, contact=15, **more):
+    """more: what a later server adds per member (confirmed_standby, key_fingerprint)."""
+    return dict({'instance_id': ch * 32, 'url': f'https://pegaprox-{ch}.example:5000', 'fingerprint': '',
+                 'role_seen': role, 'epoch_seen': 2, 'last_contact': _iso_ago(contact), 'last_error': error,
+                 'joined_at': _iso_ago(7200), 'is_source': source}, **more)
+
+
+def _reload_status(app):
+    """Saving the interval reloads the status; the next poll would take ten seconds."""
+    before = app.server.calls.count(('GET', '/api/ha/status'))
+    app.page.locator('#pgha-interval + button').click()
+    deadline = time.time() + 3
+    while time.time() < deadline and app.server.calls.count(('GET', '/api/ha/status')) == before:
+        app.page.wait_for_timeout(100)
+    app.page.wait_for_timeout(300)
+
+
+def test_runtime_an_active_without_standbys_pairs_the_first(open_app):
+    app = open_app(role='active', layout='modern', members=[])
+    page = app.page
+    panel = _open_ha(app, 'active')
+    card = panel.locator('[data-ha-members]')
+    assert card.get_attribute('data-ha-members') == '0'
+    text = card.inner_text()
+    assert '1 of 4 instances' in text and 'No other instance in the group yet.' in text
+    assert card.locator('table').count() == 0
+
+    pairing = panel.locator('[data-ha-pairing]')
+    assert pairing.get_attribute('data-ha-pairing') == 'open'
+    assert 'Add a standby' in pairing.inner_text()
+    assert page.input_value('#pgha-own-url') == SELF
+    create = pairing.get_by_role('button', name='Create pairing code')
+    assert create.is_disabled(), 'the pairing code must wait for the password'
+    page.fill('#pgha-code-password', PASSWORD)
+    create.click()
+    box = page.locator('[data-ha-code]')
+    box.wait_for(timeout=3000)
+    assert app.server.bodies['/api/ha/pairing-code'] == [{'url': SELF, 'user_password': PASSWORD}]
+    # an unchanged group keeps the code on screen
+    _reload_status(app)
+    assert box.is_visible()
+    # the first standby takes it: spent, while the card stays open for the next one
+    app.server.members.append(_member('b'))
+    _reload_status(app)
+    card.locator('[data-ha-member]').wait_for(timeout=3000)
+    assert '2 of 4 instances' in card.inner_text()
+    assert page.locator('[data-ha-code]').count() == 0
+    assert pairing.get_attribute('data-ha-pairing') == 'open'
+    assert not app.errors, app.errors
+
+
+def test_runtime_an_active_with_two_standbys_lists_them_and_pairs_a_third(open_app):
+    members = [_member('b', error='Cannot reach the peer: ConnectTimeout'), _member('c', contact=40)]
+    app = open_app(role='active', layout='modern', members=members)
+    page = app.page
+    panel = _open_ha(app, 'active')
+    card = panel.locator('[data-ha-members]')
+    assert '3 of 4 instances' in card.inner_text()
+    assert card.locator('tbody tr').count() == 2
+    headers = [h.strip() for h in card.locator('thead th').all_inner_texts()]
+    assert headers == ['Instance', 'Address', 'Seen as', 'Epoch', 'Key', 'Last contact', 'Last error', '']
+    cells = [c.strip() for c in card.locator(f'[data-ha-member="{"b" * 32}"] td').all_inner_texts()]
+    assert cells[:4] == ['bbbbbbbb', 'https://pegaprox-b.example:5000', 'Standby', '2']
+    # a member the server says nothing about keys for: no guess either way
+    assert cells[4] == '-'
+    assert 'seconds ago' in cells[5], cells
+    assert cells[6] == 'Cannot reach the peer: ConnectTimeout'
+    assert cells[7] == 'Remove'
+    assert card.locator(f'[data-ha-member="{"c" * 32}"] td').nth(6).inner_text().strip() == '-'
+    # the active pulls from nobody
+    assert card.locator('[data-ha-source]').count() == 0
+    assert card.get_by_role('button', name='Remove').count() == 2
+
+    pairing = panel.locator('[data-ha-pairing="open"]')
+    page.fill('#pgha-code-password', PASSWORD)
+    pairing.get_by_role('button', name='Create pairing code').click()
+    page.locator('[data-ha-code]').wait_for(timeout=3000)
+
+    # the third standby takes the code: it is spent, and the group is full
+    app.server.members.append(_member('d'))
+    _reload_status(app)
+    page.locator('[data-ha-pairing="full"]').wait_for(timeout=3000)
+    assert page.locator('[data-ha-code]').count() == 0
+    assert '4 of 4 instances' in card.inner_text()
+    assert card.locator('tbody tr').count() == 3
+    assert not app.errors, app.errors
+
+
+def test_runtime_a_full_group_takes_a_standby_again_once_one_is_removed(open_app):
+    app = open_app(role='active', layout='modern', members=[_member('b'), _member('c'), _member('d')])
+    page = app.page
+    panel = _open_ha(app, 'active')
+    card = panel.locator('[data-ha-members]')
+    assert '4 of 4 instances' in card.inner_text()
+    pairing = panel.locator('[data-ha-pairing]')
+    assert pairing.get_attribute('data-ha-pairing') == 'full'
+    assert 'The group is full: 4 instances, one of them active.' in pairing.inner_text()
+    assert page.locator('#pgha-own-url, #pgha-code-password').count() == 0
+    assert pairing.get_by_role('button', name='Create pairing code').count() == 0
+
+    row = card.locator(f'[data-ha-member="{"c" * 32}"]')
+    row.get_by_role('button', name='Remove').click()
+    box = panel.locator('[data-ha-confirm="remove"]')
+    assert 'https://pegaprox-c.example:5000 leaves the group' in box.inner_text()
+    # right under the table, above the pairing card
+    assert _follows(page, '[data-ha-members]', '[data-ha-confirm]')
+    assert _follows(page, '[data-ha-confirm]', '[data-ha-pairing]')
+    confirm = box.get_by_role('button', name='Remove')
+    assert confirm.is_disabled()
+    page.fill('#pgha-typed', 'remove')
+    assert confirm.is_disabled()
+    page.fill('#pgha-typed', 'REMOVE')
+    assert confirm.is_disabled(), 'remove must wait for the password'
+
+    # a wrong password: the note at the field, the box and the word stay, the row too
+    page.fill('#pgha-confirm-password', 'wrong')
+    confirm.click()
+    note = box.locator('[data-ha-reauth="HA_REAUTH"]')
+    note.wait_for(timeout=3000)
+    assert 'Incorrect password' in note.inner_text()
+    assert _follows(page, '#pgha-confirm-password', '[data-ha-reauth]')
+    assert page.input_value('#pgha-typed') == 'REMOVE'
+    assert page.input_value('#pgha-confirm-password') == ''
+    assert confirm.is_disabled()
+    assert card.locator('tbody tr').count() == 3
+    path = f'/api/ha/members/{"c" * 32}/remove'
+    assert app.server.bodies[path] == [{'confirm': 'REMOVE', 'user_password': 'wrong'}]
+
+    page.fill('#pgha-confirm-password', PASSWORD)
+    confirm.click()
+    app.see('Removed from the group')
+    row.wait_for(state='detached', timeout=3000)
+    assert app.server.bodies[path][-1] == {'confirm': 'REMOVE', 'user_password': PASSWORD}
+    assert panel.locator('[data-ha-confirm]').count() == 0
+    assert card.locator('tbody tr').count() == 2
+    # room again for one more
+    page.locator('[data-ha-pairing="open"]').wait_for(timeout=3000)
+    assert '3 of 4 instances' in card.inner_text()
+    assert page.get_by_text('Restarting PegaProx...').count() == 0
+    assert not app.errors, app.errors
+
+
+def test_runtime_an_sso_account_removes_without_a_password(open_app):
+    app = open_app(role='active', layout='modern', auth_source='oidc', members=[_member('b'), _member('c')])
+    page = app.page
+    panel = _open_ha(app, 'active')
+    panel.locator(f'[data-ha-member="{"b" * 32}"]').get_by_role('button', name='Remove').click()
+    box = panel.locator('[data-ha-confirm="remove"]')
+    assert box.locator('input[type="password"]').count() == 0
+    page.fill('#pgha-typed', 'REMOVE')
+    box.get_by_role('button', name='Remove').click()
+    app.see('Removed from the group')
+    assert app.server.bodies[f'/api/ha/members/{"b" * 32}/remove'] == [{'confirm': 'REMOVE'}]
+    assert panel.locator('[data-ha-member]').count() == 1
+    assert not app.errors, app.errors
+
+
+def test_runtime_the_remove_box_closes_when_the_member_is_gone(open_app):
+    app = open_app(role='active', layout='modern', members=[_member('b'), _member('c')])
+    page = app.page
+    panel = _open_ha(app, 'active')
+    panel.locator(f'[data-ha-member="{"c" * 32}"]').get_by_role('button', name='Remove').click()
+    panel.locator('[data-ha-confirm="remove"]').wait_for(timeout=3000)
+    # another admin removed it meanwhile
+    app.server.members = [_member('b')]
+    _reload_status(app)
+    assert panel.locator('[data-ha-confirm]').count() == 0
+    assert not [c for c in app.server.calls if c[1].startswith('/api/ha/members/')]
+    assert not app.errors, app.errors
+
+
+def test_runtime_a_standby_marks_its_source_and_removes_nobody(open_app):
+    members = [_member('b', role='active', source=True), _member('c'),
+               _member('d', error='Cannot reach the peer: ConnectTimeout')]
+    app = open_app(role='standby', layout='modern', members=members)
+    page = app.page
+    # the banner names the member it pulls from
+    assert 'https://pegaprox-b.example:5000' in page.locator('[data-ha-banner="classic"]').inner_text()
+    panel = _open_ha(app, 'standby')
+    card = panel.locator('[data-ha-members]')
+    assert '4 of 4 instances' in card.inner_text()
+    source = card.locator('[data-ha-source]')
+    assert source.count() == 1
+    assert source.get_attribute('data-ha-member') == 'b' * 32
+    cells = source.locator('td')
+    assert cells.nth(0).locator('span').all_inner_texts() == ['bbbbbbbb', 'Source']
+    assert cells.nth(2).inner_text().strip() == 'Active'
+    assert card.get_by_text('Source', exact=True).count() == 1
+    assert card.locator('[data-ha-member]').count() == 3
+    # a standby removes nobody and hands out no code
+    assert card.get_by_role('button', name='Remove').count() == 0
+    assert card.locator('thead th').count() == 7
+    assert panel.locator('[data-ha-pairing]').count() == 0
+    assert not app.errors, app.errors
+
+
+def test_runtime_the_members_table_scrolls_inside_its_card_on_a_phone(open_app):
+    members = [_member('b', role='active', source=True), _member('c'),
+               _member('d', error='Cannot reach the peer: ConnectTimeout')]
+    app = open_app(role='standby', layout='modern', members=members)
+    page = app.page
+    page.set_viewport_size({'width': 390, 'height': 900})
+    panel = _open_ha(app, 'standby')
+    page.wait_for_timeout(300)
+    assert page.evaluate('() => document.documentElement.scrollWidth') <= 390
+    card = panel.locator('[data-ha-members]')
+    assert card.evaluate('el => el.scrollWidth <= el.clientWidth')
+    # the rows scroll inside the card: the wrapper does, or on a phone the table itself
+    # (index.html makes every table a scrolling block there)
+    assert card.locator('table').evaluate('el => Math.max(el.scrollWidth - el.clientWidth, '
+                                          'el.parentElement.scrollWidth - el.parentElement.clientWidth) > 0')
+    # an address stays on one line instead of breaking up in a squeezed column
+    lines = page.evaluate('''() => Array.from(document.querySelectorAll('[data-ha-member] td:nth-child(2)'))
+        .map(td => { const r = document.createRange(); r.selectNodeContents(td); return r.getClientRects().length; })''')
+    assert lines == [1, 1, 1], lines
+    assert not app.errors, app.errors
+
+
+# -- the group fixes (#625 review) ----------------------------------------------------------------
+#
+# A member that is not confirmed as a standby under the current epoch goes only with the admin's
+# word that it is shut down for good; the answer of a removal says whether the member was told,
+# and the panel repeats it as it is; an instance that learned it was removed says so and what to
+# do; a code the server no longer has open leaves the screen; Cloud shows toasts at all.
+
+def test_an_unconfirmed_removal_asks_once_more(panel):
+    body = _function(panel, 'HaPanel')
+    confirm = _block(body, 'const confirmed = () => run(confirmAction, async () => {', '\n            });')
+    # shut_down only goes out as the second step: after the refusal and the ticked box
+    assert "const shutDownNow = what === 'remove' && unconfirmed && shutDown;" in confirm
+    assert confirm.count('shut_down: true') == 1
+    refused = confirm[confirm.index('if (!res.ok) {'):confirm.index('openConfirm(null);')]
+    at = refused.index("if (what === 'remove' && res.code === 'HA_REMOVE_UNCONFIRMED') {")
+    # the box, the word and the password stay for the second step; no error toast
+    assert at < refused.index('setUnconfirmed(true);', at) < refused.index('return;', at) \
+        < refused.index("addToast?.(res.error, 'error');")
+    assert "setPassword('confirm'" not in refused
+    # a new box starts without the second step
+    opener = _block(body, 'const openConfirm = (what, member = null) => {', '\n            };')
+    for reset in ('setUnconfirmed(false);', 'setShutDown(false);'):
+        assert reset in opener, reset
+    box = body[body.index('const needShutDown = '):body.index('const removalNote = ')]
+    assert "const needShutDown = confirmAction === 'remove' && unconfirmed;" in box
+    step = box[box.index('{needShutDown && ('):box.index("passwordInput('confirm', 'pgha-confirm-password')")]
+    for needle in ('data-ha-unconfirmed', "t('pgHaRemoveUnconfirmed')", "t('pgHaShutDownConfirm')",
+                   'checked={shutDown} onChange={e => setShutDown(e.target.checked)}'):
+        assert needle in step, needle
+
+
+def test_the_answer_of_a_removal_is_repeated_as_it_is(panel):
+    body = _function(panel, 'HaPanel')
+    confirm = _block(body, 'const confirmed = () => run(confirmAction, async () => {', '\n            });')
+    assert "const told = typeof res.data.told === 'boolean' ? res.data.told : null;" in confirm
+    assert 'setLastRemoval({ name: target.url || target.instance_id.slice(0, 8), told });' in confirm
+    note = body[body.index('const removalNote = '):body.index('const removedHere = ')]
+    assert "lastRemoval.told === true ? t('pgHaRemovedTold')" in note
+    assert "lastRemoval.told === false ? t('pgHaRemovedNotReached')" in note
+    # a server that does not say gets no claim either way
+    assert ": t('pgHaMemberRemoved')}" in note
+    # outside the members card: removing the last standby makes the instance standalone,
+    # and a standalone has no members card
+    main = body[body.index('<div className="space-y-4" data-ha-role={role}>'):]
+    assert main.index('{removalNote}') < main.index("{role === 'standalone' && (")
+
+
+def test_the_members_table_shows_confirmation_and_key(panel):
+    body = _function(panel, 'HaPanel')
+    card = body[body.index('const membersCard = ('):body.index('const intervalCard = (')]
+    assert "{t('pgHaKey')}" in card
+    assert ("data-ha-confirmed={typeof m.confirmed_standby === 'boolean' ? String(m.confirmed_standby) "
+            ": undefined}") in card
+    assert '{m.confirmed_standby === true && (' in card
+    # the active is never a standby, so only the active itself warns about the others
+    assert '{m.confirmed_standby === false && canRemove && (' in card
+    assert "m.key_fingerprint === ''" in card and "t('pgHaOldSecret')" in card
+
+
+def test_a_removed_instance_says_so(panel):
+    body = _function(panel, 'HaPanel')
+    assert 'const removedHere = status?.removed;' in body
+    assert "const removedNote = removedHere && role !== 'standalone' && (" in body
+    note = body[body.index('const removedNote = '):body.index('const pairingCard = (')]
+    for needle in ('data-ha-removed', "t('pgHaRemovedHere')", "t('pgHaRemovedBy')", "t('pgHaRemovedHereNext')"):
+        assert needle in note, needle
+    main = body[body.index('<div className="space-y-4" data-ha-role={role}>'):]
+    assert main.index('{removedNote}') < main.index("{role === 'standalone' && (")
+
+
+def test_a_shown_code_goes_once_the_server_stops_reporting_it(panel):
+    body = _function(panel, 'HaPanel')
+    load = _block(body, 'const load = async () => {', '\n            };')
+    assert 'const seq = ++loadSeq.current;' in load
+    # only an answer to a request sent after the code was made may drop it
+    assert 'seq > c.seq && data.pairing_open_until !== c.expires_at' in load
+    assert load.index('setCode(c => ') < load.index('setStatus(data);')
+    assert 'setCode({ code: res.data.code, expires_at: res.data.expires_at, seq: loadSeq.current });' in body
+    # the old rule stays next to it
+    assert 'useEffect(() => { setCode(null); }, [role, standbyCount]);' in body
+
+
+def test_cloud_renders_the_toasts_too(dash):
+    main = dash[dash.index('function PegaProxDashboard('):]
+    cloud_at = main.index('if (isCloud) {')
+    main_return = main.index("style={{ overflowX: 'clip' }}")
+    assert main.index('const toastPortal = ReactDOM.createPortal(') < cloud_at
+    assert cloud_at < main.index('{toastPortal}', cloud_at) < main_return
+    assert main.index('{toastPortal}', main_return) > main_return
+    # built once, so the two layouts cannot drift apart
+    assert main.count('toasts.map(') == 1
+
+
+def _wait_for_toast(page, text, seconds=4):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if any(text in t for t in _toasts(page)):
+            return True
+        page.wait_for_timeout(100)
+    return False
+
+
+def _remove_member(app, panel, ch, password=PASSWORD):
+    panel.locator(f'[data-ha-member="{ch * 32}"]').get_by_role('button', name='Remove').click()
+    box = panel.locator('[data-ha-confirm="remove"]')
+    app.page.fill('#pgha-typed', 'REMOVE')
+    app.page.fill('#pgha-confirm-password', password)
+    box.get_by_role('button', name='Remove').click()
+    return box
+
+
+def _keyed_members():
+    return [_member('b', confirmed_standby=True, key_fingerprint='9f2c41ab'),
+            _member('c', confirmed_standby=False, key_fingerprint='')]
+
+
+def test_runtime_the_members_table_shows_confirmation_and_key(open_app):
+    app = open_app(role='active', layout='modern', members=_keyed_members())
+    card = _open_ha(app, 'active').locator('[data-ha-members]')
+    b = card.locator(f'[data-ha-member="{"b" * 32}"]')
+    c = card.locator(f'[data-ha-member="{"c" * 32}"]')
+    assert b.get_attribute('data-ha-confirmed') == 'true'
+    assert c.get_attribute('data-ha-confirmed') == 'false'
+    seen_b, seen_c = b.locator('td').nth(2).inner_text(), c.locator('td').nth(2).inner_text()
+    assert 'Standby' in seen_b and 'confirmed' in seen_b and 'not confirmed' not in seen_b, seen_b
+    assert 'not confirmed' in seen_c, seen_c
+    assert b.locator('td').nth(4).inner_text().strip() == '9f2c41ab'
+    assert c.locator('td').nth(4).inner_text().strip() == 'old secret'
+    assert c.locator('[data-ha-key="secret"]').count() == 1
+    assert not app.errors, app.errors
+
+
+def test_runtime_a_standby_does_not_call_the_active_unconfirmed(open_app):
+    members = [_member('b', role='active', source=True, confirmed_standby=False, key_fingerprint='77aa01cd'),
+               _member('c', confirmed_standby=True, key_fingerprint='')]
+    app = open_app(role='standby', layout='modern', members=members)
+    card = _open_ha(app, 'standby').locator('[data-ha-members]')
+    active = card.locator(f'[data-ha-member="{"b" * 32}"]').locator('td').nth(2).inner_text()
+    assert 'Active' in active and 'confirmed' not in active, active
+    assert 'confirmed' in card.locator(f'[data-ha-member="{"c" * 32}"]').locator('td').nth(2).inner_text()
+    assert not app.errors, app.errors
+
+
+def test_runtime_an_unconfirmed_member_goes_only_with_the_second_confirmation(open_app):
+    app = open_app(role='active', layout='modern', members=_keyed_members())
+    app.server.unreachable.add('c' * 32)
+    page = app.page
+    panel = _open_ha(app, 'active')
+    row = panel.locator(f'[data-ha-member="{"c" * 32}"]')
+    box = _remove_member(app, panel, 'c')
+    step = box.locator('[data-ha-unconfirmed]')
+    step.wait_for(timeout=3000)
+    path = f'/api/ha/members/{"c" * 32}/remove'
+    assert app.server.bodies[path] == [{'confirm': 'REMOVE', 'user_password': PASSWORD}]
+    assert 'It may still run as an active instance' in step.inner_text()
+    # the box no longer promises that a member it cannot reach lets go by itself
+    assert 'If it cannot be reached, unpair it there before you use it again.' in box.inner_text()
+    # nothing removed, no error toast, the word and the password kept for the second step
+    assert row.count() == 1
+    assert not any('not confirmed as a standby' in t for t in _toasts(page)), _toasts(page)
+    assert page.input_value('#pgha-typed') == 'REMOVE'
+    assert page.input_value('#pgha-confirm-password') == PASSWORD
+    confirm = box.get_by_role('button', name='Remove anyway')
+    assert confirm.is_disabled(), 'the second step waits for the box'
+    step.locator('input[type="checkbox"]').check()
+    assert 'I confirm this instance is shut down for good' in step.inner_text()
+    assert confirm.is_enabled()
+    confirm.click()
+    row.wait_for(state='detached', timeout=3000)
+    assert app.server.bodies[path][-1] == {'confirm': 'REMOVE', 'user_password': PASSWORD, 'shut_down': True}
+    assert len(app.server.bodies[path]) == 2
+    # the answer said it was not told, and the panel says the same
+    note = panel.locator('[data-ha-removal]')
+    note.wait_for(timeout=3000)
+    assert note.get_attribute('data-ha-removal') == 'not-reached'
+    assert 'https://pegaprox-c.example:5000 was not reached' in note.inner_text()
+    assert 'Unpair it on that instance before you use it again' in note.inner_text()
+    assert _wait_for_toast(page, 'Removed from the group')
+    # the next box starts without the second step
+    _remove_member(app, panel, 'b')
+    panel.locator(f'[data-ha-member="{"b" * 32}"]').wait_for(state='detached', timeout=3000)
+    assert app.server.bodies[f'/api/ha/members/{"b" * 32}/remove'] == [{'confirm': 'REMOVE', 'user_password': PASSWORD}]
+    assert not app.errors, app.errors
+
+
+def test_runtime_a_confirmed_member_goes_in_one_step_and_was_told(open_app):
+    app = open_app(role='active', layout='modern', members=_keyed_members())
+    panel = _open_ha(app, 'active')
+    box = _remove_member(app, panel, 'b')
+    panel.locator(f'[data-ha-member="{"b" * 32}"]').wait_for(state='detached', timeout=3000)
+    path = f'/api/ha/members/{"b" * 32}/remove'
+    assert app.server.bodies[path] == [{'confirm': 'REMOVE', 'user_password': PASSWORD}]
+    assert box.count() == 0
+    note = panel.locator('[data-ha-removal]')
+    note.wait_for(timeout=3000)
+    assert note.get_attribute('data-ha-removal') == 'told'
+    assert 'https://pegaprox-b.example:5000 was told and has left the group.' in note.inner_text()
+    # it stays until dismissed or the next action
+    note.get_by_role('button', name='Close').click()
+    assert panel.locator('[data-ha-removal]').count() == 0
+    assert not app.errors, app.errors
+
+
+def test_runtime_removing_the_last_standby_still_says_whether_it_was_told(open_app):
+    app = open_app(role='active', layout='modern', members=[_member('b', confirmed_standby=True)])
+    app.server.unreachable.add('b' * 32)
+    panel = _open_ha(app, 'active')
+    # the server turns standalone once its last member is gone, and the members card goes
+    _remove_member(app, panel, 'b')
+    note = app.page.locator('[data-ha-role="standalone"] [data-ha-removal="not-reached"]')
+    note.wait_for(timeout=5000)
+    assert 'https://pegaprox-b.example:5000 was not reached' in note.inner_text()
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('removed', [True, False])
+def test_runtime_a_removed_instance_says_so_and_what_to_do(open_app, removed):
+    app = open_app(role='standby', layout='modern',
+                   members=[] if removed else [_member('b', role='active', source=True)])
+    if removed:
+        app.server.removed = {'epoch': 3, 'at': _iso_ago(300), 'by': 'd' * 32}
+    page = app.page
+    panel = _open_ha(app, 'standby')
+    note = panel.locator('[data-ha-removed]')
+    if not removed:
+        assert note.count() == 0
+        assert not app.errors, app.errors
+        return
+    text = note.inner_text()
+    for needle in ('This instance was removed from the group. It stays passive',
+                   'Removed by dddddddd under epoch 3', '5 minutes ago',
+                   'To use it on its own, unpair it here.'):
+        assert needle in text, (needle, text)
+    # above everything else the panel shows for the standby
+    assert _follows(page, '[data-ha-removed]', '[data-ha-members]')
+    # and the way out is where it says
+    panel.get_by_role('button', name='Unpair').click()
+    assert 'This instance becomes standalone' in panel.locator('[data-ha-confirm="unpair"]').inner_text()
+    assert not app.errors, app.errors
+
+
+def test_runtime_a_standalone_shows_no_removed_note(open_app):
+    app = open_app(role='standalone', layout='modern')
+    app.server.removed = {'epoch': 3, 'at': _iso_ago(300), 'by': 'd' * 32}
+    panel = _open_ha(app, 'standalone')
+    assert panel.locator('[data-ha-removed]').count() == 0
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('change', ['spent', 'replaced', 'kept'])
+def test_runtime_a_code_the_server_no_longer_has_open_leaves_the_screen(open_app, change):
+    """verify:robust:2 - a member that was listed already re-pairs with the code, so the count
+    stays; or another tab makes a new one. Either way the code on screen is of no use."""
+    app = open_app(role='active', layout='modern', members=[_member('b'), _member('c')])
+    page = app.page
+    panel = _open_ha(app, 'active')
+    page.fill('#pgha-code-password', PASSWORD)
+    panel.get_by_role('button', name='Create pairing code').click()
+    box = page.locator('[data-ha-code]')
+    box.wait_for(timeout=3000)
+    # the server still has it open: it stays
+    _reload_status(app)
+    assert box.is_visible()
+    if change == 'spent':
+        app.server.pairing_until = None
+    elif change == 'replaced':
+        app.server.pairing_until += 60
+    _reload_status(app)
+    if change == 'kept':
+        assert box.is_visible()
+    else:
+        box.wait_for(state='detached', timeout=3000)
+    assert '3 of 4 instances' in panel.locator('[data-ha-members]').inner_text()
+    # a replaced code is still open, just not the one this tab holds
+    assert panel.get_by_text('A pairing code is open until').count() == (1 if change == 'replaced' else 0)
+    assert not app.errors, app.errors
+
+
+def test_runtime_a_poll_already_on_its_way_keeps_a_fresh_code(open_app):
+    """A poll sent before the code existed and answered after it knows nothing of the code:
+    it must not take the shown-once code off the screen."""
+    app = open_app(role='active', layout='modern', members=[_member('b')])
+    page = app.page
+    panel = _open_ha(app, 'active')
+    app.server.hold_status = True
+    before = app.server.calls.count(('GET', '/api/ha/status'))
+    page.locator('#pgha-interval + button').click()
+    deadline = time.time() + 3
+    while time.time() < deadline and not app.server.held:
+        page.wait_for_timeout(100)
+    assert len(app.server.held) == 1
+    assert app.server.held[0][1]['pairing_open_until'] is None
+    app.server.hold_status = False
+    page.fill('#pgha-code-password', PASSWORD)
+    panel.get_by_role('button', name='Create pairing code').click()
+    box = page.locator('[data-ha-code]')
+    box.wait_for(timeout=3000)
+    # the panel's own status request after the code, answered with the code open
+    deadline = time.time() + 3
+    while time.time() < deadline and app.server.calls.count(('GET', '/api/ha/status')) < before + 2:
+        page.wait_for_timeout(100)
+    page.wait_for_timeout(300)
+    app.server.release()
+    page.wait_for_timeout(800)
+    assert box.is_visible(), 'a poll sent before the code was made took it away'
+    assert 'pgxha1_' in box.inner_text()
+    assert not app.errors, app.errors
+
+
+def _open_ha_in(app, layout):
+    if layout != 'cloud':
+        return _open_ha(app, 'active')
+    page = app.page
+    page.locator('button[title="Settings"]').first.click()
+    page.get_by_text('PegaProx Settings').first.wait_for(timeout=5000)
+    page.locator('div.fixed.inset-0 button', has_text='High Availability').first.click()
+    panel = page.locator('[data-ha-role="active"]')
+    panel.wait_for(timeout=5000)
+    return panel
+
+
+@pytest.mark.parametrize('layout', ['cloud', 'modern', 'corporate'])
+def test_runtime_every_layout_shows_the_toasts(open_app, layout):
+    """verify:robust:3 - Cloud returned before the toast portal, so a refused removal left the
+    box open without a word and a successful one said nothing either."""
+    refused = f'/api/ha/members/{"b" * 32}/remove'
+    app = open_app(role='active', layout=layout, members=[_member('b'), _member('c')],
+                   extra={('POST', refused): (500, {'error': 'Removing the member failed: disk full'})})
+    page = app.page
+    panel = _open_ha_in(app, layout)
+    _remove_member(app, panel, 'b')
+    assert _wait_for_toast(page, 'Removing the member failed: disk full'), _toasts(page)
+    assert panel.locator('[data-ha-confirm="remove"]').count() == 1
+    _remove_member(app, panel, 'c')
+    assert _wait_for_toast(page, 'Removed from the group'), _toasts(page)
+    panel.locator(f'[data-ha-member="{"c" * 32}"]').wait_for(state='detached', timeout=3000)
+    assert not app.errors, app.errors
+
+
+def test_a_promote_the_pull_could_not_prepare_asks_once_more():
+    """The promote route pulls from the active first when it still answers and refuses
+    with HA_PROMOTE_SYNC when that pull fails. The panel asks once more and only then
+    sends force, the way it handles an unconfirmed removal. A removed instance offers no
+    promote at all."""
+    src = _read('web', 'src', 'settings_modal.js')
+    assert "res.code === 'HA_PROMOTE_SYNC'" in src and 'setPromoteSync(true)' in src
+    assert "what === 'promote' && promoteSync && forcePromote" in src
+    assert '(needForce && !forcePromote)' in src
+    assert "{!broken && !status?.removed && (" in src
+    tr = _read('web', 'src', 'translations.js')
+    for key in ('pgHaPromoteSyncFirst', 'pgHaPromoteSyncFailed', 'pgHaPromoteForce'):
+        assert tr.count(f'{key}:') == len(LANGS), key

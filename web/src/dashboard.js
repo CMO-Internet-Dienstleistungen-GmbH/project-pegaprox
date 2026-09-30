@@ -14023,6 +14023,20 @@
                 return out;
             };
 
+            // One toast stack for every layout. Cloud returns early below and never reached the
+            // one in the main return, so whatever it reported through addToast stayed invisible.
+            // A portal to document.body keeps it clear of the corporate z-index/overflow rules.
+            const toastPortal = ReactDOM.createPortal(
+                React.createElement('div', {
+                    style: { position: 'fixed', bottom: isCorporate ? 64 : 24, right: 24, zIndex: 99999, display: 'flex', flexDirection: 'column', gap: 8 }
+                },
+                    toasts.map(toast =>
+                        React.createElement(Toast, { key: toast.id, message: toast.message, type: toast.type, onClose: () => removeToast(toast.id) })
+                    )
+                ),
+                document.body
+            );
+
             // NS 2026-06-05 — Cloud skin (Preview): the whole console layout is its own
             // self-contained shell (cloud.js). Mount it instead of the Modern/Corporate
             // chrome. onExitCloud flips back to Modern so the user is never locked in.
@@ -14138,6 +14152,7 @@
                             (they self-gate on isOpen + pull all context from the app providers). */}
                         <UserProfileModal isOpen={showProfile} onClose={() => setShowProfile(false)} addToast={addToast} />
                         <PegaProxSettingsModal isOpen={showSettings} onClose={() => setShowSettings(false)} addToast={addToast} onGroupsChanged={fetchClusterGroups} />
+                        {toastPortal}
                     </div>
                 );
             }
@@ -23963,16 +23978,7 @@
                     )}
 
                     {/* Toast Notifications — rendered via portal to document.body to avoid corporate layout z-index/overflow issues */}
-                    {ReactDOM.createPortal(
-                        React.createElement('div', {
-                            style: { position: 'fixed', bottom: isCorporate ? 64 : 24, right: 24, zIndex: 99999, display: 'flex', flexDirection: 'column', gap: 8 }
-                        },
-                            toasts.map(toast =>
-                                React.createElement(Toast, { key: toast.id, message: toast.message, type: toast.type, onClose: () => removeToast(toast.id) })
-                            )
-                        ),
-                        document.body
-                    )}
+                    {toastPortal}
 
                     {/* Session-expired overlay — any 401 (server restart, idle timeout, revoked token)
                         surfaces this instead of silently failing every poll. Portal to body so it sits

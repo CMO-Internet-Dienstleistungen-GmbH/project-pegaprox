@@ -9730,6 +9730,9 @@
         // PegaProx - High Availability (#625)
         // HaPanel (settings tab), HaRestartOverlay, haRelTime
         // v2: the live view switch and the restart a changed cluster setup needs
+        // v3: groups of up to four - the members table, Remove, more standbys from the active
+        // v4: confirmed standbys and member keys, a second step to remove one that is not
+        //     confirmed, whether a removed member was told, the note on a removed instance
         // ═══════════════════════════════════════════════
 
         // "3 minutes ago" in the UI language. Intl speaks all nine, so no keys for it.
@@ -9827,13 +9830,23 @@
             const [joinConfirm, setJoinConfirm] = useState(false);
             const [joinError, setJoinError] = useState('');
             const [interval, setIntervalValue] = useState('');
-            const [confirmAction, setConfirmAction] = useState(null);   // 'promote' | 'unpair'
+            const [confirmAction, setConfirmAction] = useState(null);   // 'promote' | 'unpair' | 'remove'
+            const [removing, setRemoving] = useState(null);             // the member a 'remove' is about
             const [typed, setTyped] = useState('');
             const [restarting, setRestarting] = useState(null);         // role we restart into
             const [passwords, setPasswords] = useState({ code: '', join: '', confirm: '' });
             const [reauth, setReauth] = useState(null);                 // {form, code, error} of a refused re-auth
+            const [unconfirmed, setUnconfirmed] = useState(false);      // the remove was refused as HA_REMOVE_UNCONFIRMED
+            const [shutDown, setShutDown] = useState(false);            // the admin ticked "shut down for good"
+            const [promoteSync, setPromoteSync] = useState(false);      // the promote was refused as HA_PROMOTE_SYNC
+            const [forcePromote, setForcePromote] = useState(false);    // the admin ticked "promote without it"
+            const [lastRemoval, setLastRemoval] = useState(null);       // {name, told} of the last removal
 
+            // Every status request gets a number. One that left before a code was made cannot
+            // know about it, so only a later answer may say the code is gone.
+            const loadSeq = useRef(0);
             const load = async () => {
+                const seq = ++loadSeq.current;
                 try {
                     const r = await fetch(`${API_URL}/ha/status`, { credentials: 'include', headers: getAuthHeaders() });
                     if (!r.ok) {
@@ -9841,6 +9854,11 @@
                         return;
                     }
                     const data = await r.json();
+                    // a code the server no longer reports open was spent (a member that was
+                    // already listed re-paired with it, the count stays) or replaced from another
+                    // tab. An expired one stays, the box says so itself.
+                    setCode(c => c && seq > c.seq && data.pairing_open_until !== c.expires_at
+                        && c.expires_at * 1000 > Date.now() ? null : c);
                     setStatus(data);
                     setLoadError('');
                     // prefill once, never over something typed
@@ -9868,7 +9886,15 @@
             }, [code]);
 
             const role = status?.role || 'standalone';
-            useEffect(() => { if (role !== 'standalone') setCode(null); }, [role]);
+            // up to four instances: the active and the standbys that follow it. members is
+            // everyone but this instance, so the count adds one for it
+            const members = Array.isArray(status?.members) ? status.members : [];
+            const maxMembers = status?.max_members || 4;
+            const standbyCount = status?.standby_count || 0;
+            const groupFull = standbyCount >= maxMembers - 1;
+            // the code on screen is spent once someone pairs with it: this instance turns active,
+            // or its group grows. A removal hides it as well, and the open-code note shows instead.
+            useEffect(() => { setCode(null); }, [role, standbyCount]);
 
             // POST/PUT to /api/ha/*; the error text comes from the server as is, the
             // code tells a refused re-auth apart from everything else
@@ -9914,7 +9940,7 @@
                 const res = await send('POST', 'pairing-code', withPassword('code', { url }));
                 if (!res.ok) { if (!reauthRefused('code', res)) addToast?.(res.error, 'error'); return; }
                 setPassword('code', '');
-                setCode({ code: res.data.code, expires_at: res.data.expires_at });
+                setCode({ code: res.data.code, expires_at: res.data.expires_at, seq: loadSeq.current });
                 setNow(Date.now());
                 load();
             });
@@ -9973,22 +9999,60 @@
                 else load();
             });
 
-            const WORD = { promote: 'PROMOTE', unpair: 'UNPAIR' };
-            // null closes the box; either way nothing typed survives into the next one
-            const openConfirm = (what) => {
+            const WORD = { promote: 'PROMOTE', unpair: 'UNPAIR', remove: 'REMOVE' };
+            // null closes the box; either way nothing typed survives into the next one.
+            // A remove names the member it is about.
+            const openConfirm = (what, member = null) => {
                 setConfirmAction(what);
+                setRemoving(member);
                 setTyped('');
                 setPassword('confirm', '');
                 setReauth(null);
+                setUnconfirmed(false);
+                setShutDown(false);
+                setPromoteSync(false);
+                setForcePromote(false);
+                setLastRemoval(null);
             };
             const confirmed = () => run(confirmAction, async () => {
                 const what = confirmAction;
+                const target = removing;
                 setReauth(null);
-                const res = await send('POST', what, withPassword('confirm', { confirm: WORD[what] }));
-                if (!res.ok) { if (!reauthRefused('confirm', res)) addToast?.(res.error, 'error'); return; }
+                const path = what === 'remove' ? `members/${encodeURIComponent(target.instance_id)}/remove` : what;
+                // shut_down only goes out as the second step, after the server asked for it and
+                // the admin ticked the box
+                const shutDownNow = what === 'remove' && unconfirmed && shutDown;
+                // force likewise: only after the server said the pull before promoting failed
+                const forceNow = what === 'promote' && promoteSync && forcePromote;
+                const body = { confirm: WORD[what], ...(shutDownNow ? { shut_down: true } : {}), ...(forceNow ? { force: true } : {}) };
+                const res = await send('POST', path, withPassword('confirm', body));
+                if (!res.ok) {
+                    if (reauthRefused('confirm', res)) return;
+                    // never seen as a standby under this epoch: it may still run as an active that
+                    // nobody can tell any more. Ask once more instead of reporting an error.
+                    if (what === 'remove' && res.code === 'HA_REMOVE_UNCONFIRMED') {
+                        setUnconfirmed(true);
+                        return;
+                    }
+                    // the active answers but the last configuration could not be fetched first
+                    if (what === 'promote' && res.code === 'HA_PROMOTE_SYNC') {
+                        setPromoteSync(true);
+                        return;
+                    }
+                    addToast?.(res.error, 'error');
+                    return;
+                }
                 openConfirm(null);
                 if (res.data.restarting) {
                     setRestarting(what === 'promote' ? 'active' : 'standalone');
+                } else if (what === 'remove') {
+                    // the row goes at once; the next status brings the count and the pairing card along
+                    if (Array.isArray(res.data.members)) setStatus(s => ({ ...(s || {}), members: res.data.members }));
+                    // told is true only when the member answered and let go of the group
+                    const told = typeof res.data.told === 'boolean' ? res.data.told : null;
+                    setLastRemoval({ name: target.url || target.instance_id.slice(0, 8), told });
+                    addToast?.(t('pgHaMemberRemoved'), told === false ? 'info' : 'success');
+                    load();
                 } else {
                     addToast?.(t('pgHaUnpaired'), 'success');
                     load();
@@ -10015,7 +10079,6 @@
                 </div>
             );
 
-            const peer = status?.peer;
             const sync = status?.sync || {};
             const skipped = Object.entries(sync.skipped_columns || {}).filter(([, cols]) => cols && cols.length);
             // an unreadable state file: the server refuses promote and the interval (409),
@@ -10044,29 +10107,94 @@
                 </div>
             );
 
-            const peerCard = (
-                <div className={card}>
-                    <h4 className="font-medium text-white flex items-center gap-2">
-                        <Icons.Link />
-                        {t('pgHaPeer')}
-                    </h4>
-                    {peer ? (
-                        <div className="space-y-1.5">
-                            {row(t('pgHaPeerUrl'), <span className="font-mono text-xs">{peer.url || '-'}</span>)}
-                            {row(t('pgHaLastContact'), when(peer.last_contact))}
-                            {row(t('pgHaPeerSeen'), <span className="flex items-center justify-end gap-2">
-                                {peer.role_seen ? <HaRoleBadge role={peer.role_seen} t={t} /> : '-'}
-                                <span className="text-xs text-gray-400">{t('pgHaEpoch')} {peer.epoch_seen ?? '-'}</span>
-                            </span>)}
-                            {row(t('pgHaPairedAt'), when(peer.paired_at))}
-                            {peer.last_error && (
-                                <div className="rounded-lg p-2 text-xs border bg-red-500/10 border-red-500/30 text-red-300 break-all">
-                                    {t('pgHaLastError')}: {peer.last_error}
-                                </div>
-                            )}
+            // Everyone else in the group, as this instance knows them: on the active its
+            // standbys, each with Remove; on a standby the active and the other standbys, with
+            // the one it pulls from marked as its source.
+            const cell = 'py-2 pr-4';
+            const canRemove = role === 'active';
+            const membersCard = (
+                <div className={card} data-ha-members={members.length}>
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                        <h4 className="font-medium text-white flex items-center gap-2">
+                            <Icons.Users />
+                            {t('pgHaMembers')}
+                        </h4>
+                        <span className="text-xs text-gray-400" data-ha-count>
+                            {t('pgHaMemberCount').replace('{n}', members.length + 1).replace('{max}', maxMembers)}
+                        </span>
+                    </div>
+                    {members.length > 0 ? (
+                        <div className="overflow-x-auto">
+                            <table className="w-full text-sm">
+                                <thead>
+                                    <tr className="text-left text-xs text-gray-500 border-b border-proxmox-border">
+                                        <th className={`${cell} font-medium`}>{t('pgHaInstanceId')}</th>
+                                        <th className={`${cell} font-medium`}>{t('pgHaPeerUrl')}</th>
+                                        <th className={`${cell} font-medium`}>{t('pgHaPeerSeen')}</th>
+                                        <th className={`${cell} font-medium`}>{t('pgHaEpoch')}</th>
+                                        <th className={`${cell} font-medium`}>{t('pgHaKey')}</th>
+                                        <th className={`${cell} font-medium whitespace-nowrap`}>{t('pgHaLastContact')}</th>
+                                        <th className={`${cell} font-medium whitespace-nowrap`}>{t('pgHaLastError')}</th>
+                                        {canRemove && <th className="py-2" />}
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-proxmox-border">
+                                    {members.map(m => (
+                                        <tr key={m.instance_id} data-ha-member={m.instance_id} data-ha-source={m.is_source ? '' : undefined}
+                                            data-ha-confirmed={typeof m.confirmed_standby === 'boolean' ? String(m.confirmed_standby) : undefined}>
+                                            <td className={`${cell} whitespace-nowrap`}>
+                                                <span className="font-mono text-xs text-gray-200" title={m.instance_id}>{(m.instance_id || '').slice(0, 8)}</span>
+                                                {m.is_source && (
+                                                    <span title={t('pgHaSourceHint')}
+                                                        className="ml-2 px-1.5 py-0.5 rounded-full border text-[11px] bg-blue-500/20 text-blue-300 border-blue-500/30">
+                                                        {t('pgHaSource')}
+                                                    </span>
+                                                )}
+                                            </td>
+                                            <td className={`${cell} font-mono text-xs text-gray-200 whitespace-nowrap`}>{m.url || '-'}</td>
+                                            <td className={`${cell} whitespace-nowrap`}>
+                                                {m.role_seen ? <HaRoleBadge role={m.role_seen} t={t} /> : '-'}
+                                                {/* confirmed: a standby under the current epoch. Only the active warns
+                                                    about the others, since a removal there needs the second step */}
+                                                {m.confirmed_standby === true && (
+                                                    <span title={t('pgHaConfirmedHint')} className="ml-2 text-[11px] text-green-300">{t('pgHaConfirmed')}</span>
+                                                )}
+                                                {m.confirmed_standby === false && canRemove && (
+                                                    <span title={t('pgHaUnconfirmedHint')}
+                                                        className="ml-2 px-1.5 py-0.5 rounded-full border text-[11px] bg-yellow-500/20 text-yellow-300 border-yellow-500/40">
+                                                        {t('pgHaUnconfirmed')}
+                                                    </span>
+                                                )}
+                                            </td>
+                                            <td className={`${cell} text-gray-200`}>{m.epoch_seen ?? '-'}</td>
+                                            <td className={`${cell} whitespace-nowrap`} data-ha-key={m.key_fingerprint ? 'key' : m.key_fingerprint === '' ? 'secret' : undefined}>
+                                                {m.key_fingerprint
+                                                    ? <span className="font-mono text-xs text-gray-200" title={m.key_fingerprint}>{m.key_fingerprint}</span>
+                                                    : m.key_fingerprint === ''
+                                                        ? <span className="text-xs text-yellow-300" title={t('pgHaOldSecretHint')}>{t('pgHaOldSecret')}</span>
+                                                        : <span className="text-gray-500">-</span>}
+                                            </td>
+                                            <td className={`${cell} text-gray-200 whitespace-nowrap`}>{when(m.last_contact)}</td>
+                                            <td className={`${cell} text-xs max-w-xs`}>
+                                                {m.last_error
+                                                    ? <span className="text-red-300 break-all">{m.last_error}</span>
+                                                    : <span className="text-gray-500">-</span>}
+                                            </td>
+                                            {canRemove && (
+                                                <td className="py-2 text-right">
+                                                    <button onClick={() => openConfirm('remove', m)} disabled={!!busy} className={`${btnGhost} ml-auto`}>
+                                                        <Icons.UserX />
+                                                        {t('pgHaRemove')}
+                                                    </button>
+                                                </td>
+                                            )}
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
                         </div>
                     ) : (
-                        <p className="text-sm text-gray-400">{t('pgHaNoPeer')}</p>
+                        <p className="text-sm text-gray-400">{t('pgHaNoMembers')}</p>
                     )}
                 </div>
             );
@@ -10129,13 +10257,44 @@
                 </div>
             );
 
-            // a poll can report the file unreadable while the promote box is open
-            const typedBox = confirmAction && !(confirmAction === 'promote' && broken) && (
-                <div className="rounded-xl p-4 space-y-3 border bg-red-500/10 border-red-500/30">
+            // a poll can report the file unreadable while the promote box is open, or the member
+            // gone (or this instance no longer active) while its remove box is
+            const removeStale = confirmAction === 'remove'
+                && (role !== 'active' || !members.some(m => m.instance_id === removing?.instance_id));
+            // the server refused the remove as unconfirmed: the same box asks once more
+            const needShutDown = confirmAction === 'remove' && unconfirmed;
+            const needForce = confirmAction === 'promote' && promoteSync;
+            const typedBox = confirmAction && !(confirmAction === 'promote' && broken) && !removeStale && (
+                <div className="rounded-xl p-4 space-y-3 border bg-red-500/10 border-red-500/30" data-ha-confirm={confirmAction}>
                     <p className="text-sm text-red-300">
-                        {confirmAction === 'promote' ? t('pgHaPromoteDesc')
+                        {confirmAction === 'promote' ? `${t('pgHaPromoteDesc')} ${t('pgHaPromoteSyncFirst')}`
+                            : confirmAction === 'remove' ? t('pgHaRemoveDesc').replace('{name}', removing.url || removing.instance_id.slice(0, 8))
                             : role === 'standby' ? t('pgHaUnpairStandbyDesc') : t('pgHaUnpairActiveDesc')}
                     </p>
+                    {needForce && (
+                        <div className="rounded-lg p-3 space-y-2 border bg-yellow-500/10 border-yellow-500/40" data-ha-promote-sync>
+                            <div className="flex items-start gap-2 text-sm text-yellow-200">
+                                <span className="mt-0.5 flex-shrink-0"><Icons.AlertTriangle /></span>
+                                <span>{t('pgHaPromoteSyncFailed')}</span>
+                            </div>
+                            <label className="flex items-start gap-2 text-sm text-gray-200 cursor-pointer">
+                                <input type="checkbox" checked={forcePromote} onChange={e => setForcePromote(e.target.checked)} className="mt-0.5" />
+                                <span>{t('pgHaPromoteForce')}</span>
+                            </label>
+                        </div>
+                    )}
+                    {needShutDown && (
+                        <div className="rounded-lg p-3 space-y-2 border bg-yellow-500/10 border-yellow-500/40" data-ha-unconfirmed>
+                            <div className="flex items-start gap-2 text-sm text-yellow-200">
+                                <span className="mt-0.5 flex-shrink-0"><Icons.AlertTriangle /></span>
+                                <span>{t('pgHaRemoveUnconfirmed')}</span>
+                            </div>
+                            <label className="flex items-start gap-2 text-sm text-gray-200 cursor-pointer">
+                                <input type="checkbox" checked={shutDown} onChange={e => setShutDown(e.target.checked)} className="mt-0.5" />
+                                <span>{t('pgHaShutDownConfirm')}</span>
+                            </label>
+                        </div>
+                    )}
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-3 max-w-xl">
                         <div>
                             <label className="block text-xs text-gray-400 mb-1" htmlFor="pgha-typed">
@@ -10148,12 +10307,113 @@
                     </div>
                     {reauthNote('confirm', 'pgha-confirm-password')}
                     <div className="flex flex-wrap items-center gap-2">
-                        <button onClick={confirmed} disabled={typed !== WORD[confirmAction] || needsPassword('confirm') || !!busy}
+                        <button onClick={confirmed} disabled={typed !== WORD[confirmAction] || needsPassword('confirm') || (needShutDown && !shutDown) || (needForce && !forcePromote) || !!busy}
                             className={`${btn} bg-red-600 hover:bg-red-700 text-white`}>
-                            {confirmAction === 'promote' ? t('pgHaPromote') : t('pgHaUnpair')}
+                            {confirmAction === 'promote' ? t('pgHaPromote')
+                                : confirmAction === 'remove' ? (needShutDown ? t('pgHaRemoveAnyway') : t('pgHaRemove'))
+                                : t('pgHaUnpair')}
                         </button>
                         <button onClick={() => openConfirm(null)} className={btnGhost}>{t('cancel')}</button>
                     </div>
+                </div>
+            );
+
+            // What the last removal reached, until the next action. The toast is gone after a few
+            // seconds, and a member that was not told has to be unpaired by hand over there.
+            const removalNote = lastRemoval && (
+                <div data-ha-removal={lastRemoval.told === true ? 'told' : lastRemoval.told === false ? 'not-reached' : 'unknown'}
+                    className={`rounded-xl p-4 border flex items-start gap-2 text-sm ${lastRemoval.told === false
+                        ? 'bg-yellow-500/10 border-yellow-500/40 text-yellow-200'
+                        : 'bg-green-500/10 border-green-500/30 text-green-300'}`}>
+                    <span className="mt-0.5 flex-shrink-0">{lastRemoval.told === false ? <Icons.AlertTriangle /> : <Icons.Check />}</span>
+                    <span className="flex-1 min-w-0" style={{ overflowWrap: 'anywhere' }}>
+                        {lastRemoval.told === true ? t('pgHaRemovedTold').replace('{name}', lastRemoval.name)
+                            : lastRemoval.told === false ? t('pgHaRemovedNotReached').replace('{name}', lastRemoval.name)
+                            : t('pgHaMemberRemoved')}
+                    </span>
+                    <button onClick={() => setLastRemoval(null)} title={t('close')} aria-label={t('close')}
+                        className="flex-shrink-0 text-gray-400 hover:text-white">
+                        <Icons.X />
+                    </button>
+                </div>
+            );
+
+            // This instance learned that the active took it out of the group. It acts on nothing
+            // and receives nothing until an admin unpairs it here.
+            const removedHere = status?.removed;
+            const removedNote = removedHere && role !== 'standalone' && (
+                <div className="rounded-xl p-4 space-y-2 border bg-red-500/10 border-red-500/30" data-ha-removed>
+                    <div className="flex items-start gap-2 text-sm text-red-300">
+                        <span className="mt-0.5 flex-shrink-0"><Icons.AlertTriangle /></span>
+                        <span>{t('pgHaRemovedHere')}</span>
+                    </div>
+                    <div className="text-xs text-gray-400">
+                        <span title={removedHere.by || ''}>
+                            {t('pgHaRemovedBy').replace('{by}', (removedHere.by || '-').slice(0, 8)).replace('{epoch}', removedHere.epoch ?? '-')}
+                        </span>
+                        {removedHere.at && <> · {when(removedHere.at)}</>}
+                    </div>
+                    <p className="text-sm text-gray-300">{t('pgHaRemovedHereNext')}</p>
+                </div>
+            );
+
+            // A standalone's first code makes it the active. The active hands out one code per
+            // further standby until the group is full; the server refuses a fourth standby too.
+            const adding = role === 'active';
+            const pairingCard = (
+                <div className={card} data-ha-pairing={adding && groupFull ? 'full' : 'open'}>
+                    <h4 className="font-medium text-white flex items-center gap-2">
+                        {adding ? <Icons.UserPlus /> : <Icons.Key />}
+                        {adding ? t('pgHaAddStandbyTitle') : t('pgHaMakeActiveTitle')}
+                    </h4>
+                    {adding && groupFull ? (
+                        <p className="text-sm text-yellow-300">{t('pgHaGroupFull').replace('{max}', maxMembers)}</p>
+                    ) : (
+                        <>
+                            <p className="text-sm text-gray-400">{adding ? t('pgHaAddStandbyDesc') : t('pgHaMakeActiveDesc')}</p>
+                            <div>
+                                <label className="block text-xs text-gray-400 mb-1" htmlFor="pgha-own-url">{t('pgHaOwnUrl')}</label>
+                                <input id="pgha-own-url" value={ownUrl} onChange={e => setOwnUrl(e.target.value)}
+                                    placeholder="https://pegaprox-a.example:5000" className={`${input} font-mono`} />
+                                <div className="text-[11px] text-gray-500 mt-1">{t('pgHaOwnUrlHint')}</div>
+                            </div>
+                            {passwordInput('code', 'pgha-code-password')}
+                            {reauthNote('code', 'pgha-code-password')}
+                            {status?.pairing_open_until && !code && (
+                                <p className="text-xs text-yellow-300">
+                                    {t('pgHaCodeOpen').replace('{time}', fmtDate(status.pairing_open_until))}
+                                </p>
+                            )}
+                            <button onClick={createCode} disabled={needsPassword('code') || !!busy}
+                                className={`${btn} bg-proxmox-orange hover:bg-proxmox-orange/90 text-white`}>
+                                <Icons.Key />
+                                {t('pgHaCreateCode')}
+                            </button>
+                            {code && (
+                                <div className="bg-yellow-500/10 border border-yellow-500/40 rounded-xl p-3 space-y-2" data-ha-code>
+                                    <div className="text-xs font-medium text-yellow-200">{t('pgHaCodeOnce')}</div>
+                                    {codeExpired ? (
+                                        <p className="text-sm text-red-300">{t('pgHaCodeExpired')}</p>
+                                    ) : (
+                                        <>
+                                            <div className="flex items-start gap-2">
+                                                <code className="flex-1 px-3 py-2 bg-black/40 rounded text-xs text-yellow-200 break-all font-mono select-all">{code.code}</code>
+                                                <span className="shrink-0 inline-flex">
+                                                    <CopyButton value={code.code} size="md" title={t('copy')}
+                                                        className="w-8 h-8 border border-proxmox-border hover:border-gray-500" />
+                                                </span>
+                                            </div>
+                                            <div className="flex items-center gap-2 text-xs text-gray-400">
+                                                <Icons.Clock />
+                                                <span>{t('pgHaCodeExpiresIn').replace('{time}', countdown)}</span>
+                                            </div>
+                                            <p className="text-xs text-gray-400">{t('pgHaCodeNext')}</p>
+                                        </>
+                                    )}
+                                </div>
+                            )}
+                        </>
+                    )}
                 </div>
             );
 
@@ -10201,56 +10461,12 @@
                         {loadError && <div className="text-xs text-red-400">{loadError}</div>}
                     </div>
 
+                    {removedNote}
+                    {removalNote}
+
                     {role === 'standalone' && (
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                            <div className={card}>
-                                <h4 className="font-medium text-white flex items-center gap-2">
-                                    <Icons.Key />
-                                    {t('pgHaMakeActiveTitle')}
-                                </h4>
-                                <p className="text-sm text-gray-400">{t('pgHaMakeActiveDesc')}</p>
-                                <div>
-                                    <label className="block text-xs text-gray-400 mb-1" htmlFor="pgha-own-url">{t('pgHaOwnUrl')}</label>
-                                    <input id="pgha-own-url" value={ownUrl} onChange={e => setOwnUrl(e.target.value)}
-                                        placeholder="https://pegaprox-a.example:5000" className={`${input} font-mono`} />
-                                    <div className="text-[11px] text-gray-500 mt-1">{t('pgHaOwnUrlHint')}</div>
-                                </div>
-                                {passwordInput('code', 'pgha-code-password')}
-                                {reauthNote('code', 'pgha-code-password')}
-                                {status.pairing_open_until && !code && (
-                                    <p className="text-xs text-yellow-300">
-                                        {t('pgHaCodeOpen').replace('{time}', fmtDate(status.pairing_open_until))}
-                                    </p>
-                                )}
-                                <button onClick={createCode} disabled={needsPassword('code') || !!busy}
-                                    className={`${btn} bg-proxmox-orange hover:bg-proxmox-orange/90 text-white`}>
-                                    <Icons.Key />
-                                    {t('pgHaCreateCode')}
-                                </button>
-                                {code && (
-                                    <div className="bg-yellow-500/10 border border-yellow-500/40 rounded-xl p-3 space-y-2" data-ha-code>
-                                        <div className="text-xs font-medium text-yellow-200">{t('pgHaCodeOnce')}</div>
-                                        {codeExpired ? (
-                                            <p className="text-sm text-red-300">{t('pgHaCodeExpired')}</p>
-                                        ) : (
-                                            <>
-                                                <div className="flex items-start gap-2">
-                                                    <code className="flex-1 px-3 py-2 bg-black/40 rounded text-xs text-yellow-200 break-all font-mono select-all">{code.code}</code>
-                                                    <span className="shrink-0 inline-flex">
-                                                        <CopyButton value={code.code} size="md" title={t('copy')}
-                                                            className="w-8 h-8 border border-proxmox-border hover:border-gray-500" />
-                                                    </span>
-                                                </div>
-                                                <div className="flex items-center gap-2 text-xs text-gray-400">
-                                                    <Icons.Clock />
-                                                    <span>{t('pgHaCodeExpiresIn').replace('{time}', countdown)}</span>
-                                                </div>
-                                                <p className="text-xs text-gray-400">{t('pgHaCodeNext')}</p>
-                                            </>
-                                        )}
-                                    </div>
-                                )}
-                            </div>
+                            {pairingCard}
 
                             <div className={card}>
                                 <h4 className="font-medium text-white flex items-center gap-2">
@@ -10294,8 +10510,10 @@
 
                     {role === 'active' && (
                         <>
+                            {membersCard}
+                            {confirmAction === 'remove' && typedBox}
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                {peerCard}
+                                {pairingCard}
                                 {intervalCard}
                             </div>
                             {liveViewCard}
@@ -10305,15 +10523,15 @@
                                     {t('pgHaUnpair')}
                                 </button>
                             </div>
-                            {typedBox}
+                            {confirmAction !== 'remove' && typedBox}
                         </>
                     )}
 
                     {role === 'standby' && (
                         <>
                             {restartNote}
+                            {membersCard}
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                {peerCard}
                                 <div className={card}>
                                     <h4 className="font-medium text-white flex items-center gap-2">
                                         <Icons.RefreshCw />
@@ -10339,18 +10557,16 @@
                                         </div>
                                     )}
                                 </div>
-                            </div>
-                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 {intervalCard}
-                                {liveViewCard}
                             </div>
+                            {liveViewCard}
                             <div className="flex flex-wrap gap-2">
                                 <button onClick={syncNow} disabled={!!busy}
                                     className={`${btn} bg-proxmox-orange hover:bg-proxmox-orange/90 text-white`}>
                                     <span className={`inline-flex ${busy === 'sync' ? 'animate-spin' : ''}`}><Icons.RefreshCw /></span>
                                     {t('pgHaSyncNow')}
                                 </button>
-                                {!broken && (
+                                {!broken && !status?.removed && (
                                     <button onClick={() => openConfirm('promote')} disabled={!!busy}
                                         className={`${btn} bg-yellow-600 hover:bg-yellow-700 text-white`}>
                                         <Icons.Zap />
