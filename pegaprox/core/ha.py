@@ -1,10 +1,38 @@
 """Warm standby for PegaProx itself (#625).
 
-Two instances are paired. The ACTIVE one runs as always. The STANDBY one keeps the
-UI up, pulls the shared configuration from the active every few seconds, refuses
-writes and lets none of the background loops act. An admin promotes the standby by
-hand; the instance that was active steps down the moment it learns about a newer
-epoch, from either side.
+Up to four instances form a group: one ACTIVE and up to three STANDBYs. The active
+runs as always. A standby keeps the UI up, pulls the shared configuration from the
+active every few seconds, refuses writes and lets none of the background loops act.
+An admin promotes a standby by hand. Every member follows the active with the
+highest epoch, and an active that learns about a newer one steps down and becomes
+its standby. Two actives under the same epoch (two admins promoting two standbys at
+once) are settled by the instance id: the higher one stays, the other steps down.
+
+The group is a star with the active in the middle. A standby pairs with the active,
+never with another standby; the active hands the member list to every standby with
+each snapshot, so they know each other by the time one of them is promoted.
+
+Every instance has an Ed25519 key pair and signs each call to another member over
+method, path, a digest of the body, the time, a nonce and the instance id of the
+receiver; the member list carries the public keys. A captured call is worth nothing
+at another member, and nothing at the same one after two minutes, a second time, or
+once the receiver has restarted: the nonces it saw are memory only, so a call older
+than its process is refused like one from outside the window. The members' clocks
+have to agree within SIGNATURE_WINDOW. A pair from before the groups presented a
+secret instead ('<id>:<secret>', the other side holding its hash): such a member is
+still taken with that header until it has published a key, and an instance on this
+release sends its key along with every such call until the other side says it holds
+it (_auth_for). The key is taken that way only from the partner of such a pair, the
+one other instance that knows the secret. The group format with hashes that came
+between the two was never released and has no such path: there every member had
+seen every other member's secret, so a secret proves nothing about a key sent with
+it. Its members keep going by their secrets until they pair again.
+
+A member the active removes stays on record as removed (a tombstone, handed out
+with the member list): its calls get 410 HA_REMOVED everywhere, and an instance
+that hears so from a member lets go of the group and stays passive. A standby that
+holds a tombstone for a member its active still lists (the active was promoted while
+it could not hear about the removal) hands it back (take_tombstones).
 
 The live view (on unless an admin switches it off, per instance): a standby starts
 its cluster, PBS and ESXi managers as well and lets them read, so the UI shows the
@@ -14,16 +42,17 @@ place after each sync; a change to how they connect restarts the standby once th
 change has settled. With the live view off a standby starts no managers at all.
 
 What travels:
-  * pairing - the standby POSTs the one-time code to the active and gets back the
-    field key (.pegaprox_aes256.key) and a secret, both sealed with a key derived
-    from the code. Encrypted columns then copy 1:1, including ones added later;
-    a value still in the old Fernet format is resealed on its way out.
+  * pairing - the standby POSTs the one-time code and its public key to the active
+    and gets back the field key (.pegaprox_aes256.key), the active's public key and
+    the member list, sealed with a key derived from the code.
+    Encrypted columns then copy 1:1, including ones added later; a value still in
+    the old Fernet format is resealed on its way out.
   * sync - GET /api/ha/peer/snapshot returns every table in SYNC_TABLES plus the host
-    key pins, the login background and the plugins' config.json files.
-    Instance-local tables and settings stay put.
+    key pins, the login background, the plugins' config.json files and the member
+    list. Instance-local tables and settings stay put.
 
-Both sides hold a secret to present to the other and the hash of the one they
-expect, so the roles can swap without pairing again.
+A state file from before the groups holds a single peer. It reads as a group of two
+(_from_pair_format), and both sides keep talking without pairing again.
 
 State lives in config/ha_state.json, next to the key files and just as private.
 It is never part of a snapshot.
@@ -64,7 +93,33 @@ SNAPSHOT_FORMAT = 1
 CODE_PREFIX = 'pgxha1_'
 PAIRING_TTL = 15 * 60
 DEFAULT_INTERVAL = 30
+# the sender's instance id; '<id>:<secret>' from a member paired before the keys
 PEER_HEADER = 'X-PegaProx-Peer'
+PEER_TS_HEADER = 'X-PegaProx-Peer-Ts'
+PEER_NONCE_HEADER = 'X-PegaProx-Peer-Nonce'
+PEER_SIG_HEADER = 'X-PegaProx-Peer-Sig'
+# our public key, along with a call that still carries the old secret
+PEER_KEY_HEADER = 'X-PegaProx-Peer-Key'
+# the answer to it: the receiver holds the key this call was signed with
+PEER_KEYED_HEADER = 'X-PegaProx-Peer-Keyed'
+# how far a signed call's time may be off, either way
+SIGNATURE_WINDOW = 120
+_NONCES_PER_SENDER = 4096
+# /peer/status and the snapshot say they come from this release: members, keys, tombstones
+GROUP_MARK = 1
+# the highest epoch any member reads, holds or hands on. A promotion that would go past
+# it is refused: an epoch nobody can read would leave two actives that never settle
+EPOCH_MAX = 2 ** 31 - 1
+# one active and up to three standbys
+MAX_MEMBERS = 4
+MAX_TOMBSTONES = 16
+GROUP_FULL_ERROR = f'This group already has {MAX_MEMBERS - 1} standbys - remove one first'
+REMOVED_ERROR = 'This instance was removed from the group'
+# the pull of a pass: at most this long, at least the floor whatever the interval,
+# and short when the watch of the same pass could not reach the source
+PULL_TIMEOUT = 60
+PULL_TIMEOUT_FLOOR = 20
+PULL_TIMEOUT_UNREACHABLE = 10
 
 # Shared configuration. Everything else in the database is per host: sessions,
 # audit trail, metrics, run and event history, runtime alerts. A table that is in
@@ -140,6 +195,14 @@ _DNS_LABEL_RE = re.compile(r'(?!-)[a-z0-9-]{1,63}(?<!-)')
 _URL_CHARS_RE = re.compile(r'[A-Za-z0-9.\-_~:/\[\]]+')
 _URL_PATH_RE = re.compile(r'/[A-Za-z0-9._~\-/]*')
 _URL_PORT_RE = re.compile(r':[0-9]{1,5}')
+_ID_RE = re.compile(r'[0-9a-f]{32}')
+_SECRET_HASH_RE = re.compile(r'[0-9a-f]{64}')
+_FP_RE = re.compile(r'[0-9A-F]{2}(:[0-9A-F]{2}){31}')
+# an Ed25519 public key or signature, base64 of the raw bytes
+_PUBLIC_KEY_RE = re.compile(r'[A-Za-z0-9+/]{43}=')
+_SIGNATURE_RE = re.compile(r'[A-Za-z0-9+/]{86}==')
+_NONCE_RE = re.compile(r'[A-Za-z0-9_-]{16,64}')
+_TS_RE = re.compile(r'[0-9]{1,12}')
 
 # A standby restarts to pick up new connection settings for its managers: once
 # the new ones have held for CONFIG_SETTLE seconds, not before the process has run
@@ -174,10 +237,33 @@ def _fresh_run():
 # from the decrypted passwords and keys, so it never goes near the state file.
 _run = _fresh_run()
 _pull_lock = threading.Lock()
+# the nonces of signed calls taken within the window, per (receiver, sender). Memory
+# only, so a call signed before this process started is not taken at all
+_nonce_lock = threading.Lock()
+_seen_nonces = {}
+_PROCESS_STARTED = int(time.time())
+# what the last look at the group could not reach, for the pull of the same pass
+_last_watch = {'at': None, 'unreachable': frozenset()}
 
 
 class HaError(Exception):
     """Something the admin (or the peer) should be told as is."""
+
+
+class PeerUnreachable(HaError):
+    """The member did not answer at all: network, timeout or a certificate we cannot trust."""
+
+
+class PeerRefused(HaError):
+    """The member answered and turned the call away (401, or 410 once it removed us)."""
+
+    def __init__(self, message, status, code=''):
+        super().__init__(message)
+        self.status, self.code = status, code
+
+
+class RemoveUnconfirmed(HaError):
+    """remove_member: the member was not seen as a standby under the current epoch."""
 
 
 # --- state ---------------------------------------------------------------------
@@ -192,10 +278,60 @@ def _default_state():
         'epoch': 0,
         'instance_id': uuid.uuid4().hex,
         'interval': DEFAULT_INTERVAL,
-        'peer': None,
+        # what this instance signs every call to another member with (base64 of the raw
+        # Ed25519 private key), made when it first pairs
+        'signing_key': None,
+        # the secret a group from before the keys presented; gone once every member
+        # holds our public key
+        'member_secret': None,
+        # every OTHER member: {instance id: {url, fingerprint, public_key, secret_hash,
+        # pair_secret, role_seen, epoch_seen, last_contact, last_error, joined_at,
+        # group_seen, key_acked}}
+        'members': {},
+        # members the active took out: {instance id: {epoch, at, by, public_key,
+        # secret_hash}}, so their calls get 410 and no stale list takes them back
+        'tombstones': {},
+        # set when a member told us we were removed: {epoch, at, by}
+        'removed': None,
+        # on a standby, the member it pulls from
+        'source': None,
         'pairing': None,
         'sync': {},
     }
+
+
+def _from_pair_format(st):
+    """A state file from before the groups: one 'peer' with the secret we present to it
+    (secret_out) and the hash of the one it presents to us (secret_in_hash). That is a
+    group of two, and it reads as one. Our secret_out becomes the secret we present to
+    every member, and the other side holds its hash already, so neither side pairs
+    again - whichever of the two is upgraded first. Only in memory; the file takes
+    the new form with the next write.
+
+    The record is marked pair_secret: its secret was made for this pair and nobody
+    else has seen it, so a key the member sends along with it is its own
+    (peer_verdict)."""
+    p = st.pop('peer', None)
+    if 'members' in st or not isinstance(p, dict):
+        return st
+    pid = p.get('instance_id')
+    st['members'] = {}
+    if isinstance(pid, str) and pid:
+        st['member_secret'] = p.get('secret_out') or None
+        st['members'][pid] = {
+            'url': p.get('url') or '',
+            'fingerprint': p.get('fingerprint') or '',
+            'secret_hash': p.get('secret_in_hash') or '',
+            'pair_secret': True,
+            'role_seen': p.get('role_seen'),
+            'epoch_seen': p.get('epoch_seen') or 0,
+            'last_contact': p.get('last_contact'),
+            'last_error': p.get('last_error') or '',
+            'joined_at': p.get('paired_at'),
+        }
+        if st.get('role') == ROLE_STANDBY:
+            st['source'] = pid
+    return st
 
 
 def _key_backups():
@@ -241,9 +377,14 @@ def _load():
         if not isinstance(st, dict):
             st = _default_state()
         base = _default_state()
-        base.update(st)
+        base.update(_from_pair_format(st))
         if base.get('role') not in (ROLE_STANDALONE, ROLE_ACTIVE, ROLE_STANDBY):
             base['role'] = ROLE_STANDBY
+        for field in ('members', 'tombstones'):
+            ms = base.get(field) if isinstance(base.get(field), dict) else {}
+            base[field] = {k: v for k, v in ms.items() if isinstance(k, str) and isinstance(v, dict)}
+        if not isinstance(base.get('removed'), dict):
+            base['removed'] = None
         # nothing is written until something changes: an instance that never pairs
         # never grows a state file
         _state = base
@@ -304,14 +445,22 @@ def _update_sync(**changes):
         _commit_locked(dict(_state, sync=sync))
 
 
-def _update_peer(**changes):
+def _note_members(notes):
+    """{member id: changes} into the member records, one write for all of them, and
+    none when nothing changes (a member that stays down keeps the same error). A
+    member that left meanwhile stays gone."""
     with _lock:
         _load()
-        if not _state.get('peer'):
-            return
-        peer = dict(_state['peer'])
-        peer.update(changes)
-        _commit_locked(dict(_state, peer=peer))
+        ms = dict(_state.get('members') or {})
+        hit = False
+        for mid, changes in notes.items():
+            if mid in ms:
+                merged = dict(ms[mid], **changes)
+                if merged != ms[mid]:
+                    ms[mid] = merged
+                    hit = True
+        if hit:
+            _commit_locked(dict(_state, members=ms))
 
 
 def reset_for_tests():
@@ -346,9 +495,94 @@ def epoch():
     return int(_load().get('epoch') or 0)
 
 
+def _epoch_value(value, low=0):
+    """`value` when it is an epoch, None for anything else: a whole number from `low`
+    to EPOCH_MAX. The one check for every epoch another member sends or reports, and
+    for every one this instance takes over from it."""
+    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= EPOCH_MAX:
+        return None
+    return value
+
+
+def _joined_order(ms):
+    """Member ids in the order they joined, the id settling a tie."""
+    return sorted(ms, key=lambda mid: (str(ms[mid].get('joined_at') or ''), mid))
+
+
+def members():
+    """Every other member of the group in the order they joined, as copies that
+    carry their instance_id."""
+    ms = _load().get('members') or {}
+    return [dict(ms[mid], instance_id=mid) for mid in _joined_order(ms)]
+
+
+def member(member_id):
+    """The record of one member with its instance_id, None for anybody else."""
+    rec = (_load().get('members') or {}).get(member_id) if isinstance(member_id, str) else None
+    return dict(rec, instance_id=member_id) if rec else None
+
+
+def source_id():
+    """The member a standby pulls from, None on any other instance or when it has
+    lost it (the active unpaired while this one could not be told)."""
+    st = _load()
+    sid = st.get('source')
+    if st['role'] != ROLE_STANDBY or sid not in (st.get('members') or {}):
+        return None
+    return sid
+
+
 def peer():
-    p = _load().get('peer')
-    return dict(p) if p else None
+    """The one member, for code that needs only one: on a standby the member it pulls
+    from, anywhere else the first member. None when there is none."""
+    if role() == ROLE_STANDBY:
+        return member(source_id())
+    ms = members()
+    return ms[0] if ms else None
+
+
+def standby_count():
+    """Standbys in the group as this instance knows it: on the active its members, on
+    a standby everybody but the member it pulls from, itself included."""
+    st = _load()
+    n = len(st.get('members') or {})
+    if st['role'] == ROLE_ACTIVE:
+        return n
+    if st['role'] == ROLE_STANDBY and n:
+        return n + 1 - (1 if source_id() else 0)
+    return 0
+
+
+def group_full():
+    """True when this instance has MAX_MEMBERS - 1 other members and takes no more."""
+    return len(_load().get('members') or {}) >= MAX_MEMBERS - 1
+
+
+def _seen_in_group(rec):
+    """A member known to run this release: it answered with the group mark, or it has
+    a public key, which only this release makes."""
+    return bool(rec.get('group_seen') or rec.get('public_key'))
+
+
+def group_waiting():
+    """The first member not yet seen running this release, None when there is none.
+    A release from before the groups takes calls from its one peer only, so a
+    further standby would be refused there and stranded once it is promoted."""
+    for rec in members():
+        if not _seen_in_group(rec):
+            return rec
+    return None
+
+
+def _group_waiting_error(rec):
+    return (f"{rec.get('url') or rec['instance_id']} has not answered as a member of a group "
+            "yet - update it to this release and let it answer once before adding a standby")
+
+
+def _confirmed_standby(rec, st):
+    """The member answered as a standby under our current epoch."""
+    return (rec.get('role_seen') == ROLE_STANDBY
+            and int(rec.get('epoch_seen') or 0) == int(st.get('epoch') or 0))
 
 
 # --- the live view -------------------------------------------------------------
@@ -738,6 +972,287 @@ def _hash_secret(value):
     return hashlib.sha256(('pegaprox-ha:' + (value or '')).encode()).hexdigest()
 
 
+def _new_signing_key():
+    """A fresh Ed25519 private key, as the state file keeps it."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    raw = Ed25519PrivateKey.generate().private_bytes(
+        serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
+    return base64.b64encode(raw).decode()
+
+
+def _private_key(value):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    return Ed25519PrivateKey.from_private_bytes(base64.b64decode(value))
+
+
+def _public_of(private):
+    from cryptography.hazmat.primitives import serialization
+    return base64.b64encode(private.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode()
+
+
+# The y coordinates of the eight Ed25519 points of small order (libsodium keeps the
+# same list). OpenSSL takes them as public keys, and under the identity point one
+# fixed signature holds for every message: such a key would be an identity anybody
+# can sign as.
+_ED25519_P = 2 ** 255 - 19
+_ORDER_8_Y = 2707385501144840649318225287225658788936804267575313519463743609750303402022
+_SMALL_ORDER_Y = frozenset((0, 1, _ED25519_P - 1, _ORDER_8_Y, _ED25519_P - _ORDER_8_Y))
+
+
+def _public_key(value):
+    """The Ed25519 public key in `value` (base64 of the raw 32 bytes), None for anything
+    else, a point of small order included."""
+    if not isinstance(value, str) or not _PUBLIC_KEY_RE.fullmatch(value):
+        return None
+    raw = base64.b64decode(value)
+    # the sign bit of x left out, and y taken mod p: the encodings above p are the
+    # same points
+    if (int.from_bytes(raw, 'little') & ((1 << 255) - 1)) % _ED25519_P in _SMALL_ORDER_Y:
+        return None
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    try:
+        return Ed25519PublicKey.from_public_bytes(raw)
+    except Exception:
+        return None
+
+
+def peer_key_fingerprint(public_key):
+    """A short digest of a member's public key for the status page, '' without one."""
+    if not _public_key(public_key):
+        return ''
+    return hashlib.sha256(b'pegaprox-ha-peer-key:' + base64.b64decode(public_key)).hexdigest()[:16]
+
+
+def own_public_key():
+    """The public key of this instance, '' until it has one."""
+    value = _load().get('signing_key')
+    try:
+        return _public_of(_private_key(value)) if value else ''
+    except Exception:
+        return ''
+
+
+def _wire_body(json_body):
+    """The bytes a peer call carries, the same ones its signature covers."""
+    if json_body is None:
+        return b''
+    return json.dumps(json_body, separators=(',', ':'), sort_keys=True).encode()
+
+
+def _to_sign(method, path, body, ts, nonce, receiver, sender):
+    return '\n'.join(('pegaprox-ha-peer-1', method.upper(), path,
+                      hashlib.sha256(body or b'').hexdigest(), ts, nonce, receiver,
+                      sender)).encode()
+
+
+def _signed_headers(private, sender, receiver, method, path, body):
+    ts, nonce = str(int(time.time())), secrets.token_urlsafe(18)
+    sig = private.sign(_to_sign(method, path, body, ts, nonce, receiver, sender))
+    return {PEER_HEADER: sender, PEER_TS_HEADER: ts, PEER_NONCE_HEADER: nonce,
+            PEER_SIG_HEADER: base64.b64encode(sig).decode()}
+
+
+class _Signer:
+    """Who this instance is to the other members, read once: a caller that fans out
+    hands it to every call instead of reading the state in each of them."""
+
+    def __init__(self, instance_id, private=None, secret=None):
+        self.instance_id, self.private, self.secret = instance_id, private, secret
+        self.public_key = _public_of(private) if private is not None else ''
+
+
+def _signer():
+    """This instance's _Signer. Makes the key pair on first use, once it is paired: a
+    group from before the keys has none yet. A key is written before it is used, or a
+    member would take one that a restart forgets. When it cannot be written, the old
+    secret alone still reaches the members that hold its hash."""
+    with _lock:
+        st = _load()
+        if not st.get('signing_key') and (st.get('members') or st.get('member_secret')):
+            try:
+                _commit_locked(dict(st, signing_key=_new_signing_key()))
+            except Exception as e:
+                logging.warning(f"[HA] could not save a key pair for the peer calls: {e}")
+            st = _load()
+        value, secret = st.get('signing_key'), st.get('member_secret') or None
+        if not value and not secret:
+            raise HaError('Not paired')
+        private = None
+        if value:
+            try:
+                private = _private_key(value)
+            except Exception as e:
+                if not secret:
+                    raise HaError(f'The key pair in the HA state file cannot be read ({type(e).__name__})')
+        return _Signer(st['instance_id'], private, secret)
+
+
+def _auth_for(signer, receiver, legacy=False):
+    """The headers of one call to `receiver`, as auth for _peer_call: signed, and with
+    `legacy` also the old '<id>:<secret>' and our public key, for a member that may
+    not hold that key yet. It records the key from such a call and says so in the
+    answer (PEER_KEYED_HEADER); a member from before the keys goes by the secret."""
+    def auth(method, path, body):
+        h = {}
+        if signer.private is not None:
+            h.update(_signed_headers(signer.private, signer.instance_id, receiver, method, path, body))
+        if legacy and signer.secret:
+            h[PEER_HEADER] = f'{signer.instance_id}:{signer.secret}'
+            if signer.public_key:
+                h[PEER_KEY_HEADER] = signer.public_key
+        if PEER_HEADER not in h:
+            raise HaError('Not paired')
+        return h
+    return auth
+
+
+def forget_seen_nonces():
+    """For tests: start the replay cache over."""
+    with _nonce_lock:
+        _seen_nonces.clear()
+
+
+def _fresh_nonce(receiver, sender, nonce, ts):
+    """True the first time `nonce` comes from `sender` within the window. Only called
+    once the signature is good, so nobody else can fill a member's share."""
+    now = time.time()
+    with _nonce_lock:
+        seen = _seen_nonces.setdefault((receiver, sender), {})
+        for n in [n for n, until in seen.items() if until < now]:
+            del seen[n]
+        if nonce in seen:
+            return False
+        if len(seen) >= _NONCES_PER_SENDER:
+            logging.warning(f"[HA] member {sender} sent more signed calls than the replay "
+                            "cache holds - refusing until they age out")
+            return False
+        seen[nonce] = ts + SIGNATURE_WINDOW + 1
+        return True
+
+
+def _signature_check(headers, method, path, body, sender, public_key, receiver):
+    """'ok' when the signature headers hold for this call, from `sender` under
+    `public_key` and for `receiver`, inside the window and with a nonce not seen
+    before. 'skewed' for a good signature from outside the window: the member's clock
+    is off, or the call is an old one. A call signed before this process started is
+    one of those too, since the nonces seen until then are gone. '' for anything else."""
+    ts, nonce, sig = (headers.get(PEER_TS_HEADER), headers.get(PEER_NONCE_HEADER),
+                      headers.get(PEER_SIG_HEADER))
+    if not all(isinstance(v, str) for v in (ts, nonce, sig)):
+        return ''
+    if not (_TS_RE.fullmatch(ts) and _NONCE_RE.fullmatch(nonce) and _SIGNATURE_RE.fullmatch(sig)):
+        return ''
+    key = _public_key(public_key)
+    if key is None:
+        return ''
+    from cryptography.exceptions import InvalidSignature
+    try:
+        key.verify(base64.b64decode(sig), _to_sign(method, path, body, ts, nonce, receiver, sender))
+    except (InvalidSignature, ValueError):
+        return ''
+    if abs(time.time() - int(ts)) > SIGNATURE_WINDOW:
+        logging.warning(f"[HA] a signed call from member {sender} is {int(time.time()) - int(ts)}s "
+                        "off our clock - are the clocks of the members in sync?")
+        return 'skewed'
+    if int(ts) < _PROCESS_STARTED:
+        # whether we took it before the restart is not known any more: a member whose
+        # clock is behind hears HA_CLOCK for that long, a replay nothing better
+        logging.info(f"[HA] a signed call from member {sender} is older than this process")
+        return 'skewed'
+    return 'ok' if _fresh_nonce(receiver, sender, nonce, int(ts)) else ''
+
+
+def _signature_ok(headers, method, path, body, sender, public_key, receiver):
+    return _signature_check(headers, method, path, body, sender, public_key, receiver) == 'ok'
+
+
+def _legacy_ok(secret, digest):
+    return (bool(secret) and isinstance(digest, str) and bool(digest)
+            and hmac.compare_digest(_hash_secret(secret), digest))
+
+
+def _record_key(member_id, public_key):
+    """A member from before the keys has shown it holds `public_key`: from now on only
+    its signed calls count. True when we hold the key afterwards."""
+    with _lock:
+        st = _load()
+        ms = dict(st.get('members') or {})
+        rec = ms.get(member_id)
+        if rec is None:
+            return False
+        if rec.get('public_key'):
+            return rec['public_key'] == public_key
+        ms[member_id] = dict(rec, public_key=public_key)
+        try:
+            _commit_locked(dict(st, members=ms))
+        except Exception as e:
+            logging.warning(f"[HA] could not record the key of member {member_id}: {e}")
+            return False
+    logging.info(f"[HA] member {member_id} signs its calls from now on")
+    return True
+
+
+def peer_verdict(headers, method, path, body):
+    """Who sent a peer call: ('member', record), ('removed', tombstone), ('skewed',
+    record) or (None, None).
+
+    `headers` is the request's, `path` its path (a peer call carries no query
+    string), `body` is every byte of it. A member with a public key on record needs a
+    good signature, made for us. One with only the hash of a secret (paired before
+    the keys) needs that secret. A key it sends along with a signature over this very
+    call is its key from then on, but only when the secret was made for our pair
+    (pair_secret): a member list from the active can carry the hash of a secret as
+    well, and more instances than the member itself may know that one. The record
+    carries keyed=True when we hold the key the call was signed with. 'skewed' is a
+    member whose signature is good but whose time is outside the window (or before
+    our start): refused, but told why, since that is a clock to fix and no sign
+    that it was removed. A removed member is known by the same credentials, so
+    the answer it gets tells it and nobody else that it is out."""
+    raw = headers.get(PEER_HEADER) if headers is not None else None
+    if not isinstance(raw, str) or not raw:
+        return None, None
+    claimed, _, secret = raw.partition(':')
+    if not _ID_RE.fullmatch(claimed):
+        return None, None
+    st = _load()
+    me = st['instance_id']
+    rec = (st.get('members') or {}).get(claimed)
+    if rec is not None:
+        rec = dict(rec, instance_id=claimed)
+        if rec.get('public_key'):
+            check = _signature_check(headers, method, path, body, claimed, rec['public_key'], me)
+            if check == 'ok':
+                return 'member', dict(rec, keyed=True)
+            if check == 'skewed':
+                return 'skewed', rec
+            return None, None
+        if not _legacy_ok(secret, rec.get('secret_hash')):
+            return None, None
+        offered, keyed = headers.get(PEER_KEY_HEADER), False
+        if (rec.get('pair_secret') is True and isinstance(offered, str) and _public_key(offered)
+                and _signature_ok(headers, method, path, body, claimed, offered, me)):
+            keyed = _record_key(claimed, offered)
+        return 'member', dict(rec, keyed=keyed)
+    tomb = (st.get('tombstones') or {}).get(claimed)
+    if tomb:
+        # an old call of a removed member hears the same, whatever its time
+        if tomb.get('public_key') and _signature_check(headers, method, path, body, claimed,
+                                                       tomb['public_key'], me):
+            return 'removed', dict(tomb, instance_id=claimed)
+        if tomb.get('secret_hash') and _legacy_ok(secret, tomb['secret_hash']):
+            return 'removed', dict(tomb, instance_id=claimed)
+    return None, None
+
+
+def verify_peer(headers, method='GET', path='', body=b''):
+    """The member record (with its instance_id) when a peer call is from a member, else
+    None. See peer_verdict."""
+    kind, who = peer_verdict(headers, method, path, body)
+    return who if kind == 'member' else None
+
+
 def key_fingerprint(key=None):
     """A short, domain-separated digest of the field key, never the key itself."""
     if key is None:
@@ -860,38 +1375,145 @@ def decode_code(code):
 
 
 def create_pairing_code(own_url, fingerprint):
-    """On the instance that will be active. Returns (code, expires_at).
+    """On the instance that will be active, or already is. Returns (code, expires_at).
 
-    One code at a time; a new one replaces the old. It is good for PAIRING_TTL.
+    One code at a time; a new one replaces the old. It is good for PAIRING_TTL. The
+    address and pin it carries are also what the member list says about this instance.
     """
-    st = _load()
-    if st['role'] == ROLE_STANDBY:
-        raise HaError('A standby cannot hand out pairing codes - promote it first')
-    if st.get('peer'):
-        raise HaError('This instance is already paired - unpair it first')
-    secret = secrets.token_urlsafe(32)
-    expires = int(time.time()) + PAIRING_TTL
-    _update(pairing={'code_hash': _hash_secret(secret), 'expires': expires})
+    with _lock:
+        st = _load()
+        if st['role'] == ROLE_STANDBY:
+            raise HaError('A standby cannot hand out pairing codes - promote it first')
+        if len(st.get('members') or {}) >= MAX_MEMBERS - 1:
+            raise HaError(GROUP_FULL_ERROR)
+        waiting = group_waiting()
+        if waiting:
+            raise HaError(_group_waiting_error(waiting))
+        secret = secrets.token_urlsafe(32)
+        expires = int(time.time()) + PAIRING_TTL
+        changes = dict(pairing={'code_hash': _hash_secret(secret), 'expires': expires},
+                       own_url=own_url, own_fingerprint=fingerprint or '')
+        if not st.get('signing_key'):
+            changes['signing_key'] = _new_signing_key()
+        _update(**changes)
     return encode_code(own_url, fingerprint, secret, st['instance_id']), expires
 
 
-def verify_peer(header_value):
-    """The peer dict when an incoming X-PegaProx-Peer header is right, else None."""
-    if not header_value or ':' not in header_value:
-        return None
-    claimed_id, _, secret = header_value.partition(':')
-    p = peer()
-    if not p or not secret:
-        return None
-    ok_id = hmac.compare_digest(claimed_id.encode(), (p.get('instance_id') or '').encode())
-    ok_secret = hmac.compare_digest(_hash_secret(secret), p.get('secret_in_hash') or '')
-    return p if (ok_id and ok_secret) else None
+def _credentials(rec):
+    return {'public_key': rec.get('public_key') or '', 'secret_hash': rec.get('secret_hash') or ''}
+
+
+def _member_list(st):
+    """The group as the active hands it out: the active itself and every member, each
+    with address, pin, public key and, for a member paired before the keys, the hash
+    of its secret. Sorted, so the etag stays put."""
+    out = []
+    own = {'public_key': '', 'secret_hash': ''}
+    if st.get('signing_key'):
+        try:
+            own['public_key'] = _public_of(_private_key(st['signing_key']))
+        except Exception as e:
+            logging.warning(f"[HA] the key pair in the state file cannot be read: {e}")
+    if st.get('member_secret'):
+        own['secret_hash'] = _hash_secret(st['member_secret'])
+    if own['public_key'] or own['secret_hash']:
+        out.append(dict(own, instance_id=st['instance_id'], url=st.get('own_url') or '',
+                        fingerprint=st.get('own_fingerprint') or ''))
+    for mid, rec in (st.get('members') or {}).items():
+        out.append(dict(_credentials(rec), instance_id=mid, url=rec.get('url') or '',
+                        fingerprint=rec.get('fingerprint') or ''))
+    return sorted(out, key=lambda e: e['instance_id'])
+
+
+def _clean_entries(entries):
+    """{instance id: {url, fingerprint, public_key, secret_hash}} from a member list as
+    it arrives, one entry per id. Each needs a public key or the hash of a secret.
+    Whatever is not well formed is left out; an address that is not plain https
+    counts as unknown, and a pin without an address as none."""
+    out = {}
+    if not isinstance(entries, list):
+        return out
+    for e in entries[:MAX_MEMBERS * 2]:
+        if not isinstance(e, dict):
+            continue
+        mid, digest, key = e.get('instance_id'), e.get('secret_hash'), e.get('public_key')
+        if not (isinstance(mid, str) and _ID_RE.fullmatch(mid)):
+            continue
+        digest = digest if isinstance(digest, str) and _SECRET_HASH_RE.fullmatch(digest) else ''
+        key = key if _public_key(key) else ''
+        if not digest and not key:
+            continue
+        url = valid_https_url(e.get('url')) if e.get('url') else ''
+        fp = e.get('fingerprint')
+        fp = fp.strip().upper() if isinstance(fp, str) and url else ''
+        if fp and not _FP_RE.fullmatch(fp):
+            fp = ''
+        out.setdefault(mid, {'url': url, 'fingerprint': fp, 'public_key': key, 'secret_hash': digest})
+    return out
+
+
+def _clean_tombstones(entries):
+    """{instance id: {epoch, at, by, public_key, secret_hash}} from a tombstone list as
+    it arrives. The credentials say which instance is out: one that pairs again comes
+    with a new key and is not taken for it."""
+    out = {}
+    if not isinstance(entries, list):
+        return out
+    for e in entries[:MAX_TOMBSTONES * 2]:
+        if not isinstance(e, dict):
+            continue
+        mid, ep, at, by = e.get('instance_id'), e.get('epoch'), e.get('at'), e.get('by')
+        if not (isinstance(mid, str) and _ID_RE.fullmatch(mid)):
+            continue
+        if _epoch_value(ep) is None:
+            continue
+        creds = _clean_entries([dict(e, url='', fingerprint='')]).get(mid)
+        if not creds:
+            continue
+        out[mid] = {'epoch': ep, 'at': at if isinstance(at, str) and len(at) <= 40 else '',
+                    'by': by if isinstance(by, str) and _ID_RE.fullmatch(by) else '',
+                    'public_key': creds['public_key'], 'secret_hash': creds['secret_hash']}
+    return out
+
+
+def _tombstone_list(st):
+    return sorted((dict(t, instance_id=mid) for mid, t in (st.get('tombstones') or {}).items()),
+                  key=lambda e: e['instance_id'])
+
+
+def _bounded_tombstones(tombs):
+    keep = sorted(tombs, key=lambda mid: (int(tombs[mid].get('epoch') or 0),
+                                          str(tombs[mid].get('at') or ''), mid))[-MAX_TOMBSTONES:]
+    return {mid: tombs[mid] for mid in keep}
+
+
+def _merged_tombstones(local, incoming, me):
+    """Ours and the ones that came with a member list, the later of two for one id."""
+    out = dict(local or {})
+    for mid, t in (incoming or {}).items():
+        old = out.get(mid)
+        if old is None or (int(t['epoch']), t['at']) > (int(old.get('epoch') or 0), str(old.get('at') or '')):
+            out[mid] = t
+    out.pop(me, None)
+    return _bounded_tombstones(out)
+
+
+def _matches_tombstone(rec, tomb):
+    """The member record is the instance the tombstone is about."""
+    if not tomb:
+        return False
+    key, digest = tomb.get('public_key'), tomb.get('secret_hash')
+    return bool((key and rec.get('public_key') == key) or (digest and rec.get('secret_hash') == digest))
 
 
 # --- pairing -------------------------------------------------------------------
 
-def accept_pairing(code_secret, standby_id, standby_url, standby_fp, standby_secret):
-    """Active side of the handshake. Returns the response body for the standby."""
+def accept_pairing(code_secret, standby_id, standby_url, standby_fp, standby_public_key):
+    """Active side of the handshake. Returns the response body for the standby.
+
+    The standby sends its public key. Up to MAX_MEMBERS - 1 standbys; an instance
+    that is a member already takes its old place again (it unpaired while we could
+    not be told), and one we removed comes back with the new key it pairs with."""
     with _lock:
         st = _load()
         pairing = st.get('pairing') or {}
@@ -900,12 +1522,21 @@ def accept_pairing(code_secret, standby_id, standby_url, standby_fp, standby_sec
                  and hmac.compare_digest(_hash_secret(code_secret), pairing['code_hash']))
         if not valid:
             raise HaError('The pairing code is wrong or has expired')
-        if st['role'] == ROLE_STANDBY or st.get('peer'):
+        if st['role'] == ROLE_STANDBY:
             raise HaError('This instance cannot take a standby right now')
         if not re.match(r'^[0-9a-f]{32}$', standby_id or '') or standby_id == st['instance_id']:
             raise HaError('The standby did not identify itself')
-        if not isinstance(standby_secret, str) or len(standby_secret) < 32:
-            raise HaError('The standby did not send a usable secret')
+        ms = dict(st.get('members') or {})
+        if len([mid for mid in ms if mid != standby_id]) >= MAX_MEMBERS - 1:
+            raise HaError(GROUP_FULL_ERROR)
+        for mid, rec in ms.items():
+            if mid != standby_id and not _seen_in_group(rec):
+                raise HaError(_group_waiting_error(dict(rec, instance_id=mid)))
+        # a public key: a standby from before the keys sends the hash of a secret (or
+        # the secret itself) and is refused here
+        if not _public_key(standby_public_key):
+            raise HaError('The standby did not send a usable public key - update it to '
+                          'this release and pair again')
         if standby_url and not isinstance(standby_url, str):
             raise HaError('The standby address must be https://host[:port][/path]')
         if standby_url and standby_url.strip():
@@ -916,7 +1547,7 @@ def accept_pairing(code_secret, standby_id, standby_url, standby_fp, standby_sec
         else:
             standby_url = ''
         standby_fp = (standby_fp or '').strip().upper()
-        if standby_fp and not re.match(r'^[0-9A-F]{2}(:[0-9A-F]{2}){31}$', standby_fp):
+        if standby_fp and not _FP_RE.fullmatch(standby_fp):
             raise HaError('The standby sent a malformed certificate fingerprint')
 
         from pegaprox.core.db import get_db
@@ -924,26 +1555,40 @@ def accept_pairing(code_secret, standby_id, standby_url, standby_fp, standby_sec
         if not field_key or len(field_key) != 32:
             raise HaError('This instance has no field key to share')
 
-        for_standby = secrets.token_urlsafe(32)
+        signing_key = st.get('signing_key') or _new_signing_key()
         new_epoch = max(1, int(st.get('epoch') or 0))
-        _commit_locked(dict(st, role=ROLE_ACTIVE, epoch=new_epoch, pairing=None, peer={
-            'instance_id': standby_id,
+        if _epoch_value(new_epoch) is None:
+            # the standby would refuse the answer and still stand in our member list
+            raise HaError('This instance holds an epoch no member can read - unpair it here, '
+                          'then pair again')
+        ms[standby_id] = {
             'url': standby_url,
             'fingerprint': standby_fp,
-            'secret_out': standby_secret,
-            'secret_in_hash': _hash_secret(for_standby),
-            'paired_at': _now(),
+            'public_key': standby_public_key,
             'role_seen': ROLE_STANDBY,
             'epoch_seen': new_epoch,
-        }))
+            'last_contact': None,
+            'last_error': '',
+            'joined_at': _now(),
+            'group_seen': True,
+        }
+        tombs = dict(st.get('tombstones') or {})
+        tombs.pop(standby_id, None)
+        new = dict(st, role=ROLE_ACTIVE, epoch=new_epoch, pairing=None, signing_key=signing_key,
+                   members=ms, source=None, tombstones=tombs, removed=None)
+        _commit_locked(new)
+        # the member list too, so the new standby can verify every other member the
+        # day one of them is promoted, and who is out
         sealed = _seal(code_secret, {'field_key': base64.b64encode(field_key).decode(),
-                                     'secret': for_standby}, aad=standby_id)
+                                     'public_key': _public_of(_private_key(signing_key)),
+                                     'members': _member_list(new),
+                                     'tombstones': _tombstone_list(new)}, aad=standby_id)
         return {'instance_id': st['instance_id'], 'epoch': new_epoch, 'sealed': sealed,
                 'key_fp': key_fingerprint(field_key)}
 
 
 def _check_can_join(st, info):
-    if st['role'] != ROLE_STANDALONE or st.get('peer'):
+    if st['role'] != ROLE_STANDALONE or st.get('members'):
         raise HaError('Only a standalone, unpaired instance can become a standby')
     if info['instance_id'] == st['instance_id']:
         raise HaError('That code was made on this instance')
@@ -969,9 +1614,10 @@ def join(code, own_url, own_fingerprint):
             # a code of our own, redeemed while we wait for the other active, would
             # make us its active and then be overwritten below: one pairing at a time
             _commit_locked(dict(st, pairing=None))
-    my_secret = secrets.token_urlsafe(32)
+    # a fresh key pair for every group this instance joins; only the public half leaves
+    my_key = _new_signing_key()
     body = {'code': info['secret'], 'instance_id': me, 'url': own_url,
-            'fingerprint': own_fingerprint or '', 'secret': my_secret}
+            'fingerprint': own_fingerprint or '', 'public_key': _public_of(_private_key(my_key))}
     resp = _peer_call('POST', info['url'], info['fingerprint'], '/api/ha/peer/pair',
                       json_body=body, auth=None)
     if resp.status_code != 200:
@@ -987,34 +1633,45 @@ def join(code, own_url, own_fingerprint):
     try:
         opened = _unseal(info['secret'], data.get('sealed') or '', aad=me)
         field_key = base64.b64decode(opened['field_key'])
-        secret_to_active = opened['secret']
+        active_key = opened.get('public_key')
+        group = opened.get('members', [])
+        tombs = opened.get('tombstones', [])
     except Exception:
         raise HaError('The answer from the active instance could not be opened')
     if len(field_key) != 32 or key_fingerprint(field_key) != data.get('key_fp'):
         raise HaError('The field key from the active instance is not intact')
     new_epoch = data.get('epoch')
-    if (isinstance(new_epoch, bool) or not isinstance(new_epoch, int)
-            or not 0 < new_epoch < 2 ** 31
-            or not isinstance(secret_to_active, str) or len(secret_to_active) < 32):
+    if (_epoch_value(new_epoch, low=1) is None
+            or not _public_key(active_key)
+            or not isinstance(group, list) or not isinstance(tombs, list)):
         raise HaError('The answer from the active instance is incomplete')
+    others = _clean_entries(group)
+    others.pop(me, None)
+    others.pop(info['instance_id'], None)
+    tombs = _clean_tombstones(tombs)
+    tombs.pop(me, None)
 
     with _lock:
         st = _load()
-        if st['role'] == ROLE_STANDALONE and not st.get('peer') and st['instance_id'] == me:
+        if st['role'] == ROLE_STANDALONE and not st.get('members') and st['instance_id'] == me:
+            now = _now()
+            ms = {info['instance_id']: {
+                'url': info['url'], 'fingerprint': info['fingerprint'], 'public_key': active_key,
+                'role_seen': ROLE_ACTIVE, 'epoch_seen': new_epoch, 'last_contact': now,
+                'last_error': '', 'joined_at': now, 'group_seen': True}}
+            for mid in sorted(others)[:MAX_MEMBERS - 2]:
+                if _matches_tombstone(others[mid], tombs.get(mid)):
+                    continue
+                ms[mid] = dict(others[mid], role_seen=None, epoch_seen=0, last_contact=None,
+                               last_error='', joined_at=now)
             # standby first, key second: if the key write fails we are a passive
             # standby whose sync refuses a key mismatch, not a standalone that acts
             # on a foreign key. Both under the lock, so accept_pairing cannot seal
             # the adopted key to anybody in between.
-            _commit_locked(dict(st, role=ROLE_STANDBY, epoch=new_epoch, pairing=None, sync={}, peer={
-                'instance_id': info['instance_id'],
-                'url': info['url'],
-                'fingerprint': info['fingerprint'],
-                'secret_out': secret_to_active,
-                'secret_in_hash': _hash_secret(my_secret),
-                'paired_at': _now(),
-                'role_seen': ROLE_ACTIVE,
-                'epoch_seen': new_epoch,
-            }))
+            _commit_locked(dict(st, role=ROLE_STANDBY, epoch=new_epoch, pairing=None, sync={},
+                                signing_key=my_key, member_secret=None, members=ms,
+                                tombstones=_bounded_tombstones(tombs), removed=None,
+                                source=info['instance_id']))
             try:
                 _install_field_key(field_key)
             except Exception as e:
@@ -1031,7 +1688,8 @@ def join(code, own_url, own_fingerprint):
     # its standby by now; tell it, so it does not wait for one that never comes.
     try:
         _peer_call('POST', info['url'], info['fingerprint'], '/api/ha/peer/unpaired',
-                   auth=None, headers={PEER_HEADER: f'{me}:{secret_to_active}'}, timeout=10)
+                   auth=_auth_for(_Signer(me, _private_key(my_key)), info['instance_id']),
+                   timeout=10)
     except Exception as e:
         logging.warning(f"[HA] could not tell {info['url']} that the join was dropped: {e}")
     raise HaError('This instance changed its pairing while joining - try again')
@@ -1069,8 +1727,9 @@ def _install_field_key(new_key):
 
 
 def unpair():
-    """Forget the peer. A standby becomes standalone, which means it starts acting
-    after the restart the caller schedules.
+    """Leave the group. A standby becomes standalone, which means it starts acting
+    after the restart the caller schedules; an active becomes standalone and the
+    members go on without it. Telling the members is the caller's part.
 
     The one write allowed on a state file _load could not read: it is the way out,
     and the note about the broken file goes with it.
@@ -1079,59 +1738,338 @@ def unpair():
         st = _load()
         was = st['role']
         new = {k: v for k, v in st.items() if k != 'broken'}
-        new.update(peer=None, pairing=None, sync={}, role=ROLE_STANDALONE)
+        # the key pair goes too: the next group gets a fresh one. So does the epoch: a
+        # standalone has nobody to be ordered against, and the next group counts anew
+        # (one at the ceiling would otherwise refuse every promotion there as well)
+        new.update(members={}, source=None, member_secret=None, signing_key=None, pairing=None,
+                   sync={}, tombstones={}, removed=None, role=ROLE_STANDALONE, epoch=0)
         _commit_locked(new)
         return was
 
 
-def forget_peer(peer_id):
-    """The peer told us it unpaired. Only the peer itself may do that."""
+def _mark_removed(by, their_epoch):
+    """A member says this instance is out of the group: let go of every member and
+    stay passive, an active included, until an admin unpairs it. Returns the role it
+    had, None when nothing changed. Never raises."""
+    try:
+        with _lock:
+            st = _load()
+            if st.get('broken') or st['role'] == ROLE_STANDALONE:
+                return None
+            if st.get('removed') and not st.get('members'):
+                # heard it already, from another member
+                return None
+            if _epoch_value(their_epoch) is None:
+                their_epoch = int(st.get('epoch') or 0)
+            was = st['role']
+            _commit_locked(dict(st, role=ROLE_STANDBY, members={}, source=None, sync={}, pairing=None,
+                                epoch=max(int(st.get('epoch') or 0), their_epoch),
+                                removed={'epoch': their_epoch, 'at': _now(), 'by': by}))
+    except Exception as e:
+        logging.error(f"[HA] member {by} says this instance was removed, and that could not be "
+                      f"saved: {e}")
+        return None
+    logging.warning(f"[HA] member {by} says this instance was removed from the group (epoch "
+                    f"{their_epoch}) - passive until it is unpaired")
+    _audit('ha.removed', f"removed from the group, as member {by} says (epoch {their_epoch}); "
+                         f"this instance was {was} and stays passive until it is unpaired")
+    return was
+
+
+def _removed_answer(rec, resp):
+    """A member answered 410 HA_REMOVED: it holds a tombstone for us. Taken from any
+    member, since the answer came from its address under its pin."""
+    try:
+        data = resp.json()
+    except Exception:
+        data = None
+    if not isinstance(data, dict) or data.get('code') != 'HA_REMOVED':
+        return None
+    their = _epoch_value(data.get('epoch'))
+    if their is None:
+        their = int(rec.get('epoch_seen') or 0)
+    return _mark_removed(rec['instance_id'], their)
+
+
+def _speaks_for_group(peer_id, timeout=3):
+    """The epoch under which `peer_id` speaks for the group to us, None when it does
+    not: on a standby the member it pulls from or one it has seen active; otherwise
+    the member has to answer as active right now, under at least our epoch (an active
+    wants it newer, or the same and the tie won)."""
+    st = _load()
+    rec = (st.get('members') or {}).get(peer_id)
+    if rec is None:
+        return None
+    mine = int(st.get('epoch') or 0)
+    if st['role'] == ROLE_STANDBY and (peer_id == st.get('source') or rec.get('role_seen') == ROLE_ACTIVE):
+        return max(mine, int(rec.get('epoch_seen') or 0))
+    try:
+        their_role, their_epoch, _group = _ask(dict(rec, instance_id=peer_id), _signer(), timeout)
+    except Exception as e:
+        logging.warning(f"[HA] could not ask member {peer_id} whether it is active: {e}")
+        return None
+    _note_members({peer_id: {'role_seen': their_role, 'epoch_seen': their_epoch}})
+    if their_role != ROLE_ACTIVE:
+        return None
+    if st['role'] == ROLE_ACTIVE:
+        wins = their_epoch > mine or (their_epoch == mine and _wins_tie(peer_id, st['instance_id']))
+    else:
+        wins = their_epoch >= mine
+    return their_epoch if wins else None
+
+
+def forget_peer(peer_id, whole_group=False):
+    """A member told us it left the group. Only that member itself may say so, and
+    only about itself: we drop it and keep the others. Returns 'group' when this
+    instance let go of the whole group, 'member' when it dropped the caller, '' when
+    nothing changed.
+
+    whole_group is the active telling us that it removed us: we are out of the group
+    then, let go of every member and stay passive (_mark_removed). Taken only from the
+    instance the group follows (_speaks_for_group); from anybody else it is a plain
+    leave. When we have to ask the member first, it already holds the tombstone and
+    answers 410, and we let go right there (_removed_answer): that is the same
+    'group'. An active whose last member left is standalone again."""
+    st = _load()
+    if not isinstance(peer_id, str) or peer_id not in (st.get('members') or {}):
+        return ''
+    if whole_group:
+        their = _speaks_for_group(peer_id)
+        if their is not None and _mark_removed(peer_id, their) is not None:
+            return 'group'
+        after = _load()
+        if (after.get('removed') or {}).get('by') == peer_id and not after.get('members'):
+            return 'group'
     with _lock:
         st = _load()
-        p = st.get('peer') or {}
-        if p.get('instance_id') != peer_id:
-            return False
+        ms = dict(st.get('members') or {})
+        if peer_id not in ms:
+            return ''
         was = st['role']
-        _commit_locked(dict(st, peer=None,
-                            role=ROLE_STANDALONE if was == ROLE_ACTIVE else was))
-        return True
+        ms.pop(peer_id)
+        new = dict(st, members=ms)
+        if new.get('source') not in ms:
+            new['source'] = None
+        if not ms and was == ROLE_ACTIVE:
+            new.update(role=ROLE_STANDALONE, member_secret=None)
+        _commit_locked(new)
+        return 'member'
+
+
+REMOVE_UNCONFIRMED_ERROR = ('This instance has not answered as a standby under the current '
+                            'epoch - it may still be active. Let it come back and follow this '
+                            'one first, or confirm that it is shut down for good')
+
+
+def member_confirmed(member_id):
+    """The member answered as a standby under our current epoch (see remove_member)."""
+    st = _load()
+    rec = (st.get('members') or {}).get(member_id)
+    return bool(rec) and _confirmed_standby(rec, st)
+
+
+def refresh_member(member_id, timeout=5):
+    """Ask one member for its role and epoch now and note the answer. Never raises:
+    a member that does not answer simply stays as the last tick left it."""
+    rec = member(member_id)
+    if not rec:
+        return
+    try:
+        their_role, their_epoch, mark = _ask(rec, _signer(), timeout)
+    except Exception as e:
+        logging.info(f"[HA] member {rec.get('url') or member_id} did not answer the check: {e}")
+        return
+    note = {'last_contact': _now(), 'role_seen': their_role, 'epoch_seen': their_epoch,
+            'last_error': ''}
+    if mark == GROUP_MARK:
+        note['group_seen'] = True
+    try:
+        _note_members({member_id: note})
+    except Exception as e:
+        logging.warning(f"[HA] could not note the member's answer: {e}")
+
+
+def remove_member(member_id, shut_down=False):
+    """Active: take a standby out of the group. Returns its record, for the caller to
+    tell it and the others.
+
+    Only a member seen as a standby under our epoch, unless the admin says it is shut
+    down for good (shut_down): an old active that is simply down would otherwise come
+    back to a group that refuses it, and act. It stays on record as removed (a
+    tombstone), handed out with the member list, so its calls get 410 everywhere and
+    a stale member list does not take it back. Removing the last one makes this
+    instance standalone, as that standby's own unpairing would."""
+    if not shut_down and not member_confirmed(member_id):
+        # the last tick may predate our epoch (a promotion minutes ago): ask it now
+        # rather than send the admin to the shut-down confirmation for nothing
+        refresh_member(member_id)
+    with _lock:
+        st = _load()
+        if st['role'] != ROLE_ACTIVE:
+            raise HaError('Only the active instance removes members')
+        ms = dict(st.get('members') or {})
+        if not isinstance(member_id, str) or member_id not in ms:
+            raise HaError('That instance is not a member of this group')
+        if not shut_down and not _confirmed_standby(ms[member_id], st):
+            raise RemoveUnconfirmed(REMOVE_UNCONFIRMED_ERROR)
+        rec = dict(ms.pop(member_id), instance_id=member_id)
+        tombs = dict(st.get('tombstones') or {})
+        tombs[member_id] = dict(_credentials(rec), epoch=int(st.get('epoch') or 0), at=_now(),
+                                by=st['instance_id'])
+        new = dict(st, members=ms, tombstones=_bounded_tombstones(tombs))
+        if not ms:
+            new.update(role=ROLE_STANDALONE, member_secret=None)
+        _commit_locked(new)
+    return rec
+
+
+def tombstone(member_id):
+    """The tombstone of a removed member, None for anybody else."""
+    t = (_load().get('tombstones') or {}).get(member_id)
+    return dict(t, instance_id=member_id) if t else None
+
+
+def note_member_removed(by_id, member_id, their_epoch):
+    """The active took `member_id` out of the group and tells us right away, not only
+    with the next member list: drop it and keep its tombstone. Taken only from the
+    instance the group follows (_speaks_for_group). Returns True when it was dropped."""
+    st = _load()
+    if (not isinstance(member_id, str) or member_id == st['instance_id']
+            or member_id == by_id or member_id not in (st.get('members') or {})):
+        return False
+    if _epoch_value(their_epoch) is None:
+        return False
+    if _speaks_for_group(by_id) is None:
+        return False
+    with _lock:
+        st = _load()
+        ms = dict(st.get('members') or {})
+        rec = ms.pop(member_id, None)
+        if rec is None:
+            return False
+        tombs = dict(st.get('tombstones') or {})
+        tombs[member_id] = dict(_credentials(rec), epoch=their_epoch, at=_now(), by=by_id)
+        new = dict(st, members=ms, tombstones=_bounded_tombstones(tombs))
+        if new.get('source') == member_id:
+            new['source'] = None
+        _commit_locked(new)
+    logging.warning(f"[HA] member {by_id} removed member {member_id} from the group")
+    return True
+
+
+def take_tombstones(sender_id, entries):
+    """Active: the member `sender_id` holds tombstones (`entries`, as a member list
+    carries them) for members we still list. The removal happened while we could not
+    hear about it, and we were promoted since. Taken for a member only when the
+    tombstone names the credentials we hold for it, and when that member has not
+    answered as a standby under our epoch, asked once more now: a removed instance
+    never does, so no member takes a live standby out this way. Returns the ids
+    taken out."""
+    offered = _clean_tombstones(entries)
+    st = _load()
+    ms = st.get('members') or {}
+    if st['role'] != ROLE_ACTIVE or sender_id not in ms:
+        return []
+    maybe = [mid for mid in sorted(offered) if mid in ms and mid not in (sender_id, st['instance_id'])
+             and _matches_tombstone(ms[mid], offered[mid])]
+    for mid in maybe:
+        if not member_confirmed(mid):
+            refresh_member(mid)
+    taken = []
+    with _lock:
+        st = _load()
+        ms = dict(st.get('members') or {})
+        if st['role'] != ROLE_ACTIVE or sender_id not in ms:
+            return []
+        tombs = dict(st.get('tombstones') or {})
+        for mid in maybe:
+            rec = ms.get(mid)
+            if rec is None or not _matches_tombstone(rec, offered[mid]) or _confirmed_standby(rec, st):
+                continue
+            ms.pop(mid)
+            tombs[mid] = offered[mid]
+            taken.append(mid)
+        if taken:
+            _commit_locked(dict(st, members=ms, tombstones=_bounded_tombstones(tombs)))
+    for mid in taken:
+        logging.warning(f"[HA] member {sender_id} holds a tombstone for member {mid}: out of the "
+                        "group here too")
+    return taken
 
 
 # --- promotion and stepping down -------------------------------------------------
 
 def promote():
-    """Standby to active under a new epoch. The caller restarts the process."""
+    """Standby to active under a new epoch, one above every epoch this instance has
+    seen in the group. The caller restarts the process."""
     with _lock:
         st = _load()
         if st.get('broken'):
-            # the stand-in for an unreadable file has no peer and a fresh identity:
+            # the stand-in for an unreadable file has no members and a fresh identity:
             # an active made from it could never tell the real active to step down
             raise HaError('The HA state file cannot be read - restore config/ha_state.json '
                           'and restart before promoting')
         if st['role'] != ROLE_STANDBY:
             raise HaError('Only a standby can be promoted')
-        seen = int((st.get('peer') or {}).get('epoch_seen') or 0)
+        if st.get('removed'):
+            # an active of its own would act next to the group that took it out
+            raise HaError(f'{REMOVED_ERROR} - unpair it here first')
+        ms = st.get('members') or {}
+        seen = max([int(rec.get('epoch_seen') or 0) for rec in ms.values()] + [0])
         new_epoch = max(int(st.get('epoch') or 0), seen) + 1
-        new = dict(st, epoch=new_epoch, role=ROLE_ACTIVE)
-        if st.get('peer'):
-            new['peer'] = dict(st['peer'], role_seen=None)
-        _commit_locked(new)
+        if new_epoch > EPOCH_MAX:
+            # no member could read it: the old active would never step down to us
+            raise HaError('The group has reached the highest epoch there is - unpair every '
+                          'instance and pair them again')
+        # whoever was active may not be once it hears about us
+        ms = {mid: dict(rec, role_seen=None) if rec.get('role_seen') == ROLE_ACTIVE else dict(rec)
+              for mid, rec in ms.items()}
+        _commit_locked(dict(st, epoch=new_epoch, role=ROLE_ACTIVE, members=ms, source=None))
         return new_epoch
 
 
+def _wins_tie(one, other):
+    """Two actives under the same epoch: the higher instance id stays active."""
+    return str(one) > str(other)
+
+
 def step_down(new_epoch, by_peer_id):
-    """Active to standby because the peer holds a newer epoch. Returns True when
-    this call changed the role; the caller restarts the process then."""
+    """Active to standby of `by_peer_id`, because that member is active under a newer
+    epoch, or under ours and wins the tie. Returns True when this call changed the
+    role; the caller restarts the process then."""
     with _lock:
         st = _load()
-        p = st.get('peer') or {}
-        if p.get('instance_id') != by_peer_id:
+        ms = st.get('members') or {}
+        if not isinstance(by_peer_id, str) or by_peer_id not in ms or st['role'] != ROLE_ACTIVE:
             return False
-        if st['role'] != ROLE_ACTIVE or int(new_epoch) <= int(st.get('epoch') or 0):
+        if _epoch_value(new_epoch) is None:
             return False
-        _commit_locked(dict(st, role=ROLE_STANDBY, epoch=int(new_epoch), sync={},
-                            peer=dict(p, role_seen=ROLE_ACTIVE, epoch_seen=int(new_epoch))))
-    logging.warning(f"[HA] stepped down: peer {by_peer_id} is active with epoch {new_epoch}")
+        mine = int(st.get('epoch') or 0)
+        if new_epoch < mine or (new_epoch == mine and not _wins_tie(by_peer_id, st['instance_id'])):
+            return False
+        ms = dict(ms)
+        ms[by_peer_id] = dict(ms[by_peer_id], role_seen=ROLE_ACTIVE, epoch_seen=new_epoch)
+        _commit_locked(dict(st, role=ROLE_STANDBY, epoch=new_epoch, sync={}, members=ms,
+                            source=by_peer_id))
+    logging.warning(f"[HA] stepped down: member {by_peer_id} is active with epoch {new_epoch}")
+    return True
+
+
+def step_aside(new_epoch, reason):
+    """Active to a passive standby that follows nobody yet: the group has moved on
+    without us (a member reports a newer epoch and no active under it answers), or
+    every member refuses us. The next look at the group follows the active once one
+    answers under at least that epoch. Returns True when this call changed the role;
+    the caller restarts the process then."""
+    with _lock:
+        st = _load()
+        if st['role'] != ROLE_ACTIVE:
+            return False
+        mine = int(st.get('epoch') or 0)
+        new_epoch = mine if _epoch_value(new_epoch) is None else new_epoch
+        _commit_locked(dict(st, role=ROLE_STANDBY, epoch=max(mine, new_epoch),
+                            source=None, sync={'last_error': f'Stepped aside: {reason}'[:300]}))
+    logging.warning(f"[HA] stepped aside to a passive standby: {reason}")
     return True
 
 
@@ -1415,10 +2353,36 @@ def warn_stuck(stuck):
 
 def snapshot_meta():
     """Who we are, read under the state lock. Taken on the hub and handed to
-    build_snapshot, so the threadpool worker never touches a gevent lock."""
+    build_snapshot and snapshot_etag, so the threadpool worker never touches a gevent
+    lock. On the active it carries the member list for the standbys."""
     st = _load()
-    return dict(instance_id=st['instance_id'], role=st['role'],
-                epoch=int(st.get('epoch') or 0), key_fp=key_fingerprint())
+    meta = dict(instance_id=st['instance_id'], role=st['role'],
+                epoch=int(st.get('epoch') or 0), key_fp=key_fingerprint(), group=GROUP_MARK)
+    if st['role'] == ROLE_ACTIVE:
+        meta['members'] = _member_list(st)
+        meta['tombstones'] = _tombstone_list(st)
+    return meta
+
+
+def _group_etag(etag, meta):
+    """The etag of tables and files, with the member list and the tombstones folded in
+    when there are any: a standby added or removed reaches every standby with its next
+    poll, not only once the configuration changes as well."""
+    group, tombs = meta.get('members'), meta.get('tombstones')
+    if not group and not tombs:
+        return etag
+    h = hashlib.sha256(b'pegaprox-ha-group')
+    _hash_value(h, etag)
+    _hash_value(h, meta.get('instance_id'))
+    _hash_value(h, int(meta.get('epoch') or 0))
+    for e in group or []:
+        for key in ('instance_id', 'url', 'fingerprint', 'public_key', 'secret_hash'):
+            _hash_value(h, e.get(key))
+    for t in tombs or []:
+        h.update(b'R')
+        for key in ('instance_id', 'epoch', 'at', 'by', 'public_key', 'secret_hash'):
+            _hash_value(h, t.get(key))
+    return h.hexdigest()[:32]
 
 
 def build_snapshot(meta=None, stuck=None):
@@ -1434,13 +2398,15 @@ def build_snapshot(meta=None, stuck=None):
     else:
         stuck.extend(found)
     return dict(tables=tables, files=files, format=SNAPSHOT_FORMAT, generated_at=_now(),
-                etag=etag, **meta)
+                etag=_group_etag(etag, meta), **meta)
 
 
-def snapshot_etag():
-    """The etag build_snapshot() would put on a snapshot now, without building the
-    body: a poll that ends in 304 reads and hashes, nothing more."""
-    return _walk_snapshot(body=False)[0]
+def snapshot_etag(meta=None):
+    """The etag build_snapshot(meta) would put on a snapshot now, without building the
+    body: a poll that ends in 304 reads and hashes, nothing more. From the threadpool,
+    pass `meta` from snapshot_meta()."""
+    meta = meta or snapshot_meta()
+    return _group_etag(_walk_snapshot(body=False)[0], meta)
 
 
 def snapshot_bytes(snap):
@@ -1450,10 +2416,11 @@ def snapshot_bytes(snap):
 def apply_snapshot(snap):
     """Replace every SYNC table with the snapshot's rows, in one transaction.
 
-    Refuses a snapshot that is not from our peer, not from an active instance, from
-    an older epoch, or sealed under a different field key. Returns a summary.
+    Refuses a snapshot that is not from the member we pull from, not from an active
+    instance, from an older epoch, or sealed under a different field key. Takes the
+    member list and the epoch that come with it. Returns a summary.
     """
-    p = peer()
+    p = peer() if is_standby() else None
     if not p:
         raise HaError('Not paired')
     if snap.get('format') != SNAPSHOT_FORMAT:
@@ -1462,7 +2429,10 @@ def apply_snapshot(snap):
         raise HaError('The snapshot is not from the paired instance')
     if snap.get('role') != ROLE_ACTIVE:
         raise HaError('The paired instance is not active')
-    if int(snap.get('epoch') or 0) < epoch():
+    their_epoch = _epoch_value(snap.get('epoch') or 0)
+    if their_epoch is None:
+        raise HaError('The active instance sent an epoch this version does not read')
+    if their_epoch < epoch():
         raise HaError('The paired instance runs an older epoch than this one')
     if snap.get('key_fp') != key_fingerprint():
         raise HaError('The field key changed on the active instance (key rotation?) - pair again')
@@ -1549,8 +2519,102 @@ def apply_snapshot(snap):
     if before is not None and after is not None:
         _end_sessions(sorted(u for u, row in before.items() if after.get(u) != row))
     summary['file_errors'] = _apply_files(snap.get('files') or {})
+    problem = _adopt_group(snap)
+    if problem:
+        summary['file_errors'].append(problem)
+    summary['tombstones_owed'] = _tombstones_owed(snap)
     _after_apply()
     return summary
+
+
+def _merged_members(st, sender, entries, tombstones=None):
+    """Our member records after the member list `entries` from `sender`, the active we
+    pull from. Whoever the active no longer lists is gone, whoever a tombstone names
+    stays gone (a stale list from a promoted standby must not take a removed member
+    back), and we never list ourselves. The sender stays whatever its list says, and
+    keeps the address we reached it on; for the others the list is the word on
+    address, pin and keys, except that a key we hold is not given up for the hash of a
+    secret. What we noted about each member ourselves (roles seen, contact, errors)
+    stays."""
+    me, local = st['instance_id'], st.get('members') or {}
+    tombs = (st.get('tombstones') or {}) if tombstones is None else tombstones
+    listed = _clean_entries(entries)
+    listed.pop(me, None)
+    out = {}
+    for mid in [sender] + sorted(m for m in listed if m != sender):
+        entry, old = listed.get(mid), local.get(mid)
+        if entry is None:
+            if mid == sender and old:
+                out[mid] = dict(old)
+            continue
+        rec = dict(old or {'role_seen': None, 'epoch_seen': 0, 'last_contact': None,
+                           'last_error': '', 'joined_at': _now()})
+        if entry['public_key']:
+            if rec.get('public_key') and rec['public_key'] != entry['public_key']:
+                # paired again: it holds our key only once it says so
+                rec['key_acked'] = False
+            rec['public_key'], rec['secret_hash'] = entry['public_key'], entry['secret_hash']
+        else:
+            rec['secret_hash'] = entry['secret_hash']
+        if not (mid == sender and old and old.get('url')) and entry['url']:
+            rec['url'], rec['fingerprint'] = entry['url'], entry['fingerprint']
+        rec.setdefault('url', '')
+        rec.setdefault('fingerprint', '')
+        if mid != sender and _matches_tombstone(rec, tombs.get(mid)):
+            continue
+        out[mid] = rec
+        if len(out) >= MAX_MEMBERS - 1:
+            break
+    return out
+
+
+def _adopt_group(snap):
+    """A standby takes the member list, the tombstones and the epoch of the active it
+    pulled from, once the rows are in. Tombstones add up: an active that stepped down
+    keeps the ones it made. An active from before the groups sends no list: ours
+    stays. Never raises; returns what the sync status should say when the state could
+    not be saved."""
+    try:
+        with _lock:
+            st = _load()
+            sender = snap.get('instance_id')
+            if st['role'] != ROLE_STANDBY or st.get('source') != sender:
+                return ''
+            new = dict(st)
+            tombs = st.get('tombstones') or {}
+            if isinstance(snap.get('tombstones'), list):
+                tombs = _merged_tombstones(tombs, _clean_tombstones(snap['tombstones']),
+                                           st['instance_id'])
+                new['tombstones'] = tombs
+            if isinstance(snap.get('members'), list):
+                new['members'] = _merged_members(st, sender, snap['members'], tombs)
+            their_epoch = _epoch_value(snap.get('epoch') or 0)
+            if their_epoch is not None and their_epoch > int(st.get('epoch') or 0):
+                # never back to an active from before this one
+                new['epoch'] = their_epoch
+            if new != st:
+                _commit_locked(new)
+        return ''
+    except Exception as e:
+        logging.warning(f"[HA] could not take the member list from the active instance: {e}")
+        return f'the member list was not saved ({type(e).__name__}: {e})'
+
+
+def _tombstones_owed(snap):
+    """The tombstones we hold for members that the member list in `snap` still names:
+    the removal reached us and not the active we pull from, which was promoted while it
+    could not hear about it. As a tombstone list, for take_tombstones on that active;
+    [] when there are none."""
+    if not isinstance(snap.get('members'), list):
+        return []
+    st = _load()
+    sender = snap.get('instance_id')
+    if st['role'] != ROLE_STANDBY or st.get('source') != sender:
+        return []
+    tombs = st.get('tombstones') or {}
+    listed = _clean_entries(snap['members'])
+    return [dict(tombs[mid], instance_id=mid) for mid in sorted(listed)
+            if mid not in (sender, st['instance_id']) and _matches_tombstone(listed[mid], tombs.get(mid))]
 
 
 def _sign_in_rows(cur):
@@ -1709,16 +2773,27 @@ def _after_apply():
             logging.debug(f"[HA] {mod}.{fn} after sync: {e}")
 
 
-# --- talking to the peer -------------------------------------------------------
+# --- talking to the other members ----------------------------------------------
 
-def _peer_call(method, base_url, fingerprint, path, json_body=None, auth='peer',
+def _peer_call(method, base_url, fingerprint, path, json_body=None, auth=None,
                headers=None, timeout=15):
+    """One HTTPS call to another instance. `auth` is None (the pairing call) or a
+    callable (method, path, body) -> headers, from _auth_for, that signs exactly the
+    bytes sent here."""
     import requests
     from pegaprox.utils.url_security import is_safe_outbound_url
     url = base_url.rstrip('/') + path
     ok, why = is_safe_outbound_url(url, allowed_schemes=('https',), allow_private=True)
     if not ok:
         raise HaError(f'The peer address is not allowed: {why}')
+    body = _wire_body(json_body)
+    h = {'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json'}
+    if body:
+        h['Content-Type'] = 'application/json'
+    if auth is not None:
+        h.update(auth(method, path, body))
+    if headers:
+        h.update(headers)
     sess = requests.Session()
     if fingerprint:
         from pegaprox.core.pbs import _PinnedFingerprintAdapter
@@ -1726,29 +2801,21 @@ def _peer_call(method, base_url, fingerprint, path, json_body=None, auth='peer',
         verify = False
     else:
         verify = True
-    h = {'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json'}
-    if auth == 'peer':
-        p = peer()
-        if not p:
-            raise HaError('Not paired')
-        h[PEER_HEADER] = f"{instance_id()}:{p['secret_out']}"
-    if headers:
-        h.update(headers)
     try:
         import urllib3
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     except Exception:
         pass
     try:
-        return sess.request(method, url, json=json_body, headers=h, verify=verify,
+        return sess.request(method, url, data=body or None, headers=h, verify=verify,
                             timeout=timeout, allow_redirects=False)
     except requests.exceptions.SSLError as e:
         if fingerprint:
-            raise HaError(f'The peer certificate does not match the pinned fingerprint ({type(e).__name__})')
-        raise HaError('The peer certificate is not trusted by a CA, and no fingerprint is pinned '
-                      f'for it ({type(e).__name__})')
+            raise PeerUnreachable(f'The peer certificate does not match the pinned fingerprint ({type(e).__name__})')
+        raise PeerUnreachable('The peer certificate is not trusted by a CA, and no fingerprint is '
+                              f'pinned for it ({type(e).__name__})')
     except requests.exceptions.RequestException as e:
-        raise HaError(f'Cannot reach the peer: {type(e).__name__}')
+        raise PeerUnreachable(f'Cannot reach the peer: {type(e).__name__}')
     finally:
         sess.close()
 
@@ -1760,16 +2827,115 @@ def _peer_error(resp, fallback):
         return f'{fallback} (HTTP {resp.status_code})'
 
 
-def call_peer(method, path, json_body=None, headers=None, timeout=15):
-    p = peer()
-    if not p or not p.get('url'):
-        raise HaError('No peer address known')
-    return _peer_call(method, p['url'], p.get('fingerprint') or '', path,
-                      json_body=json_body, headers=headers, timeout=timeout)
+def _error_text(e):
+    return (str(e) if isinstance(e, HaError) else f'{type(e).__name__}: {e}')[:300]
 
 
-def pull_once(timeout=60):
-    """Standby: fetch and apply one snapshot. Returns a short status string.
+def _answer_header(resp, name):
+    headers = getattr(resp, 'headers', None)
+    try:
+        return headers.get(name) if headers is not None else None
+    except Exception:
+        return None
+
+
+def _note_key_acked(member_id):
+    """The member holds our public key now: no more old secret towards it. Once every
+    member does, the secret is dropped altogether."""
+    try:
+        with _lock:
+            st = _load()
+            ms = dict(st.get('members') or {})
+            if member_id not in ms or ms[member_id].get('key_acked'):
+                return
+            ms[member_id] = dict(ms[member_id], key_acked=True)
+            new = dict(st, members=ms)
+            if st.get('member_secret') and all(r.get('key_acked') for r in ms.values()):
+                new['member_secret'] = None
+                logging.info("[HA] every member holds our key - the old secret is dropped")
+            _commit_locked(new)
+    except Exception as e:
+        logging.warning(f"[HA] could not note that member {member_id} holds our key: {e}")
+
+
+def call_member(rec, method, path, json_body=None, headers=None, timeout=15, signer=None):
+    """One signed call to the member `rec` (a record from members()). `signer` is ours,
+    read beforehand by a caller that fans out (_signer).
+
+    A member that is not known to hold our key yet also gets the old secret and the
+    key, if this instance still has a secret from before the keys. An answer of
+    410 HA_REMOVED means that member removed us: we let go of the group here."""
+    if not rec or not rec.get('url'):
+        raise HaError('No address known for this member')
+    signer = signer or _signer()
+    legacy = bool(signer.secret) and not rec.get('key_acked')
+    resp = _peer_call(method, rec['url'], rec.get('fingerprint') or '', path,
+                      json_body=json_body, auth=_auth_for(signer, rec['instance_id'], legacy),
+                      headers=headers, timeout=timeout)
+    if legacy and signer.private is not None and _answer_header(resp, PEER_KEYED_HEADER) == '1':
+        _note_key_acked(rec['instance_id'])
+    if resp.status_code == 410:
+        _removed_answer(rec, resp)
+    return resp
+
+
+def _fan_out(jobs, timeout):
+    """Run the callables in `jobs` side by side and wait at most `timeout` seconds for
+    all of them. Returns [(result, None) or (None, exception)] in the order given; a
+    job still out when the time is up counts as failed, a single one as well.
+
+    Under gevent these threads are greenlets: a call waiting on the network costs a
+    socket, and a member that does not answer holds up none of the others."""
+    results = [None] * len(jobs)
+
+    def run(i, job):
+        try:
+            results[i] = (job(), None)
+        except Exception as e:
+            results[i] = (None, e)
+    threads = [threading.Thread(target=run, args=(i, job), daemon=True, name='ha-member-call')
+               for i, job in enumerate(jobs)]
+    for t in threads:
+        t.start()
+    deadline = time.monotonic() + timeout
+    for t in threads:
+        t.join(max(0.0, deadline - time.monotonic()))
+    late = HaError('The member did not answer in time')
+    return [r if r is not None else (None, late) for r in list(results)]
+
+
+def tell_members(method, path, json_body=None, timeout=10, only=None):
+    """The same call to every member, or to the ids in `only`, side by side.
+
+    Returns {member id: None when it answered 200, else what went wrong}, and notes
+    the failures on the member records. Never raises."""
+    try:
+        signer = _signer()
+        targets = [m for m in members() if only is None or m['instance_id'] in only]
+    except Exception as e:
+        logging.warning(f"[HA] cannot call the members: {e}")
+        return {mid: _error_text(e) for mid in (only or [])}
+    results = _fan_out([lambda rec=rec: call_member(rec, method, path, json_body=json_body,
+                                                    timeout=timeout, signer=signer)
+                        for rec in targets], timeout + 5)
+    out, notes = {}, {}
+    for rec, (resp, err) in zip(targets, results):
+        mid = rec['instance_id']
+        if err is None and resp.status_code != 200:
+            err = HaError(_peer_error(resp, f'The member refused {path}'))
+        out[mid] = None if err is None else _error_text(err)
+        if err is not None:
+            notes[mid] = {'last_error': out[mid]}
+    try:
+        _note_members(notes)
+    except Exception as e:
+        logging.warning(f"[HA] could not note the member errors: {e}")
+    return out
+
+
+def pull_once(timeout=PULL_TIMEOUT):
+    """Standby: fetch and apply one snapshot from the member it pulls from. Returns a
+    short status string.
 
     Also where a config restart that has fallen due goes out (see
     note_managers_started): after a sync, and on the polls that find nothing new."""
@@ -1786,6 +2952,34 @@ def pull_once(timeout=60):
     return result
 
 
+def pull_before_promote(timeout=15):
+    """The promote route, before this standby becomes active: one pull from the member
+    it follows, so a planned failover starts from the configuration, the member list
+    and the tombstones of now. Returns (True, '') when it is fine to go on: the pull
+    worked, there is nothing to pull from, or the source did not answer at all (the
+    failover this is for). (False, why) when the source answered and the pull failed,
+    or this instance was removed meanwhile."""
+    if not is_standby() or not peer():
+        return True, ''
+    if not _pull_lock.acquire(timeout=timeout + 5):
+        return False, 'a sync is running right now - try again in a moment'
+    try:
+        result, answered, error = _pull_detail(timeout)
+    finally:
+        _pull_lock.release()
+    if result in ('applied', 'unchanged', 'not paired', 'not a standby'):
+        return True, ''
+    if result == 'removed':
+        return False, REMOVED_ERROR
+    if result == 'source switched':
+        rec = peer() or {}
+        return False, (f"the group has an active instance, {rec.get('url') or rec.get('instance_id')}, "
+                       "and this standby follows it from now on")
+    if not answered:
+        return True, ''
+    return False, error or result
+
+
 def boot_pull(timeout=BOOT_PULL_TIMEOUT):
     """main(), on a standby with the live view on, before the managers start: one
     short pull, so they start from the active's configuration of now and not from
@@ -1799,37 +2993,64 @@ def boot_pull(timeout=BOOT_PULL_TIMEOUT):
         return 'error'
 
 
+def _finish_pull(sid, sync, member=None):
+    """The outcome of a pull in one write: the sync status and what it says about the
+    source. Nothing is written when nothing changed."""
+    with _lock:
+        st = _load()
+        new = dict(st, sync=dict(st.get('sync') or {}, **sync))
+        ms = st.get('members') or {}
+        if member and sid in ms:
+            new['members'] = dict(ms, **{sid: dict(ms[sid], **member)})
+        if new != st:
+            _commit_locked(new)
+
+
 def _pull(timeout):
+    return _pull_detail(timeout)[0]
+
+
+def _pull_detail(timeout):
+    """(result, answered, error): answered is True once the source sent an HTTP answer."""
     global _etag_checked
     if not is_standby():
-        return 'not a standby'
-    if not peer():
+        return 'not a standby', False, ''
+    src = peer()
+    if not src:
         # nothing to pull from, and writing here would replace a state file that
         # _load could not read with a fresh one
-        return 'not paired'
+        return 'not paired', False, ''
+    sid = src['instance_id']
     with _lock:
         first, _etag_checked = not _etag_checked, True
-    if first:
+    started = _now()
+    committed = answered = False
+    try:
         # the first pull after a start is a full one: an upgrade may have added
         # columns, a restored database may hold other rows, and the active's etag
         # knows about neither
-        _update_sync(last_attempt_at=_now(), etag=None)
-    else:
-        _update_sync(last_attempt_at=_now())
-    committed = False
-    try:
-        etag = (_load().get('sync') or {}).get('etag')
-        resp = call_peer('GET', '/api/ha/peer/snapshot',
-                         headers={'If-None-Match': etag} if etag else None, timeout=timeout)
+        etag = None if first else (_load().get('sync') or {}).get('etag')
+        resp = call_member(src, 'GET', '/api/ha/peer/snapshot',
+                           headers={'If-None-Match': etag} if etag else None, timeout=timeout)
+        answered = True
         if resp.status_code == 304:
-            _update_sync(last_ok_at=_now(), last_error='')
-            _update_peer(last_contact=_now(), last_error='')
-            return 'unchanged'
+            now = _now()
+            _finish_pull(sid, {'last_attempt_at': started, 'last_ok_at': now, 'last_error': ''},
+                         {'last_contact': now, 'last_error': ''})
+            return 'unchanged', True, ''
+        if resp.status_code == 410 and _load().get('removed'):
+            return 'removed', True, REMOVED_ERROR
+        if resp.status_code == 409:
+            switched = _take_follow_hint(src, resp, timeout)
+            if switched:
+                return switched, True, ''
         if resp.status_code != 200:
             raise HaError(_peer_error(resp, 'The active instance refused the snapshot'))
         snap = resp.json()
-        _update_peer(last_contact=_now(), role_seen=snap.get('role'),
-                     epoch_seen=int(snap.get('epoch') or 0), last_error='')
+        seen = {'last_contact': _now(), 'role_seen': snap.get('role'),
+                'epoch_seen': int(snap.get('epoch') or 0), 'last_error': ''}
+        if snap.get('group') == GROUP_MARK:
+            seen['group_seen'] = True
         summary = apply_snapshot(snap)
         committed = True
         problems = summary.get('file_errors') or []
@@ -1837,16 +3058,25 @@ def _pull(timeout):
         # written we hold less than that, and a 304 would keep it so (after an
         # upgrade, or once the file can be written again)
         etag = None if summary['skipped_columns'] or problems else snap.get('etag')
+        owed = summary.get('tombstones_owed') or []
+        if owed and not _hand_back_tombstones(src, owed):
+            # the next pull is a full one and finds them again
+            etag = None
         note = ('The configuration was applied, but ' + '; '.join(problems)) if problems else ''
-        _update_sync(last_ok_at=_now(), last_error=note[:300], etag=etag,
-                     source_epoch=int(snap.get('epoch') or 0), rows=summary['rows'],
-                     tables=summary['tables'], skipped_columns=summary['skipped_columns'])
-        return 'applied'
+        _finish_pull(sid, {'last_attempt_at': started, 'last_ok_at': _now(), 'last_error': note[:300],
+                           'etag': etag, 'source_epoch': int(snap.get('epoch') or 0),
+                           'rows': summary['rows'], 'tables': summary['tables'],
+                           'skipped_columns': summary['skipped_columns']}, seen)
+        return 'applied', True, ''
     except Exception as e:
-        msg = str(e) if isinstance(e, HaError) else f'{type(e).__name__}: {e}'
-        _update_sync(last_error=msg[:300])
+        msg = _error_text(e)
+        try:
+            _finish_pull(sid, dict({'last_attempt_at': started, 'last_error': msg},
+                                   **({'etag': None} if first else {})))
+        except Exception as e2:
+            logging.warning(f"[HA] could not note the failed sync: {e2}")
         logging.warning(f"[HA] sync failed: {msg}")
-        return 'failed'
+        return 'failed', answered, msg
     finally:
         # the database holds the new rows now, whatever failed after the commit: the
         # managers are compared against them, or a new connection setting would never
@@ -1855,81 +3085,300 @@ def _pull(timeout):
             _after_sync_applied()
 
 
-def _peer_status(timeout):
-    """(role, epoch) as the peer reports them. Raises when it does not answer."""
-    resp = call_peer('GET', '/api/ha/peer/status', timeout=timeout)
+def _hand_back_tombstones(src, owed):
+    """Tell the active we pull from about the members it lists and we hold tombstones
+    for (_tombstones_owed). True once it has heard, whether it took them or not."""
+    try:
+        resp = call_member(src, 'POST', '/api/ha/peer/tombstones', json_body={'tombstones': owed},
+                           timeout=10)
+    except Exception as e:
+        logging.warning(f"[HA] could not hand the tombstones back to {src.get('url')}: {_error_text(e)}")
+        return False
     if resp.status_code != 200:
-        raise HaError(_peer_error(resp, 'The peer refused the status call'))
+        logging.warning(f"[HA] {src.get('url')} did not take the tombstones: "
+                        f"{_peer_error(resp, 'refused')}")
+        return False
+    return True
+
+
+def follow_hint():
+    """What a standby tells a member that asks it for a snapshot: the member it follows,
+    as that member is to be reached and checked. None when it follows nobody it has
+    seen active."""
+    st = _load()
+    if st['role'] != ROLE_STANDBY or st.get('removed'):
+        return None
+    sid = st.get('source')
+    rec = (st.get('members') or {}).get(sid)
+    if not rec or rec.get('role_seen') != ROLE_ACTIVE or not rec.get('public_key') or not rec.get('url'):
+        return None
+    return {'instance_id': sid, 'url': rec['url'], 'fingerprint': rec.get('fingerprint') or '',
+            'public_key': rec['public_key'],
+            'epoch': max(int(st.get('epoch') or 0), int(rec.get('epoch_seen') or 0))}
+
+
+def _take_follow_hint(src, resp, timeout):
+    """The member we pull from is not active and names the one it follows. It is a
+    member we trust, so we take the name, but only once that instance answers a signed
+    status call as active under that very epoch, at least ours. Returns 'source
+    switched', or None when the hint is not taken."""
+    try:
+        hint = (resp.json() or {}).get('follow')
+    except Exception:
+        return None
+    if not isinstance(hint, dict):
+        return None
+    entry = _clean_entries([hint]).get(hint.get('instance_id'))
+    their = hint.get('epoch')
+    st = _load()
+    me = st['instance_id']
+    if (not entry or not entry['public_key'] or not entry['url']
+            or _epoch_value(their, low=int(st.get('epoch') or 0)) is None):
+        return None
+    hid = hint['instance_id']
+    if hid in (me, src['instance_id']) or _matches_tombstone(entry, (st.get('tombstones') or {}).get(hid)):
+        return None
+    known = (st.get('members') or {}).get(hid)
+    if known is None and len(st.get('members') or {}) >= MAX_MEMBERS - 1:
+        logging.warning(f"[HA] {src.get('url')} follows {entry['url']}, and there is no room "
+                        "for another member here")
+        return None
+    rec = dict(known or entry, instance_id=hid)
+    try:
+        their_role, their_epoch, group = _ask(rec, _signer(), timeout=min(10, timeout))
+    except Exception as e:
+        logging.warning(f"[HA] {src.get('url')} follows {entry['url']}, which did not confirm it: {e}")
+        return None
+    if their_role != ROLE_ACTIVE or their_epoch != their:
+        return None
+    with _lock:
+        st = _load()
+        ms = dict(st.get('members') or {})
+        if st['role'] != ROLE_STANDBY or st.get('source') != src['instance_id']:
+            return None
+        if hid not in ms and len(ms) >= MAX_MEMBERS - 1:
+            return None
+        base = ms.get(hid) or dict(entry, joined_at=_now(), last_error='')
+        ms[hid] = dict(base, role_seen=ROLE_ACTIVE, epoch_seen=their_epoch, last_contact=_now(),
+                       group_seen=bool(base.get('group_seen') or group == GROUP_MARK))
+        _commit_locked(dict(st, members=ms, source=hid,
+                            sync=dict(st.get('sync') or {}, etag=None, last_error='')))
+    logging.warning(f"[HA] {src.get('url')} is not active and follows {entry['url']}, which "
+                    f"answers as active with epoch {their_epoch} - following it from now on")
+    _audit('ha.follow_hint', f"following {entry['url']} (epoch {their_epoch}), as "
+                             f"{src.get('url') or src['instance_id']} does")
+    return 'source switched'
+
+
+def _ask(rec, signer, timeout):
+    """(role, epoch, group mark) as the member `rec` reports them. Raises PeerRefused
+    when it turns us away (401, 410), HaError when it does not answer usably."""
+    resp = call_member(rec, 'GET', '/api/ha/peer/status', timeout=timeout, signer=signer)
+    if resp.status_code in (401, 410):
+        try:
+            data = resp.json()
+        except Exception:
+            data = None
+        data = data if isinstance(data, dict) else {}
+        said = data.get('instance_id')
+        if said is not None and said != rec['instance_id']:
+            # set up anew at that address, say: its refusal is not the member's
+            raise HaError('Another instance answers at the address of this member')
+        raise PeerRefused(_peer_error(resp, 'The member refused the status call'),
+                          resp.status_code, data.get('code') or '')
+    if resp.status_code != 200:
+        raise HaError(_peer_error(resp, 'The member refused the status call'))
     data = resp.json()
     if not isinstance(data, dict):
-        raise HaError('The peer sent a status this version does not read')
-    return data.get('role'), int(data.get('epoch') or 0)
+        raise HaError('The member sent a status this version does not read')
+    said = data.get('instance_id')
+    if said is not None and said != rec['instance_id']:
+        raise HaError('Another instance answers at the address of this member')
+    their_role, their_epoch = data.get('role'), _epoch_value(data.get('epoch') or 0)
+    if their_role not in (ROLE_STANDALONE, ROLE_ACTIVE, ROLE_STANDBY):
+        their_role = None
+    if their_epoch is None:
+        raise HaError('The member sent an epoch this version does not read')
+    return their_role, their_epoch, data.get('group')
+
+
+def _ask_members(timeout, refused=None):
+    """Ask every member for its role and epoch, side by side and each within `timeout`.
+    Notes contact or error on every record (one write, none when nothing changed) and
+    returns {member id: (role, epoch)} of the members that answered. `refused`, a dict,
+    gets {member id: HTTP status} of the ones that turned us away."""
+    ms = members()
+    if not ms:
+        return {}
+    signer = _signer()
+    results = _fan_out([lambda rec=rec: _ask(rec, signer, timeout) for rec in ms], timeout + 5)
+    answers, notes, unreachable, now = {}, {}, set(), _now()
+    for rec, (value, err) in zip(ms, results):
+        mid = rec['instance_id']
+        if err is not None:
+            notes[mid] = {'last_error': _error_text(err)}
+            if isinstance(err, PeerRefused) and err.code != 'HA_CLOCK':
+                if refused is not None:
+                    refused[mid] = err.status
+            elif not isinstance(err, PeerRefused):
+                unreachable.add(mid)
+            else:
+                # it knows us and says our clocks differ: no sign that we are out
+                logging.warning(f"[HA] member {rec.get('url') or mid} refuses our calls: {err}")
+            continue
+        answers[mid] = value[:2]
+        notes[mid] = {'last_contact': now, 'role_seen': value[0], 'epoch_seen': value[1],
+                      'last_error': ''}
+        if value[2] == GROUP_MARK:
+            notes[mid]['group_seen'] = True
+    _last_watch.update(at=time.monotonic(), unreachable=frozenset(unreachable))
+    try:
+        _note_members(notes)
+    except Exception as e:
+        # the answers stand: a full disk must not keep the leader from telling another
+        # active to step down, which needs no write of ours
+        logging.warning(f"[HA] could not note the member answers: {e}")
+    return answers
+
+
+def _leader(answers, own=None):
+    """(epoch, instance id) of the instance the group follows: the active with the
+    highest epoch, a tie going to the higher instance id. `own` is this instance when
+    it is active. None when nobody is."""
+    actives = [(e, mid) for mid, (r, e) in answers.items() if r == ROLE_ACTIVE]
+    if own:
+        actives.append(own)
+    return max(actives) if actives else None
 
 
 def check_peer_at_boot(timeout=5):
-    """Ask the peer once, before managers and loops start.
+    """Ask every member once, before managers and loops start.
 
     An instance that comes back as active may have been replaced while it was
-    down. When the peer is active under a newer epoch we step down right here,
-    without a restart, so the caller comes up as a standby and nothing acts on
-    the old configuration. Never raises; returns a short status string.
+    down. When a member is active under a newer epoch (or under ours, and wins the
+    tie) we step down to it right here, without a restart, so the caller comes up as
+    a standby and nothing acts on the old configuration. The same when a member says
+    we were removed ('removed'), when every member refuses us or one reports a newer
+    epoch that no active answers under ('stepped aside'). Never raises; returns a
+    short status string.
     """
     try:
-        if role() != ROLE_ACTIVE or not peer():
+        if role() != ROLE_ACTIVE or not members():
             return 'idle'
-        mine, p = epoch(), peer()
-        try:
-            their_role, their_epoch = _peer_status(timeout)
-        except Exception as e:
-            _update_peer(last_error=str(e)[:300])
+        mine, me, n = epoch(), instance_id(), len(members())
+        refused = {}
+        answers = _ask_members(timeout, refused)
+        if _load().get('removed'):
+            # a member holds a tombstone for us: we come up passive, nothing restarts
+            return 'removed'
+        if not answers and not refused:
             return 'unreachable'
-        _update_peer(last_contact=_now(), role_seen=their_role, epoch_seen=their_epoch, last_error='')
-        if their_role == ROLE_ACTIVE and their_epoch > mine and step_down(their_epoch, p['instance_id']):
-            _audit('ha.stepped_down', f"at start: peer {p.get('url') or p['instance_id']} "
-                                      f"is active with epoch {their_epoch}")
+        top = _leader(answers, (mine, me))
+        if top[1] != me and step_down(top[0], top[1]):
+            rec = member(top[1]) or {}
+            _audit('ha.stepped_down', f"at start: member {rec.get('url') or top[1]} "
+                                      f"is active with epoch {top[0]}")
             return 'stepped down'
+        aside = _moved_on(answers, refused, mine, n)
+        if top[1] == me and aside and step_aside(*aside):
+            _audit('ha.stepped_aside', f'at start: {aside[1]}')
+            return 'stepped aside'
         return 'ok'
     except Exception as e:
-        logging.warning(f"[HA] peer check at start failed: {e}")
+        logging.warning(f"[HA] member check at start failed: {e}")
         return 'error'
 
 
-def watch_once():
-    """Active: look at the peer. Step down to a newer active, tell an older one
-    to step down. Never promotes anything."""
-    if role() != ROLE_ACTIVE or not peer():
+def _moved_on(answers, refused, mine, n):
+    """(epoch, reason) when an active that leads among the answers has still been left
+    behind: every one of its `n` members refused it, or a member reports an epoch
+    above ours while no active under that epoch answered (it would lead otherwise).
+    Unreachable members prove nothing and count for neither. None when neither holds."""
+    if n and len(refused) == n:
+        return mine, f'every member ({n}) refused this instance'
+    if answers:
+        seen, mid = max((e, m) for m, (_r, e) in answers.items())
+        if seen > mine:
+            rec = member(mid) or {}
+            return seen, (f"member {rec.get('url') or mid} reports epoch {seen}, above this "
+                          f"instance's {mine}, and no active under it answers")
+    return None
+
+
+def watch_once(timeout=10):
+    """One look at the group, every tick on every paired instance. Never promotes
+    anything.
+
+    Every member is asked for its role and epoch. The group follows the active with
+    the highest epoch, a tie going to the higher instance id. An active that is not
+    that one steps down and becomes its standby; the one that is tells every other
+    active it sees to step down. An active the group has moved on from, or that every
+    member refuses, steps aside to a passive standby (_moved_on). A standby pulls from
+    the leader from then on (_follow). A member that removed us says so (410), and we
+    let go of the group."""
+    st = _load()
+    was = st['role']
+    if was == ROLE_STANDALONE or not st.get('members'):
         return 'idle'
-    # our epoch as it was before the call; the peer may step us down meanwhile
-    mine = epoch()
-    try:
-        their_role, their_epoch = _peer_status(10)
-    except Exception as e:
-        _update_peer(last_error=str(e)[:300])
-        return 'unreachable'
-    if role() != ROLE_ACTIVE:
-        # stepped down while the call was out; that path restarts us already
+    # our epoch as it was before the calls; a member may step us down meanwhile
+    mine, me, n = int(st.get('epoch') or 0), st['instance_id'], len(st['members'])
+    refused = {}
+    answers = _ask_members(timeout, refused)
+    if _load().get('removed'):
+        if was == ROLE_ACTIVE:
+            restart_process('removed from the group')
+        return 'removed'
+    if role() != was:
+        # stepped down while the calls were out; that path restarts us already
         return 'idle'
-    _update_peer(last_contact=_now(), role_seen=their_role, epoch_seen=their_epoch, last_error='')
-    if their_role != ROLE_ACTIVE:
-        return 'ok'
-    if their_epoch > mine:
-        if step_down(their_epoch, peer()['instance_id']):
-            _audit('ha.stepped_down', f'peer {peer()["url"]} is active with epoch {their_epoch}')
+    if was == ROLE_STANDBY:
+        return _follow(answers, mine)
+    top = _leader(answers, (mine, me))
+    if top[1] != me:
+        if step_down(top[0], top[1]):
+            rec = member(top[1]) or {}
+            _audit('ha.stepped_down', f"member {rec.get('url') or top[1]} is active "
+                                      f"with epoch {top[0]}")
             restart_process('stepped down to standby')
             return 'stepped down'
         return 'ok'
-    if their_epoch < mine:
-        try:
-            r = call_peer('POST', '/api/ha/peer/step-down', json_body={'epoch': mine}, timeout=10)
-            return 'told peer to step down' if r.status_code == 200 else 'peer refused to step down'
-        except Exception as e:
-            _update_peer(last_error=str(e)[:300])
-            return 'unreachable'
-    # promote() takes only a standby, so the way out is a fresh pairing
-    _update_peer(last_error='Both instances are active with the same epoch - unpair one of them '
-                            'and pair it again as the standby of the other')
-    logging.error('[HA] both instances are active with the same epoch')
-    return 'conflict'
+    aside = _moved_on(answers, refused, mine, n)
+    if aside:
+        if step_aside(*aside):
+            _audit('ha.stepped_aside', aside[1])
+            restart_process('stepped aside to standby')
+            return 'stepped aside'
+        return 'ok'
+    others = [mid for mid, (r, _e) in answers.items() if r == ROLE_ACTIVE]
+    if not others:
+        return 'ok' if answers else 'unreachable'
+    told = tell_members('POST', '/api/ha/peer/step-down', json_body={'epoch': mine},
+                        timeout=timeout, only=others)
+    if all(told.get(mid) is None for mid in others):
+        return 'told peer to step down'
+    return 'peer refused to step down'
+
+
+def _follow(answers, mine):
+    """A standby's half of watch_once: pull from the leader among the members that
+    answered as active under at least our epoch. When none did, the member we pull
+    from stays what it is and the pull says what is wrong; a standby never promotes
+    itself."""
+    top = _leader({mid: a for mid, a in answers.items() if a[1] >= mine})
+    if top is None:
+        return 'no active member' if answers else 'unreachable'
+    if top[1] == source_id():
+        return 'ok'
+    with _lock:
+        st = _load()
+        if st['role'] != ROLE_STANDBY or top[1] not in (st.get('members') or {}):
+            return 'idle'
+        before = st.get('source')
+        # a full pull from the new one: an etag of the old one says nothing here
+        _commit_locked(dict(st, source=top[1], sync=dict(st.get('sync') or {}, etag=None)))
+    logging.warning(f"[HA] following {top[1]} from now on, active with epoch {top[0]} "
+                    f"(was following {before or 'nobody'})")
+    return 'source switched'
 
 
 def _audit(action, details):
@@ -1940,16 +3389,36 @@ def _audit(action, details):
         pass
 
 
+def _pull_timeout(started, interval):
+    """The timeout of the pull in the pass that began at `started` (monotonic): short
+    when the watch of this pass could not reach the source, else what is left of the
+    interval, within PULL_TIMEOUT_FLOOR and PULL_TIMEOUT. A source that is gone then
+    costs a pass seconds, not a minute and more."""
+    at, unreachable = _last_watch['at'], _last_watch['unreachable']
+    if at is not None and at >= started and source_id() in unreachable:
+        return PULL_TIMEOUT_UNREACHABLE
+    left = interval - (time.monotonic() - started)
+    return int(max(PULL_TIMEOUT_FLOOR, min(PULL_TIMEOUT, left)))
+
+
 def _loop():
     # give the app a moment to come up before the first call
     time.sleep(5)
     while True:
+        r = None
+        started = time.monotonic()
         try:
             r = role()
-            if r == ROLE_STANDBY and peer():
-                pull_once()
-            elif r == ROLE_ACTIVE:
+            if r != ROLE_STANDALONE and _load().get('members'):
                 watch_once()
+        except Exception as e:
+            logging.error(f"[HA] loop: {e}")
+        try:
+            # only when this pass started as a standby: one that just stepped down
+            # restarts first
+            if r == ROLE_STANDBY and is_standby() and peer():
+                interval = int(_load().get('interval') or DEFAULT_INTERVAL)
+                pull_once(timeout=_pull_timeout(started, interval))
         except Exception as e:
             logging.error(f"[HA] loop: {e}")
         interval = int(_load().get('interval') or DEFAULT_INTERVAL)
@@ -1970,10 +3439,30 @@ def start_loop():
     threading.Thread(target=_loop, daemon=True, name='ha-peer').start()
 
 
+def _member_view(rec, src, st):
+    """A member record as the status page shows it: no secret, no hash, the public key
+    only as a short fingerprint ('' while the member still goes by its old secret)."""
+    return {
+        'instance_id': rec['instance_id'],
+        'url': rec.get('url') or '',
+        'fingerprint': rec.get('fingerprint') or '',
+        'role_seen': rec.get('role_seen'),
+        'epoch_seen': rec.get('epoch_seen'),
+        'confirmed_standby': _confirmed_standby(rec, st),
+        'key_fingerprint': peer_key_fingerprint(rec.get('public_key')),
+        'last_contact': rec.get('last_contact'),
+        'last_error': rec.get('last_error') or '',
+        'joined_at': rec.get('joined_at'),
+        'is_source': rec['instance_id'] == src,
+    }
+
+
 def public_status():
     st = _load()
-    p = st.get('peer') or {}
+    p = peer() or {}
+    src = source_id()
     pairing = st.get('pairing') or {}
+    removed = st.get('removed')
     return {
         'role': st['role'],
         'epoch': int(st.get('epoch') or 0),
@@ -1982,18 +3471,25 @@ def public_status():
         'live_view': live_view(),
         'managers_running': bool(_run['managers']),
         'broken': st.get('broken') or '',
+        # set once a member told this instance it was removed; it is passive then
+        'removed': {'epoch': removed.get('epoch'), 'at': removed.get('at'), 'by': removed.get('by')}
+                   if removed else None,
         'pairing_open_until': pairing.get('expires') if pairing.get('code_hash') and
                               int(pairing.get('expires') or 0) >= int(time.time()) else None,
+        # the member a standby pulls from, or the first one; kept for what reads one peer
         'peer': {
             'instance_id': p.get('instance_id'),
             'url': p.get('url'),
             'fingerprint': p.get('fingerprint'),
-            'paired_at': p.get('paired_at'),
+            'paired_at': p.get('joined_at'),
             'role_seen': p.get('role_seen'),
             'epoch_seen': p.get('epoch_seen'),
             'last_contact': p.get('last_contact'),
             'last_error': p.get('last_error') or '',
         } if p else None,
+        'members': [_member_view(rec, src, st) for rec in members()],
+        'max_members': MAX_MEMBERS,
+        'standby_count': standby_count(),
         'sync': dict(st.get('sync') or {}, etag=None, restart_pending=_restart_pending()),
     }
 
@@ -2003,6 +3499,6 @@ def banner():
     st = _load()
     if st['role'] != ROLE_STANDBY:
         return {'role': st['role']}
-    p = st.get('peer') or {}
+    p = peer() or {}
     return {'role': st['role'], 'peer_url': p.get('url') or '',
             'last_sync_at': (st.get('sync') or {}).get('last_ok_at') or ''}

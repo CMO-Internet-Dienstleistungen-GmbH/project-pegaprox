@@ -86,6 +86,16 @@ def _ha_state_out_of_the_checkout(tmp_path, monkeypatch):
     monkeypatch.setattr(settings_api, '_ip_whitelist_enabled', False)
     monkeypatch.setattr(settings_api, '_ip_whitelist', set())
     monkeypatch.setattr(settings_api, '_ip_blacklist', set())
+    # The certificate in the checkout's config/ssl (a dev instance's) went into every
+    # pairing code a test made, so the pins in the member records depended on the
+    # machine: green in CI, red next to a running instance. A test that wants a pin
+    # sets one.
+    import pegaprox.api.auto_install as auto_install
+    monkeypatch.setattr(auto_install, 'self_signed_fingerprint', lambda: '')
+    # A signed call from before the process started is refused (the nonces seen until
+    # then are gone). The test process started whenever the run did, so every test
+    # counts as a process that has run for longer than the signature window.
+    monkeypatch.setattr(ha, '_PROCESS_STARTED', 0)
     ha.reset_for_tests()
     yield
     ha.reset_for_tests()

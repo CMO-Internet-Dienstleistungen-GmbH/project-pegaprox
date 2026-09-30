@@ -77,6 +77,24 @@ def test_the_documented_permissions_are_the_enforced_ones(api, committed):
                     for (p, m), (d, l) in list(drift.items())[:4]))
 
 
+def test_the_auth_kind_comes_from_the_handler_not_from_the_file(api, monkeypatch):
+    """(#625) inspect.getsource takes the lines from the file as it is on disk now, at
+    the line numbers of the import. An edit to pegaprox/api/ha.py during a run made
+    GET /api/ha/peer/snapshot and POST /api/ha/peer/step-down 'public' in the test
+    above. What the handler runs decides, whatever the file says meanwhile."""
+    import inspect
+    import pegaprox.cli.gen_openapi as gen
+    monkeypatch.setattr(inspect, 'getsource', lambda obj: 'def moved_here():\n    return None\n')
+    for endpoint in ('ha.peer_snapshot', 'ha.peer_step_down', 'ha.peer_tombstones'):
+        fn = api.app.view_functions[endpoint]
+        assert gen._auth_kind(fn, False) == 'inline', endpoint
+        assert gen._uses(fn, gen._HA_PEER_AUTH), endpoint
+    assert gen._uses(api.app.view_functions['ha.peer_pair'], gen._HA_PAIRING_AUTH)
+    # the settings key a route only names in its answer still counts, as it did
+    assert gen._auth_kind(api.app.view_functions['metrics_exporter.prometheus_metrics'],
+                          False) == 'inline'
+
+
 # --- found by the 2026-09-29 scan -------------------------------------------
 #
 # Seven URLs carry TWO registrations (same path, same method, two blueprints).

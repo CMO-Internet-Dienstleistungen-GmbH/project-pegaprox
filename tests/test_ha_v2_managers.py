@@ -536,7 +536,7 @@ def test_the_loop_wakes_for_a_restart_that_falls_due(env):
         if len(env.clock.naps) == 2:
             raise _Stop()
     env.clock.sleep = nap
-    env.mp.setattr(ha, 'pull_once', lambda: None)
+    env.mp.setattr(ha, 'pull_once', lambda **kw: None)
     with pytest.raises(_Stop):
         ha._loop()
     assert env.clock.naps == [5, 61]

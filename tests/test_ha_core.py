@@ -28,6 +28,21 @@ A = 'a' * 32   # the active
 B = 'b' * 32   # the standby
 C = 'c' * 32   # somebody else
 FP = ':'.join(['AB'] * 32)
+# what a standby from before the keys presented, and the hash it handed over
+Z = 'z' * 43
+ZH = ha._hash_secret(Z)
+# the key pair a standby pairs with now: it keeps the private half, the public half
+# (ZK) goes to the active (#625 groups)
+ZKEY = ha._private_key(base64.b64encode(bytes(range(1, 33))).decode())
+ZK = ha._public_of(ZKEY)
+# the active behind _fake_active signs with this one
+TKEY = ha._private_key(base64.b64encode(bytes(range(33, 65))).decode())
+TK = ha._public_of(TKEY)
+
+
+def _signed_by(private, sender, receiver, method='GET', path='/api/ha/peer/status', body=b''):
+    """The peer headers of a call `sender` signs with `private` for `receiver`."""
+    return ha._auth_for(ha._Signer(sender, private), receiver)(method, path, body)
 
 
 @pytest.fixture
@@ -53,6 +68,7 @@ def _write_state(**st):
 
 
 def _peer(pid, **kw):
+    """A peer record in the pair format of v1/v2; _load reads it as a group of two."""
     p = {'instance_id': pid, 'url': 'https://peer.example:5000', 'fingerprint': '',
          'secret_out': 'o' * 43, 'secret_in_hash': ha._hash_secret('i' * 43),
          'paired_at': '2026-09-29T10:00:00+00:00', 'role_seen': None, 'epoch_seen': 0}
@@ -237,7 +253,7 @@ def test_nothing_is_written_until_something_changes(env):
     ha.instance_id(), ha.epoch(), ha.peer(), ha.public_status(), ha.banner()
     assert ha.pull_once() == 'not a standby'
     assert ha.watch_once() == 'idle'
-    assert ha.verify_peer(f'{A}:secret') is None
+    assert ha.verify_peer({ha.PEER_HEADER: f'{A}:secret'}) is None
     assert not os.path.exists(ha.STATE_FILE)
 
     ha.create_pairing_code('https://pp1.example:5000', '')
@@ -289,9 +305,9 @@ def test_an_unreadable_state_file_makes_a_standby_and_stays_as_it_is(env, conten
     # what the loop would do: nothing to pull from, nothing to watch
     assert ha.pull_once() == 'not paired'
     assert ha.watch_once() == 'idle'
-    assert ha.verify_peer(f'{A}:secret') is None
+    assert ha.verify_peer({ha.PEER_HEADER: f'{A}:secret'}) is None
     assert ha.step_down(99, A) is False
-    assert ha.forget_peer(A) is False
+    assert ha.forget_peer(A) == ''
     with pytest.raises(ha.HaError):
         ha.create_pairing_code('https://pp1.example:5000', '')
 
@@ -405,32 +421,37 @@ def test_pairing_turns_a_standalone_into_the_active_and_hands_over_the_key(env, 
     assert info['instance_id'] == ha.instance_id()
     assert ha.public_status()['pairing_open_until'] == expires
 
-    answer = ha.accept_pairing(info['secret'], B, 'https://pp2.example:5000/', FP.lower(), 'z' * 43)
+    answer = ha.accept_pairing(info['secret'], B, 'https://pp2.example:5000/', FP.lower(), ZK)
 
     assert ha.role() == 'active' and ha.epoch() == 1
     assert answer['instance_id'] == ha.instance_id() and answer['epoch'] == 1
     assert answer['key_fp'] == ha.key_fingerprint()
     p = ha.peer()
-    assert (p['instance_id'], p['url'], p['fingerprint'], p['secret_out']) == \
-        (B, 'https://pp2.example:5000', FP, 'z' * 43)
+    assert (p['instance_id'], p['url'], p['fingerprint'], p['public_key']) == \
+        (B, 'https://pp2.example:5000', FP, ZK)
     assert ha.public_status()['pairing_open_until'] is None
 
     opened = ha._unseal(info['secret'], answer['sealed'], aad=B)
     assert base64.b64decode(opened['field_key']) == db.aes_key
-    assert ha.verify_peer(f"{B}:{opened['secret']}")['instance_id'] == B
+    # the standby signs with its own key, whose private half never left it
+    me = ha.instance_id()
+    assert ha.verify_peer(_signed_by(ZKEY, B, me), 'GET', '/api/ha/peer/status')['instance_id'] == B
+    # and gets our public key, to check what we sign for it
+    assert opened['public_key'] == ha.own_public_key()
+    assert ha._load()['signing_key'] not in json.dumps(opened)
+    assert 'secret_hash' not in opened and ha._load()['member_secret'] is None
 
-    # the state file keeps a hash of what the standby will present, never the key
+    # the state file keeps the standby's public key, never the field key or the code
     text = _file_bytes(ha.STATE_FILE).decode()
-    assert opened['secret'] not in text
     assert opened['field_key'] not in text and info['secret'] not in text
 
 
 def test_a_pairing_code_works_once(env, db):
     info, _ = _open_code()
-    ha.accept_pairing(info['secret'], B, 'https://pp2.example', '', 'z' * 43)
+    ha.accept_pairing(info['secret'], B, 'https://pp2.example', '', ZK)
 
     with pytest.raises(ha.HaError, match='wrong or has expired'):
-        ha.accept_pairing(info['secret'], C, 'https://pp3.example', '', 'z' * 43)
+        ha.accept_pairing(info['secret'], C, 'https://pp3.example', '', ZK)
     assert ha.peer()['instance_id'] == B
 
 
@@ -439,41 +460,55 @@ def test_a_pairing_code_expires(env, db, monkeypatch):
     monkeypatch.setattr(ha, 'time', types.SimpleNamespace(time=lambda: expires + 1))
 
     with pytest.raises(ha.HaError, match='wrong or has expired'):
-        ha.accept_pairing(info['secret'], B, 'https://pp2.example', '', 'z' * 43)
+        ha.accept_pairing(info['secret'], B, 'https://pp2.example', '', ZK)
     assert ha.role() == 'standalone' and ha.peer() is None
 
 
 def test_a_wrong_code_is_refused(env, db):
     _open_code()
     with pytest.raises(ha.HaError, match='wrong or has expired'):
-        ha.accept_pairing('s' * 43, B, 'https://pp2.example', '', 'z' * 43)
+        ha.accept_pairing('s' * 43, B, 'https://pp2.example', '', ZK)
     assert ha.role() == 'standalone'
 
 
-@pytest.mark.parametrize('change', [
-    pytest.param({'peer': _peer(C)}, id='already-paired'),
-    pytest.param({'role': 'standby'}, id='standby'),
+def _members(*ids):
+    return {mid: {'url': f'https://{mid[:4]}.example', 'fingerprint': '',
+                  'secret_hash': ha._hash_secret(mid), 'joined_at': '2026-09-30T10:00:00+00:00'}
+            for mid in ids}
+
+
+@pytest.mark.parametrize('change,message', [
+    pytest.param({'members': _members('1' * 32, '2' * 32, '3' * 32)}, 'already has 3 standbys',
+                 id='group-full'),
+    pytest.param({'role': 'standby'}, 'cannot take a standby', id='standby'),
 ])
-def test_accept_pairing_refuses_a_paired_instance_or_a_standby(env, db, change):
+def test_accept_pairing_refuses_a_full_group_or_a_standby(env, db, change, message):
     info, _ = _open_code()
     with open(ha.STATE_FILE, encoding='utf-8') as fh:
         st = json.load(fh)
     st.update(change)
     _write_state(**st)
 
-    with pytest.raises(ha.HaError, match='cannot take a standby'):
-        ha.accept_pairing(info['secret'], B, 'https://pp2.example', '', 'z' * 43)
-    assert ha.role() == st['role']
+    with pytest.raises(ha.HaError, match=message):
+        ha.accept_pairing(info['secret'], B, 'https://pp2.example', '', ZK)
+    assert ha.role() == st['role'] and B not in ha._load()['members']
 
 
 @pytest.mark.parametrize('standby_id,url,fp,secret,message', [
-    pytest.param('own', 'https://pp2.example', '', 'z' * 43, 'identify', id='own-id'),
-    pytest.param('B' * 32, 'https://pp2.example', '', 'z' * 43, 'identify', id='id-uppercase'),
-    pytest.param(None, 'https://pp2.example', '', 'z' * 43, 'identify', id='id-missing'),
-    pytest.param(B, 'https://pp2.example', '', 'z' * 31, 'usable secret', id='secret-short'),
-    pytest.param(B, 'https://pp2.example', '', ['z' * 43], 'usable secret', id='secret-list'),
-    pytest.param(B, 'http://pp2.example', '', 'z' * 43, 'https://', id='plain-http'),
-    pytest.param(B, 'https://pp2.example', 'AB:CD', 'z' * 43, 'fingerprint', id='fp-short'),
+    pytest.param('own', 'https://pp2.example', '', ZK, 'identify', id='own-id'),
+    pytest.param('B' * 32, 'https://pp2.example', '', ZK, 'identify', id='id-uppercase'),
+    pytest.param(None, 'https://pp2.example', '', ZK, 'identify', id='id-missing'),
+    pytest.param(B, 'https://pp2.example', '', ZK[:40] + '=', 'usable public key', id='key-short'),
+    pytest.param(B, 'https://pp2.example', '', ZK.replace('=', '!'), 'usable public key',
+                 id='key-not-base64'),
+    # the hash of a secret, as a standby from before the keys sends it
+    pytest.param(B, 'https://pp2.example', '', ZH, 'usable public key', id='secret-hash'),
+    # the secret itself, as a standby from before the groups sends it
+    pytest.param(B, 'https://pp2.example', '', Z, 'usable public key', id='secret-in-clear'),
+    pytest.param(B, 'https://pp2.example', '', [ZK], 'usable public key', id='key-list'),
+    pytest.param(B, 'https://pp2.example', '', None, 'usable public key', id='key-missing'),
+    pytest.param(B, 'http://pp2.example', '', ZK, 'https://', id='plain-http'),
+    pytest.param(B, 'https://pp2.example', 'AB:CD', ZK, 'fingerprint', id='fp-short'),
 ])
 def test_accept_pairing_refuses_a_standby_that_does_not_identify_itself(
         env, db, standby_id, url, fp, secret, message):
@@ -486,19 +521,29 @@ def test_accept_pairing_refuses_a_standby_that_does_not_identify_itself(
     assert ha.role() == 'standalone' and ha.peer() is None
 
     # a refused attempt does not use the code up
-    ha.accept_pairing(info['secret'], B, 'https://pp2.example', '', 'z' * 43)
+    ha.accept_pairing(info['secret'], B, 'https://pp2.example', '', ZK)
     assert ha.role() == 'active'
 
 
-def test_verify_peer_takes_only_the_right_id_and_secret(env, db):
+def test_verify_peer_takes_only_the_members_signature(env, db):
     info, _ = _open_code()
-    answer = ha.accept_pairing(info['secret'], B, 'https://pp2.example', '', 'z' * 43)
-    secret = ha._unseal(info['secret'], answer['sealed'], aad=B)['secret']
+    ha.accept_pairing(info['secret'], B, 'https://pp2.example', '', ZK)
+    me = ha.instance_id()
 
-    assert ha.verify_peer(f'{B}:{secret}')['instance_id'] == B
-    for header in (f'{C}:{secret}', f'{B}:{secret}x', f'{B}:', f':{secret}', B, secret,
-                   '', None, f'{B}:{"z" * 43}', f'{ha.instance_id()}:{secret}'):
-        assert ha.verify_peer(header) is None, header
+    assert ha.verify_peer(_signed_by(ZKEY, B, me), 'GET', '/api/ha/peer/status')['instance_id'] == B
+    good = _signed_by(ZKEY, B, me)
+    for headers in (
+            {ha.PEER_HEADER: f'{B}:{Z}'},                      # a secret, from a member with a key
+            dict(good, **{ha.PEER_HEADER: C}),                 # somebody else's id
+            _signed_by(ZKEY, C, me),                           # signed as nobody we know
+            _signed_by(TKEY, B, me),                           # the right id, another key
+            _signed_by(ZKEY, B, C),                            # made for another receiver
+            {k: v for k, v in good.items() if k != ha.PEER_SIG_HEADER},
+            {}, None, {ha.PEER_HEADER: 42}):
+        assert ha.verify_peer(headers, 'GET', '/api/ha/peer/status') is None, headers
+    # and a good one counts once
+    assert ha.verify_peer(good, 'GET', '/api/ha/peer/status')['instance_id'] == B
+    assert ha.verify_peer(good, 'GET', '/api/ha/peer/status') is None
 
 
 def _key_next_to_the_db(env):
@@ -528,10 +573,15 @@ def test_join_adopts_the_key_only_after_the_answer_opens(env, db, monkeypatch):
     method, url, path, auth, body = seen[0]
     assert (method, url, path, auth) == ('POST', 'https://pp1.example:5000', '/api/ha/peer/pair', None)
     assert body['code'] == 's' * 43 and body['instance_id'] == me
-    assert body['url'] == 'https://pp2.example:5000' and len(body['secret']) >= 32
+    assert body['url'] == 'https://pp2.example:5000'
+    # only the public half of our new key leaves; we sign with the private one from now on
+    assert 'secret' not in body and 'secret_hash' not in body
+    assert body['public_key'] == ha.own_public_key()
+    assert ha._load()['signing_key'] not in json.dumps(body) and ha._load()['member_secret'] is None
     assert ha.role() == 'standby' and ha.epoch() == 4
-    assert (p['instance_id'], p['secret_out']) == (A, 't' * 43)
-    assert ha.verify_peer(f"{A}:{body['secret']}")['instance_id'] == A
+    assert (p['instance_id'], p['public_key']) == (A, TK)
+    assert ha.verify_peer(_signed_by(TKEY, A, me), 'GET', '/api/ha/peer/status')['instance_id'] == A
+    assert ha.source_id() == A
 
     assert _file_bytes(ha.AES_KEY_FILE) == new_key and db.aes_key == new_key
     backups = _pre_ha_backups(keydir)
@@ -542,13 +592,19 @@ def test_join_adopts_the_key_only_after_the_answer_opens(env, db, monkeypatch):
 
 
 def _fake_active(monkeypatch, code_secret, key, answer_id=A, aad=None, key_fp=None, status=200,
-                 epoch=4, secret='t' * 43):
+                 epoch=4, public_key=TK, members=(), tombstones=()):
+    """The active behind the pair call: it signs with TKEY, so it hands over TK, and
+    `members` as its member list."""
     seen = []
 
-    def fake_call(method, base_url, fingerprint, path, json_body=None, auth='peer', **kw):
+    def fake_call(method, base_url, fingerprint, path, json_body=None, auth=None, **kw):
         seen.append((method, base_url, path, auth, dict(json_body)))
         sealed = ha._seal(code_secret, {'field_key': base64.b64encode(key).decode(),
-                                        'secret': secret}, aad=aad or json_body['instance_id'])
+                                        'public_key': public_key,
+                                        'members': list(members) if isinstance(members, tuple) else members,
+                                        'tombstones': list(tombstones) if isinstance(tombstones, tuple)
+                                        else tombstones},
+                          aad=aad or json_body['instance_id'])
         data = {'instance_id': answer_id, 'epoch': epoch, 'sealed': sealed,
                 'key_fp': key_fp or ha.key_fingerprint(key), 'error': 'no'}
         return types.SimpleNamespace(status_code=status, json=lambda: data)
@@ -616,9 +672,13 @@ def _join_code():
     pytest.param({'epoch': -3}, id='epoch-negative'),
     pytest.param({'epoch': 1.5}, id='epoch-float'),
     pytest.param({'epoch': 2 ** 31}, id='epoch-huge'),
-    pytest.param({'secret': 't' * 31}, id='secret-short'),
-    pytest.param({'secret': 12345}, id='secret-number'),
-    pytest.param({'secret': None}, id='secret-missing'),
+    pytest.param({'public_key': TK[:40] + '='}, id='key-short'),
+    # an active from before the keys hands over the hash of its secret
+    pytest.param({'public_key': ha._hash_secret('t' * 43)}, id='hash-instead-of-key'),
+    pytest.param({'public_key': 12345}, id='key-number'),
+    pytest.param({'public_key': None}, id='key-missing'),
+    pytest.param({'members': {'b' * 32: 'x'}}, id='members-not-a-list'),
+    pytest.param({'tombstones': {'b' * 32: 'x'}}, id='tombstones-not-a-list'),
 ])
 def test_join_checks_every_field_of_the_answer_before_it_writes(env, db, monkeypatch, answer):
     """(#625 review) An epoch that was not a number surfaced only after the key file
@@ -679,7 +739,7 @@ def test_join_withdraws_the_pairing_code_this_instance_handed_out(env, db, monke
     def racing(method, base_url, fingerprint, path, **kw):
         # what a second greenlet can do while the pair call is out
         try:
-            redeemed.append(ha.accept_pairing(own['secret'], 'd' * 32, 'https://s.example', '', 'z' * 43))
+            redeemed.append(ha.accept_pairing(own['secret'], 'd' * 32, 'https://s.example', '', ZK))
         except ha.HaError as e:
             redeemed.append(str(e))
         return answer(method, base_url, fingerprint, path, **kw)
@@ -698,15 +758,16 @@ def test_join_refuses_when_something_paired_with_this_instance_meanwhile(env, db
     monkeypatch.setattr(ha, '_install_field_key', installed.append)
     _fake_active(monkeypatch, 's' * 43, os.urandom(32))
     answer = ha._peer_call
-    calls = []
+    calls, sent = [], []
     me = ha.instance_id()
 
-    def racing(method, base_url, fingerprint, path, json_body=None, auth='peer', headers=None, **kw):
+    def racing(method, base_url, fingerprint, path, json_body=None, auth=None, headers=None, **kw):
         calls.append((method, base_url, path, auth, dict(headers or {})))
         if path == '/api/ha/peer/pair':
+            sent.append(json_body['public_key'])
             # a fresh code, handed out and redeemed while the answer is on its way
             info = ha.decode_code(ha.create_pairing_code('https://pp2.example:5000', '')[0])
-            ha.accept_pairing(info['secret'], 'd' * 32, 'https://s.example', '', 'z' * 43)
+            ha.accept_pairing(info['secret'], 'd' * 32, 'https://s.example', '', ZK)
             return answer(method, base_url, fingerprint, path, json_body=json_body, auth=auth, **kw)
         return types.SimpleNamespace(status_code=200, json=lambda: {})
     monkeypatch.setattr(ha, '_peer_call', racing)
@@ -717,9 +778,13 @@ def test_join_refuses_when_something_paired_with_this_instance_meanwhile(env, db
     assert ha.role() == 'active' and ha.peer()['instance_id'] == 'd' * 32
     assert installed == []
     # and the active that took us is told to let go
-    method, url, path, auth, headers = calls[-1]
-    assert (method, url, path, auth) == ('POST', 'https://pp1.example:5000', '/api/ha/peer/unpaired', None)
-    assert headers[ha.PEER_HEADER] == f"{me}:{'t' * 43}"
+    method, url, path, auth, _headers = calls[-1]
+    assert (method, url, path) == ('POST', 'https://pp1.example:5000', '/api/ha/peer/unpaired')
+    # signed with the key whose public half the pair call handed over, which is what
+    # the active checks, and for that active
+    headers = auth(method, path, b'')
+    assert headers[ha.PEER_HEADER] == me
+    assert ha._signature_ok(headers, method, path, b'', me, sent[0], A)
 
 
 @pytest.mark.parametrize('url', [
@@ -737,11 +802,11 @@ def test_accept_pairing_takes_only_a_plain_https_standby_address(env, db, url):
     info, _ = _open_code()
 
     with pytest.raises(ha.HaError, match=re.escape('https://host[:port][/path]')):
-        ha.accept_pairing(info['secret'], B, url, '', 'z' * 43)
+        ha.accept_pairing(info['secret'], B, url, '', ZK)
     assert ha.role() == 'standalone' and ha.peer() is None
 
     # a refused address does not use the code up
-    ha.accept_pairing(info['secret'], B, 'https://PP2.example:5000/', '', 'z' * 43)
+    ha.accept_pairing(info['secret'], B, 'https://PP2.example:5000/', '', ZK)
     assert ha.peer()['url'] == 'https://pp2.example:5000'
 
 
@@ -806,23 +871,25 @@ def test_a_tls_error_without_a_pin_does_not_blame_a_pin(env, monkeypatch):
 # --- epochs --------------------------------------------------------------------
 
 def test_step_down_needs_a_newer_epoch_from_the_peer(env):
-    _write_state(role='active', instance_id=A, epoch=5, peer=_peer(B, role_seen='standby'),
+    # B is active and A its member: A never wins a tie against B
+    _write_state(role='active', instance_id=B, epoch=5, peer=_peer(A, role_seen='standby'),
                  sync={'etag': 'x'})
     before = _file_bytes(ha.STATE_FILE)
 
-    assert ha.step_down(5, B) is False
-    assert ha.step_down(4, B) is False
+    assert ha.step_down(5, A) is False
+    assert ha.step_down(4, A) is False
     assert ha.step_down(9, C) is False
     assert ha.step_down(9, None) is False
     assert ha.role() == 'active' and ha.epoch() == 5
     assert _file_bytes(ha.STATE_FILE) == before
 
-    assert ha.step_down(6, B) is True
+    assert ha.step_down(6, A) is True
     assert ha.role() == 'standby' and ha.epoch() == 6
     assert (ha.peer()['role_seen'], ha.peer()['epoch_seen']) == ('active', 6)
+    assert ha.source_id() == A
     assert ha.public_status()['sync'] == {'etag': None, 'restart_pending': None}
     # already a standby: nothing left to step down from
-    assert ha.step_down(7, B) is False and ha.epoch() == 6
+    assert ha.step_down(7, A) is False and ha.epoch() == 6
     assert env.restarts == []  # step_down leaves the restart to its caller
 
 
@@ -908,10 +975,10 @@ def test_an_old_active_asks_its_peer_before_it_acts_and_steps_down(env):
 
 
 @pytest.mark.parametrize('answer,result', [
-    pytest.param(_status('active', 3), 'ok', id='same-epoch'),
     pytest.param(_status('active', 1), 'ok', id='older-epoch'),
-    pytest.param(_status('standby', 9), 'ok', id='peer-is-standby'),
-    pytest.param(_status('active', 9, status=401), 'unreachable', id='refused'),
+    # a standby under our own epoch is where it belongs
+    pytest.param(_status('standby', 3), 'ok', id='peer-is-standby'),
+    pytest.param(_status('active', 9, status=429), 'unreachable', id='over-budget'),
     pytest.param(ha.HaError('Cannot reach the peer: ConnectTimeout'), 'unreachable', id='down'),
     pytest.param(types.SimpleNamespace(status_code=200, json=lambda: ['x']), 'unreachable', id='not-a-dict'),
     pytest.param(types.SimpleNamespace(status_code=200, json=lambda: {'epoch': 'x'}), 'unreachable',
@@ -925,6 +992,43 @@ def test_the_boot_check_keeps_acting_unless_a_newer_active_answers(env, answer, 
     assert ha.check_peer_at_boot(timeout=2) == result
 
     assert ha.role() == 'active' and ha.epoch() == 3
+    assert env.restarts == []
+
+
+@pytest.mark.parametrize('answer,epoch', [
+    # the group moved on under epoch 9 and nobody active under it answers: a standby
+    # that follows somebody else says so (#625 review)
+    pytest.param(_status('standby', 9), 9, id='member-reports-a-newer-epoch'),
+    # every member refuses us: we were taken out while we were down
+    pytest.param(_status('active', 9, status=401), 3, id='every-member-refuses'),
+])
+def test_the_boot_check_steps_aside_when_the_group_has_moved_on(env, answer, epoch):
+    """Before this, both came up as an acting active next to the group (#625 review):
+    the boot check only looked at actives, and a refusal counted as unreachable."""
+    _be_active(epoch=3)
+    _peer_answers(env.mp, lambda path, body: answer)
+
+    assert ha.check_peer_at_boot(timeout=2) == 'stepped aside'
+
+    assert ha.role() == 'standby' and not ha.is_active() and ha.epoch() == epoch
+    assert ha.source_id() is None and ha.peer() is None
+    assert 'Stepped aside' in ha.public_status()['sync']['last_error']
+    # the boot check comes up passive; nothing restarts
+    assert env.restarts == []
+
+
+@pytest.mark.parametrize('me,them,result', [
+    pytest.param(A, B, 'stepped down', id='the-member-wins'),
+    pytest.param(B, A, 'ok', id='we-win'),
+])
+def test_the_boot_check_settles_the_same_epoch_by_instance_id(env, me, them, result):
+    """Two actives under one epoch (two admins promoting at once): the higher id stays."""
+    _write_state(role='active', instance_id=me, epoch=3, peer=_peer(them, role_seen='standby'))
+    _peer_answers(env.mp, lambda path, body: _status('active', 3))
+
+    assert ha.check_peer_at_boot() == result
+
+    assert ha.role() == ('standby' if result == 'stepped down' else 'active') and ha.epoch() == 3
     assert env.restarts == []
 
 
@@ -967,17 +1071,23 @@ def test_watch_once_reads_its_own_epoch_before_the_call(env):
     assert 'same epoch' not in ha.public_status()['peer']['last_error']
 
 
-def test_equal_epochs_name_a_way_out_the_api_allows(env):
-    """promote() takes only a standby, so 'promote one of them again' was advice
-    both instances refused with 409."""
-    _be_active(epoch=3)
-    _peer_answers(env.mp, lambda path, body: _status('active', 3))
+def test_equal_epochs_are_settled_by_the_instance_id(env):
+    """Both instances active under one epoch used to be a conflict an admin had to
+    untangle by unpairing. The higher instance id stays active now, on both sides."""
+    _be_active(epoch=3)                       # we are A, the member B is the higher id
+    calls = _peer_answers(env.mp, lambda path, body: _status('active', 3))
 
-    assert ha.watch_once() == 'conflict'
+    assert ha.watch_once() == 'stepped down'
+    assert ha.role() == 'standby' and ha.source_id() == B and ha.epoch() == 3
+    assert env.restarts == ['stepped down to standby']
+    assert [c[1] for c in calls] == ['/api/ha/peer/status']
 
-    msg = ha.public_status()['peer']['last_error']
-    assert 'unpair one of them' in msg and 'standby of the other' in msg
-    assert 'promote' not in msg
+    # the other side: we are the higher id and tell the lower one to step down
+    _write_state(role='active', instance_id=B, epoch=3, peer=_peer(A, role_seen='standby'))
+    calls = _peer_answers(env.mp, lambda path, body: _status('active', 3))
+    assert ha.watch_once() == 'told peer to step down'
+    assert ha.role() == 'active'
+    assert calls[-1][:3] == ('POST', '/api/ha/peer/step-down', {'epoch': 3})
 
 
 # --- snapshot and apply --------------------------------------------------------
@@ -1449,7 +1559,7 @@ def _snapshot_to_pull(db, seed, extra_column=False):
 
 
 def _serve(env, snap):
-    """The active behind call_peer: 304 for the snapshot's etag, else the snapshot.
+    """The active behind the pull: 304 for the snapshot's etag, else the snapshot.
     Returns the If-None-Match of every call."""
     sent = []
 
@@ -1647,5 +1757,7 @@ def test_the_snapshot_worker_needs_no_state_lock_and_logs_nothing(env, db, seed,
 
     snap = ha.build_snapshot(meta, stuck=stuck)
     assert snap['instance_id'] == meta['instance_id'] and snap['role'] == 'active'
-    assert ha.snapshot_etag() == snap['etag']
+    # the etag too: the member list in it comes from meta, not from the state
+    assert ha.snapshot_etag(meta) == snap['etag']
+    assert [e['instance_id'] for e in snap['members']] == [A, B]
     assert logged == []

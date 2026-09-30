@@ -302,13 +302,14 @@ def test_a_failure_after_the_commit_still_notes_the_new_connection(env, monkeypa
     """Whatever fails once the rows are in, the managers are compared against them."""
     _standby_with_managers(env)
     env.clock.advance(300)
-    real = ha._update_sync
+    real = ha._finish_pull
 
-    def no_note(**kw):
-        if 'etag' in kw:
+    def no_note(sid, sync, member=None):
+        # the note of a pull that got its rows in; the one of a failure goes through
+        if 'last_ok_at' in sync:
             raise OSError('No space left on device')
-        return real(**kw)
-    monkeypatch.setattr(ha, '_update_sync', no_note)
+        return real(sid, sync, member)
+    monkeypatch.setattr(ha, '_finish_pull', no_note)
 
     assert _sync(env, lambda: _update(env.db, 'clusters', 'pve1', host='10.0.0.9')) == 'failed'
     assert ha._run['pending']['reason'] == '1 cluster changed'

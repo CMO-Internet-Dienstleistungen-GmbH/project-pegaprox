@@ -12,6 +12,7 @@ what a pair looks like right after a sync anyway.
 """
 import ast
 import base64
+import contextvars
 import gzip
 import inspect
 import json
@@ -40,6 +41,7 @@ ADMIN_ROUTES = [
     ('post', '/api/ha/unpair', {'confirm': 'UNPAIR', 'user_password': ADMIN_PW}),
     ('put', '/api/ha/settings', {'interval': 60}),
     ('post', '/api/ha/apply-config', None),
+    ('post', f'/api/ha/members/{B_ID}/remove', {'confirm': 'REMOVE', 'user_password': ADMIN_PW}),
 ]
 PEER_ROUTES = [
     ('POST', '/api/ha/peer/pair'),
@@ -47,6 +49,8 @@ PEER_ROUTES = [
     ('GET', '/api/ha/peer/snapshot'),
     ('POST', '/api/ha/peer/step-down'),
     ('POST', '/api/ha/peer/unpaired'),
+    ('POST', '/api/ha/peer/member-removed'),
+    ('POST', '/api/ha/peer/tombstones'),
 ]
 
 
@@ -73,6 +77,7 @@ def ha_env(api, tmp_path, monkeypatch):
     monkeypatch.setattr(ha, 'restart_process', env.restarts.append)
     monkeypatch.setattr(ha, '_install_field_key', env.installed.append)
     ha.reset_for_tests()
+    ha.forget_seen_nonces()
     for window in (ha_api._pair_attempts, ha_api._peer_failures, ha_api._reauth_attempts):
         window.reset()
     yield env
@@ -97,6 +102,8 @@ def _be(env, role, **kw):
 
 
 def _peer_record(instance_id=B_ID, url=STANDBY_URL, role_seen='standby'):
+    """The peer of a v1/v2 pair state file, which _load reads as a group of two: we
+    present 'y' * 43 to every member, and the member presents PEER_SECRET."""
     from pegaprox.core import ha
     return {'instance_id': instance_id, 'url': url, 'fingerprint': '',
             'secret_out': 'y' * 43, 'secret_in_hash': ha._hash_secret(PEER_SECRET),
@@ -188,20 +195,25 @@ def _wire_to(env, monkeypatch, other_side, down=False):
     ha = env.ha
     client = env.api.app.test_client()
 
-    def call(method, base_url, fingerprint, path, json_body=None, auth='peer',
+    def call(method, base_url, fingerprint, path, json_body=None, auth=None,
              headers=None, timeout=15):
         env.calls.append((method, base_url, path))
         if down:
-            raise ha.HaError('Cannot reach the peer: ConnectTimeout')
+            raise ha.PeerUnreachable('Cannot reach the peer: ConnectTimeout')
+        body = ha._wire_body(json_body)
         h = {'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json'}
-        if auth == 'peer':
-            h[ha.PEER_HEADER] = f"{ha.instance_id()}:{ha.peer()['secret_out']}"
+        if body:
+            h['Content-Type'] = 'application/json'
+        if auth is not None:
+            h.update(auth(method, path, body))
         h.update(headers or {})
         home = ha.STATE_FILE
         _switch(env, other_side)
         try:
-            resp = client.open(path, method=method, json=json_body, headers=h,
-                               base_url='http://localhost')
+            # a request of its own, as between two processes: not in the app context
+            # (and flask.g) of a route it is made from
+            resp = contextvars.Context().run(client.open, path, method=method, data=body or None,
+                                             headers=h, base_url='http://localhost')
         finally:
             _switch(env, home)
         return _Wire(resp)
@@ -240,7 +252,8 @@ def test_the_route_lists_are_every_ha_route(api):
     for rule in api.app.url_map.iter_rules():
         if rule.rule.startswith('/api/ha/'):
             for m in rule.methods - {'HEAD', 'OPTIONS'}:
-                served.add((m, rule.rule))
+                # the list names one member for the route that takes any
+                served.add((m, rule.rule.replace('<instance_id>', B_ID)))
     assert served == listed
 
 
@@ -311,6 +324,7 @@ def test_an_admin_reaches_every_route(ha_env, seed):
         '/api/ha/unpair': 409,        # not paired
         '/api/ha/settings': 200,
         '/api/ha/apply-config': 409,  # not a standby
+        f'/api/ha/members/{B_ID}/remove': 409,  # not active
     }
     for method, path, body in ADMIN_ROUTES:
         r = _send(c, method, path, body)
@@ -332,9 +346,10 @@ def test_an_admin_api_token_reaches_the_page(ha_env, seed):
 def test_peer_routes_want_the_peer_header(ha_env):
     import pegaprox.api.ha as ha_api
     ha, api = ha_env.ha, ha_env.api
-    _active_with_standby(ha_env)
+    _active_with_standby(ha_env, epoch=2)
     wrong = [None, '', PEER_SECRET, f'{B_ID}:', f'{B_ID}:wrong-secret',
-             f'{A_ID}:{PEER_SECRET}', f'{B_ID}:{PEER_SECRET}x']
+             f'{A_ID}:{PEER_SECRET}', f'{B_ID}:{PEER_SECRET}x',
+             f'{B_ID}:{ha._hash_secret(PEER_SECRET)}']
     for method, path in PEER_ROUTES:
         if path == '/api/ha/peer/pair':
             continue                               # the code authenticates that one
@@ -342,12 +357,12 @@ def test_peer_routes_want_the_peer_header(ha_env):
         for header in wrong:
             r = _peer(api, method, path, header, json={'epoch': 99})
             assert r.status_code == 401, (path, header, r.status_code)
-    assert ha.role() == 'active' and ha.epoch() == 1 and ha.peer()['instance_id'] == B_ID
+    assert ha.role() == 'active' and ha.epoch() == 2 and ha.peer()['instance_id'] == B_ID
     assert ha_env.restarts == []
 
     r = _peer(api, 'GET', '/api/ha/peer/status', GOOD)
     assert r.status_code == 200
-    assert r.get_json() == {'instance_id': A_ID, 'role': 'active', 'epoch': 1}
+    assert r.get_json() == {'instance_id': A_ID, 'role': 'active', 'epoch': 2, 'group': 1}
     assert _peer(api, 'GET', '/api/ha/peer/snapshot', GOOD).status_code == 200
     r = _peer(api, 'POST', '/api/ha/peer/step-down', GOOD, json={'epoch': 1})
     assert r.status_code == 200 and r.get_json()['stepped_down'] is False
@@ -380,12 +395,25 @@ def _code(admin, url=ACTIVE_URL):
     return r.get_json()
 
 
-STANDBY_SECRET = 'the-standby-made-this-' + 'z' * 30
+# the key pair the standby of these tests pairs with; only the public half is sent
+STANDBY_KEY = base64.b64encode(bytes(range(32))).decode()
+
+
+def _standby_public():
+    from pegaprox.core import ha
+    return ha._public_of(ha._private_key(STANDBY_KEY))
+
+
+def _as_standby(to, method, path, body=b''):
+    """The peer headers of a call the standby of STANDBY_KEY signs for `to`."""
+    from pegaprox.core import ha
+    signer = ha._Signer(B_ID, ha._private_key(STANDBY_KEY))
+    return ha._auth_for(signer, to)(method, path, body)
 
 
 def _pair_body(secret, instance_id=B_ID):
     return {'code': secret, 'instance_id': instance_id, 'url': STANDBY_URL,
-            'fingerprint': '', 'secret': STANDBY_SECRET}
+            'fingerprint': '', 'public_key': _standby_public()}
 
 
 def test_the_pairing_handshake_through_the_routes(ha_env, seed):
@@ -419,9 +447,15 @@ def test_the_pairing_handshake_through_the_routes(ha_env, seed):
 
     assert ha.role() == 'active' and ha.epoch() == 1
     assert ha.peer()['instance_id'] == B_ID and ha.peer()['url'] == STANDBY_URL
-    assert ha.peer()['secret_out'] == STANDBY_SECRET
-    # the secret handed over is what the standby presents from now on
-    r = _peer(api, 'GET', '/api/ha/peer/status', f"{B_ID}:{opened['secret']}")
+    assert ha.peer()['public_key'] == _standby_public()
+    # our public key, and the member list with both of us in it
+    assert opened['public_key'] == ha.own_public_key() and 'secret_hash' not in opened
+    assert {e['instance_id'] for e in opened['members']} == {ha.instance_id(), B_ID}
+    assert ha._load()['signing_key'] not in json.dumps(opened)
+    # the standby signs with its own key from now on, which never left it
+    assert STANDBY_KEY not in json.dumps(_file(ha.STATE_FILE))
+    r = _peer(api, 'GET', '/api/ha/peer/status', None,
+              headers=_as_standby(ha.instance_id(), 'GET', '/api/ha/peer/status'))
     assert r.status_code == 200 and r.get_json()['role'] == 'active'
 
     # single use
@@ -483,9 +517,21 @@ def test_a_pairing_code_needs_https_and_a_free_instance(ha_env, seed):
         assert r.status_code == 400, (bad, r.status_code)
     assert not os.path.exists(ha_env.ha.STATE_FILE)
 
+    # an active with a standby takes more, up to three - once that standby has
+    # answered as a member of a group: the pair release takes calls from its one peer only
     _active_with_standby(ha_env)
     r = admin.post('/api/ha/pairing-code', json={'url': ACTIVE_URL, 'user_password': ADMIN_PW})
-    assert r.status_code == 409 and 'already paired' in r.get_json()['error']
+    assert r.status_code == 409 and STANDBY_URL in r.get_json()['error']
+    assert 'update it' in r.get_json()['error']
+    ha_env.ha._note_members({B_ID: {'group_seen': True}})
+    r = admin.post('/api/ha/pairing-code', json={'url': ACTIVE_URL, 'user_password': ADMIN_PW})
+    assert r.status_code == 200, r.data
+    full = {mid: {'url': f'https://{mid[:4]}.example', 'fingerprint': '',
+                  'secret_hash': ha_env.ha._hash_secret(mid)} for mid in ('1' * 32, '2' * 32, '3' * 32)}
+    _be(ha_env, 'active', members=full, member_secret='y' * 43)
+    r = admin.post('/api/ha/pairing-code', json={'url': ACTIVE_URL, 'user_password': ADMIN_PW})
+    assert r.status_code == 409
+    assert r.get_json() == {'error': 'This group already has 3 standbys - remove one first'}
     _standby_of_active(ha_env)
     r = admin.post('/api/ha/pairing-code', json={'url': ACTIVE_URL, 'user_password': ADMIN_PW})
     assert r.status_code == 409 and 'standby' in r.get_json()['error']
@@ -576,10 +622,13 @@ def test_join_pairs_through_the_real_pair_route(ha_env, seed, monkeypatch):
     assert mine['instance_id'] == A_ID and mine['url'] == ACTIVE_URL
     theirs = _file(active)
     assert theirs['role'] == 'active' and theirs['epoch'] == 1
-    assert theirs['peer']['instance_id'] == B_ID and theirs['peer']['url'] == STANDBY_URL
-    # each side accepts what the other presents
-    assert ha._hash_secret(mine['secret_out']) == theirs['peer']['secret_in_hash']
-    assert ha._hash_secret(theirs['peer']['secret_out']) == mine['secret_in_hash']
+    assert list(theirs['members']) == [B_ID] and theirs['members'][B_ID]['url'] == STANDBY_URL
+    # each side holds the other's public key, and nothing private of it
+    assert theirs['members'][B_ID]['public_key'] == ha.own_public_key()
+    assert mine['public_key'] == ha._public_of(ha._private_key(theirs['signing_key']))
+    assert ha._load()['signing_key'] not in json.dumps(theirs)
+    assert theirs['signing_key'] not in json.dumps(ha._load())
+    assert theirs['member_secret'] is None and ha._load()['member_secret'] is None
     assert len(_audit('ha.joined')) == 1 and len(_audit('ha.paired')) == 1
 
 
@@ -595,7 +644,7 @@ def test_join_says_so_when_the_active_cannot_be_reached(ha_env, seed, monkeypatc
     assert r.status_code == 502 and 'reach' in r.get_json()['error']
     assert ha.role() == 'standalone' and ha.peer() is None
     assert ha_env.restarts == [] and ha_env.installed == []
-    assert _file(active)['role'] == 'standalone' and _file(active)['peer'] is None
+    assert _file(active)['role'] == 'standalone' and _file(active)['members'] == {}
 
 
 def test_join_passes_on_the_actives_refusal(ha_env, seed, monkeypatch):
@@ -696,7 +745,9 @@ def test_the_snapshot_route(ha_env):
 def test_step_down_only_for_a_newer_epoch(ha_env):
     ha, api = ha_env.ha, ha_env.api
     _active_with_standby(ha_env, epoch=3)
-    for older in (1, 3):
+    # the same epoch goes to the higher instance id, and B is higher than us: see
+    # tests/test_ha_members.py for the tie
+    for older in (1, 2):
         r = _peer(api, 'POST', '/api/ha/peer/step-down', GOOD, json={'epoch': older})
         assert r.status_code == 200
         assert r.get_json() == {'stepped_down': False, 'role': 'active', 'epoch': 3}
@@ -755,7 +806,9 @@ def test_promote_goes_ahead_when_the_old_active_is_gone(ha_env, seed, monkeypatc
     _wire_to(ha_env, monkeypatch, str(ha_env.tmp / 'gone.json'), down=True)
     r = admin.post('/api/ha/promote', json={'confirm': 'PROMOTE', 'user_password': ADMIN_PW})
     assert r.status_code == 200, r.data
-    assert ha_env.calls == [('POST', ACTIVE_URL, '/api/ha/peer/step-down')]
+    # the sync first finds nobody, which is the failover this is for
+    assert ha_env.calls == [('GET', ACTIVE_URL, '/api/ha/peer/snapshot'),
+                            ('POST', ACTIVE_URL, '/api/ha/peer/step-down')]
     assert ha.role() == 'active' and ha.epoch() == 3
     assert ha_env.restarts == ['promoted to active']
     assert 'not reached' in _audit('ha.promoted')[-1]['details']
@@ -795,7 +848,7 @@ def test_unpairing_a_standby_tells_the_active_and_restarts(ha_env, seed, monkeyp
     assert ha_env.restarts == ['joined as standby', 'unpaired, standalone from now on']
     assert ha.role() == 'standalone' and ha.peer() is None
     theirs = _file(active)
-    assert theirs['role'] == 'standalone' and theirs['peer'] is None
+    assert theirs['role'] == 'standalone' and theirs['members'] == {}
     # one line from each side
     assert len(_audit('ha.unpaired')) == 2
 
@@ -886,7 +939,8 @@ def test_the_interval_leaves_an_unreadable_state_file_alone(ha_env, seed):
     assert r.status_code == 200, r.data
     st = _file(ha.STATE_FILE)
     assert st['interval'] == 60 and st['epoch'] == 7 and st['instance_id'] == B_ID
-    assert st['peer']['instance_id'] == A_ID
+    # written in the member form now, the pairing kept
+    assert list(st['members']) == [A_ID] and st['source'] == A_ID and 'peer' not in st
 
 
 # --- the write block on a standby -------------------------------------------------------
@@ -1146,32 +1200,42 @@ def test_what_the_real_client_sends_passes_the_csrf_gate(ha_env, monkeypatch):
     import requests
     import pegaprox.utils.url_security as urlsec
     ha, api = ha_env.ha, ha_env.api
-    _active_with_standby(ha_env, epoch=1)
+    # epoch 2: the replayed epoch 1 is older, so the call is answered and changes nothing
+    _active_with_standby(ha_env, epoch=2)
     monkeypatch.setattr(urlsec, 'is_safe_outbound_url', lambda *a, **k: (True, ''))
     sent = {}
 
     def capture(self, method, url, **kw):
         sent.update(kw.get('headers') or {})
-        return types.SimpleNamespace(status_code=200)
+        sent['body'] = kw.get('data')
+        return types.SimpleNamespace(status_code=200, headers={})
     monkeypatch.setattr(requests.Session, 'request', capture)
-    # our own header towards the standby, i.e. the secret_out we hold for it
-    ha._peer_call('POST', STANDBY_URL, '', '/api/ha/peer/step-down', json_body={'epoch': 1})
+    # what call_member sends the standby: signed for it, and while the standby may not
+    # hold our key yet, the secret from the pair state file and the key along with it
+    ha.call_member(dict(ha.peer(), instance_id=B_ID), 'POST', '/api/ha/peer/step-down',
+                   json_body={'epoch': 1})
+    body = sent.pop('body')
+    assert body == b'{"epoch":1}' and sent['Content-Type'] == 'application/json'
     assert sent['X-Requested-With'] == 'XMLHttpRequest'
     assert 'Origin' not in sent and 'Referer' not in sent
     assert sent[ha.PEER_HEADER] == f"{A_ID}:{'y' * 43}"
+    assert sent[ha.PEER_KEY_HEADER] == ha.own_public_key()
+    assert sent[ha.PEER_SIG_HEADER] and sent[ha.PEER_NONCE_HEADER] and sent[ha.PEER_TS_HEADER]
 
-    # replayed with the right secret for this side, the gate lets it through
-    replay = dict(sent, **{ha.PEER_HEADER: GOOD})
+    # the same shape from the standby's side (it goes by its secret), and the gate
+    # lets it through
+    replay = {k: v for k, v in sent.items() if not k.startswith('X-PegaProx-Peer')}
+    replay[ha.PEER_HEADER] = GOOD
     client = api.app.test_client()
-    r = client.post('/api/ha/peer/step-down', json={'epoch': 1}, headers=replay,
+    r = client.post('/api/ha/peer/step-down', data=body, headers=replay,
                     base_url='http://localhost')
     assert r.status_code == 200, r.data
     # the gate is on for these paths: without the marker, or from a foreign page, no
     no_marker = {k: v for k, v in replay.items() if k != 'X-Requested-With'}
-    r = client.post('/api/ha/peer/step-down', json={'epoch': 1}, headers=no_marker,
+    r = client.post('/api/ha/peer/step-down', data=body, headers=no_marker,
                     base_url='http://localhost')
     assert r.status_code == 403 and 'CSRF' in r.get_json()['error']
-    r = client.post('/api/ha/peer/step-down', json={'epoch': 1},
+    r = client.post('/api/ha/peer/step-down', data=body,
                     headers=dict(replay, Origin='https://evil.example'), base_url='http://localhost')
     assert r.status_code == 403
     assert ha.role() == 'active'
@@ -1190,7 +1254,7 @@ def test_the_spec_says_what_the_peer_routes_take(api):
         else:
             assert op['security'] == [{'haPeer': []}], path
     for method, path, _b in ADMIN_ROUTES:
-        op = paths[path][method]
+        op = paths[path.replace(B_ID, '{instance_id}')][method]
         assert op['x-pegaprox-roles'] == ['admin'], path
 
 

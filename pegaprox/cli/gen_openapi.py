@@ -29,8 +29,8 @@ import sys
 # A handler without @require_auth is not automatically public: several
 # authenticate inline (the websocket-adjacent ones, webauthn, the session list)
 # because they answer 401 themselves rather than through the decorator. Calling
-# those "unauthenticated" in a published spec would be a lie, so the source is
-# checked for the helpers that actually establish an identity.
+# those "unauthenticated" in a published spec would be a lie, so the handler is
+# checked for the helpers that actually establish an identity (_code_refs).
 _INLINE_AUTH = ('_require_session', 'validate_session(', 'validate_api_token(',
                 'validate_ws_token', 'validate_sse_token', 'WS_INTERNAL_SECRET',
                 '_metrics_token', 'metrics_public',
@@ -84,23 +84,53 @@ def _split_rule(rule):
     return ''.join(out), params
 
 
+def _code_refs(fn):
+    """(names, strings) of the compiled handler, nested functions included: every
+    global and attribute it looks up, and every string constant it holds.
+
+    MK Sep 2026 (#625) - this used to read the source text. inspect.getsource takes
+    the line numbers from the code object and the lines from the file as it is on
+    disk now, so an edit to the module while the app was up (a test run next to the
+    editor) handed back the wrong block, and /api/ha/peer/snapshot and step-down
+    were written down as 'public'. The code object is what runs."""
+    code = getattr(inspect.unwrap(fn), '__code__', None)
+    if code is None:
+        return None
+    names, strings, todo = set(), [], [code]
+    while todo:
+        code = todo.pop()
+        names.update(code.co_names)
+        for const in code.co_consts:
+            if inspect.iscode(const):
+                todo.append(const)
+            elif isinstance(const, str):
+                strings.append(const)
+    return names, strings
+
+
+def _refers_to(refs, markers):
+    names, strings = refs
+    for tok in markers:
+        tok = tok.rstrip('(')
+        # a name it calls, or one it mentions in a string (the settings key metrics_public)
+        if tok in names or any(tok in s for s in strings):
+            return True
+    return False
+
+
 def _auth_kind(fn, decorated):
     """'decorator' | 'inline' | 'public' - how this route establishes identity."""
     if decorated:
         return 'decorator'
-    try:
-        src = inspect.getsource(inspect.unwrap(fn))
-    except (OSError, TypeError):
+    refs = _code_refs(fn)
+    if refs is None:
         return 'unknown'
-    return 'inline' if any(tok in src for tok in _INLINE_AUTH) else 'public'
+    return 'inline' if _refers_to(refs, _INLINE_AUTH) else 'public'
 
 
 def _uses(fn, markers):
-    try:
-        src = inspect.getsource(inspect.unwrap(fn))
-    except (OSError, TypeError):
-        return False
-    return any(tok in src for tok in markers)
+    refs = _code_refs(fn)
+    return refs is not None and _refers_to(refs, markers)
 
 
 def _doc(fn):
@@ -156,6 +186,8 @@ def build(app):
             if kind == 'inline' and _uses(fn, _HA_PEER_AUTH):
                 op['security'] = [{'haPeer': []}]
                 op['responses']['401'] = {'description': 'Not the paired instance'}
+                op['responses']['410'] = {'description': 'HA_REMOVED: the caller was removed '
+                                                         'from the group'}
             elif kind == 'inline' and _uses(fn, _HA_PAIRING_AUTH):
                 op['security'] = []
                 op['responses'].pop('401', None)
@@ -268,8 +300,14 @@ def spec(app, version):
                 },
                 'haPeer': {
                     'type': 'apiKey', 'in': 'header', 'name': 'X-PegaProx-Peer',
-                    'description': 'Only for the other instance of a standby pair: '
-                                   '<its instance id>:<the secret exchanged at pairing>.',
+                    'description': 'Only for the other members of a standby group: the '
+                                   'instance id of the caller, with X-PegaProx-Peer-Ts, '
+                                   '-Nonce and -Sig, an Ed25519 signature over method, '
+                                   'path, body, time, nonce and the instance id of the '
+                                   'receiver, under the key every other member holds since '
+                                   'the pairing. A member paired before the keys sends '
+                                   '<its instance id>:<its own secret> until it has '
+                                   'published one.',
                 },
                 'sessionId': {
                     'type': 'apiKey', 'in': 'header', 'name': 'X-Session-ID',

@@ -33,7 +33,7 @@
         "type": "apiKey",
         "in": "header",
         "name": "X-PegaProx-Peer",
-        "description": "Only for the other instance of a standby pair: <its instance id>:<the secret exchanged at pairing>."
+        "description": "Only for the other members of a standby group: the instance id of the caller, with X-PegaProx-Peer-Ts, -Nonce and -Sig, an Ed25519 signature over method, path, body, time, nonce and the instance id of the receiver, under the key every other member holds since the pairing. A member paired before the keys sends <its instance id>:<its own secret> until it has published one."
       },
       "sessionId": {
         "type": "apiKey",
@@ -43282,8 +43282,8 @@
             "description": "Insufficient permissions"
           }
         },
-        "summary": "Role, epoch, peer and last sync of this instance.",
-        "description": "suggested_url and own_fingerprint are what a pairing code made here would carry,\nso the UI can prefill the form.",
+        "summary": "Role, epoch, members and last sync of this instance.",
+        "description": "members lists every other instance of the group, is_source marks the one a\nstandby pulls from; peer is that one (or the first member) for older readers.\nsuggested_url and own_fingerprint are what a pairing code made here would carry,\nso the UI can prefill the form.",
         "x-pegaprox-auth": "decorator",
         "security": [
           {
@@ -43318,8 +43318,8 @@
             "description": "Insufficient permissions"
           }
         },
-        "summary": "A one-time code for the instance that is to follow this one.",
-        "description": "url is this instance as the standby will reach it, user_password the caller's\nown password (see _refuse_without_reauth). A new code replaces an open one; it is\ngood for 15 minutes and for one pairing.",
+        "summary": "A one-time code for an instance that is to follow this one.",
+        "description": "url is this instance as the standby will reach it, user_password the caller's\nown password (see _refuse_without_reauth). A new code replaces an open one; it is\ngood for 15 minutes and for one pairing. An active that has standbys already hands\nout codes too, up to three standbys.",
         "requestBody": {
           "required": false,
           "content": {
@@ -43456,7 +43456,7 @@
           }
         },
         "summary": "Make this standby the active instance under a new epoch, then restart.",
-        "description": "Wants user_password. The instance that was active is told to step down before the\nrestart, if it answers within a few seconds; otherwise it steps down as soon as\neither side sees the other.",
+        "description": "Wants user_password. When the instance it follows still answers, one sync from it\ncomes first, so the new active starts from the configuration and the member list\nof now; if that sync fails the promotion is refused (409 HA_PROMOTE_SYNC), unless\nforce is true. An instance that does not answer at all is the failover this is for.\nEvery member hears about the new epoch before the restart, if it answers within a\nfew seconds: the instance that was active steps down, the other standbys follow\nthis one from their next look at the group. A member that does not answer does the\nsame as soon as it sees this instance.",
         "requestBody": {
           "required": false,
           "content": {
@@ -43501,8 +43501,64 @@
             "description": "Insufficient permissions"
           }
         },
-        "summary": "Forget the peer. The peer is told first if it answers. Wants user_password.",
-        "description": "A standby becomes standalone and restarts, because from then on it acts on the\nconfiguration it holds.",
+        "summary": "Leave the group. Every member is told first if it answers. Wants user_password.",
+        "description": "A standby leaves on its own: the active drops it, and with the next sync so does\neverybody else. It becomes standalone and restarts, because from then on it acts on\nthe configuration it holds. An active leaves the group entirely: every member drops\nit and it becomes standalone; the standbys keep each other and wait for one of them\nto be promoted.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-roles": [
+          "admin"
+        ]
+      }
+    },
+    "/api/ha/members/{instance_id}/remove": {
+      "post": {
+        "operationId": "ha.remove_member_post",
+        "tags": [
+          "ha"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Take a standby out of the group, on the active. Wants user_password.",
+        "description": "Only a member that answered as a standby under the current epoch: anything else\nmay be an old active that is merely down, and would act again once it is back.\nshut_down: true is the admin confirming that the instance is shut down for good;\nwithout it such a member gets 409 HA_REMOVE_UNCONFIRMED. The removed instance\nstays on record as removed, and every remaining member hears so at once: from\nthen on its calls get 410 everywhere, and it lets go of the group when it hears\nthat. It is told right away if it answers (told), and stays a passive standby\nuntil an admin unpairs it there. Removing the last standby makes this instance\nstandalone.",
+        "parameters": [
+          {
+            "name": "instance_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "required": false,
           "content": {
@@ -43637,7 +43693,7 @@
           }
         },
         "summary": "The standby's half of the pairing handshake.",
-        "description": "No session and no peer header: the pairing code in the body authenticates the\ncall and is spent by it. The field key goes back sealed with a key derived from\nthat code.",
+        "description": "No session and no peer header: the pairing code in the body authenticates the\ncall and is spent by it. The standby sends its Ed25519 public key (public_key).\nThe field key, our own public key, the member list and the removed members go\nback sealed with a key derived from that code.",
         "requestBody": {
           "required": false,
           "content": {
@@ -43667,9 +43723,12 @@
           },
           "401": {
             "description": "Not the paired instance"
+          },
+          "410": {
+            "description": "HA_REMOVED: the caller was removed from the group"
           }
         },
-        "summary": "Role and epoch, for the peer's watch loop.",
+        "summary": "Role and epoch, for the watch loop of every other member. group says this release takes calls from every member, not only from one peer.",
         "x-pegaprox-auth": "inline",
         "security": [
           {
@@ -43693,10 +43752,13 @@
           },
           "401": {
             "description": "Not the paired instance"
+          },
+          "410": {
+            "description": "HA_REMOVED: the caller was removed from the group"
           }
         },
         "summary": "The shared configuration as gzip-compressed JSON, for the standby.",
-        "description": "304 when If-None-Match carries the current etag. 409 unless this instance is the\nactive one: a standby must never serve a snapshot another standby could take.",
+        "description": "304 when If-None-Match carries the current etag. 409 unless this instance is the\nactive one: a standby must never serve a snapshot another standby could take. A\nstandby names the active it follows in follow {instance_id, url, fingerprint,\npublic_key, epoch}, for a member that missed it; that member checks it with the\nactive itself before it follows.",
         "x-pegaprox-auth": "inline",
         "security": [
           {
@@ -43720,9 +43782,12 @@
           },
           "401": {
             "description": "Not the paired instance"
+          },
+          "410": {
+            "description": "HA_REMOVED: the caller was removed from the group"
           }
         },
-        "summary": "The peer is active under a newer epoch. We become its standby and restart; an older or equal epoch changes nothing.",
+        "summary": "A member is active under a newer epoch, or under ours with the higher instance id. We become its standby and restart; anything else changes nothing.",
         "requestBody": {
           "required": false,
           "content": {
@@ -43756,9 +43821,92 @@
           },
           "401": {
             "description": "Not the paired instance"
+          },
+          "410": {
+            "description": "HA_REMOVED: the caller was removed from the group"
           }
         },
-        "summary": "The peer unpaired on its side. An active instance becomes standalone; a standby stays passive until an admin unpairs or promotes it here.",
+        "summary": "A member left the group, and we drop it. An active whose last member left becomes standalone; a standby stays passive until an admin unpairs or promotes it here.",
+        "description": "removed: true is the instance the group follows saying it took this one out of\nthe group: we then let go of every member and stay passive until an admin unpairs\nus, an active included. From any other member it is a plain leave. left_group\nsays which of the two it was.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "inline",
+        "security": [
+          {
+            "haPeer": []
+          }
+        ]
+      }
+    },
+    "/api/ha/peer/member-removed": {
+      "post": {
+        "operationId": "ha.peer_member_removed_post",
+        "tags": [
+          "ha"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not the paired instance"
+          },
+          "410": {
+            "description": "HA_REMOVED: the caller was removed from the group"
+          }
+        },
+        "summary": "The active took another member out of the group: instance_id, and the epoch it did so under. We drop that member now rather than with the next member list, and keep its tombstone, so its calls get 410 here too. Taken only from the instance the group follows.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "inline",
+        "security": [
+          {
+            "haPeer": []
+          }
+        ]
+      }
+    },
+    "/api/ha/peer/tombstones": {
+      "post": {
+        "operationId": "ha.peer_tombstones_post",
+        "tags": [
+          "ha"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not the paired instance"
+          },
+          "410": {
+            "description": "HA_REMOVED: the caller was removed from the group"
+          }
+        },
+        "summary": "A member holds tombstones for members this active still lists.",
+        "description": "The removal happened while this instance could not hear about it, and it was\npromoted since. tombstones is the list as the member list carries it. Each one is\ntaken only for a member that has not answered as a standby under our epoch, asked\nonce more first, and whose credentials it names; taken lists the ones that were.\nAnywhere but on the active nothing changes.",
         "requestBody": {
           "required": false,
           "content": {

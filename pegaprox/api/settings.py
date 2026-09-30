@@ -2955,18 +2955,18 @@ def check_ip_whitelist():
         # MK Sep 2026 (#625) - the list is synced, so a standby enforces the active's
         # copy, and nobody lists the active's own address on the active: its watch and
         # unpair calls to the standby would bounce here. The peer calls carry their own
-        # credential, so a right X-PegaProx-Peer header gets through. A wrong one counts
-        # against the same failure budget as on the peer routes, so the list does not
-        # turn into a free place to try secrets. The pairing call has no peer header
-        # yet and stays behind the list.
+        # credential, a signature over the whole call, so a member gets through (and a
+        # removed one too, to hear 410 from the route). A wrong one counts against the
+        # same failure budget as on the peer routes, so the list does not turn into a
+        # free place to try credentials. The pairing call has no peer credential yet
+        # and stays behind the list.
         # A blacklist entry is an explicit no and stays one, peer or not.
         path = request.path
         if (path.startswith('/api/ha/peer/') and path != '/api/ha/peer/pair'
                 and not _ip_blacklisted(client_ip)):
-            from pegaprox.core import ha
-            if ha.verify_peer(request.headers.get(ha.PEER_HEADER, '')):
+            from pegaprox.api.ha import request_peer, _peer_failures
+            if request_peer()[0]:
                 return None
-            from pegaprox.api.ha import _peer_failures
             _peer_failures.allow(client_ip)
         logging.warning(f"IP blocked: {client_ip} - {reason}")
         return jsonify({
