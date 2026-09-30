@@ -582,11 +582,13 @@ def _directory_agrees_with_synced_row(ldap_result, row):
 
 def _ha_banner():
     """ha.banner(), and on a standby whether it shows the clusters live. With the live
-    view off its cluster list is empty on purpose, and the UI has to say so."""
+    view off its cluster list is empty on purpose, and the UI has to say so. forwarding
+    says whether a change made here goes to the active right now or is refused."""
     from pegaprox.core import ha
     out = ha.banner()
     if out.get('role') == ha.ROLE_STANDBY:
         out['live_view'] = bool(ha.live_view())
+        out['forwarding'] = bool(ha.forwarding())
     return out
 
 
@@ -988,11 +990,13 @@ def auth_login():
         is_admin = user.get('role') == ROLE_ADMIN
         exclude_admins = settings.get('force_2fa_exclude_admins', False)
         if not has_2fa and not is_external and not (is_admin and exclude_admins):
-            if is_admin and ha.is_standby():
-                # MK Sep 2026 (#625) - enrolment is a write and a standby refuses it, and
+            if is_admin and ha.is_standby() and not ha.forwarding():
+                # MK Sep 2026 (#625) - enrolment is a write, and a standby that cannot hand
+                # it to the active (the active is gone, or forwarding is off) refuses it;
                 # the setup screen has no way past it. For an admin that is the way to
                 # the promote button during a failover, so let them in and say so in the
-                # audit trail. Enrolment happens on the active.
+                # audit trail. While the standby forwards, enrolment goes to the active
+                # like any other change, and nobody skips it.
                 log_audit(username, 'ha.standby_2fa_skipped',
                           'Forced 2FA enrolment skipped on a standby for an admin without TOTP')
             else:
@@ -1276,9 +1280,9 @@ def auth_check():
         is_admin = fresh_role == ROLE_ADMIN
         exclude_admins = settings.get('force_2fa_exclude_admins', False)
         # skip OIDC/Entra users (they use their IdP's MFA) and optionally admins
-        # #625: and admins on a standby, which refuses the enrolment (see auth_login)
+        # #625: and admins on a standby that cannot enrol them (see auth_login)
         if not has_2fa and not is_external and not (is_admin and exclude_admins) \
-                and not (is_admin and ha.is_standby()):
+                and not (is_admin and ha.is_standby() and not ha.forwarding()):
             requires_2fa_setup = True
     
     from pegaprox.api.auto_install import autoinstall_access

@@ -194,7 +194,8 @@ def group(api, tmp_path, monkeypatch):
 
 
 def _fresh_windows(ha_api):
-    for window in (ha_api._pair_attempts, ha_api._peer_failures, ha_api._reauth_attempts):
+    for window in (ha_api._pair_attempts, ha_api._peer_failures, ha_api._reauth_attempts,
+                   ha_api._forward_per_user):
         window.reset()
 
 

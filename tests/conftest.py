@@ -96,6 +96,8 @@ def _ha_state_out_of_the_checkout(tmp_path, monkeypatch):
     # then are gone). The test process started whenever the run did, so every test
     # counts as a process that has run for longer than the signature window.
     monkeypatch.setattr(ha, '_PROCESS_STARTED', 0)
+    # a standby's note that its active did not answer lives as long as the process
+    monkeypatch.setattr(ha, '_silent_source', {'id': None})
     ha.reset_for_tests()
     yield
     ha.reset_for_tests()
@@ -237,7 +239,9 @@ def _integration_app():
     dbmod._db = None
     dbmod.PegaProxDB._instance = None
 
-    # never persist test sessions to disk
+    # never persist test sessions to disk (a test that checks what would be saved
+    # calls the real one with get_db patched)
+    authmod._real_save_sessions = authmod.save_sessions
     authmod.save_sessions = lambda *a, **k: None
 
     from pegaprox.app import create_app

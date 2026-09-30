@@ -51,6 +51,7 @@ PEER_ROUTES = [
     ('POST', '/api/ha/peer/unpaired'),
     ('POST', '/api/ha/peer/member-removed'),
     ('POST', '/api/ha/peer/tombstones'),
+    ('POST', '/api/ha/peer/forward'),
 ]
 
 
@@ -115,6 +116,10 @@ def _active_with_standby(env, epoch=1):
 
 
 def _standby_of_active(env, **kw):
+    """A standby whose active answers. Its writes are refused, as they were before v3:
+    these tests are about that block, and nothing here answers a forwarded write.
+    tests/test_ha_forward.py covers forward_writes on."""
+    kw.setdefault('forward_writes', False)
     _be(env, 'standby', instance_id=B_ID, peer=_peer_record(A_ID, ACTIVE_URL, 'active'), **kw)
 
 
@@ -1152,7 +1157,7 @@ def test_a_standby_still_signs_people_in_and_out(ha_env, db, tmp_path, monkeypat
     assert r.status_code == 200, r.data
     body = r.get_json()
     banner = {'role': 'standby', 'peer_url': ACTIVE_URL, 'last_sync_at': '2026-09-29T10:00:00+00:00',
-              'live_view': True}
+              'live_view': True, 'forwarding': False}
     assert body['ha'] == banner
     sid = {'X-Session-ID': body['session_id']}
     check = api.anon().get('/api/auth/check', headers=sid)

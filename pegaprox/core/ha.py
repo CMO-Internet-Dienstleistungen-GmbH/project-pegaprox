@@ -41,6 +41,15 @@ is_active(). Settings the managers read when they use them are handed over in
 place after each sync; a change to how they connect restarts the standby once the
 change has settled. With the live view off a standby starts no managers at all.
 
+Forwarded writes (on unless an admin switches them off, per instance): a write the
+standby would refuse goes to the active it follows instead, when a user signed in on
+the standby sends it from the browser. The standby vouches for that user: a signed
+peer call carries the request and the username, and the active checks the account
+against its own users table and runs the request through its own routing, as that
+user and with that user's rights there (api/ha.py peer_forward). An API token is
+nobody the standby can vouch for, its writes are refused as before. A write that went
+through is followed by a pull right away (pull_soon), so it shows here at once.
+
 What travels:
   * pairing - the standby POSTs the one-time code and its public key to the active
     and gets back the field key (.pegaprox_aes256.key), the active's public key and
@@ -102,6 +111,9 @@ PEER_SIG_HEADER = 'X-PegaProx-Peer-Sig'
 PEER_KEY_HEADER = 'X-PegaProx-Peer-Key'
 # the answer to it: the receiver holds the key this call was signed with
 PEER_KEYED_HEADER = 'X-PegaProx-Peer-Keyed'
+# the sha256 of the body, as signed: a receiver can check who sent a large call before
+# it reads the body (signed_before_body), and the body against it afterwards
+PEER_BODY_HEADER = 'X-PegaProx-Peer-Body'
 # how far a signed call's time may be off, either way
 SIGNATURE_WINDOW = 120
 _NONCES_PER_SENDER = 4096
@@ -120,6 +132,49 @@ REMOVED_ERROR = 'This instance was removed from the group'
 PULL_TIMEOUT = 60
 PULL_TIMEOUT_FLOOR = 20
 PULL_TIMEOUT_UNREACHABLE = 10
+
+# A write a standby forwards: the peer route that takes it on the active, and the key
+# the active marks the call it runs for the standby with in the WSGI environ (the
+# session made for it, the standby, the client address). A client cannot set an
+# environ key of that name; headers arrive as HTTP_*.
+FORWARD_PATH = '/api/ha/peer/forward'
+FORWARD_ENVIRON = 'pegaprox.ha_forward'
+FORWARD_MAX_BODY = 50 * 1024 * 1024
+# The browser waits for it, and some writes run a while before they answer (a clone
+# with cloud-init waits up to 10 minutes for its task). Connecting has its own, short
+# limit: an active that is gone costs a click seconds, not minutes.
+FORWARD_TIMEOUT = 900
+FORWARD_CONNECT_TIMEOUT = 15
+FORWARD_READ_TIMEOUT = 30
+_FORWARD_CHUNK = 1024 * 1024
+# The reads a forwarding standby hands on as well: the progress of jobs that live in the
+# process, or in the tables of its own, of the instance that started them. A job
+# started through a standby runs on the active, and without these the standby would
+# show no progress at all (nor the cutover of a migration that waits for one). A GET
+# rule, as app.url_map writes it; the active serves nothing else as a forwarded read.
+FORWARDED_READS = frozenset((
+    '/api/vmware/migrations',
+    '/api/vmware/migrations/<mid>',
+    '/api/xhm/migrations',
+    '/api/xhm/migrations/<mid>',
+    '/api/clusters/<cluster_id>/updates/status',
+    '/api/clusters/<cluster_id>/nodes/<node_name>/update',
+    '/api/clusters/<cluster_id>/nodes/<node_name>/maintenance',
+    '/api/clusters/<cluster_id>/datastores/<storage_name>/download-status/<task_id>',
+    '/api/pbs/<pbs_id>/update',
+    '/api/clusters/<cluster_id>/backup-verify/<task_id>',
+    '/api/clusters/<cluster_id>/backup-verify/active',
+    '/api/clusters/<cluster_id>/backup-verify/history',
+    '/api/clusters/<cluster_id>/iso-sync/last-result',
+    '/api/clusters/<cluster_id>/migrations',
+    '/api/cluster-groups/<group_id>/lb-history',
+    '/api/clusters/<cluster_id>/templates/deployments',
+    '/api/templates/deployments/<dep_id>',
+    '/api/dr-drills/<drill_id>',
+    '/api/site-recovery/plans/<plan_id>/drills',
+    '/api/site-recovery/plans/<plan_id>/events',
+    '/api/clusters/<cluster_id>/snapshot-policies/<pid>/runs',
+))
 
 # Shared configuration. Everything else in the database is per host: sessions,
 # audit trail, metrics, run and event history, runtime alerts. A table that is in
@@ -203,6 +258,7 @@ _PUBLIC_KEY_RE = re.compile(r'[A-Za-z0-9+/]{43}=')
 _SIGNATURE_RE = re.compile(r'[A-Za-z0-9+/]{86}==')
 _NONCE_RE = re.compile(r'[A-Za-z0-9_-]{16,64}')
 _TS_RE = re.compile(r'[0-9]{1,12}')
+_DIGEST_RE = re.compile(r'[0-9a-f]{64}')
 
 # A standby restarts to pick up new connection settings for its managers: once
 # the new ones have held for CONFIG_SETTLE seconds, not before the process has run
@@ -244,6 +300,10 @@ _seen_nonces = {}
 _PROCESS_STARTED = int(time.time())
 # what the last look at the group could not reach, for the pull of the same pass
 _last_watch = {'at': None, 'unreachable': frozenset()}
+# the member this standby pulls from, when the last try to reach it (watch, pull or a
+# forwarded write) got no answer at all; the next answer clears it. Forwarding waits
+# for that answer instead of holding every write until it times out
+_silent_source = {'id': None}
 
 
 class HaError(Exception):
@@ -252,6 +312,11 @@ class HaError(Exception):
 
 class PeerUnreachable(HaError):
     """The member did not answer at all: network, timeout or a certificate we cannot trust."""
+
+
+class PeerNoAnswer(PeerUnreachable):
+    """The member took the call and then sent no answer, in time or at all: whatever
+    the call asked for may have happened there."""
 
 
 class PeerRefused(HaError):
@@ -625,6 +690,67 @@ def managers_wanted():
     if st['role'] != ROLE_STANDBY:
         return True
     return not st.get('broken') and live_view()
+
+
+# --- forwarded writes ------------------------------------------------------------
+
+def forward_writes():
+    """Whether this instance, as a standby, hands the writes it refuses to the active.
+
+    Per instance and never part of a snapshot; on until an admin switches it off."""
+    value = _load().get('forward_writes', True)
+    return value if isinstance(value, bool) else True
+
+
+def set_forward_writes(value):
+    """Switch forward_writes. Returns True when it changed. Nothing holds on to the
+    value, the next write goes by it."""
+    if not isinstance(value, bool):
+        raise HaError('forward_writes is true or false')
+    with _lock:
+        if value == forward_writes():
+            return False
+        _update(forward_writes=value)
+    return True
+
+
+def forwarding():
+    """True when a write this standby refuses goes to the active right now: forwarding
+    is on and the member it pulls from last answered as active, and did answer the
+    last time this instance tried. False on every other instance. A standby that was
+    removed, or cannot read its state file, has no such member."""
+    st = _load()
+    if st['role'] != ROLE_STANDBY:
+        return False
+    rec = (st.get('members') or {}).get(st.get('source'))
+    return (bool(rec) and rec.get('role_seen') == ROLE_ACTIVE and forward_writes()
+            and _silent_source['id'] != st.get('source'))
+
+
+def sign_in_digest(username):
+    """A digest of this instance's copy of the account's password hash and salt, ''
+    when there is no such account. A standby sends it with a forwarded write: an
+    active whose copy differs has changed the password since, and the session the
+    standby vouches for is one the next sync would end (_end_sessions)."""
+    from pegaprox.core.db import get_db
+    try:
+        row = get_db().conn.cursor().execute(
+            'SELECT password_hash, password_salt FROM users WHERE username = ?', (username,)).fetchone()
+    except Exception as e:
+        logging.warning(f"[HA] could not read the sign-in of {username!r}: {e}")
+        return ''
+    if row is None:
+        return ''
+    return hashlib.sha256(b'pegaprox-ha-sign-in:' + json.dumps([row[0], row[1]]).encode()).hexdigest()
+
+
+def _note_source_heard(member_id, heard):
+    """Whether the member this standby pulls from answered the last call to it."""
+    if heard:
+        if _silent_source['id'] == member_id:
+            _silent_source['id'] = None
+    elif member_id:
+        _silent_source['id'] = member_id
 
 
 # --- what the managers connect with -----------------------------------------------
@@ -1041,17 +1167,21 @@ def _wire_body(json_body):
     return json.dumps(json_body, separators=(',', ':'), sort_keys=True).encode()
 
 
-def _to_sign(method, path, body, ts, nonce, receiver, sender):
+def _body_digest(body):
+    return hashlib.sha256(body or b'').hexdigest()
+
+
+def _to_sign(method, path, body, ts, nonce, receiver, sender, digest=None):
     return '\n'.join(('pegaprox-ha-peer-1', method.upper(), path,
-                      hashlib.sha256(body or b'').hexdigest(), ts, nonce, receiver,
-                      sender)).encode()
+                      digest if digest is not None else _body_digest(body), ts, nonce,
+                      receiver, sender)).encode()
 
 
 def _signed_headers(private, sender, receiver, method, path, body):
-    ts, nonce = str(int(time.time())), secrets.token_urlsafe(18)
-    sig = private.sign(_to_sign(method, path, body, ts, nonce, receiver, sender))
+    ts, nonce, digest = str(int(time.time())), secrets.token_urlsafe(18), _body_digest(body)
+    sig = private.sign(_to_sign(method, path, body, ts, nonce, receiver, sender, digest))
     return {PEER_HEADER: sender, PEER_TS_HEADER: ts, PEER_NONCE_HEADER: nonce,
-            PEER_SIG_HEADER: base64.b64encode(sig).decode()}
+            PEER_SIG_HEADER: base64.b64encode(sig).decode(), PEER_BODY_HEADER: digest}
 
 
 class _Signer:
@@ -1166,6 +1296,41 @@ def _signature_check(headers, method, path, body, sender, public_key, receiver):
 
 def _signature_ok(headers, method, path, body, sender, public_key, receiver):
     return _signature_check(headers, method, path, body, sender, public_key, receiver) == 'ok'
+
+
+def signed_before_body(headers, method, path):
+    """Before the body of a large peer call is read: True when its headers carry a
+    good signature, inside the window, from a member we hold a key of, over the body
+    digest they name. Nothing more - the nonce is not spent here and the body is not
+    known yet; peer_verdict checks both once it is read, and a body that is not the
+    one named fails there."""
+    try:
+        claimed = (headers.get(PEER_HEADER) or '').partition(':')[0]
+        digest = headers.get(PEER_BODY_HEADER)
+        ts, nonce, sig = (headers.get(PEER_TS_HEADER), headers.get(PEER_NONCE_HEADER),
+                          headers.get(PEER_SIG_HEADER))
+        if not (isinstance(digest, str) and _DIGEST_RE.fullmatch(digest)
+                and all(isinstance(v, str) for v in (ts, nonce, sig))
+                and _ID_RE.fullmatch(claimed) and _TS_RE.fullmatch(ts)
+                and _NONCE_RE.fullmatch(nonce) and _SIGNATURE_RE.fullmatch(sig)):
+            return False
+        if abs(time.time() - int(ts)) > SIGNATURE_WINDOW or int(ts) < _PROCESS_STARTED:
+            return False
+        st = _load()
+        rec = (st.get('members') or {}).get(claimed) or {}
+        key = _public_key(rec.get('public_key')) if rec.get('public_key') else None
+        if key is None:
+            return False
+        from cryptography.exceptions import InvalidSignature
+        try:
+            key.verify(base64.b64decode(sig), _to_sign(method, path, None, ts, nonce,
+                                                       st['instance_id'], claimed, digest))
+        except (InvalidSignature, ValueError):
+            return False
+        return True
+    except Exception as e:
+        logging.debug(f"[HA] could not check the headers of a peer call: {e}")
+        return False
 
 
 def _legacy_ok(secret, digest):
@@ -2806,14 +2971,30 @@ def _peer_call(method, base_url, fingerprint, path, json_body=None, auth=None,
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     except Exception:
         pass
+    data = body or None
+    if body and path == FORWARD_PATH:
+        # The envelope of an upload is larger than what the receiving app takes with a
+        # Content-Length before any route has seen the call (PEGAPROX_MAX_REQUEST_SIZE).
+        # Sent in chunks, it meets the cap the forward route sets for itself instead.
+        data = (body[i:i + _FORWARD_CHUNK] for i in range(0, len(body), _FORWARD_CHUNK))
     try:
-        return sess.request(method, url, data=body or None, headers=h, verify=verify,
+        return sess.request(method, url, data=data, headers=h, verify=verify,
                             timeout=timeout, allow_redirects=False)
     except requests.exceptions.SSLError as e:
         if fingerprint:
             raise PeerUnreachable(f'The peer certificate does not match the pinned fingerprint ({type(e).__name__})')
         raise PeerUnreachable('The peer certificate is not trusted by a CA, and no fingerprint is '
                               f'pinned for it ({type(e).__name__})')
+    except (requests.exceptions.ReadTimeout, requests.exceptions.ChunkedEncodingError) as e:
+        raise PeerNoAnswer(f'The peer took the call but sent no answer: {type(e).__name__}')
+    except requests.exceptions.ConnectionError as e:
+        # connected, then dropped before an answer came: the call may have run there.
+        # Refused, unresolvable or timed out while connecting: it never got there
+        from urllib3.exceptions import ProtocolError
+        if (not isinstance(e, requests.exceptions.ConnectTimeout) and e.args
+                and isinstance(e.args[0], ProtocolError)):
+            raise PeerNoAnswer(f'The peer took the call but sent no answer: {type(e).__name__}')
+        raise PeerUnreachable(f'Cannot reach the peer: {type(e).__name__}')
     except requests.exceptions.RequestException as e:
         raise PeerUnreachable(f'Cannot reach the peer: {type(e).__name__}')
     finally:
@@ -2952,6 +3133,78 @@ def pull_once(timeout=PULL_TIMEOUT):
     return result
 
 
+def forward_write(envelope, timeout=FORWARD_TIMEOUT):
+    """Standby: hand one write to the member it pulls from, as a signed call whose body
+    is `envelope` (api/ha.py forward_to_active builds it). Returns the answer; raises
+    PeerUnreachable when the active cannot be reached, and PeerNoAnswer (one of those)
+    when it took the call and sent nothing back: the write may have happened there.
+    Until the active answers again, forwarding() is False."""
+    src = peer() if is_standby() else None
+    if not src:
+        raise HaError('Not paired')
+    try:
+        resp = call_member(src, 'POST', FORWARD_PATH, json_body=envelope,
+                           timeout=(FORWARD_CONNECT_TIMEOUT, timeout))
+    except PeerNoAnswer:
+        # it got there: the active is busy with it, or went down while at it
+        raise
+    except PeerUnreachable:
+        _note_source_heard(src['instance_id'], False)
+        raise
+    _note_source_heard(src['instance_id'], True)
+    return resp
+
+
+_soon_lock = threading.Lock()
+_soon = {'wanted': False, 'running': False}
+
+
+def _in_background(fn, name):
+    threading.Thread(target=fn, daemon=True, name=name).start()
+
+
+def pull_soon():
+    """Standby: one pull right away, in the background, after a write it forwarded went
+    through, so the change shows here without waiting for the interval. Writes that
+    come in while that pull runs get one more pull after it, not one each. Returns
+    True when it started a run."""
+    with _soon_lock:
+        _soon['wanted'] = True
+        if _soon['running']:
+            return False
+        _soon['running'] = True
+    try:
+        _in_background(_pull_soon_run, 'ha-pull-soon')
+    except Exception as e:
+        with _soon_lock:
+            _soon['running'] = False
+        logging.warning(f"[HA] could not start the sync after a forwarded write: {e}")
+        return False
+    return True
+
+
+def _pull_soon_run():
+    finished = False
+    try:
+        while True:
+            with _soon_lock:
+                if not _soon['wanted']:
+                    _soon['running'] = False
+                    finished = True
+                    return
+                _soon['wanted'] = False
+            try:
+                if is_standby() and peer():
+                    pull_once(timeout=PULL_TIMEOUT_FLOOR)
+            except Exception as e:
+                logging.warning(f"[HA] the sync after a forwarded write failed: {_error_text(e)}")
+    finally:
+        if not finished:
+            # killed halfway: the next forwarded write starts a run of its own
+            with _soon_lock:
+                _soon['running'] = False
+
+
 def pull_before_promote(timeout=15):
     """The promote route, before this standby becomes active: one pull from the member
     it follows, so a planned failover starts from the configuration, the member list
@@ -3033,6 +3286,7 @@ def _pull_detail(timeout):
         resp = call_member(src, 'GET', '/api/ha/peer/snapshot',
                            headers={'If-None-Match': etag} if etag else None, timeout=timeout)
         answered = True
+        _note_source_heard(sid, True)
         if resp.status_code == 304:
             now = _now()
             _finish_pull(sid, {'last_attempt_at': started, 'last_ok_at': now, 'last_error': ''},
@@ -3070,6 +3324,8 @@ def _pull_detail(timeout):
         return 'applied', True, ''
     except Exception as e:
         msg = _error_text(e)
+        if not answered and isinstance(e, PeerUnreachable):
+            _note_source_heard(sid, False)
         try:
             _finish_pull(sid, dict({'last_attempt_at': started, 'last_error': msg},
                                    **({'etag': None} if first else {})))
@@ -3232,6 +3488,9 @@ def _ask_members(timeout, refused=None):
         if value[2] == GROUP_MARK:
             notes[mid]['group_seen'] = True
     _last_watch.update(at=time.monotonic(), unreachable=frozenset(unreachable))
+    src = source_id()
+    if src in answers or src in unreachable:
+        _note_source_heard(src, src in answers)
     try:
         _note_members(notes)
     except Exception as e:
@@ -3469,6 +3728,9 @@ def public_status():
         'instance_id': st['instance_id'],
         'interval': int(st.get('interval') or DEFAULT_INTERVAL),
         'live_view': live_view(),
+        # the switch, and whether a refused write goes to the active right now
+        'forward_writes': forward_writes(),
+        'forwarding': forwarding(),
         'managers_running': bool(_run['managers']),
         'broken': st.get('broken') or '',
         # set once a member told this instance it was removed; it is passive then

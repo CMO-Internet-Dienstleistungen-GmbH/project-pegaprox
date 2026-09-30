@@ -17,21 +17,37 @@ route that runs before there is a member, /api/ha/peer/pair, is authenticated by
 pairing code in its body. Peer calls send X-Requested-With and no Origin, which the
 CSRF gate in app.py already accepts, so none of this is exempted there.
 
+A write the block in app.py would refuse on a standby goes to the active instead
+(forward_to_active): the browser's request, the signed-in user and the client address
+travel as the body of a signed peer call, and the active runs the request as that user
+by its own accounts (peer_forward). The consoles are not among them, see app.py.
+
 The state machine behind all of it is pegaprox/core/ha.py; nothing here decides a
 role on its own.
 
 MK Sep 2026
 """
+import base64
+import binascii
+import contextvars
+import hmac
+import io
+import ipaddress
 import logging
+import re
+import sys
+import threading
 import time
 
-from flask import Blueprint, jsonify, request, Response
+from flask import Blueprint, current_app, jsonify, request, Response
+from werkzeug.exceptions import RequestEntityTooLarge
 
 from pegaprox.core import ha
 from pegaprox.models.permissions import ROLE_ADMIN
 from pegaprox.utils.auth import require_auth, build_authz_user
 from pegaprox.utils.audit import log_audit, get_client_ip
 from pegaprox.utils.ratelimit import SlidingWindow
+from pegaprox.utils.sanitization import sanitize_log_message
 from pegaprox.api.helpers import safe_error, effective_reverse_proxy
 
 bp = Blueprint('ha', __name__)
@@ -51,6 +67,27 @@ _REAUTH_MAX_AGE = 600
 # A peer call's body is read whole before the caller is known, so it is capped: the
 # notices are a few bytes, the snapshot is a GET.
 _MAX_PEER_BODY = 64 * 1024
+# A forwarded write carries its body in base64, an upload of up to FORWARD_MAX_BODY
+# included. Read that far only when the header names a member that signs its calls.
+_MAX_FORWARD_ENVELOPE = 4 * ((ha.FORWARD_MAX_BODY + 2) // 3) + 64 * 1024
+
+# What a standby forwards, and what of the active's answer reaches the browser besides
+# the status and the body.
+_FORWARD_METHODS = ('POST', 'PUT', 'PATCH', 'DELETE')
+_FORWARD_HEADERS = ('Content-Type', 'Content-Disposition', 'Retry-After')
+FORWARD_UNREACHABLE_ERROR = ('The active instance cannot be reached - act again once it is '
+                             'back, or promote this standby')
+FORWARD_NO_ANSWER_ERROR = ('The active instance took the change but did not answer in time - '
+                           'it may still be carrying it out. Check there before you try again')
+_CONTROL_RE = re.compile(r'[\x00-\x1f\x7f]')
+# Every write a standby forwards reaches the active from the standby's address, so they
+# all share the one per-address API budget there with the standby's own sync. One user
+# gets half of it.
+_forward_per_user = SlidingWindow(limit=600, window=60, max_keys=4096, name='ha-forward')
+# A large body is held a few times over on both instances while it travels: only a few
+# at once, the rest hear 503 and try again
+_FORWARD_LARGE = 1024 * 1024
+_forward_large_slots = threading.BoundedSemaphore(4)
 
 
 def _body():
@@ -192,6 +229,202 @@ def standby_console_refusal():
     return jsonify({'code': 'HA_STANDBY', 'error': STANDBY_CONSOLE_ERROR}), 409
 
 
+# --- forwarded writes, the standby's half ------------------------------------------
+
+def forward_to_active(read=False):
+    """The answer for a write the block in app.py would refuse on this standby, when it
+    goes to the active instead. None when it does not, and the block refuses it as
+    before: not a write method, no browser session behind it (an API token is nobody
+    the standby can vouch for), forwarding switched off, or the member it pulls from
+    not seen active.
+
+    read: a GET of ha.FORWARDED_READS, the progress of a job the active runs. The same
+    way there, with a short timeout; None whenever it does not come back whole, and
+    the route answers from this instance.
+
+    The active runs the request as the signed-in user, checked against its own
+    accounts, and its status, body and content headers come back as they are. 413
+    above ha.FORWARD_MAX_BODY, read no further than that; 503 HA_ACTIVE_UNREACHABLE
+    when the active cannot be reached, 504 HA_FORWARD_NO_ANSWER when it took the call
+    and did not answer (the change may have happened there); 429 past one user's
+    share, 503 HA_FORWARD_BUSY while other large bodies are on their way. A write that
+    went through (2xx) starts a pull right away. An account whose password changed on
+    the active since our last sync gets 401 and a sync, which ends the session here."""
+    if request.environ.get(ha.FORWARD_ENVIRON) is not None:
+        # a forwarded call that met an instance which stepped down meanwhile ends here
+        return None
+    if request.method not in (('GET',) if read else _FORWARD_METHODS):
+        return None
+    if request.headers.get('Authorization', '').startswith('Bearer pgx_'):
+        return None
+    from pegaprox.utils.auth import validate_session
+    session = validate_session(request.headers.get('X-Session-ID') or request.cookies.get('session_id'))
+    if not session:
+        return None
+    if not ha.forwarding():
+        return None
+    if not _forward_per_user.allow(session['user']):
+        resp = jsonify({'error': 'Too many changes through this standby at once - slow down, or '
+                                 'make them on the active instance'})
+        resp.headers['Retry-After'] = '60'
+        return resp, 429
+
+    if read:
+        return _forward_read(session)
+    large = request.content_length is None or request.content_length > _FORWARD_LARGE
+    if large and not _forward_large_slots.acquire(blocking=False):
+        resp = jsonify({'code': 'HA_FORWARD_BUSY',
+                        'error': 'This standby is handing other large changes to the active '
+                                 'instance - try again in a moment'})
+        resp.headers['Retry-After'] = '10'
+        return resp, 503
+    try:
+        return _forward(session)
+    finally:
+        if large:
+            _forward_large_slots.release()
+
+
+def _forward(session):
+    too_large = (jsonify({'code': 'HA_FORWARD_TOO_LARGE',
+                          'error': f'Too large to hand to the active instance - at most '
+                                   f'{ha.FORWARD_MAX_BODY // (1024 * 1024)} MB. Make this '
+                                   f'change on the active instance'}), 413)
+    try:
+        # werkzeug refuses a Content-Length above the cap before reading a byte, and cuts
+        # a body without one at the cap without a word: one byte more tells a cut body
+        # from a whole one. Not cached: no route runs here after this
+        request.max_content_length = min(request.max_content_length or ha.FORWARD_MAX_BODY + 1,
+                                         ha.FORWARD_MAX_BODY + 1)
+        body = request.get_data(cache=False)
+    except RequestEntityTooLarge:
+        return too_large
+    if len(body) > ha.FORWARD_MAX_BODY:
+        return too_large
+
+    envelope = _envelope_for(session, body)
+    del body
+    # the path is the browser's: no line breaks of its into our log
+    what = sanitize_log_message(f'{request.method} {request.path}')
+    try:
+        resp = ha.forward_write(envelope)
+    except ha.PeerNoAnswer as e:
+        logging.warning(f"[HA] forwarded {what}, no answer from the active: {ha._error_text(e)}")
+        return jsonify({'code': 'HA_FORWARD_NO_ANSWER', 'error': FORWARD_NO_ANSWER_ERROR}), 504
+    except ha.HaError as e:
+        logging.warning(f"[HA] could not forward {what}: {ha._error_text(e)}")
+        return jsonify({'code': 'HA_ACTIVE_UNREACHABLE', 'error': FORWARD_UNREACHABLE_ERROR}), 503
+
+    if resp.status_code == 200:
+        answer = _forwarded_answer(resp)
+        if answer is not None:
+            status, headers, content = answer
+            if 200 <= status < 300:
+                ha.pull_soon()
+            return Response(content, status=status, headers=headers)
+        why = 'The active instance sent an answer this version does not read'
+    elif resp.status_code == 403 and _answer_code(resp) == 'HA_FORWARD_STALE_SIGN_IN':
+        # the password changed there: the sync ends this session, the browser signs in
+        ha.pull_soon()
+        return jsonify({'code': 'HA_FORWARD_STALE_SIGN_IN',
+                        'error': 'Your password was changed on the active instance - sign in '
+                                 'again'}), 401
+    elif resp.status_code in (409, 410):
+        # not active any more, or it took us out of the group: we refuse as a standby
+        logging.warning(f"[HA] the active instance refused a forwarded {what} "
+                        f"(HTTP {resp.status_code})")
+        return None
+    elif resp.status_code == 403 and _answer_code(resp) == 'HA_FORWARD_USER':
+        # the account is not there, or disabled, on the active: its words
+        return jsonify(resp.json()), 403
+    elif resp.status_code == 413:
+        # a proxy in front of the active, or its own size cap for requests
+        return jsonify({'code': 'HA_FORWARD_TOO_LARGE',
+                        'error': 'Too large for the active instance to take - make this '
+                                 'change on the active instance'}), 413
+    elif resp.status_code in (404, 405):
+        why = ('The active instance runs a release that does not take changes from a '
+               'standby - update it, or make the change there')
+    else:
+        why = ha._peer_error(resp, 'The active instance refused the change')
+    logging.warning(f"[HA] forwarding {what} failed: {why}")
+    return jsonify({'code': 'HA_FORWARD_REFUSED', 'error': why}), 502
+
+
+def _envelope_for(session, body):
+    return {
+        'method': request.method,
+        'path': request.path,
+        'query': request.query_string.decode('latin-1'),
+        'content_type': request.headers.get('Content-Type', ''),
+        'body_b64': base64.b64encode(body).decode('ascii'),
+        'user': session['user'],
+        'sign_in': ha.sign_in_digest(session['user']),
+        'client_ip': _plain_client_ip(),
+    }
+
+
+def _forward_read(session):
+    """A job's progress from the active, or None for our own copy."""
+    try:
+        resp = ha.forward_write(_envelope_for(session, b''), timeout=ha.FORWARD_READ_TIMEOUT)
+    except ha.HaError as e:
+        logging.debug(f"[HA] could not fetch {sanitize_log_message(request.path)} from the "
+                      f"active: {ha._error_text(e)}")
+        return None
+    answer = _forwarded_answer(resp) if resp.status_code == 200 else None
+    if answer is None:
+        if resp.status_code == 403 and _answer_code(resp) == 'HA_FORWARD_STALE_SIGN_IN':
+            ha.pull_soon()
+        return None
+    status, headers, content = answer
+    return Response(content, status=status, headers=headers)
+
+
+def _plain_client_ip():
+    """The client address for the envelope, as the active checks it: a trusted proxy
+    may hand on '1.2.3.4:5678', '[v6]:port' or 'unknown'. Anything that is not an
+    address after taking the port off is the address the call came from here."""
+    raw = (get_client_ip() or '').strip()
+    candidates = [raw]
+    if raw.startswith('[') and ']' in raw:
+        candidates.append(raw[1:raw.index(']')])
+    elif raw.count(':') == 1:
+        candidates.append(raw.partition(':')[0])
+    for value in candidates + [request.remote_addr or '']:
+        try:
+            return str(ipaddress.ip_address(value))
+        except ValueError:
+            continue
+    return '0.0.0.0'
+
+
+def _answer_code(resp):
+    try:
+        data = resp.json()
+    except Exception:
+        return ''
+    return (data.get('code') or '') if isinstance(data, dict) else ''
+
+
+def _forwarded_answer(resp):
+    """(status, headers, body) from the active's answer to a forwarded write, None when
+    it is not one."""
+    try:
+        data = resp.json()
+        status, headers = data['status'], data['headers']
+        content = base64.b64decode(data['body_b64'], validate=True)
+    except Exception:
+        return None
+    if isinstance(status, bool) or not isinstance(status, int) or not 100 <= status <= 599:
+        return None
+    if not isinstance(headers, dict):
+        return None
+    out = [(name, value) for name, value in headers.items()
+           if name in _FORWARD_HEADERS and isinstance(value, str) and not _CONTROL_RE.search(value)]
+    return status, out, content
+
+
 # --- admin -----------------------------------------------------------------------
 
 @bp.route('/api/ha/status', methods=['GET'])
@@ -202,7 +435,8 @@ def ha_status():
     members lists every other instance of the group, is_source marks the one a
     standby pulls from; peer is that one (or the first member) for older readers.
     suggested_url and own_fingerprint are what a pairing code made here would carry,
-    so the UI can prefill the form."""
+    so the UI can prefill the form. forward_writes is this instance's switch, forwarding
+    whether a standby hands its writes to the active right now."""
     denied = _refuse_confined_admin()
     if denied:
         return denied
@@ -477,18 +711,23 @@ def remove_member(instance_id):
 @bp.route('/api/ha/settings', methods=['PUT'])
 @require_auth(roles=[ROLE_ADMIN])
 def update_settings():
-    """How often the standby pulls and the active looks at its peer, and the live view.
+    """How often the standby pulls and the active looks at its peer, the live view, and
+    whether this instance as a standby forwards writes.
 
     interval is in seconds. live_view is this instance's own switch: on, a standby
-    connects to the clusters read-only; off, it holds no connection at all. Either one
-    or both. A standby restarts when live_view changes, because it sets its connections
-    up once per process; any other role only keeps the value for when it follows."""
+    connects to the clusters read-only; off, it holds no connection at all. A standby
+    restarts when live_view changes, because it sets its connections up once per
+    process; any other role only keeps the value for when it follows. forward_writes,
+    also this instance's own: on, a standby hands the writes of its signed-in users to
+    the active; off, it refuses them. It counts from the next write. Any of the three,
+    or several."""
     denied = _refuse_confined_admin()
     if denied:
         return denied
     data = _body()
-    if 'interval' not in data and 'live_view' not in data:
-        return jsonify({'error': 'Nothing to change - send interval, live_view or both'}), 400
+    if 'interval' not in data and 'live_view' not in data and 'forward_writes' not in data:
+        return jsonify({'error': 'Nothing to change - send interval, live_view, forward_writes '
+                                 'or several of them'}), 400
     interval = data.get('interval')
     if 'interval' in data and (isinstance(interval, bool) or not isinstance(interval, int)
                                or not _MIN_INTERVAL <= interval <= _MAX_INTERVAL):
@@ -497,6 +736,9 @@ def update_settings():
     live = data.get('live_view')
     if 'live_view' in data and not isinstance(live, bool):
         return jsonify({'error': 'live_view is true or false'}), 400
+    forward = data.get('forward_writes')
+    if 'forward_writes' in data and not isinstance(forward, bool):
+        return jsonify({'error': 'forward_writes is true or false'}), 400
     status = ha.public_status()
     if status['broken']:
         # saving now would write the placeholder state over the file that could not be
@@ -516,6 +758,19 @@ def update_settings():
             return jsonify({'error': safe_error(e, 'Could not save the interval')}), 500
         log_audit(_user(), 'ha.settings_changed', f'sync interval {before}s -> {interval}s')
         out['interval'] = interval
+
+    # before the live view, which may restart this standby
+    if 'forward_writes' in data:
+        try:
+            changed = ha.set_forward_writes(forward)
+        except ha.HaError as e:
+            return jsonify({'error': str(e)}), 409
+        except Exception as e:
+            return jsonify({'error': safe_error(e, 'Could not save the forwarding switch')}), 500
+        if changed:
+            log_audit(_user(), 'ha.settings_changed',
+                      f"forwarding writes to the active instance {'on' if forward else 'off'}")
+        out['forward_writes'] = forward
 
     if 'live_view' in data:
         was = ha.live_view()
@@ -585,16 +840,40 @@ def request_peer():
     verdict = (None, None)
     try:
         plain = not request.query_string and '?' not in request.path
-        if plain and (request.content_length is None or request.content_length <= _MAX_PEER_BODY):
-            request.max_content_length = _MAX_PEER_BODY
+        limit = _peer_body_limit()
+        if plain and (request.content_length is None or request.content_length <= limit):
+            request.max_content_length = limit
             body = request.get_data(cache=True)
-            if len(body) <= _MAX_PEER_BODY:
+            if len(body) <= limit:
                 verdict = ha.peer_verdict(request.headers, request.method, request.path, body)
     except Exception as e:
         logging.warning(f"[HA] could not check a peer call to {request.path}: {e}")
         verdict = (None, None)
     env[_PEER_VERDICT] = verdict
     return verdict
+
+
+def _peer_body_limit():
+    """How much of a peer call is read before its sender is known. A forwarded write
+    carries an upload, and it comes in chunks (ha._peer_call), past the size check the
+    app makes on a Content-Length; its cap is set here, on the active, and only for a
+    call whose headers are signed by a member we hold a key of, over the digest of the
+    body to come. Everything else is a few bytes."""
+    if (request.method == 'POST' and request.path == ha.FORWARD_PATH and ha.is_active()
+            and signed_member_call()):
+        return _MAX_FORWARD_ENVELOPE
+    return _MAX_PEER_BODY
+
+
+def signed_member_call():
+    """Whether this request's headers carry a good signature of a member, checked
+    before its body is read (ha.signed_before_body), once per request. The rate limit
+    in app.py and the read limit above go by it; the route still checks the whole
+    call."""
+    key = 'pegaprox.ha_signed_headers'
+    if key not in request.environ:
+        request.environ[key] = ha.signed_before_body(request.headers, request.method, request.path)
+    return request.environ[key]
 
 
 @bp.after_request
@@ -845,3 +1124,183 @@ def peer_tombstones():
                   f"member {p.get('url') or p['instance_id']} holds a tombstone for member {mid}, "
                   f"which is out of the group here too", ip_address=get_client_ip())
     return jsonify({'success': True, 'taken': taken})
+
+
+# --- forwarded writes, the active's half ---------------------------------------------
+
+@bp.route('/api/ha/peer/forward', methods=['POST'])
+def peer_forward():
+    """A write a standby would have refused, handed to us to run as the user it names.
+
+    The body is {method, path, query, content_type, body_b64, user, sign_in,
+    client_ip}, the browser's request as the standby took it, and the peer signature
+    covers it like the body of every peer call: neither the request nor the user can
+    change on the way. Only on the active (409 anywhere else, which also stops a write
+    that would travel on), only from a member that signs its calls, only a write under
+    /api/ and never under /api/ha/ - or a GET of ha.FORWARDED_READS, the progress of a
+    job - and only for an account that exists and is enabled here. sign_in is the
+    standby's digest of the account's password (ha.sign_in_digest): 403
+    HA_FORWARD_STALE_SIGN_IN when ours differs, the password changed here since.
+    The request then goes through our routing and every check on the way, CSRF and
+    the IP list included, under a session for that user that holds for this one
+    request: role, tenant and permissions are ours, whatever the standby thinks of
+    them. Its audit lines name the standby and carry the client address the standby
+    saw. The answer is {status, headers, body_b64}."""
+    p, refused = _peer_or_refuse()
+    if refused:
+        return refused
+    if not p.get('keyed'):
+        # a member that still goes by its old secret signs nothing, the body included
+        return jsonify({'code': 'HA_FORWARD_UNSIGNED',
+                        'error': 'Only a member that signs its calls can hand over a change'}), 401
+    if ha.role() != ha.ROLE_ACTIVE:
+        return jsonify({'code': 'HA_STANDBY', 'error': 'This instance is not active'}), 409
+    call, bad = _forward_envelope(_peer_body())
+    if bad:
+        return jsonify({'code': 'HA_FORWARD_INVALID', 'error': bad}), 400
+    try:
+        from pegaprox.core.db import get_db
+        user = get_db().get_user(call['user'])
+    except Exception as e:
+        logging.warning(f"[HA] could not read the account of {call['user']} for a forwarded write: {e}")
+        user = None
+    if not isinstance(user, dict) or not user.get('enabled', True):
+        return jsonify({'code': 'HA_FORWARD_USER',
+                        'error': 'This account does not exist on the active instance, or it is '
+                                 'disabled there'}), 403
+    if not hmac.compare_digest(call['sign_in'], ha.sign_in_digest(call['user'])):
+        # its password changed here since the standby's last sync: the session it
+        # vouches for is one that sync ends
+        return jsonify({'code': 'HA_FORWARD_STALE_SIGN_IN',
+                        'error': 'The password of this account changed on the active instance'}), 403
+    via = p.get('url') or p['instance_id']
+    status, headers, body = _run_forwarded(call, user, via)
+    (logging.debug if call['method'] == 'GET' else logging.info)(
+        f"[HA] {call['method']} {call['path']} for {call['user']} via standby {via} "
+        f"(client {call['client_ip']}): {status}")
+    return jsonify({'status': status, 'headers': headers,
+                    'body_b64': base64.b64encode(body).decode('ascii')})
+
+
+def _text(value, limit):
+    return isinstance(value, str) and len(value) <= limit and not _CONTROL_RE.search(value)
+
+
+def _forward_envelope(data):
+    """(the call, None) from a forward body, or (None, what is wrong with it)."""
+    method, path = data.get('method'), data.get('path')
+    if method not in _FORWARD_METHODS and method != 'GET':
+        return None, 'method is POST, PUT, PATCH or DELETE, or GET for a job\'s progress'
+    # routing goes by the path as it stands (no dot segments resolved, a double slash
+    # redirects), so the prefix is what decides
+    if not _text(path, 4096) or not path.startswith('/api/') or path.startswith('/api/ha/'):
+        return None, 'path is under /api/, and not under /api/ha/'
+    if method == 'GET' and _read_rule(path) not in ha.FORWARDED_READS:
+        return None, 'a read is the progress of a job, nothing else'
+    sign_in = data.get('sign_in')
+    if not isinstance(sign_in, str) or not (sign_in == '' or re.fullmatch(r'[0-9a-f]{64}', sign_in)):
+        return None, 'sign_in is the digest of the account\'s sign-in'
+    query, content_type = data.get('query', ''), data.get('content_type', '')
+    if not _text(query, 8192) or not _text(content_type, 1024):
+        return None, 'query and content_type are short strings'
+    user = data.get('user')
+    if not _text(user, 255) or not user:
+        return None, 'user names the account'
+    try:
+        client_ip = str(ipaddress.ip_address(data.get('client_ip')))
+    except (TypeError, ValueError):
+        return None, 'client_ip is an IP address'
+    raw = data.get('body_b64', '')
+    if not isinstance(raw, str) or len(raw) > _MAX_FORWARD_ENVELOPE:
+        return None, 'body_b64 is the body in base64'
+    try:
+        body = base64.b64decode(raw, validate=True)
+    except (binascii.Error, ValueError):
+        return None, 'body_b64 is the body in base64'
+    if len(body) > ha.FORWARD_MAX_BODY:
+        return None, f'the body is larger than {ha.FORWARD_MAX_BODY} bytes'
+    if method == 'GET' and body:
+        return None, 'a read has no body'
+    return {'method': method, 'path': path, 'query': query, 'content_type': content_type,
+            'body': body, 'user': user, 'sign_in': sign_in, 'client_ip': client_ip}, None
+
+
+def _read_rule(path):
+    """The GET rule this app serves `path` with, or None."""
+    try:
+        rule, _ = current_app.url_map.bind('localhost').match(path, method='GET', return_rule=True)
+    except Exception:
+        return None
+    return rule.rule
+
+
+def _run_forwarded(call, user, via):
+    """Run the call through this app as its user: (status, headers, body)."""
+    from pegaprox.utils.auth import open_forwarded_session, end_forwarded_session
+    outer = request.environ
+    sid = open_forwarded_session(call['user'], user.get('role') or 'viewer', call['client_ip'], via)
+    environ = {
+        'REQUEST_METHOD': call['method'],
+        'SCRIPT_NAME': '',
+        # WSGI carries the path as the latin-1 text of its UTF-8 bytes
+        'PATH_INFO': call['path'].encode('utf-8').decode('latin-1'),
+        'QUERY_STRING': call['query'],
+        'SERVER_NAME': outer.get('SERVER_NAME') or 'localhost',
+        'SERVER_PORT': outer.get('SERVER_PORT') or '443',
+        'SERVER_PROTOCOL': 'HTTP/1.1',
+        'REMOTE_ADDR': call['client_ip'],
+        'HTTP_HOST': request.host,
+        # the marker of the UI's own calls, and no foreign Origin: the CSRF gate takes it
+        # like any same-origin call. No Origin of ours either, the gate compares an IPv6
+        # host with its brackets against one without
+        'HTTP_X_REQUESTED_WITH': 'XMLHttpRequest',
+        'HTTP_X_SESSION_ID': sid,
+        'HTTP_USER_AGENT': f'PegaProx standby {via}'[:200],
+        'CONTENT_LENGTH': str(len(call['body'])),
+        'wsgi.version': (1, 0),
+        'wsgi.url_scheme': outer.get('wsgi.url_scheme') or 'https',
+        'wsgi.input': io.BytesIO(call['body']),
+        'wsgi.errors': outer.get('wsgi.errors') or sys.stderr,
+        'wsgi.multithread': bool(outer.get('wsgi.multithread')),
+        'wsgi.multiprocess': False,
+        'wsgi.run_once': False,
+        ha.FORWARD_ENVIRON: {'session': sid, 'via': via, 'client_ip': call['client_ip']},
+    }
+    if call['content_type']:
+        environ['CONTENT_TYPE'] = call['content_type']
+    try:
+        # a request of its own: flask.g and the contexts of this peer call stay out of it
+        return contextvars.Context().run(_dispatch, current_app._get_current_object(), environ)
+    finally:
+        end_forwarded_session(sid)
+
+
+def _dispatch(app, environ):
+    started, chunks = {}, []
+
+    def start_response(status, headers, exc_info=None):
+        started['status'], started['headers'] = status, headers
+        return chunks.append
+
+    result = app(environ, start_response)
+    size, too_large = 0, False
+    try:
+        for chunk in result:
+            size += len(chunk)
+            if size > ha.FORWARD_MAX_BODY:
+                too_large = True
+                break
+            chunks.append(chunk)
+    finally:
+        close = getattr(result, 'close', None)
+        if close:
+            close()
+    if too_large:
+        # done here, but more than the standby takes back
+        return 502, {'Content-Type': 'application/json'}, (
+            b'{"error":"The change was made, but its answer is too large to pass on - '
+            b'fetch it on the active instance"}')
+    status = int(str(started.get('status') or '500').split(' ', 1)[0])
+    wanted = {name.lower(): name for name in _FORWARD_HEADERS}
+    headers = {wanted[k.lower()]: v for k, v in started.get('headers') or () if k.lower() in wanted}
+    return status, headers, b''.join(chunks)

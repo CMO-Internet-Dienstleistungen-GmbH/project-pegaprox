@@ -704,7 +704,7 @@ def test_the_standby_banner_says_whether_the_view_is_live(ha_env, db, tmp_path, 
     live.value = on
     body = api.anon().post('/api/auth/login', json=creds).get_json()
     want = {'role': 'standby', 'peer_url': ACTIVE_URL,
-            'last_sync_at': '2026-09-30T08:00:00+00:00', 'live_view': on}
+            'last_sync_at': '2026-09-30T08:00:00+00:00', 'live_view': on, 'forwarding': False}
     assert body['ha'] == want
     check = api.anon().get('/api/auth/check', headers={'X-Session-ID': body['session_id']})
     assert check.get_json()['ha'] == want

@@ -107,6 +107,17 @@ def cleanup_audit_log():
     except Exception as e:
         logging.error(f"Failed to cleanup audit log: {e}")
 
+def _via_standby():
+    """The standby a write came through while this active runs it for one (#625), ''
+    for anything else. The client address is the request's own there: the one the
+    standby saw."""
+    if not has_request_context():
+        return ''
+    from pegaprox.core.ha import FORWARD_ENVIRON
+    mark = request.environ.get(FORWARD_ENVIRON)
+    return str(mark.get('via') or '') if isinstance(mark, dict) else ''
+
+
 def log_audit(user: str, action: str, details: str = None, ip_address: str = None, cluster: str = None):
     """Add an entry to the audit log
     
@@ -114,6 +125,10 @@ def log_audit(user: str, action: str, details: str = None, ip_address: str = Non
     """
     global audit_log
     
+    via = _via_standby()
+    if via:
+        details = f'{details} (via standby {via})' if details else f'via standby {via}'
+
     entry = {
         'timestamp': datetime.now().isoformat(),
         'user': user,

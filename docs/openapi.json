@@ -43283,7 +43283,7 @@
           }
         },
         "summary": "Role, epoch, members and last sync of this instance.",
-        "description": "members lists every other instance of the group, is_source marks the one a\nstandby pulls from; peer is that one (or the first member) for older readers.\nsuggested_url and own_fingerprint are what a pairing code made here would carry,\nso the UI can prefill the form.",
+        "description": "members lists every other instance of the group, is_source marks the one a\nstandby pulls from; peer is that one (or the first member) for older readers.\nsuggested_url and own_fingerprint are what a pairing code made here would carry,\nso the UI can prefill the form. forward_writes is this instance's switch, forwarding\nwhether a standby hands its writes to the active right now.",
         "x-pegaprox-auth": "decorator",
         "security": [
           {
@@ -43603,8 +43603,8 @@
             "description": "Insufficient permissions"
           }
         },
-        "summary": "How often the standby pulls and the active looks at its peer, and the live view.",
-        "description": "interval is in seconds. live_view is this instance's own switch: on, a standby\nconnects to the clusters read-only; off, it holds no connection at all. Either one\nor both. A standby restarts when live_view changes, because it sets its connections\nup once per process; any other role only keeps the value for when it follows.",
+        "summary": "How often the standby pulls and the active looks at its peer, the live view, and whether this instance as a standby forwards writes.",
+        "description": "interval is in seconds. live_view is this instance's own switch: on, a standby\nconnects to the clusters read-only; off, it holds no connection at all. A standby\nrestarts when live_view changes, because it sets its connections up once per\nprocess; any other role only keeps the value for when it follows. forward_writes,\nalso this instance's own: on, a standby hands the writes of its signed-in users to\nthe active; off, it refuses them. It counts from the next write. Any of the three,\nor several.",
         "requestBody": {
           "required": false,
           "content": {
@@ -43907,6 +43907,46 @@
         },
         "summary": "A member holds tombstones for members this active still lists.",
         "description": "The removal happened while this instance could not hear about it, and it was\npromoted since. tombstones is the list as the member list carries it. Each one is\ntaken only for a member that has not answered as a standby under our epoch, asked\nonce more first, and whose credentials it names; taken lists the ones that were.\nAnywhere but on the active nothing changes.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "inline",
+        "security": [
+          {
+            "haPeer": []
+          }
+        ]
+      }
+    },
+    "/api/ha/peer/forward": {
+      "post": {
+        "operationId": "ha.peer_forward_post",
+        "tags": [
+          "ha"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not the paired instance"
+          },
+          "410": {
+            "description": "HA_REMOVED: the caller was removed from the group"
+          }
+        },
+        "summary": "A write a standby would have refused, handed to us to run as the user it names.",
+        "description": "The body is {method, path, query, content_type, body_b64, user, sign_in,\nclient_ip}, the browser's request as the standby took it, and the peer signature\ncovers it like the body of every peer call: neither the request nor the user can\nchange on the way. Only on the active (409 anywhere else, which also stops a write\nthat would travel on), only from a member that signs its calls, only a write under\n/api/ and never under /api/ha/ - or a GET of ha.FORWARDED_READS, the progress of a\njob - and only for an account that exists and is enabled here. sign_in is the\nstandby's digest of the account's password (ha.sign_in_digest): 403\nHA_FORWARD_STALE_SIGN_IN when ours differs, the password changed here since.\nThe request then goes through our routing and every check on the way, CSRF and\nthe IP list included, under a session for that user that holds for this one\nrequest: role, tenant and permissions are ours, whatever the standby thinks of\nthem. Its audit lines name the standby and carry the client address the standby\nsaw. The answer is {status, headers, body_b64}.",
         "requestBody": {
           "required": false,
           "content": {

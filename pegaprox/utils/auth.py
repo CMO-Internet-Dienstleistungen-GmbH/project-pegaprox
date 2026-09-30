@@ -631,9 +631,11 @@ def save_sessions():
         for sid in expired:
             del active_sessions[sid]
         
-        # Save to database
+        # Save to database - without the sessions of forwarded writes, which hold for
+        # one request in this process and nowhere else
         db = get_db()
-        db.save_all_sessions(active_sessions)
+        db.save_all_sessions({sid: sess for sid, sess in active_sessions.items()
+                              if not sess.get('ha_forward')})
         
     except Exception as e:
         logging.error(f"Failed to save sessions: {e}")
@@ -701,8 +703,10 @@ def create_session(username: str, role: str, remember: bool = False) -> str:
     with sessions_lock:
         # Session rotation: invalidate existing sessions for this user
         # MK: keep max 3 sessions per user (browser, phone, etc)
+        # not the one-request session of a write a standby forwarded (#625), it ends
+        # on its own a moment later
         user_sessions = [(sid, sess) for sid, sess in active_sessions.items()
-                         if sess.get('user') == username]
+                         if sess.get('user') == username and not sess.get('ha_forward')]
 
         # Sort by last_activity, remove oldest if more than 2 (new one will be 3rd)
         if len(user_sessions) >= 3:
@@ -760,6 +764,11 @@ def validate_session(session_id: str) -> dict:
         save_sessions()
         return None
 
+    # MK Sep 2026 (#625) - a session the active opened for a write a standby forwarded
+    # holds inside that one request and nowhere else (open_forwarded_session)
+    if session.get('ha_forward') and not _serves_forwarded_write(session_id):
+        return None
+
     # MK: security audit — IP binding. Default: log-only (mobile roaming friendly).
     # NS 2026-04-24: when `strict_session_ip` is enabled in server settings, invalidate
     # the session on IP change so a hijacked cookie can't be used from a different
@@ -793,6 +802,48 @@ def validate_session(session_id: str) -> dict:
         pass
 
     return session
+
+def open_forwarded_session(username: str, role: str, ip: str, via: str) -> str:
+    """A session for one write a standby forwarded to this active instance (#625).
+
+    The route runs the write as `username` under it, so require_auth and everything
+    after it see an ordinary session: role and permissions come from our users table
+    as for any other. Unlike create_session it ends none of the user's own sessions
+    and saves nothing. validate_session takes it only inside the request that carries
+    it (ha.FORWARD_ENVIRON), and end_forwarded_session drops it right after.
+    """
+    session_id = generate_session_id()
+    now = time.time()
+    with sessions_lock:
+        active_sessions[session_id] = {
+            'user': username,
+            'role': role,
+            'created_at': now,
+            'last_activity': now,
+            'ip': ip,
+            'user_agent': f'via standby {via}'[:200],
+            'remember': False,
+            'ha_forward': via,
+        }
+    return session_id
+
+
+def end_forwarded_session(session_id: str):
+    with sessions_lock:
+        active_sessions.pop(session_id, None)
+
+
+def _serves_forwarded_write(session_id: str) -> bool:
+    try:
+        from flask import request as _req, has_request_context
+        if not has_request_context():
+            return False
+        from pegaprox.core.ha import FORWARD_ENVIRON
+        mark = _req.environ.get(FORWARD_ENVIRON)
+        return isinstance(mark, dict) and mark.get('session') == session_id
+    except Exception:
+        return False
+
 
 def invalidate_session(session_id: str):
     """Invalidate a session (logout)"""

@@ -361,6 +361,21 @@ def test_an_admin_without_totp_is_let_in_on_a_standby(ha_env, db, tmp_path, monk
     assert len(_audit('ha.standby_2fa_skipped')) == 2
 
 
+def test_a_standby_that_forwards_enrols_its_admins_too(ha_env, db, tmp_path, monkeypatch, force_2fa):
+    """While the standby hands its writes to the active, enrolment goes there like any
+    other change: nobody skips it. Once it cannot (the active does not answer), the
+    admin gets in again, as above."""
+    from pegaprox.core import ha
+    creds = _local_user(db, tmp_path, monkeypatch, 'breakglass', role='admin')
+    _standby_of_active(ha_env, forward_writes=True)
+    assert ha.forwarding() is True
+    assert _login_and_check(ha_env.api, creds) == (True, True)
+    assert _audit('ha.standby_2fa_skipped') == []
+    ha._note_source_heard(A_ID, False)
+    assert _login_and_check(ha_env.api, creds) == (False, False)
+    assert len(_audit('ha.standby_2fa_skipped')) == 1
+
+
 def test_everyone_else_still_enrols(ha_env, db, tmp_path, monkeypatch, force_2fa):
     """Counterproof: the same admin on an active or a standalone, and a non-admin on
     the standby, are still sent to the enrolment."""

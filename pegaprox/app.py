@@ -138,7 +138,14 @@ def create_app():
         if request.path.startswith('/api/'):
             skip_paths = ['/api/auth/login', '/api/auth/check', '/api/events', '/api/health', '/api/sse',
                           '/api/vmware/migrations']
-            if not any(request.path.startswith(p) for p in skip_paths):
+            # MK Sep 2026 (#625) - a group member's signed call is not a client: every
+            # write a standby forwards comes from its one address, next to its sync, and
+            # the forwarded request counts against the client's own address inside
+            peer_call = False
+            if request.path.startswith('/api/ha/peer/'):
+                from pegaprox.api.ha import signed_member_call
+                peer_call = signed_member_call()
+            if not peer_call and not any(request.path.startswith(p) for p in skip_paths):
                 # NS: Mar 2026 - use centralized get_client_ip, respects trusted_proxies
                 from pegaprox.utils.audit import get_client_ip
                 client_ip = get_client_ip()
@@ -394,8 +401,9 @@ def create_app():
     # order, and the IP allow list is hooked in by the settings blueprint above, so
     # this runs after the CSRF, rate-limit and IP checks.
     # Open on a standby: the pairing/promotion routes and signing in and out. A TOTP
-    # code travels inside /api/auth/login; /api/auth/2fa/* is enrolment and stays shut,
-    # like setup, password changes, tokens and preferences.
+    # code travels inside /api/auth/login. Enrolment (/api/auth/2fa/*), setup, password
+    # changes, tokens and preferences are writes like any other: refused here, and
+    # forwarded to the active while forwarding is on.
     _STANDBY_WRITABLE = (
         '/api/auth/login',
         '/api/auth/logout',
@@ -440,10 +448,64 @@ def create_app():
     # which one it got, so a GET reaches their write paths too. On a standby the whole
     # proxy is shut, whatever the method.
     _PLUGIN_PROXY_RULE = '/api/plugins/<plugin_id>/api/<path:subpath>'
+    # v3: a write refused here goes to the active instead, when a signed-in browser sent
+    # it (api/ha.py forward_to_active). These stay refused.
+    _STANDBY_NOT_FORWARDED = frozenset((
+        # Consoles: a standby proxies none, the UI offers the active instance instead.
+        # Every caller of the console token opens one; the others hand out a ticket or
+        # carry the session (vnc-poll is a whole VNC transport over POST).
+        ('POST', '/api/ws/token'),
+        ('POST', '/api/clusters/<cluster_id>/nodes/<node>/shell'),
+        ('POST', '/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/termproxy'),
+        ('POST', '/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/vnc-poll'),
+        ('POST', '/api/vmware/<vmware_id>/vms/<vm_id>/console'),
+        # This instance's own settings: run on the active they would set the active's
+        # port, domain, certificate and so on to what the form here shows. The server
+        # form sends its local keys every time, whatever else changed.
+        ('POST', '/api/settings/server'),
+        ('POST', '/api/settings/acme/request'),
+        ('POST', '/api/settings/acme/dns/complete'),
+        ('POST', '/api/hardware-monitoring/consent'),
+        ('POST', '/api/hardware-monitoring/redfish-consent'),
+        ('POST', '/api/config/restore'),
+        ('POST', '/api/security/cors'),
+        # the code and the loaded plugins of a process: an update or a plugin switched
+        # on would happen to the active and not here
+        ('POST', '/api/pegaprox/update'),
+        ('POST', '/api/pegaprox/update/rollback'),
+        ('POST', '/api/plugins/<plugin_id>/reload'),
+        ('POST', '/api/plugins/<plugin_id>/enable'),
+        ('POST', '/api/plugins/<plugin_id>/disable'),
+        ('POST', '/api/plugins/rescan'),
+        ('DELETE', '/api/plugins/<plugin_id>'),
+        ('POST', '/api/clusters/<cluster_id>/pools/refresh-cache'),
+        # a security key is bound to the host the browser sees, and the active would
+        # answer for its own
+        ('POST', '/api/webauthn/register/begin'),
+        ('POST', '/api/webauthn/register/finish'),
+        # rows of tables every instance keeps for itself, named by an id from this one's
+        # copy: on the active the same id is another row, or none
+        ('POST', '/api/drift/events/<int:eid>/acknowledge'),
+        ('POST', '/api/clusters/<cluster_id>/active-alerts/<fired_id>/ack'),
+        ('DELETE', '/api/auto-install/runs/<run_id>'),
+        ('POST', '/api/push/inbox/clear'),
+        ('POST', '/api/insights/force-snapshot'),
+    ))
+    # a plugin route that opens a console, behind the one proxy rule
+    _PLUGIN_CONSOLE_PATHS = frozenset(('vm/console',))
+    from pegaprox.core.ha import FORWARDED_READS as _ha_forwarded_reads
 
     @app.before_request
     def refuse_writes_on_standby():
         rule = request.url_rule.rule if request.url_rule is not None else None
+        if request.method == 'GET' and rule in _ha_forwarded_reads:
+            # the progress of a job the active runs: from there while this standby hands
+            # its writes on, else our own (empty) copy
+            from pegaprox.core import ha
+            if ha.is_standby():
+                from pegaprox.api.ha import forward_to_active
+                return forward_to_active(read=True)
+            return None
         plugin_call = rule == _PLUGIN_PROXY_RULE
         if request.method not in ('POST', 'PUT', 'PATCH', 'DELETE') and not plugin_call:
             return None
@@ -455,6 +517,15 @@ def create_app():
         from pegaprox.core import ha
         if not ha.is_standby():
             return None
+        # a path no route serves goes nowhere: forwarded, it would only cost the active
+        forwardable = rule is not None and (request.method, rule) not in _STANDBY_NOT_FORWARDED
+        if plugin_call and (request.view_args or {}).get('subpath') in _PLUGIN_CONSOLE_PATHS:
+            forwardable = False
+        if forwardable:
+            from pegaprox.api.ha import forward_to_active
+            forwarded = forward_to_active()
+            if forwarded is not None:
+                return forwarded
         return jsonify({
             'error': 'This is a standby instance. Make changes and act on the active '
                      'instance; its configuration arrives here with the next sync.',
