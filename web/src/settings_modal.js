@@ -9729,6 +9729,7 @@
         // ═══════════════════════════════════════════════
         // PegaProx - High Availability (#625)
         // HaPanel (settings tab), HaRestartOverlay, haRelTime
+        // v2: the live view switch and the restart a changed cluster setup needs
         // ═══════════════════════════════════════════════
 
         // "3 minutes ago" in the UI language. Intl speaks all nine, so no keys for it.
@@ -9952,6 +9953,26 @@
                 load();
             });
 
+            // Live view is this instance's own setting, never synced. A standby restarts to
+            // connect or disconnect; elsewhere it is only stored for when it becomes one.
+            const liveView = status?.live_view !== false;
+            const setLiveView = (on) => run('live', async () => {
+                const res = await send('PUT', 'settings', { live_view: on });
+                if (!res.ok) { addToast?.(res.error, 'error'); return; }
+                if (res.data.restarting) { setRestarting('standby'); return; }
+                addToast?.(t('pgHaLiveViewSaved'), 'success');
+                load();
+            });
+
+            // a changed cluster setup on the active: the standby restarts by itself after a
+            // while, this does it now
+            const applyNow = () => run('apply', async () => {
+                const res = await send('POST', 'apply-config', {});
+                if (!res.ok) { addToast?.(res.error, 'error'); return; }
+                if (res.data.restarting) setRestarting('standby');
+                else load();
+            });
+
             const WORD = { promote: 'PROMOTE', unpair: 'UNPAIR' };
             // null closes the box; either way nothing typed survives into the next one
             const openConfirm = (what) => {
@@ -10059,6 +10080,52 @@
                         <button onClick={saveInterval} disabled={!!busy || broken} className={btnGhost}>{t('save')}</button>
                     </div>
                     <p className="text-xs text-gray-500">{t('pgHaIntervalHint')}</p>
+                </div>
+            );
+
+            // the running managers only differ from the switch until the restart that follows
+            const standby = role === 'standby';
+            const pending = sync.restart_pending || null;
+            const liveMismatch = standby && typeof status?.managers_running === 'boolean'
+                && status.managers_running !== liveView;
+
+            const liveViewCard = (
+                <div className={card} data-ha-live-view={liveView ? 'on' : 'off'}>
+                    <div className="flex items-start justify-between gap-4">
+                        <div className="min-w-0">
+                            <label className="block text-sm font-medium text-white" htmlFor="pgha-live-view">{t('pgHaLiveView')}</label>
+                            <p className="text-xs text-gray-500 mt-1">{t('pgHaLiveViewHint')}</p>
+                        </div>
+                        <button id="pgha-live-view" type="button" role="switch" aria-checked={liveView}
+                            onClick={() => setLiveView(!liveView)} disabled={!!busy || broken}
+                            className={`toggle-switch flex-shrink-0 disabled:opacity-50 disabled:cursor-not-allowed ${liveView ? 'active' : ''}`} />
+                    </div>
+                    {standby && (
+                        <>
+                            {row(t('pgHaManagers'), status.managers_running
+                                ? <span className="text-green-300">{t('pgHaManagersRunning')}</span>
+                                : <span className="text-gray-400">{t('pgHaManagersOff')}</span>)}
+                            <p className="text-xs text-yellow-300">{t('pgHaLiveViewRestart')}</p>
+                        </>
+                    )}
+                </div>
+            );
+
+            const restartNote = standby && (pending || liveMismatch) && (
+                <div className="rounded-xl p-4 space-y-2 border bg-yellow-500/10 border-yellow-500/40" data-ha-restart-pending>
+                    <div className="flex items-start gap-2 text-sm text-yellow-200">
+                        <span className="mt-0.5 flex-shrink-0"><Icons.AlertTriangle /></span>
+                        <span>{t('pgHaRestartPending')}</span>
+                    </div>
+                    {pending && (pending.reason || pending.since) && (
+                        <div className="text-xs text-gray-400 break-all">
+                            {pending.reason}{pending.reason && pending.since ? ' · ' : ''}{pending.since && when(pending.since)}
+                        </div>
+                    )}
+                    <button onClick={applyNow} disabled={!!busy} className={`${btn} bg-yellow-600 hover:bg-yellow-700 text-white`}>
+                        <Icons.RefreshCw />
+                        {t('pgHaApplyNow')}
+                    </button>
                 </div>
             );
 
@@ -10221,6 +10288,7 @@
                                     {busy === 'join' ? t('pgHaJoining') : t('pgHaJoin')}
                                 </button>
                             </div>
+                            <div className="md:col-span-2">{liveViewCard}</div>
                         </div>
                     )}
 
@@ -10230,6 +10298,7 @@
                                 {peerCard}
                                 {intervalCard}
                             </div>
+                            {liveViewCard}
                             <div className="flex flex-wrap gap-2">
                                 <button onClick={() => openConfirm('unpair')} disabled={!!busy} className={btnGhost}>
                                     <Icons.Unlink />
@@ -10242,6 +10311,7 @@
 
                     {role === 'standby' && (
                         <>
+                            {restartNote}
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 {peerCard}
                                 <div className={card}>
@@ -10270,7 +10340,10 @@
                                     )}
                                 </div>
                             </div>
-                            {intervalCard}
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                {intervalCard}
+                                {liveViewCard}
+                            </div>
                             <div className="flex flex-wrap gap-2">
                                 <button onClick={syncNow} disabled={!!busy}
                                     className={`${btn} bg-proxmox-orange hover:bg-proxmox-orange/90 text-white`}>

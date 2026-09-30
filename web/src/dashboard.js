@@ -834,6 +834,8 @@
                 .filter(alert => alert.cluster_id === cluster.id && alert.status === 'offline')
                 .length;
             const hasOfflineNodes = offlineNodesCount > 0;
+            // rename, re-configure, delete and regroup belong on the active instance (#625)
+            const { haReadOnly } = useAuth();
 
             const statusColor = cluster.connected === false
                 ? 'bg-red-500' : hasOfflineNodes
@@ -898,6 +900,7 @@
                                 <p className="text-xs text-gray-500 truncate">{cluster.host}</p>
                             </div>
                         </div>
+                        {!haReadOnly && (
                         <div className="flex gap-0.5 flex-shrink-0">
                             <button
                                 onClick={(e) => { e.stopPropagation(); setRenamingCluster(cluster); setRenameValue(cluster.display_name || cluster.name || ''); }}
@@ -938,6 +941,7 @@
                                 </button>
                             )}
                         </div>
+                        )}
                     </div>
                     {/* Status Tags */}
                     <div className="flex gap-1 mt-2 flex-wrap">
@@ -3899,6 +3903,9 @@
         // MK May 2026 — Power & Carbon Tracking. Same shape as Cost Dashboard
         // (rates editor + summary + per-VM table) but in kWh / kg CO₂.
         function PowerCarbonTab({ clusterId, clusterName, authFetch, addToast, t, isAdmin }) {
+            // the admin buttons here change things: on a standby they are the active's (#625)
+            const { haReadOnly } = useAuth();
+            const canAct = isAdmin && !haReadOnly;
             const [summary, setSummary] = React.useState(null);
             const [rows, setRows] = React.useState([]);
             const [loading, setLoading] = React.useState(false);
@@ -4116,7 +4123,7 @@
                                 <option value={7}>{t('last7Days') || 'last 7 days'}</option>
                                 <option value={30}>{t('last30Days') || 'last 30 days'}</option>
                             </select>
-                            {isAdmin && (
+                            {canAct && (
                                 <button onClick={openRates}
                                     className="px-3 py-1.5 bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white rounded-lg text-sm flex items-center gap-1.5">
                                     <Icons.Settings className="w-3.5 h-3.5" />
@@ -4275,6 +4282,9 @@
         }
 
         function CostDashboardTab({ clusterId, clusterName, authFetch, addToast, t, isAdmin }) {
+            // the admin buttons here change things: on a standby they are the active's (#625)
+            const { haReadOnly } = useAuth();
+            const canAct = isAdmin && !haReadOnly;
             const [summary, setSummary] = React.useState(null);
             const [rows, setRows] = React.useState([]);
             const [loading, setLoading] = React.useState(false);
@@ -4503,7 +4513,7 @@
                                 <option value={14}>{t('last14Days') || 'last 14 days'}</option>
                                 <option value={30}>{t('last30Days') || 'last 30 days'}</option>
                             </select>
-                            {isAdmin && (
+                            {canAct && (
                                 <button onClick={openRates}
                                     className="px-3 py-1.5 bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white rounded-lg text-sm flex items-center gap-1.5">
                                     <Icons.Settings className="w-3.5 h-3.5" />
@@ -4694,6 +4704,9 @@
         // Tracks open events grouped by kind (vm_config, storage, network, cluster_options).
         // Admin can rescan, set baseline, acknowledge/promote events.
         function DriftTab({ clusterId, clusterName, authFetch, addToast, t, isAdmin }) {
+            // the admin buttons here change things: on a standby they are the active's (#625)
+            const { haReadOnly } = useAuth();
+            const canAct = isAdmin && !haReadOnly;
             const [status, setStatus] = React.useState(null);
             const [events, setEvents] = React.useState([]);
             const [filter, setFilter] = React.useState('open');
@@ -4809,7 +4822,7 @@
                                 <option value="acknowledged">{t('driftAcknowledged2') || 'acknowledged'}</option>
                                 <option value="all">{t('all') || 'all'}</option>
                             </select>
-                            {isAdmin && (
+                            {canAct && (
                                 <>
                                     <button onClick={setBaseline} disabled={busy}
                                         className="px-3 py-1.5 bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white rounded-lg text-sm flex items-center gap-1.5 disabled:opacity-50">
@@ -4886,7 +4899,7 @@
                                                 </span>
                                             </div>
                                             <div className="flex items-center gap-2 flex-shrink-0">
-                                                {isAdmin && ev.status === 'open' && (
+                                                {canAct && ev.status === 'open' && (
                                                     <>
                                                         <button onClick={e => { e.stopPropagation(); ack(ev.id, false); }}
                                                             className="text-[11px] px-2 py-0.5 bg-proxmox-darker border border-proxmox-border rounded text-gray-300 hover:text-white">
@@ -5166,6 +5179,9 @@
         // backend SSHs in and runs the qm pipeline (download → import → cloudinit drive
         // → template). Live deployment status polled from /api/templates/deployments/<id>.
         function TemplatesLibraryTab({ clusterId, clusterName, authFetch, addToast, t, isAdmin, isCorporate }) {
+            // the admin buttons here change things: on a standby they are the active's (#625)
+            const { haReadOnly } = useAuth();
+            const canAct = isAdmin && !haReadOnly;
             const [catalog, setCatalog] = React.useState([]);
             const [deployments, setDeployments] = React.useState([]);
             const [existing, setExisting] = React.useState([]);
@@ -5355,7 +5371,7 @@
                             </p>
                         </div>
                         <div className="flex gap-2">
-                            {isAdmin && (
+                            {canAct && (
                                 <button onClick={() => setShowAdd(true)}
                                     className="px-3 py-1.5 bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white rounded-lg text-sm flex items-center gap-1.5">
                                     <Icons.Plus className="w-3.5 h-3.5" />
@@ -5377,7 +5393,7 @@
                             const owned = existing.some(e => (e.name || '').includes(tpl.distro) && (e.name || '').includes(tpl.version.replace(/\./g, '')));
                             return (
                                 <div key={tpl.id} className={`bg-proxmox-card border ${distroColor(tpl.distro)} rounded-xl p-4 flex flex-col relative`}>
-                                    {tpl.custom && isAdmin && (
+                                    {tpl.custom && canAct && (
                                         <button
                                             onClick={() => deleteCustom(tpl)}
                                             className="absolute top-2 right-2 p-1 text-gray-500 hover:text-red-400 rounded"
@@ -5414,7 +5430,7 @@
                                     <div className="mt-auto flex items-center gap-2">
                                         <button
                                             onClick={() => openDeploy(tpl)}
-                                            disabled={!isAdmin || (dep && dep.status === 'running')}
+                                            disabled={!canAct || (dep && dep.status === 'running')}
                                             className="flex-1 px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm rounded flex items-center justify-center gap-1.5">
                                             {dep && dep.status === 'running'
                                                 ? <><Icons.RotateCw className="w-3.5 h-3.5 animate-spin" /> {dep.progress}%</>
@@ -5630,6 +5646,9 @@
         // Reads /insights/right-sizing + /insights/forecast endpoints, fed by the
         // 5-min metrics_history collector. Force-snapshot button is admin-only.
         function InsightsTab({ clusterId, clusterName, authFetch, addToast, t, isAdmin }) {
+            // the admin buttons here change things: on a standby they are the active's (#625)
+            const { haReadOnly } = useAuth();
+            const canAct = isAdmin && !haReadOnly;
             const [rs, setRs] = React.useState(null);
             const [fc, setFc] = React.useState(null);
             // LW May 2026 — top-N noisy neighbors card
@@ -5969,7 +5988,7 @@
                             </p>
                         </div>
                         <div className="flex gap-2">
-                            {isAdmin && (
+                            {canAct && (
                                 <button onClick={forceSnap} disabled={forcing}
                                     className="px-3 py-1.5 bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white rounded-lg text-sm flex items-center gap-1.5 disabled:opacity-50">
                                     {forcing ? <Icons.RotateCw className="w-3.5 h-3.5 animate-spin" /> : <Icons.RefreshCw className="w-3.5 h-3.5" />}
@@ -7160,8 +7179,10 @@
 
         // NS: Mar 2026 - Site Recovery tab component (#150)
         function SiteRecoveryTab({ clusters, selectedCluster, authFetch, addToast, t, isCorporate, srProgress, user }) {
-            const canManage = user?.permissions?.includes('site_recovery.manage');
-            const canFailover = user?.permissions?.includes('site_recovery.failover');
+            // like can(): a standby reads the plans and changes none of them (#625)
+            const { haReadOnly } = useAuth();
+            const canManage = !haReadOnly && !!user?.permissions?.includes('site_recovery.manage');
+            const canFailover = !haReadOnly && !!user?.permissions?.includes('site_recovery.failover');
             const [plans, setPlans] = useState([]);
             const [loading, setLoading] = useState(true);
             const [selectedPlan, setSelectedPlan] = useState(null);
@@ -7569,11 +7590,11 @@
                                                         <td className="py-2">{vm.vm_name || '-'}</td>
                                                         <td className="py-2">{editingVm?.id === vm.id && editingVm?.field === 'boot_group'
                                                             ? <input type="number" className="w-16 bg-proxmox-dark border border-proxmox-border rounded px-1 py-0.5 text-xs" defaultValue={vm.boot_group} autoFocus onBlur={e => handleUpdateVm(vm.id, 'boot_group', parseInt(e.target.value))} onKeyDown={e => e.key === 'Enter' && handleUpdateVm(vm.id, 'boot_group', parseInt(e.target.value))} />
-                                                            : <span className="cursor-pointer hover:text-proxmox-orange" onClick={() => setEditingVm({id: vm.id, field: 'boot_group'})}>{vm.boot_group}</span>
+                                                            : <span className="cursor-pointer hover:text-proxmox-orange" onClick={() => canManage && setEditingVm({id: vm.id, field: 'boot_group'})}>{vm.boot_group}</span>
                                                         }</td>
                                                         <td className="py-2">{editingVm?.id === vm.id && editingVm?.field === 'boot_delay'
                                                             ? <input type="number" className="w-16 bg-proxmox-dark border border-proxmox-border rounded px-1 py-0.5 text-xs" defaultValue={vm.boot_delay} autoFocus onBlur={e => handleUpdateVm(vm.id, 'boot_delay', parseInt(e.target.value))} onKeyDown={e => e.key === 'Enter' && handleUpdateVm(vm.id, 'boot_delay', parseInt(e.target.value))} />
-                                                            : <span className="cursor-pointer hover:text-proxmox-orange" onClick={() => setEditingVm({id: vm.id, field: 'boot_delay'})}>{vm.boot_delay}s</span>
+                                                            : <span className="cursor-pointer hover:text-proxmox-orange" onClick={() => canManage && setEditingVm({id: vm.id, field: 'boot_delay'})}>{vm.boot_delay}s</span>
                                                         }</td>
                                                         <td className="py-2"><span className={rpoColor(vm)}>{vm.last_replication ? fmtDate(vm.last_replication) : '-'}</span></td>
                                                         {canManage && <td className="py-2"><button onClick={() => handleRemoveVm(vm.id)} className="text-red-400 hover:text-red-300"><Icons.Trash2 className="w-3.5 h-3.5" /></button></td>}
@@ -7627,7 +7648,7 @@
                                     ))}
                                     <button onClick={() => setStorMapRows(prev => [...prev, {src:'',tgt:''}])} className="text-xs text-proxmox-orange hover:underline">{t('addMapping') || '+ Add Mapping'}</button>
                                 </div>
-                                <div className="flex justify-end"><button onClick={saveMappings} className="px-4 py-1.5 text-sm rounded-lg bg-proxmox-orange text-white hover:bg-proxmox-orange/80">{t('saveMappings') || 'Save Mappings'}</button></div>
+                                {canManage && <div className="flex justify-end"><button onClick={saveMappings} className="px-4 py-1.5 text-sm rounded-lg bg-proxmox-orange text-white hover:bg-proxmox-orange/80">{t('saveMappings') || 'Save Mappings'}</button></div>}
                             </div>
                         )}
 
@@ -7686,7 +7707,7 @@
                                     <div className="flex items-center justify-between pt-2 border-t border-proxmox-border/50"><div><label className="text-sm font-medium">{t('testDisconnectNics') || 'Disconnect NICs on Test Failover'}</label><p className="text-xs text-gray-500">{t('testDisconnectNicsDesc') || 'Bring test-failover clones up with network cables unplugged (link down) so a DR test cannot collide with production IPs.'}</p></div>
                                         <div className={`toggle-switch ${settingsForm.test_disconnect_nics ? 'active' : ''}`} onClick={() => { setSettingsForm(f => ({...f, test_disconnect_nics: !f.test_disconnect_nics})); setSettingsDirty(true); }} />
                                     </div>
-                                    <div className="flex justify-end"><button onClick={saveSettings} disabled={!settingsDirty} className="px-4 py-1.5 text-sm rounded-lg bg-proxmox-orange text-white hover:bg-proxmox-orange/80 disabled:opacity-40">{t('saveSettings') || 'Save'}</button></div>
+                                    {canManage && <div className="flex justify-end"><button onClick={saveSettings} disabled={!settingsDirty} className="px-4 py-1.5 text-sm rounded-lg bg-proxmox-orange text-white hover:bg-proxmox-orange/80 disabled:opacity-40">{t('saveSettings') || 'Save'}</button></div>}
                                 </div>
                                 {canManage && <div className="bg-red-500/5 border border-red-500/20 rounded-xl p-4">
                                     <h4 className="text-sm font-medium text-red-400 mb-2">{t('dangerZone') || 'Danger Zone'}</h4>
@@ -8044,10 +8065,15 @@
 
         function PegaProxDashboard() {
             const { t } = useTranslation();
-            const { user, sessionId, logout, getAuthHeaders, isAdmin, passwordExpiry, updatePreferences, ha } = useAuth();
-            // #625: a standby starts no cluster managers, so its cluster list is empty on purpose
+            const { user, sessionId, logout, getAuthHeaders, isAdmin, passwordExpiry, updatePreferences, ha, haReadOnly } = useAuth();
+            // #625: a standby shows the clusters read-only, or none at all with its live view off
             const haStandby = (ha || {}).role === 'standby';
-            const can = (permission) => isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes(permission));
+            // on a standby only the reading permissions count, for admins too
+            const can = (permission) => (!haReadOnly || haReadPermission(permission)) &&
+                (isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes(permission)));
+            // what the account holds, the standby rule aside: only for a tab that just reads,
+            // so a standby keeps showing it (#625); its buttons still ask can()
+            const holds = (permission) => isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes(permission));
             // not can(): the auto-install routes also refuse tenant/cluster-confined callers
             // (capped admins included), the server folds that into this flag for us
             const canAutoInstall = !!user?.autoinstall_access;
@@ -8705,8 +8731,11 @@
             // a new identity, which tore down + re-ran their effects on every SSE-driven render — the
             // 60s poll never elapsed (~4 req/s from one idle tab). Deps: only getAuthHeaders (now
             // stable); setSessionExpired/setConnectionError are stable React setters.
+            // #625 v2 - what authFetch does with a 409 HA_STANDBY, set further down once
+            // addToast and t exist. A ref, because authFetch keeps one identity for good.
+            const haRefusedRef = useRef(null);
             const authFetch = React.useCallback(async (url, opts = {}) => {
-                const { timeout, ...rest } = opts;
+                const { timeout, quiet, ...rest } = opts;
                 let ctrl, timer;
                 if (timeout) {
                     ctrl = new AbortController();
@@ -8728,6 +8757,17 @@
                         setSessionExpired(true);
                     }
                     setConnectionError(null);
+                    // #625 v2 - a standby refuses what acts. One translated toast here, and the
+                    // caller gets the same words as err.error, so its own error toast is the
+                    // same message and addToast drops it. quiet: a background read sent as a POST.
+                    if (res.status === 409 && haRefusedRef.current) {
+                        const body = await res.clone().json().catch(() => null);
+                        if (body && body.code === 'HA_STANDBY') {
+                            const error = haRefusedRef.current(quiet);
+                            return new Response(JSON.stringify({ ...body, error }),
+                                { status: 409, statusText: res.statusText, headers: { 'Content-Type': 'application/json' } });
+                        }
+                    }
                     return res;
                 } catch (err) {
                     // an aborted poll is a soft-fail — callers already treat null as "skip this round"
@@ -8753,8 +8793,11 @@
             useEffect(() => { vmwareSelectedMigrationRef.current = vmwareSelectedMigration; }, [vmwareSelectedMigration]);
 
             const addToast = (message, type = 'success') => {
-                const id = Date.now();
-                setToasts(prev => [...prev, { id, message, type }]);
+                const id = Date.now() + Math.random();
+                // the same message twice at once says nothing new (authFetch and its caller
+                // both report a standby refusal, #625). The newer one replaces the older and
+                // gets its own full lifetime, so a retry that fails the same way still shows.
+                setToasts(prev => [...prev.filter(x => x.message !== message || x.type !== type), { id, message, type }]);
                 // auto remove after 5 seconds
                 setTimeout(() => {
                     setToasts(prev => prev.filter(t => t.id !== id));
@@ -8763,6 +8806,13 @@
 
             const removeToast = (id) => {
                 setToasts(prev => prev.filter(toast => toast.id !== id));
+            };
+
+            // the words for a standby refusal (#625), fresh every render for the language
+            haRefusedRef.current = (quiet = false) => {
+                const msg = t('pgHaStandbyRefused');
+                if (!quiet) addToast(msg, 'error');
+                return msg;
             };
 
             // MK May 2026 — one-time discoverability hint for the new ?-shortcuts.
@@ -9824,7 +9874,8 @@
                     const res = await authFetch(`${API_URL}/snapshots/overview`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(body)
+                        body: JSON.stringify(body),
+                        quiet: true  // a read; a standby refusing it is not the user's doing
                     });
                     if (res && res.ok) {
                         const data = await res.json();
@@ -9845,6 +9896,12 @@
             
             // #696 — stable per-row key for multi-select (the render idx is unstable across sorts)
             const snapKey = (s) => `${s.cluster_id || ''}:${s.node || ''}:${s.vm_type || ''}:${s.vmid}:${s.snapshot_name}`;
+            // selecting and deleting rows is for who may snapshot; a standby only lists (#625)
+            const canDeleteSnaps = can('vm.snapshot');
+
+            // what a refused delete says: the reason per snapshot when the server lists them,
+            // else its error (on a standby that is already the translated refusal, #625)
+            const snapDeleteError = (data, fallback) => ((data && data.errors) || []).join('; ') || (data && data.error) || fallback;
 
             // #696 — bulk-delete the checked snapshots (backend /snapshots/delete already loops an array)
             const deleteSelectedSnapshots = async (clusterId) => {
@@ -9854,12 +9911,18 @@
                     return;
                 }
                 try {
-                    await authFetch(`${API_URL}/snapshots/delete`, {
+                    const res = await authFetch(`${API_URL}/snapshots/delete`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ snapshots: chosen.map(s => ({ ...s, cluster_id: s.cluster_id || clusterId })) })
                     });
-                    addToast(`${chosen.length} snapshot(s) deleted`, 'success');
+                    const data = res ? await res.json().catch(() => ({})) : {};
+                    if (!res || !res.ok) {
+                        addToast(snapDeleteError(data, 'Failed to delete selected snapshots'), 'error');
+                        return;
+                    }
+                    addToast(`${data.deleted ?? chosen.length} snapshot(s) deleted`, 'success');
+                    if (data.errors && data.errors.length) addToast(data.errors.join('; '), 'error');
                     setSelectedSnaps({});
                     await fetchGlobalSnapshots(clusterId, snapshotFilterDate || null);
                 } catch (err) {
@@ -9873,11 +9936,16 @@
                     return;
                 }
                 try {
-                    await authFetch(`${API_URL}/snapshots/delete`, {
+                    const res = await authFetch(`${API_URL}/snapshots/delete`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ snapshots: [snap] })
                     });
+                    if (!res || !res.ok) {
+                        const data = res ? await res.json().catch(() => ({})) : {};
+                        addToast(snapDeleteError(data, 'Failed to delete snapshot'), 'error');
+                        return;
+                    }
                     addToast('Snapshot deleted', 'success');
                     await fetchGlobalSnapshots(clusterId, snapshotFilterDate || null);
                 } catch (err) {
@@ -10307,6 +10375,7 @@
             const runCveScan = async (clusterId = null) => {
                 const clId = clusterId || selectedCluster?.id;
                 if (!clId) return;
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // debsecan runs on the nodes, from the active (#625)
 
                 setCveScanLoading(true);
                 setCveResults(null);
@@ -10334,6 +10403,7 @@
             };
 
             const installDebsecan = async (clusterId = null) => {
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 const clId = clusterId || selectedCluster?.id;
                 if (!clId) return;
                 setDebsecanInstalling(true);
@@ -10396,6 +10466,7 @@
             // Opens the gated confirmation modal instead of a bare confirm(), so a click-happy user
             // has to read + tick before anything touches the node (#16745 A/C).
             const applyHardening = () => {
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 if (!selectedCluster?.id || !hardenNode) return;
                 const toApply = Object.keys(hardenSelected).filter(k => hardenSelected[k]);
                 if (!toApply.length) { addToast(t('noControlsSelected') || 'No controls selected', 'warning'); return; }
@@ -10461,6 +10532,7 @@
 
             // NS #386: restore selected controls to their pre-apply snapshot.
             const rollbackHardening = async () => {
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 if (!selectedCluster?.id || !hardenNode) return;
                 const toRoll = Object.keys(hardenSelected).filter(k => hardenSelected[k]);
                 if (!toRoll.length) { addToast(t('noControlsSelected') || 'No controls selected', 'warning'); return; }
@@ -11830,6 +11902,7 @@
             };
             
             const toggleVMwareDRS = async (vmwId, clusterId, enabled, automation) => {
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 try {
                     const resp = await authFetch(`${API_URL}/vmware/${vmwId}/clusters/${clusterId}/drs`, {
                         method: 'POST', headers: {'Content-Type':'application/json'},
@@ -11846,6 +11919,7 @@
             };
             
             const toggleVMwareHA = async (vmwId, clusterId, enabled) => {
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 try {
                     const resp = await authFetch(`${API_URL}/vmware/${vmwId}/clusters/${clusterId}/ha`, {
                         method: 'POST', headers: {'Content-Type':'application/json'},
@@ -11873,6 +11947,7 @@
             
             const vmwarePowerAction = async (vmId, action) => {
                 if (!selectedVMware) return;
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 // #147: confirm disruptive ESXi actions
                 if (['stop', 'reset', 'suspend'].includes(action)) {
                     if (!confirm(`${action.charAt(0).toUpperCase() + action.slice(1)} VM?`)) return;
@@ -11894,6 +11969,7 @@
             };
             
             const vmwareSnapshotAction = async (vmId, action, data = {}) => {
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 if (!selectedVMware) return;
                 try {
                     const method = action === 'delete' ? 'DELETE' : 'POST';
@@ -11956,6 +12032,7 @@
             };
             
             const handleDeleteVMware = async (vmwId) => {
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 if (!confirm(t('deleteEsxiServerConfirm'))) return;
                 try {
                     const resp = await authFetch(`${API_URL}/vmware/${vmwId}`, { method: 'DELETE' });
@@ -12029,9 +12106,10 @@
                     return () => {
                         clearInterval(renewInterval);
                         clearInterval(fallbackInterval);
-                        // Unwatch
+                        // Unwatch - quiet: a view that closes has nothing to tell the user (#625)
                         authFetch(`${API_URL}/vmware/${selectedVMware.id}/vms/${vmwareSelectedVm}/watch`, {
-                            method: 'DELETE'
+                            method: 'DELETE',
+                            quiet: true
                         }).catch(() => {});
                     };
                 } else {
@@ -12322,6 +12400,7 @@
                 finally { setXhmLoading(false); }
             };
             const startXhmMigration = async () => {
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 setXhmLoading(true);
                 try {
                     const body = { ...xhmForm };
@@ -12832,7 +12911,8 @@
                     authFetch(`${API_URL}/sse/subscribe`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ client_id: cid, clusters })
+                        body: JSON.stringify({ client_id: cid, clusters }),
+                        quiet: true
                     }).catch(() => {});  // best effort
                 }, 300);
             }, []);
@@ -12893,6 +12973,7 @@
             };
 
             const handleDeleteCluster = async (clusterId) => {
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 if (!window.confirm(t('deleteClusterConfirm'))) return;
                 
                 try {
@@ -12927,6 +13008,7 @@
             // NS: Mar 2026 - rename cluster (display_name)
             const handleRenameCluster = async () => {
                 if (!renamingCluster) return;
+                if (haReadOnly) { haRefusedRef.current?.(); return; }
                 const newName = renameValue.trim();
                 const msg = newName
                     ? `${t('confirmRename') || 'Rename cluster to'} "${newName}"?`
@@ -12957,6 +13039,7 @@
             // MK: #294 — OIDC/Entra users don't have local passwords, skip prompt
             const handleReconfigureAuth = async () => {
                 if (!reconfigureCluster) return;
+                if (haReadOnly) { haRefusedRef.current?.(); return; }
                 const isExternalAuth = user?.auth_source && !['local', 'ldap'].includes(user.auth_source);
                 if (!isExternalAuth && !reconfigurePassword) return;
                 setReconfigureLoading(true);
@@ -13045,6 +13128,7 @@
             
             // #149 - manual balance trigger
             const handleBalanceNow = async () => {
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 if (!selectedCluster || balanceRunning) return;
                 setBalanceRunning(true);
                 try {
@@ -13109,6 +13193,7 @@
 
             const handleMaintenanceToggle = async (nodeName, enable) => {
                 if (!selectedCluster) return;
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 // #147
                 const msg = enable
                     ? `${t('startingMaintenanceMode') || 'Enable maintenance mode'}: "${nodeName}"? VMs will be evacuated.`
@@ -13152,6 +13237,7 @@
 
             const handleStartUpdate = async (nodeName, reboot) => {
                 if (!selectedCluster) return;
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 
                 try {
                     addToast(t('startingUpdateFor') + ` ${nodeName}...`, 'info');
@@ -13175,6 +13261,7 @@
 
             const handleNodeAction = async (nodeName, action) => {
                 if (!selectedCluster) return;
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
 
                 try {
                     const actionText = action === 'reboot' ? t('rebootNode') : t('shutdownNode');
@@ -13226,7 +13313,9 @@
                     'resume': 'running'
                 };
                 
-                if (expectedStatus[action]) {
+                // not on a standby (#625): the answer is a refusal, a flipped status would lie
+                const flipped = !!expectedStatus[action] && !haReadOnly;
+                if (flipped) {
                     setClusterResources(prev => 
                         prev.map(r => 
                             r.vmid === resource.vmid && r.node === resource.node 
@@ -13236,6 +13325,19 @@
                     );
                 }
                 
+                // a failed action puts the old status back itself: the refetch below only
+                // repaints when the server list changed, and after a failure it did not
+                const unflip = () => {
+                    if (!flipped) return;
+                    setClusterResources(prev =>
+                        prev.map(r =>
+                            r.vmid === resource.vmid && r.node === resource.node && r._optimistic
+                                ? { ...r, status: resource.status, _optimistic: false }
+                                : r
+                        )
+                    );
+                };
+
                 // LW: Feb 2026 - track task for corporate panel
                 const taskId = addRecentTask(`${action} VM`, resource.name || `VM ${resource.vmid}`, 'running');
                 try {
@@ -13249,16 +13351,19 @@
                         updateRecentTask(taskId, 'completed');
                         // NS: SSE push_immediate_update will send real status within 500ms
                     } else if (response) {
+                        unflip();
                         const err = await response.json();
                         addToast(err.error || `${action} ${t('actionFailed')}`, 'error');
                         updateRecentTask(taskId, 'failed');
                         fetchClusterResources(selectedCluster.id);
                     } else {
+                        unflip();
                         addToast(t('connectionError'), 'error');
                         updateRecentTask(taskId, 'failed');
                         fetchClusterResources(selectedCluster.id);
                     }
                 } catch (error) {
+                    unflip();
                     addToast(t('connectionError'), 'error');
                     updateRecentTask(taskId, 'failed');
                     // Revert optimistic update on error
@@ -13436,6 +13541,7 @@
             const handleForceStop = async (resource) => {
                 const cId = resource._clusterId || selectedCluster?.id;
                 if (!cId) return;
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
 
                 if (!confirm(`${resource.name || resource.vmid} ${t('forceStopConfirm')}`)) return;
 
@@ -13555,6 +13661,7 @@
             const handleOpenSpice = async (resource) => {
                 const cId = resource._clusterId || selectedCluster?.id;
                 if (!cId) return;
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // consoles only on the active (#625)
                 try {
                     const r = await authFetch(`${API_URL}/clusters/${cId}/vms/${resource.node}/${resource.type}/${resource.vmid}/spice`);
                     if (!r.ok) {
@@ -13577,6 +13684,7 @@
             const handleOpenConsole = async (resource) => {
                 const cId = resource._clusterId || selectedCluster?.id;
                 if (!cId) return;
+                if (haReadOnly) { haRefusedRef.current?.(); return; }
                 // NS: Feb 2026 - Use correct cluster's host for cross-cluster console
                 const cluster = clusters.find(c => c.id === cId) || selectedCluster;
                 const info = {
@@ -13952,6 +14060,13 @@
                         fetchTasks(selectedCluster.id);
                     },
                 };
+                // #625 v2 - a standby hands the shell what reads and nothing that acts;
+                // cloud.js leaves out every entry whose handler is missing
+                if (haReadOnly) {
+                    ['vmAction', 'forceStop', 'openConsole', 'openSpice', 'openLxcShell', 'migrate', 'clone', 'del',
+                     'crossMigrate', 'snapshot', 'createVm', 'nodeAction', 'maintenanceToggle', 'startUpdate']
+                        .forEach(k => { delete cloudActions[k]; });
+                }
                 return (
                     <div style={{ height: '100vh', overflow: 'hidden' }}>
                         <CloudShell
@@ -14366,8 +14481,8 @@
                                         </div>
                                     )}
 
-                                    {/* Add Cluster Dropdown (corporate: via sidebar or right-click) */}
-                                    {!isCorporate && isAdmin && (
+                                    {/* Add Cluster Dropdown (corporate: via sidebar or right-click); a standby adds nothing (#625) */}
+                                    {!isCorporate && isAdmin && !haStandby && (
                                         <div className="relative">
                                             <button
                                                 onClick={() => setShowAddDropdown(!showAddDropdown)}
@@ -14640,7 +14755,8 @@
                                     <div className="flex items-center justify-between px-1">
                                         <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">{t('clusters')}</h2>
                                         <div className="flex items-center gap-1">
-                                            {isAdmin && (
+                                            {/* #625: cluster and group changes are made on the active instance */}
+                                            {isAdmin && !haStandby && (
                                                 isCorporate ? (
                                                     <>
                                                     <button
@@ -14677,7 +14793,7 @@
                                                 <Icons.Server />
                                             </div>
                                             {haStandby ? (
-                                                <p className="text-gray-400 text-sm">{t('pgHaNoClustersHere')}</p>
+                                                <p className="text-gray-400 text-sm">{ha.live_view === false ? t('pgHaNoClustersLiveOff') : t('pgHaNoClustersHere')}</p>
                                             ) : (<>
                                             <p className="text-gray-400 text-sm">{t('noClusterSelected')}</p>
                                             <button
@@ -14785,8 +14901,8 @@
                                                 </span>
                                             </button>
 
-                                            {/* LW Sep 2026 - automated installs, next to World Map because that row is always there once a cluster exists; the empty-sidebar card above covers the rest */}
-                                            {canAutoInstall && (
+                                            {/* LW Sep 2026 - automated installs, next to World Map because that row is always there once a cluster exists; the empty-sidebar card above covers the rest. Not on a standby (#625). */}
+                                            {canAutoInstall && !haStandby && (
                                                 <button
                                                     onClick={() => openAutoInstall()}
                                                     className={isCorporate
@@ -14998,7 +15114,7 @@
                                     <div className="mt-4 pt-4 border-t border-proxmox-border">
                                         <div className="flex items-center justify-between px-1 mb-2">
                                             <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">{t('backupServers') || 'Backup Servers'}</h2>
-                                            {isAdmin && (
+                                            {isAdmin && !haStandby && (
                                                 <button onClick={() => setShowAddPBS(true)} className="p-1 text-gray-500 hover:text-proxmox-orange rounded transition-colors" title="Add PBS">
                                                     <Icons.Plus className="w-4 h-4" />
                                                 </button>
@@ -15040,7 +15156,7 @@
                                 )}
                                 
                                 {/* add PBS button - hidden in corporate */}
-                                {!isCorporate && pbsServers.length === 0 && isAdmin && (
+                                {!isCorporate && pbsServers.length === 0 && isAdmin && !haStandby && (
                                     <div className="mt-4 pt-4 border-t border-proxmox-border">
                                         <button onClick={() => setShowAddPBS(true)} className="w-full flex items-center gap-2 px-3 py-2 rounded-xl bg-proxmox-card border border-dashed border-proxmox-border text-gray-500 hover:text-blue-400 hover:border-blue-500/30 transition-all text-sm">
                                             <Icons.Shield className="w-4 h-4" />
@@ -15054,7 +15170,7 @@
                                     <div className="mt-4 pt-4 border-t border-proxmox-border">
                                         <div className="flex items-center justify-between px-1 mb-2">
                                             <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">ESXi</h2>
-                                            {isAdmin && (
+                                            {isAdmin && !haStandby && (
                                                 <button onClick={() => { setEditingVMware(null); setVmwareForm({ name: '', host: '', port: 443, username: 'root', password: '', ssl_verify: false, notes: '' }); setShowAddVMware(true); }} className="p-1 text-gray-500 hover:text-proxmox-orange rounded transition-colors" title={t('addEsxiServer')}>
                                                     <Icons.Plus className="w-4 h-4" />
                                                 </button>
@@ -15217,7 +15333,7 @@
                                 )}
 
                                 {/* add VMware button - hidden in corporate */}
-                                {!isCorporate && vmwareServers.length === 0 && isAdmin && (
+                                {!isCorporate && vmwareServers.length === 0 && isAdmin && !haStandby && (
                                     <div className="mt-4 pt-4 border-t border-proxmox-border">
                                         <button onClick={() => { setEditingVMware(null); setVmwareForm({ name: '', host: '', port: 443, username: 'root', password: '', ssl_verify: false, notes: '' }); setShowAddVMware(true); }} className="w-full flex items-center gap-2 px-3 py-2 rounded-xl bg-proxmox-card border border-dashed border-proxmox-border text-gray-500 hover:text-emerald-400 hover:border-emerald-500/30 transition-all text-sm">
                                             <Icons.Cloud className="w-4 h-4" />
@@ -15348,7 +15464,8 @@
                                                 // #390 — admin role always passes (matches backend has_permission shortcut).
                                                 if (tab.id === 'site-recovery') return can('site_recovery.view');
                                                 if (tab.id === 'plugins') return can('plugins.view');
-                                                if (tab.id === 'compliance') return can('admin.audit') || can('node.maintenance');
+                                                // compliance only reads, so a standby keeps it (#625)
+                                                if (tab.id === 'compliance') return holds('admin.audit') || holds('node.maintenance');
                                                 if (typeof tab.id === 'string' && tab.id.startsWith('plugin:')) return can('plugins.view');
                                                 return true;
                                             }).map(tab => (
@@ -15397,6 +15514,8 @@
                                                         <div className="flex items-center gap-2">
                                                             <Icons.Database className="w-4 h-4" style={{color: 'var(--corp-accent)'}} />
                                                             <span className="corp-header-title">{selectedCluster.display_name || selectedCluster.name}</span>
+                                                            {/* rename, re-configure and delete belong on the active instance (#625) */}
+                                                            {!haReadOnly && (<>
                                                             <button onClick={() => { setRenamingCluster(selectedCluster); setRenameValue(selectedCluster.display_name || selectedCluster.name || ''); }} className="corp-rename-btn" title={t('renameCluster') || 'Rename'} style={{background:'none', border:'none', cursor:'pointer', padding:'2px', color:'var(--corp-text-muted)', display:'inline-flex', alignItems:'center'}}>
                                                                 <Icons.Edit className="w-3 h-3" />
                                                             </button>
@@ -15406,6 +15525,7 @@
                                                             {isAdmin && <button onClick={() => handleDeleteCluster(selectedCluster.id)} title={t('deleteCluster') || 'Remove Cluster'} style={{background:'none', border:'none', cursor:'pointer', padding:'2px', color:'var(--corp-text-muted)', display:'inline-flex', alignItems:'center'}} onMouseEnter={(e) => e.currentTarget.style.color='#f54f47'} onMouseLeave={(e) => e.currentTarget.style.color='var(--corp-text-muted)'}>
                                                                 <Icons.Trash className="w-3 h-3" />
                                                             </button>}
+                                                            </>)}
                                                             <span className="corp-badge" style={selectedCluster.connected
                                                                 ? {background: 'rgba(96,181,21,0.15)', color: '#60b515', border: '1px solid rgba(96,181,21,0.3)'}
                                                                 : {background: 'rgba(245,79,71,0.15)', color: '#f54f47', border: '1px solid rgba(245,79,71,0.3)'}
@@ -15944,8 +16064,9 @@
                                                             } : undefined}
                                                         />
                                                         
-                                                        {/* Create VM/CT Buttons */}
+                                                        {/* Create VM/CT Buttons - not on a standby (#625), the export stays */}
                                                         <div className={`flex gap-3 ${isCorporate ? 'mt-2' : 'mt-4'}`}>
+                                                            {!haReadOnly && (<>
                                                             <button
                                                                 onClick={() => setShowCreateVm('qemu')}
                                                                 className={isCorporate
@@ -15966,6 +16087,7 @@
                                                                 <Icons.Plus className={isCorporate ? 'w-3 h-3' : ''} />
                                                                 {t('createContainer')}
                                                             </button>
+                                                            </>)}
                                                             {/* LW — quick CSV export of the current VM list */}
                                                             <button
                                                                 onClick={() => {
@@ -16075,7 +16197,7 @@
                                                         {/* #696 — bulk actions bar (shows once one or more snapshots are checked; works in both layouts) */}
                                                         {(() => {
                                                             const selCount = (sortedSnapshots || []).filter(s => selectedSnaps[snapKey(s)]).length;
-                                                            return selCount > 0 ? (
+                                                            return canDeleteSnaps && selCount > 0 ? (
                                                                 <div className="flex items-center gap-3 mb-3 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/30">
                                                                     <span className="text-sm text-gray-200">{selCount} {t('selected') || 'selected'}</span>
                                                                     <button
@@ -16117,6 +16239,7 @@
                                                                 <table className={isCorporate ? 'corp-snap-table' : 'min-w-full text-sm'}>
                                                                     <thead className={isCorporate ? '' : 'bg-black/40 text-gray-400'}>
                                                                         <tr>
+                                                                            {canDeleteSnaps && (
                                                                             <th className={isCorporate ? '' : 'px-4 py-3 text-left w-8'}>
                                                                                 {/* #696 — select-all across the currently listed snapshots */}
                                                                                 <input type="checkbox"
@@ -16127,6 +16250,7 @@
                                                                                     }}
                                                                                     className="rounded" title={t('selectAll') || 'Select all'} />
                                                                             </th>
+                                                                            )}
                                                                             <th onClick={() => toggleSnapshotSort('vmid')} className={isCorporate ? '' : 'px-4 py-3 text-left cursor-pointer hover:text-white'}>
                                                                                 VM ID {snapshotSortBy === 'vmid' && (snapshotSortDir === 'asc' ? '↑' : '↓')}
                                                                             </th>
@@ -16148,7 +16272,7 @@
                                                                             <th onClick={() => toggleSnapshotSort('age')} className={isCorporate ? '' : 'px-4 py-3 text-left cursor-pointer hover:text-white'}>
                                                                                 {t('snapshotsAge') || 'Age'} {snapshotSortBy === 'age' && (snapshotSortDir === 'asc' ? '↑' : '↓')}
                                                                             </th>
-                                                                            <th className={isCorporate ? 'corp-snap-action' : 'px-4 py-3 text-right w-12'}>{t('snapshotsAction') || 'Action'}</th>
+                                                                            {canDeleteSnaps && <th className={isCorporate ? 'corp-snap-action' : 'px-4 py-3 text-right w-12'}>{t('snapshotsAction') || 'Action'}</th>}
                                                                         </tr>
                                                                     </thead>
                                                                     <tbody className={isCorporate ? '' : 'divide-y divide-gray-800'}>
@@ -16157,6 +16281,7 @@
                                                                                 key={`${snap.vmid}-${snap.snapshot_name}-${idx}`}
                                                                                 className={isCorporate ? 'group' : 'group hover:bg-white/5 transition-colors'}
                                                                             >
+                                                                                {canDeleteSnaps && (
                                                                                 <td className={isCorporate ? '' : 'px-4 py-3'}>
                                                                                     {/* #696 — per-row select */}
                                                                                     <input type="checkbox"
@@ -16164,6 +16289,7 @@
                                                                                         onChange={(e) => setSelectedSnaps(prev => { const n = {...prev}; if (e.target.checked) n[snapKey(snap)] = true; else delete n[snapKey(snap)]; return n; })}
                                                                                         className="rounded" />
                                                                                 </td>
+                                                                                )}
                                                                                 <td className={isCorporate ? '' : 'px-4 py-3 text-gray-300'}>{snap.vmid ?? '-'}</td>
                                                                                 <td className={isCorporate ? '' : 'px-4 py-3 text-gray-200'}>{snap.vm_name ?? '-'}</td>
                                                                                 <td className={isCorporate ? '' : 'px-4 py-3'}>
@@ -16183,6 +16309,7 @@
                                                                                 <td className={isCorporate ? 'corp-snap-mono' : 'px-4 py-3 font-mono text-gray-200'}>{snap.snapshot_name ?? '-'}</td>
                                                                                 <td className={isCorporate ? '' : 'px-4 py-3 text-gray-300'}>{snap.snapshot_ts ? fmtDate(snap.snapshot_ts) : (snap.snapshot_date ?? '-')}</td>
                                                                                 <td className={isCorporate ? 'corp-snap-age' : 'px-4 py-3 text-yellow-400'}>{snap.age ?? '-'}</td>
+                                                                                {canDeleteSnaps && (
                                                                                 <td className={isCorporate ? 'corp-snap-action' : 'px-4 py-3 text-right'}>
                                                                                     <button
                                                                                         onClick={() => deleteGlobalSnapshot(snap, selectedCluster.id)}
@@ -16194,6 +16321,7 @@
                                                                                         <Icons.Trash className="w-4 h-4" />
                                                                                     </button>
                                                                                 </td>
+                                                                                )}
                                                                             </tr>
                                                                         ))}
                                                                     </tbody>
@@ -16519,12 +16647,14 @@
                                                     <div className="space-y-4">
                                                         <div className="flex justify-between items-center">
                                                             <p className="text-sm text-gray-400">{t('schedulesDesc') || 'Automatically start, stop, reboot or snapshot VMs on a schedule'}</p>
+                                                            {!haReadOnly && (
                                                             <button
                                                                 onClick={() => { setEditingSchedule(null); setShowScheduleModal(true); }}
                                                                 className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm"
                                                             >
                                                                 <Icons.Plus /> {t('newSchedule') || 'New Schedule'}
                                                             </button>
+                                                            )}
                                                         </div>
                                                         
                                                         {schedules.filter(s => s.cluster_id === selectedCluster?.id).length === 0 ? (
@@ -16552,6 +16682,7 @@
                                                                                 <td className="p-3">
                                                                                     <button
                                                                                         onClick={() => toggleScheduleEnabled(schedule.id, !schedule.enabled)}
+                                                                                        disabled={haReadOnly}
                                                                                         className={`w-9 h-5 rounded-full relative transition-colors ${schedule.enabled ? 'bg-green-500' : 'bg-gray-600'}`}
                                                                                     >
                                                                                         <span className={`absolute top-0.5 w-4 h-4 bg-white rounded-full transition-transform ${schedule.enabled ? 'left-4' : 'left-0.5'}`} />
@@ -16579,12 +16710,14 @@
                                                                                     {schedule.run_count > 0 && ` (${schedule.run_count}x)`}
                                                                                 </td>
                                                                                 <td className="p-3 flex gap-1">
+                                                                                    {!haReadOnly && (<>
                                                                                     <button onClick={() => { setEditingSchedule(schedule); setShowScheduleModal(true); }} className="p-1 hover:bg-blue-500/20 rounded text-gray-500 hover:text-blue-400" title="Edit">
                                                                                         <Icons.Edit className="w-4 h-4" />
                                                                                     </button>
                                                                                     <button onClick={() => deleteSchedule(schedule.id)} className="p-1 hover:bg-red-500/20 rounded text-gray-500 hover:text-red-400">
                                                                                         <Icons.Trash className="w-4 h-4" />
                                                                                     </button>
+                                                                                    </>)}
                                                                                 </td>
                                                                             </tr>
                                                                         ))}
@@ -16633,6 +16766,7 @@
                                                     <div className="space-y-4">
                                                         <div className="flex justify-between items-center">
                                                             <p className="text-sm text-gray-400">{t('alertsDesc') || 'Get notified when resources exceed thresholds'}</p>
+                                                            {!haReadOnly && (
                                                             <button
                                                                 onClick={async () => {
                                                                     setEditingAlert(null);  // #618 — fresh create
@@ -16652,6 +16786,7 @@
                                                             >
                                                                 <Icons.Plus /> {t('newAlert') || 'New Alert'}
                                                             </button>
+                                                            )}
                                                         </div>
                                                         
                                                         {/* NS #501 — currently firing incidents (severity + ack) */}
@@ -16678,7 +16813,7 @@
                                                                                 </div>
                                                                             </div>
                                                                         </div>
-                                                                        {!a.acked_at && (
+                                                                        {!a.acked_at && !haReadOnly && (
                                                                             <button onClick={() => ackAlert(a.id)} className="px-3 py-1.5 text-xs bg-proxmox-dark hover:bg-proxmox-hover border border-proxmox-border rounded-lg shrink-0">
                                                                                 {t('acknowledge') || 'Acknowledge'}
                                                                             </button>
@@ -16700,6 +16835,7 @@
                                                                         <div className="flex items-center gap-3">
                                                                             <button
                                                                                 onClick={() => toggleAlertEnabled(alert.id, !alert.enabled)}
+                                                                                disabled={haReadOnly}
                                                                                 className={`w-9 h-5 rounded-full relative transition-colors ${alert.enabled ? 'bg-green-500' : 'bg-gray-600'}`}
                                                                             >
                                                                                 <span className={`absolute top-0.5 w-4 h-4 bg-white rounded-full transition-transform ${alert.enabled ? 'left-4' : 'left-0.5'}`} />
@@ -16722,6 +16858,7 @@
                                                                                 </div>
                                                                             </div>
                                                                         </div>
+                                                                        {!haReadOnly && (
                                                                         <div className="flex items-center gap-1">
                                                                             <button onClick={() => openEditAlert(alert)} title={t('editAlert') || 'Edit Alert'} className="p-1.5 hover:bg-proxmox-hover rounded text-gray-500 hover:text-proxmox-orange">
                                                                                 <Icons.Edit className="w-4 h-4" />
@@ -16730,6 +16867,7 @@
                                                                                 <Icons.Trash className="w-4 h-4" />
                                                                             </button>
                                                                         </div>
+                                                                        )}
                                                                     </div>
                                                                 ))}
                                                             </div>
@@ -16742,12 +16880,14 @@
                                                     <div className="space-y-4">
                                                         <div className="flex justify-between items-center">
                                                             <p className="text-sm text-gray-400">{t('affinityDesc') || 'Keep VMs together or separate across nodes'}</p>
+                                                            {!haReadOnly && (
                                                             <button
                                                                 onClick={() => setShowAffinityModal(true)}
                                                                 className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm"
                                                             >
                                                                 <Icons.Plus /> {t('newRule') || 'New Rule'}
                                                             </button>
+                                                            )}
                                                         </div>
                                                         
                                                         {clusterAffinityRules.length === 0 ? (
@@ -16767,9 +16907,11 @@
                                                                             <span className="text-sm text-white font-medium">{rule.name || rule.id}</span>
                                                                             <span className="text-sm text-gray-400">VMs: {(rule.vm_ids || rule.vms || []).join(', ')}</span>
                                                                         </div>
+                                                                        {!haReadOnly && (
                                                                         <button onClick={() => deleteClusterAffinityRule(rule.id)} className="p-1.5 hover:bg-red-500/20 rounded text-gray-500 hover:text-red-400">
                                                                             <Icons.Trash className="w-4 h-4" />
                                                                         </button>
+                                                                        )}
                                                                     </div>
                                                                 ))}
                                                             </div>
@@ -16790,12 +16932,14 @@
                                                                 >
                                                                     <Icons.RefreshCw className="w-4 h-4" />
                                                                 </button>
+                                                                {!haReadOnly && (
                                                                 <button
                                                                     onClick={() => { setEditingScript(null); setShowScriptModal(true); }}
                                                                     className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm"
                                                                 >
                                                                     <Icons.Plus /> {t('newScript') || 'New Script'}
                                                                 </button>
+                                                                )}
                                                             </div>
                                                         </div>
                                                         
@@ -16827,6 +16971,7 @@
                                                                             </div>
                                                                             <div className="flex items-center gap-2">
                                                                                 {/* Run Script - opens password confirmation */}
+                                                                                {!haReadOnly && (
                                                                                 <button
                                                                                     onClick={() => setShowScriptRunModal(script)}
                                                                                     className="p-2 rounded-lg bg-green-500/20 text-green-400 hover:bg-green-500/30"
@@ -16835,6 +16980,7 @@
                                                                                 >
                                                                                     <Icons.Play className="w-4 h-4" />
                                                                                 </button>
+                                                                                )}
                                                                                 {/* View Last Output */}
                                                                                 {script.last_run && (
                                                                                     <button
@@ -16855,6 +17001,7 @@
                                                                                         <Icons.FileText className="w-4 h-4" />
                                                                                     </button>
                                                                                 )}
+                                                                                {!haReadOnly && (<>
                                                                                 <button
                                                                                     onClick={() => { setEditingScript(script); setShowScriptModal(true); }}
                                                                                     className="p-2 rounded-lg bg-proxmox-dark text-gray-400 hover:bg-proxmox-hover hover:text-white"
@@ -16879,6 +17026,7 @@
                                                                                 >
                                                                                     <Icons.Trash className="w-4 h-4" />
                                                                                 </button>
+                                                                                </>)}
                                                                             </div>
                                                                         </div>
                                                                         {script.description && (
@@ -17342,6 +17490,7 @@
                                                                         className="px-2.5 py-1 text-xs rounded border border-proxmox-border text-gray-400 hover:text-white hover:border-gray-500 whitespace-nowrap"
                                                                         title={t('exportPdf') || 'Export as PDF'}
                                                                     >PDF</button>
+                                                                    {!haReadOnly && (<>
                                                                     <button
                                                                         onClick={applyHardening}
                                                                         disabled={hardenApplying || selectedCount === 0}
@@ -17365,6 +17514,7 @@
                                                                     >
                                                                         <Icons.RotateCcw className="w-4 h-4" /> {t('rollbackSelected') || 'Rollback Selected'} ({selectedCount})
                                                                     </button>
+                                                                    </>)}
                                                                 </div>
 
                                                                 {/* #16745 (A/C) — gated apply confirmation: click-happy users must read + tick before anything touches the node */}
@@ -17879,6 +18029,7 @@
                                                                         >PDF</button>
                                                                     </>
                                                                 )}
+                                                                {!haReadOnly && (
                                                                 <button
                                                                     onClick={() => runCveScan()}
                                                                     disabled={cveScanLoading}
@@ -17891,6 +18042,7 @@
                                                                     <Icons.Shield className={`w-4 h-4 ${cveScanLoading ? 'animate-pulse' : ''}`} />
                                                                     {cveScanLoading ? (t('scanning') || 'Scanning...') : (t('scanAllNodes') || 'Scan All Nodes')}
                                                                 </button>
+                                                                )}
                                                             </div>
                                                         </div>
 
@@ -17923,6 +18075,7 @@
                                                                                     </p>
                                                                                 </div>
                                                                             </div>
+                                                                            {!haReadOnly && (
                                                                             <button
                                                                                 onClick={() => installDebsecan()}
                                                                                 disabled={debsecanInstalling}
@@ -17938,6 +18091,7 @@
                                                                                     <><Icons.Download className="w-4 h-4" /> {t('installDebsecan') || 'Install debsecan'}</>
                                                                                 )}
                                                                             </button>
+                                                                            )}
                                                                         </div>
                                                                     </div>
                                                                 )}
@@ -18575,6 +18729,7 @@
                                                                 onChange={v => updateConfig('auto_migrate', v)}
                                                                 label={t('autoMigrate')}
                                                             />
+                                                            {!haReadOnly && (
                                                             <button
                                                                 onClick={handleBalanceNow}
                                                                 disabled={balanceRunning || !selectedCluster.connected}
@@ -18587,6 +18742,7 @@
                                                                 }
                                                                 {t('balanceNow') || 'Balance Now'}
                                                             </button>
+                                                            )}
                                                         </div>
                                                         <Toggle
                                                             checked={selectedCluster.dry_run}
@@ -18987,7 +19143,8 @@
                                                 </div>
                                             </div>
                                             <div className={isCorporate ? 'corp-toolbar flex items-center gap-1' : 'flex items-center gap-2'}>
-                                                {isAdmin && (
+                                                {/* editing the server and its keys is the active's (#625) */}
+                                                {isAdmin && !haReadOnly && (
                                                     <>
                                                         <button onClick={() => { setEditingPBS(selectedPBS); setPbsForm({ name: selectedPBS.name, host: selectedPBS.host, port: selectedPBS.port, user: selectedPBS.user, password: '********', api_token_id: selectedPBS.api_token_id || '', api_token_secret: selectedPBS.using_api_token ? '********' : '', fingerprint: selectedPBS.fingerprint || '', ssl_verify: selectedPBS.ssl_verify || false, linked_clusters: selectedPBS.linked_clusters || [], notes: selectedPBS.notes || '', ssh_user: selectedPBS.ssh_user || '', ssh_port: selectedPBS.ssh_port || 22, ssh_key: selectedPBS.has_ssh_key ? '********' : '', _showSsh: !!selectedPBS.ssh_user }); setShowAddPBS(true); }} className={isCorporate ? '' : 'px-3 py-2 rounded-lg bg-proxmox-card border border-proxmox-border text-gray-400 hover:text-white hover:border-blue-500/30 transition-all text-sm flex items-center gap-2'}>
                                                             <Icons.Edit className="w-4 h-4" /> {t('edit') || 'Edit'}
@@ -18998,7 +19155,7 @@
                                                     </>
                                                 )}
                                                 {/* LW May 2026 — Encryption Key generator */}
-                                                {isAdmin && (
+                                                {isAdmin && !haReadOnly && (
                                                     <button onClick={() => setShowEncryptionKeyModal(true)}
                                                         className={isCorporate ? '' : 'px-3 py-2 rounded-lg bg-proxmox-card border border-proxmox-border text-gray-400 hover:text-yellow-400 hover:border-yellow-500/30 transition-all text-sm flex items-center gap-2'}
                                                         title={t('encryptionKey') || 'Encryption Key'}>
@@ -19006,7 +19163,7 @@
                                                     </button>
                                                 )}
                                                 {/* NS May 2026 — Auto-Verify schedule settings */}
-                                                {isAdmin && (
+                                                {isAdmin && !haReadOnly && (
                                                     <button onClick={() => setShowVerifyScheduleModal(true)}
                                                         className={isCorporate ? '' : 'px-3 py-2 rounded-lg bg-proxmox-card border border-proxmox-border text-gray-400 hover:text-cyan-400 hover:border-cyan-500/30 transition-all text-sm flex items-center gap-2'}
                                                         title={t('autoVerify') || 'Auto Verify'}>
@@ -20399,7 +20556,7 @@
                                                 </div>
                                             </div>
                                             <div className={isCorporate ? 'corp-toolbar flex items-center gap-1' : 'flex items-center gap-2'}>
-                                                {isAdmin && (
+                                                {isAdmin && !haReadOnly && (
                                                     <>
                                                         <button onClick={() => { setEditingVMware(selectedVMware); setVmwareForm({ name: selectedVMware.name || '', host: selectedVMware.host, port: selectedVMware.port || 443, username: selectedVMware.username || 'root', password: '', ssl_verify: selectedVMware.ssl_verify || false, notes: selectedVMware.notes || '' }); setShowAddVMware(true); }} className={isCorporate ? '' : 'px-3 py-2 rounded-lg bg-proxmox-card border border-proxmox-border text-gray-400 hover:text-white text-sm'}>
                                                             <Icons.Settings className="w-4 h-4" />
@@ -20543,7 +20700,7 @@
                                                                                 <td className="p-3 text-gray-400 text-sm">{(vm.host || vm.host_name || '-').split('.')[0]}</td>
                                                                                 <td className="p-3 text-right" onClick={e => e.stopPropagation()}>
                                                                                     <div className="flex items-center justify-end gap-1">
-                                                                                        {!isOn ? (
+                                                                                        {!haReadOnly && (!isOn ? (
                                                                                             <button onClick={() => vmwarePowerAction(vm.vm || vm.vm_id || vm.id, 'start')} disabled={!!actionLoading} className="p-1.5 rounded-lg text-green-400 hover:bg-green-500/10 disabled:opacity-50" title={t('start')}>
                                                                                                 {actionLoading === 'start' ? <Icons.RefreshCw className="w-4 h-4 animate-spin" /> : <Icons.Play className="w-4 h-4" />}
                                                                                             </button>
@@ -20559,7 +20716,7 @@
                                                                                                     <Icons.Pause className="w-4 h-4" />
                                                                                                 </button>
                                                                                             </>
-                                                                                        )}
+                                                                                        ))}
                                                                                     </div>
                                                                                 </td>
                                                                             </tr>
@@ -20640,6 +20797,8 @@
                                                                             </div>
                                                                         </div>
                                                                     </div>
+                                                                    {/* power, console, rename, clone, migrate and delete are the active's (#625) */}
+                                                                    {!haReadOnly && (
                                                                     <div className="flex items-center gap-2">
                                                                         {/* Power Actions */}
                                                                         {!isOn ? (
@@ -20690,6 +20849,7 @@
                                                                             </div>
                                                                         </div>
                                                                     </div>
+                                                                    )}
                                                                 </div>
                                                             </div>
                                                             
@@ -20828,8 +20988,9 @@
                                                                 const initNotes = vmwareConfigEdit.notes !== undefined && vmwareConfigEdit.notes !== '' ? vmwareConfigEdit.notes : (vm.annotation || vm.notes || vm.config?.annotation || '');
                                                                 const perfData = vm.performance || {};
                                                                 
+                                                                // #625: on a standby the settings show, but nothing here saves
                                                                 return (
-                                                                    <div className="space-y-4">
+                                                                    <fieldset disabled={haReadOnly} className="space-y-4 min-w-0" data-ha-locked={haReadOnly ? '' : undefined}>
                                                                         {/* Power State Warning */}
                                                                         {isOn && (
                                                                             <div className="bg-yellow-500/10 border border-yellow-500/20 rounded-xl p-3">
@@ -20993,6 +21154,7 @@
                                                                         )}
                                                                         
                                                                         {/* Save Button */}
+                                                                        {!haReadOnly && (
                                                                         <div className="flex justify-end gap-3">
                                                                             <button onClick={() => setVmwareConfigEdit({ cpu: '', memory: '', notes: '', cpu_hot_add: false, memory_hot_add: false })}
                                                                                 className="px-4 py-2 rounded-lg bg-proxmox-card border border-proxmox-border text-gray-400 hover:text-white text-sm">
@@ -21005,7 +21167,8 @@
                                                                                 {t('saveChanges')}
                                                                             </button>
                                                                         </div>
-                                                                    </div>
+                                                                        )}
+                                                                    </fieldset>
                                                                 );
                                                             })()}
                                                             
@@ -21100,6 +21263,7 @@
                                                                                     </div>
                                                                                 </div>
                                                                             )}
+                                                                            {!haReadOnly && (
                                                                             <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4">
                                                                                 <h3 className="text-sm font-semibold text-gray-400 uppercase mb-4">{t('quickActions') || 'Quick Actions'}</h3>
                                                                                 <div className="space-y-2">
@@ -21121,6 +21285,7 @@
                                                                                     </button>
                                                                                 </div>
                                                                             </div>
+                                                                            )}
                                                                         </div>
                                                                     </div>
                                                                 </div>
@@ -21131,7 +21296,7 @@
                                                                 <div className="space-y-4">
                                                                     <div className="flex items-center justify-between">
                                                                         <h3 className="text-sm font-semibold text-gray-400">{t('snapshots')} ({snapsList.length})</h3>
-                                                                        <button onClick={async () => {
+                                                                        {!haReadOnly && <button onClick={async () => {
                                                                             const name = prompt(`${t('snapshotName')}:`);
                                                                             if (name) {
                                                                                 await vmwareSnapshotAction(vmwareSelectedVm, 'create', { name, description: '' });
@@ -21139,7 +21304,7 @@
                                                                             }
                                                                         }} className="px-3 py-1.5 rounded-lg bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30 text-sm font-medium">
                                                                             + {t('createSnapshot')}
-                                                                        </button>
+                                                                        </button>}
                                                                     </div>
                                                                     {snapsList.length > 0 ? (
                                                                         <div className="space-y-2">
@@ -21155,9 +21320,9 @@
                                                                                             {snap.created && <div className="text-xs text-gray-600">{fmtDate(snap.created)}</div>}
                                                                                         </div>
                                                                                     </div>
-                                                                                    <button onClick={() => vmwareSnapshotAction(vmwareSelectedVm, 'delete', { snapshot_id: snap.id || snap.snapshot })} className="p-2 text-red-400 hover:bg-red-500/10 rounded-lg" title={t('deleteSnapshot')}>
+                                                                                    {!haReadOnly && <button onClick={() => vmwareSnapshotAction(vmwareSelectedVm, 'delete', { snapshot_id: snap.id || snap.snapshot })} className="p-2 text-red-400 hover:bg-red-500/10 rounded-lg" title={t('deleteSnapshot')}>
                                                                                         <Icons.Trash className="w-4 h-4" />
-                                                                                    </button>
+                                                                                    </button>}
                                                                                 </div>
                                                                             ))}
                                                                         </div>
@@ -21207,9 +21372,9 @@
                                                                             <div>4. {t('migStep4') || 'Atomic cutover and start VM on Proxmox'}</div>
                                                                         </div>
                                                                         
-                                                                        <button onClick={() => fetchMigrationPlan(vmwareSelectedVm)} disabled={vmwareMigrateLoading} className="w-full py-2.5 rounded-lg bg-emerald-500 text-white font-medium hover:bg-emerald-600 disabled:opacity-50 text-sm">
+                                                                        {!haReadOnly && <button onClick={() => fetchMigrationPlan(vmwareSelectedVm)} disabled={vmwareMigrateLoading} className="w-full py-2.5 rounded-lg bg-emerald-500 text-white font-medium hover:bg-emerald-600 disabled:opacity-50 text-sm">
                                                                             {vmwareMigrateLoading ? 'Loading Migration Plan...' : 'Start Migration Wizard'}
-                                                                        </button>
+                                                                        </button>}
                                                                     </div>
                                                                     
                                                                     {/* Active Migrations */}
@@ -21234,7 +21399,7 @@
                                                                                             </div>
                                                                                         )}
                                                                                         {m.current_step && <div className="text-xs text-gray-500 mt-1">{m.current_step}</div>}
-                                                                                        {m.phase === 'awaiting_confirmation' && (
+                                                                                        {m.phase === 'awaiting_confirmation' && !haReadOnly && (
                                                                                             <div className="mt-2 flex items-center gap-2">
                                                                                                 <span className="text-xs text-amber-300 flex-1">{t('awaitingCutoverShort') || 'Ready to switch over — source still running.'}</span>
                                                                                                 <button onClick={() => confirmVmwareCutover(m.id)} className="px-2 py-1 rounded text-xs font-semibold bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30 border border-emerald-500/40">{t('commitSwitchover') || 'Commit switchover now'}</button>
@@ -22065,6 +22230,8 @@
                                                                             </div>
                                                                         </div>
                                                                     </div>
+                                                                    {/* switching DRS and HA is the active's (#625) */}
+                                                                    {!haReadOnly && (
                                                                     <div className="flex items-center gap-2">
                                                                         {cl.drs_enabled && (
                                                                             <select 
@@ -22088,6 +22255,7 @@
                                                                             {cl.drs_enabled ? t('disable') : t('enable')}
                                                                         </button>
                                                                     </div>
+                                                                    )}
                                                                 </div>
                                                                 
                                                                 {/* HA */}
@@ -22105,7 +22273,7 @@
                                                                             </div>
                                                                         </div>
                                                                     </div>
-                                                                    <button 
+                                                                    {!haReadOnly && <button 
                                                                         onClick={() => toggleVMwareHA(selectedVMware.id, cl.cluster, !cl.ha_enabled)}
                                                                         className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
                                                                             cl.ha_enabled 
@@ -22114,7 +22282,7 @@
                                                                         }`}
                                                                     >
                                                                         {cl.ha_enabled ? t('disable') : t('enable')}
-                                                                    </button>
+                                                                    </button>}
                                                                 </div>
                                                                 
                                                                 {/* Cluster Hosts */}
@@ -22200,7 +22368,7 @@
                                                                             </div>
                                                                         )}
                                                                         {/* #562 — cutover gate: commit / cancel the switchover */}
-                                                                        {isAwaiting && (
+                                                                        {isAwaiting && !haReadOnly && (
                                                                             <div className="mt-3 p-3 rounded-lg bg-amber-500/10 border border-amber-500/30" onClick={e => e.stopPropagation()}>
                                                                                 <div className="flex items-start gap-2 text-xs text-amber-300 mb-2">
                                                                                     <Icons.AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
@@ -22624,9 +22792,9 @@
                                                             </label>
                                                         </div>
 
-                                                        <button onClick={startXhmMigration} disabled={xhmLoading || !xhmForm.target_storage || (xhmPlan?.direction === 'xcpng_to_pve' && !xhmForm.target_node)} className="w-full py-2.5 rounded-lg bg-purple-500 text-white font-medium hover:bg-purple-600 disabled:opacity-50 text-sm">
+                                                        {!haReadOnly && <button onClick={startXhmMigration} disabled={xhmLoading || !xhmForm.target_storage || (xhmPlan?.direction === 'xcpng_to_pve' && !xhmForm.target_node)} className="w-full py-2.5 rounded-lg bg-purple-500 text-white font-medium hover:bg-purple-600 disabled:opacity-50 text-sm">
                                                             {xhmLoading ? 'Starting...' : (t('xhmStartMigration') || 'Start Migration')}
-                                                        </button>
+                                                        </button>}
                                                     </div>
                                                 )}
                                             </div>
@@ -22738,8 +22906,8 @@
                                             authFetch={authFetch}
                                             API_URL={API_URL}
                                             addToast={addToast}
-                                            canAdminSettings={isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes('admin.settings'))}
-                                            canManage={isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes('sdn.manage') && user.permissions.includes('admin.settings'))}
+                                            canAdminSettings={can('admin.settings')}
+                                            canManage={can('sdn.manage') && can('admin.settings')}
                                         />
                                     </div>
                                 ) : sidebarAutoInstall ? (
@@ -25385,7 +25553,7 @@
         // host, which is one /api/clusters read — the parent window is not involved at all,
         // so the popup survives the opener being closed or navigated away.
         function StandaloneConsole({ consoleKey }) {
-            const { getAuthHeaders } = useAuth();
+            const { getAuthHeaders, haReadOnly } = useAuth();
             const { t } = useTranslation();
             const [state, setState] = useState({ status: 'loading', vm: null, info: null, clusterId: null });
 
@@ -25401,6 +25569,11 @@
                     (type !== 'qemu' && type !== 'lxc') || !/^\d+$/.test(vmid) ||
                     !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(node || '')) {
                     setState({ status: 'error', error: 'malformed' });
+                    return;
+                }
+                // consoles are the active's (#625); the server refuses one here anyway
+                if (haReadOnly) {
+                    setState({ status: 'error', error: 'standby' });
                     return;
                 }
 
@@ -25445,7 +25618,7 @@
                     }
                 })();
                 return () => { cancelled = true; };
-            }, [consoleKey]);  // eslint-disable-line react-hooks/exhaustive-deps
+            }, [consoleKey, haReadOnly]);  // eslint-disable-line react-hooks/exhaustive-deps
 
             // window.close() is only allowed for a window script opened. Someone who pasted
             // or bookmarked the link is in an ordinary tab, where it does nothing at all and
@@ -25470,6 +25643,7 @@
                             <p className="text-gray-500 text-sm">{
                                 state.error === 'malformed' ? t('consoleLinkMalformed')
                                 : state.error === 'noAccess' ? t('consoleNoClusterAccess')
+                                : state.error === 'standby' ? t('pgHaStandbyRefused')
                                 : state.error
                             }</p>
                         </div>

@@ -75,7 +75,8 @@
         // Node Card Component
         function NodeCard({ name, metrics, index, clusterId, nodeUiSuffix, onMaintenanceToggle, onStartUpdate, onOpenNodeConfig, onNodeAction, onRemoveNode, onMoveNode }) {
             const { t } = useTranslation();
-            const { getAuthHeaders } = useAuth();
+            // #625 v2: a standby shows maintenance and update state, it does not change them
+            const { getAuthHeaders, haReadOnly } = useAuth();
             // NS: 20 data points = last ~40s of sparkline at 2s polling interval
             const historyRef = useRef({
                 cpu: Array(20).fill(0),
@@ -269,7 +270,7 @@
                                              updateTask.status}
                                         </span>
                                         {/* Dismiss button for completed/failed */}
-                                        {(updateTask.status === 'completed' || updateTask.status === 'failed') && (
+                                        {!haReadOnly && (updateTask.status === 'completed' || updateTask.status === 'failed') && (
                                             <button
                                                 onClick={async (e) => {
                                                     e.stopPropagation();
@@ -313,6 +314,7 @@
                                         <div className="text-xs text-red-400">
                                             ❌ {t('error')}: {updateTask.error}
                                         </div>
+                                        {!haReadOnly && (
                                         <button
                                             onClick={async () => {
                                                 // First clear the update status
@@ -330,6 +332,7 @@
                                         >
                                             {t('cancelAndExitMaintenance')}
                                         </button>
+                                        )}
                                     </div>
                                 )}
                             </div>
@@ -418,6 +421,7 @@
                                         )}
                                         
                                         {/* Proceed or Exit buttons */}
+                                        {!haReadOnly && (
                                         <div className="flex gap-2">
                                             <button
                                                 onClick={async () => {
@@ -444,11 +448,12 @@
                                                 {t('exitMaintenance')}
                                             </button>
                                         </div>
+                                        )}
                                     </div>
                                 )}
                                 
                                 {/* After acknowledging completed_with_errors OR normal completed - show full menu */}
-                                {(maintenanceTask?.status === 'completed' || (maintenanceTask?.status === 'completed_with_errors' && metrics.maintenance_acknowledged)) && (
+                                {!haReadOnly && (maintenanceTask?.status === 'completed' || (maintenanceTask?.status === 'completed_with_errors' && metrics.maintenance_acknowledged)) && (
                                     <div className="space-y-2 mt-2">
                                         {/* Show warning reminder if there were errors */}
                                         {maintenanceTask?.status === 'completed_with_errors' && maintenanceTask?.failed_vms?.length > 0 && (
@@ -543,7 +548,7 @@
                             </div>
                         </div>
                         <div className="flex items-center gap-2">
-                            {!isInMaintenance && !isUpdating && (
+                            {!haReadOnly && !isInMaintenance && !isUpdating && (
                                 <button
                                     onClick={() => setShowMaintenanceConfirm(true)}
                                     className="p-2 rounded-lg bg-proxmox-dark hover:bg-yellow-500/20 text-gray-400 hover:text-yellow-400 transition-all"
@@ -967,7 +972,7 @@
         // NS: Mar 2026 - added sparkline history + detail cards
         function NodeCompactRow({ name, metrics, clusterId, nodeUiSuffix, onOpenNodeConfig, onMaintenanceToggle, onStartUpdate, onNodeAction, onRemoveNode, onMoveNode }) {
             const { t } = useTranslation();
-            const { getAuthHeaders } = useAuth();
+            const { getAuthHeaders, haReadOnly } = useAuth();  // #625: read-only on a standby
             const [expanded, setExpanded] = useState(false);
             const [showMaintenanceConfirm, setShowMaintenanceConfirm] = useState(false);
             const [showRebootConfirm, setShowRebootConfirm] = useState(false);
@@ -1088,7 +1093,7 @@
                                                 t('updateRunning')
                                             }: {updateTask.phase || '...'}</span>
                                         </div>
-                                        {(updateTask.status === 'completed' || updateTask.status === 'failed') && (
+                                        {!haReadOnly && (updateTask.status === 'completed' || updateTask.status === 'failed') && (
                                             <button onClick={(e) => { e.stopPropagation();
                                                 fetch(`${API_URL}/clusters/${clusterId}/nodes/${name}/update`, { method: 'DELETE', credentials: 'include', headers: getAuthHeaders() }).catch(() => {});
                                             }} className="text-[10px] px-1.5 py-0.5 hover:text-white" style={{color: '#728b9a'}}>✕</button>
@@ -1137,7 +1142,7 @@
                                         </div>
                                     )}
                                     {/* NS: force/exit buttons - only when NOT yet acknowledged */}
-                                    {!metrics.maintenance_acknowledged && (maintenanceTask.status === 'completed_with_errors' || (maintenanceTask.failed_vms && maintenanceTask.failed_vms.length > 0)) && (
+                                    {!haReadOnly && !metrics.maintenance_acknowledged && (maintenanceTask.status === 'completed_with_errors' || (maintenanceTask.failed_vms && maintenanceTask.failed_vms.length > 0)) && (
                                         <div className="mt-1.5 flex items-center gap-2">
                                             <button onClick={(e) => { e.stopPropagation();
                                                 if (confirm(t('forceMaintenanceWarning') || 'Proceeding may stop remaining VMs. Continue?')) {
@@ -1196,6 +1201,7 @@
                                 <Icons.ExternalLink className="w-3 h-3" style={{color: '#49afd9'}} /> {t('openInProxmox') || 'Open in Proxmox'}
                             </button>
                         )}
+                        {!haReadOnly && (<>
                         {!isInMaintenance ? (
                             <button onClick={() => setShowMaintenanceConfirm(true)}>
                                 <Icons.Wrench className="w-3 h-3" style={{color: '#efc006'}} /> {t('enterMaintenance') || t('maintenance')}
@@ -1224,6 +1230,7 @@
                                 <button onClick={() => setShowShutdownConfirm(true)}>
                                     <Icons.Power className="w-3 h-3" style={{color: '#f54f47'}} /> {t('shutdown')}
                                 </button>
+                                </>)}
                             </div>
                         </div>
                     )}
@@ -1291,7 +1298,10 @@
         // NS: filtering + sorting uses useMemo below (lines 1320+)
         function ResourceTable({ resources, clusterId, clusters, sourceCluster, onVmAction, onOpenConsole, onOpenSpice, onOpenConfig, onMigrate, onBulkMigrate, onDelete, onClone, onForceStop, onCrossClusterMigrate, nodes, datastores, onOpenTags, highlightedVm, addToast, pendingVmAction, onPendingActionConsumed, onVmNavigate, backupStatus }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, user } = useAuth();
+            const { getAuthHeaders, user, haReadOnly } = useAuth();
+            // #625 v2 - a standby shows the guests live but acts on none of them: no power,
+            // console, migrate, clone or delete buttons. Config, metrics and Proxmox links stay.
+            const acts = !haReadOnly;
             const { isCorporate } = useLayout(); // LW: Feb 2026 - corporate defaults to table view
             // NS Mar 2026 - per-VM sparkline history for table view
             const vmHistRef = useRef({});
@@ -1627,10 +1637,12 @@
                                     {/* LW Sep 2026 (#798) - the bulk bar below is suppressed in corporate
                                         because it was meant to live up here, but only the count ever made
                                         it across, so selecting rows in this layout did nothing at all. */}
+                                    {acts && (
                                     <button onClick={() => setShowBulkMigrate(true)}
                                         className="corp-toolbar-filter" style={{color: '#49afd9'}}>
                                         {t('migrate')}
                                     </button>
+                                    )}
                                     <button onClick={() => setSelectedVms([])}
                                         className="corp-toolbar-filter">
                                         {t('clearSelection') || 'Clear selection'}
@@ -1743,7 +1755,7 @@
                     )}
 
                     {/* Bulk Actions Bar (hidden in corporate - integrated in toolbar) */}
-                    {!isCorporate && selectedVms.length > 0 && (
+                    {!isCorporate && acts && selectedVms.length > 0 && (
                         <div className="flex items-center gap-3 p-3 bg-proxmox-orange/10 border border-proxmox-orange/30 rounded-lg">
                             <span className="text-sm text-proxmox-orange font-medium">
                                 {selectedVms.length} {t('selectedItems')}
@@ -1928,7 +1940,7 @@
                                                         <Icons.ExternalLink />
                                                     </button>
                                                 )}
-                                                {resource.status === 'stopped' ? (
+                                                {!acts ? null : resource.status === 'stopped' ? (
                                                     <button
                                                         onClick={() => handleAction(resource, 'start')}
                                                         disabled={actionLoading[`${resource.vmid}-start`]}
@@ -1957,7 +1969,7 @@
                                                         </button>
                                                     </>
                                                 )}
-                                                {resource.status === 'running' && (
+                                                {acts && resource.status === 'running' && (
                                                     <button
                                                         onClick={() => onOpenConsole(resource)}
                                                         className="p-1.5 rounded-lg hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
@@ -1966,7 +1978,7 @@
                                                         <Icons.Monitor />
                                                     </button>
                                                 )}
-                                                {resource.status === 'running' && resource.type === 'qemu' && onOpenSpice && (
+                                                {acts && resource.status === 'running' && resource.type === 'qemu' && onOpenSpice && (
                                                     <button
                                                         onClick={() => onOpenSpice(resource)}
                                                         className="p-1.5 rounded-lg hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
@@ -1982,6 +1994,7 @@
                                                 >
                                                     <Icons.Cog />
                                                 </button>
+                                                {acts && (
                                                 <button
                                                     onClick={() => setShowMigrateModal(resource)}
                                                     className="p-1.5 rounded-lg hover:bg-cyan-500/20 text-gray-400 hover:text-cyan-400 transition-all"
@@ -1989,6 +2002,7 @@
                                                 >
                                                     <Icons.ArrowRight />
                                                 </button>
+                                                )}
                                             </div>
                                             
                                             {/* More Actions Dropdown */}
@@ -2008,6 +2022,7 @@
                                                     <>
                                                         <div className="fixed inset-0 z-40" onClick={() => setOpenDropdown(null)} />
                                                         <div className="absolute right-0 bottom-full mb-1 w-48 bg-proxmox-card border border-proxmox-border rounded-lg shadow-xl z-50 py-1 animate-fade-in">
+                                                            {acts && (<>
                                                             <button
                                                                 onClick={() => { setShowMigrateModal(resource); setOpenDropdown(null); }}
                                                                 className="w-full px-3 py-2 text-left text-sm text-gray-300 hover:bg-proxmox-hover flex items-center gap-2"
@@ -2024,6 +2039,7 @@
                                                                     {t('crossClusterMigrate')}
                                                                 </button>
                                                             )}
+                                                            </>)}
                                                             <button
                                                                 onClick={() => { setShowMetricsModal(resource); setOpenDropdown(null); }}
                                                                 className="w-full px-3 py-2 text-left text-sm text-gray-300 hover:bg-proxmox-hover flex items-center gap-2"
@@ -2031,6 +2047,7 @@
                                                                 <Icons.BarChart className="w-4 h-4" />
                                                                 {t('performance')}
                                                             </button>
+                                                            {acts && (<>
                                                             <button
                                                                 onClick={() => { setShowCloneModal(resource); setOpenDropdown(null); }}
                                                                 className="w-full px-3 py-2 text-left text-sm text-gray-300 hover:bg-proxmox-hover flex items-center gap-2"
@@ -2067,6 +2084,7 @@
                                                                 <Icons.Trash className="w-4 h-4" />
                                                                 {t('delete')}
                                                             </button>
+                                                            </>)}
                                                         </div>
                                                     </>
                                                 )}
@@ -2301,6 +2319,7 @@
                                                             </>
                                                         )}
                                                         {/* power group */}
+                                                        {acts && (<>
                                                         <div className="corp-action-group">
                                                             {resource.status === 'stopped' ? (
                                                                 <button onClick={() => handleAction(resource, 'start')} disabled={actionLoading[`${resource.vmid}-start`]} className="corp-action-btn" title={t('start')}>
@@ -2318,20 +2337,25 @@
                                                             )}
                                                         </div>
                                                         <span className="corp-toolbar-divider" style={{margin: '0 3px'}} />
+                                                        </>)}
                                                         {/* management group */}
                                                         <div className="corp-action-group">
-                                                            {resource.status === 'running' && (
+                                                            {acts && resource.status === 'running' && (
                                                                 <button onClick={() => onOpenConsole(resource)} className="corp-action-btn" title={t('openConsole')}><Icons.Monitor className="w-3.5 h-3.5" /></button>
                                                             )}
-                                                            {resource.status === 'running' && resource.type === 'qemu' && onOpenSpice && (
+                                                            {acts && resource.status === 'running' && resource.type === 'qemu' && onOpenSpice && (
                                                                 <button onClick={() => onOpenSpice(resource)} className="corp-action-btn" title={t('spiceConsole') || 'SPICE'}><Icons.ExternalLink className="w-3.5 h-3.5" /></button>
                                                             )}
                                                             <button onClick={() => onOpenConfig(resource)} className="corp-action-btn" title={t('configuration')}><Icons.Cog className="w-3.5 h-3.5" /></button>
+                                                            {acts && (<>
                                                             <button onClick={() => setShowMigrateModal(resource)} className="corp-action-btn" title={t('migrate')}><Icons.ArrowRight className="w-3.5 h-3.5" /></button>
                                                             <button onClick={() => setShowCloneModal(resource)} className="corp-action-btn" title={t('clone')}><Icons.Copy className="w-3.5 h-3.5" /></button>
+                                                            </>)}
                                                         </div>
+                                                        {acts && (<>
                                                         <span className="corp-toolbar-divider" style={{margin: '0 3px'}} />
                                                         <button onClick={() => setShowDeleteConfirm(resource)} className="corp-action-btn danger" title={t('delete')}><Icons.Trash className="w-3.5 h-3.5" /></button>
+                                                        </>)}
                                                     </div>
                                                     ) : (
                                                     <div className="flex items-center gap-1">
@@ -2351,6 +2375,7 @@
                                                         >
                                                             <Icons.Cog />
                                                         </button>
+                                                        {acts && (
                                                         <button
                                                             onClick={() => onOpenTags && onOpenTags(resource)}
                                                             className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-yellow-500/20 text-gray-400 hover:text-yellow-400 transition-all"
@@ -2358,6 +2383,7 @@
                                                         >
                                                             <Icons.Tag />
                                                         </button>
+                                                        )}
                                                         <button
                                                             onClick={() => setShowMetricsModal(resource)}
                                                             className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
@@ -2365,6 +2391,7 @@
                                                         >
                                                             <Icons.BarChart />
                                                         </button>
+                                                        {acts && (<>
                                                         <button
                                                             onClick={() => setShowMigrateModal(resource)}
                                                             className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-cyan-500/20 text-gray-400 hover:text-cyan-400 transition-all"
@@ -2460,6 +2487,7 @@
                                                         >
                                                             <Icons.Trash />
                                                         </button>
+                                                        </>)}
                                                     </div>
                                                     )}
                                                 </td>

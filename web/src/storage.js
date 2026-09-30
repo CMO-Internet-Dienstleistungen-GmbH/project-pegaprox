@@ -5,11 +5,12 @@
         // Datastore Tab Component - with Storage Clusters for balancing
         function DatastoreTab({ clusterId, addToast, initialStorage, initialNode, sharedDatastoreData }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, isAdmin, user } = useAuth();
+            const { getAuthHeaders, isAdmin, user, haReadOnly } = useAuth();
             // #644: gate the storage action bar on the same fine-grained perms the API
             // enforces (storage.download / upload / config) rather than a blanket admin
             // check — a non-admin who holds e.g. storage.upload should get the button.
-            const hasPerm = (p) => isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes(p));
+            // #625: a standby keeps the reading ones only.
+            const hasPerm = (p) => (!haReadOnly || haReadPermission(p)) && (isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes(p)));
             const { isCorporate } = useLayout();
             const [loading, setLoading] = useState(true);
             const [datastores, setDatastores] = useState({ shared: [], local: {}, nodes: [] });

@@ -125,8 +125,9 @@ def test_all_clusters_is_not_lit_next_to_another_global_view(dash, sidebar):
 
 def test_the_entry_sits_right_after_world_map(sidebar):
     world = sidebar.index('Worldmap sidebar entry')
-    # the empty-sidebar card further up uses the same gate, so look after World Map
-    entry = sidebar.index('{canAutoInstall && (', world)
+    # the empty-sidebar card further up uses the same gate, so look after World Map;
+    # a standby installs nothing and shows neither (#625)
+    entry = sidebar.index('{canAutoInstall && !haStandby && (', world)
     xhm = sidebar.index('XHM sidebar')
     assert world < entry < xhm
 
@@ -198,7 +199,10 @@ def test_the_cloud_nav_item_is_gated_and_sits_after_hosts(cloud):
 
 
 def test_the_cloud_shell_reads_the_flag_off_the_current_user(cloud):
-    assert 'const canAutoInstall = !!(currentUser && currentUser.autoinstall_access);' in cloud
+    # not on a standby (#625), like the sidebar entry of the other two layouts
+    assert 'const canAutoInstall = !!(currentUser && currentUser.autoinstall_access) && !haReadOnly;' in cloud
+    shell = cloud[cloud.index('function CloudShell('):]
+    assert shell.index('const { haReadOnly } = useAuth();') < shell.index('const canAutoInstall =')
     assert 'canAutoInstall={canAutoInstall}' in cloud
 
 

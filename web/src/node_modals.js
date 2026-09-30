@@ -1054,7 +1054,7 @@
         // LW: I did the UI, Marcus handled the backend websocket stuff
         function NodeModal({ node, clusterId, clusterType, onClose, addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders } = useAuth();  // NS: Fix - need auth!
+            const { getAuthHeaders, haReadOnly } = useAuth();  // NS: Fix - need auth!
             const { isCorporate } = useLayout();
             const [activeTab, setActiveTab] = useState('summary');
             const [loading, setLoading] = useState(true);
@@ -1080,7 +1080,7 @@
             const authHeaders = getAuthHeaders();  // NS: Get auth headers
 
             // LW: XCP-ng doesn't have Ceph, repos differ, subscription not applicable
-            const tabs = isXcpng ? [
+            const allTabs = isXcpng ? [
                 { id: 'summary', label: 'Summary', icon: Icons.Activity },
                 { id: 'performance', label: 'Performance', icon: Icons.BarChart },
                 { id: 'shell', label: 'Shell', icon: Icons.Terminal },
@@ -1101,6 +1101,13 @@
                 { id: 'subscription', label: 'Subscription', icon: Icons.Shield },
                 { id: 'ceph', label: 'Ceph', icon: Icons.Database },
             ];
+            // #625 v2 - a standby shows the node but changes nothing on it: no shell, and
+            // every tab that can change something renders with its controls disabled
+            const tabs = haReadOnly ? allTabs.filter(tab => tab.id !== 'shell') : allTabs;
+            const lockedTab = haReadOnly && !['summary', 'performance', 'tasks'].includes(activeTab);
+            // spread on the fieldsets around the parts that change the node; what only reads
+            // (Refresh, SMART) sits outside them and keeps working on a standby
+            const haLock = { disabled: lockedTab, 'data-ha-locked': lockedTab ? '' : undefined };
 
             useEffect(() => { loadTabData(activeTab); }, [activeTab, perfTimeframe]);
 
@@ -1900,7 +1907,7 @@
                                         </div>
                                     )}
 
-                                    {activeTab === 'shell' && (
+                                    {activeTab === 'shell' && !haReadOnly && (
                                         <div className="h-full flex flex-col">
                                             <div className="flex items-center justify-between mb-4">
                                                 <div className="flex items-center gap-3">
@@ -1926,6 +1933,7 @@
                                     )}
 
                                     {activeTab === 'network' && (
+                                        <fieldset {...haLock} className="contents">
                                         <div className="space-y-4">
                                             {/* Action Buttons */}
                                             <div className="flex items-center gap-3 flex-wrap">
@@ -2278,6 +2286,7 @@
                                                 </div>
                                             )}
                                         </div>
+                                        </fieldset>
                                     )}
 
                                     {activeTab === 'system' && (
@@ -2453,6 +2462,7 @@
                                                     </>)}
                                                 </div>
                                             )}
+                                            <fieldset {...haLock} className="space-y-6 min-w-0">
                                             {/* DNS */}
                                             <div className="p-4 bg-proxmox-dark rounded-lg border border-proxmox-border">
                                                 <div className="flex justify-between items-center mb-4">
@@ -2635,6 +2645,7 @@
                                                     </div>
                                                 )}
                                             </div>
+                                            </fieldset>
 
                                             {/* Syslog */}
                                             <div className="p-4 bg-proxmox-dark rounded-lg border border-proxmox-border">
@@ -2660,7 +2671,9 @@
                                     )}
 
                                     {activeTab === 'hardware' && (
+                                        <fieldset {...haLock} className="contents">
                                         <HardwareMonitoringPanel clusterId={clusterId} node={node} t={t} addToast={addToast} getAuthHeaders={getAuthHeaders} />
+                                        </fieldset>
                                     )}
 
                                     {activeTab === 'disks' && (
@@ -2752,7 +2765,7 @@
                                                                                 <Icons.Activity />
                                                                             </button>
                                                                             {(d.used === 'unused' || !d.used) && (
-                                                                                <>
+                                                                                <fieldset {...haLock} className="contents">
                                                                                     <button 
                                                                                         onClick={async () => {
                                                                                             if (!confirm(`Initialize ${d.devpath} with GPT partition table?\n\nThis will ERASE all data on the disk!`)) return;
@@ -2802,7 +2815,7 @@
                                                                                     >
                                                                                         <Icons.Trash />
                                                                                     </button>
-                                                                                </>
+                                                                                </fieldset>
                                                                             )}
                                                                         </div>
                                                                     </td>
@@ -2815,6 +2828,7 @@
                                                 </div>
                                             </div>
 
+                                            <fieldset {...haLock} className="space-y-6 min-w-0">
                                             {isXcpng ? (
                                                 /* XCP-ng: Storage Repositories - NS Mar 2026 */
                                                 <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
@@ -2976,11 +2990,13 @@
                                             </div>
                                                 </>
                                             )}
+                                            </fieldset>
                                         </div>
                                     )}
 
                                     {/* APT Repos tab */}
                                     {activeTab === 'repos' && (
+                                        <fieldset {...haLock} className="contents">
                                         <div className="space-y-4">
                                             <div className="flex items-center justify-between">
                                                 <h3 className="text-lg font-medium text-white flex items-center gap-2">
@@ -3148,6 +3164,7 @@
                                                 </div>
                                             </div>
                                         </div>
+                                        </fieldset>
                                     )}
 
                                     {activeTab === 'tasks' && (
@@ -3234,7 +3251,7 @@
                                             <div className="p-6 bg-proxmox-dark rounded-lg border border-proxmox-border">
                                                 <h4 className="font-medium text-white mb-4">{t('enterLicenseKey')}</h4>
                                                 <div className="space-y-4">
-                                                    <div>
+                                                    <fieldset {...haLock} className="min-w-0">
                                                         <label className="block text-xs text-gray-400 mb-2">{t('subscriptionKey')}</label>
                                                         <input 
                                                             type="text" 
@@ -3246,8 +3263,9 @@
                                                         <p className="text-xs text-gray-500 mt-2">
                                                             Format: pve1c-xxxxxxxxxx, pve2c-xxxxxxxxxx, pve4c-xxxxxxxxxx, etc.
                                                         </p>
-                                                    </div>
+                                                    </fieldset>
                                                     <div className="flex gap-3">
+                                                        <fieldset {...haLock} className="contents">
                                                         <button
                                                             onClick={async () => {
                                                                 if(!data.newLicenseKey) {
@@ -3279,6 +3297,7 @@
                                                             <Icons.Shield />
                                                             {t('activateLicense')}
                                                         </button>
+                                                        </fieldset>
                                                         <button
                                                             onClick={() => loadTabData('subscription')}
                                                             className="flex items-center gap-2 px-4 py-2 bg-proxmox-card border border-proxmox-border rounded-lg text-gray-300 hover:text-white transition-colors"
@@ -3308,6 +3327,7 @@
                                     )}
 
                                     {activeTab === 'ceph' && (
+                                        <fieldset {...haLock} className="contents">
                                         <div className="space-y-6">
                                             {loading ? (
                                                 <div className="flex items-center justify-center py-12">
@@ -3548,6 +3568,7 @@
                                                 </>
                                             )}
                                         </div>
+                                        </fieldset>
                                     )}
                                 </>
                             )}
@@ -3555,7 +3576,7 @@
                     </div>
 
                     {/* Fullscreen Shell Modal */}
-                    {data.shellFullscreen && (
+                    {!haReadOnly && data.shellFullscreen && (
                         <div className="fixed inset-0 z-[70] bg-black flex flex-col">
                             <div className="flex items-center justify-between px-4 py-2 bg-proxmox-dark border-b border-proxmox-border">
                                 <div className="flex items-center gap-3">
@@ -4755,7 +4776,9 @@
 
         function CorporateNodeDetailView({ node, clusterId, clusterHost, clusterMetrics, clusterResources, onBack, onOpenNodeConfig, onMaintenanceToggle, onNodeAction, onStartUpdate, onSelectVm, addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, reverseProxyEnabled } = useAuth();
+            const { getAuthHeaders, reverseProxyEnabled, haReadOnly } = useAuth();
+            // #625 v2 - a standby shows the node: no power, maintenance or update actions, no
+            // shell, and the configure and hardware forms render disabled
             const [activeDetailTab, setActiveDetailTab] = useState('summary');
             const [showActionsMenu, setShowActionsMenu] = useState(false);
             const [configSubTab, setConfigSubTab] = useState('network');
@@ -5013,6 +5036,7 @@
                                 </button>
                                 {showActionsMenu && (
                                     <div className="corp-dropdown absolute right-0 top-full mt-1 w-52 z-50 py-1" onClick={(e) => e.stopPropagation()}>
+                                        {!haReadOnly && (<>
                                         <button onClick={() => { if(!confirm(`${isMaint ? 'Disable' : 'Enable'} maintenance mode on "${node}"?`)) return; onMaintenanceToggle(node, !isMaint); setShowActionsMenu(false); }} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: 'var(--corp-text-secondary)'}}>
                                             <Icons.Wrench className="w-3.5 h-3.5" /> {isMaint ? t('disableMaintenance') || 'Disable Maintenance' : t('maintenance')}
                                         </button>
@@ -5026,6 +5050,7 @@
                                             <Icons.Download className="w-3.5 h-3.5" /> {t('update') || 'Update'}
                                         </button>
                                         <div className="my-1" style={{borderTop: '1px solid var(--corp-border-medium)'}}></div>
+                                        </>)}
                                         <button onClick={() => { onOpenNodeConfig(node); setShowActionsMenu(false); }} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: 'var(--corp-text-secondary)'}}>
                                             <Icons.Settings className="w-3.5 h-3.5" /> {t('nodeSettings')}
                                         </button>
@@ -5051,7 +5076,7 @@
 
                     {/* Tab Strip */}
                     <div className="corp-tab-strip px-4">
-                        {['summary', 'monitor', 'configure', 'hardware', 'vms', 'shell', 'subscription'].map(tab => (
+                        {['summary', 'monitor', 'configure', 'hardware', 'vms', 'shell', 'subscription'].filter(tab => !(haReadOnly && tab === 'shell')).map(tab => (
                             <button key={tab} className={activeDetailTab === tab ? 'active' : ''} onClick={() => setActiveDetailTab(tab)}>
                                 {tab === 'summary' ? t('summary') : tab === 'monitor' ? t('monitor') : tab === 'configure' ? t('configure') : tab === 'hardware' ? (t('hardware') || 'Hardware') : tab === 'vms' ? 'VMs' : tab === 'shell' ? 'Shell' : t('subscriptionInfo')}
                             </button>
@@ -5245,6 +5270,7 @@
                                     <button className={`corp-subnav-item ${configSubTab === 'ceph' ? 'active' : ''}`} onClick={() => { setConfigSubTab('ceph'); if (!data.ceph) loadTabData('ceph'); }}>Ceph</button>
                                 </div>
                                 <div className="flex-1 pl-4">
+                                    <fieldset disabled={haReadOnly} className="contents">
                                     {loading && !data.network && !data.dns && !data.disks ? (
                                         <div className="flex items-center justify-center h-32"><Icons.RotateCw className="w-5 h-5 animate-spin" style={{color: '#49afd9'}} /></div>
                                     ) : (
@@ -5724,6 +5750,7 @@
                                             )}
                                         </>
                                     )}
+                                    </fieldset>
                                 </div>
                             </div>
                         )}
@@ -5760,7 +5787,9 @@
                         {/* Hardware Tab (#609 in-band BMC) */}
                         {activeDetailTab === 'hardware' && (
                             <div className="space-y-6">
-                                <HardwareMonitoringPanel clusterId={clusterId} node={node} t={t} addToast={addToast} getAuthHeaders={getAuthHeaders} />
+                                <fieldset disabled={haReadOnly} className="contents">
+                                    <HardwareMonitoringPanel clusterId={clusterId} node={node} t={t} addToast={addToast} getAuthHeaders={getAuthHeaders} />
+                                </fieldset>
                                 {/* #601 — lm-sensors panel + temperature chart (was fetched but never rendered on the Corporate node view) */}
                                 {data.sensors && data.sensors.length > 0 && (
                                     <div className="p-4 bg-proxmox-dark rounded-lg border border-proxmox-border">
@@ -5847,7 +5876,7 @@
                         )}
 
                         {/* Shell Tab */}
-                        {activeDetailTab === 'shell' && (
+                        {activeDetailTab === 'shell' && !haReadOnly && (
                             // NS #727 — clip (not hidden) so Firefox's selection-autoscroll can't
                             // scroll this panel; hidden boxes stay programmatically scrollable, clip doesn't.
                             <div className="bg-black border border-proxmox-border" style={{height: '500px', overflow: 'clip'}}>

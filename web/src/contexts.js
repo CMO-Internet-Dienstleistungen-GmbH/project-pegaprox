@@ -514,11 +514,21 @@
                 return {};  // Empty - credentials: 'include' handles auth for fetch
             }, []);
             
+            // LW Sep 2026 (#625 v2) - a standby may be connected to the clusters, but only the
+            // active acts on them. One flag for every place that hides actions; isAdmin stays
+            // as it is, the HA tab and the promote flow hang off it.
+            const haReadOnly = ha.role === 'standby';
+
             return(
-                <AuthContext.Provider value={{ user, sessionId, isAuthenticated, loading, error, login, logout, getAuthHeaders, isAdmin: user?.role === 'admin', passwordExpiry, requires2FASetup, setRequires2FASetup, updatePreferences, updateCurrentUser, ldapEnabled, oidcEnabled, oidcButtonText, loginBackground, reverseProxyEnabled, needsSetup, setNeedsSetup, ha, refreshHa }}>
+                <AuthContext.Provider value={{ user, sessionId, isAuthenticated, loading, error, login, logout, getAuthHeaders, isAdmin: user?.role === 'admin', passwordExpiry, requires2FASetup, setRequires2FASetup, updatePreferences, updateCurrentUser, ldapEnabled, oidcEnabled, oidcButtonText, loginBackground, reverseProxyEnabled, needsSetup, setNeedsSetup, ha, refreshHa, haReadOnly }}>
                     {children}
                 </AuthContext.Provider>
             );
+        }
+
+        // #625 v2 - what a standby still lets through the permission helpers: the *.view ones
+        function haReadPermission(permission) {
+            return typeof permission === 'string' && permission.endsWith('.view');
         }
         
         function useAuth() {

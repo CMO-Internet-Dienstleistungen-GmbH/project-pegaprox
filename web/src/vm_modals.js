@@ -830,7 +830,8 @@
         // LW: this shows when you click a VM in detail view mode
         function VmDetailPanel({ vm, clusterId, onAction, onOpenConsole, onOpenSpice, onOpenLxcShell, onOpenConfig, onMigrate, onClone, onForceStop, onDelete, onCrossClusterMigrate, showCrossCluster, actionLoading, onShowMetrics, addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders } = useAuth();
+            const { getAuthHeaders, haReadOnly } = useAuth();
+            const acts = !haReadOnly;  // #625: a standby shows this VM, the active acts on it
             
             // some quick helpers
             const isQemu = vm.type === 'qemu';
@@ -1081,7 +1082,7 @@
                                 {lockInfo?.locked && (
                                     <span 
                                         className="px-2 py-1 rounded-full text-xs font-medium bg-red-500/20 text-red-400 border border-red-500/30 flex items-center gap-1 cursor-pointer hover:bg-red-500/30 transition-colors"
-                                        onClick={() => setShowUnlockConfirm(true)}
+                                        onClick={() => acts && setShowUnlockConfirm(true)}
                                         title={lockInfo?.lock_description || 'Locked'}
                                     >
                                         <Icons.Lock />
@@ -1354,7 +1355,7 @@
                     <div className="px-6 pb-6">
                         <div className="text-xs text-gray-500 mb-3">{t('quickActions')}</div>
                         <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-                            {vm.status === 'stopped' ? (
+                            {!acts ? null : vm.status === 'stopped' ? (
                                 <button
                                     onClick={() => handleAction('start')}
                                     disabled={actionLoading?.[`${vm.vmid}-start`]}
@@ -1383,6 +1384,7 @@
                                     </button>
                                 </>
                             )}
+                            {acts && (
                             <button
                                 onClick={() => onOpenConsole(vm)}
                                 className="flex items-center justify-center gap-2 p-3 bg-blue-500/10 hover:bg-blue-500/20 border border-blue-500/30 rounded-lg text-blue-400 transition-all"
@@ -1390,9 +1392,10 @@
                                 <Icons.Monitor />
                                 {t('console')}
                             </button>
+                            )}
                             {/* NS May 2026 — VNC↔Term toggle moved inside Console modal. */}
                             {/* MK Aug 2026 — SPICE (virt-viewer .vv) sits next to the web console; QEMU only */}
-                            {isQemu && onOpenSpice && (
+                            {acts && isQemu && onOpenSpice && (
                                 <button
                                     onClick={() => onOpenSpice(vm)}
                                     title={t('spiceConsoleHint') || 'Download a virt-viewer file (audio / USB / multi-monitor)'}
@@ -1423,6 +1426,7 @@
                                 <Icons.BarChart />
                                 {t('performanceMetrics')}
                             </button>
+                            {acts && (<>
                             <button
                                 onClick={onMigrate}
                                 className="flex items-center gap-2 px-3 py-2 bg-proxmox-dark hover:bg-proxmox-border border border-proxmox-border rounded-lg text-sm text-gray-300 transition-all"
@@ -1475,6 +1479,7 @@
                                 <Icons.Trash />
                                 {t('delete')}
                             </button>
+                            </>)}
                         </div>
                     </div>
 
@@ -1498,6 +1503,7 @@
                                         </div>
                                     </div>
                                 </div>
+                                {acts && (
                                 <button
                                     onClick={toggleProxmoxHa}
                                     disabled={haLoading}
@@ -1515,6 +1521,7 @@
                                         t('haActivate')
                                     )}
                                 </button>
+                                )}
                             </div>
                             {haEnabled && (
                                 <div className="mt-3 pt-3 border-t border-gray-700/50 grid grid-cols-2 gap-4 text-xs">
@@ -1551,7 +1558,10 @@
         // LW: Feb 2026 - Corporate VM Detail View (experimental)
         function CorporateVmDetailView({ vm, clusterId, onAction, onOpenConsole, onOpenSpice, onOpenConfig, onBack, onMigrate, onClone, onForceStop, onDelete, onCrossClusterMigrate, showCrossCluster, actionLoading, onShowMetrics, addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders } = useAuth();
+            const { getAuthHeaders, haReadOnly } = useAuth();
+            // #625 v2 - on a standby: no power, console, SPICE, snapshot or HA changes, and no
+            // console preview either, since the grab runs on the node
+            const acts = !haReadOnly;
             const [activeDetailTab, setActiveDetailTab] = useState('summary');
             const [showActionsMenu, setShowActionsMenu] = useState(false);
             const [snapshots, setSnapshots] = useState([]);
@@ -1581,7 +1591,7 @@
             const [shotLoading, setShotLoading] = useState(false);
             const [shotNonce, setShotNonce] = useState(0);  // bump = force fresh grab
             useEffect(() => {
-                if (!isQemu || !isRunning) { setConsoleShot(null); return; }
+                if (!isQemu || !isRunning || !acts) { setConsoleShot(null); return; }
                 // reuse a recent frame on re-mount/poll instead of re-grabbing
                 const cached = _consoleShotCache[shotKey];
                 if (shotNonce === 0 && cached && (Date.now() - cached.ts) < SHOT_REUSE_MS) {
@@ -1606,7 +1616,7 @@
                     .catch(() => { if (!cancelled) setConsoleShot(_consoleShotCache[shotKey]?.url || null); })
                     .finally(() => { if (!cancelled) setShotLoading(false); });
                 return () => { cancelled = true; };
-            }, [vm.vmid, vm.status, clusterId, shotNonce]);
+            }, [vm.vmid, vm.status, clusterId, shotNonce, acts]);
 
             // LW Apr 2026 (#250) — per-VM web link (browser-local; keyed by cluster:vmid)
             const webLinkKey = `${clusterId}:${vm.vmid}`;
@@ -1650,7 +1660,7 @@
                     const base = `${API_URL}/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}`;
                     const [stdRes, effRes] = await Promise.all([
                         authFetch(`${base}/snapshots`),
-                        authFetch(`${base}/efficient-snapshots?refresh=true`)
+                        authFetch(`${base}/efficient-snapshots${acts ? '?refresh=true' : ''}`)
                     ]);
                     if (stdRes?.ok) setSnapshots(await stdRes.json());
                     if (effRes?.ok) setEfficientSnapshots(await effRes.json());
@@ -1936,12 +1946,12 @@
                             {lockInfo.locked && <span className="corp-badge corp-badge-locked flex items-center gap-1"><Icons.Lock className="w-2.5 h-2.5" />{t('locked')}</span>}
                         </div>
                         <div className="corp-toolbar flex items-center gap-1">
-                            {!isRunning && (
+                            {acts && !isRunning && (
                                 <button onClick={() => handleAction('start')} disabled={actionLoading?.[`${vm.vmid}-start`]}>
                                     {actionLoading?.[`${vm.vmid}-start`] ? <Icons.RotateCw className="w-3 h-3 animate-spin" /> : <Icons.PlayCircle className="w-3 h-3" style={{color: '#60b515'}} />} {t('start')}
                                 </button>
                             )}
-                            {isRunning && (
+                            {acts && isRunning && (
                                 <>
                                     <button onClick={() => handleAction('shutdown')} disabled={actionLoading?.[`${vm.vmid}-shutdown`]}>
                                         {actionLoading?.[`${vm.vmid}-shutdown`] ? <Icons.RotateCw className="w-3 h-3 animate-spin" /> : <Icons.Power className="w-3 h-3" style={{color: '#f54f47'}} />} {t('shutdown')}
@@ -1951,12 +1961,12 @@
                                     </button>
                                 </>
                             )}
-                            {isQemu && isRunning && (
+                            {acts && isQemu && isRunning && (
                                 <button onClick={() => onOpenConsole(vm)}>
                                     <Icons.Terminal className="w-3 h-3" /> {t('console')}
                                 </button>
                             )}
-                            {isQemu && isRunning && onOpenSpice && (
+                            {acts && isQemu && isRunning && onOpenSpice && (
                                 <button onClick={() => onOpenSpice(vm)} title={t('spiceConsoleHint') || 'Download a virt-viewer file (audio / USB / multi-monitor)'}>
                                     <Icons.ExternalLink className="w-3 h-3" /> {t('spiceConsole') || 'SPICE'}
                                 </button>
@@ -1976,6 +1986,7 @@
                                                 <Icons.BarChart className="w-3.5 h-3.5" /> {t('performanceMetrics')}
                                             </button>
                                         )}
+                                        {acts && (<>
                                         <button onClick={() => { onMigrate(vm); setShowActionsMenu(false); }} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: 'var(--corp-text-secondary)'}}>
                                             <Icons.ArrowRight className="w-3.5 h-3.5" /> {t('migrate')}
                                         </button>
@@ -1997,6 +2008,7 @@
                                                 <Icons.XCircle className="w-3.5 h-3.5" /> {t('forceStop')}
                                             </button>
                                         )}
+                                        </>)}
                                         <div className="my-1" style={{borderTop: '1px solid var(--corp-border-medium)'}}></div>
                                         {/* LW Apr 2026 (#250) — user-configurable web URL for this VM */}
                                         <button onClick={() => { openVmWebUrl(); setShowActionsMenu(false); }}
@@ -2010,10 +2022,12 @@
                                                 <span className="w-3.5 h-3.5" /> {t('editVmWebLink') || 'Edit Web URL…'}
                                             </button>
                                         )}
+                                        {acts && (<>
                                         <div className="my-1" style={{borderTop: '1px solid var(--corp-border-medium)'}}></div>
                                         <button onClick={() => { onDelete(vm); setShowActionsMenu(false); }} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: '#f54f47'}}>
                                             <Icons.Trash className="w-3.5 h-3.5" /> {t('delete')}
                                         </button>
+                                        </>)}
                                     </div>
                                 )}
                             </div>
@@ -2033,7 +2047,7 @@
                             <Icons.Settings className="w-3 h-3 inline mr-1" />{t('configure')}
                         </button>
                         {/* LW: Feb 2026 - console tab for QEMU (VNC) and LXC (xterm.js) */}
-                        {isRunning && (
+                        {acts && isRunning && (
                             <button onClick={() => onOpenConsole(vm)}>
                                 <Icons.Terminal className="w-3 h-3 inline mr-1" />{t('console')}
                             </button>
@@ -2069,19 +2083,20 @@
                                                 }
                                                 <div className="text-[11px]" style={{color: '#728b9a'}}>
                                                     {!isRunning ? (t('vmStopped') || 'VM is powered off')
+                                                        : !acts ? t('running')
                                                         : (shotLoading && isQemu ? (t('loadingPreview') || 'Loading preview…')
                                                                                  : (t('consoleAvailable') || 'Console available'))}
                                                 </div>
                                             </div>
                                         )}
                                     </div>
-                                    {isRunning && (
+                                    {acts && isRunning && (
                                         <button onClick={() => onOpenConsole(vm)} className="w-full mt-1.5 py-1.5 text-[12px] font-medium uppercase tracking-wider flex items-center justify-center gap-1.5" style={{background: 'var(--corp-header-bg)', border: '1px solid var(--corp-border-medium)', color: 'var(--corp-accent)'}}>
                                             <Icons.Terminal className="w-3.5 h-3.5" />
                                             {t('launchWebConsole') || 'Launch Web Console'}
                                         </button>
                                     )}
-                                    {isRunning && isQemu && onOpenSpice && (
+                                    {acts && isRunning && isQemu && onOpenSpice && (
                                         <button onClick={() => onOpenSpice(vm)} title={t('spiceConsoleHint') || 'Download a virt-viewer file (audio / USB / multi-monitor)'} className="w-full mt-1.5 py-1.5 text-[12px] font-medium uppercase tracking-wider flex items-center justify-center gap-1.5" style={{background: 'var(--corp-surface-1)', border: '1px solid var(--corp-border-medium)', color: 'var(--corp-text-secondary)'}}>
                                             <Icons.ExternalLink className="w-3.5 h-3.5" />
                                             {t('spiceConsole') || 'SPICE'}
@@ -2148,9 +2163,11 @@
                                         <Icons.Lock className="w-4 h-4" style={{color: '#efc006'}} />
                                         <span className="text-[13px]" style={{color: '#efc006'}}>{t('vmLocked') || 'This virtual machine is locked'}: {lockInfo.lock_reason || 'unknown'}</span>
                                     </div>
+                                    {acts && (
                                     <button onClick={() => setShowUnlockConfirm(true)} className="px-2 py-1 text-[12px] font-medium" style={{color: '#49afd9'}}>
                                         {t('unlock') || 'Unlock'}
                                     </button>
+                                    )}
                                 </div>
                             )}
                             {isQemu && isRunning && !guestInfo && (
@@ -2404,6 +2421,7 @@
                                     <div style={{border: '1px solid var(--corp-border-medium)'}}>
                                         <div className="px-3 py-2 flex items-center justify-between" style={{background: 'var(--corp-header-bg)', borderBottom: '1px solid var(--corp-border-medium)'}}>
                                             <span className="text-[13px] font-medium" style={{color: '#e9ecef'}}>{t('proxmoxHa') || 'Proxmox HA'}</span>
+                                            {acts && (
                                             <button
                                                 onClick={toggleProxmoxHa}
                                                 disabled={haLoading}
@@ -2415,6 +2433,7 @@
                                             >
                                                 {haLoading ? <Icons.RotateCw className="w-3 h-3 animate-spin" /> : haEnabled ? t('disable') : t('haActivate') || 'Enable'}
                                             </button>
+                                            )}
                                         </div>
                                         <div className="px-3 py-2 flex items-center gap-2">
                                             <Icons.Shield className="w-4 h-4" style={{color: haEnabled ? '#60b515' : '#728b9a'}} />
@@ -2507,14 +2526,16 @@
                                         </span>
                                     )}
                                 </h3>
+                                {acts && (
                                 <button onClick={() => setShowCreateSnap(!showCreateSnap)}
                                     className="corp-vm-btn corp-vm-btn-primary flex items-center gap-1.5">
                                     <Icons.Plus className="w-3 h-3" />
                                     {t('createSnapshot') || 'Take Snapshot'}
                                 </button>
+                                )}
                             </div>
 
-                            {showCreateSnap && (
+                            {acts && showCreateSnap && (
                                 <div style={{background: 'var(--corp-surface-2, #1a2733)', border: '1px solid var(--corp-border-medium, #344955)', padding: '12px 14px'}}>
                                     <div className="space-y-2">
                                         <div>
@@ -2591,6 +2612,7 @@
                                                     <Icons.ChevronRight className="w-3 h-3" style={{transform:'rotate(90deg)'}} />
                                                     <span className="text-[11px]">{t('compare') || 'Compare'}</span>
                                                 </button>
+                                                {acts && (<>
                                                 <button onClick={() => handleRollbackSnap(node.name)}
                                                     className="corp-vm-btn corp-vm-btn-ghost flex items-center gap-1" title={t('rollback')}>
                                                     <Icons.RotateCcw className="w-3 h-3" />
@@ -2600,6 +2622,7 @@
                                                     className="corp-vm-btn corp-vm-btn-danger-ghost" title={t('delete')}>
                                                     <Icons.Trash2 className="w-3 h-3" />
                                                 </button>
+                                                </>)}
                                             </div>
                                         </div>
                                         {node.children.map(child => renderSnapNode(child, depth + 1))}
@@ -2646,6 +2669,7 @@
                                                     </div>
                                                 </div>
                                                 <div className="flex gap-1">
+                                                    {acts && (<>
                                                     <button onClick={() => handleRollbackEfficientSnap(snap.id, snap.name)}
                                                         className="corp-vm-btn corp-vm-btn-ghost flex items-center gap-1" title={t('rollback')}>
                                                         <Icons.RotateCcw className="w-3 h-3" />
@@ -2655,6 +2679,7 @@
                                                         className="corp-vm-btn corp-vm-btn-danger-ghost" title={t('delete')}>
                                                         <Icons.Trash2 className="w-3 h-3" />
                                                     </button>
+                                                    </>)}
                                                 </div>
                                             </div>
                                         ))}
@@ -5131,9 +5156,12 @@
         // LW: All Clusters Overview - GitHub Feature Request #16
         // added a bunch of stuff here - storage, sparklines, sorting etc
         function AllClustersOverview({ clusters, allMetrics, clusterGroups = [], topGuests = [], allClusterGuests = {}, pbsServers = [], onSelectCluster, onSelectVm, topologyOnly = false, onAutoInstall }) {
-            // #625: on a standby the list is empty on purpose - say so instead of offering to add one
-            const haStandby = ((useAuth() || {}).ha || {}).role === 'standby';
+            // #625: an empty list on a standby is no reason to offer adding a cluster there -
+            // say why it is empty instead: no sync yet, or its live view is off
+            const haInfo = (useAuth() || {}).ha || {};
+            const haStandby = haInfo.role === 'standby';
             const { t } = useTranslation();
+            const haNoClusters = haInfo.live_view === false ? t('pgHaNoClustersLiveOff') : t('pgHaNoClustersHere');
             const { isCorporate } = useLayout();
             const [sortBy, setSortBy] = useState('name');
             const [sortDir, setSortDir] = useState('asc');
@@ -5823,7 +5851,7 @@
                         {clusters.length === 0 && (
                             <div className="py-8 text-center text-[13px]" style={{color: '#728b9a'}}>
                                 <Icons.Server className="w-6 h-6 mx-auto mb-2" style={{color: 'var(--corp-border-medium)'}} />
-                                {haStandby ? t('pgHaNoClustersHere') : (t('noClustersConfigured') || 'No clusters configured')}
+                                {haStandby ? haNoClusters : (t('noClustersConfigured') || 'No clusters configured')}
                                 {onAutoInstall && !haStandby && (
                                     <div className="mt-2">
                                         <button onClick={onAutoInstall} className="hover:underline" style={{color: 'var(--corp-accent)'}}>
@@ -6071,7 +6099,7 @@
                                 <Icons.Server className="w-8 h-8 text-proxmox-orange" />
                             </div>
                             <h3 className="text-lg font-semibold text-white mb-2">{t('noClustersConfigured') || 'No clusters configured'}</h3>
-                            <p className="text-gray-500 text-sm">{haStandby ? t('pgHaNoClustersHere') : (t('addClusterToStart') || 'Add a cluster to get started')}</p>
+                            <p className="text-gray-500 text-sm">{haStandby ? haNoClusters : (t('addClusterToStart') || 'Add a cluster to get started')}</p>
                             {/* no PVE box yet? the dashboard only passes this to managers */}
                             {onAutoInstall && !haStandby && (
                                 <button

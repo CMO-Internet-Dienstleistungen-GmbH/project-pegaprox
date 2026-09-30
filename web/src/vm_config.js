@@ -119,7 +119,7 @@
 
         function ConfigModal({ vm, clusterId, allClusters = [], dashboardAuthFetch, onClose, addToast, isCorporate = false }) {
             const { t } = useTranslation();
-            const { getAuthHeaders } = useAuth();
+            const { getAuthHeaders, haReadOnly } = useAuth();
             const [config, setConfig] = useState(null);
             const [configError, setConfigError] = useState(null);  // MK: Track config load errors
             const [loading, setLoading] = useState(true);
@@ -565,7 +565,8 @@
             // NS: Feb 2026 - Fetch efficient snapshots + capability
             const fetchEfficientSnapshots = async () => {
                 try {
-                    const response = await authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}/efficient-snapshots?refresh=true`);
+                    // ?refresh=true runs lvs, maybe lvextend, on the node; a standby reads what is stored (#625)
+                    const response = await authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}/efficient-snapshots${haReadOnly ? '' : '?refresh=true'}`);
                     if (response && response.ok) {
                         setEfficientSnapshots(await response.json());
                     }
@@ -1564,6 +1565,8 @@
                     { id: 'options', labelKey: 'optionsTab', icon: Icons.Settings },
                 ];
 
+            const lockedTab = haReadOnly && activeTab !== 'history';
+
             // NS May 2026: in Corporate layout we render a corporate flat
             // chrome (flat, light-weighted typography, underlined tabs, clean
             // header with explicit Apply / Cancel actions). The Modern dark
@@ -1604,7 +1607,7 @@
                                     {hasChanges && (
                                         <span className="corp-unsaved-pill">{t('unsavedChanges') || 'Unsaved Changes'}</span>
                                     )}
-                                    {hasChanges && (
+                                    {hasChanges && !haReadOnly && (
                                         <button
                                             onClick={handleSave}
                                             disabled={saving}
@@ -1728,7 +1731,9 @@
                                     </div>
                                 )
                             ) : config ? (
-                                <>
+                                // #625 v2 - a standby shows the configuration and changes none of
+                                // it: every tab but History renders its controls disabled
+                                <fieldset disabled={lockedTab} className="contents" data-ha-locked={lockedTab ? '' : undefined}>
                                     {/* General Tab */}
                                     {activeTab === 'general' && (
                                         <div className="space-y-6">
@@ -5288,7 +5293,7 @@
                                             )}
                                         </div>
                                     )}
-                                </>
+                                </fieldset>
                             ) : (
                                 <div className="text-center py-8 text-red-400">
                                     Konfiguration konnte nicht geladen werden
@@ -5312,7 +5317,7 @@
                                 >
                                     {t('cancel')}
                                 </button>
-                                <button
+                                {!haReadOnly && <button
                                     onClick={handleSave}
                                     disabled={!hasChanges || saving}
                                     className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange rounded-lg text-white font-medium hover:bg-orange-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
@@ -5323,7 +5328,7 @@
                                         <Icons.Save />
                                     )}
                                     {t('save')}
-                                </button>
+                                </button>}
                             </div>
                         </div>
                     </div>

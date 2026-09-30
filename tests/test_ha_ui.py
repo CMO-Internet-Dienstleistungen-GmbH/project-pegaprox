@@ -398,7 +398,9 @@ class _FakeServer:
     """
 
     def __init__(self, role='standby', layout='modern', language='en', admin=True,
-                 auth_source='local', broken='', sso_stale=False):
+                 auth_source='local', broken='', sso_stale=False, live_view=True,
+                 restart_pending=None, clusters=None, resources=None, refuse_as_standby=False,
+                 autoinstall=None, metrics=None, extra=None, permissions=None):
         self.role, self.layout, self.language, self.admin = role, layout, language, admin
         self.auth_source, self.broken, self.sso_stale = auth_source, broken, sso_stale
         self.down_until = 0.0
@@ -408,6 +410,22 @@ class _FakeServer:
         self.fail_pairing_once = False
         self.interval = 30
         self.logged_out = False
+        # v2: instance-local live view, whether this process started its managers, and a
+        # restart the standby still owes after a changed cluster setup
+        self.live_view = live_view
+        self.managers_running = live_view if role == 'standby' else True
+        self.restart_pending = restart_pending
+        # the cluster list a live standby (or any other role) shows
+        self.clusters = clusters or []
+        self.resources = resources or []
+        self.metrics = metrics or {}
+        self.urls = []   # with the query string, which calls drops
+        # the page still thinks it is on an active, the instance answers as a standby
+        self.refuse_as_standby = refuse_as_standby
+        self.autoinstall = autoinstall
+        # (method, path) -> (status, body): the reads (and the odd write) a test needs
+        self.extra = dict(extra or {})
+        self.permissions = list(permissions or [])
 
     def _reauth_refusal(self, body):
         if self.auth_source in ('oidc', 'entra'):
@@ -431,20 +449,29 @@ class _FakeServer:
         if self.role == 'standby':
             sync = {'last_ok_at': _iso_ago(20), 'last_attempt_at': _iso_ago(20), 'last_error': '',
                     'rows': 1234, 'tables': 41, 'source_epoch': 2, 'etag': None,
-                    'skipped_columns': {'clusters': ['new_col']}}
+                    'skipped_columns': {'clusters': ['new_col']},
+                    'restart_pending': self.restart_pending}
         return {'role': self.role, 'epoch': 0 if self.role == 'standalone' else 2,
                 'instance_id': 'a' * 32, 'interval': self.interval, 'broken': self.broken,
                 'pairing_open_until': None, 'peer': peer, 'sync': sync,
-                'suggested_url': SELF, 'own_fingerprint': ''}
+                'suggested_url': SELF, 'own_fingerprint': '',
+                'live_view': self.live_view, 'managers_running': self.managers_running}
 
     def banner(self):
         if self.role != 'standby':
             return {'role': self.role}
-        return {'role': 'standby', 'peer_url': PEER, 'last_sync_at': _iso_ago(90)}
+        return {'role': 'standby', 'peer_url': PEER, 'last_sync_at': _iso_ago(90),
+                'live_view': self.live_view}
 
     def _restart(self, role):
         self.down_until = time.time() + 4
         self.role_after_restart = role
+
+    def _come_back(self):
+        """What a fresh process knows: the role it restarted into, managers as the switch says."""
+        self.role, self.role_after_restart = self.role_after_restart, None
+        self.managers_running = self.live_view if self.role == 'standby' else True
+        self.restart_pending = None
 
     def handle(self, route):
         req = route.request
@@ -464,6 +491,7 @@ class _FakeServer:
         if not path.startswith('/api/'):
             return route.fulfill(status=404, body='')
         self.calls.append((req.method, path))
+        self.urls.append(req.url)
         try:
             body = json.loads(req.post_data) if req.post_data else {}
         except Exception:
@@ -474,18 +502,21 @@ class _FakeServer:
             return route.fulfill(status=status, body=json.dumps(data),
                                  headers={'Content-Type': 'application/json'})
 
+        if (req.method, path) in self.extra:
+            status, data = self.extra[(req.method, path)]
+            return answer(data, status)
         if path == '/api/auth/check':
             if time.time() < self.down_until:
                 return route.abort('connectionrefused')
             if self.logged_out:
                 return answer({'authenticated': False, 'ha_role': self.role})
             if self.role_after_restart:
-                self.role, self.role_after_restart = self.role_after_restart, None
+                self._come_back()
             user = {'username': 'admin' if self.admin else 'viewer',
                     'role': 'admin' if self.admin else 'viewer', 'display_name': 'Admin',
                     'ui_layout': self.layout, 'layout_chosen': True, 'theme': '',
-                    'language': self.language, 'permissions': [], 'enabled': True,
-                    'auth_source': self.auth_source}
+                    'language': self.language, 'permissions': self.permissions, 'enabled': True,
+                    'auth_source': self.auth_source, 'autoinstall_access': self.autoinstall}
             return answer({'authenticated': True, 'session_id': 'sid', 'user': user,
                            'ha': self.banner(), 'default_theme': 'proxmoxDark'})
         if path == '/api/auth/logout':
@@ -512,8 +543,26 @@ class _FakeServer:
         if path == '/api/ha/sync-now':
             return answer({'result': 'applied', 'status': self.status()})
         if path == '/api/ha/settings':
+            if 'live_view' in body:
+                changed = bool(body['live_view']) != self.live_view
+                self.live_view = bool(body['live_view'])
+                if changed and self.role == 'standby':
+                    self._restart('standby')
+                    return answer({'success': True, 'restarting': True})
+                return answer({'success': True, 'live_view': self.live_view})
             self.interval = int(body.get('interval') or 30)
             return answer({'success': True, 'interval': self.interval})
+        if path == '/api/ha/apply-config':
+            if self.role != 'standby':
+                return answer({'error': 'Only a standby applies a synced configuration'}, 409)
+            self._restart('standby')
+            return answer({'success': True, 'restarting': True})
+        if req.method == 'GET' and path == '/api/clusters':
+            return answer(self.clusters)
+        if req.method == 'GET' and self.clusters and path.endswith('/resources'):
+            return answer(self.resources)
+        if req.method == 'GET' and self.clusters and path.endswith('/metrics'):
+            return answer(self.metrics)
         if path == '/api/ha/promote':
             if body.get('confirm') != 'PROMOTE':
                 return answer({'error': 'type PROMOTE'}, 400)
@@ -528,7 +577,7 @@ class _FakeServer:
             else:
                 self.role = 'standalone'
             return answer({'success': True, 'restarting': was == 'standby'})
-        if req.method != 'GET' and self.role == 'standby':
+        if req.method != 'GET' and (self.role == 'standby' or self.refuse_as_standby):
             return answer({'error': 'This is a standby instance. Make changes on the active instance; '
                                     'they arrive here with the next sync.', 'code': 'HA_STANDBY'}, 409)
         return answer({'error': 'not mocked'}, 404)
@@ -922,18 +971,1319 @@ def test_runtime_an_unreadable_state_file_offers_no_promote(open_app):
 
 
 def test_a_standby_says_why_its_cluster_list_is_empty():
-    """(#625 live test) A standby starts no cluster managers, so its list is empty on
-    purpose. It used to say "No clusters configured" and offer Add First Cluster and
-    the automated install, both refused there. Sidebar card, Corporate and Modern
-    overview."""
+    """(#625 live test) An empty list on a standby used to say "No clusters configured"
+    and offer Add First Cluster and the automated install, both refused there. In v2 it
+    is empty until the next sync, or for good while its live view is off, and it says
+    which. Sidebar card, Corporate and Modern overview."""
     dash = _read('web', 'src', 'dashboard.js')
     card = dash[dash.index("{t('noClusterSelected')}") - 400:dash.index("{t('noClusterSelected')}")]
-    assert "haStandby ? (" in card and "t('pgHaNoClustersHere')" in card
-    assert '{canAutoInstall && !haStandby && (' in dash
+    assert "haStandby ? (" in card
+    assert "{ha.live_view === false ? t('pgHaNoClustersLiveOff') : t('pgHaNoClustersHere')}" in card
+    assert dash.count('{canAutoInstall && !haStandby && (') == 2   # the card and the sidebar entry
 
     vm = _read('web', 'src', 'vm_modals.js')
     start = vm.index('function AllClustersOverview(')
     body = vm[start:vm.index('function GroupSettingsModal(', start)]
-    assert "const haStandby = ((useAuth() || {}).ha || {}).role === 'standby';" in body
-    assert body.count("t('pgHaNoClustersHere')") == 2
+    assert "const haStandby = haInfo.role === 'standby';" in body
+    assert "const haNoClusters = haInfo.live_view === false ? t('pgHaNoClustersLiveOff') : t('pgHaNoClustersHere');" in body
+    # t has to exist before the text is picked
+    assert body.index('const { t } = useTranslation();') < body.index('const haNoClusters =')
+    assert body.count('{haStandby ? haNoClusters : (') == 2
     assert body.count('{onAutoInstall && !haStandby && (') == 2
+
+
+# -- v2: a live standby is a read-only view (#625) --------------------------------------------
+#
+# A standby now starts its managers and shows the clusters. Only the active acts: the
+# permission helpers keep the *.view permissions on a standby (admins included), the action
+# surfaces that ask for no permission hide their buttons, and a refusal the server still
+# sends (409 HA_STANDBY) turns into one translated toast.
+
+def _block(src, start, end):
+    at = src.index(start)
+    return src[at:src.index(end, at)]
+
+
+def test_the_context_derives_one_read_only_flag(ctx):
+    assert "const haReadOnly = ha.role === 'standby';" in ctx
+    provider = ctx[ctx.index('<AuthContext.Provider value={{'):]
+    provider = provider[:provider.index('}}>')]
+    assert re.search(r'\bhaReadOnly\b', provider)
+    # isAdmin is left alone: the HA tab, the banner button and promote hang off it
+    assert "isAdmin: user?.role === 'admin'," in provider
+    helper = _block(ctx, 'function haReadPermission(', '\n        }')
+    assert "return typeof permission === 'string' && permission.endsWith('.view');" in helper
+
+
+@pytest.mark.parametrize('name,helper', [('dashboard.js', 'can'), ('storage.js', 'hasPerm'),
+                                         ('security.js', 'hasPerm')])
+def test_every_permission_helper_keeps_only_reading_on_a_standby(name, helper):
+    src = _read('web', 'src', name)
+    found = re.findall(r'const %s = \((\w+)\) => (.*?);\n' % helper, src, re.S)
+    assert len(found) == 1, found
+    arg, body = found[0]
+    # and-ed in front of the admin shortcut, so it holds for admins too
+    assert body.startswith('(!haReadOnly || haReadPermission(%s)) &&' % arg), body
+    assert 'isAdmin ||' in body
+    assert re.search(r'const \{[^}]*\bhaReadOnly\b[^}]*\} = useAuth\(\);', src)
+
+
+def test_can_answers_as_agreed(ctx, dash):
+    """The helper and can() as they are in the source, run in node."""
+    import shutil
+    import subprocess
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('node is not installed')
+    helper = _block(ctx, 'function haReadPermission(', '\n        }') + '\n        }'
+    can = re.search(r'const can = \(permission\) => (.*?);\n', dash, re.S).group(1)
+    script = helper + """
+    const mk = (haReadOnly, isAdmin, user) => (permission) => %s;
+    const out = {
+        standbyAdmin: ['vm.view', 'vm.start', 'vm.console', 'node.shell', 'cluster.config', 'plugins.view', 'admin.audit']
+            .map(mk(true, true, { permissions: [] })),
+        standbyUser: ['vm.view', 'vm.start', 'storage.view'].map(mk(true, false, { permissions: ['vm.view', 'vm.start'] })),
+        activeAdmin: ['vm.start', 'node.shell'].map(mk(false, true, { permissions: [] })),
+        activeUser: ['vm.view', 'vm.start', 'storage.view'].map(mk(false, false, { permissions: ['vm.view', 'vm.start'] })),
+        odd: [undefined, null, 5, 'view', '.view'].map(haReadPermission),
+    };
+    console.log(JSON.stringify(out));
+    """ % can
+    res = subprocess.run([node, '-e', script], capture_output=True, text=True, timeout=30)
+    assert res.returncode == 0, res.stderr
+    out = json.loads(res.stdout)
+    assert out['standbyAdmin'] == [True, False, False, False, False, True, False]
+    assert out['standbyUser'] == [True, False, False]   # a view permission it does not hold stays off
+    assert out['activeAdmin'] == [True, True]
+    assert out['activeUser'] == [True, True, False]
+    assert out['odd'] == [False, False, False, False, True]
+
+
+def test_one_ha_standby_branch_in_the_dashboard_authfetch(dash):
+    body = _block(dash, 'const authFetch = React.useCallback(async (url, opts = {}) => {', '}, [getAuthHeaders]);')
+    assert 'const { timeout, quiet, ...rest } = opts;' in body
+    assert 'if (res.status === 409 && haRefusedRef.current) {' in body
+    assert "if (body && body.code === 'HA_STANDBY') {" in body
+    assert 'const error = haRefusedRef.current(quiet);' in body
+    assert 'return new Response(JSON.stringify({ ...body, error }),' in body
+    # the only place in the dashboard that knows the code
+    assert dash.count("'HA_STANDBY'") == 1
+    setter = _block(dash, 'haRefusedRef.current = (quiet = false) => {', '};')
+    assert "const msg = t('pgHaStandbyRefused');" in setter
+    assert "if (!quiet) addToast(msg, 'error');" in setter
+    # reads that go out as a POST in the background stay silent
+    for path in ('/snapshots/overview', '/sse/subscribe'):
+        at = dash.index('`${API_URL}%s`' % path)
+        assert 'quiet: true' in dash[at:at + 320], path
+    # the caller's own error toast with the same words replaces the first (review: a
+    # dropped copy took a retry's failure off the screen with the first toast's timer)
+    toast = _block(dash, 'const addToast = (message, type = ', '};')
+    assert '[...prev.filter(x => x.message !== message || x.type !== type), { id, message, type }]' in toast
+    assert 'prev.some(' not in toast
+
+
+def test_no_optimistic_status_flip_on_a_standby(dash):
+    body = _block(dash, 'const handleVmAction = async (resource, action) => {', 'const handleMigrate = ')
+    assert 'const flipped = !!expectedStatus[action] && !haReadOnly;' in body
+    assert 'if (flipped) {' in body
+    assert body.count('_optimistic: true') == 1
+
+
+@pytest.mark.parametrize('handler,first_act', [
+    ('const handleOpenConsole = async (resource) => {', 'setConsoleStack('),
+    ('const handleOpenSpice = async (resource) => {', 'await authFetch('),
+])
+def test_the_dashboard_refuses_a_console_before_opening_it(dash, handler, first_act):
+    body = _block(dash, handler, '\n            };')
+    guard = 'if (haReadOnly) { haRefusedRef.current?.(); return; }'
+    assert guard in body
+    assert body.index(guard) < body.index(first_act)
+
+
+READ_HANDLERS = {'openConfig', 'openMetrics', 'configNode', 'openSettings', 'openProfile', 'refresh'}
+
+
+def test_a_standby_hands_the_cloud_shell_nothing_that_acts(dash):
+    """A new handler in the bundle has to be sorted: read, or dropped on a standby."""
+    start = dash.index('const cloudActions = {')
+    bundle = dash[start:dash.index('\n                };', start)]
+    keys = set(re.findall(r'^ {20}(\w+):', bundle, re.M))
+    assert {'vmAction', 'openConsole', 'refresh'} <= keys
+    drop = dash[dash.index('if (haReadOnly) {', start):]
+    drop = drop[:drop.index('.forEach(')]
+    dropped = set(re.findall(r"'(\w+)'", drop))
+    assert dropped == keys - READ_HANDLERS, sorted(dropped ^ (keys - READ_HANDLERS))
+
+
+def test_cloud_offers_only_what_it_was_handed(cloud):
+    assert "has: (k) => typeof actions?.[k] === 'function'," in cloud
+    items = _block(cloud, 'function cloudVmActionItems(', '\n        }')
+    for line in items.splitlines():
+        if 'onClick: () => act.' not in line or 'act.openMetrics(' in line or 'act.openConfig(' in line:
+            continue
+        assert re.match(r'\s+(power && |has\(\')', line), line
+    # no divider left at an end or doubled once entries are gone
+    assert 'while (out.length && out[out.length - 1].divider) out.pop();' in items
+    assert "const primary = !act.has('vmAction') ? [] : running" in cloud
+    assert "{act.has('openConsole') && (" in cloud
+    assert "{act.has('openSpice') && r.status === 'running' && r.type === 'qemu' && (" in cloud
+    assert "{selCount > 0 && canPower ? (" in cloud
+    assert "const canCreate = act.has('createVm');" in cloud
+    assert "action={!(q || statusFilter !== 'all') && canCreate ? (" in cloud
+    assert "const nodeActions = !isAdmin ? [] : !act.has('nodeAction') ? [" in cloud
+
+
+def test_the_node_modal_has_no_shell_and_locks_what_changes_on_a_standby():
+    src = _read('web', 'src', 'node_modals.js')
+    body = src[src.index('function NodeModal('):src.index('function ConsoleModal(')]
+    assert 'const { getAuthHeaders, haReadOnly } = useAuth();' in body
+    assert "const tabs = haReadOnly ? allTabs.filter(tab => tab.id !== 'shell') : allTabs;" in body
+    assert "const lockedTab = haReadOnly && !['summary', 'performance', 'tasks'].includes(activeTab);" in body
+    assert "{activeTab === 'shell' && !haReadOnly && (" in body
+    assert '{!haReadOnly && data.shellFullscreen && (' in body
+    assert "const haLock = { disabled: lockedTab, 'data-ha-locked': lockedTab ? '' : undefined };" in body
+    # (#625 v2 review) no fieldset around all tab bodies any more, it disabled Refresh and
+    # SMART too: each tab that changes the node locks its changing parts itself
+    assert '<fieldset disabled={lockedTab}' not in body
+    tabs = {}
+    for m in re.finditer(r"\n( +)\{activeTab === '(\w+)'", body):
+        tabs[m.group(2)] = body[m.end():body.index('\n' + m.group(1) + ')}\n', m.end())]
+    assert {'summary', 'performance', 'network', 'system', 'hardware', 'disks', 'repos', 'tasks',
+            'subscription', 'ceph'} <= set(tabs)
+    for name in ('network', 'hardware', 'repos', 'ceph'):
+        assert tabs[name].split('\n', 1)[1].lstrip().startswith('<fieldset {...haLock} className="contents">'), name
+    for name in ('summary', 'performance', 'tasks'):
+        assert 'haLock' not in tabs[name], name
+
+    def locked(tab, needle):
+        at = tabs[tab].index(needle)
+        return tabs[tab].count('<fieldset {...haLock}', 0, at) > tabs[tab].count('</fieldset>', 0, at)
+
+    # what reads stays usable
+    reads = [m.start() for m in re.finditer(re.escape("onClick={() => loadTabData('system')}"), tabs['system'])]
+    assert len(reads) == 3                      # sensors, cluster health, syslog
+    for at in reads:
+        assert not locked('system', tabs['system'][at:at + 60])
+    assert not locked('disks', "onClick={() => loadTabData('disks')}")
+    assert not locked('disks', 'title="SMART Data"')
+    assert not locked('subscription', "onClick={() => loadTabData('subscription')}")
+    # what changes the node stays locked
+    for needle in ("handleSave('dns'", "handleSave('hosts'", 'showCertUpload: !data.showCertUpload'):
+        assert locked('system', needle), needle
+    for needle in ('title="Initialize GPT"', 'title="Wipe Disk"', "openDiskModal('lvm')",
+                   "openDiskModal('zfs')", "openDiskModal('sr')"):
+        assert locked('disks', needle), needle
+    assert locked('subscription', 'value={data.newLicenseKey')
+    assert locked('subscription', "{t('activateLicense')}")
+
+
+@pytest.mark.parametrize('name,component', [
+    ('tables.js', 'function ResourceTable('),
+    ('vm_modals.js', 'function VmDetailPanel('),
+    ('vm_modals.js', 'function CorporateVmDetailView('),
+])
+def test_the_action_surfaces_read_the_flag(name, component):
+    src = _read('web', 'src', name)
+    body = src[src.index(component):]
+    nxt = re.search(r'\n        function \w+\(', body[10:])
+    body = body[:10 + nxt.start()] if nxt else body
+    head = body[:body.index('const acts = !haReadOnly;') + 40]
+    assert re.search(r'const \{[^}]*\bhaReadOnly\b[^}]*\} = useAuth\(\);', head)
+    assert body.count('acts &&') + body.count('!acts ?') >= 5
+
+
+def test_the_corporate_detail_view_leaves_the_node_alone_on_a_standby():
+    """The console preview grabs a frame on the node, and ?refresh=true runs lvs and can
+    lvextend there and write the table; a standby reads what is stored."""
+    src = _read('web', 'src', 'vm_modals.js')
+    body = _block(src, 'function CorporateVmDetailView(', 'function AllClustersOverview(')
+    assert 'if (!isQemu || !isRunning || !acts) { setConsoleShot(null); return; }' in body
+    assert "authFetch(`${base}/efficient-snapshots${acts ? '?refresh=true' : ''}`)" in body
+
+
+def test_the_sidebar_leaves_cluster_changes_to_the_active(dash):
+    heading = dash[dash.index("<h2 className=\"text-sm font-semibold text-gray-400 uppercase tracking-wider\">{t('clusters')}</h2>"):]
+    heading = heading[:heading.index('{clusters.length === 0 ? (')]
+    assert '{isAdmin && !haStandby && (' in heading
+    item = _block(dash, 'function ClusterSidebarItem(', 'function TopologyView(')
+    assert 'const { haReadOnly } = useAuth();' in item
+    actions = item[item.index('{!haReadOnly && ('):]
+    assert actions.index('<div className="flex gap-0.5 flex-shrink-0">') < actions.index('handleDeleteCluster(cluster.id)')
+    create = _block(dash, '{/* Create VM/CT Buttons', 'quick CSV export of the current VM list')
+    assert '{!haReadOnly && (<>' in create and "setShowCreateVm('qemu')" in create
+
+
+def test_the_panel_speaks_the_v2_contract(panel):
+    body = _function(panel, 'HaPanel')
+    assert "const liveView = status?.live_view !== false;" in body
+    assert "send('PUT', 'settings', { live_view: on })" in body
+    assert "if (res.data.restarting) { setRestarting('standby'); return; }" in body
+    assert "send('POST', 'apply-config', {})" in body
+    assert 'const pending = sync.restart_pending || null;' in body
+    card = body[body.index('const liveViewCard = ('):body.index('const restartNote = ')]
+    assert 'role="switch" aria-checked={liveView}' in card
+    assert 'disabled={!!busy || broken}' in card
+    assert 'status.managers_running' in card
+    note = body[body.index('const restartNote = '):body.index('const typedBox = ')]
+    assert 'standby && (pending || liveMismatch) && (' in note
+    assert '<button onClick={applyNow} disabled={!!busy}' in note
+    # the switch is on every role's page, the note on the standby's
+    standalone = body[body.index("{role === 'standalone' && ("):body.index("{role === 'active' && (")]
+    active = body[body.index("{role === 'active' && ("):body.index("{role === 'standby' && (")]
+    standby = body[body.index("{role === 'standby' && ("):]
+    for part in (standalone, active, standby):
+        assert '{liveViewCard}' in part
+    assert '{restartNote}' in standby
+
+
+# -- runtime: a live standby in the browser ---------------------------------------------------
+
+CLUSTER = {'id': 'c1', 'name': 'Testi', 'display_name': 'Testi', 'host': '10.0.0.1',
+           'connected': True, 'status': 'running', 'cluster_type': 'proxmox', 'enabled': True}
+VM = {'vmid': 100, 'name': 'web01', 'type': 'qemu', 'status': 'running', 'node': 'pve1',
+      'cpu': 0.05, 'cpu_percent': 5, 'maxcpu': 2, 'mem': 1073741824, 'maxmem': 4294967296,
+      'mem_percent': 25, 'disk': 0, 'maxdisk': 34359738368, 'uptime': 3600}
+REFUSED = {'en': 'This is a standby instance. Actions and consoles are only available on the active instance.',
+           'de': 'Das ist eine Standby-Instanz. Aktionen und Konsolen gibt es nur auf der aktiven Instanz.'}
+# what a guest's buttons say, by title or text, in the three views and both layouts
+ACTING = {'Start', 'Shutdown', 'Reboot', 'Console', 'Open Console', 'SPICE Console', 'Migrate',
+          'Clone', 'Delete', 'Tags', 'Force Stop', 'Force Reset', 'Launch Web Console',
+          'Create VM', 'Create Container', 'Take Snapshot', 'Unlock'}
+
+
+def _labels(page):
+    return set(page.evaluate(
+        '() => Array.from(document.querySelectorAll("button"))'
+        '.filter(b => b.offsetParent !== null)'
+        '.map(b => (b.getAttribute("title") || b.innerText || "").trim())'))
+
+
+def _open_resources(app):
+    page = app.page
+    page.get_by_text('Testi').first.click()
+    page.locator('button', has_text='Resources').first.click()
+    page.get_by_text('web01').first.wait_for(timeout=5000)
+    page.wait_for_timeout(300)
+
+
+@pytest.mark.parametrize('role', ['standby', 'active'])
+def test_runtime_modern_shows_the_guests_but_no_action_on_a_standby(open_app, role):
+    app = open_app(role=role, layout='modern', clusters=[CLUSTER], resources=[VM], autoinstall='manage')
+    page = app.page
+    standby = role == 'standby'
+    # the sidebar: groups, auto-install and the per-cluster buttons belong to the active
+    assert (page.locator('button[title="Manage Groups"]').count() == 0) == standby
+    assert (page.get_by_text('Automated Installations').count() == 0) == standby
+    assert (page.locator('button[title="Rename Cluster"]').count() == 0) == standby
+    _open_resources(app)
+    for view in ('Grid View', 'List View', 'Compact View'):
+        page.locator(f'button[title="{view}"]').first.click()
+        if view == 'Compact View':
+            page.get_by_text('Select a VM from the list').wait_for(timeout=3000)
+            page.locator('div.cursor-pointer', has_text='web01').first.click()
+            page.get_by_text('Quick Actions').wait_for(timeout=3000)
+        page.wait_for_timeout(200)
+        labels = _labels(page)
+        # reading stays in every view, in both roles
+        assert 'Configuration' in labels, (view, sorted(labels))
+        if standby:
+            assert not labels & ACTING, (view, sorted(labels & ACTING))
+        else:
+            assert {'Shutdown', 'Migrate', 'Delete'} <= labels, (view, sorted(labels & ACTING))
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('role', ['standby', 'active'])
+def test_runtime_corporate_menu_table_and_detail_on_a_standby(open_app, role):
+    app = open_app(role=role, layout='corporate', clusters=[CLUSTER], resources=[VM])
+    page = app.page
+    standby = role == 'standby'
+
+    # the cluster's context menu keeps what reads, for an admin too
+    page.locator('.corp-tree-item', has_text='Testi').first.click(button='right')
+    menu = page.locator('.corp-context-menu').first
+    menu.wait_for(timeout=3000)
+    text = menu.inner_text()
+    assert 'Refresh' in text
+    for entry in ('New VM', 'Rename Cluster', 'Delete Cluster'):
+        assert (entry not in text) == standby, (entry, text)
+    page.keyboard.press('Escape')
+    page.mouse.click(5, 900)
+
+    _open_resources(app)
+    labels = _labels(page)
+    assert 'Configuration' in labels
+    assert bool(labels & ACTING) != standby, sorted(labels & ACTING)
+
+    # the name opens the corporate detail view: no power, console or snapshot changes
+    page.locator('span', has_text='web01').first.click()
+    page.get_by_text('Snapshots').first.wait_for(timeout=3000)
+    labels = _labels(page)
+    assert bool(labels & ACTING) != standby, sorted(labels & ACTING)
+    # a standby never asks the node for a console frame
+    shots = [c for c in app.server.calls if c[1].endswith('/screenshot')]
+    assert (not shots) == standby, shots
+    page.get_by_text('Snapshots').first.click()
+    page.wait_for_timeout(500)
+    eff = [u for u in app.server.urls if '/efficient-snapshots' in u]
+    assert eff, app.server.calls[-10:]
+    assert all(('refresh=true' in u) != standby for u in eff), eff
+    assert not app.errors, app.errors
+
+
+def test_runtime_cloud_offers_no_action_on_a_standby(open_app):
+    app = open_app(role='standby', layout='cloud', clusters=[CLUSTER], resources=[VM], autoinstall='manage')
+    page = app.page
+    assert page.get_by_text('Automated Installs').count() == 0
+    page.get_by_text('Virtual Machines').first.click()
+    page.get_by_text('web01').first.wait_for(timeout=5000)
+    labels = _labels(page)
+    assert 'New VM' not in labels, sorted(labels)
+    page.get_by_text('web01').first.click()
+    page.locator('.cloud-detail-actions').wait_for(timeout=3000)
+    bar = page.locator('.cloud-detail-actions').inner_text()
+    for word in ('Console', 'Shutdown', 'Reboot', 'SPICE'):
+        assert word not in bar, bar
+    page.locator('.cloud-detail-actions button', has_text='Actions').click()
+    page.wait_for_timeout(300)
+    menu = page.evaluate('() => Array.from(document.querySelectorAll("[role=menu], .cloud-menu"))'
+                         '.map(m => m.innerText).join("\\n")')
+    assert 'Metrics' in menu, menu
+    for word in ('Start', 'Stop', 'Console', 'Delete', 'Clone', 'Migrate', 'Snapshot'):
+        assert word not in menu.split('\n'), (word, menu)
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('language', ['en', 'de'])
+def test_runtime_a_standby_refusal_is_one_translated_toast(open_app, language):
+    """The page was loaded on an active that has since stepped down: it still offers the
+    buttons, the instance refuses. One toast in the user's language, not the English
+    server text next to it."""
+    app = open_app(role='active', layout='modern', language=language, clusters=[CLUSTER],
+                   resources=[VM], refuse_as_standby=True)
+    page = app.page
+    page.on('dialog', lambda d: d.accept())
+    page.get_by_text('Testi').first.click()
+    page.locator('button', has_text='Ressourcen' if language == 'de' else 'Resources').first.click()
+    page.get_by_text('web01').first.wait_for(timeout=5000)
+    shutdown = 'Herunterfahren' if language == 'de' else 'Shutdown'
+    page.locator(f'button[title="{shutdown}"]').first.click()
+    app.see(REFUSED[language], timeout=5000)
+    page.wait_for_timeout(600)
+    assert page.get_by_text(REFUSED[language]).count() == 1
+    assert page.get_by_text('they arrive here with the next sync').count() == 0
+    assert ('POST', '/api/clusters/c1/vms/pve1/qemu/100/shutdown') in app.server.calls
+    assert not app.errors, app.errors
+
+
+def test_runtime_the_live_view_switch_restarts_a_standby(open_app):
+    app = open_app(role='standby', layout='modern')
+    page = app.page
+    # the sidebar card and the overview both say why the list is empty
+    app.see('Its clusters appear here, read-only, after the next sync.')
+    assert page.get_by_text('Its clusters appear here, read-only, after the next sync.').count() == 2
+    panel = _open_ha(app, 'standby')
+    switch = page.get_by_role('switch', name='Connect to the clusters while standing by (read only)')
+    assert switch.get_attribute('aria-checked') == 'true'
+    text = panel.inner_text()
+    assert 'Connected, read only' in text and 'Changing this restarts this instance.' in text
+    assert panel.locator('[data-ha-restart-pending]').count() == 0
+
+    before = len(app.loads)
+    switch.click()
+    app.see('Restarting PegaProx...', timeout=3000)
+    assert app.server.bodies['/api/ha/settings'] == [{'live_view': False}]
+    app.wait_for_reload(before)
+    # back as a standby that does not connect, and the empty list says so
+    app.see('It does not connect to the clusters while its live view is off.')
+    assert page.get_by_text('It does not connect to the clusters while its live view is off.').count() == 2
+    panel = _open_ha(app, 'standby')
+    switch = page.get_by_role('switch', name='Connect to the clusters while standing by (read only)')
+    assert switch.get_attribute('aria-checked') == 'false'
+    assert 'Not connected' in panel.inner_text()
+    assert not app.errors, app.errors
+
+
+def test_runtime_the_live_view_switch_only_saves_elsewhere(open_app):
+    app = open_app(role='standalone', layout='modern')
+    page = app.page
+    panel = _open_ha(app, 'standalone')
+    text = panel.inner_text()
+    assert 'unless its live view is off' in text          # the join warning
+    assert 'Connected, read only' not in text and 'Changing this restarts' not in text
+    switch = page.get_by_role('switch', name='Connect to the clusters while standing by (read only)')
+    switch.click()
+    app.see('Saved. It applies once this instance runs as a standby.')
+    page.wait_for_function('() => document.querySelector("#pgha-live-view").getAttribute("aria-checked") === "false"',
+                           timeout=3000)
+    assert app.server.bodies['/api/ha/settings'] == [{'live_view': False}]
+    assert page.get_by_text('Restarting PegaProx...').count() == 0
+    assert not app.errors, app.errors
+
+
+def test_runtime_a_pending_restart_applies_now(open_app):
+    app = open_app(role='standby', layout='modern',
+                   restart_pending={'since': _iso_ago(180), 'reason': 'cluster Testi: host changed'})
+    page = app.page
+    panel = _open_ha(app, 'standby')
+    note = panel.locator('[data-ha-restart-pending]')
+    text = note.inner_text()
+    assert 'restarts on its own shortly' in text
+    assert 'cluster Testi: host changed' in text and 'minutes ago' in text
+    # at the top, before the peer and sync cards
+    assert _follows(page, '[data-ha-restart-pending]', '#pgha-interval')
+
+    before = len(app.loads)
+    note.get_by_role('button', name='Apply now').click()
+    app.see('Restarting PegaProx...', timeout=3000)
+    assert app.server.calls.count(('POST', '/api/ha/apply-config')) == 1
+    app.wait_for_reload(before)
+    panel = _open_ha(app, 'standby')
+    assert panel.locator('[data-ha-restart-pending]').count() == 0
+    assert not app.errors, app.errors
+
+
+def test_runtime_an_unreadable_state_file_locks_the_live_view_too(open_app):
+    app = open_app(role='standby', layout='modern', broken='bad json')
+    _open_ha(app, 'standby')
+    assert app.page.locator('#pgha-live-view').is_disabled()
+    assert not app.errors, app.errors
+
+
+NODE_METRICS = {'pve1': {'status': 'online', 'cpu_percent': 5.0, 'mem_percent': 20.0, 'disk_percent': 10.0,
+                         'score': 42.0, 'uptime': 86400, 'loadavg': [0.1, 0.2, 0.3], 'netin': 0, 'netout': 0,
+                         'mem_used': 6871947673, 'mem_total': 34359738368, 'disk_used': 10737418240,
+                         'disk_total': 107374182400, 'pveversion': 'pve-manager/9.0.3',
+                         'kversion': 'Linux 6.14.8-2-pve', 'cpuinfo': {'cpus': 8, 'cores': 4, 'sockets': 1},
+                         'maintenance_mode': False, 'is_updating': False}}
+
+
+@pytest.mark.parametrize('role', ['standby', 'active'])
+def test_runtime_the_node_shows_but_does_not_change_on_a_standby(open_app, role):
+    app = open_app(role=role, layout='modern', clusters=[CLUSTER], resources=[VM], metrics=NODE_METRICS)
+    page = app.page
+    standby = role == 'standby'
+    page.get_by_text('Testi').first.click()
+    page.locator('button[title="Node Configuration"]').first.wait_for(timeout=5000)
+    # the card: maintenance is the active's
+    assert (page.locator('button[title="Enter Maintenance Mode"]').count() == 0) == standby
+
+    page.locator('button[title="Node Configuration"]').first.click()
+    page.get_by_text('Proxmox Node').first.wait_for(timeout=5000)
+    tabs = page.evaluate('() => Array.from(document.querySelectorAll("button")).map(b => b.innerText.trim())')
+    assert ('Shell' not in tabs) == standby, tabs
+    # a tab that changes things renders its controls disabled, a reading one does not
+    page.locator('button', has_text='System').last.click()
+    page.wait_for_timeout(300)
+    assert (page.locator('fieldset[data-ha-locked]').count() == 1) == standby
+    if standby:
+        assert page.evaluate('() => document.querySelector("fieldset[data-ha-locked]").disabled')
+    page.locator('button', has_text='Summary').last.click()
+    page.wait_for_timeout(200)
+    assert page.locator('fieldset[data-ha-locked]').count() == 0
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('role', ['standby', 'active'])
+def test_runtime_the_corporate_node_row_offers_no_action_on_a_standby(open_app, role):
+    app = open_app(role=role, layout='corporate', clusters=[CLUSTER], resources=[VM], metrics=NODE_METRICS)
+    page = app.page
+    standby = role == 'standby'
+    page.locator('.corp-tree-item', has_text='Testi').first.click()
+    row = page.locator('.corp-node-row', has_text='pve1').first
+    row.wait_for(timeout=5000)
+    row.get_by_text('pve1').first.click()     # expands the row
+    row.locator('.corp-toolbar').wait_for(timeout=3000)
+    bar = row.locator('.corp-toolbar').inner_text()
+    for word in ('Reboot', 'Shutdown', 'Maintenance'):
+        assert (word not in bar) == standby, (word, bar)
+
+    # the node in the tree (selecting the cluster opened it): its menu keeps what reads,
+    # the detail view has no shell
+    child = page.locator('.corp-tree-child', has_text='pve1').first
+    child.wait_for(timeout=5000)
+    child.click(button='right')
+    menu = page.locator('.corp-context-menu').first
+    menu.wait_for(timeout=3000)
+    assert ('SSH Console' not in menu.inner_text()) == standby, menu.inner_text()
+    page.keyboard.press('Escape')
+    page.mouse.click(5, 900)
+    child.click()
+    strip = page.locator('.corp-tab-strip').last
+    strip.get_by_text('Configure').wait_for(timeout=5000)
+    assert ('Shell' not in strip.inner_text()) == standby, strip.inner_text()
+    page.locator('.corp-toolbar button', has_text='Actions').last.click()
+    dropdown = page.locator('.corp-dropdown').last.inner_text()
+    assert 'Node Settings' in dropdown
+    assert ('Reboot Node' not in dropdown) == standby, dropdown
+    page.mouse.click(5, 900)
+    strip.get_by_text('Configure').click()
+    page.wait_for_timeout(300)
+    assert page.evaluate('() => Array.from(document.querySelectorAll("fieldset")).some(f => f.disabled)') == standby
+    assert not app.errors, app.errors
+
+
+def test_the_node_handlers_refuse_on_a_standby(dash):
+    """Anything left that still reaches them: refused with the toast, before a question
+    is asked or a request goes out."""
+    guard = 'if (haReadOnly) { haRefusedRef.current?.(); return; }'
+    for head in ('const handleMaintenanceToggle = async (nodeName, enable) => {',
+                 'const handleStartUpdate = async (nodeName, reboot) => {',
+                 'const handleNodeAction = async (nodeName, action) => {',
+                 'const handleForceStop = async (resource) => {'):
+        body = _block(dash, head, '\n            };')
+        assert guard in body, head
+        later = [i for i in (body.find('confirm('), body.find('authFetch(')) if i >= 0]
+        assert later and body.index(guard) < min(later), head
+
+
+def test_the_node_cards_show_but_do_not_change_on_a_standby():
+    src = _read('web', 'src', 'tables.js')
+    card = src[src.index('function NodeCard('):src.index('function NodeCompactRow(')]
+    assert 'const { getAuthHeaders, haReadOnly } = useAuth();' in card
+    assert '{!haReadOnly && !isInMaintenance && !isUpdating && (' in card
+    assert "{!haReadOnly && (maintenanceTask?.status === 'completed' ||" in card
+    assert "{!haReadOnly && (updateTask.status === 'completed' || updateTask.status === 'failed') && (" in card
+    row = src[src.index('function NodeCompactRow('):src.index('function ResourceTable(')]
+    assert 'const { getAuthHeaders, haReadOnly } = useAuth();' in row
+    bar = row[row.index('{/* Action Buttons */}'):row.index('{/* Confirmation Modals */}')]
+    assert bar.index('{!haReadOnly && (<>') < bar.index('setShowMaintenanceConfirm(true)')
+    assert bar.index('setShowShutdownConfirm(true)') < bar.index('</>)}')
+    assert '{!haReadOnly && !metrics.maintenance_acknowledged &&' in row
+
+
+def test_the_corporate_node_view_shows_but_does_not_change_on_a_standby():
+    src = _read('web', 'src', 'node_modals.js')
+    body = src[src.index('function CorporateNodeDetailView('):]
+    assert 'const { getAuthHeaders, reverseProxyEnabled, haReadOnly } = useAuth();' in body
+    assert ".filter(tab => !(haReadOnly && tab === 'shell')).map(tab => (" in body
+    assert "{activeDetailTab === 'shell' && !haReadOnly && (" in body
+    menu = body[body.index('<div className="corp-dropdown absolute right-0 top-full'):]
+    assert menu.index('{!haReadOnly && (<>') < menu.index('onMaintenanceToggle(node, !isMaint)')
+    assert menu.index("onNodeAction(node, 'shutdown')") < menu.index('</>)}') < menu.index('onOpenNodeConfig(node)')
+    configure = body[body.index("{activeDetailTab === 'configure' && ("):body.index("{activeDetailTab === 'vms' && (")]
+    # the sub navigation reads and stays outside the disabled part
+    assert configure.index('corp-subnav-item') < configure.index('<fieldset disabled={haReadOnly} className="contents">')
+    hw = body[body.index("{activeDetailTab === 'hardware' && ("):]
+    assert hw.index('<fieldset disabled={haReadOnly} className="contents">') < hw.index('<HardwareMonitoringPanel')
+
+
+def test_no_efficient_snapshot_refresh_from_a_standby():
+    """GET ?refresh=true runs lvs and maybe lvextend on the node and writes the table."""
+    cfg = _read('web', 'src', 'vm_config.js')
+    modal = cfg[cfg.index('function ConfigModal('):]
+    assert 'const { getAuthHeaders, haReadOnly } = useAuth();' in modal[:400]
+    assert "efficient-snapshots${haReadOnly ? '' : '?refresh=true'}`" in cfg
+    for name in ('vm_config.js', 'vm_modals.js'):
+        assert 'efficient-snapshots?refresh=true' not in _read('web', 'src', name), name
+
+
+def test_a_console_window_on_a_standby_says_why(dash):
+    body = _block(dash, 'function StandaloneConsole(', 'function App(')
+    assert 'const { getAuthHeaders, haReadOnly } = useAuth();' in body
+    guard = "if (haReadOnly) {\n                    setState({ status: 'error', error: 'standby' });"
+    assert guard in body
+    # before anything is fetched
+    assert body.index(guard) < body.index('await fetch(')
+    assert '}, [consoleKey, haReadOnly]);' in body
+    assert "state.error === 'standby' ? t('pgHaStandbyRefused')" in body
+
+
+# -- v2 review: the surfaces the first pass missed (#625) -----------------------------------
+#
+# Each finding of the v2 review gets a source check and, where it renders, a runtime check
+# in both roles: the standby hides (or disables) what acts, the active keeps it.
+
+GUARD = 'if (haReadOnly) { haRefusedRef.current?.(); return; }'
+
+
+def _guarded_before(body, *later):
+    """The standby guard comes before the first confirm, request or state change named."""
+    assert GUARD in body, body[:120]
+    first = [i for i in (body.find(x) for x in later) if i >= 0]
+    assert first and body.index(GUARD) < min(first), body[:120]
+
+
+def test_the_corporate_header_leaves_cluster_changes_to_the_active(dash):
+    """verify:frontend:5 - the Corporate overview header had its own rename, re-configure
+    and delete next to the read-only context menu."""
+    header = _block(dash, '<div className="corp-content-header">', "{t('refreshData')")
+    gate = header.index('{!haReadOnly && (<>')
+    for action in ('setRenamingCluster(selectedCluster)', 'setReconfigureCluster(selectedCluster)',
+                   'handleDeleteCluster(selectedCluster.id)'):
+        assert gate < header.index(action) < header.index('</>)}'), action
+    # the online badge and the health pill still read
+    assert header.index('</>)}') < header.index('<ClusterHealthBadge')
+    _guarded_before(_block(dash, 'const handleDeleteCluster = async (clusterId) => {', '\n            };'),
+                    'confirm(', 'authFetch(')
+    _guarded_before(_block(dash, 'const handleRenameCluster = async () => {', '\n            };'),
+                    'confirm(', 'authFetch(')
+    _guarded_before(_block(dash, 'const handleReconfigureAuth = async () => {', '\n            };'),
+                    'setReconfigureLoading(', 'authFetch(')
+
+
+def test_esxi_pbs_and_the_add_buttons_stay_on_the_active(dash):
+    """verify:frontend:4"""
+    assert '{!isCorporate && isAdmin && !haStandby && (' in dash                  # header Add Cluster
+    assert '{!isCorporate && pbsServers.length === 0 && isAdmin && !haStandby && (' in dash
+    assert '{!isCorporate && vmwareServers.length === 0 && isAdmin && !haStandby && (' in dash
+    for opener in ('<button onClick={() => setShowAddPBS(true)} className="p-1',
+                   "<button onClick={() => { setEditingVMware(null); setVmwareForm({ name: '', host: '', port: 443, "
+                   "username: 'root', password: '', ssl_verify: false, notes: '' }); setShowAddVMware(true); }} className=\"p-1"):
+        at = dash.index(opener)
+        assert '{isAdmin && !haStandby && (' in dash[at - 120:at], opener
+    # PBS edit/delete, encryption key and auto-verify; ESXi re-configure/delete
+    for opener in ('<button onClick={() => { setEditingPBS(selectedPBS);', '<button onClick={() => setShowEncryptionKeyModal(true)}',
+                   '<button onClick={() => setShowVerifyScheduleModal(true)}',
+                   '<button onClick={() => { setEditingVMware(selectedVMware);'):
+        at = dash.index(opener)
+        assert '{isAdmin && !haReadOnly && (' in dash[at - 220:at], opener
+    for head in ('const vmwarePowerAction = async (vmId, action) => {',
+                 'const vmwareSnapshotAction = async (vmId, action, data = {}) => {',
+                 'const toggleVMwareDRS = async (vmwId, clusterId, enabled, automation) => {',
+                 'const toggleVMwareHA = async (vmwId, clusterId, enabled) => {',
+                 'const handleDeleteVMware = async (vmwId) => {'):
+        _guarded_before(_block(dash, head, '\n            };'), 'confirm(', 'authFetch(', 'setVmwareActionLoading(')
+    # every power button, list and detail, and the HA/DRS switches sit behind the flag
+    for call in ("onClick={() => vmwarePowerAction(vm.vm || vm.vm_id || vm.id, 'start')}",
+                 "onClick={() => vmwarePowerAction(vmwareSelectedVm, 'start')}",
+                 'onClick={() => toggleVMwareDRS(selectedVMware.id, cl.cluster, !cl.drs_enabled)}',
+                 'onClick={() => toggleVMwareHA(selectedVMware.id, cl.cluster, !cl.ha_enabled)}',
+                 "onClick={() => { setVmwareRenameName(vm.name || ''); setShowVmwareRename(true); }} className=\"w-full flex",
+                 'onClick={() => fetchMigrationPlan(vmwareSelectedVm)} disabled={vmwareMigrateLoading} className="w-full py-2.5',
+                 "onClick={() => vmwareSnapshotAction(vmwareSelectedVm, 'delete'"):
+        at = dash.index(call)
+        # the DRS switch sits after its automation select, inside the same gate
+        assert '!haReadOnly && ' in dash[at - (1800 if 'DRS' in call else 700):at], call
+    assert "{vmwareVmTab === 'settings' && (() => {" in dash
+    settings = dash[dash.index("{vmwareVmTab === 'settings' && (() => {"):dash.index("{vmwareVmTab === 'config' && (")]
+    assert "<fieldset disabled={haReadOnly} className=\"space-y-4 min-w-0\" data-ha-locked={haReadOnly ? '' : undefined}>" in settings
+    assert settings.index('{!haReadOnly && (') < settings.index('onClick={() => handleVmwareConfigSave(vmwareSelectedVm)}')
+
+
+def test_the_toast_for_a_repeated_error_gets_its_own_lifetime(dash):
+    """verify:frontend:7 - addToast run in node: the second identical toast replaces the
+    first, so the first one's timer no longer takes the newer message off the screen."""
+    import shutil
+    import subprocess
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('node is not installed')
+    fn = _block(dash, 'const addToast = (message, type = ', '\n            };') + '\n            };'
+    script = """
+    let toasts = [];
+    const setToasts = (f) => { toasts = f(toasts); };
+    const timers = [];
+    const setTimeout = (fn, ms) => timers.push(fn);
+    %s
+    addToast('VM 100 is locked', 'error');
+    const first = toasts.map(x => x.id);
+    addToast('VM 100 is locked', 'error');
+    const second = toasts.map(x => x.id);
+    timers[0]();                        // the first toast's 5 s timer runs out
+    const after = toasts.map(x => x.message);
+    addToast('something else', 'error');
+    addToast('VM 100 is locked', 'success');
+    console.log(JSON.stringify({first, second, after, n: toasts.length}));
+    """ % fn
+    res = subprocess.run([node, '-e', script], capture_output=True, text=True, timeout=30)
+    assert res.returncode == 0, res.stderr
+    out = json.loads(res.stdout)
+    assert len(out['first']) == 1 and len(out['second']) == 1
+    assert out['second'] != out['first']            # replaced, not dropped
+    assert out['after'] == ['VM 100 is locked']     # the retry's copy outlives the first timer
+    assert out['n'] == 3                            # other text or type: a toast of its own
+
+
+def test_the_snapshot_overview_deletes_only_for_who_may_and_reads_the_answer(dash):
+    """verify:frontend:1"""
+    assert "const canDeleteSnaps = can('vm.snapshot');" in dash
+    ov = dash[dash.index('const selCount = (sortedSnapshots || []).filter(s => selectedSnaps[snapKey(s)]).length;'):]
+    ov = ov[:ov.index('</table>')]
+    assert 'return canDeleteSnaps && selCount > 0 ? (' in ov
+    assert ov.count('{canDeleteSnaps && (') == 3            # select-all, row checkbox, row delete
+    assert ov.count("{canDeleteSnaps && <th className={isCorporate ? 'corp-snap-action'") == 1
+    for head in ('const deleteSelectedSnapshots = async (clusterId) => {',
+                 'const deleteGlobalSnapshot = async (snap, clusterId) => {'):
+        body = _block(dash, head, '\n            };')
+        assert 'const res = await authFetch(`${API_URL}/snapshots/delete`' in body
+        fail = body.index('if (!res || !res.ok) {')
+        assert fail < body.index("'success')")
+        assert 'snapDeleteError(data, ' in body[fail:body.index("'success')")]
+    bulk = _block(dash, 'const deleteSelectedSnapshots = async (clusterId) => {', '\n            };')
+    assert bulk.index('return;\n', bulk.index('if (!res || !res.ok) {')) < bulk.index('setSelectedSnaps({});')
+    assert '`${data.deleted ?? chosen.length} snapshot(s) deleted`' in bulk
+
+
+def test_a_failed_action_puts_the_old_status_back(dash):
+    """verify:frontend:9 - the refetch skips data that did not change, so the handler undoes
+    its own optimistic flip on every failure path."""
+    body = _block(dash, 'const handleVmAction = async (resource, action) => {', 'const handleMigrate = ')
+    undo = body[body.index('const unflip = () => {'):]
+    undo = undo[:undo.index('\n                };')]
+    assert 'if (!flipped) return;' in undo
+    assert '? { ...r, status: resource.status, _optimistic: false }' in undo
+    assert 'r._optimistic' in undo
+    # three failure paths, each undoes before it refetches
+    tail = body[body.index('const response = await authFetch('):]
+    assert tail.count('unflip();') == 3
+    for m in re.finditer(r'fetchClusterResources\(selectedCluster\.id\);', tail):
+        assert tail.rindex('unflip();', 0, m.start()) > tail.rindex("updateRecentTask(taskId, 'completed');", 0, m.start())
+
+
+def test_no_permission_copy_ignores_the_standby():
+    """verify:frontend:3 - Site Recovery and Multi-Cluster EVPN read the permission list
+    themselves; outside the helpers nothing may read it without the flag."""
+    helpers = {'dashboard.js': ['const can = (permission) =>', 'const holds = (permission) =>'],
+               'storage.js': ['const hasPerm = (p) =>'], 'security.js': ['const hasPerm = (p) =>']}
+    seen = 0
+    for name in sorted(os.listdir(SRC)):
+        if not name.endswith('.js'):
+            continue
+        src = _read('web', 'src', name)
+        for m in re.finditer(r'\buser\??\.permissions\??\.includes\(', src):
+            seen += 1
+            stmt = src[src.rindex('\n', 0, src.rindex('const ', 0, m.start())):src.index(';', m.start())]
+            if any(h in stmt for h in helpers.get(name, [])):
+                continue
+            assert 'haReadOnly' in stmt, (name, stmt.strip()[:160])
+    assert seen >= 6
+    dash = _read('web', 'src', 'dashboard.js')
+    sr = _block(dash, 'function SiteRecoveryTab(', 'const [plans, setPlans]')
+    assert 'const { haReadOnly } = useAuth();' in sr
+    assert "const canManage = !haReadOnly && !!user?.permissions?.includes('site_recovery.manage');" in sr
+    assert "const canFailover = !haReadOnly && !!user?.permissions?.includes('site_recovery.failover');" in sr
+    assert "canAdminSettings={can('admin.settings')}" in dash
+    assert "canManage={can('sdn.manage') && can('admin.settings')}" in dash
+    # a plan's mappings and settings save only for who may manage it
+    assert '{canManage && <div className="flex justify-end"><button onClick={saveMappings}' in dash
+    assert '{canManage && <div className="flex justify-end"><button onClick={saveSettings}' in dash
+
+
+def test_the_vm_configuration_locks_on_a_standby():
+    """verify:frontend:6"""
+    cfg = _read('web', 'src', 'vm_config.js')
+    modal = _function(cfg, 'ConfigModal')
+    assert "const lockedTab = haReadOnly && activeTab !== 'history';" in modal
+    fs = modal.index("<fieldset disabled={lockedTab} className=\"contents\" data-ha-locked={lockedTab ? '' : undefined}>")
+    fe = modal.index('</fieldset>', fs)
+    for tab in ('general', 'disks', 'network', 'snapshots', 'backups', 'replication', 'history', 'firewall',
+                'options'):
+        assert fs < modal.index("{activeTab === '%s' && (" % tab, fs) < fe, tab
+    # the tab strip and the retry after a load error stay outside
+    assert modal.index('onClick={() => setActiveTab(tab.id)}') < fs
+    assert modal.index('onClick={() => { setConfigError(null); fetchConfig(); }}') < fs
+    # no Save (footer) and no Apply (corporate header) on a standby
+    assert '{hasChanges && !haReadOnly && (' in modal
+    assert ('{!haReadOnly && <button\n                                    onClick={handleSave}\n'
+            '                                    disabled={!hasChanges || saving}') in modal
+
+
+def test_the_update_check_does_not_run_from_a_standby():
+    """verify:frontend:2 - opening a cluster's Settings posted the check, which SSHes every
+    node and which the standby refuses."""
+    sec = _read('web', 'src', 'security.js')
+    comp = _function(sec, 'UpdateManagerSection')
+    mount = comp[comp.index('// Load cached status from localStorage'):comp.index('// Poll for rolling update status')]
+    calls = [m.start() for m in re.finditer(r'checkUpdates\(\)', mount)]
+    assert len(calls) == 3
+    for at in calls:
+        assert '!haReadOnly' in mount[at - 130:at], mount[at - 130:at]
+    # a cached result still shows
+    assert mount.index('setUpdateStatus({ summary: data.summary') < mount.index('!haReadOnly')
+    rolling = comp[comp.index('// #183: auto-refresh update counts'):]
+    assert rolling.index('if (haReadOnly) return;') < rolling.index('checkUpdates();')
+    assert "{!haReadOnly && <button\n                                    onClick={(e) => { e.stopPropagation(); checkUpdates(true); }}" in comp
+    assert "json.code === 'HA_STANDBY' ? t('pgHaStandbyRefused')" in comp
+
+
+def test_closing_an_esxi_vm_never_toasts(dash):
+    """verify:frontend:0 - the unwatch on close goes out quiet; the watch itself is left as is."""
+    effect = dash[dash.index('// Watch VM detail via SSE'):]
+    effect = effect[:effect.index('}, [selectedVMware?.id, vmwareSelectedVm]);')]
+    assert 'quiet' not in effect[effect.index("method: 'POST'"):effect.index('watchVm();')]
+    assert "method: 'DELETE',\n                            quiet: true" in effect[effect.index('// Unwatch'):]
+
+
+def test_compliance_stays_a_reading_tab_on_a_standby(dash):
+    """info: the tab only reads, so on a standby it stays for whoever reads it on the active;
+    its acting buttons still ask the flag."""
+    assert ('const holds = (permission) => isAdmin || (Array.isArray(user?.permissions) '
+            '&& user.permissions.includes(permission));') in dash
+    assert "if (tab.id === 'compliance') return holds('admin.audit') || holds('node.maintenance');" in dash
+    # holds() decides this tab and nothing else
+    assert len(re.findall(r'\bholds\(', dash)) == 2
+    drift = _function(dash, 'DriftTab')
+    assert 'const canAct = isAdmin && !haReadOnly;' in drift and '{isAdmin && (' not in drift
+
+
+@pytest.mark.parametrize('component', ['PowerCarbonTab', 'CostDashboardTab', 'DriftTab',
+                                       'TemplatesLibraryTab', 'InsightsTab'])
+def test_the_admin_buttons_of_the_report_tabs_follow_the_flag(dash, component):
+    body = _function(dash, component)
+    assert 'const { haReadOnly } = useAuth();' in body
+    assert 'const canAct = isAdmin && !haReadOnly;' in body
+    assert len(re.findall(r'\bisAdmin\b', body)) == 2        # the prop and canAct
+    assert 'canAct' in body.split('const canAct = ', 1)[1]
+
+
+def test_automation_reports_and_settings_leave_acting_to_the_active(dash):
+    """info: the acting controls haReadOnly reaches cheaply."""
+    auto = dash[dash.index("{automationSubTab === 'schedules' && ("):dash.index("{automationSubTab === 'snapshots' && (")]
+    for opener in ("onClick={() => { setEditingSchedule(null); setShowScheduleModal(true); }}",
+                   "setEditingAlert(null);  // #618", "onClick={() => setShowAffinityModal(true)}",
+                   "onClick={() => { setEditingScript(null); setShowScriptModal(true); }}",
+                   "onClick={() => setShowScriptRunModal(script)}", "onClick={() => deleteClusterAffinityRule(rule.id)}",
+                   "onClick={() => { setEditingSchedule(schedule); setShowScheduleModal(true); }}",
+                   "onClick={() => openEditAlert(alert)}", "onClick={() => { setEditingScript(script); setShowScriptModal(true); }}"):
+        at = auto.index(opener)
+        assert '{!haReadOnly && (' in auto[max(0, at - 260):at], opener
+    for toggle in ('onClick={() => toggleScheduleEnabled(schedule.id, !schedule.enabled)}\n',
+                   'onClick={() => toggleAlertEnabled(alert.id, !alert.enabled)}\n'):
+        assert auto[auto.index(toggle) + len(toggle):].lstrip().startswith('disabled={haReadOnly}'), toggle
+    assert '{!a.acked_at && !haReadOnly && (' in auto
+    # the scripts' Refresh reads
+    at = auto.index('onClick={() => loadCustomScripts(')
+    assert '{!haReadOnly' not in auto[at - 200:at]
+    for head in ('const handleBalanceNow = async () => {', 'const startXhmMigration = async () => {',
+                 'const installDebsecan = async (clusterId = null) => {', 'const applyHardening = () => {',
+                 'const rollbackHardening = async () => {', 'const runCveScan = async (clusterId = null) => {'):
+        _guarded_before(_block(dash, head, '\n            };'), 'authFetch(', 'setHardenConfirm(', 'setCveScanLoading(')
+    for button in ('onClick={handleBalanceNow}', 'onClick={() => runCveScan()}', 'onClick={() => installDebsecan()}',
+                   'onClick={applyHardening}'):
+        at = dash.index(button)
+        assert '{!haReadOnly && (' in dash[at - 200:at], button
+    assert '{!haReadOnly && <button onClick={startXhmMigration}' in dash
+
+
+def test_the_cloud_pages_change_nothing_from_a_standby(cloud):
+    """info: useCloudMutate backs every change the Cloud secondary pages make."""
+    hook = _function(cloud, 'useCloudMutate')
+    assert 'const { getAuthHeaders, haReadOnly } = useAuth();' in hook
+    assert 'return { busy, run, acts: !haReadOnly };' in hook
+    assert "b && b.code === 'HA_STANDBY' ? t('pgHaStandbyRefused')" in hook
+    # every row button that runs a change sits behind the flag
+    rows = 0
+    for m in re.finditer(r'<CloudRowActions>(.*?)</CloudRowActions>', cloud, re.S):
+        inner = m.group(1)
+        for call in re.finditer(r'<CloudIconBtn [^\n]*?onClick=\{[^\n]*?(mut\.run\(|setRunFor\()', inner):
+            rows += 1
+            before = inner[:call.start()]
+            assert before.rstrip().endswith('{mut.acts &&') or before.lstrip().startswith('{mut.acts && (<>'), inner[:200]
+    assert rows >= 12
+    for opener in ("{t('cloud.newRule') || 'New rule'}", "{t('cloud.newScript') || 'New script'}",
+                   "{t('cloud.newSchedule') || 'New schedule'}", "mut.run('rescan'"):
+        line = cloud[cloud.rindex('\n', 0, cloud.index(opener)):cloud.index(opener)]
+        assert '{mut.acts && <button' in line, opener
+    assert '{s.pending && mut.acts ? (' in cloud
+    assert cloud.count('right: mut.acts ? <button type="button" className="cloud-link-btn" onClick={() => setModal(') == 2
+    assert 'right: vnets.length && mut.acts ? <button' in cloud
+    assert 'right: mut.acts && (\n' in cloud                       # plugin reload and disable
+    cve = _function(cloud, 'CloudCVE')
+    assert 'const { haReadOnly } = useAuth();' in cve
+    assert '{!haReadOnly && <button type="button" className="cloud-btn-primary" onClick={scan}' in cve
+
+
+# -- runtime -----------------------------------------------------------------------------------
+
+ESXI = {'id': 'v1', 'name': 'esx01', 'host': '10.0.0.9', 'port': 443, 'server_type': 'esxi',
+        'connected': True, 'status': 'connected', 'enabled': True}
+EVM = {'vm': 'vm-1', 'name': 'legacy01', 'power_state': 'POWERED_ON', 'cpu_count': 2,
+       'memory_size_MiB': 4096, 'guest_OS': 'UBUNTU_64', 'host': 'esx01.lab'}
+PBS = {'id': 'p1', 'name': 'backup01', 'host': '10.0.0.20', 'port': 8007, 'user': 'root@pam',
+       'connected': True, 'status': 'connected', 'linked_clusters': []}
+ESXI_READS = {('GET', '/api/vmware'): (200, [ESXI]), ('GET', '/api/vmware/v1/vms'): (200, [EVM]),
+              ('GET', '/api/vmware/v1/vms/vm-1'): (200, dict(EVM)), ('GET', '/api/pbs'): (200, []),
+              # the watch is a read the backend lets a standby register (#625)
+              ('POST', '/api/vmware/v1/vms/vm-1/watch'): (200, {'success': True})}
+ESXI_POWER = {'Start', 'Stop', 'Shutdown', 'Reset', 'Suspend', 'Console (VMRC)'}
+# the real app hands a standby its SSE token (a local write); the fake's refusal would put
+# a toast on the screen that has nothing to do with what a test looks at. No token in the
+# answer, so the page polls instead of opening a stream.
+SSE_TOKEN = {('POST', '/api/sse/token'): (200, {})}
+
+TOASTS_JS = '''() => { const c = Array.from(document.body.children).find(d => d.style && d.style.zIndex === '99999');
+    return c ? Array.from(c.children).map(x => x.innerText.trim()) : []; }'''
+
+
+def _toasts(page):
+    return page.evaluate(TOASTS_JS)
+
+
+def _wait_for_call(app, call, seconds=3):
+    deadline = time.time() + seconds
+    while time.time() < deadline and call not in app.server.calls:
+        app.page.wait_for_timeout(100)
+    return call in app.server.calls
+
+
+@pytest.mark.parametrize('role', ['standby', 'active'])
+def test_runtime_the_corporate_header_leaves_cluster_changes_to_the_active(open_app, role):
+    app = open_app(role=role, layout='corporate', clusters=[CLUSTER], resources=[VM])
+    page = app.page
+    page.locator('.corp-tree-item', has_text='Testi').first.click()
+    page.locator('.corp-content-header').first.wait_for(timeout=5000)
+    page.wait_for_timeout(300)
+    titles = set(page.evaluate('() => Array.from(document.querySelectorAll(".corp-content-header button"))'
+                               '.filter(b => b.offsetParent !== null)'
+                               '.map(b => (b.getAttribute("title") || b.innerText || "").trim())'))
+    changes = {'Rename Cluster', 'Re-configure Cluster', 'Delete Cluster'}
+    if role == 'standby':
+        assert not changes & titles, titles
+    else:
+        assert changes <= titles, titles
+    assert 'Refresh' in ' '.join(titles)
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('role', ['standby', 'active'])
+def test_runtime_esxi_and_the_add_buttons_on_a_standby(open_app, role):
+    """verify:frontend:4"""
+    app = open_app(role=role, layout='modern', clusters=[CLUSTER], resources=[VM], extra=ESXI_READS)
+    page = app.page
+    standby = role == 'standby'
+    page.get_by_text('esx01').first.wait_for(timeout=8000)
+    assert (page.locator('header button', has_text='Add Cluster').count() == 0) == standby
+    assert (page.locator('button[title="Add ESXi Server"]').count() == 0) == standby
+    assert (page.locator('button', has_text='Add Backup Server').count() == 0) == standby
+
+    page.get_by_text('esx01').first.click()
+    page.get_by_text('legacy01').first.wait_for(timeout=8000)
+    page.wait_for_timeout(300)
+    listed = _labels(page)
+    assert bool(listed & ESXI_POWER) != standby, sorted(listed & ESXI_POWER)
+    page.get_by_text('legacy01').first.click()
+    page.locator('button', has_text='Snapshots').first.wait_for(timeout=5000)
+    page.wait_for_timeout(300)
+    detail = _labels(page)
+    assert bool(detail & ESXI_POWER) != standby, sorted(detail & ESXI_POWER)
+    # the more-actions menu (rename, clone, migrate, delete) is in the page, shown on hover
+    assert (page.get_by_text('Migrate to Proxmox').count() == 0) == standby
+    page.locator('button', has_text='Snapshots').first.click()
+    page.wait_for_timeout(200)
+    assert (page.get_by_text('Create Snapshot').count() == 0) == standby
+    assert not [c for c in app.server.calls if '/power/' in c[1]]
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('role', ['standby', 'active'])
+def test_runtime_the_pbs_toolbar_edits_only_on_the_active(open_app, role):
+    """verify:frontend:4"""
+    app = open_app(role=role, layout='modern', clusters=[CLUSTER], resources=[VM],
+                   extra={('GET', '/api/pbs'): (200, [PBS])})
+    page = app.page
+    standby = role == 'standby'
+    page.get_by_text('backup01').first.wait_for(timeout=8000)
+    assert (page.locator('button[title="Add PBS"]').count() == 0) == standby
+    page.get_by_text('backup01').first.click()
+    page.locator('button', has_text='Encryption Key' if not standby else 'Refresh').first.wait_for(timeout=5000)
+    page.wait_for_timeout(300)
+    labels = _labels(page)
+    for word in ('Edit', 'Delete', 'Encryption Key', 'Auto Verify'):
+        assert (not any(label.endswith(word) for label in labels)) == standby, (word, sorted(labels))
+
+
+NODE_PATH = '/api/clusters/c1/nodes/pve1'
+NODE_READS = {('GET', NODE_PATH + sub): (200, data) for sub, data in {
+    '/summary': {'status': 'online', 'uptime': 100, 'cpu': 0.1, 'loadavg': [0, 0, 0],
+                 'memory': {'used': 1, 'total': 2}, 'rootfs': {'used': 1, 'total': 2}},
+    '/disks': [{'devpath': '/dev/sda', 'model': 'Samsung SSD', 'size': 500107862016, 'type': 'ssd',
+                'used': 'LVM', 'health': 'PASSED', 'serial': 'S1'},
+               {'devpath': '/dev/sdb', 'model': 'Spare', 'size': 500107862016, 'type': 'hdd',
+                'used': 'unused', 'health': 'PASSED', 'serial': 'S2'}],
+    '/disks/lvm': [], '/disks/lvmthin': [], '/disks/zfs': [],
+    '/disks/sda/smart': {'health': 'PASSED', 'type': 'ata', 'attributes': [
+        {'id': 5, 'name': 'Reallocated_Sector_Ct', 'value': 100, 'worst': 100, 'threshold': 10,
+         'raw': '0', 'flags': 'PO--CK'}]},
+    '/dns': {'search': 'lan', 'dns1': '1.1.1.1'}, '/hosts': {'data': '127.0.0.1 localhost'},
+    '/time': {'timezone': 'UTC', 'localtime': 0}, '/syslog': ['hello syslog'], '/certificates': [],
+    '/cluster-health': {'quorate': True, 'rings': [], 'services': []},
+    '/sensors': {'sensors': [{'chip': 'coretemp', 'label': 'Package id 0', 'type': 'temp', 'value': 42.0}]},
+}.items()}
+
+
+@pytest.mark.parametrize('role', ['standby', 'active'])
+def test_runtime_the_node_modal_reads_but_changes_nothing_on_a_standby(open_app, role):
+    """verify:frontend:8 - Refresh and SMART keep working, the changing parts stay locked."""
+    app = open_app(role=role, layout='modern', clusters=[CLUSTER], resources=[VM], metrics=NODE_METRICS,
+                   extra=NODE_READS)
+    page = app.page
+    standby = role == 'standby'
+    page.get_by_text('Testi').first.click()
+    page.locator('button[title="Node Configuration"]').first.wait_for(timeout=5000)
+    page.locator('button[title="Node Configuration"]').first.click()
+    page.get_by_text('Proxmox Node').first.wait_for(timeout=5000)
+
+    page.locator('button', has_text='Disks').last.click()
+    smart = page.locator('button[title="SMART Data"]').first
+    smart.wait_for(timeout=5000)
+    assert smart.is_enabled()
+    assert page.locator('button[title="Wipe Disk"]').first.is_disabled() == standby
+    assert page.locator('button', has_text='Create LVM').first.is_disabled() == standby
+    smart.click()
+    page.get_by_text('Reallocated_Sector_Ct').first.wait_for(timeout=5000)
+    assert ('GET', NODE_PATH + '/disks/sda/smart') in app.server.calls
+
+    page.mouse.click(5, 5)                     # the backdrop closes the SMART view
+    page.get_by_text('Reallocated_Sector_Ct').first.wait_for(state='hidden', timeout=3000)
+    page.locator('button', has_text='System').last.click()
+    page.get_by_text('hello syslog').first.wait_for(timeout=5000)
+    refresh = page.locator('button[title="Refresh"]').first
+    assert refresh.is_enabled()
+    before = app.server.calls.count(('GET', NODE_PATH + '/syslog'))
+    refresh.click()
+    deadline = time.time() + 3
+    while time.time() < deadline and app.server.calls.count(('GET', NODE_PATH + '/syslog')) == before:
+        page.wait_for_timeout(100)
+    assert app.server.calls.count(('GET', NODE_PATH + '/syslog')) == before + 1
+    page.get_by_text('hello syslog').first.wait_for(timeout=5000)
+    assert page.locator('input[value="1.1.1.1"]').first.is_disabled() == standby
+    assert not [c for c in app.server.calls if c[0] != 'GET' and c[1].startswith(NODE_PATH)]
+    assert not app.errors, app.errors
+
+
+def test_runtime_a_retry_that_fails_the_same_way_still_shows(open_app):
+    """verify:frontend:7 - on an active: the second identical error replaces the first toast
+    and outlives the first one's timer."""
+    err = {'error': 'VM 100 is locked (backup)'}
+    reboot = ('POST', '/api/clusters/c1/vms/pve1/qemu/100/reboot')
+    app = open_app(role='active', layout='modern', clusters=[CLUSTER], resources=[VM], extra={reboot: (500, err)})
+    page = app.page
+    page.on('dialog', lambda d: d.accept())
+    _open_resources(app)
+    page.locator('button[title="Reboot"]').first.click()
+    deadline = time.time() + 5
+    while time.time() < deadline and not any(err['error'] in x for x in _toasts(page)):
+        page.wait_for_timeout(10)
+    t0 = time.time()
+    page.wait_for_timeout(2800)
+    page.locator('button[title="Reboot"]').first.click()
+    page.wait_for_timeout(max(0, int((t0 + 5.4 - time.time()) * 1000)))
+    assert app.server.calls.count(reboot) == 2
+    assert [x for x in _toasts(page) if err['error'] in x], 'the retry lost its error'
+    assert not app.errors, app.errors
+
+
+SNAP = {'cluster_id': 'c1', 'node': 'pve1', 'vm_type': 'qemu', 'vmid': 100, 'vm_name': 'web01',
+        'snapshot_name': 'before-upgrade', 'snapshot_date': '2026-09-01 10:00', 'age': '29 days'}
+
+
+def _open_snapshot_overview(app):
+    page = app.page
+    page.on('dialog', lambda d: d.accept())
+    _open_resources(app)
+    page.locator('button', has_text='Snapshot Overview').first.click()
+    page.get_by_text('before-upgrade').first.wait_for(timeout=5000)
+    page.wait_for_timeout(300)
+
+
+def test_runtime_the_snapshot_overview_lists_but_deletes_nothing_on_a_standby(open_app):
+    """verify:frontend:1"""
+    app = open_app(role='standby', layout='modern', clusters=[CLUSTER], resources=[VM],
+                   extra={('POST', '/api/snapshots/overview'): (200, {'snapshots': [SNAP]})})
+    _open_snapshot_overview(app)
+    page = app.page
+    assert page.locator('button[title="Delete snapshot"]').count() == 0
+    assert page.locator('table input[type="checkbox"]').count() == 0
+    assert ('POST', '/api/snapshots/delete') not in app.server.calls
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('bulk', [False, True])
+def test_runtime_a_refused_snapshot_delete_says_so(open_app, bulk):
+    """verify:frontend:1 - on an active the handlers read the answer: no 'deleted' after a
+    failure, the server's reason instead."""
+    reason = 'Failed to delete before-upgrade: snapshot is locked'
+    app = open_app(role='active', layout='modern', clusters=[CLUSTER], resources=[VM],
+                   extra={('POST', '/api/snapshots/overview'): (200, {'snapshots': [SNAP]}),
+                          ('POST', '/api/snapshots/delete'): (500, {'success': False, 'error': 'No snapshots deleted',
+                                                                    'errors': [reason]})})
+    _open_snapshot_overview(app)
+    page = app.page
+    if bulk:
+        page.locator('tbody input[type="checkbox"]').first.check()
+        page.locator('button', has_text='deleteSelected').first.click()   # the key has no text yet (pre-existing)
+    else:
+        page.locator('button[title="Delete snapshot"]').first.click(force=True)
+    page.get_by_text(reason).first.wait_for(timeout=5000)
+    toasts = _toasts(page)
+    assert not [x for x in toasts if 'deleted' in x], toasts
+    assert app.server.calls.count(('POST', '/api/snapshots/delete')) == 1
+    if bulk:   # the selection stays for a retry
+        assert page.locator('tbody input[type="checkbox"]').first.is_checked()
+    assert not app.errors, app.errors
+
+
+def test_runtime_a_failed_shutdown_shows_the_guest_running_again(open_app):
+    """verify:frontend:9 - the refetch finds nothing changed and skips the repaint; the
+    handler puts the status back itself."""
+    app = open_app(role='active', layout='modern', clusters=[CLUSTER], resources=[VM],
+                   extra={('POST', '/api/clusters/c1/vms/pve1/qemu/100/shutdown'):
+                          (500, {'error': 'VM 100 is locked (backup)'})})
+    page = app.page
+    page.on('dialog', lambda d: d.accept())
+    _open_resources(app)
+    page.locator('button[title="Shutdown"]').first.click()
+    page.get_by_text('VM 100 is locked (backup)').first.wait_for(timeout=5000)
+    page.locator('button[title="Shutdown"]').first.wait_for(timeout=2500)
+    assert page.locator('button[title="Start"]').count() == 0
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('role', ['standby', 'active'])
+def test_runtime_site_recovery_and_evpn_follow_the_flag(open_app, role):
+    """verify:frontend:3 - with the permission list the real /auth/check sends an admin."""
+    from pegaprox.utils.rbac import get_user_permissions
+    perms = sorted(get_user_permissions({'username': 'admin', 'role': 'admin'}))
+    remote = dict(CLUSTER, id='c2', name='Remote', display_name='Remote', host='10.0.0.2')
+    plan = {'id': 'p1', 'name': 'DR-Plan-One', 'source_cluster': 'c1', 'target_cluster': 'c2', 'status': 'ready',
+            'vms': [{'id': 'v1', 'vmid': 100, 'vm_name': 'web01', 'boot_group': 0, 'boot_delay': 30,
+                     'vm_type': 'qemu'}], 'network_mappings': {}, 'storage_mappings': {}, 'auto_failover': False}
+    vnet = {'id': 'n1', 'name': 'evpn10', 'alias': '', 'zone': 'z1', 'vni': 10010, 'asn': 65000,
+            'controller': 'ctl', 'status': 'applied', 'member_clusters': ['c1', 'c2'],
+            'per_cluster_status': {'c1': {'status': 'applied'}, 'c2': {'status': 'applied'}}}
+    app = open_app(role=role, layout='modern', clusters=[CLUSTER, remote], resources=[VM], permissions=perms,
+                   extra={('GET', '/api/site-recovery/plans'): (200, [plan]),
+                          ('GET', '/api/site-recovery/plans/p1'): (200, plan),
+                          ('GET', '/api/site-recovery/plans/p1/events'): (200, []),
+                          ('GET', '/api/cross-cluster-replications'): (200, []),
+                          ('GET', '/api/multi-sdn/vnets'): (200, [vnet]),
+                          ('GET', '/api/settings/server'): (200, {'multi_sdn_drift_reconcile': False})})
+    page = app.page
+    standby = role == 'standby'
+    page.get_by_text('Testi').first.click()
+    page.locator('button', has_text='Site Recovery').first.click()
+    page.get_by_text('DR-Plan-One').first.wait_for(timeout=5000)
+    page.wait_for_timeout(300)
+    assert ('Create Plan' not in _labels(page)) == standby
+    page.get_by_text('DR-Plan-One').first.click()
+    page.wait_for_timeout(800)
+    acting = {'Readiness Check', 'DR Drill', 'Test Failover', 'Planned Failover', 'Emergency Failover'}
+    if not standby:
+        page.get_by_text('Planned Failover').first.wait_for(timeout=5000)
+    assert (not acting & _labels(page)) == standby, sorted(acting & _labels(page))
+
+    page.locator('button', has_text='Multi-Cluster EVPN').first.click()
+    page.get_by_text('evpn10').first.wait_for(timeout=5000)
+    page.get_by_text('evpn10').first.click()
+    page.wait_for_timeout(400)
+    evpn = {'Create EVPN vNet', 'Scan for drift', 'Re-apply / retry', 'Reconcile drift', 'Forget record',
+            'Delete + purge from clusters'}
+    assert (not evpn & _labels(page)) == standby, sorted(evpn & _labels(page))
+    assert not [c for c in app.server.calls if c[0] != 'GET' and ('site-recovery' in c[1] or 'multi-sdn' in c[1])]
+    assert not app.errors, app.errors
+
+
+VM_CONFIG = {'general': {'name': 'web01', 'description': '', 'tags': ''},
+             'hardware': {'cores': 2, 'sockets': 1, 'cpu': 'host', 'memory': '4096', 'balloon': 0,
+                          'bios': 'seabios', 'scsihw': 'virtio-scsi-single'},
+             'disks': [{'id': 'scsi0', 'value': 'local-lvm:vm-100-disk-0,size=32G', 'storage': 'local-lvm',
+                        'size': '32G', 'volume': 'vm-100-disk-0'}],
+             'networks': [{'id': 'net0', 'value': 'virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0', 'bridge': 'vmbr0',
+                           'model': 'virtio', 'macaddr': 'AA:BB:CC:DD:EE:FF'}],
+             'options': {'onboot': 0, 'boot': 'order=scsi0', 'ostype': 'l26', 'agent': '0'},
+             'unused_disks': [], 'raw': {'name': 'web01', 'digest': 'x'}, 'status': {'status': 'running'},
+             'vmid': 100, 'node': 'pve1', 'type': 'qemu', 'lock': {'locked': False}}
+
+
+@pytest.mark.parametrize('role', ['standby', 'active'])
+def test_runtime_the_vm_configuration_changes_nothing_on_a_standby(open_app, role):
+    """verify:frontend:6"""
+    app = open_app(role=role, layout='modern', clusters=[CLUSTER], resources=[VM],
+                   extra={('GET', '/api/clusters/c1/vms/pve1/qemu/100/config'): (200, VM_CONFIG)})
+    page = app.page
+    standby = role == 'standby'
+    _open_resources(app)
+    page.locator('button[title="Configuration"]').first.click()
+    name = page.locator('input[value="web01"]').first
+    name.wait_for(timeout=8000)
+    assert name.is_disabled() == standby
+    assert (page.locator('fieldset[data-ha-locked]').count() == 1) == standby
+    assert (page.locator('button', has_text='Save').count() == 0) == standby
+    # History only reads, it stays usable
+    page.locator('button', has_text='History').first.click()
+    page.wait_for_timeout(300)
+    assert page.locator('fieldset[data-ha-locked]').count() == 0
+    assert not [c for c in app.server.calls if c[0] != 'GET' and '/qemu/100/' in c[1]]
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('role', ['standby', 'active'])
+def test_runtime_the_settings_tab_checks_for_updates_only_on_the_active(open_app, role):
+    """verify:frontend:2"""
+    app = open_app(role=role, layout='modern', clusters=[CLUSTER], resources=[VM], extra=SSE_TOKEN)
+    page = app.page
+    page.get_by_text('Testi').first.click()
+    page.wait_for_timeout(800)
+    page.locator('button', has_text='Settings').last.click()
+    check = ('POST', '/api/clusters/c1/updates/check')
+    posted = _wait_for_call(app, check, 3)
+    assert posted != (role == 'standby')
+    assert not [x for x in _toasts(page) if 'standby' in x.lower()]
+    assert not app.errors, app.errors
+
+
+def test_runtime_closing_an_esxi_vm_on_a_standby_says_nothing(open_app):
+    """verify:frontend:0 - the unwatch a standby refuses stays quiet."""
+    app = open_app(role='standby', layout='modern', clusters=[CLUSTER], resources=[VM],
+                   extra={**ESXI_READS, **SSE_TOKEN})
+    page = app.page
+    page.get_by_text('esx01').first.wait_for(timeout=8000)
+    page.get_by_text('esx01').first.click()
+    page.get_by_text('legacy01').first.wait_for(timeout=8000)
+    page.get_by_text('legacy01').first.click()
+    page.locator('button', has_text='Snapshots').first.wait_for(timeout=5000)
+    assert ('POST', '/api/vmware/v1/vms/vm-1/watch') in app.server.calls
+    page.get_by_text('esx01').first.click()      # back to the list: the view closes
+    assert _wait_for_call(app, ('DELETE', '/api/vmware/v1/vms/vm-1/watch'))
+    page.wait_for_timeout(500)
+    assert not _toasts(page), _toasts(page)
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('role', ['standby', 'active'])
+def test_runtime_compliance_stays_on_a_standby(open_app, role):
+    app = open_app(role=role, layout='modern', clusters=[CLUSTER], resources=[VM])
+    page = app.page
+    page.get_by_text('Testi').first.click()
+    page.locator('button', has_text='Resources').first.wait_for(timeout=5000)
+    assert page.locator('button', has_text='Compliance').count() >= 1
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('role', ['standby', 'active'])
+def test_runtime_automation_changes_nothing_on_a_standby(open_app, role):
+    schedule = {'id': 's1', 'cluster_id': 'c1', 'name': 'nightly', 'vmid': 100, 'vm_type': 'qemu',
+                'action': 'snapshot', 'schedule_type': 'daily', 'time': '02:00', 'enabled': True}
+    app = open_app(role=role, layout='modern', clusters=[CLUSTER], resources=[VM],
+                   extra={('GET', '/api/schedules'): (200, [schedule]),
+                          ('GET', '/api/clusters/c1/scripts'): (200, [])})
+    page = app.page
+    standby = role == 'standby'
+    page.get_by_text('Testi').first.click()
+    page.locator('button', has_text='Automation').first.click()
+    page.get_by_text('nightly').first.wait_for(timeout=5000)
+    page.wait_for_timeout(200)
+    assert (page.locator('button', has_text='New Schedule').count() == 0) == standby
+    assert (page.locator('button[title="Edit"]').count() == 0) == standby
+    row = page.locator('tr', has_text='nightly').first
+    assert row.locator('button').first.is_disabled() == standby      # the switch still shows the state
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('role', ['standby', 'active'])
+def test_runtime_cloud_backups_change_nothing_on_a_standby(open_app, role):
+    job = {'id': 'backup-1', 'enabled': 1, 'schedule': 'daily', 'storage': 'local', 'mode': 'snapshot',
+           'vmid': '100', 'node': 'pve1'}
+    app = open_app(role=role, layout='cloud', clusters=[CLUSTER], resources=[VM],
+                   extra={('GET', '/api/clusters/c1/datacenter/backup'): (200, [job])})
+    page = app.page
+    standby = role == 'standby'
+    page.locator('.cloud-shell').get_by_text('Backups', exact=True).first.click()
+    page.locator('.cloud-table-row', has_text='daily').first.wait_for(timeout=5000)
+    page.wait_for_timeout(200)
+    labels = _labels(page)
+    for word in ('Run now', 'Delete'):
+        assert (word not in labels) == standby, (word, sorted(labels))
+    assert 'Refresh' in ' '.join(labels)
+    assert not app.errors, app.errors

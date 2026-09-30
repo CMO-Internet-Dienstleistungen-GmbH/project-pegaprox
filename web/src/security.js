@@ -2071,10 +2071,11 @@
         // update Manager Section Component (for Settings tab)
         function UpdateManagerSection({ clusterId, addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, isAdmin, user } = useAuth();
+            const { getAuthHeaders, isAdmin, user, haReadOnly } = useAuth();
             // #644-class: gate the update-manager controls on the backend perms they
             // actually call (backup.schedule / node.update), not a blanket isAdmin.
-            const hasPerm = (p) => isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes(p));
+            // Nothing here is a reading permission, so a standby (#625) shows none of them.
+            const hasPerm = (p) => (!haReadOnly || haReadPermission(p)) && (isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes(p)));
             const { isCorporate } = useLayout();
             const [loading, setLoading] = useState(false);
             const [checking, setChecking] = useState(false);
@@ -2273,7 +2274,7 @@
                             addToast(t('noUpdatesAvailable'), 'success');
                         }
                     } else {
-                        addToast(json.error || 'Error checking updates', 'error');
+                        addToast(json.code === 'HA_STANDBY' ? t('pgHaStandbyRefused') : (json.error || 'Error checking updates'), 'error');
                     }
                 } catch (err) {
                     console.error('Update check error:', err);
@@ -2481,7 +2482,9 @@
                 // Check rolling update status
                 getRollingStatus();
                 
-                // Load cached status from localStorage
+                // Load cached status from localStorage. A standby shows what this browser
+                // checked before but starts no check itself: the check runs apt-update over
+                // SSH on every node, which is the active's job (#625)
                 const cached = localStorage.getItem(`updateCheck_${clusterId}`);
                 if (cached) {
                     try {
@@ -2493,13 +2496,13 @@
                         // Check if cache is older than 24 hours
                         const lastCheck = new Date(data.time);
                         const hoursSince = (Date.now() - lastCheck.getTime()) / (1000 * 60 * 60);
-                        if (hoursSince > 24) {
+                        if (hoursSince > 24 && !haReadOnly) {
                             checkUpdates();
                         }
                     } catch (e) {
-                        checkUpdates();
+                        if (!haReadOnly) checkUpdates();
                     }
-                } else {
+                } else if (!haReadOnly) {
                     // No cache - do initial check
                     checkUpdates();
                 }
@@ -2513,6 +2516,7 @@
 
             // #183: auto-refresh update counts when rolling update finishes
             useEffect(() => {
+                if (haReadOnly) return;
                 if (rollingUpdate && ['completed', 'failed', 'cancelled'].includes(rollingUpdate.status)) {
                     localStorage.removeItem(`updateCheck_${clusterId}`);
                     checkUpdates();
@@ -2589,7 +2593,7 @@
                         <div className="border-t border-proxmox-border p-4 space-y-4">
                             {/* Actions */}
                             <div className="flex items-center gap-3">
-                                <button
+                                {!haReadOnly && <button
                                     onClick={(e) => { e.stopPropagation(); checkUpdates(true); }}
                                     disabled={checking}
                                     className="px-4 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-sm hover:border-proxmox-orange transition-colors flex items-center gap-2 disabled:opacity-50"
@@ -2600,7 +2604,7 @@
                                         <Icons.RefreshCw />
                                     )}
                                     {t('checkForUpdates')}
-                                </button>
+                                </button>}
                                 
                                 {/* MK: Schedule button */}
                                 {hasPerm('backup.schedule') && (
