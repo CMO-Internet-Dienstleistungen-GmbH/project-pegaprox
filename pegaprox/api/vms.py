@@ -42,6 +42,8 @@ def _require_vm_access(cluster_id, vmid, perm, vm_type=None):
 from pegaprox.utils.realtime import broadcast_sse, broadcast_action, push_immediate_update
 from pegaprox.core.config import save_config
 from pegaprox.api.helpers import get_connected_manager, check_cluster_access, register_task_user, safe_error, parse_pve_error, scope_vm_rows, require_unconfined, caller_is_scoped
+from pegaprox.api.ha import standby_console_refusal, STANDBY_CONSOLE_ERROR
+from pegaprox.core import ha
 from pegaprox.utils.ssh import get_paramiko
 from pegaprox.utils.sanitization import sanitize_int, validate_snapshot_name
 from urllib.parse import urlencode, quote as url_quote
@@ -3840,6 +3842,10 @@ def _datacenter_keymap(cluster_id, manager):
 @require_auth()
 def get_console_ticket(cluster_id, node, vm_type, vmid):
     """Get VNC console ticket for VM - NS: Now uses VM ACLs"""
+    # #625 - the vncproxy call below starts a console on the node
+    refused = standby_console_refusal()
+    if refused:
+        return refused
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
 
@@ -3902,6 +3908,11 @@ def get_spice_console(cluster_id, node, vm_type, vmid):
     own web UI): opens in remote-viewer, full SPICE (audio / USB / multi-monitor).
     Same authz as the VNC console (vm.console + per-VM ACL). remote-viewer tunnels the
     SPICE stream through the PVE host's pveproxy, so it works behind a single public IP."""
+    # #625 - once the .vv file is out, remote-viewer talks to the node and PegaProx is
+    # not in the path any more, so this route is the only place to say no
+    refused = standby_console_refusal()
+    if refused:
+        return refused
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
@@ -4076,6 +4087,10 @@ def _screenshot_via_rfb(mgr, node, vm_type, vmid, max_width=480, timeout=10):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/screenshot', methods=['GET'])
 @require_auth()
 def get_vm_screenshot(cluster_id, node, vm_type, vmid):
+    # #625 - a screendump runs qm monitor on the node, the fallback opens a vncproxy
+    refused = standby_console_refusal()
+    if refused:
+        return refused
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
     if cluster_id not in cluster_managers:
@@ -5931,7 +5946,9 @@ def get_efficient_snapshots_api(cluster_id, node, vm_type, vmid):
         return jsonify({'error': 'Permission denied: vm.snapshot'}), 403
 
     mgr = cluster_managers[cluster_id]
-    refresh = request.args.get('refresh', 'false').lower() == 'true'
+    # #625 - a refresh measures the COW volumes over SSH, extends one that runs full and
+    # writes the result into a synced table. A standby shows what the active recorded.
+    refresh = request.args.get('refresh', 'false').lower() == 'true' and not ha.is_standby()
     snapshots = mgr.get_efficient_snapshots(cluster_id, vmid, refresh_usage=refresh)
     return jsonify(snapshots)
 
@@ -8291,6 +8308,14 @@ def handle_vnc_websocket(ws, cluster_id, node, vm_type, vmid):
     print(f"VNC WEBSOCKET: {vm_type}/{vmid} on {node}")
     print(f"{'='*60}")
     
+    # #625 - keyboard and mouse on a guest are the active's to hand out
+    if ha.is_standby():
+        try:
+            ws.close(1008, STANDBY_CONSOLE_ERROR)
+        except Exception:
+            pass
+        return
+
     if cluster_id not in cluster_managers:
         print(f"ERROR: Cluster {cluster_id} not found")
         return
@@ -8587,6 +8612,12 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
         print(f"\n{'='*60}")
         print(f"VNC WebSocket connected: {path}")
         print(f"{'='*60}")
+
+        # #625 - the console port runs on a standby too; the answer there is no, before
+        # a token is spent or a stable-mode key is claimed
+        if ha.is_standby():
+            await websocket.close(1008, STANDBY_CONSOLE_ERROR)
+            return
         
         # NS: Mar 2026 - authenticate via single-use WS token (not session in URL)
         from urllib.parse import urlparse, parse_qs
@@ -9230,6 +9261,15 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
     print(f"VNC WEBSOCKET: {vm_type}/{vmid} on {node}")
     print(f"{'='*60}")
     
+    # #625 - see handle_vnc_websocket
+    if ha.is_standby():
+        try:
+            ws.send(STANDBY_CONSOLE_ERROR)
+            ws.close(reason=1008, message=STANDBY_CONSOLE_ERROR)
+        except Exception:
+            pass
+        return
+
     # NS: Mar 2026 - prefer WS token, session as legacy fallback
     from pegaprox.utils.realtime import validate_ws_token
     ws_token = request.args.get('token')
@@ -9636,6 +9676,24 @@ import threading
 # (mirrors the main app's _persist_lock, which this standalone can't import).
 _KH_WRITE_LOCK = threading.Lock()
 
+
+async def _refused_as_standby(ws, resp):
+    """#625 - on a standby the main app answers 409 HA_STANDBY to the validate and
+    cluster-creds calls. Hand its sentence to the browser instead of calling it a bad
+    session. True when it did and the socket is closed."""
+    if resp is None or resp.status_code != 409:
+        return False
+    try:
+        body = resp.json() or {}
+    except Exception:
+        return False
+    if body.get('code') != 'HA_STANDBY':
+        return False
+    await ws.send(json.dumps({'status': 'error', 'message': body.get('error') or 'Consoles are only available on the active instance.'}))
+    await ws.close(1008, "standby")
+    return True
+
+
 async def ssh_handler(websocket):
     """SSH WebSocket handler with user credential prompt and SSH key support
     
@@ -9712,6 +9770,8 @@ async def ssh_handler(websocket):
         # cert-read access already has more direct attack paths. MK 2026-06-04.
         r = requests.get(validate_url, cookies=cookies, headers=headers, timeout=8, verify=False)
 
+        if await _refused_as_standby(websocket, r):
+            return
         if r.status_code == 403:
             print(f"Auth failed: 403 (no access to cluster {cluster_id})")
             await websocket.send(json.dumps({'status': 'error', 'message': f'No access to cluster {cluster_id}'}))
@@ -9742,6 +9802,8 @@ async def ssh_handler(websocket):
                 # nosec B501 — same-host PegaProx self-signed cert, see MK 2026-06-04 audit
                 rc = requests.get(f"{PEGAPROX_URL}/api/internal/cluster-creds/{cluster_id}",
                                   cookies={'session': session_id}, timeout=10, verify=False)
+                if await _refused_as_standby(websocket, rc):
+                    return
                 if rc.status_code == 200:
                     creds = rc.json()
                     cluster_host = creds.get('host')
@@ -10022,6 +10084,8 @@ async def termproxy_handler(client_ws, query, m_term, ws_token, session_id):
         # own self-signed cert. Same-host trust boundary; attacker with local
         # cert-read access already has more direct attack paths. MK 2026-06-04.
         r = requests.get(validate_url, cookies=cookies, headers=headers, timeout=8, verify=False)
+        if await _refused_as_standby(client_ws, r):
+            return
         if r.status_code == 403:
             await client_ws.send(json.dumps({'status': 'error', 'message': f'No access to cluster {cluster_id}'}))
             await client_ws.close(1008, "Forbidden")
@@ -10086,6 +10150,8 @@ async def termproxy_handler(client_ws, query, m_term, ws_token, session_id):
         try:
             cr = requests.get(f"{PEGAPROX_URL}/api/internal/cluster-creds/{cluster_id}",
                               cookies={'session': session_id}, timeout=10, verify=False)  # nosec B501 — localhost-to-PegaProx self-signed cert; same-host trust boundary, see MK 2026-06-04 audit
+            if await _refused_as_standby(client_ws, cr):
+                return
             if cr.status_code == 200:
                 cr_data = cr.json() or {}
                 if cr_data.get('host'):
@@ -10393,6 +10459,14 @@ if __name__ == '__main__':
 @sock.route('/api/clusters/<cluster_id>/nodes/<node>/shellws')
 def node_shell_websocket_proxy(ws, cluster_id, node):
     """WebSocket proxy for node shell via SSH"""
+
+    # #625 - a root shell on a hypervisor node is the active's alone
+    if ha.is_standby():
+        try:
+            ws.send(json.dumps({'status': 'error', 'message': STANDBY_CONSOLE_ERROR}))
+        except Exception:
+            pass
+        return
 
     # NS Feb 2026: Authentication + authorization (was missing entirely - critical security fix)
     session_id = request.args.get('session')

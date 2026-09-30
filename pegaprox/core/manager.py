@@ -462,71 +462,7 @@ class PegaProxManager:
         self.ha_recovery_in_progress = {}
         
         # load saved HA settings
-        saved_ha = getattr(config, 'ha_settings', {}) or {}
-        
-        self.ha_failure_threshold = saved_ha.get('failure_threshold', 3)
-        
-        # split-brain stuff (complicated, dont touch) - NS
-        self.ha_config = {
-            'quorum_enabled': saved_ha.get('quorum_enabled', True),
-            'quorum_hosts': saved_ha.get('quorum_hosts', []),
-            'quorum_gateway': saved_ha.get('quorum_gateway', ''),
-            'quorum_required_votes': saved_ha.get('quorum_required_votes', 2),
-            
-            # self-fencing
-            'self_fence_enabled': saved_ha.get('self_fence_enabled', True),
-            'watchdog_enabled': saved_ha.get('watchdog_enabled', False),
-            
-            # network checks
-            'verify_network_before_recovery': saved_ha.get('verify_network', True),
-            'network_check_hosts': saved_ha.get('network_check_hosts', []),
-            'network_check_required': saved_ha.get('network_check_required', 1),
-            
-            # storage fencing
-            'storage_fence_enabled': saved_ha.get('storage_fence_enabled', False),
-            
-            # storage heartbeat - safest for 2-node clusters
-            # NS: spent forever getting this to work right
-            'storage_heartbeat_enabled': saved_ha.get('storage_heartbeat_enabled', False),
-            'storage_heartbeat_path': saved_ha.get('storage_heartbeat_path', ''),
-            'storage_heartbeat_interval': saved_ha.get('storage_heartbeat_interval', 5),
-            'storage_heartbeat_timeout': saved_ha.get('storage_heartbeat_timeout', 30),
-            'poison_pill_enabled': saved_ha.get('poison_pill_enabled', True),
-            
-            # ═══════════════════════════════════════════════════════════════
-            # DUAL-NETWORK PROTECTION - NS Jan 2026
-            # For setups with separate Server and Storage networks!
-            # Auto-installs a small agent on each node that communicates
-            # via the storage network (survives server network failures)
-            # ═══════════════════════════════════════════════════════════════
-            'dual_network_mode': saved_ha.get('dual_network_mode', False),
-            'node_agent_installed': saved_ha.get('node_agent_installed', {}),  # node -> True/False
-            'self_fence_installed': saved_ha.get('self_fence_installed', False),  # MK: was missing, status got lost on restart
-            'self_fence_nodes': saved_ha.get('self_fence_nodes', []),  # NS: list of nodes with agent installed
-            
-            # Timing - defaults tuned for 3-node ceph setups (most common in the field)
-            # for 2-node with shared storage, recovery_delay should be higher (45-60)
-            # because the surviving node needs time to import the pool locks
-            'recovery_delay': saved_ha.get('recovery_delay', 30),  # seconds before recovery starts
-            'node_timeout': saved_ha.get('node_timeout', 60),  # node must be dead this long
-            'ssh_connect_timeout': saved_ha.get('ssh_connect_timeout', 10),  # ssh timeout per node
-            
-            # ═══════════════════════════════════════════════════════════════
-            # 2-NODE CLUSTER MODE - Automatic quorum handling
-            # Uses cluster credentials (same as Proxmox API login) for SSH
-            # ═══════════════════════════════════════════════════════════════
-            'two_node_mode': saved_ha.get('two_node_mode', False),
-            'force_quorum_on_failure': saved_ha.get('force_quorum_on_failure', False),
-            
-            # ═══════════════════════════════════════════════════════════════
-            # STRICT MODE - Maximum safety, may cause false positives
-            # ═══════════════════════════════════════════════════════════════
-            'strict_fencing': saved_ha.get('strict_fencing', False),  # Require successful fencing before recovery
-            'require_storage_heartbeat_confirm': saved_ha.get('require_storage_heartbeat_confirm', False),  # Must confirm via storage
-            
-            # Node IPs (auto-discovered but can be overridden)
-            'node_ips': saved_ha.get('node_ips', {}),  # node_name -> ip
-        }
+        self._apply_ha_settings(getattr(config, 'ha_settings', {}) or {})
         
         # Storage heartbeat tracking
         self.ha_heartbeat_thread = None
@@ -1359,7 +1295,9 @@ class PegaProxManager:
 
                             # MK: auto-create API token so 2FA won't lock us out later (#110)
                             # Never from a standby: that would mint a token on the cluster and
-                            # write it into a clusters row the next sync overwrites.
+                            # write it into a synced clusters row, where it stays - the standby
+                            # polls with If-None-Match, so no sync replaces the row until the
+                            # active changes something itself.
                             if not self.config.api_token_user and ha.is_active():
                                 self._try_create_api_token(session, host)
 
@@ -1446,6 +1384,9 @@ class PegaProxManager:
     def _try_create_api_token(self, session, host):
         """Auto-create a PVE API token so REST auth survives 2FA being enabled later.
         SSH keeps using the password regardless. - MK Mar 2026 (#110)"""
+        # the caller asks too; this one holds for any other caller (#625)
+        if not ha.is_active():
+            return
         try:
             user = self.config.user  # e.g. root@pam
             import random, string
@@ -4279,9 +4220,87 @@ class PegaProxManager:
         except Exception as e:
             self.logger.debug(f"[HA] Error updating fallback hosts: {e}")
     
+    def _apply_ha_settings(self, saved_ha):
+        """ha_failure_threshold and ha_config from a cluster's stored ha_settings.
+
+        __init__ builds them here. On a PegaProx standby ha._refresh_managers calls it
+        again after a sync (#625): the HA monitor never runs there, so these are only
+        what the HA page shows. Keys the running process put into ha_config itself
+        and the stored settings do not carry (fence_strategy, scsi_keys, node_ips)
+        stay as they are."""
+        previous = getattr(self, 'ha_config', None) or {}
+        self.ha_failure_threshold = saved_ha.get('failure_threshold', 3)
+        
+        # split-brain stuff (complicated, dont touch) - NS
+        ha_config = {
+            'quorum_enabled': saved_ha.get('quorum_enabled', True),
+            'quorum_hosts': saved_ha.get('quorum_hosts', []),
+            'quorum_gateway': saved_ha.get('quorum_gateway', ''),
+            'quorum_required_votes': saved_ha.get('quorum_required_votes', 2),
+            
+            # self-fencing
+            'self_fence_enabled': saved_ha.get('self_fence_enabled', True),
+            'watchdog_enabled': saved_ha.get('watchdog_enabled', False),
+            
+            # network checks
+            'verify_network_before_recovery': saved_ha.get('verify_network', True),
+            'network_check_hosts': saved_ha.get('network_check_hosts', []),
+            'network_check_required': saved_ha.get('network_check_required', 1),
+            
+            # storage fencing
+            'storage_fence_enabled': saved_ha.get('storage_fence_enabled', False),
+            
+            # storage heartbeat - safest for 2-node clusters
+            # NS: spent forever getting this to work right
+            'storage_heartbeat_enabled': saved_ha.get('storage_heartbeat_enabled', False),
+            'storage_heartbeat_path': saved_ha.get('storage_heartbeat_path', ''),
+            'storage_heartbeat_interval': saved_ha.get('storage_heartbeat_interval', 5),
+            'storage_heartbeat_timeout': saved_ha.get('storage_heartbeat_timeout', 30),
+            'poison_pill_enabled': saved_ha.get('poison_pill_enabled', True),
+            
+            # ═══════════════════════════════════════════════════════════════
+            # DUAL-NETWORK PROTECTION - NS Jan 2026
+            # For setups with separate Server and Storage networks!
+            # Auto-installs a small agent on each node that communicates
+            # via the storage network (survives server network failures)
+            # ═══════════════════════════════════════════════════════════════
+            'dual_network_mode': saved_ha.get('dual_network_mode', False),
+            'node_agent_installed': saved_ha.get('node_agent_installed', {}),  # node -> True/False
+            'self_fence_installed': saved_ha.get('self_fence_installed', False),  # MK: was missing, status got lost on restart
+            'self_fence_nodes': saved_ha.get('self_fence_nodes', []),  # NS: list of nodes with agent installed
+            
+            # Timing - defaults tuned for 3-node ceph setups (most common in the field)
+            # for 2-node with shared storage, recovery_delay should be higher (45-60)
+            # because the surviving node needs time to import the pool locks
+            'recovery_delay': saved_ha.get('recovery_delay', 30),  # seconds before recovery starts
+            'node_timeout': saved_ha.get('node_timeout', 60),  # node must be dead this long
+            'ssh_connect_timeout': saved_ha.get('ssh_connect_timeout', 10),  # ssh timeout per node
+            
+            # ═══════════════════════════════════════════════════════════════
+            # 2-NODE CLUSTER MODE - Automatic quorum handling
+            # Uses cluster credentials (same as Proxmox API login) for SSH
+            # ═══════════════════════════════════════════════════════════════
+            'two_node_mode': saved_ha.get('two_node_mode', False),
+            'force_quorum_on_failure': saved_ha.get('force_quorum_on_failure', False),
+            
+            # ═══════════════════════════════════════════════════════════════
+            # STRICT MODE - Maximum safety, may cause false positives
+            # ═══════════════════════════════════════════════════════════════
+            'strict_fencing': saved_ha.get('strict_fencing', False),  # Require successful fencing before recovery
+            'require_storage_heartbeat_confirm': saved_ha.get('require_storage_heartbeat_confirm', False),  # Must confirm via storage
+            
+            # Node IPs (auto-discovered but can be overridden)
+            'node_ips': saved_ha.get('node_ips', {}),  # node_name -> ip
+        }
+        for key, value in previous.items():
+            if key not in ha_config or (key == 'node_ips' and key not in saved_ha):
+                ha_config[key] = value
+        self.ha_config = ha_config
+
     def start_ha_monitor(self):
-        # a PegaProx standby never runs the failover monitor, whoever asks for it.
-        # Managers do not start there at all; this is the second lock on that door.
+        # a PegaProx standby never runs the failover monitor, whoever asks for it. Its
+        # managers do start with the live view (#625 v2) and call this from start()
+        # when the synced row says ha_enabled, so this is the lock on that door.
         if not ha.is_active():
             self.logger.info("HA monitor not started - this PegaProx instance is a standby")
             return
@@ -4371,6 +4390,11 @@ class PegaProxManager:
             threading.Thread(target=self._ha_start_self_fence_agents, daemon=True).start()
     
     def stop_ha_monitor(self):
+        # MK Sep 2026 (#625) - self_fence_installed comes from the synced clusters row, so
+        # on a PegaProx standby (or wherever the monitor never ran) it describes agents the
+        # other instance runs. Stopping them there switches off its split-brain protection.
+        # Only the instance that started the monitor, and only while it acts, stops them.
+        started_here = self.ha_thread is not None
         self.ha_enabled = False
         self.config.ha_enabled = False
         
@@ -4382,8 +4406,12 @@ class PegaProxManager:
         
         # Stop self-fence agents on nodes (but don't uninstall) - NS Jan 2026
         if self.ha_config.get('self_fence_installed'):
-            self.logger.info("[HA] Stopping self-fence agents on nodes...")
-            threading.Thread(target=self._ha_stop_self_fence_agents, daemon=True).start()
+            if ha.is_active() and started_here:
+                self.logger.info("[HA] Stopping self-fence agents on nodes...")
+                threading.Thread(target=self._ha_stop_self_fence_agents, daemon=True).start()
+            else:
+                self.logger.info("[HA] Self-fence agents left running - the HA monitor did not "
+                                 "run on this PegaProx instance")
         
         self.logger.info("[HA] High Availability monitor stopped")
     
@@ -4393,6 +4421,10 @@ class PegaProxManager:
         update_counter = 0
         
         while self.ha_enabled and not self.stop_event.is_set():
+            # stepped down to standby (#625): nothing more from here, the restart follows
+            if not ha.is_active():
+                self.logger.warning("[HA] HA monitor ends - this PegaProx instance is a standby now")
+                break
             try:
                 self._ha_check_nodes()
                 
@@ -4531,6 +4563,14 @@ class PegaProxManager:
         recovery_thread.start()
     
     def _ha_recovery_worker(self, failed_node: str):
+        # MK Sep 2026 (#625) - a PegaProx standby recovers nothing. Asked here and again
+        # before each step that changes something: an instance that steps down while a
+        # recovery waits out its delay stops at the next step, instead of racing the new
+        # active until the restart replaces the process.
+        if not ha.is_active():
+            self.logger.warning(f"[HA] Not recovering {failed_node} - this PegaProx instance is a standby")
+            self.ha_recovery_in_progress.pop(failed_node, None)
+            return
         
         try:
             # ============================================
@@ -4555,6 +4595,9 @@ class PegaProxManager:
                         self.logger.info(f"[HA] Node {failed_node} came back online - cancelling recovery")
                         self._ha_release_recovery_lock(failed_node)
                         return
+            if not ha.is_active():
+                self.logger.warning(f"[HA] Recovery of {failed_node} dropped - this PegaProx instance stepped down")
+                return
             
             # ============================================
             # SPLIT-BRAIN PREVENTION STEP 2: SSH CHECK (AUTOMATIC!)
@@ -4607,6 +4650,9 @@ class PegaProxManager:
                     self.logger.info(f"[HA] No storage heartbeat found for {failed_node}")
             
             # Now handle based on combined results
+            if not ha.is_active():
+                self.logger.warning(f"[HA] Recovery of {failed_node} dropped - this PegaProx instance stepped down")
+                return
             if node_is_alive:
                 # NODE IS ALIVE! This is a network split!
                 self.logger.critical(f"[HA] ☠️ SPLIT-BRAIN RISK DETECTED!")
@@ -4636,6 +4682,11 @@ class PegaProxManager:
                     
                     # If SSH didn't work, use poison pill via storage
                     if not vms_stopped and (self.ha_config.get('dual_network_mode') or self.ha_config.get('storage_heartbeat_enabled')):
+                        # the SSH stop above can take a while; a step-down that came in
+                        # meanwhile leaves the node to the new active (#625)
+                        if not ha.is_active():
+                            self.logger.warning(f"[HA] Recovery of {failed_node} dropped - this PegaProx instance stepped down")
+                            return
                         self.logger.info(f"[HA] SSH stop failed, using POISON PILL via storage...")
                         if self._ha_write_poison_pill(failed_node, "Recovery initiated - stop all VMs"):
                             # Wait for the node agent to see the poison and stop VMs
@@ -4713,6 +4764,9 @@ class PegaProxManager:
             # ============================================
             # Optional: Hardware fencing (IPMI/iLO if configured)
             # ============================================
+            if not ha.is_active():
+                self.logger.warning(f"[HA] Recovery of {failed_node} dropped - this PegaProx instance stepped down")
+                return
             fenced = self._ha_fence_node(failed_node)
             if fenced:
                 self.logger.info(f"[HA] ✓ Hardware fencing successful for {failed_node}")
@@ -4749,6 +4803,10 @@ class PegaProxManager:
             skipped_local = 0
             
             for vm in vms_on_failed_node:
+                if not ha.is_active():
+                    self.logger.warning(f"[HA] Recovery of {failed_node} stopped after {recovered} VM(s) "
+                                        "- this PegaProx instance stepped down")
+                    break
                 vmid = vm.get('vmid')
                 vm_name = vm.get('name', f'VM {vmid}')
                 vm_type = vm.get('type', 'qemu')
@@ -4770,6 +4828,13 @@ class PegaProxManager:
                     failed += 1
                     continue
                 
+                # asked again after the storage check and the target choice, both API reads
+                # that can take seconds: the loop-top check alone would still start this VM
+                # next to the new active (#625)
+                if not ha.is_active():
+                    self.logger.warning(f"[HA] Recovery of {failed_node} stopped after {recovered} VM(s) "
+                                        "- this PegaProx instance stepped down")
+                    break
                 self.logger.info(f"[HA] Attempting to recover {vm_name} ({vmid}) to {target_node}")
                 
                 # Try to start the VM on the target node
@@ -11225,6 +11290,11 @@ echo "AGENT_INSTALLED_OK"
 
         if not refresh_usage or not snapshots:
             return snapshots
+        # a PegaProx standby shows what the active measured (#625): the refresh below
+        # SSHes to the node, may lvextend there and writes efficient_snapshots, a synced
+        # table no sync would put right again until the active changes it
+        if not ha.is_active():
+            return snapshots
 
         # All snapshots for this VM are on the same node/VG
         node = snapshots[0]['node']
@@ -17462,6 +17532,47 @@ echo DONE""",
                                  f"maintenance for {node_name} after restart (#720)")
         except Exception as e:
             self.logger.debug(f"[MAINT] maintenance restore failed: {e}")
+
+    def _follow_persisted_maintenance(self):
+        """#625 - on a PegaProx standby node_maintenance arrives with every sync, and the
+        restore above only runs at start. ha._refresh_managers calls this after a sync so
+        the live view shows what the active holds: nodes it put into maintenance since,
+        not the ones it has taken out again. Only restored entries are touched; the ones
+        the poll found in PVE's own HA maintenance stay the poll's. A standby enters no
+        maintenance itself, so there is nothing else here.
+
+        Returns how many entries changed."""
+        if ha.is_active():
+            # an acting instance keeps its own set; its routes write the rows
+            return 0
+        from pegaprox.models.tasks import MaintenanceTask
+        rows = {node: bool(native_ha) for node, _entered_at, native_ha
+                in get_db().get_node_maintenance(self.id)}
+        changed = 0
+        with self.maintenance_lock:
+            for node_name, task in list(self.nodes_in_maintenance.items()):
+                if not getattr(task, '_restored', False) or getattr(task, '_discovered_by_refresh', False):
+                    continue
+                if node_name not in rows:
+                    self.nodes_in_maintenance.pop(node_name, None)
+                    self.logger.info(f"[MAINT] {node_name} left maintenance on the active PegaProx instance")
+                    changed += 1
+                elif bool(getattr(task, 'native_ha', False)) != rows[node_name]:
+                    task.native_ha = rows[node_name]
+                    changed += 1
+            for node_name, native_ha in rows.items():
+                if node_name in self.nodes_in_maintenance:
+                    continue
+                t = MaintenanceTask(node_name)
+                t.native_ha = native_ha
+                t.status = 'completed'
+                t.total_vms = 0
+                t._restored = True
+                self.nodes_in_maintenance[node_name] = t
+                self.logger.info(f"[MAINT] {node_name} entered {'native HA' if native_ha else 'soft'} "
+                                 "maintenance on the active PegaProx instance")
+                changed += 1
+        return changed
 
     def start(self):
         """Start the PegaProx daemon"""

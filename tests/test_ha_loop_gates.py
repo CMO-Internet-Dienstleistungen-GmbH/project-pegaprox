@@ -63,11 +63,35 @@ GATES = [
     ('pegaprox/core/manager.py', 'PegaProxManager.start_ha_monitor',
      ['_ha_discover_fallback_hosts', 'connect_to_proxmox', 'Thread'], []),
     ('pegaprox/core/xcpng.py', 'XcpngManager._run_loop', ['run_balance_check'], ['wait']),
+    # the live view (#625 v2): managers run on a standby, so what they reach that acts
+    # or writes a synced table is gated where it happens, not only at the call site.
+    # Behaviour in tests/test_ha_v2_managers.py.
+    ('pegaprox/core/config.py', 'save_config', ['get_db', 'save_cluster'], []),
+    ('pegaprox/core/manager.py', 'PegaProxManager._try_create_api_token',
+     ['post', 'update_cluster', 'save_config'], []),
+    ('pegaprox/core/manager.py', 'PegaProxManager.stop_ha_monitor', ['Thread'], ['join']),
+    ('pegaprox/core/manager.py', 'PegaProxManager._ha_monitor_loop',
+     ['_ha_check_nodes', '_ha_update_fallback_hosts'], []),
+    ('pegaprox/core/manager.py', 'PegaProxManager._ha_recovery_worker',
+     ['_ha_acquire_recovery_lock', '_ha_ssh_stop_vms_on_node', '_ha_write_poison_pill',
+      '_ha_fence_node', '_ha_start_vm_on_node'], []),
+    ('pegaprox/core/manager.py', 'PegaProxManager.get_efficient_snapshots',
+     ['_node_ssh_exec', 'update_efficient_snapshot_disks', 'update_efficient_snapshot_status'],
+     ['get_efficient_snapshots']),
+    ('pegaprox/core/xcpng.py', 'XcpngManager.run_balance_check',
+     ['get_node_status', 'find_migration_candidate', '_do_balance_migrate'], []),
+    ('pegaprox/background/metrics.py', 'collect_metrics_snapshot', ['run_per_node'],
+     ['get_vm_resources']),
+    # the scrape reads over the API in every role; only the SSH-backed Ceph probe is gated
+    ('pegaprox/api/metrics_exporter.py', 'prometheus_metrics', ['get_ceph_health_summary'],
+     ['get_node_status', 'get_vm_resources']),
 ]
 
 # gated right at the top: the first statement after the docstring is the early return
 TOP_GATED = {'run_cross_cluster_balance_check', 'recover_orphan_runs',
-             'PegaProxManager.run_balance_check', 'PegaProxManager.start_ha_monitor'}
+             'PegaProxManager.run_balance_check', 'PegaProxManager.start_ha_monitor',
+             'save_config', 'PegaProxManager._try_create_api_token',
+             'PegaProxManager._ha_recovery_worker', 'XcpngManager.run_balance_check'}
 
 # per host, never behind the gate
 UNGATED = {

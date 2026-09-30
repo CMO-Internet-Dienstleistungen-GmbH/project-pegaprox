@@ -43547,7 +43547,54 @@
             "description": "Insufficient permissions"
           }
         },
-        "summary": "How often the standby pulls and the active looks at its peer, in seconds.",
+        "summary": "How often the standby pulls and the active looks at its peer, and the live view.",
+        "description": "interval is in seconds. live_view is this instance's own switch: on, a standby\nconnects to the clusters read-only; off, it holds no connection at all. Either one\nor both. A standby restarts when live_view changes, because it sets its connections\nup once per process; any other role only keeps the value for when it follows.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-roles": [
+          "admin"
+        ]
+      }
+    },
+    "/api/ha/apply-config": {
+      "post": {
+        "operationId": "ha.apply_config_post",
+        "tags": [
+          "ha"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Restart this standby now to take up a configuration change that is waiting.",
+        "description": "A sync that changes how the clusters are reached leaves a restart pending, which a\nstandby takes by itself once the change holds still. This skips the wait. No\npassword: it only decides when this standby restarts, not what it does.",
         "requestBody": {
           "required": false,
           "content": {

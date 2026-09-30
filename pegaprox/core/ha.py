@@ -2,9 +2,16 @@
 
 Two instances are paired. The ACTIVE one runs as always. The STANDBY one keeps the
 UI up, pulls the shared configuration from the active every few seconds, refuses
-writes, starts no cluster managers and lets none of the background loops act. An
-admin promotes the standby by hand; the instance that was active steps down the
-moment it learns about a newer epoch, from either side.
+writes and lets none of the background loops act. An admin promotes the standby by
+hand; the instance that was active steps down the moment it learns about a newer
+epoch, from either side.
+
+The live view (on unless an admin switches it off, per instance): a standby starts
+its cluster, PBS and ESXi managers as well and lets them read, so the UI shows the
+clusters as they are. They act on nothing - every path that would is gated on
+is_active(). Settings the managers read when they use them are handed over in
+place after each sync; a change to how they connect restarts the standby once the
+change has settled. With the live view off a standby starts no managers at all.
 
 What travels:
   * pairing - the standby POSTs the one-time code to the active and gets back the
@@ -134,12 +141,39 @@ _URL_CHARS_RE = re.compile(r'[A-Za-z0-9.\-_~:/\[\]]+')
 _URL_PATH_RE = re.compile(r'/[A-Za-z0-9._~\-/]*')
 _URL_PORT_RE = re.compile(r':[0-9]{1,5}')
 
+# A standby restarts to pick up new connection settings for its managers: once
+# the new ones have held for CONFIG_SETTLE seconds, not before the process has run
+# for CONFIG_MIN_UPTIME, and at most once per CONFIG_RESTART_SPACING.
+CONFIG_SETTLE = 60
+CONFIG_MIN_UPTIME = 120
+CONFIG_RESTART_SPACING = 600
+BOOT_PULL_TIMEOUT = 10
+
 _lock = threading.RLock()
 _state = None
 _loop_started = False
 # the stored etag is dropped once per process start: an upgrade or a restored
 # database changes what we hold without the active knowing
 _etag_checked = False
+
+
+def _fresh_run():
+    return {
+        'started': time.monotonic(),
+        'managers': False,          # main() started the cluster, PBS and ESXi managers
+        'signature': None,          # manager_signature() they started from
+        'items': None,              # the per-connection digests behind it, to name a change
+        'live_view': None,          # the live view this process runs with, once known
+        'live_view_changed': None,  # when set_live_view last changed it
+        'pending': None,            # a config restart waiting for its rules
+        'restarting': False,
+    }
+
+
+# What this process started its managers from. Memory only: the signature is taken
+# from the decrypted passwords and keys, so it never goes near the state file.
+_run = _fresh_run()
+_pull_lock = threading.Lock()
 
 
 class HaError(Exception):
@@ -296,9 +330,10 @@ def is_standby():
 
 
 def is_active():
-    """True when this instance may act: start managers, fire schedules, send mail.
+    """True when this instance may act: change a cluster, fire schedules, send mail.
 
-    A standalone instance is active too. Only a standby holds back.
+    A standalone instance is active too. Only a standby holds back; with the live
+    view its managers still read (managers_wanted), and nothing more.
     """
     return role() != ROLE_STANDBY
 
@@ -314,6 +349,387 @@ def epoch():
 def peer():
     p = _load().get('peer')
     return dict(p) if p else None
+
+
+# --- the live view -------------------------------------------------------------
+
+def live_view():
+    """Whether a standby runs its managers read-only, so its UI shows live data.
+
+    Per instance and never part of a snapshot; on until an admin switches it off.
+    Means nothing on an active instance, whose managers always run."""
+    value = _load().get('live_view', True)
+    return value if isinstance(value, bool) else True
+
+
+def set_live_view(value):
+    """Switch the live view of this instance. Returns True when it changed.
+
+    Only saved: a standby runs with the new value after its next start, which
+    apply_config_now() brings about."""
+    if not isinstance(value, bool):
+        raise HaError('live_view is true or false')
+    with _lock:
+        before = live_view()
+        if _run['live_view'] is None:
+            # nothing has changed it in this process yet, so this is what it runs with
+            _run['live_view'] = before
+        if value == before:
+            return False
+        _update(live_view=value)
+        _run['live_view_changed'] = _now()
+    return True
+
+
+def managers_wanted():
+    """True when this process starts its cluster, PBS and ESXi managers: always on an
+    instance that acts, on a standby only with the live view on.
+
+    A state file that cannot be read keeps them down. Whether the admin switched
+    the live view off is in the part we cannot read."""
+    st = _load()
+    if st['role'] != ROLE_STANDBY:
+        return True
+    return not st.get('broken') and live_view()
+
+
+# --- what the managers connect with -----------------------------------------------
+
+# Everything a manager is built from and holds on to once connected (the current
+# host, the auth mode, the SSH pool). A change here needs a new manager, which on
+# a standby means a restart. Fallback hosts, the HA settings, updated_at and the
+# display and balancing fields stay out: the active rewrites some of them on its
+# own, and the managers read the rest each time they use them.
+# (kind, table, only enabled rows, columns)
+_IDENTITY = (
+    ('cluster', 'clusters', False,
+     ('cluster_type', 'host', 'user', 'pass_encrypted', 'api_port', 'ssl_verification',
+      'api_token_user', 'api_token_secret_encrypted', 'ssh_user', 'ssh_key_encrypted',
+      'ssh_port', 'ssh_disabled')),
+    ('pbs', 'pbs_servers', True,
+     ('host', 'port', 'user', 'pass_encrypted', 'api_token_id', 'api_token_secret_encrypted',
+      'fingerprint', 'ssl_verify', 'ssh_user', 'ssh_port', 'ssh_key_encrypted')),
+    ('vmware', 'vmware_servers', True,
+     ('host', 'port', 'username', 'pass_encrypted', 'server_type', 'ssl_verify')),
+)
+_IDENTITY_LABELS = {'cluster': ('cluster', 'clusters'), 'pbs': ('PBS server', 'PBS servers'),
+                    'vmware': ('ESXi server', 'ESXi servers')}
+_UNREADABLE = '\x00unreadable'
+
+# Read by the managers at the moment they use them, so a sync hands them over in
+# place: what the active's cluster routes set on mgr.config (PUT /api/clusters/<id>,
+# location, backup SLA) less the connection fields above, plus the fallback hosts
+# and SMBIOS settings the active changes without an admin. ha_enabled and
+# ha_settings are the exception: a PVE manager copies them when it is built, so
+# _hand_over_ha_view refreshes those copies as well.
+_REFRESH_CLUSTER_FIELDS = (
+    'name', 'enabled', 'check_interval', 'migration_threshold', 'migration_tolerance',
+    'auto_migrate', 'balance_containers', 'balance_local_disks', 'dry_run', 'ha_enabled',
+    'ha_settings', 'excluded_nodes', 'predictive_balancing', 'predictive_threshold',
+    'balance_cpu_weight', 'balance_mem_weight', 'balance_io_weight', 'cpu_baseline',
+    'vnc_tunnel', 'proxlb_tags_enabled', 'node_ui_suffix', 'backup_sla_max_age_hours',
+    'latitude', 'longitude', 'location_label', 'fallback_hosts', 'smbios_autoconfig',
+)
+_REFRESH_SERVER_FIELDS = ('name', 'notes', 'linked_clusters')
+
+
+def _plain(db, value):
+    """A sealed column as the manager sees it. One we cannot open gets a fixed marker:
+    a fresh nonce on every save must not read as a change."""
+    if not value:
+        return ''
+    try:
+        return db._decrypt(value)
+    except Exception:
+        return _UNREADABLE
+
+
+def _identity_items():
+    """{'<kind>:<id>': digest} over every cluster and every enabled PBS and ESXi server.
+
+    Taken from the decrypted values: each save on the active seals the secrets
+    again under a new nonce, and that alone must not restart anything."""
+    from pegaprox.core.db import get_db
+    db = get_db()
+    cur = db.conn.cursor()
+    present = _existing_tables(cur)
+    items = {}
+    for kind, table, enabled_only, columns in _IDENTITY:
+        if table not in present:
+            continue
+        cur.execute(f'SELECT * FROM "{table}"' + (' WHERE enabled = 1' if enabled_only else ''))
+        for row in cur.fetchall():
+            row = dict(row)
+            h = hashlib.sha256()
+            for col in columns:
+                v = row.get(col)
+                _hash_value(h, _plain(db, v) if col.endswith('_encrypted') else v)
+            items[f"{kind}:{row['id']}"] = h.hexdigest()
+    return items
+
+
+def _signature_of(items):
+    h = hashlib.sha256(b'pegaprox-ha-managers')
+    for key in sorted(items):
+        _hash_value(h, key)
+        _hash_value(h, items[key])
+    return h.hexdigest()
+
+
+def manager_signature():
+    """A digest of how the cluster, PBS and ESXi managers connect: which ones there are,
+    host, user, credentials, ports, TLS and SSH settings, cluster and server type.
+
+    Held in memory only, never written anywhere."""
+    return _signature_of(_identity_items())
+
+
+def _describe_change(before, after):
+    """'1 cluster added, 2 PBS servers changed' - counts and kinds, no names or values."""
+    parts = []
+    if before is not None:
+        for kind, (one, many) in _IDENTITY_LABELS.items():
+            b = {k: v for k, v in before.items() if k.startswith(kind + ':')}
+            a = {k: v for k, v in after.items() if k.startswith(kind + ':')}
+            for word, n in (('added', len(a.keys() - b.keys())),
+                            ('removed', len(b.keys() - a.keys())),
+                            ('changed', sum(1 for k in a.keys() & b.keys() if a[k] != b[k]))):
+                if n:
+                    parts.append(f'{n} {one if n == 1 else many} {word}')
+    return ', '.join(parts) or 'the connection settings changed'
+
+
+def note_managers_started(signature):
+    """main(), right after the managers came up: the manager_signature() they started
+    from. A sync that changes it restarts a standby (see pull_once)."""
+    try:
+        items = _identity_items()
+    except Exception as e:
+        logging.warning(f"[HA] could not read what the managers were started from: {e}")
+        items = None
+    with _lock:
+        _run.update(managers=True, signature=signature, items=items, live_view=live_view(),
+                    pending=None)
+
+
+def _refresh_managers():
+    """Hand what the running managers read at the moment of use over to them, the way
+    the active's PUT /api/clusters/<id> does: setattr on mgr.config, no stop and no
+    start. On a standby also the HA view and the PegaProx node maintenance, which a
+    PVE manager otherwise only reads at its start. Returns how many values changed."""
+    from pegaprox import globals as g
+    from pegaprox.core.db import get_db
+    db = get_db()
+    changed = 0
+    for cid, data in (db.get_all_clusters() or {}).items():
+        mgr = g.cluster_managers.get(cid)
+        cfg = getattr(mgr, 'config', None)
+        if cfg is None or getattr(mgr, 'cluster_type', None) == 'esxi':
+            continue
+        ha_changed = False
+        for key in _REFRESH_CLUSTER_FIELDS:
+            if key in data and hasattr(cfg, key) and getattr(cfg, key) != data[key]:
+                setattr(cfg, key, data[key])
+                changed += 1
+                ha_changed = ha_changed or key in ('ha_enabled', 'ha_settings')
+        if is_active():
+            continue
+        try:
+            if ha_changed:
+                _hand_over_ha_view(mgr, cfg)
+            follow = getattr(mgr, '_follow_persisted_maintenance', None)
+            if follow is not None:
+                changed += int(follow() or 0)
+        except Exception as e:
+            logging.warning(f"[HA] could not refresh the HA or maintenance view of cluster {cid}: {e}")
+    cur = db.conn.cursor()
+    for registry, table in ((g.pbs_managers, 'pbs_servers'), (g.vmware_managers, 'vmware_servers')):
+        if not registry:
+            continue
+        cur.execute(f'SELECT id, name, notes, linked_clusters FROM "{table}"')
+        for row in cur.fetchall():
+            mgr = registry.get(row['id'])
+            if mgr is None:
+                continue
+            try:
+                linked = json.loads(row['linked_clusters'] or '[]')
+            except (TypeError, ValueError):
+                linked = []
+            fresh = {'name': row['name'], 'notes': row['notes'], 'linked_clusters': linked}
+            for key in _REFRESH_SERVER_FIELDS:
+                value = fresh[key]
+                if getattr(mgr, key, None) != value:
+                    setattr(mgr, key, value)
+                    changed += 1
+    return changed
+
+
+def _hand_over_ha_view(mgr, cfg):
+    """A PVE manager copies ha_enabled and ha_settings into its own fields when it is
+    built, and the HA page (get_ha_status) reads those copies, not mgr.config. On a
+    standby the HA monitor never runs, so the copies are only a view: rebuild them
+    from the synced row. Wherever a monitor runs they are its own and stay as they are."""
+    apply = getattr(mgr, '_apply_ha_settings', None)
+    if apply is None or getattr(mgr, 'ha_thread', None) is not None:
+        return
+    settings = getattr(cfg, 'ha_settings', None)
+    mgr.ha_enabled = bool(getattr(cfg, 'ha_enabled', False))
+    apply(settings if isinstance(settings, dict) else {})
+
+
+def _after_sync_applied():
+    """A sync changed our database: refresh the running managers in place, and when
+    their connection settings changed, note a restart. Never raises."""
+    if not _run['managers']:
+        return
+    try:
+        n = _refresh_managers()
+        if n:
+            logging.info(f"[HA] sync: handed {n} changed setting(s) to the running managers")
+    except Exception as e:
+        logging.warning(f"[HA] could not refresh the running managers after a sync: {e}")
+    try:
+        items = _identity_items()
+    except Exception as e:
+        logging.warning(f"[HA] could not read the connection settings after a sync: {e}")
+        return
+    _note_signature(_signature_of(items), items)
+
+
+def _note_signature(sig, items):
+    with _lock:
+        pending = _run['pending']
+        if sig == _run['signature']:
+            if pending and pending.get('signature'):
+                # changed and changed back before it settled
+                _run['pending'] = None
+                logging.warning("[HA] the connection settings are back to what the managers "
+                                "started with - no restart needed")
+            return
+        if pending and pending.get('signature') == sig:
+            return
+        reason = _describe_change(_run['items'], items)
+        _run['pending'] = {'signature': sig, 'since': time.monotonic(), 'since_iso': _now(),
+                           'reason': reason}
+    logging.warning(f"[HA] connection settings changed on the active instance ({reason}) - "
+                    f"restarting once they have held for {CONFIG_SETTLE}s")
+
+
+def request_config_restart(reason):
+    """Ask for a restart that picks up the configuration, under the rules a sync goes by:
+    settled for a minute, not right after a start, at most one every ten minutes.
+    Only a standby restarts for this. Returns True when it is pending now."""
+    if not is_standby():
+        return False
+    with _lock:
+        if not _run['pending']:
+            _run['pending'] = {'signature': None, 'since': time.monotonic(), 'since_iso': _now(),
+                               'reason': str(reason or 'restart requested')[:200]}
+    return True
+
+
+def _live_view_switch():
+    """'on' or 'off' when a standby's live view is not the one this process runs with."""
+    running = _run['live_view']
+    if running is None or not is_standby():
+        return ''
+    now = live_view()
+    return '' if now == running else ('on' if now else 'off')
+
+
+def _config_restart_wait():
+    """Seconds until the pending config restart may run, 0 once it may, None when
+    none is pending."""
+    pending = _run['pending']
+    if not pending or _run['restarting']:
+        return None
+    mono = time.monotonic()
+    waits = [pending['since'] + CONFIG_SETTLE - mono, _run['started'] + CONFIG_MIN_UPTIME - mono]
+    last = _load().get('last_config_restart')
+    if isinstance(last, (int, float)) and not isinstance(last, bool):
+        now = time.time()
+        if last > now:
+            # stamped under a clock that was set back since: count the ten minutes from
+            # the moment we noticed, not from a time still to come. Written back, so the
+            # next process spaces from it too.
+            try:
+                _update(last_config_restart=int(now))
+            except Exception as e:
+                logging.warning(f"[HA] could not correct a config restart stamp from the future: {e}")
+            last = now
+        waits.append(last + CONFIG_RESTART_SPACING - now)
+    return max(0.0, *waits)
+
+
+def _restart_for_config(reason, automatic):
+    with _lock:
+        if _run['restarting']:
+            return False
+        if automatic:
+            try:
+                # noted before the restart: without it a state file we cannot write
+                # would restart us again every two minutes
+                _update(last_config_restart=int(time.time()))
+            except Exception as e:
+                logging.error(f"[HA] not restarting for the new configuration, the state "
+                              f"file cannot be written: {e}")
+                return False
+        _run['restarting'] = True
+    _audit('ha.restart_for_config', reason)
+    logging.warning(f"[HA] restarting to pick up the configuration of the active instance: {reason}")
+    restart_process(f'configuration changed on the active instance: {reason}')
+    return True
+
+
+def _restart_for_config_if_due():
+    if not is_standby():
+        return False
+    # read once: a sync that brings the old settings back clears it meanwhile
+    pending = _run['pending']
+    if not pending or _config_restart_wait() != 0:
+        return False
+    return _restart_for_config(pending['reason'], automatic=True)
+
+
+def apply_config_now():
+    """The admin's "apply now" on a standby: restart at once, past the rules above,
+    when a restart is pending, the live view was switched, or the connection settings
+    differ from what the managers started with.
+
+    Returns True when a restart is on its way, False when there is nothing to apply.
+    Raises HaError anywhere but on a standby."""
+    if not is_standby():
+        raise HaError('Only a standby takes its configuration from the active instance')
+    switch = _live_view_switch()
+    reason = f'the live view was switched {switch}' if switch else ''
+    pending = _run['pending']
+    if not reason and pending:
+        reason = pending['reason']
+    if not reason and _run['managers']:
+        try:
+            items = _identity_items()
+        except Exception as e:
+            logging.warning(f"[HA] could not read the connection settings: {e}")
+        else:
+            if _signature_of(items) != _run['signature']:
+                reason = _describe_change(_run['items'], items)
+    if not reason:
+        return False
+    return _restart_for_config(reason, automatic=False)
+
+
+def _restart_pending():
+    """public_status: None, or since and reason of the restart this standby waits for."""
+    if not is_standby():
+        return None
+    switch = _live_view_switch()
+    if switch:
+        return {'since': _run['live_view_changed'] or _now(),
+                'reason': f'the live view was switched {switch}'}
+    pending = _run['pending']
+    if pending:
+        return {'since': pending['since_iso'], 'reason': pending['reason']}
+    return None
 
 
 # --- secrets and codes ---------------------------------------------------------
@@ -1128,10 +1544,11 @@ def apply_snapshot(snap):
             pass
         raise
 
+    # the rows are in; nothing below raises, so a caller that got here can count them
     after = _sign_in_rows(conn.cursor())
     if before is not None and after is not None:
         _end_sessions(sorted(u for u, row in before.items() if after.get(u) != row))
-    _apply_files(snap.get('files') or {})
+    summary['file_errors'] = _apply_files(snap.get('files') or {})
     _after_apply()
     return summary
 
@@ -1189,12 +1606,27 @@ def _add_column(cur, table, column, coldef):
 
 
 def _apply_files(files):
+    """The host key pins, the login background and the plugins' config.json files.
+
+    Runs once the rows are committed, so it never raises: a file that cannot be
+    written must not make a sync whose rows are in look failed. Returns what the
+    sync status should say about it, [] when all went well."""
+    problems = []
     kh = files.get('ssh_known_hosts')
     if isinstance(kh, str):
-        _write_private(KNOWN_HOSTS_FILE, kh.encode())
+        try:
+            _write_private(KNOWN_HOSTS_FILE, kh.encode())
+        except Exception as e:
+            logging.warning(f"[HA] could not write the SSH host key pins: {e}")
+            problems.append(f'the SSH host key pins were not written ({type(e).__name__}: {e})')
     branding = files.get('branding')
     if isinstance(branding, dict):
-        os.makedirs(BRANDING_DIR, exist_ok=True)
+        try:
+            os.makedirs(BRANDING_DIR, exist_ok=True)
+        except Exception as e:
+            logging.warning(f"[HA] could not create the branding folder: {e}")
+            problems.append(f'the login background was not written ({type(e).__name__}: {e})')
+            branding = {}
         for fn, b64 in branding.items():
             if not re.match(r'^[A-Za-z0-9_.\-]{1,64}$', fn) or fn.startswith('.'):
                 continue
@@ -1216,6 +1648,7 @@ def _apply_files(files):
                 _apply_plugin_config(pid, text)
             except Exception as e:
                 logging.warning(f"[HA] could not write the configuration of plugin {pid}: {e}")
+    return problems
 
 
 def _apply_plugin_config(pid, text):
@@ -1335,8 +1768,38 @@ def call_peer(method, path, json_body=None, headers=None, timeout=15):
                       json_body=json_body, headers=headers, timeout=timeout)
 
 
-def pull_once():
-    """Standby: fetch and apply one snapshot. Returns a short status string."""
+def pull_once(timeout=60):
+    """Standby: fetch and apply one snapshot. Returns a short status string.
+
+    Also where a config restart that has fallen due goes out (see
+    note_managers_started): after a sync, and on the polls that find nothing new."""
+    # one pull at a time: "sync now" and the loop would otherwise apply side by side,
+    # and the file writes share their temporary names
+    if not _pull_lock.acquire(timeout=timeout + 5):
+        return 'busy'
+    try:
+        result = _pull(timeout)
+    finally:
+        _pull_lock.release()
+    if result in ('applied', 'unchanged', 'failed'):
+        _restart_for_config_if_due()
+    return result
+
+
+def boot_pull(timeout=BOOT_PULL_TIMEOUT):
+    """main(), on a standby with the live view on, before the managers start: one
+    short pull, so they start from the active's configuration of now and not from
+    the one this instance stopped with. Never raises."""
+    try:
+        if not is_standby() or not peer():
+            return 'idle'
+        return pull_once(timeout=timeout)
+    except Exception as e:
+        logging.warning(f"[HA] pull at start failed: {e}")
+        return 'error'
+
+
+def _pull(timeout):
     global _etag_checked
     if not is_standby():
         return 'not a standby'
@@ -1353,10 +1816,11 @@ def pull_once():
         _update_sync(last_attempt_at=_now(), etag=None)
     else:
         _update_sync(last_attempt_at=_now())
+    committed = False
     try:
         etag = (_load().get('sync') or {}).get('etag')
         resp = call_peer('GET', '/api/ha/peer/snapshot',
-                         headers={'If-None-Match': etag} if etag else None, timeout=60)
+                         headers={'If-None-Match': etag} if etag else None, timeout=timeout)
         if resp.status_code == 304:
             _update_sync(last_ok_at=_now(), last_error='')
             _update_peer(last_contact=_now(), last_error='')
@@ -1367,10 +1831,14 @@ def pull_once():
         _update_peer(last_contact=_now(), role_seen=snap.get('role'),
                      epoch_seen=int(snap.get('epoch') or 0), last_error='')
         summary = apply_snapshot(snap)
-        # an etag stands for all of the content; with columns left out we hold
-        # less than that, and a 304 would keep it so after we are upgraded
-        etag = None if summary['skipped_columns'] else snap.get('etag')
-        _update_sync(last_ok_at=_now(), last_error='', etag=etag,
+        committed = True
+        problems = summary.get('file_errors') or []
+        # an etag stands for all of the content; with columns left out or a file not
+        # written we hold less than that, and a 304 would keep it so (after an
+        # upgrade, or once the file can be written again)
+        etag = None if summary['skipped_columns'] or problems else snap.get('etag')
+        note = ('The configuration was applied, but ' + '; '.join(problems)) if problems else ''
+        _update_sync(last_ok_at=_now(), last_error=note[:300], etag=etag,
                      source_epoch=int(snap.get('epoch') or 0), rows=summary['rows'],
                      tables=summary['tables'], skipped_columns=summary['skipped_columns'])
         return 'applied'
@@ -1379,6 +1847,12 @@ def pull_once():
         _update_sync(last_error=msg[:300])
         logging.warning(f"[HA] sync failed: {msg}")
         return 'failed'
+    finally:
+        # the database holds the new rows now, whatever failed after the commit: the
+        # managers are compared against them, or a new connection setting would never
+        # restart anything while that failure lasts
+        if committed:
+            _after_sync_applied()
 
 
 def _peer_status(timeout):
@@ -1479,6 +1953,10 @@ def _loop():
         except Exception as e:
             logging.error(f"[HA] loop: {e}")
         interval = int(_load().get('interval') or DEFAULT_INTERVAL)
+        # a pending config restart goes out when it falls due, not up to an hour later
+        wait = _config_restart_wait() if is_standby() else None
+        if wait is not None:
+            interval = min(interval, int(wait) + 1)
         time.sleep(max(5, min(interval, 3600)))
 
 
@@ -1501,6 +1979,8 @@ def public_status():
         'epoch': int(st.get('epoch') or 0),
         'instance_id': st['instance_id'],
         'interval': int(st.get('interval') or DEFAULT_INTERVAL),
+        'live_view': live_view(),
+        'managers_running': bool(_run['managers']),
         'broken': st.get('broken') or '',
         'pairing_open_until': pairing.get('expires') if pairing.get('code_hash') and
                               int(pairing.get('expires') or 0) >= int(time.time()) else None,
@@ -1514,7 +1994,7 @@ def public_status():
             'last_contact': p.get('last_contact'),
             'last_error': p.get('last_error') or '',
         } if p else None,
-        'sync': dict(st.get('sync') or {}, etag=None),
+        'sync': dict(st.get('sync') or {}, etag=None, restart_pending=_restart_pending()),
     }
 
 

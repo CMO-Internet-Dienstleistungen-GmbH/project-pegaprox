@@ -39,6 +39,7 @@ ADMIN_ROUTES = [
     ('post', '/api/ha/promote', {'confirm': 'PROMOTE', 'user_password': ADMIN_PW}),
     ('post', '/api/ha/unpair', {'confirm': 'UNPAIR', 'user_password': ADMIN_PW}),
     ('put', '/api/ha/settings', {'interval': 60}),
+    ('post', '/api/ha/apply-config', None),
 ]
 PEER_ROUTES = [
     ('POST', '/api/ha/peer/pair'),
@@ -309,6 +310,7 @@ def test_an_admin_reaches_every_route(ha_env, seed):
         '/api/ha/promote': 409,       # not a standby
         '/api/ha/unpair': 409,        # not paired
         '/api/ha/settings': 200,
+        '/api/ha/apply-config': 409,  # not a standby
     }
     for method, path, body in ADMIN_ROUTES:
         r = _send(c, method, path, body)
@@ -1006,6 +1008,8 @@ def test_every_local_write_names_a_real_route(api):
     assert listed and listed <= served, listed - served
     # the mixed settings form stays out
     assert not any(rule == '/api/settings/server' for _m, rule in listed)
+    # and so does the console token: every caller of it opens a console (v2)
+    assert ('POST', '/api/ws/token') not in listed
 
 
 def test_a_standby_lets_instance_local_writes_through(ha_env, seed, monkeypatch):
@@ -1018,6 +1022,8 @@ def test_a_standby_lets_instance_local_writes_through(ha_env, seed, monkeypatch)
     admin = _admin(api, seed)
     other = api.as_user({'username': 'root', 'role': 'admin'})    # root's second session
     _standby_of_active(ha_env)
+    # /api/auth/check below reports the live view of a standby (v2)
+    monkeypatch.setattr(ha_env.ha, 'live_view', lambda: True, raising=False)
 
     # the caller's own session, by its revocation token
     listing = admin.get('/api/user/sessions').get_json()['sessions']
@@ -1027,9 +1033,16 @@ def test_a_standby_lets_instance_local_writes_through(ha_env, seed, monkeypatch)
     assert other.get('/api/auth/check').status_code == 401
     assert admin.get('/api/auth/check').status_code == 200
 
-    for path in ('/api/sse/token', '/api/ws/token'):
-        r = admin.post(path, json={})
-        assert r.status_code == 200 and r.get_json()['token'], (path, r.data)
+    r = admin.post('/api/sse/token', json={})
+    assert r.status_code == 200 and r.get_json()['token'], r.data
+    # v2: the console token is not local any more, a standby opens no console
+    r = admin.post('/api/ws/token', json={})
+    assert r.status_code == 409 and r.get_json()['code'] == 'HA_STANDBY', r.data
+    # and the two reads the live UI sends as POST
+    r = admin.post('/api/sse/subscribe', json={'client_id': 'gone-already'})
+    assert r.status_code == 200 and r.get_json() == {'ok': False, 'reason': 'client_not_found'}, r.data
+    r = admin.post('/api/snapshots/overview', json={})
+    assert r.status_code == 200 and r.get_json() == {'snapshots': []}, r.data
 
     monkeypatch.setitem(login_attempts_by_ip, '198.51.100.9', {'attempts': [], 'locked_until': 9e9})
     monkeypatch.setitem(login_attempts_by_user, 'someone', {'attempts': [], 'locked_until': 9e9})
@@ -1079,11 +1092,13 @@ def test_a_standby_still_signs_people_in_and_out(ha_env, db, tmp_path, monkeypat
     api = ha_env.api
     creds = _local_user(db, tmp_path, monkeypatch)
     _standby_of_active(ha_env, sync={'last_ok_at': '2026-09-29T10:00:00+00:00'})
+    monkeypatch.setattr(ha_env.ha, 'live_view', lambda: True, raising=False)
 
     r = api.anon().post('/api/auth/login', json=creds)
     assert r.status_code == 200, r.data
     body = r.get_json()
-    banner = {'role': 'standby', 'peer_url': ACTIVE_URL, 'last_sync_at': '2026-09-29T10:00:00+00:00'}
+    banner = {'role': 'standby', 'peer_url': ACTIVE_URL, 'last_sync_at': '2026-09-29T10:00:00+00:00',
+              'live_view': True}
     assert body['ha'] == banner
     sid = {'X-Session-ID': body['session_id']}
     check = api.anon().get('/api/auth/check', headers=sid)
@@ -1193,8 +1208,9 @@ def _calls_in(nodes):
 
 def test_a_standby_boots_without_managers_and_acting_starters():
     """main() cannot run in a test (it binds a port), so read it: everything that
-    starts a manager or rewrites run state sits behind the standby check, and the
-    peer loop starts in every role."""
+    rewrites run state sits behind the standby check, and the peer loop starts in
+    every role. The managers go by managers_wanted() since the live view, see
+    tests/test_ha_v2_managers.py."""
     from pegaprox import app as app_mod
     fn = ast.parse(inspect.getsource(app_mod.main)).body[0]
     guarded = set()
@@ -1202,8 +1218,7 @@ def test_a_standby_boots_without_managers_and_acting_starters():
         if isinstance(node, ast.If) and 'standby' in ast.unparse(node.test):
             acting = node.orelse if ast.unparse(node.test) == 'standby' else node.body
             guarded |= _calls_in(acting)
-    for starter in ('PegaProxManager', 'XcpngManager', 'ESXiClusterManager', 'load_pbs_servers',
-                    'load_vmware_servers', 'start_heartbeat', 'start_plugin_backgrounds'):
+    for starter in ('start_heartbeat', 'start_plugin_backgrounds'):
         assert starter in guarded, starter
     top_level = _calls_in([n for n in fn.body if not isinstance(n, ast.If)])
     assert 'start_loop' in top_level
@@ -1227,7 +1242,7 @@ def test_an_old_active_asks_its_peer_before_anything_can_act():
     call = next(n for n in ast.walk(fn) if isinstance(n, ast.Call)
                 and getattr(n.func, 'attr', None) == 'check_peer_at_boot')
     assert [(k.arg, getattr(k.value, 'value', None)) for k in call.keywords] == [('timeout', 5)]
-    for later in ('create_app', 'is_standby', 'PegaProxManager', 'XcpngManager',
+    for later in ('create_app', 'is_standby', 'managers_wanted', 'boot_pull', '_start_managers',
                   'start_alert_thread', 'start_scheduler_thread', 'start_actions_scheduler',
                   'start_password_expiry_thread', 'start_cross_cluster_lb_thread',
                   'start_cross_cluster_replication_thread', 'start_heartbeat',

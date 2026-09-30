@@ -387,7 +387,9 @@ def create_app():
     register_blueprints(app)
 
     # MK Sep 2026 (#625) - a standby takes its configuration from the active instance
-    # and would lose a local change at the next sync, so it refuses writes. Registered
+    # and would lose a local change at the next sync, so it refuses writes. With the
+    # live view on it also holds connections to the clusters, and a write there is an
+    # action on them (start, migrate, delete) that only the active takes. Registered
     # here and not in validate_request: before_request hooks run in registration
     # order, and the IP allow list is hooked in by the settings blueprint above, so
     # this runs after the CSRF, rate-limit and IP checks.
@@ -408,9 +410,19 @@ def create_app():
     _STANDBY_LOCAL_WRITES = frozenset((
         # the caller's own session; sessions are per instance and never synced
         ('DELETE', '/api/user/sessions/<token>'),
-        # short-lived stream and console tokens, in memory, bound to a session here
+        # the live stream: its short-lived token and which clusters it carries, both in
+        # memory here. Not /api/ws/token - every caller of that one opens a console,
+        # and consoles belong to the active.
         ('POST', '/api/sse/token'),
-        ('POST', '/api/ws/token'),
+        ('POST', '/api/sse/subscribe'),
+        # a read that takes its filter in the body; the GET beside it is open anyway
+        ('POST', '/api/snapshots/overview'),
+        # the ESXi VM detail watch: which VMs the live stream pushes details for, a dict
+        # in this process like the SSE subscription (vmware.vm.view, the per-server
+        # check still applies). The push only reads the VM, its guest info and its
+        # performance from the ESXi host.
+        ('POST', '/api/vmware/<vmware_id>/vms/<vm_id>/watch'),
+        ('DELETE', '/api/vmware/<vmware_id>/vms/<vm_id>/watch'),
         # restarts this process and changes nothing
         ('POST', '/api/settings/server/restart'),
         # Not the ACME request and DNS-complete routes and not the hardware-monitoring
@@ -444,8 +456,8 @@ def create_app():
         if not ha.is_standby():
             return None
         return jsonify({
-            'error': 'This is a standby instance. Make changes on the active instance; '
-                     'they arrive here with the next sync.',
+            'error': 'This is a standby instance. Make changes and act on the active '
+                     'instance; its configuration arrives here with the next sync.',
             'code': 'HA_STANDBY',
         }), 409
 
@@ -871,16 +883,55 @@ def _resolve_ssl_context(reverse_proxy, domain='', app_name='PegaProx',
     return (cert_file, key_file)
 
 
+def _start_managers(config):
+    """Cluster managers (Proxmox and XCP-ng) for `config` as load_config() returns it,
+    then the PBS and ESXi servers and the ESXi hosts XHM treats as clusters.
+
+    The same in every role: on a standby with the live view they start as well and
+    only read, since everything in them that acts asks ha.is_active() first."""
+    from pegaprox.core.pbs import load_pbs_servers
+    from pegaprox.core.vmware import load_vmware_servers
+    from pegaprox.models.tasks import PegaProxConfig
+    from pegaprox.core.manager import PegaProxManager
+
+    for cluster_id, cluster_data in config.items():
+        config_obj = PegaProxConfig(cluster_data)
+        ctype = cluster_data.get('cluster_type', 'proxmox')
+        if ctype == 'xcpng':
+            from pegaprox.core.xcpng import XcpngManager
+            manager = XcpngManager(cluster_id, config_obj)
+            manager.start()
+            g.cluster_managers[cluster_id] = manager
+            print(f"Started XCP-ng manager for pool: {cluster_data['name']}")
+        else:
+            manager = PegaProxManager(cluster_id, config_obj)
+            manager.start()
+            g.cluster_managers[cluster_id] = manager
+            print(f"Started PegaProx manager for cluster: {cluster_data['name']}")
+
+    try:
+        load_pbs_servers()
+    except Exception as e:
+        logging.warning(f"Failed to load PBS servers at startup: {e}")
+
+    try:
+        load_vmware_servers()
+        # NS: register ESXi hosts as XHM-capable clusters
+        from pegaprox.core.esxi_cluster import ESXiClusterManager
+        for vmw_id, vmw_mgr in g.vmware_managers.items():
+            if getattr(vmw_mgr, 'server_type', '') == 'esxi':
+                g.cluster_managers[vmw_id] = ESXiClusterManager(vmw_id, vmw_mgr)
+                logging.info(f"Registered ESXi host '{vmw_mgr.name}' as XHM cluster {vmw_id}")
+    except Exception as e:
+        logging.warning(f"Failed to load VMware servers at startup: {e}")
+
+
 def main(debug_mode=False):
     """Main entry point - starts PegaProx server."""
     from pegaprox.utils.auth import (load_users, load_sessions, backfill_initialized_marker,
                                      initialization_state, INIT_UNINITIALIZED, INIT_UNKNOWN)
     from pegaprox.utils.audit import load_audit_log
     from pegaprox.core.config import load_config
-    from pegaprox.core.pbs import load_pbs_servers
-    from pegaprox.core.vmware import load_vmware_servers
-    from pegaprox.models.tasks import PegaProxConfig
-    from pegaprox.core.manager import PegaProxManager
     from pegaprox.background.broadcast import start_broadcast_thread
     from pegaprox.background.alerts import start_alert_thread
     from pegaprox.background.scheduler import start_scheduler_thread
@@ -1072,53 +1123,38 @@ def main(debug_mode=False):
         print("  encryption key and the permissions on config/.")
         print("=" * 50 + "\n")
 
+    # MK Sep 2026 (#625) - a standby holds the configuration and acts on none of it.
+    # The role is read once: every role change restarts the process, and so does a
+    # change of the live view or of how the managers connect.
+    standby = ha.is_standby()
+    live_managers = ha.managers_wanted()
+
+    if standby and live_managers:
+        # the live view: the managers start here too and only read. One short pull
+        # first, so they start from the active's configuration of now - starting from
+        # the one this instance stopped with would restart it right after the first sync.
+        _ha_pull = ha.boot_pull(timeout=10)
+        logging.warning(f"[HA] standby with the live view: cluster, PBS and ESXi managers start "
+                        f"read-only, nothing acts from here (sync at start: {_ha_pull})")
+    elif standby:
+        logging.warning("[HA] standby, live view off: no cluster, PBS or ESXi managers are "
+                        "started - they stay down until this instance is promoted or the "
+                        "live view is switched on")
+
     # Load existing configuration
     config = load_config()
 
-    # MK Sep 2026 (#625) - a standby holds the configuration and acts on none of it.
-    # The role is read once: every role change restarts the process.
-    standby = ha.is_standby()
-
-    # Start managers for existing clusters
-    if standby:
-        logging.warning("[HA] standby: no cluster, PBS or ESXi managers are started - "
-                        "they stay down until this instance is promoted")
-    else:
-        for cluster_id, cluster_data in config.items():
-            config_obj = PegaProxConfig(cluster_data)
-            ctype = cluster_data.get('cluster_type', 'proxmox')
-            if ctype == 'xcpng':
-                from pegaprox.core.xcpng import XcpngManager
-                manager = XcpngManager(cluster_id, config_obj)
-                manager.start()
-                g.cluster_managers[cluster_id] = manager
-                print(f"Started XCP-ng manager for pool: {cluster_data['name']}")
-            else:
-                manager = PegaProxManager(cluster_id, config_obj)
-                manager.start()
-                g.cluster_managers[cluster_id] = manager
-                print(f"Started PegaProx manager for cluster: {cluster_data['name']}")
+    if live_managers:
+        _start_managers(config)
+        try:
+            ha.note_managers_started(ha.manager_signature())
+        except Exception as e:
+            # without a baseline a standby never restarts for new connection settings
+            logging.warning(f"[HA] could not note what the managers started from: {e}")
 
     # Start background threads
     start_broadcast_thread()
     print("Started WebSocket live updates broadcast thread")
-
-    if not standby:
-        try:
-            load_pbs_servers()
-        except Exception as e:
-            logging.warning(f"Failed to load PBS servers at startup: {e}")
-
-        try:
-            load_vmware_servers()
-            # NS: register ESXi hosts as XHM-capable clusters
-            from pegaprox.core.esxi_cluster import ESXiClusterManager
-            for vmw_id, vmw_mgr in g.vmware_managers.items():
-                if getattr(vmw_mgr, 'server_type', '') == 'esxi':
-                    g.cluster_managers[vmw_id] = ESXiClusterManager(vmw_id, vmw_mgr)
-                    logging.info(f"Registered ESXi host '{vmw_mgr.name}' as XHM cluster {vmw_id}")
-        except Exception as e:
-            logging.warning(f"Failed to load VMware servers at startup: {e}")
 
     start_alert_thread()
     print("Started alert monitoring thread")

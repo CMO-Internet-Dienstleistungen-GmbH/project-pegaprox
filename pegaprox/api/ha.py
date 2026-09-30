@@ -170,6 +170,21 @@ def _status_body():
     return out
 
 
+# A standby with the live view on holds real connections to the clusters, and reads
+# through them. A console is not a read: keyboard and mouse on a guest, a root shell
+# on a node, a SPICE ticket that goes to the node directly. Every console path asks
+# this before it looks for a manager - the WebSocket ones too, since the old ?session=
+# login reaches them without ever minting a ws token.
+STANDBY_CONSOLE_ERROR = 'Consoles are only available on the active instance.'
+
+
+def standby_console_refusal():
+    """The answer a console route gives on a standby, None anywhere else."""
+    if not ha.is_standby():
+        return None
+    return jsonify({'code': 'HA_STANDBY', 'error': STANDBY_CONSOLE_ERROR}), 409
+
+
 # --- admin -----------------------------------------------------------------------
 
 @bp.route('/api/ha/status', methods=['GET'])
@@ -354,31 +369,89 @@ def unpair_peer():
 @bp.route('/api/ha/settings', methods=['PUT'])
 @require_auth(roles=[ROLE_ADMIN])
 def update_settings():
-    """How often the standby pulls and the active looks at its peer, in seconds."""
+    """How often the standby pulls and the active looks at its peer, and the live view.
+
+    interval is in seconds. live_view is this instance's own switch: on, a standby
+    connects to the clusters read-only; off, it holds no connection at all. Either one
+    or both. A standby restarts when live_view changes, because it sets its connections
+    up once per process; any other role only keeps the value for when it follows."""
     denied = _refuse_confined_admin()
     if denied:
         return denied
-    interval = _body().get('interval')
-    if isinstance(interval, bool) or not isinstance(interval, int) \
-            or not _MIN_INTERVAL <= interval <= _MAX_INTERVAL:
+    data = _body()
+    if 'interval' not in data and 'live_view' not in data:
+        return jsonify({'error': 'Nothing to change - send interval, live_view or both'}), 400
+    interval = data.get('interval')
+    if 'interval' in data and (isinstance(interval, bool) or not isinstance(interval, int)
+                               or not _MIN_INTERVAL <= interval <= _MAX_INTERVAL):
         return jsonify({'error': f'The interval is a whole number of seconds, '
                                  f'{_MIN_INTERVAL} to {_MAX_INTERVAL}'}), 400
+    live = data.get('live_view')
+    if 'live_view' in data and not isinstance(live, bool):
+        return jsonify({'error': 'live_view is true or false'}), 400
     status = ha.public_status()
     if status['broken']:
         # saving now would write the placeholder state over the file that could not be
         # read, and with it the instance id, the epoch and the peer secrets
         return jsonify({'error': 'The HA state file cannot be read - repair or remove '
                                  'config/ha_state.json first'}), 409
-    before = status['interval']
+
+    out = {'success': True}
+    if 'interval' in data:
+        before = status['interval']
+        try:
+            # instance-local, never part of a snapshot; ha.py has no setter of its own
+            ha._update(interval=interval)
+        except ha.HaError as e:
+            return jsonify({'error': str(e)}), 409
+        except Exception as e:
+            return jsonify({'error': safe_error(e, 'Could not save the interval')}), 500
+        log_audit(_user(), 'ha.settings_changed', f'sync interval {before}s -> {interval}s')
+        out['interval'] = interval
+
+    if 'live_view' in data:
+        was = ha.live_view()
+        try:
+            ha.set_live_view(live)
+        except ha.HaError as e:
+            return jsonify({'error': str(e)}), 409
+        except Exception as e:
+            return jsonify({'error': safe_error(e, 'Could not save the live view')}), 500
+        restarting = False
+        if live != was:
+            standby = ha.is_standby()
+            log_audit(_user(), 'ha.live_view_changed',
+                      f"live view {'on' if live else 'off'}"
+                      f"{', restarting this standby' if standby else ', takes effect as a standby'}")
+            if standby:
+                restarting = ha.apply_config_now() is not False
+        out.update(live_view=live, restarting=restarting)
+    return jsonify(out)
+
+
+@bp.route('/api/ha/apply-config', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def apply_config():
+    """Restart this standby now to take up a configuration change that is waiting.
+
+    A sync that changes how the clusters are reached leaves a restart pending, which a
+    standby takes by itself once the change holds still. This skips the wait. No
+    password: it only decides when this standby restarts, not what it does."""
+    denied = _refuse_confined_admin()
+    if denied:
+        return denied
+    if not ha.is_standby():
+        return jsonify({'error': 'Only a standby takes its configuration from the active instance'}), 409
+    pending = (ha.public_status().get('sync') or {}).get('restart_pending') or {}
     try:
-        # instance-local, never part of a snapshot; ha.py has no setter of its own
-        ha._update(interval=interval)
-    except ha.HaError as e:
-        return jsonify({'error': str(e)}), 409
+        restarting = ha.apply_config_now() is not False
     except Exception as e:
-        return jsonify({'error': safe_error(e, 'Could not save the interval')}), 500
-    log_audit(_user(), 'ha.settings_changed', f'sync interval {before}s -> {interval}s')
-    return jsonify({'success': True, 'interval': interval})
+        return jsonify({'error': safe_error(e, 'Could not apply the configuration')}), 500
+    if restarting:
+        reason = pending.get('reason') if isinstance(pending, dict) else ''
+        log_audit(_user(), 'ha.config_applied', 'restarting this standby now'
+                  + (f' for the waiting change: {reason}' if reason else ''))
+    return jsonify({'success': True, 'restarting': restarting})
 
 
 # --- peer ------------------------------------------------------------------------

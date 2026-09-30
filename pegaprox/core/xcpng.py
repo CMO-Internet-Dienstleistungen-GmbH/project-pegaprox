@@ -494,6 +494,9 @@ class XcpngManager:
 
     def _fetch_vms(self, api) -> list:
         db = get_db()
+        # a PegaProx standby looks ids up and hands none out (#625): a VM the active
+        # has not numbered yet stays out of the list until the sync brings its id
+        new_ids = ha.is_active()
         vm_refs = api.VM.get_all()
         now = time.time()
         vms = []
@@ -512,7 +515,9 @@ class XcpngManager:
                 continue
 
             vm_uuid = rec.get('uuid', '')
-            vmid = db.xcpng_get_vmid(self.id, vm_uuid)
+            vmid = db.xcpng_get_vmid(self.id, vm_uuid, create=new_ids)
+            if vmid is None:
+                continue
 
             # figure out which host its on
             resident = rec.get('resident_on', 'OpaqueRef:NULL')
@@ -2916,6 +2921,7 @@ class XcpngManager:
 
             if ha_enabled:
                 vm_ha = []
+                new_ids = ha.is_active()   # see _fetch_vms (#625)
                 for vm_ref in api.VM.get_all():
                     try:
                         if api.VM.get_is_a_template(vm_ref):
@@ -2927,7 +2933,9 @@ class XcpngManager:
                             name = api.VM.get_name_label(vm_ref)
                             uuid = api.VM.get_uuid(vm_ref)
                             db = get_db()
-                            vmid = db.xcpng_get_vmid(self.id, uuid)
+                            vmid = db.xcpng_get_vmid(self.id, uuid, create=new_ids)
+                            if vmid is None:
+                                continue
                             vm_ha.append({
                                 'vmid': vmid,
                                 'name': name,
@@ -4969,6 +4977,9 @@ echo DONE""",
 
     def run_balance_check(self):
         """Main balancing cycle - called from _run_loop."""
+        # a PegaProx standby migrates nothing, whoever calls this (#625)
+        if not ha.is_active():
+            return
         node_status = self.get_node_status()
         if not node_status:
             return

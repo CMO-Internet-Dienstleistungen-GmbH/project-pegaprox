@@ -3386,14 +3386,20 @@ class PegaProxDB:
         self.conn.commit()
         return cursor.rowcount or 0
 
-    def xcpng_get_vmid(self, cluster_id, vm_uuid):
-        """Get or create synthetic VMID for XCP-ng VM UUID"""
+    def xcpng_get_vmid(self, cluster_id, vm_uuid, create=True):
+        """Get or create synthetic VMID for XCP-ng VM UUID.
+
+        create=False only looks it up and gives None for a UUID without an id. That
+        is what a PegaProx standby does: the map is synced, and an id made up there
+        could differ from the one the active hands the same VM (#625)."""
         cursor = self.conn.cursor()
         cursor.execute('SELECT vmid FROM xcpng_vmid_map WHERE cluster_id = ? AND uuid = ?',
                        (cluster_id, vm_uuid))
         row = cursor.fetchone()
         if row:
             return row['vmid']
+        if not create:
+            return None
         # allocate next vmid starting at 100
         cursor.execute('SELECT MAX(vmid) FROM xcpng_vmid_map WHERE cluster_id = ?', (cluster_id,))
         max_row = cursor.fetchone()

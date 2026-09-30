@@ -387,8 +387,10 @@ def _worker_loop():
             # MK Sep 2026 (#625) - a standby forwards too. Its audit rows are its own
             # (logins, failed logins, promotion) and the active never sees them, so
             # holding them back would hide exactly what happens on the standby. The
-            # stats _deliver_one writes into siem_targets get replaced by the next
-            # sync, which is harmless.
+            # stats _deliver_one writes into siem_targets stay here until the next full
+            # pull replaces the table: the standby asks with If-None-Match and the stats
+            # are no part of the etag, so that is when the active changes something
+            # else or this process restarts. Counters of our own sends, so harmless.
             for t in _list_enabled():
                 _deliver_one(t, evt)
         except Exception as e:

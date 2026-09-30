@@ -24,6 +24,7 @@ from pegaprox.globals import (
 from pegaprox.api.helpers import load_server_settings
 from pegaprox.utils.auth import validate_api_token, load_users, build_authz_user
 from pegaprox.core.db import get_db
+from pegaprox.core import ha  # PegaProx's own warm standby (#625)
 from pegaprox.models.permissions import ROLE_ADMIN
 from pegaprox.utils.rbac import has_permission
 from pegaprox.utils import auth as auth_state
@@ -343,8 +344,13 @@ def prometheus_metrics():
         # Ceph health (#540) — best-effort; get_ceph_health_summary returns None when
         # the cluster has no Ceph, so no ceph_* series are emitted for those clusters.
         # One SSH probe per cluster per scrape, consistent with the apt-updates metric.
+        # MK Sep 2026 (#625) - not from a PegaProx standby, like the metrics collector:
+        # ceph -s goes over SSH, the active reads the same nodes already, and a host key
+        # pinned here lands in the known_hosts file the next sync replaces. A standby
+        # scrape then has no ceph series, as for a cluster without Ceph.
         try:
-            ceph = mgr.get_ceph_health_summary() if hasattr(mgr, 'get_ceph_health_summary') else None
+            ceph = (mgr.get_ceph_health_summary()
+                    if ha.is_active() and hasattr(mgr, 'get_ceph_health_summary') else None)
             if ceph:
                 _cmap = {'HEALTH_OK': 0, 'HEALTH_WARN': 1, 'HEALTH_ERR': 2}
                 out.extend(_sample('pegaprox_ceph_health_status', _cmap.get(ceph.get('status'), 3), base))

@@ -16,6 +16,7 @@ METRICS_HISTORY_FILE = os.path.join(CONFIG_DIR, 'metrics_history.json')
 
 from pegaprox.globals import cluster_managers
 from pegaprox.core.db import get_db
+from pegaprox.core import ha
 from pegaprox.utils.concurrent import run_per_node  # #601: SSH-aware bounded fan-out for per-node temp reads
 
 
@@ -299,9 +300,13 @@ def collect_metrics_snapshot():
             # the 5-min collector greenlet, off the broadcast hot-path. Writes both the
             # snapshot (→ persisted history) and the manager temp-cache (→ read by the
             # 60s alert loop, which must not SSH).
+            # MK Sep 2026 (#625) - not from a PegaProx standby, and neither is the BMC and
+            # Redfish fan-out below: the active reads the same nodes already, and a TOFU pin
+            # made here would land in the known_hosts file the sync replaces. The API figures
+            # above and below are what a standby's live view shows.
             try:
                 online_node_names = list(cluster_data['nodes'].keys())
-                if online_node_names:
+                if online_node_names and ha.is_active():
                     node_calls = {name: (lambda nm: _node_hottest_temp(mgr, nm))
                                   for name in online_node_names}
                     temp_by_node = run_per_node(node_calls, max_concurrent=8, timeout=90)
@@ -345,7 +350,8 @@ def collect_metrics_snapshot():
                 _rf_enabled = _redfish_consent_state()[0]
             except Exception:
                 _hw_enabled = _rf_enabled = False
-            if (_hw_enabled or _rf_enabled) and getattr(mgr, 'cluster_type', 'proxmox') == 'proxmox':
+            if ((_hw_enabled or _rf_enabled) and getattr(mgr, 'cluster_type', 'proxmox') == 'proxmox'
+                    and ha.is_active()):
                 try:
                     online_node_names = list(cluster_data['nodes'].keys())
                     if online_node_names:

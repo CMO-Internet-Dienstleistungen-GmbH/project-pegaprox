@@ -303,6 +303,12 @@ def validate_ws_token_api():
     and trust the token alone to gate it. cluster_id is OPTIONAL for back-compat
     (the VNC paths in vms.py / VM-level shells call without it today).
     """
+    # #625 - only the console servers ask here: the node shell and the VM terminal of
+    # the SSH server. A standby opens neither, whatever the token says.
+    from pegaprox.api.ha import standby_console_refusal
+    refused = standby_console_refusal()
+    if refused:
+        return refused
     token = request.args.get('token')
     if not token:
         return jsonify({'error': 'Token required'}), 401

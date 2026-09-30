@@ -580,6 +580,16 @@ def _directory_agrees_with_synced_row(ldap_result, row):
             and (would_be.get('tenant_permissions') or {}) == (row.get('tenant_permissions') or {}))
 
 
+def _ha_banner():
+    """ha.banner(), and on a standby whether it shows the clusters live. With the live
+    view off its cluster list is empty on purpose, and the UI has to say so."""
+    from pegaprox.core import ha
+    out = ha.banner()
+    if out.get('role') == ha.ROLE_STANDBY:
+        out['live_view'] = bool(ha.live_view())
+    return out
+
+
 @bp.route('/api/auth/login', methods=['POST'])
 def auth_login():
     """login endpoint - MK"""
@@ -1027,7 +1037,7 @@ def auth_login():
         # NS: Security warning if using default password
         'security_warning': 'DEFAULT_PASSWORD' if (user['role'] == ROLE_ADMIN and password == 'admin') else None,
         'requires_password_change': bool(user.get('force_password_change')),
-        'ha': ha.banner(),  # MK Sep 2026 (#625) - role, and on a standby where it follows
+        'ha': _ha_banner(),  # MK Sep 2026 (#625) - role, and on a standby where it follows
     })
     
     # Set session cookie with security flags
@@ -1299,7 +1309,7 @@ def auth_check():
         'reverse_proxy_enabled': effective_reverse_proxy(settings),
         'air_gap_mode': settings.get('air_gap_mode', False),
         'default_theme': default_theme,
-        'ha': ha.banner(),
+        'ha': _ha_banner(),
     })
 
 
@@ -1349,6 +1359,13 @@ def get_cluster_creds_internal(cluster_id):
     MK: Returns node IPs for SSH connections
     For single-node setups, we use the cluster host directly
     """
+    # #625 - node addresses and a fresh PVE ticket for a shell: that is a console, and
+    # a standby opens none (the legacy session path of the SSH server lands here)
+    from pegaprox.api.ha import standby_console_refusal
+    refused = standby_console_refusal()
+    if refused:
+        return refused
+
     # Check session from cookie
     session_id = request.cookies.get('session') or request.cookies.get('session_id')
     

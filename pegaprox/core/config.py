@@ -12,6 +12,7 @@ from pathlib import Path
 
 from pegaprox.constants import CONFIG_DIR, KEY_FILE, CONFIG_FILE, CONFIG_FILE_ENCRYPTED
 from pegaprox.core.db import get_db, ENCRYPTION_AVAILABLE
+from pegaprox.core import ha
 from pegaprox.globals import cluster_managers
 
 try:
@@ -112,6 +113,14 @@ def save_config():
     
     SQLite instead of JSON now
     """
+    # MK Sep 2026 (#625) - on a standby the clusters rows are the active's, and this
+    # writes every running manager's in-memory config back over them. The fallback
+    # discovery on each reconnect gets here, so would a cluster the active deleted.
+    # Nothing heals such a write: the standby asks with If-None-Match, and the active
+    # answers 304 until it changes something itself.
+    if not ha.is_active():
+        logging.debug("save_config on a standby - the clusters rows are the active instance's")
+        return False
     if not cluster_managers:
         logging.warning("save_config called with no clusters - skipping")
         return False
@@ -120,6 +129,10 @@ def save_config():
         db = get_db()
 
         for cluster_id, manager in cluster_managers.items():
+            # an ESXi host registered for XHM lives in vmware_servers. Saved here it would
+            # come back at the next start as a Proxmox manager pointed at the ESXi host.
+            if getattr(manager, 'cluster_type', None) == 'esxi':
+                continue
             try:
                 # Sanitize fallback_hosts
                 fallback_hosts = getattr(manager.config, 'fallback_hosts', []) or []
