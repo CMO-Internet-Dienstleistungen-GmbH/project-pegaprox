@@ -1054,7 +1054,7 @@
         // LW: I did the UI, Marcus handled the backend websocket stuff
         function NodeModal({ node, clusterId, clusterType, onClose, addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, haReadOnly, haStandby } = useAuth();  // NS: Fix - need auth!
+            const { getAuthHeaders, haReadOnly, haConsolesElsewhere } = useAuth();  // NS: Fix - need auth!
             const { isCorporate } = useLayout();
             const [activeTab, setActiveTab] = useState('summary');
             const [loading, setLoading] = useState(true);
@@ -1104,7 +1104,7 @@
             // #625 v2 - a standby shows the node but changes nothing on it: every tab that can
             // change something renders with its controls disabled. A forwarding standby
             // changes it through the active, so only a read-only one locks them. The shell
-            // tab stays on every standby and points to the shell on the active instead.
+            // tab points to the shell on the active instead, unless this one serves users.
             const tabs = allTabs;
             const lockedTab = haReadOnly && !['summary', 'performance', 'tasks'].includes(activeTab);
             // spread on the fieldsets around the parts that change the node; what only reads
@@ -1909,9 +1909,9 @@
                                         </div>
                                     )}
 
-                                    {activeTab === 'shell' && haStandby && <HaConsoleOnActive />}
+                                    {activeTab === 'shell' && haConsolesElsewhere && <HaConsoleOnActive />}
 
-                                    {activeTab === 'shell' && !haStandby && (
+                                    {activeTab === 'shell' && !haConsolesElsewhere && (
                                         <div className="h-full flex flex-col">
                                             <div className="flex items-center justify-between mb-4">
                                                 <div className="flex items-center gap-3">
@@ -3580,7 +3580,7 @@
                     </div>
 
                     {/* Fullscreen Shell Modal */}
-                    {!haStandby && data.shellFullscreen && (
+                    {!haConsolesElsewhere && data.shellFullscreen && (
                         <div className="fixed inset-0 z-[70] bg-black flex flex-col">
                             <div className="flex items-center justify-between px-4 py-2 bg-proxmox-dark border-b border-proxmox-border">
                                 <div className="flex items-center gap-3">
@@ -4786,11 +4786,11 @@
 
         function CorporateNodeDetailView({ node, clusterId, clusterHost, clusterMetrics, clusterResources, onBack, onOpenNodeConfig, onMaintenanceToggle, onNodeAction, onStartUpdate, onSelectVm, addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, reverseProxyEnabled, haReadOnly, haStandby } = useAuth();
+            const { getAuthHeaders, reverseProxyEnabled, haReadOnly, haConsolesElsewhere } = useAuth();
             // #625 v2 - a standby shows the node: no power, maintenance or update actions, no
             // shell, and the configure and hardware forms render disabled
             // A forwarding standby acts through the active again; the shell tab points
-            // to the shell on the active on every standby
+            // to the shell on the active on every standby that does not serve users
             const [activeDetailTab, setActiveDetailTab] = useState('summary');
             const [showActionsMenu, setShowActionsMenu] = useState(false);
             const [configSubTab, setConfigSubTab] = useState('network');
@@ -5888,8 +5888,8 @@
                         )}
 
                         {/* Shell Tab */}
-                        {activeDetailTab === 'shell' && haStandby && <HaConsoleOnActive />}
-                        {activeDetailTab === 'shell' && !haStandby && (
+                        {activeDetailTab === 'shell' && haConsolesElsewhere && <HaConsoleOnActive />}
+                        {activeDetailTab === 'shell' && !haConsolesElsewhere && (
                             // NS #727 — clip (not hidden) so Firefox's selection-autoscroll can't
                             // scroll this panel; hidden boxes stay programmatically scrollable, clip doesn't.
                             <div className="bg-black border border-proxmox-border" style={{height: '500px', overflow: 'clip'}}>

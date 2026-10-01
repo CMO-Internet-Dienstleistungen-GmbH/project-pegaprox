@@ -1308,9 +1308,10 @@
         // DELETE with auth, optional confirm() for destructive ops, reload on success.
         // #625: `acts` is false on a standby, and the pages show their changing buttons
         // only with it; a refusal that still comes back says why, in the user's language.
-        // True again on a standby that forwards; the active out of reach says so too
+        // True again on a standby that forwards; the active out of reach says so too.
+        // A member that serves users names the leader in both.
         function useCloudMutate(reload) {
-            const { getAuthHeaders, haReadOnly } = useAuth();
+            const { getAuthHeaders, haReadOnly, haServing } = useAuth();
             const { t } = useTranslation();
             const [busy, setBusy] = React.useState('');
             const run = React.useCallback((key, method, path, body, confirmMsg) => {
@@ -1320,11 +1321,12 @@
                 if (body !== undefined) opts.body = JSON.stringify(body);
                 fetch(path, opts)
                     .then(r => r.ok ? r.json().catch(() => ({})) : r.json().catch(() => ({})).then(b => Promise.reject(
-                        new Error(b && b.code === 'HA_STANDBY' ? t('pgHaStandbyRefused')
-                            : b && b.code === 'HA_ACTIVE_UNREACHABLE' ? t('pgHaActiveUnreachable') : 'HTTP ' + r.status))))
+                        new Error(b && b.code === 'HA_STANDBY' ? (haServing ? t('pgHaServingRefused') : t('pgHaStandbyRefused'))
+                            : b && b.code === 'HA_ACTIVE_UNREACHABLE' ? (haServing ? t('pgHaLeaderUnreachable') : t('pgHaActiveUnreachable'))
+                            : 'HTTP ' + r.status))))
                     .then(() => { setBusy(''); if (reload) reload(); })
                     .catch(e => { setBusy(''); window.alert('Action failed: ' + (e && e.message || e)); });
-            }, [reload, t]);
+            }, [reload, t, haServing]);
             return { busy, run, acts: !haReadOnly };
         }
         function CloudRowActions({ children }) { return <td><div style={{ display: 'flex', gap: 4, justifyContent: 'flex-end' }}>{children}</div></td>; }
@@ -2255,7 +2257,7 @@
             // server-computed, already false for tenant/cluster-confined users; a standby
             // installs nothing (#625), like the sidebar entry in the other two layouts. Not
             // even a forwarding one: the answer URL it would show is this instance's own.
-            const { ha, haStandby } = useAuth();
+            const { ha, haStandby, haConsolesElsewhere } = useAuth();
             const canAutoInstall = !!(currentUser && currentUser.autoinstall_access) && !haStandby;
 
             // PegaProx t() ECHOES the key back on a miss, so `t('cloud.x') || 'Fallback'`
@@ -2291,10 +2293,10 @@
                 multiCluster: safeClusters.length > 1,   // gate the cross-cluster migrate item
                 // what the dashboard handed over; a standby leaves out everything that acts (#625)
                 has: (k) => typeof actions?.[k] === 'function',
-                // a standby leaves out the consoles too, forwarding or not; this opens the
-                // guest's console on the active in their place
-                consoleOnActive: haStandby ? (r) => haOpenOnActive(ha && ha.peer_url, haConsoleSearch(stamp(r))) : null,
-            }), [actions, cid, safeClusters.length, haStandby, ha && ha.peer_url]);
+                // a standby leaves out the consoles too, forwarding or not, unless it serves
+                // users; this opens the guest's console on the active in their place
+                consoleOnActive: haConsolesElsewhere ? (r) => haOpenOnActive(ha && ha.peer_url, haConsoleSearch(stamp(r))) : null,
+            }), [actions, cid, safeClusters.length, haConsolesElsewhere, ha && ha.peer_url]);
 
             const vms = safeResources.filter(r => r && r.type === 'qemu');
             const cts = safeResources.filter(r => r && r.type === 'lxc');

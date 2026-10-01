@@ -203,7 +203,7 @@ def test_the_cloud_shell_reads_the_flag_off_the_current_user(cloud):
     # that forwards either: the answer URL the page shows would be the standby's own
     assert 'const canAutoInstall = !!(currentUser && currentUser.autoinstall_access) && !haStandby;' in cloud
     shell = cloud[cloud.index('function CloudShell('):]
-    assert shell.index('const { ha, haStandby } = useAuth();') < shell.index('const canAutoInstall =')
+    assert shell.index('const { ha, haStandby, haConsolesElsewhere } = useAuth();') < shell.index('const canAutoInstall =')
     assert 'canAutoInstall={canAutoInstall}' in cloud
 
 
@@ -216,7 +216,7 @@ def test_every_layout_keeps_the_entry_off_every_standby(dash):
         assert gate not in _read(VM_MODALS), gate
     assert dash.count('{canAutoInstall && !haStandby && (') == 2
     assert ("const { user, sessionId, logout, getAuthHeaders, isAdmin, passwordExpiry, updatePreferences, "
-            "ha, haReadOnly, haStandby, refreshHa } = useAuth();") in dash
+            "ha, haReadOnly, haStandby, haConsolesElsewhere, haServing, refreshHa } = useAuth();") in dash
 
 
 def test_the_cloud_page_hands_the_panel_the_raw_t(cloud):

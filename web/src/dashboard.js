@@ -780,6 +780,8 @@
         // from and that changes belong on the active one. Admins get a way to the HA tab.
         // Cloud passes cloud so it picks up the shell's own tokens.
         // A standby that forwards says that what is done here is carried out there.
+        // A member that serves users is an active instance to them: it names the leader
+        // that runs the automation, or says so when the leader stops answering.
         function HaStandbyBanner({ onOpenHa, cloud = false }) {
             const { t, language } = useTranslation();
             const { ha, isAdmin } = useAuth();
@@ -795,39 +797,63 @@
 
             if (!standby) return null;
 
-            const text = t(ha.forwarding === true ? 'pgHaBannerForwarding' : 'pgHaBannerStandby')
+            const serving = ha.serving === true;
+            const leaderDown = serving && ha.leader_reachable === false;
+            const text = t(leaderDown ? 'pgHaBannerLeaderDown'
+                    : serving ? 'pgHaBannerServing'
+                    : ha.forwarding === true ? 'pgHaBannerForwarding' : 'pgHaBannerStandby')
                 .replace('{url}', ha.peer_url || '-')
                 .replace('{time}', ha.last_sync_at ? haRelTime(ha.last_sync_at, language) : t('pgHaNotYet'));
+            // yellow on a standby, blue on a serving member, red while its leader is away
+            const tone = leaderDown ? 'red' : serving ? 'blue' : 'yellow';
+            const icon = leaderDown ? <Icons.AlertTriangle /> : <Icons.Layers />;
             const button = isAdmin && onOpenHa && (
                 <button onClick={onOpenHa}
-                    className={cloud ? 'cloud-btn cloud-btn-sm' : 'px-3 py-1 rounded-lg text-xs font-medium bg-yellow-600 hover:bg-yellow-700 text-white whitespace-nowrap'}
+                    className={cloud ? 'cloud-btn cloud-btn-sm' : `px-3 py-1 rounded-lg text-xs font-medium text-white whitespace-nowrap ${HA_BANNER_TONE[tone].button}`}
                     style={cloud ? { whiteSpace: 'nowrap' } : undefined}>
                     {t('pgHaTab')}
                 </button>
             );
+            const data = {
+                'data-ha-forwarding': ha.forwarding === true ? 'on' : 'off',
+                'data-ha-serving': serving ? 'on' : 'off',
+                'data-ha-leader': leaderDown ? 'down' : undefined,
+            };
 
             if (cloud) {
+                const c = HA_BANNER_TONE[tone].cloud;
                 return (
-                    <div data-ha-banner="cloud" data-ha-forwarding={ha.forwarding === true ? 'on' : 'off'} role="status"
+                    <div data-ha-banner="cloud" {...data} role="status"
                         style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 16px', fontSize: 13,
-                                 background: 'rgba(245,185,69,0.14)', borderBottom: '1px solid rgba(245,185,69,0.42)',
-                                 color: 'var(--cloud-warning, #e0a82e)' }}>
-                        <span style={{ display: 'inline-flex', flexShrink: 0 }}><Icons.Layers /></span>
+                                 background: c[0], borderBottom: `1px solid ${c[1]}`, color: c[2] }}>
+                        <span style={{ display: 'inline-flex', flexShrink: 0 }}>{icon}</span>
                         <span style={{ flex: '1 1 auto', minWidth: 0 }}>{text}</span>
                         {button}
                     </div>
                 );
             }
             return (
-                <div data-ha-banner="classic" data-ha-forwarding={ha.forwarding === true ? 'on' : 'off'} role="status" className="px-4 py-2 bg-yellow-500/10 border-b border-yellow-500/40">
+                <div data-ha-banner="classic" {...data} role="status" className={`px-4 py-2 border-b ${HA_BANNER_TONE[tone].box}`}>
                     <div className="flex items-center gap-3 text-sm">
-                        <span className="flex-shrink-0 text-yellow-400"><Icons.Layers /></span>
-                        <span className="flex-1 min-w-0 text-yellow-300">{text}</span>
+                        <span className={`flex-shrink-0 ${HA_BANNER_TONE[tone].icon}`}>{icon}</span>
+                        <span className={`flex-1 min-w-0 ${HA_BANNER_TONE[tone].text}`}>{text}</span>
                         {button}
                     </div>
                 </div>
             );
         }
+
+        const HA_BANNER_TONE = {
+            yellow: { box: 'bg-yellow-500/10 border-yellow-500/40', icon: 'text-yellow-400', text: 'text-yellow-300',
+                      button: 'bg-yellow-600 hover:bg-yellow-700',
+                      cloud: ['rgba(245,185,69,0.14)', 'rgba(245,185,69,0.42)', 'var(--cloud-warning, #e0a82e)'] },
+            blue: { box: 'bg-blue-500/10 border-blue-500/40', icon: 'text-blue-400', text: 'text-blue-300',
+                    button: 'bg-blue-600 hover:bg-blue-700',
+                    cloud: ['rgba(56,189,248,0.12)', 'rgba(56,189,248,0.40)', 'var(--cloud-info, #38bdf8)'] },
+            red: { box: 'bg-red-500/10 border-red-500/50', icon: 'text-red-400', text: 'text-red-300',
+                   button: 'bg-red-600 hover:bg-red-700',
+                   cloud: ['rgba(248,113,113,0.14)', 'rgba(248,113,113,0.42)', 'var(--cloud-error, #f87171)'] },
+        };
 
         // Cluster Sidebar Item Component - NS Jan 2026
         function ClusterSidebarItem({ cluster, idx, selectedCluster, setSelectedCluster, nodeAlerts, clusterGroups, isAdmin, handleDeleteCluster, setShowAssignGroup, setRenamingCluster, setRenameValue, setReconfigureCluster, t, getAuthHeaders, fetchClusters, addToast, isCorporate, expandedSidebarClusters, toggleSidebarCluster, onContextMenu, hwHealth }) {
@@ -4705,9 +4731,8 @@
         // Tracks open events grouped by kind (vm_config, storage, network, cluster_options).
         // Admin can rescan, set baseline, acknowledge/promote events.
         function DriftTab({ clusterId, clusterName, authFetch, addToast, t, isAdmin }) {
-            // the admin buttons here change things: on a standby they are the active's (#625)
-            // Ack names an event row every instance keeps for itself: never from a standby
-            const { haReadOnly, haStandby } = useAuth();
+            // the admin buttons here change things: a standby hands them to the active (#625)
+            const { haReadOnly } = useAuth();
             const canAct = isAdmin && !haReadOnly;
             const [status, setStatus] = React.useState(null);
             const [events, setEvents] = React.useState([]);
@@ -4715,21 +4740,30 @@
             const [busy, setBusy] = React.useState(false);
             const [scanning, setScanning] = React.useState(false);
             const [expanded, setExpanded] = React.useState({});
+            // #625: only the leader keeps the drift rows; a member says so while it is away
+            // and drops what it showed, an ack must never name a row from elsewhere
+            const [leaderAway, setLeaderAway] = React.useState(false);
 
             const refresh = async () => {
                 if (!clusterId) return;
                 setBusy(true);
                 try {
-                    const [s, e] = await Promise.all([
-                        authFetch(`${API_URL}/clusters/${clusterId}/drift/status`).then(r => r?.json()).catch(() => null),
-                        authFetch(`${API_URL}/clusters/${clusterId}/drift/events?status=${filter}&limit=200`).then(r => r?.json()).catch(() => null),
+                    const [sr, er] = await Promise.all([
+                        authFetch(`${API_URL}/clusters/${clusterId}/drift/status`),
+                        authFetch(`${API_URL}/clusters/${clusterId}/drift/events?status=${filter}&limit=200`),
                     ]);
+                    const away = (await haLeaderAway(sr)) || (await haLeaderAway(er));
+                    setLeaderAway(away);
+                    if (away) { setStatus(null); setEvents([]); return; }
+                    const s = await sr?.json().catch(() => null);
+                    const e = await er?.json().catch(() => null);
                     if (s && !s.error) setStatus(s);
                     if (e && e.events) setEvents(e.events);
                 } finally { setBusy(false); }
             };
 
-            React.useEffect(() => { refresh(); /* eslint-disable-line */ }, [clusterId, filter]);
+            // again when forwarding comes or goes: the list is the leader's then, or not
+            React.useEffect(() => { refresh(); /* eslint-disable-line */ }, [clusterId, filter, haReadOnly]);
 
             const scan = async () => {
                 setScanning(true);
@@ -4878,7 +4912,11 @@
                         </div>
                     )}
 
-                    {events.length === 0 ? (
+                    {leaderAway ? (
+                        <div data-ha-leader-away="drift" className="bg-proxmox-card border border-proxmox-border rounded-xl p-6 text-center text-sm text-gray-400">
+                            {t('pgHaLeaderAwayView')}
+                        </div>
+                    ) : events.length === 0 ? (
                         <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-6 text-center text-sm text-gray-500">
                             {filter === 'open' ? (t('driftNoOpen') || 'No open drift events. Cluster matches baseline.')
                                               : (t('driftNoEvents') || 'No events for this filter.')}
@@ -4901,7 +4939,7 @@
                                                 </span>
                                             </div>
                                             <div className="flex items-center gap-2 flex-shrink-0">
-                                                {canAct && !haStandby && ev.status === 'open' && (
+                                                {canAct && ev.status === 'open' && (
                                                     <>
                                                         <button onClick={e => { e.stopPropagation(); ack(ev.id, false); }}
                                                             className="text-[11px] px-2 py-0.5 bg-proxmox-darker border border-proxmox-border rounded text-gray-300 hover:text-white">
@@ -4947,8 +4985,8 @@
         // recent inbox). Subscribes via SW + VAPID, persists subscription on the
         // server. Wake-up pushes hit the SW, which fetches /api/push/inbox.
         function PushBellButton({ authFetch, addToast, t }) {
-            // the inbox is this instance's own: no standby clears it (#625)
-            const { haStandby } = useAuth();
+            // clearing the inbox goes through the active like any change (#625)
+            const { haReadOnly } = useAuth();
             const [open, setOpen] = React.useState(false);
             const [supported, setSupported] = React.useState(true);
             const [permission, setPermission] = React.useState(typeof Notification !== 'undefined' ? Notification.permission : 'default');
@@ -4956,6 +4994,7 @@
             const [items, setItems] = React.useState([]);
             const [unread, setUnread] = React.useState(0);
             const [busy, setBusy] = React.useState(false);
+            const [leaderAway, setLeaderAway] = React.useState(false);  // the inbox is the leader's (#625)
 
             const checkSubState = async () => {
                 if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
@@ -4971,6 +5010,9 @@
             const refreshInbox = async () => {
                 try {
                     const r = await authFetch(`${API_URL}/push/inbox`);
+                    const away = await haLeaderAway(r);
+                    setLeaderAway(away);
+                    if (away) { setItems([]); setUnread(0); return; }
                     if (r?.ok) {
                         const d = await r.json();
                         const list = d.items || [];
@@ -5098,7 +5140,7 @@
                             <div className="absolute right-0 top-full mt-2 w-80 bg-proxmox-card border border-proxmox-border rounded-xl shadow-xl z-50 overflow-hidden">
                                 <div className="px-3 py-2 border-b border-proxmox-border flex items-center justify-between">
                                     <div className="text-sm font-semibold text-white">{t('notifications') || 'Notifications'}</div>
-                                    {items.length > 0 && !haStandby && (
+                                    {items.length > 0 && !haReadOnly && (
                                         <button onClick={clearInbox} className="text-[10px] text-gray-500 hover:text-white">
                                             {t('markAllRead') || 'mark read'}
                                         </button>
@@ -5142,7 +5184,12 @@
 
                                 {/* Inbox */}
                                 <div className="max-h-72 overflow-y-auto">
-                                    {items.length === 0 && (
+                                    {leaderAway && (
+                                        <div data-ha-leader-away="inbox" className="px-3 py-6 text-center text-xs text-gray-400">
+                                            {t('pgHaLeaderAwayView')}
+                                        </div>
+                                    )}
+                                    {items.length === 0 && !leaderAway && (
                                         <div className="px-3 py-6 text-center text-xs text-gray-500">
                                             {t('inboxEmpty') || 'No notifications yet'}
                                         </div>
@@ -8070,10 +8117,10 @@
 
         function PegaProxDashboard() {
             const { t } = useTranslation();
-            const { user, sessionId, logout, getAuthHeaders, isAdmin, passwordExpiry, updatePreferences, ha, haReadOnly, haStandby, refreshHa } = useAuth();
+            const { user, sessionId, logout, getAuthHeaders, isAdmin, passwordExpiry, updatePreferences, ha, haReadOnly, haStandby, haConsolesElsewhere, haServing, refreshHa } = useAuth();
             // #625: a standby shows the clusters read-only, or none at all with its live view off.
             // Since forwarding, haReadOnly holds only while it does not forward, haStandby on
-            // every standby
+            // every standby, haConsolesElsewhere on one that does not serve users
             // on a standby only the reading permissions count, for admins too
             const can = (permission) => (!haReadOnly || haReadPermission(permission)) &&
                 (isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes(permission)));
@@ -8657,6 +8704,7 @@
             const [alertChannels, setAlertChannels] = useState([]);
             const [pickedChannels, setPickedChannels] = useState(['email']);
             const [activeAlerts, setActiveAlerts] = useState([]);  // NS #501 — firing incidents
+            const [activeAlertsAway, setActiveAlertsAway] = useState(false);  // kept by the leader only (#625)
             const [escSteps, setEscSteps] = useState([]);  // NS #501 — escalation steps in the create modal
             const [alertMetricSel, setAlertMetricSel] = useState('cpu');  // #601 — drives the threshold unit (% vs °C)
             const [editingAlert, setEditingAlert] = useState(null);  // #618 — alert being edited (null = create)
@@ -8768,12 +8816,14 @@
                     // caller gets the same words as err.error, so its own error toast is the
                     // same message and addToast drops it. quiet: a background read sent as a POST.
                     // A forwarding standby answers 503 when the active is out of reach; the
-                    // same, in other words.
+                    // same, in other words. Not for a read: a list only the leader keeps says
+                    // so itself (haLeaderAway), and a poll would toast every round.
                     if ((res.status === 409 || res.status === 503) && haRefusedRef.current) {
                         const body = await res.clone().json().catch(() => null);
                         const code = body && body.code;
                         if ((res.status === 409 && code === 'HA_STANDBY') || (res.status === 503 && code === 'HA_ACTIVE_UNREACHABLE')) {
-                            const error = haRefusedRef.current(quiet, code);
+                            const read = res.status === 503 && (rest.method || 'GET').toUpperCase() === 'GET';
+                            const error = haRefusedRef.current(quiet || read, code);
                             return new Response(JSON.stringify({ ...body, error }),
                                 { status: res.status, statusText: res.statusText, headers: { 'Content-Type': 'application/json' } });
                         }
@@ -8821,10 +8871,11 @@
             // the words for a standby refusal (#625), fresh every render for the language.
             // The active out of reach has its own, and a console refused on a forwarding
             // standby too. Either answer may mean forwarding just changed, so the banner and
-            // the buttons are read again.
+            // the buttons are read again. A member that serves users is the active instance
+            // to them: its words name the leader.
             haRefusedRef.current = (quiet = false, code = '') => {
-                const msg = t(code === 'HA_ACTIVE_UNREACHABLE' ? 'pgHaActiveUnreachable'
-                    : code === 'console' ? 'pgHaConsoleOnActive' : 'pgHaStandbyRefused');
+                const msg = t(code === 'HA_ACTIVE_UNREACHABLE' ? (haServing ? 'pgHaLeaderUnreachable' : 'pgHaActiveUnreachable')
+                    : code === 'console' ? 'pgHaConsoleOnActive' : haServing ? 'pgHaServingRefused' : 'pgHaStandbyRefused');
                 if (!quiet) addToast(msg, 'error');
                 if (!quiet && code !== 'console') refreshHa?.();
                 return msg;
@@ -10287,6 +10338,7 @@
                 if (!clusterId) return;
                 try {
                     const r = await authFetch(`${API_URL}/clusters/${clusterId}/active-alerts`);
+                    setActiveAlertsAway(await haLeaderAway(r));
                     if (r && r.ok) { const d = await r.json(); setActiveAlerts(d.active_alerts || []); }
                     else setActiveAlerts([]);
                 } catch (e) { setActiveAlerts([]); }
@@ -12482,7 +12534,7 @@
 
             // VMware Console Ticket
             const openVmwareConsole = async (vmId) => {
-                if (haStandby) { haRefusedRef.current?.(false, 'console'); return; }  // consoles only on the active (#625)
+                if (haConsolesElsewhere) { haRefusedRef.current?.(false, 'console'); return; }  // consoles only on the active (#625)
                 try {
                     const resp = await authFetch(`${API_URL}/vmware/${selectedVMware.id}/vms/${vmId}/console`, { method: 'POST' });
                     if (resp?.ok) {
@@ -13685,7 +13737,7 @@
             const handleOpenSpice = async (resource) => {
                 const cId = resource._clusterId || selectedCluster?.id;
                 if (!cId) return;
-                if (haStandby) { haRefusedRef.current?.(false, 'console'); return; }  // consoles only on the active (#625)
+                if (haConsolesElsewhere) { haRefusedRef.current?.(false, 'console'); return; }  // consoles only on the active (#625)
                 try {
                     const r = await authFetch(`${API_URL}/clusters/${cId}/vms/${resource.node}/${resource.type}/${resource.vmid}/spice`);
                     if (!r.ok) {
@@ -13708,7 +13760,7 @@
             const handleOpenConsole = async (resource) => {
                 const cId = resource._clusterId || selectedCluster?.id;
                 if (!cId) return;
-                if (haStandby) { haRefusedRef.current?.(false, 'console'); return; }  // a forwarding standby too (#625)
+                if (haConsolesElsewhere) { haRefusedRef.current?.(false, 'console'); return; }  // a forwarding standby too, unless it serves users (#625)
                 // NS: Feb 2026 - Use correct cluster's host for cross-cluster console
                 const cluster = clusters.find(c => c.id === cId) || selectedCluster;
                 const info = {
@@ -13842,8 +13894,8 @@
                                 fetchSidebarClusterData(clusterId);
                             } catch (e) { addToast(t('connectionError'), 'error'); }
                         }, disabled: !online },
-                        ...(haStandby ? onActiveItems('node.shell', '', !online) : [
-                        { perm: 'node.shell', label: t('sshConsole') || 'SSH Console', icon: <Icons.Terminal className="w-3.5 h-3.5" />, onClick: () => { selectCluster(); const c = clusters.find(cl => cl.id === clusterId); if (c) { setConsoleInfo({ vmid: 0, node: nodeName, type: 'node', host: c.host }); setConsoleVm({ vmid: 0, node: nodeName, type: 'node', name: nodeName }); } }, disabled: !online },
+                        ...(haConsolesElsewhere ? onActiveItems('node.shell', '', !online) : [
+                        { perm: 'node.shell', label: t('sshConsole') || 'SSH Console', icon: <Icons.Terminal className="w-3.5 h-3.5" />, onClick: () => { selectCluster(); const c = clusters.find(cl => cl.id === clusterId); if (c) { setConsoleInfo({ vmid: 0, node: nodeName, type: 'node', host: c.host }); setConsoleVm({ vmid: 0, node: nodeName, type: 'node', name: nodeName }); } }, disabled: !online, console: true },
                         ]),
                         { separator: true },
                         { label: t('refreshData') || 'Refresh', icon: <Icons.RefreshCw className="w-3.5 h-3.5" />, onClick: () => { fetchSidebarClusterData(clusterId); } },
@@ -13906,9 +13958,9 @@
                     const items = [
                         { label: t('power') || 'Power', icon: <Icons.Power className="w-3.5 h-3.5" />, submenu: powerItems },
                         { separator: true },
-                        ...(haStandby ? onActiveItems('vm.console', haConsoleSearch(vm), !isRunning) : [
-                        { perm: 'vm.console', label: t('console') || 'Console', icon: <Icons.Terminal className="w-3.5 h-3.5" />, onClick: () => handleOpenConsole(vm), disabled: !isRunning },
-                        ...(vm.type === 'qemu' ? [{ perm: 'vm.console', label: t('spiceConsole') || 'SPICE', icon: <Icons.ExternalLink className="w-3.5 h-3.5" />, onClick: () => handleOpenSpice(vm), disabled: !isRunning }] : []),
+                        ...(haConsolesElsewhere ? onActiveItems('vm.console', haConsoleSearch(vm), !isRunning) : [
+                        { perm: 'vm.console', label: t('console') || 'Console', icon: <Icons.Terminal className="w-3.5 h-3.5" />, onClick: () => handleOpenConsole(vm), disabled: !isRunning, console: true },
+                        ...(vm.type === 'qemu' ? [{ perm: 'vm.console', label: t('spiceConsole') || 'SPICE', icon: <Icons.ExternalLink className="w-3.5 h-3.5" />, onClick: () => handleOpenSpice(vm), disabled: !isRunning, console: true }] : []),
                         ]),
                         // NS May 2026 — VNC ↔ Term toggle now lives inside the Console modal,
                         // so the separate Terminal entry was removed (one entry point = clearer UX).
@@ -14033,12 +14085,16 @@
             // whose endpoint forgot its own check would go unnoticed. Each entry above carries the
             // permission its endpoint requires; this drops the ones the caller lacks, so that
             // table is the single place to audit instead of 25 call sites.
+            // #625: a console entry asks what the account holds, not can(). It is only in the
+            // menu where this instance opens consoles, and a serving member does so with its
+            // leader away too, while can() keeps only the reading permissions then.
+            const menuAllows = (i) => !i.perm || (i.console ? holds(i.perm) : can(i.perm));
             const buildContextMenuItems = (type, target) => {
-                const kept = buildContextMenuItemsRaw(type, target).filter(i => !i.perm || can(i.perm));
+                const kept = buildContextMenuItemsRaw(type, target).filter(menuAllows);
                 const out = [];
                 for (const item of kept) {
                     if (item.submenu) {
-                        const sub = item.submenu.filter(i => !i.perm || can(i.perm));
+                        const sub = item.submenu.filter(menuAllows);
                         if (!sub.length) continue;          // no children left, drop the parent
                         out.push({ ...item, submenu: sub });
                         continue;
@@ -14104,8 +14160,9 @@
                 };
                 // #625 v2 - a standby hands the shell what reads and nothing that acts;
                 // cloud.js leaves out every entry whose handler is missing
-                // A forwarding standby hands over the actions again, never a console
-                if (haStandby) {
+                // A forwarding standby hands over the actions again, a console only when it
+                // serves users
+                if (haConsolesElsewhere) {
                     ['openConsole', 'openSpice', 'openLxcShell'].forEach(k => { delete cloudActions[k]; });
                 }
                 if (haReadOnly) {
@@ -14840,7 +14897,7 @@
                                                 <Icons.Server />
                                             </div>
                                             {haStandby ? (
-                                                <p className="text-gray-400 text-sm">{ha.live_view === false ? t('pgHaNoClustersLiveOff') : t('pgHaNoClustersHere')}</p>
+                                                <p className="text-gray-400 text-sm">{ha.live_view === false ? t('pgHaNoClustersLiveOff') : haServing ? t('pgHaNoClustersServing') : t('pgHaNoClustersHere')}</p>
                                             ) : (<>
                                             <p className="text-gray-400 text-sm">{t('noClusterSelected')}</p>
                                             <button
@@ -16837,6 +16894,12 @@
                                                         </div>
                                                         
                                                         {/* NS #501 — currently firing incidents (severity + ack) */}
+                                                        {activeAlertsAway && (
+                                                            <div data-ha-leader-away="alerts" className="flex items-center gap-2 p-3 rounded-lg border border-proxmox-border bg-proxmox-dark text-sm text-gray-400">
+                                                                <Icons.AlertTriangle className="w-4 h-4 text-gray-500 shrink-0" />
+                                                                <span>{t('pgHaLeaderAwayView')}</span>
+                                                            </div>
+                                                        )}
                                                         {activeAlerts.length > 0 && (
                                                             <div className="space-y-2">
                                                                 <div className="text-sm font-semibold text-gray-300 flex items-center gap-2">
@@ -16860,8 +16923,7 @@
                                                                                 </div>
                                                                             </div>
                                                                         </div>
-                                                                        {/* a fired alert is a row of this instance's own: never acked from a standby */}
-                                                                        {!a.acked_at && !haStandby && (
+                                                                        {!a.acked_at && !haReadOnly && (
                                                                             <button onClick={() => ackAlert(a.id)} className="px-3 py-1.5 text-xs bg-proxmox-dark hover:bg-proxmox-hover border border-proxmox-border rounded-lg shrink-0">
                                                                                 {t('acknowledge') || 'Acknowledge'}
                                                                             </button>
@@ -20867,13 +20929,13 @@
                                                                             </>
                                                                         )}
                                                                         <div className="w-px h-8 bg-proxmox-border mx-1" />
-                                                                        {/* Console; a standby links to the active's start page instead (#625) */}
-                                                                        {isOn && !haStandby && (
+                                                                        {/* Console; a standby links to the active's start page instead, unless it serves users (#625) */}
+                                                                        {isOn && !haConsolesElsewhere && (
                                                                             <button onClick={() => openVmwareConsole(vmwareSelectedVm)} className="p-2 rounded-lg bg-purple-500/10 text-purple-400 hover:bg-purple-500/20" title={t('vmwareConsoleVmrc')}>
                                                                                 <Icons.Terminal className="w-4 h-4" />
                                                                             </button>
                                                                         )}
-                                                                        {isOn && haStandby && (
+                                                                        {isOn && haConsolesElsewhere && (
                                                                             <HaOnActiveLink iconOnly iconClass="w-4 h-4" className="p-2 rounded-lg bg-purple-500/10 text-purple-400 hover:bg-purple-500/20" />
                                                                         )}
                                                                         {/* More Actions Dropdown */}
@@ -25595,7 +25657,7 @@
         // host, which is one /api/clusters read — the parent window is not involved at all,
         // so the popup survives the opener being closed or navigated away.
         function StandaloneConsole({ consoleKey }) {
-            const { getAuthHeaders, haStandby } = useAuth();
+            const { getAuthHeaders, haConsolesElsewhere } = useAuth();
             const { t } = useTranslation();
             const [state, setState] = useState({ status: 'loading', vm: null, info: null, clusterId: null });
 
@@ -25614,8 +25676,9 @@
                     return;
                 }
                 // consoles are the active's (#625); the server refuses one here anyway.
-                // Forwarding or not; the window offers the same console there instead
-                if (haStandby) {
+                // Forwarding or not; the window offers the same console there instead. A
+                // member that serves users opens it itself
+                if (haConsolesElsewhere) {
                     setState({ status: 'standby', clusterId, info: null,
                                vm: { vmid: Number(vmid), node, type, _clusterId: clusterId } });
                     return;
@@ -25662,7 +25725,7 @@
                     }
                 })();
                 return () => { cancelled = true; };
-            }, [consoleKey, haStandby]);  // eslint-disable-line react-hooks/exhaustive-deps
+            }, [consoleKey, haConsolesElsewhere]);  // eslint-disable-line react-hooks/exhaustive-deps
 
             // window.close() is only allowed for a window script opened. Someone who pasted
             // or bookmarked the link is in an ordinary tab, where it does nothing at all and

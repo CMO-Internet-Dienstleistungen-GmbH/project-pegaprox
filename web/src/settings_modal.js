@@ -9755,6 +9755,8 @@
         // v4: confirmed standbys and member keys, a second step to remove one that is not
         //     confirmed, whether a removed member was told, the note on a removed instance
         // v5: the switch that has a standby carry out what is done on it through the active
+        // v6: the switch that has a standby serve users as an active instance; the active is
+        //     the leader, the one that runs the automation
         // ═══════════════════════════════════════════════
 
         // "3 minutes ago" in the UI language. Intl speaks all nine, so no keys for it.
@@ -9779,13 +9781,19 @@
         const HA_ROLE_STYLE = {
             standalone: 'bg-gray-500/20 text-gray-300 border-gray-500/30',
             active: 'bg-green-500/20 text-green-300 border-green-500/30',
+            serving: 'bg-blue-500/20 text-blue-300 border-blue-500/30',
             standby: 'bg-yellow-500/20 text-yellow-300 border-yellow-500/40',
         };
 
-        function HaRoleBadge({ role, t }) {
-            const label = { standalone: t('pgHaRoleStandalone'), active: t('pgHaRoleActive'), standby: t('pgHaRoleStandby') }[role] || role || '-';
+        // the active is the leader, it runs the automation. A standby that serves users is
+        // an active instance to them and shows as one, every other standby as a standby.
+        function HaRoleBadge({ role, serving = false, t }) {
+            const shown = role === 'standby' && serving ? 'serving' : role;
+            const label = { standalone: t('pgHaRoleStandalone'), active: t('pgHaRoleLeader'), serving: t('pgHaRoleActive'),
+                            standby: t('pgHaRoleStandby') }[shown] || role || '-';
             return (
-                <span className={`px-2 py-0.5 rounded-full border text-xs font-medium ${HA_ROLE_STYLE[role] || HA_ROLE_STYLE.standalone}`}>
+                <span data-ha-badge={shown || undefined}
+                    className={`px-2 py-0.5 rounded-full border text-xs font-medium ${HA_ROLE_STYLE[shown] || HA_ROLE_STYLE.standalone}`}>
                     {label}
                 </span>
             );
@@ -10026,13 +10034,28 @@
                 refreshHa?.();
             });
 
-            // a changed cluster setup on the active: the standby restarts by itself after a
-            // while, this does it now
+            // Serving users is this instance's own too and takes effect at once. It counts only
+            // on a standby with live view and forwarding on (status.serving says whether it does
+            // now): its users get consoles here and see an active instance, the automation
+            // stays with the leader.
+            const serveUsers = status?.serve_users === true;
+            const setServeUsers = (on) => run('serve', async () => {
+                const res = await send('PUT', 'settings', { serve_users: on });
+                if (!res.ok) { addToast?.(res.error, 'error'); return; }
+                addToast?.(t(on ? 'pgHaServeOn' : 'pgHaServeOff'), 'success');
+                load();
+                refreshHa?.();
+            });
+
+            // a live view switched since this standby started waits for a restart, this does
+            // it now. A changed cluster connection is rebuilt in place without one, and a
+            // waiting one is rebuilt at once; either way the answer says which it was.
             const applyNow = () => run('apply', async () => {
                 const res = await send('POST', 'apply-config', {});
                 if (!res.ok) { addToast?.(res.error, 'error'); return; }
-                if (res.data.restarting) setRestarting('standby');
-                else load();
+                if (res.data.restarting) { setRestarting('standby'); return; }
+                addToast?.(t(res.data.reloaded ? 'pgHaReloaded' : 'pgHaNothingToApply'), res.data.reloaded ? 'success' : 'info');
+                load();
             });
 
             const WORD = { promote: 'PROMOTE', unpair: 'UNPAIR', remove: 'REMOVE' };
@@ -10189,7 +10212,7 @@
                                             </td>
                                             <td className={`${cell} font-mono text-xs text-gray-200 whitespace-nowrap`}>{m.url || '-'}</td>
                                             <td className={`${cell} whitespace-nowrap`}>
-                                                {m.role_seen ? <HaRoleBadge role={m.role_seen} t={t} /> : '-'}
+                                                {m.role_seen ? <HaRoleBadge role={m.role_seen} serving={m.serving_seen === true} t={t} /> : '-'}
                                                 {/* confirmed: a standby under the current epoch. Only the active warns
                                                     about the others, since a removal there needs the second step */}
                                                 {m.confirmed_standby === true && (
@@ -10252,6 +10275,13 @@
             const pending = sync.restart_pending || null;
             const liveMismatch = standby && typeof status?.managers_running === 'boolean'
                 && status.managers_running !== liveView;
+            // a changed cluster connection is rebuilt in place, a few seconds after the sync
+            // that brought it; what the last rebuild could not build stays disconnected here
+            const reloadPending = standby && sync.reload_pending ? sync.reload_pending : null;
+            const lastReload = standby && sync.last_reload && typeof sync.last_reload === 'object' ? sync.last_reload : null;
+            const reloadFailed = Array.isArray(lastReload?.failed)
+                ? lastReload.failed.map(f => typeof f === 'string' ? f : (f?.name || f?.key || f?.id || '')).filter(Boolean)
+                : [];
 
             const liveViewCard = (
                 <div className={card} data-ha-live-view={liveView ? 'on' : 'off'}>
@@ -10269,6 +10299,32 @@
                             {row(t('pgHaManagers'), status.managers_running
                                 ? <span className="text-green-300">{t('pgHaManagersRunning')}</span>
                                 : <span className="text-gray-400">{t('pgHaManagersOff')}</span>)}
+                            {lastReload && row(t('pgHaLastReload'), (
+                                <span data-ha-last-reload>
+                                    {when(lastReload.at)}
+                                    {lastReload.reason && <span className="block text-xs text-gray-500">{lastReload.reason}</span>}
+                                </span>
+                            ))}
+                            {reloadPending && (
+                                <div className="space-y-2" data-ha-reload-pending>
+                                    <p className="text-xs text-yellow-300">
+                                        {t('pgHaReloadPending')}
+                                        {reloadPending.reason && <span className="block text-gray-400 break-all">{reloadPending.reason}</span>}
+                                    </p>
+                                    <button onClick={applyNow} disabled={!!busy} className={btnGhost}>
+                                        <Icons.RefreshCw />
+                                        {t('pgHaApplyNow')}
+                                    </button>
+                                </div>
+                            )}
+                            {reloadFailed.length > 0 && (
+                                <div className="rounded-lg p-2 text-xs border bg-red-500/10 border-red-500/30 text-red-300 space-y-1" data-ha-reload-failed>
+                                    <div>{t('pgHaReloadFailed')}</div>
+                                    <ul className="font-mono break-all">
+                                        {reloadFailed.map(f => <li key={f}>{f}</li>)}
+                                    </ul>
+                                </div>
+                            )}
                             <p className="text-xs text-yellow-300">{t('pgHaLiveViewRestart')}</p>
                         </>
                     )}
@@ -10291,6 +10347,25 @@
                     </div>
                     {forwardPaused && (
                         <p className="text-xs text-yellow-300" data-ha-forward-paused>{t('pgHaForwardPaused')}</p>
+                    )}
+                </div>
+            );
+
+            // below the two it needs: without either it does nothing, and says so
+            const serveIdle = !liveView || !forwardWrites;
+            const serveCard = (
+                <div className={`${card} md:col-span-2`} data-ha-serve={serveUsers ? 'on' : 'off'}>
+                    <div className="flex items-start justify-between gap-4">
+                        <div className="min-w-0">
+                            <label className="block text-sm font-medium text-white" htmlFor="pgha-serve">{t('pgHaServeUsers')}</label>
+                            <p className="text-xs text-gray-500 mt-1">{t('pgHaServeUsersHint')}</p>
+                        </div>
+                        <button id="pgha-serve" type="button" role="switch" aria-checked={serveUsers}
+                            onClick={() => setServeUsers(!serveUsers)} disabled={!!busy || broken}
+                            className={`toggle-switch flex-shrink-0 disabled:opacity-50 disabled:cursor-not-allowed ${serveUsers ? 'active' : ''}`} />
+                    </div>
+                    {serveIdle && (
+                        <p className="text-xs text-yellow-300" data-ha-serve-idle>{t('pgHaServeNeeds')}</p>
                     )}
                 </div>
             );
@@ -10501,9 +10576,15 @@
                                 <Icons.Layers />
                                 {t('pgHaTab')}
                             </h3>
-                            <HaRoleBadge role={role} t={t} />
+                            <HaRoleBadge role={role} serving={status.serving === true} t={t} />
                         </div>
                         <p className="text-sm text-gray-400 max-w-3xl">{t('pgHaIntro')}</p>
+                        {role !== 'standalone' && (
+                            <p className="text-xs text-gray-400 max-w-3xl flex items-start gap-2" data-ha-automation>
+                                <span className="flex-shrink-0"><Icons.Zap /></span>
+                                <span>{t('pgHaAutomationLeader')}</span>
+                            </p>
+                        )}
                         <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-gray-400">
                             <span>{t('pgHaEpoch')}: <span className="text-gray-200">{status.epoch}</span></span>
                             <span>{t('pgHaInstanceId')}: <span className="font-mono text-gray-200" title={status.instance_id}>{(status.instance_id || '').slice(0, 8)}</span></span>
@@ -10562,6 +10643,7 @@
                             </div>
                             {liveViewCard}
                             {forwardCard}
+                            {serveCard}
                         </div>
                     )}
 
@@ -10576,6 +10658,7 @@
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 {liveViewCard}
                                 {forwardCard}
+                                {serveCard}
                             </div>
                             <div className="flex flex-wrap gap-2">
                                 <button onClick={() => openConfirm('unpair')} disabled={!!busy} className={btnGhost}>
@@ -10622,6 +10705,7 @@
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 {liveViewCard}
                                 {forwardCard}
+                                {serveCard}
                             </div>
                             <div className="flex flex-wrap gap-2">
                                 <button onClick={syncNow} disabled={!!busy}

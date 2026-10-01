@@ -260,7 +260,7 @@ def test_the_banner_shows_on_a_standby_only(banner):
     assert "const standby = ha?.role === 'standby';" in banner
     assert 'if (!standby) return null;' in banner
     # read-only, or carried out on the active while the standby forwards
-    assert "t(ha.forwarding === true ? 'pgHaBannerForwarding' : 'pgHaBannerStandby')" in banner
+    assert ": ha.forwarding === true ? 'pgHaBannerForwarding' : 'pgHaBannerStandby')" in banner
     assert ".replace('{url}', ha.peer_url || '-')" in banner
     # the HA tab button is for admins
     assert 'const button = isAdmin && onOpenHa && (' in banner
@@ -422,7 +422,8 @@ class _FakeServer:
                  auth_source='local', broken='', sso_stale=False, live_view=True,
                  restart_pending=None, clusters=None, resources=None, refuse_as_standby=False,
                  autoinstall=None, metrics=None, extra=None, permissions=None, members=None,
-                 forward_writes=False, source_active=True, active_down=False):
+                 forward_writes=False, source_active=True, active_down=False, serve_users=False,
+                 reload_pending=None, last_reload=None):
         self.role, self.layout, self.language, self.admin = role, layout, language, admin
         self.auth_source, self.broken, self.sso_stale = auth_source, broken, sso_stale
         self.down_until = 0.0
@@ -437,6 +438,10 @@ class _FakeServer:
         self.live_view = live_view
         self.managers_running = live_view if role == 'standby' else True
         self.restart_pending = restart_pending
+        # a changed cluster connection is rebuilt in place: waiting for the settle time, and
+        # what the last rebuild did ({at, reason, failed})
+        self.reload_pending = reload_pending
+        self.last_reload = last_reload
         # the cluster list a live standby (or any other role) shows
         self.clusters = clusters or []
         self.resources = resources or []
@@ -467,9 +472,15 @@ class _FakeServer:
         self.source_active = source_active
         self.active_down = active_down
         self.forwarded = []
+        # serving users: the instance-local switch; it counts on a standby with live view and
+        # forwarding on, whether the leader answers or not (then source_active is False)
+        self.serve_users = serve_users
 
     def forwarding(self):
         return self.role == 'standby' and self.forward_writes and self.source_active
+
+    def serving(self):
+        return self.role == 'standby' and self.serve_users and self.live_view and self.forward_writes
 
     def group(self):
         if self.role not in ('active', 'standby'):
@@ -513,7 +524,8 @@ class _FakeServer:
             sync = {'last_ok_at': _iso_ago(20), 'last_attempt_at': _iso_ago(20), 'last_error': '',
                     'rows': 1234, 'tables': 41, 'source_epoch': 2, 'etag': None,
                     'skipped_columns': {'clusters': ['new_col']},
-                    'restart_pending': self.restart_pending}
+                    'restart_pending': self.restart_pending, 'reload_pending': self.reload_pending,
+                    'last_reload': self.last_reload}
         open_until = self.pairing_until if (self.pairing_until or 0) >= time.time() else None
         return {'role': self.role, 'epoch': 0 if self.role == 'standalone' else 2,
                 'instance_id': 'a' * 32, 'interval': self.interval, 'broken': self.broken,
@@ -522,7 +534,8 @@ class _FakeServer:
                 'live_view': self.live_view, 'managers_running': self.managers_running,
                 'members': [dict(m) for m in group], 'max_members': 4,
                 'standby_count': self.standby_count(), 'removed': self.removed,
-                'forward_writes': self.forward_writes, 'forwarding': self.forwarding()}
+                'forward_writes': self.forward_writes, 'forwarding': self.forwarding(),
+                'serve_users': self.serve_users, 'serving': self.serving()}
 
     def banner(self):
         if self.role != 'standby':
@@ -530,7 +543,8 @@ class _FakeServer:
         source = self._source()
         return {'role': 'standby', 'peer_url': source['url'] if source else PEER,
                 'last_sync_at': _iso_ago(90), 'live_view': self.live_view,
-                'forwarding': self.forwarding()}
+                'forwarding': self.forwarding(), 'serving': self.serving(),
+                'leader_reachable': self.source_active}
 
     def release(self):
         held, self.held = self.held, []
@@ -647,6 +661,9 @@ class _FakeServer:
         if path == '/api/ha/sync-now':
             return answer({'result': 'applied', 'status': self.status()})
         if path == '/api/ha/settings':
+            if 'serve_users' in body:
+                self.serve_users = bool(body['serve_users'])
+                return answer({'success': True, 'serve_users': self.serve_users})
             if 'forward_writes' in body:
                 self.forward_writes = bool(body['forward_writes'])
                 return answer({'success': True, 'forward_writes': self.forward_writes})
@@ -662,8 +679,14 @@ class _FakeServer:
         if path == '/api/ha/apply-config':
             if self.role != 'standby':
                 return answer({'error': 'Only a standby applies a synced configuration'}, 409)
-            self._restart('standby')
-            return answer({'success': True, 'restarting': True})
+            # a switched live view restarts, a waiting rebuild runs in place, else nothing
+            if self.restart_pending or self.managers_running != self.live_view:
+                self._restart('standby')
+                return answer({'success': True, 'restarting': True})
+            reloaded, self.reload_pending = bool(self.reload_pending), None
+            if reloaded:
+                self.last_reload = {'at': _iso_ago(0), 'reason': '1 cluster changed', 'failed': []}
+            return answer({'success': True, 'restarting': False, 'reloaded': reloaded})
         if req.method == 'GET' and path == '/api/clusters':
             return answer(self.clusters)
         if req.method == 'GET' and self.clusters and path.endswith('/resources'):
@@ -1098,14 +1121,16 @@ def test_a_standby_says_why_its_cluster_list_is_empty():
     dash = _read('web', 'src', 'dashboard.js')
     card = dash[dash.index("{t('noClusterSelected')}") - 400:dash.index("{t('noClusterSelected')}")]
     assert "haStandby ? (" in card
-    assert "{ha.live_view === false ? t('pgHaNoClustersLiveOff') : t('pgHaNoClustersHere')}" in card
+    assert ("{ha.live_view === false ? t('pgHaNoClustersLiveOff') : haServing ? t('pgHaNoClustersServing') "
+            ": t('pgHaNoClustersHere')}") in card
     assert dash.count('{canAutoInstall && !haStandby && (') == 2   # the card and the sidebar entry
 
     vm = _read('web', 'src', 'vm_modals.js')
     start = vm.index('function AllClustersOverview(')
     body = vm[start:vm.index('function GroupSettingsModal(', start)]
     assert "const haStandby = haInfo.role === 'standby';" in body
-    assert "const haNoClusters = haInfo.live_view === false ? t('pgHaNoClustersLiveOff') : t('pgHaNoClustersHere');" in body
+    assert ("const haNoClusters = haInfo.live_view === false ? t('pgHaNoClustersLiveOff')\n"
+            "                : haInfo.serving === true ? t('pgHaNoClustersServing') : t('pgHaNoClustersHere');") in body
     # t has to exist before the text is picked
     assert body.index('const { t } = useTranslation();') < body.index('const haNoClusters =')
     assert body.count('{haStandby ? haNoClusters : (') == 2
@@ -1187,15 +1212,20 @@ def test_one_ha_standby_branch_in_the_dashboard_authfetch(dash):
     assert 'if ((res.status === 409 || res.status === 503) && haRefusedRef.current) {' in body
     assert ("if ((res.status === 409 && code === 'HA_STANDBY') || "
             "(res.status === 503 && code === 'HA_ACTIVE_UNREACHABLE')) {") in body
-    assert 'const error = haRefusedRef.current(quiet, code);' in body
+    # a 503 on a read: the view that asked says so (haLeaderAway), no toast every poll
+    assert "const read = res.status === 503 && (rest.method || 'GET').toUpperCase() === 'GET';" in body
+    assert 'const error = haRefusedRef.current(quiet || read, code);' in body
     assert 'return new Response(JSON.stringify({ ...body, error }),' in body
     assert '{ status: res.status, statusText: res.statusText,' in body
     # the only place in the dashboard that knows the codes
     assert dash.count("'HA_STANDBY'") == 1
     assert dash.count("'HA_ACTIVE_UNREACHABLE'") == 2    # the check and the key it picks
     setter = _block(dash, "haRefusedRef.current = (quiet = false, code = '') => {", '};')
-    assert "const msg = t(code === 'HA_ACTIVE_UNREACHABLE' ? 'pgHaActiveUnreachable'" in setter
-    assert ": code === 'console' ? 'pgHaConsoleOnActive' : 'pgHaStandbyRefused');" in setter
+    # a member that serves users names the leader, a standby the active instance
+    assert ("const msg = t(code === 'HA_ACTIVE_UNREACHABLE' ? (haServing ? 'pgHaLeaderUnreachable' "
+            ": 'pgHaActiveUnreachable')") in setter
+    assert (": code === 'console' ? 'pgHaConsoleOnActive' : haServing ? 'pgHaServingRefused' "
+            ": 'pgHaStandbyRefused');") in setter
     assert "if (!quiet) addToast(msg, 'error');" in setter
     # a refusal may mean forwarding changed: the banner and the buttons are read again
     assert "if (!quiet && code !== 'console') refreshHa?.();" in setter
@@ -1223,8 +1253,8 @@ def test_no_optimistic_status_flip_on_a_standby(dash):
 ])
 def test_the_dashboard_refuses_a_console_before_opening_it(dash, handler, first_act):
     body = _block(dash, handler, '\n            };')
-    # not haReadOnly: a forwarding standby runs no console either
-    guard = "if (haStandby) { haRefusedRef.current?.(false, 'console'); return; }"
+    # not haReadOnly: a forwarding standby runs no console either, unless it serves users
+    guard = "if (haConsolesElsewhere) { haRefusedRef.current?.(false, 'console'); return; }"
     assert guard in body
     assert body.index(guard) < body.index(first_act)
     assert 'haReadOnly' not in body
@@ -1240,8 +1270,9 @@ def test_a_standby_hands_the_cloud_shell_nothing_that_acts(dash):
     bundle = dash[start:dash.index('\n                };', start)]
     keys = set(re.findall(r'^ {20}(\w+):', bundle, re.M))
     assert {'vmAction', 'openConsole', 'refresh'} <= keys
-    # consoles go on every standby, what acts only on one that does not forward
-    consoles = dash[dash.index('if (haStandby) {', start):]
+    # consoles go on every standby that does not serve users, what acts only on one that
+    # does not forward
+    consoles = dash[dash.index('if (haConsolesElsewhere) {', start):]
     consoles = set(re.findall(r"'(\w+)'", consoles[:consoles.index('.forEach(')]))
     assert consoles == CONSOLE_HANDLERS
     drop = dash[dash.index('if (haReadOnly) {', start):]
@@ -1273,13 +1304,14 @@ def test_cloud_offers_only_what_it_was_handed(cloud):
 def test_the_node_modal_has_no_shell_and_locks_what_changes_on_a_standby():
     src = _read('web', 'src', 'node_modals.js')
     body = src[src.index('function NodeModal('):src.index('function ConsoleModal(')]
-    assert 'const { getAuthHeaders, haReadOnly, haStandby } = useAuth();' in body
-    # the shell tab stays on every standby and points to the shell on the active
+    assert 'const { getAuthHeaders, haReadOnly, haConsolesElsewhere } = useAuth();' in body
+    # the shell tab stays on every standby and points to the shell on the active, unless
+    # the standby serves users
     assert 'const tabs = allTabs;' in body
     assert "const lockedTab = haReadOnly && !['summary', 'performance', 'tasks'].includes(activeTab);" in body
-    assert "{activeTab === 'shell' && haStandby && <HaConsoleOnActive />}" in body
-    assert "{activeTab === 'shell' && !haStandby && (" in body
-    assert '{!haStandby && data.shellFullscreen && (' in body
+    assert "{activeTab === 'shell' && haConsolesElsewhere && <HaConsoleOnActive />}" in body
+    assert "{activeTab === 'shell' && !haConsolesElsewhere && (" in body
+    assert '{!haConsolesElsewhere && data.shellFullscreen && (' in body
     assert body.count('<NodeShellTerminal') == 2
     assert "const haLock = { disabled: lockedTab, 'data-ha-locked': lockedTab ? '' : undefined };" in body
     # (#625 v2 review) no fieldset around all tab bodies any more, it disabled Refresh and
@@ -1337,8 +1369,9 @@ def test_the_corporate_detail_view_leaves_the_node_alone_on_a_standby():
     lvextend there and write the table; a standby reads what is stored."""
     src = _read('web', 'src', 'vm_modals.js')
     body = _block(src, 'function CorporateVmDetailView(', 'function AllClustersOverview(')
-    # on every standby, forwarding or not: a GET is not forwarded and would run here
-    assert 'const consoles = !haStandby;' in body
+    # on every standby, forwarding or not: a GET is not forwarded and would run here. A
+    # serving member grabs the preview itself, the refresh stays off every standby
+    assert 'const consoles = !haConsolesElsewhere;' in body
     assert 'if (!isQemu || !isRunning || !consoles) { setConsoleShot(null); return; }' in body
     assert "authFetch(`${base}/efficient-snapshots${haStandby ? '' : '?refresh=true'}`)" in body
 
@@ -1522,8 +1555,8 @@ def test_runtime_the_live_view_switch_restarts_a_standby(open_app):
     app = open_app(role='standby', layout='modern')
     page = app.page
     # the sidebar card and the overview both say why the list is empty
-    app.see('Its clusters appear here, read-only, after the next sync.')
-    assert page.get_by_text('Its clusters appear here, read-only, after the next sync.').count() == 2
+    app.see('This is a standby instance. Its clusters appear here after the next sync.')
+    assert page.get_by_text('This is a standby instance. Its clusters appear here after the next sync.').count() == 2
     panel = _open_ha(app, 'standby')
     switch = page.get_by_role('switch', name='Connect to the clusters while standing by (read only)')
     assert switch.get_attribute('aria-checked') == 'true'
@@ -1565,13 +1598,15 @@ def test_runtime_the_live_view_switch_only_saves_elsewhere(open_app):
 
 def test_runtime_a_pending_restart_applies_now(open_app):
     app = open_app(role='standby', layout='modern',
-                   restart_pending={'since': _iso_ago(180), 'reason': 'cluster Testi: host changed'})
+                   restart_pending={'since': _iso_ago(180), 'reason': 'the live view was switched on'})
     page = app.page
     panel = _open_ha(app, 'standby')
     note = panel.locator('[data-ha-restart-pending]')
     text = note.inner_text()
-    assert 'restarts on its own shortly' in text
-    assert 'cluster Testi: host changed' in text and 'minutes ago' in text
+    # the live view: nothing restarts it on its own, and no connection setting changed
+    assert 'The live view was switched since this standby started. It takes effect once this instance restarts.' in text
+    assert 'restarts on its own shortly' not in text and 'connection settings' not in text
+    assert 'the live view was switched on' in text and 'minutes ago' in text
     # at the top, before the peer and sync cards
     assert _follows(page, '[data-ha-restart-pending]', '#pgha-interval')
 
@@ -1707,10 +1742,10 @@ def test_the_node_cards_show_but_do_not_change_on_a_standby():
 def test_the_corporate_node_view_shows_but_does_not_change_on_a_standby():
     src = _read('web', 'src', 'node_modals.js')
     body = src[src.index('function CorporateNodeDetailView('):]
-    assert 'const { getAuthHeaders, reverseProxyEnabled, haReadOnly, haStandby } = useAuth();' in body
+    assert 'const { getAuthHeaders, reverseProxyEnabled, haReadOnly, haConsolesElsewhere } = useAuth();' in body
     assert "['summary', 'monitor', 'configure', 'hardware', 'vms', 'shell', 'subscription'].map(tab => (" in body
-    assert "{activeDetailTab === 'shell' && haStandby && <HaConsoleOnActive />}" in body
-    assert "{activeDetailTab === 'shell' && !haStandby && (" in body
+    assert "{activeDetailTab === 'shell' && haConsolesElsewhere && <HaConsoleOnActive />}" in body
+    assert "{activeDetailTab === 'shell' && !haConsolesElsewhere && (" in body
     menu = body[body.index('<div className="corp-dropdown absolute right-0 top-full'):]
     assert menu.index('{!haReadOnly && (<>') < menu.index('onMaintenanceToggle(node, !isMaint)')
     assert menu.index("onNodeAction(node, 'shutdown')") < menu.index('</>)}') < menu.index('onOpenNodeConfig(node)')
@@ -1734,13 +1769,13 @@ def test_no_efficient_snapshot_refresh_from_a_standby():
 
 def test_a_console_window_on_a_standby_says_why(dash):
     body = _block(dash, 'function StandaloneConsole(', 'function App(')
-    assert 'const { getAuthHeaders, haStandby } = useAuth();' in body
-    guard = "if (haStandby) {\n                    setState({ status: 'standby', clusterId, info: null,"
+    assert 'const { getAuthHeaders, haConsolesElsewhere } = useAuth();' in body
+    guard = "if (haConsolesElsewhere) {\n                    setState({ status: 'standby', clusterId, info: null,"
     assert guard in body
     # checked against the same rules as a real window first, and before anything is fetched
     assert body.index("setState({ status: 'error', error: 'malformed' });") < body.index(guard)
     assert body.index(guard) < body.index('await fetch(')
-    assert '}, [consoleKey, haStandby]);' in body
+    assert '}, [consoleKey, haConsolesElsewhere]);' in body
     # it offers the same console on the active
     assert "if (state.status === 'standby') {" in body
     assert '<HaConsoleOnActive vm={state.vm} clusterId={state.clusterId} />' in body
@@ -1952,7 +1987,7 @@ def test_the_update_check_does_not_run_from_a_standby():
     rolling = comp[comp.index('// #183: auto-refresh update counts'):]
     assert rolling.index('if (haReadOnly) return;') < rolling.index('checkUpdates();')
     assert "{!haReadOnly && <button\n                                    onClick={(e) => { e.stopPropagation(); checkUpdates(true); }}" in comp
-    assert "json.code === 'HA_STANDBY' ? t('pgHaStandbyRefused')" in comp
+    assert "json.code === 'HA_STANDBY' ? (haServing ? t('pgHaServingRefused') : t('pgHaStandbyRefused'))" in comp
 
 
 def test_closing_an_esxi_vm_never_toasts(dash):
@@ -1969,9 +2004,11 @@ def test_compliance_stays_a_reading_tab_on_a_standby(dash):
     assert ('const holds = (permission) => isAdmin || (Array.isArray(user?.permissions) '
             '&& user.permissions.includes(permission));') in dash
     assert "if (tab.id === 'compliance') return holds('admin.audit') || holds('node.maintenance');" in dash
-    # holds() decides this tab, and whether a standby offers a console on the active
-    assert len(re.findall(r'\bholds\(', dash)) == 3
+    # holds() decides this tab, whether a standby offers a console on the active, and the
+    # console entries of a member that opens them itself
+    assert len(re.findall(r'\bholds\(', dash)) == 4
     assert 'const onActiveItems = (permission, search, disabled = false) => !holds(permission) ? [] : [{' in dash
+    assert 'const menuAllows = (i) => !i.perm || (i.console ? holds(i.perm) : can(i.perm));' in dash
     drift = _function(dash, 'DriftTab')
     assert 'const canAct = isAdmin && !haReadOnly;' in drift and '{isAdmin && (' not in drift
 
@@ -2002,8 +2039,8 @@ def test_automation_reports_and_settings_leave_acting_to_the_active(dash):
     for toggle in ('onClick={() => toggleScheduleEnabled(schedule.id, !schedule.enabled)}\n',
                    'onClick={() => toggleAlertEnabled(alert.id, !alert.enabled)}\n'):
         assert auto[auto.index(toggle) + len(toggle):].lstrip().startswith('disabled={haReadOnly}'), toggle
-    # a fired alert is a row of each instance's own: not acked from any standby (v3)
-    assert '{!a.acked_at && !haStandby && (' in auto
+    # a fired alert is acked through the active like any change (v6)
+    assert '{!a.acked_at && !haReadOnly && (' in auto
     # the scripts' Refresh reads
     at = auto.index('onClick={() => loadCustomScripts(')
     assert '{!haReadOnly' not in auto[at - 200:at]
@@ -2021,9 +2058,10 @@ def test_automation_reports_and_settings_leave_acting_to_the_active(dash):
 def test_the_cloud_pages_change_nothing_from_a_standby(cloud):
     """info: useCloudMutate backs every change the Cloud secondary pages make."""
     hook = _function(cloud, 'useCloudMutate')
-    assert 'const { getAuthHeaders, haReadOnly } = useAuth();' in hook
+    assert 'const { getAuthHeaders, haReadOnly, haServing } = useAuth();' in hook
     assert 'return { busy, run, acts: !haReadOnly };' in hook
-    assert "b && b.code === 'HA_STANDBY' ? t('pgHaStandbyRefused')" in hook
+    assert "b && b.code === 'HA_STANDBY' ? (haServing ? t('pgHaServingRefused') : t('pgHaStandbyRefused'))" in hook
+    assert '}, [reload, t, haServing]);' in hook
     # every row button that runs a change sits behind the flag
     rows = 0
     for m in re.finditer(r'<CloudRowActions>(.*?)</CloudRowActions>', cloud, re.S):
@@ -2483,7 +2521,8 @@ def test_the_members_table_shows_what_the_contract_carries(panel):
     card = body[body.index('const membersCard = ('):body.index('const intervalCard = (')]
     for needle in ("{t('pgHaInstanceId')}", "{t('pgHaPeerUrl')}", "{t('pgHaPeerSeen')}", "{t('pgHaEpoch')}",
                    "{t('pgHaLastContact')}", "{t('pgHaLastError')}", "(m.instance_id || '').slice(0, 8)",
-                   "{m.url || '-'}", '<HaRoleBadge role={m.role_seen} t={t} />', "{m.epoch_seen ?? '-'}",
+                   "{m.url || '-'}", '<HaRoleBadge role={m.role_seen} serving={m.serving_seen === true} t={t} />',
+                   "{m.epoch_seen ?? '-'}",
                    '{when(m.last_contact)}', '{m.last_error}', "{t('pgHaSource')}", "t('pgHaNoMembers')"):
         assert needle in card, needle
     assert "data-ha-source={m.is_source ? '' : undefined}" in card
@@ -2714,7 +2753,7 @@ def test_runtime_a_standby_marks_its_source_and_removes_nobody(open_app):
     assert source.get_attribute('data-ha-member') == 'b' * 32
     cells = source.locator('td')
     assert cells.nth(0).locator('span').all_inner_texts() == ['bbbbbbbb', 'Source']
-    assert cells.nth(2).inner_text().strip() == 'Active'
+    assert cells.nth(2).inner_text().strip() == 'Active - Leader (automation)'
     assert card.get_by_text('Source', exact=True).count() == 1
     assert card.locator('[data-ha-member]').count() == 3
     # a standby removes nobody and hands out no code
@@ -3155,12 +3194,13 @@ def test_the_active_address_and_the_console_key(ctx):
 def test_the_link_opens_the_same_view_on_the_active():
     ui = _read('web', 'src', 'ui.js')
     link = _function(ui, 'HaOnActiveLink')
-    assert "if (ha?.role !== 'standby') return null;" in link
+    assert 'if (!(settings ? haStandby : haConsolesElsewhere)) return null;' in link
     assert "const href = haActiveHref(ha.peer_url, vm ? haConsoleSearch(vm, clusterId) : '');" in link
     assert 'if (!href) return null;' in link
     assert 'target="_blank" rel="noopener noreferrer" data-ha-on-active={href}' in link
     assert "onClick={() => window.open(href, '_blank', 'noopener,noreferrer')}" in link
-    assert "const label = t('pgHaOpenOnActive');" in link
+    # only the settings link shows on a member that serves users, and it names the leader
+    assert "const label = haServing ? t('pgHaOpenOnLeader') : t('pgHaOpenOnActive');" in link
     box = _function(ui, 'HaConsoleOnActive')
     assert "{t('pgHaConsoleOnActive')}" in box
     assert '<HaOnActiveLink vm={vm} clusterId={clusterId}' in box
@@ -3179,10 +3219,11 @@ CONSOLE_OPENERS = ('{consoles && ', '{acts && ', '{!acts ? ', '{consoleShot ? ('
 ])
 def test_every_console_button_asks_the_standby_flag(name, component, links):
     """Forwarding brings the actions back, not the consoles: each console and SPICE button
-    sits behind consoles (= !haStandby), and each place shows the link instead."""
+    sits behind consoles (= !haConsolesElsewhere, only a serving member opens them), and each
+    place shows the link instead."""
     body = _function(_read('web', 'src', name), component)
-    assert 'const consoles = !haStandby;' in body
-    assert re.search(r'const \{[^}]*\bhaStandby\b[^}]*\} = useAuth\(\);', body)
+    assert 'const consoles = !haConsolesElsewhere;' in body
+    assert re.search(r'const \{[^}]*\bhaConsolesElsewhere\b[^}]*\} = useAuth\(\);', body)
     calls = list(re.finditer(r'=> (onOpenConsole|onOpenSpice)\(', body))
     assert len(calls) >= 2, component
     for m in calls:
@@ -3196,16 +3237,16 @@ def test_every_console_button_asks_the_standby_flag(name, component, links):
 
 def test_the_dashboard_sends_every_console_to_the_active(dash):
     # the context menus: node shell and guest console become the way to the active
-    assert "...(haStandby ? onActiveItems('node.shell', '', !online) : [" in dash
-    assert "...(haStandby ? onActiveItems('vm.console', haConsoleSearch(vm), !isRunning) : [" in dash
+    assert "...(haConsolesElsewhere ? onActiveItems('node.shell', '', !online) : [" in dash
+    assert "...(haConsolesElsewhere ? onActiveItems('vm.console', haConsoleSearch(vm), !isRunning) : [" in dash
     items = _block(dash, 'const onActiveItems = (permission, search, disabled = false) =>', '}];')
     assert "label: t('pgHaOpenOnActive')" in items
     assert "if (!haOpenOnActive(ha?.peer_url, search)) haRefusedRef.current?.(false, 'console');" in items
     # the ESXi console: its button and handler on every standby, the link in its place
     vmrc = _block(dash, 'const openVmwareConsole = async (vmId) => {', '\n            };')
-    assert vmrc.index("if (haStandby) { haRefusedRef.current?.(false, 'console'); return; }") < vmrc.index('authFetch(')
-    assert '{isOn && !haStandby && (\n' in dash
-    at = dash.index('{isOn && haStandby && (')
+    assert vmrc.index("if (haConsolesElsewhere) { haRefusedRef.current?.(false, 'console'); return; }") < vmrc.index('authFetch(')
+    assert '{isOn && !haConsolesElsewhere && (\n' in dash
+    at = dash.index('{isOn && haConsolesElsewhere && (')
     assert '<HaOnActiveLink iconOnly' in dash[at:at + 200]
     # the GETs that act on the node stay off every standby: they are not forwarded
     cfg = _read('web', 'src', 'vm_config.js')
@@ -3214,14 +3255,15 @@ def test_the_dashboard_sends_every_console_to_the_active(dash):
 
 def test_the_cloud_shell_offers_the_active_for_a_console(cloud):
     shell = _function(cloud, 'CloudShell')
-    assert "consoleOnActive: haStandby ? (r) => haOpenOnActive(ha && ha.peer_url, haConsoleSearch(stamp(r))) : null," in shell
+    assert "consoleOnActive: haConsolesElsewhere ? (r) => haOpenOnActive(ha && ha.peer_url, haConsoleSearch(stamp(r))) : null," in shell
     items = _block(cloud, 'function cloudVmActionItems(', '\n        }')
     assert ("act.consoleOnActive && { label: t('pgHaOpenOnActive'), icon: 'ExternalLink', "
             "onClick: () => act.consoleOnActive(r) },") in items
     detail = _function(cloud, 'CloudInstanceDetail')
     assert '{act.consoleOnActive && <HaOnActiveLink vm={r} className="cloud-btn" />}' in detail
     hook = _function(cloud, 'useCloudMutate')
-    assert "b && b.code === 'HA_ACTIVE_UNREACHABLE' ? t('pgHaActiveUnreachable')" in hook
+    assert ("b && b.code === 'HA_ACTIVE_UNREACHABLE' ? (haServing ? t('pgHaLeaderUnreachable') "
+            ": t('pgHaActiveUnreachable'))") in hook
     assert 'return { busy, run, acts: !haReadOnly };' in hook
 
 
@@ -3249,6 +3291,7 @@ def test_the_panel_speaks_the_forwarding_contract(panel):
         assert ('<div className="grid grid-cols-1 md:grid-cols-2 gap-4">\n'
                 '                                {liveViewCard}\n'
                 '                                {forwardCard}\n'
+                '                                {serveCard}\n'
                 '                            </div>') in part
 
 
@@ -3590,11 +3633,15 @@ def test_runtime_esxi_on_a_forwarding_standby(open_app, role):
 
 def test_the_note_says_why_and_links_the_active():
     note = _function(_read('web', 'src', 'ui.js'), 'HaSettingsOnActive')
-    assert "{own ? t('pgHaOwnSettingsHere') : t('pgHaSettingsOnActive')}" in note
+    # a member that serves users is no standby to its users: the same note names the leader
+    assert ("const text = haServing ? (own ? t('pgHaOwnSettingsOnLeader') : t('pgHaSettingsOnLeader'))\n"
+            "                : (own ? t('pgHaOwnSettingsHere') : t('pgHaSettingsOnActive'));") in note
+    assert '<span className="flex-1 min-w-0">{text}</span>' in note
     assert "data-ha-settings-on-active={own ? 'own' : 'shared'}" in note
-    assert '<HaOnActiveLink className=' in note
-    # it renders wherever it is put: every caller asks the flag
-    assert 'useAuth' not in note
+    assert '<HaOnActiveLink settings className=' in note
+    # it renders wherever it is put: every caller asks the flag, the note only for its words
+    assert 'const { haServing } = useAuth();' in note
+    assert 'return null' not in note and 'haStandby' not in note
 
 
 # (file, what the control is found by, the gate in front of it, how far in front at most).
@@ -3621,9 +3668,6 @@ STANDBY_GATES = [
     ('node_modals.js', 'onClick={openWarn}', OWN_NOTE, 300),
     ('node_modals.js', 'onClick={openRfWarn}', OWN_NOTE, 300),
     ('create_modals.js', 'onClick={register}', '{!haStandby && (', 300),
-    ('dashboard.js', 'onClick={e => { e.stopPropagation(); ack(ev.id, ', "{canAct && !haStandby && ev.status === 'open' && (", 700),
-    ('dashboard.js', 'onClick={clearInbox}', '{items.length > 0 && !haStandby && (', 300),
-    ('dashboard.js', 'onClick={() => ackAlert(a.id)}', '{!a.acked_at && !haStandby && (', 300),
     ('vm_modals.js', 'onClick={() => saveAutoReconcile(!autoReconcile)}', '{canAdminSettings && !haStandby && (', 300),
 ]
 
@@ -3797,4 +3841,972 @@ def test_runtime_a_security_key_is_enrolled_on_the_active(open_app, role, forwar
     if standby:
         assert notes.first.locator('a[data-ha-on-active]').get_attribute('href') == PEER + '/'
     assert not [c for c in app.server.calls if 'webauthn/register' in c[1]]
+    assert not app.errors, app.errors
+
+
+# -- serving members: a standby that serves users as an active instance (#625) --------------------
+#
+# The active is the leader: it keeps every automation and the config DB. A standby with live view
+# and forwarding on can be switched to serve users (serve_users); the server then reports it as
+# serving. Its role stays standby, so every automation gate stays shut, but to its users it is an
+# active instance: consoles, shells, SPICE and the console preview open on it, every change goes
+# to the leader. The page asks haConsolesElsewhere (a standby that does not serve) for consoles,
+# haStandby for the settings that stay on the leader, haReadOnly for changes.
+
+LEADER = 'Active - Leader (automation)'
+SERVING_BANNER = f'Active instance. Automation (HA, balancing, schedules) runs on the leader {PEER}'
+LEADER_DOWN = (f'Active instance. The leader {PEER} does not answer: changes are paused, live data and '
+               'consoles keep working.')
+FORWARDING_BANNER = 'What you do here is carried out on the active instance'
+SERVE_SWITCH = 'Serve users as an active instance'
+
+
+def test_the_context_derives_the_console_flag(ctx):
+    assert "const haConsolesElsewhere = haStandby && ha.serving !== true;" in ctx
+    provider = ctx[ctx.index('<AuthContext.Provider value={{'):]
+    provider = provider[:provider.index('}}>')]
+    for flag in ('haReadOnly', 'haStandby', 'haConsolesElsewhere'):
+        assert re.search(r'\b%s\b' % flag, provider), flag
+
+
+def test_the_three_flags_answer_as_agreed(ctx):
+    """The three lines as they are in the source, run in node over every combination."""
+    import shutil
+    import subprocess
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('node is not installed')
+    lines = _block(ctx, 'const haStandby = ', 'return(')
+    script = """
+    const out = [];
+    for (const role of ['standalone', 'active', 'standby'])
+      for (const forwarding of [true, false, undefined])
+        for (const serving of [true, false, undefined]) {
+          const ha = { role, forwarding, serving };
+          %s
+          out.push([role, String(forwarding), String(serving), haStandby, haReadOnly, haConsolesElsewhere]);
+        }
+    console.log(JSON.stringify(out));
+    """ % lines
+    res = subprocess.run([node, '-e', script], capture_output=True, text=True, timeout=30)
+    assert res.returncode == 0, res.stderr
+    for role, forwarding, serving, standby, read_only, elsewhere in json.loads(res.stdout):
+        assert standby == (role == 'standby')
+        assert read_only == (role == 'standby' and forwarding != 'true')
+        # a serving member opens consoles itself, whether its leader answers or not
+        assert elsewhere == (role == 'standby' and serving != 'true'), (role, forwarding, serving)
+
+
+def test_the_link_stands_in_for_a_console_only_where_none_opens():
+    ui = _read('web', 'src', 'ui.js')
+    link = _function(ui, 'HaOnActiveLink')
+    assert 'const { ha, haStandby, haConsolesElsewhere, haServing } = useAuth();' in link
+    assert 'if (!(settings ? haStandby : haConsolesElsewhere)) return null;' in link
+    # the settings note keeps its link on every standby, serving or not
+    note = _function(ui, 'HaSettingsOnActive')
+    assert '<HaOnActiveLink settings className=' in note
+    # every other link stands in for a console
+    for name in ('cloud.js', 'dashboard.js', 'tables.js', 'vm_modals.js', 'node_modals.js'):
+        assert '<HaOnActiveLink settings' not in _read('web', 'src', name), name
+
+
+# the console surfaces and the flag each asks, by file
+CONSOLE_GATES = [
+    ('dashboard.js', "if (haConsolesElsewhere) { haRefusedRef.current?.(false, 'console'); return; }", 3),
+    ('dashboard.js', "...(haConsolesElsewhere ? onActiveItems('node.shell', '', !online) : [", 1),
+    ('dashboard.js', "...(haConsolesElsewhere ? onActiveItems('vm.console', haConsoleSearch(vm), !isRunning) : [", 1),
+    ('dashboard.js', '{isOn && !haConsolesElsewhere && (', 1),
+    ('dashboard.js', '{isOn && haConsolesElsewhere && (', 1),
+    ('dashboard.js', '}, [consoleKey, haConsolesElsewhere]);', 1),
+    ('node_modals.js', "{activeTab === 'shell' && haConsolesElsewhere && <HaConsoleOnActive />}", 1),
+    ('node_modals.js', "{activeTab === 'shell' && !haConsolesElsewhere && (", 1),
+    ('node_modals.js', '{!haConsolesElsewhere && data.shellFullscreen && (', 1),
+    ('node_modals.js', "{activeDetailTab === 'shell' && haConsolesElsewhere && <HaConsoleOnActive />}", 1),
+    ('node_modals.js', "{activeDetailTab === 'shell' && !haConsolesElsewhere && (", 1),
+    ('tables.js', 'const consoles = !haConsolesElsewhere;', 1),
+    ('vm_modals.js', 'const consoles = !haConsolesElsewhere;', 2),
+    ('cloud.js', 'consoleOnActive: haConsolesElsewhere ? (r) => haOpenOnActive(', 1),
+]
+
+
+@pytest.mark.parametrize('name,gate,count', CONSOLE_GATES, ids=[f'{n}:{g[:48]}' for n, g, _ in CONSOLE_GATES])
+def test_every_console_surface_asks_the_console_flag(name, gate, count):
+    assert _read('web', 'src', name).count(gate) == count
+
+
+def test_no_console_surface_asks_the_standby_flag_any_more():
+    """haStandby stays for the settings kept on the leader; nothing that opens a console,
+    shell, SPICE or the console preview reads it."""
+    dash = _read('web', 'src', 'dashboard.js')
+    for old in ("if (haStandby) { haRefusedRef.current?.(false, 'console')", "...(haStandby ? onActiveItems(",
+                '{isOn && !haStandby && (', '{isOn && haStandby && (', '}, [consoleKey, haStandby]);'):
+        assert old not in dash, old
+    cloud_actions = dash[dash.index('const cloudActions = {'):]
+    assert cloud_actions.index('if (haConsolesElsewhere) {') < cloud_actions.index("['openConsole', 'openSpice', 'openLxcShell']")
+    for name in ('tables.js', 'vm_modals.js', 'node_modals.js', 'cloud.js'):
+        src = _read('web', 'src', name)
+        for old in ('const consoles = !haStandby;', "=== 'shell' && haStandby", "=== 'shell' && !haStandby",
+                    '!haStandby && data.shellFullscreen', 'consoleOnActive: haStandby'):
+            assert old not in src, (name, old)
+    # what runs on the node and is not forwarded still asks haStandby: the snapshot refresh
+    vm = _read('web', 'src', 'vm_modals.js')
+    assert "authFetch(`${base}/efficient-snapshots${haStandby ? '' : '?refresh=true'}`)" in vm
+
+
+# the per-instance rows that are forwarded now: they follow haReadOnly again (v6)
+FORWARDED_GATES = [
+    ('dashboard.js', 'onClick={e => { e.stopPropagation(); ack(ev.id, ', "{canAct && ev.status === 'open' && (", 700),
+    ('dashboard.js', 'onClick={clearInbox}', '{items.length > 0 && !haReadOnly && (', 300),
+    ('dashboard.js', 'onClick={() => ackAlert(a.id)}', '{!a.acked_at && !haReadOnly && (', 300),
+]
+
+
+@pytest.mark.parametrize('name,anchor,gate,reach', FORWARDED_GATES,
+                         ids=[f'{n}:{a[:40]}' for n, a, _, _ in FORWARDED_GATES])
+def test_the_forwarded_acknowledgements_follow_the_read_only_flag(name, anchor, gate, reach):
+    src = _read('web', 'src', name)
+    spots = [m.start() for m in re.finditer(re.escape(anchor), src)]
+    assert spots, anchor
+    for at in spots:
+        gate_at = src.rfind(gate, 0, at)
+        assert gate_at >= 0 and at - gate_at < reach, (anchor, at - gate_at, src[max(0, at - 300):at])
+        assert '!haStandby' not in src[gate_at:at], anchor
+    dash = _read('web', 'src', 'dashboard.js')
+    assert 'const canAct = isAdmin && !haReadOnly;' in _function(dash, 'DriftTab')
+    assert 'const { haReadOnly } = useAuth();' in _function(dash, 'PushBellButton')
+
+
+def test_the_banner_names_the_leader_on_a_serving_member(banner):
+    assert 'const serving = ha.serving === true;' in banner
+    assert 'const leaderDown = serving && ha.leader_reachable === false;' in banner
+    assert ("const text = t(leaderDown ? 'pgHaBannerLeaderDown'\n"
+            "                    : serving ? 'pgHaBannerServing'\n"
+            "                    : ha.forwarding === true ? 'pgHaBannerForwarding' : 'pgHaBannerStandby')") in banner
+    assert "'data-ha-serving': serving ? 'on' : 'off'," in banner
+    assert "'data-ha-leader': leaderDown ? 'down' : undefined," in banner
+    # both layouts carry the same attributes
+    assert banner.count('{...data}') == 2
+
+
+def test_the_panel_speaks_the_serving_contract(panel):
+    body = _function(panel, 'HaPanel')
+    assert 'const serveUsers = status?.serve_users === true;' in body
+    save = body[body.index('const setServeUsers = (on) =>'):body.index('const applyNow = ')]
+    assert "send('PUT', 'settings', { serve_users: on })" in save
+    assert "addToast?.(t(on ? 'pgHaServeOn' : 'pgHaServeOff'), 'success');" in save
+    assert 'refreshHa?.();' in save
+    card = body[body.index('const serveCard = ('):body.index('const restartNote = ')]
+    assert 'role="switch" aria-checked={serveUsers}' in card
+    assert 'htmlFor="pgha-serve"' in card and 'id="pgha-serve"' in card
+    assert 'disabled={!!busy || broken}' in card
+    assert "{t('pgHaServeUsers')}" in card and "{t('pgHaServeUsersHint')}" in card
+    assert 'const serveIdle = !liveView || !forwardWrites;' in body
+    assert '{serveIdle && (' in card and "{t('pgHaServeNeeds')}" in card
+    # next to the live view and forwarding, in every role
+    assert body.count('{forwardCard}\n                            {serveCard}') == 1           # standalone
+    assert body.count('{forwardCard}\n                                {serveCard}') == 2       # active, standby
+    # the automation line and the badges
+    assert "{role !== 'standalone' && (" in body and "{t('pgHaAutomationLeader')}" in body
+    assert '<HaRoleBadge role={role} serving={status.serving === true} t={t} />' in body
+    assert '<HaRoleBadge role={m.role_seen} serving={m.serving_seen === true} t={t} />' in body
+    badge = _function(panel, 'HaRoleBadge')
+    assert "const shown = role === 'standby' && serving ? 'serving' : role;" in badge
+    assert "active: t('pgHaRoleLeader'), serving: t('pgHaRoleActive')" in badge
+
+
+OLD_CONSOLE_CLAUSE = {'de': 'Konsolen öffnen sich immer', 'en': 'consoles always open', 'zh': '控制台始终',
+                      'pl': 'konsole zawsze', 'fr': r"consoles s\'ouvrent toujours", 'es': 'consolas siempre',
+                      'pt': 'consoles sempre', 'ko': '콘솔은 항상', 'it': 'console si aprono sempre'}
+
+
+def test_the_serving_strings_say_no_em_dash():
+    blocks = _blocks()
+    for key in ('pgHaRoleLeader', 'pgHaBannerServing', 'pgHaBannerLeaderDown', 'pgHaServeUsers',
+                'pgHaServeUsersHint', 'pgHaServeNeeds', 'pgHaServeOn', 'pgHaServeOff', 'pgHaAutomationLeader',
+                'pgHaForwardWritesHint'):
+        for lang, block in blocks.items():
+            line = re.search(r'^ +%s: (.*),$' % key, block, re.M)
+            assert line, (lang, key)
+            assert '\u2014' not in line.group(1), (lang, key)
+    # the forwarding hint no longer says consoles always open on the active
+    for lang, block in blocks.items():
+        hint = re.search(r'^ +pgHaForwardWritesHint: (.*),$', block, re.M).group(1)
+        assert OLD_CONSOLE_CLAUSE[lang] not in hint, lang
+    assert 'consoles open on the active instance unless this instance serves users' in blocks['en']
+    assert "{ code: 'de', flag: '\U0001F1E6\U0001F1F9'," in _read('web', 'src', 'contexts.js')
+
+
+# -- runtime ------------------------------------------------------------------------------------
+
+def _console_calls(app, since=0):
+    return [c for c in app.server.calls[since:]
+            if c[1].endswith(('/console', '/spice', '/screenshot', '/termproxy')) or c[1] == '/api/ws/token']
+
+
+@pytest.mark.parametrize('serve', [True, False])
+def test_runtime_a_serving_member_opens_consoles_itself(open_app, serve):
+    """Serving: the banner calls it an active instance, the consoles are there and nothing
+    links to the leader. Not serving (the counterproof): today's forwarding standby."""
+    app = open_app(role='standby', layout='modern', clusters=[CLUSTER], resources=[VM], forward_writes=True,
+                   serve_users=serve, autoinstall='manage', extra=SSE_TOKEN)
+    page = app.page
+    banner = page.locator('[data-ha-banner="classic"]')
+    assert banner.get_attribute('data-ha-serving') == ('on' if serve else 'off')
+    assert banner.get_attribute('data-ha-leader') is None
+    text = banner.inner_text()
+    assert (SERVING_BANNER in text) == serve, text
+    assert ('Standby instance' in text) != serve, text
+    assert (FORWARDING_BANNER in text) != serve, text
+    # the automated installs stay with the instance that answers the installer: never a standby
+    assert page.get_by_text('Automated Installations').count() == 0
+
+    _open_resources(app)
+    for view in ('Grid View', 'List View', 'Compact View'):
+        page.locator(f'button[title="{view}"]').first.click()
+        if view == 'Compact View':
+            page.get_by_text('Select a VM from the list').wait_for(timeout=3000)
+            page.locator('div.cursor-pointer', has_text='web01').first.click()
+            page.get_by_text('Quick Actions').wait_for(timeout=3000)
+        page.wait_for_timeout(200)
+        labels = _labels(page)
+        assert {'Shutdown', 'Migrate'} <= labels, (view, sorted(labels))
+        assert bool(labels & CONSOLE_LABELS) == serve, (view, sorted(labels & CONSOLE_LABELS))
+        assert _on_active_links(page) == ([] if serve else [CONSOLE_URL]), view
+    assert not _console_calls(app)
+    assert not app.errors, app.errors
+    if serve:
+        # the console opens here: the ticket is asked of this instance
+        page.locator('button[title="Grid View"]').first.click()
+        page.locator('button[title="Console"], button[title="Open Console"]').first.click()
+        assert _wait_for_call(app, ('GET', '/api/clusters/c1/vms/pve1/qemu/100/console'), 5), app.server.calls[-8:]
+        assert not [t for t in _toasts(page) if 'active instance' in t], _toasts(page)
+
+
+@pytest.mark.parametrize('serve', [True, False])
+def test_runtime_a_serving_member_in_corporate_menus_and_detail(open_app, serve):
+    app = open_app(role='standby', layout='corporate', clusters=[CLUSTER], resources=[VM], forward_writes=True,
+                   serve_users=serve)
+    page = app.page
+    page.locator('.corp-tree-item', has_text='Testi').first.click()
+    vm = page.locator('.corp-tree-child', has_text='web01').first
+    vm.wait_for(timeout=5000)
+    vm.click(button='right')
+    menu = page.locator('.corp-context-menu').first
+    menu.wait_for(timeout=3000)
+    lines = [x.strip() for x in menu.inner_text().split('\n') if x.strip()]
+    assert 'Power' in lines, lines
+    assert ({'Console', 'SPICE Console'} <= set(lines)) == serve, lines
+    assert not ({'Console', 'SPICE Console'} & set(lines)) == serve, lines
+    assert (ON_ACTIVE in lines) != serve, lines
+    page.keyboard.press('Escape')
+    page.mouse.click(5, 900)
+
+    _open_resources(app)
+    page.locator('span', has_text='web01').first.click()
+    page.get_by_text('Snapshots').first.wait_for(timeout=3000)
+    page.wait_for_timeout(300)
+    labels = _labels(page)
+    assert bool(labels & CONSOLE_LABELS) == serve, sorted(labels & CONSOLE_LABELS)
+    assert _on_active_links(page) == ([] if serve else [CONSOLE_URL, CONSOLE_URL])
+    # the preview is a console: a serving member grabs it itself
+    shots = [c for c in app.server.calls if c[1].endswith('/screenshot')]
+    assert bool(shots) == serve, shots
+    # the snapshot refresh is no console: lvs on the node stays with the leader either way
+    page.get_by_text('Snapshots').first.click()
+    page.wait_for_timeout(500)
+    eff = [u for u in app.server.urls if '/efficient-snapshots' in u]
+    assert eff and not [u for u in eff if 'refresh=true' in u], eff
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('serve', [True, False])
+def test_runtime_a_serving_member_in_cloud(open_app, serve):
+    app = open_app(role='standby', layout='cloud', clusters=[CLUSTER], resources=[VM], forward_writes=True,
+                   serve_users=serve)
+    page = app.page
+    banner = page.locator('[data-ha-banner="cloud"]')
+    assert banner.get_attribute('data-ha-serving') == ('on' if serve else 'off')
+    assert (SERVING_BANNER in banner.inner_text()) == serve
+    page.get_by_text('Virtual Machines').first.click()
+    page.get_by_text('web01').first.wait_for(timeout=5000)
+    page.get_by_text('web01').first.click()
+    bar = page.locator('.cloud-detail-actions')
+    bar.wait_for(timeout=3000)
+    text = bar.inner_text()
+    assert 'Shutdown' in text, text
+    assert ('SPICE' in text) == serve, text
+    assert bar.locator('a[data-ha-on-active]').count() == (0 if serve else 1)
+    page.locator('.cloud-detail-actions button', has_text='Actions').click()
+    page.wait_for_timeout(300)
+    menu = page.evaluate('() => Array.from(document.querySelectorAll("[role=menu], .cloud-menu"))'
+                         '.map(m => m.innerText).join("\\n")').split('\n')
+    menu = [x.strip() for x in menu if x.strip()]
+    assert ('Console' in menu) == serve, menu
+    assert (ON_ACTIVE in menu) != serve, menu
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('serve', [True, False])
+def test_runtime_a_serving_member_opens_the_node_shell_itself(open_app, serve):
+    app = open_app(role='standby', layout='modern', clusters=[CLUSTER], resources=[VM], metrics=NODE_METRICS,
+                   forward_writes=True, serve_users=serve)
+    page = app.page
+    page.get_by_text('Testi').first.click()
+    page.locator('button[title="Node Configuration"]').first.wait_for(timeout=5000)
+    page.locator('button[title="Node Configuration"]').first.click()
+    page.get_by_text('Proxmox Node').first.wait_for(timeout=5000)
+    assert not _console_calls(app)
+    before = len(app.server.calls)
+    page.locator('button', has_text='Shell').last.click()
+    page.wait_for_timeout(500)
+    assert page.locator('[data-ha-console-elsewhere]').count() == (0 if serve else 1)
+    assert (page.get_by_text('Node Shell', exact=True).count() > 0) == serve
+    if serve:
+        # the terminal asks this instance for its token
+        deadline = time.time() + 5
+        while time.time() < deadline and ('POST', '/api/ws/token') not in app.server.calls[before:]:
+            page.wait_for_timeout(100)
+        assert ('POST', '/api/ws/token') in app.server.calls[before:], app.server.calls[before:]
+    else:
+        assert not _console_calls(app)
+    assert not [e for e in app.errors if 'pageerror' in e], app.errors
+
+
+@pytest.mark.parametrize('serve', [True, False])
+def test_runtime_a_console_window_on_a_serving_member(open_app, serve):
+    app = open_app(role='standby', layout='modern', clusters=[CLUSTER], resources=[VM], forward_writes=True,
+                   serve_users=serve)
+    page = app.page
+    before = len(app.server.calls)
+    page.goto(BASE + '/?console=c1:qemu:100:pve1', wait_until='load')
+    if serve:
+        # it looks the cluster up and asks this instance for the console, with no link anywhere
+        ticket = ('GET', '/api/clusters/c1/vms/pve1/qemu/100/console')
+        deadline = time.time() + 10
+        while time.time() < deadline and ticket not in app.server.calls[before:]:
+            page.wait_for_timeout(100)
+        seen = app.server.calls[before:]
+        assert ('GET', '/api/clusters') in seen and ticket in seen, seen
+        assert seen.index(('GET', '/api/clusters')) < seen.index(ticket)
+        assert page.locator('[data-ha-console-elsewhere]').count() == 0
+        assert page.locator('[data-ha-on-active]').count() == 0
+        assert not [e for e in app.errors if 'pageerror' in e], app.errors
+    else:
+        page.locator('[data-ha-console-elsewhere]').wait_for(timeout=10000)
+        page.wait_for_timeout(300)
+        assert [c for c in app.server.calls[before:] if c[1] != '/api/auth/check'] == []
+
+
+@pytest.mark.parametrize('layout,kind', [('modern', 'classic'), ('cloud', 'cloud')])
+@pytest.mark.parametrize('serve', [True, False])
+def test_runtime_the_leader_out_of_reach(open_app, layout, kind, serve):
+    """The leader does not answer. A serving member says so: changes paused, consoles and live
+    data go on. A plain standby (the counterproof) keeps today's read-only banner."""
+    app = open_app(role='standby', layout=layout, clusters=[CLUSTER], resources=[VM], forward_writes=True,
+                   serve_users=serve, source_active=False)
+    page = app.page
+    banner = page.locator(f'[data-ha-banner="{kind}"]')
+    assert banner.get_attribute('data-ha-forwarding') == 'off'
+    assert banner.get_attribute('data-ha-leader') == ('down' if serve else None)
+    text = banner.inner_text()
+    assert (LEADER_DOWN in text) == serve, text
+    assert ('If it stays down, promote a member under High Availability.' in text) == serve, text
+    assert ('Read-only view' in text) != serve, text
+    if layout == 'modern':
+        _open_resources(app)
+        labels = _labels(page)
+        # nothing is forwarded while the leader is away, the consoles stay
+        assert 'Shutdown' not in labels, sorted(labels)
+        assert bool(labels & CONSOLE_LABELS) == serve, sorted(labels & CONSOLE_LABELS)
+    assert not app.errors, app.errors
+
+
+def test_runtime_the_serving_banner_speaks_german(open_app):
+    app = open_app(role='standby', layout='modern', language='de', forward_writes=True, serve_users=True)
+    text = app.page.locator('[data-ha-banner="classic"]').inner_text()
+    assert f'Aktive Instanz. Automatisierung (HA, Lastverteilung, Zeitpläne) läuft auf dem Leader {PEER}' in text, text
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('live,forward', [(True, True), (False, True), (True, False)])
+def test_runtime_the_serve_switch(open_app, live, forward):
+    app = open_app(role='standby', layout='modern', clusters=[CLUSTER], resources=[VM], live_view=live,
+                   forward_writes=forward)
+    page = app.page
+    banner = page.locator('[data-ha-banner="classic"]')
+    panel = _open_ha(app, 'standby')
+    switch = page.get_by_role('switch', name=SERVE_SWITCH)
+    assert switch.get_attribute('aria-checked') == 'false'
+    # next to the live view and forwarding
+    assert page.evaluate('([a, b]) => document.getElementById(a).closest(".grid") === '
+                         'document.getElementById(b).closest(".grid")', ['pgha-serve', 'pgha-forward'])
+    # without either of the two it has no effect, and says so
+    idle = panel.locator('[data-ha-serve-idle]')
+    assert idle.count() == (0 if live and forward else 1)
+    if idle.count():
+        assert 'No effect while the live view or forwarding is off.' in idle.inner_text()
+    assert panel.locator('[data-ha-badge]').first.inner_text().strip() == 'Standby'
+
+    switch.click()
+    assert _wait_for_toast(page, 'Saved. As a standby, this instance serves users as an active instance.'), _toasts(page)
+    assert app.server.bodies['/api/ha/settings'][-1] == {'serve_users': True}
+    assert page.locator('[role="alertdialog"]').count() == 0
+    page.wait_for_function('() => document.getElementById("pgha-serve").getAttribute("aria-checked") === "true"',
+                           timeout=5000)
+    if live and forward:
+        # the banner and the badge follow at once
+        page.wait_for_function('() => document.querySelector("[data-ha-banner]")'
+                               '.getAttribute("data-ha-serving") === "on"', timeout=5000)
+        assert SERVING_BANNER in banner.inner_text()
+        page.wait_for_function('() => document.querySelector("[data-ha-badge]").innerText.trim() === "Active"',
+                               timeout=5000)
+    else:
+        page.wait_for_timeout(600)
+        assert banner.get_attribute('data-ha-serving') == 'off'
+        assert panel.locator('[data-ha-badge]').first.inner_text().strip() == 'Standby'
+
+    switch.click()
+    assert _wait_for_toast(page, 'Saved. As a standby, this instance only stands by.'), _toasts(page)
+    assert app.server.bodies['/api/ha/settings'][-1] == {'serve_users': False}
+    page.wait_for_function('() => document.querySelector("[data-ha-banner]")'
+                           '.getAttribute("data-ha-serving") === "off"', timeout=5000)
+    assert not app.errors, app.errors
+
+
+def test_runtime_the_serve_switch_only_saves_on_an_active(open_app):
+    app = open_app(role='active', layout='modern', forward_writes=True)
+    page = app.page
+    _open_ha(app, 'active')
+    switch = page.get_by_role('switch', name=SERVE_SWITCH)
+    switch.click()
+    assert _wait_for_toast(page, 'Saved. As a standby, this instance serves users as an active instance.'), _toasts(page)
+    assert app.server.bodies['/api/ha/settings'][-1] == {'serve_users': True}
+    page.wait_for_function('() => document.getElementById("pgha-serve").getAttribute("aria-checked") === "true"',
+                           timeout=5000)
+    assert page.locator('[data-ha-banner]').count() == 0
+    assert not app.errors, app.errors
+
+
+def _seen(card, ch):
+    return card.locator(f'[data-ha-member="{ch * 32}"] td').nth(2).inner_text().strip()
+
+
+def test_runtime_the_leader_names_its_members(open_app):
+    members = [_member('b', serving_seen=True), _member('c'), _member('d', serving_seen=False)]
+    app = open_app(role='active', layout='modern', members=members)
+    panel = _open_ha(app, 'active')
+    assert panel.locator('[data-ha-badge]').first.inner_text().strip() == LEADER
+    card = panel.locator('[data-ha-members]')
+    assert _seen(card, 'b') == 'Active'
+    # unknown and False both read as a plain standby
+    assert _seen(card, 'c') == 'Standby' and _seen(card, 'd') == 'Standby'
+    line = panel.locator('[data-ha-automation]')
+    assert line.inner_text().strip() == 'Automation such as HA, balancing, schedules and alerts runs only on the leader.'
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('serve', [True, False])
+def test_runtime_a_member_names_itself_and_the_leader(open_app, serve):
+    members = [_member('b', role='active', source=True), _member('c', serving_seen=True)]
+    app = open_app(role='standby', layout='modern', members=members, forward_writes=True, serve_users=serve)
+    panel = _open_ha(app, 'standby')
+    assert panel.locator('[data-ha-badge]').first.inner_text().strip() == ('Active' if serve else 'Standby')
+    card = panel.locator('[data-ha-members]')
+    assert _seen(card, 'b') == LEADER
+    assert _seen(card, 'c') == 'Active'
+    assert panel.locator('[data-ha-automation]').count() == 1
+    assert not app.errors, app.errors
+
+
+def test_runtime_a_standalone_has_no_leader(open_app):
+    app = open_app(role='standalone', layout='modern')
+    panel = _open_ha(app, 'standalone')
+    assert panel.locator('[data-ha-badge]').first.inner_text().strip() == 'Standalone'
+    assert panel.locator('[data-ha-automation]').count() == 0
+    # the switch is there to be stored for later, like live view and forwarding
+    assert app.page.get_by_role('switch', name=SERVE_SWITCH).count() == 1
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('serve', [True, False])
+def test_runtime_a_serving_member_still_saves_its_settings_on_the_leader(open_app, serve):
+    """Serving changes the consoles, not the settings: the notes and their links stay. Their
+    words follow the banner: a serving member is the active instance to its users, so the
+    notes and the link name the leader; a plain standby keeps its own words."""
+    app = open_app(role='standby', layout='modern', forward_writes=True, serve_users=serve,
+                   extra={**SETTINGS_READS, **SSE_TOKEN})
+    page = app.page
+    app.open_settings()
+    _settings_tab(app, 'Server')
+    page.get_by_text('Plugins', exact=True).first.wait_for(timeout=5000)
+    assert _notes(page, 'own').count() == 2
+    link = _notes(page, 'own').first.locator('a[data-ha-on-active]')
+    assert link.get_attribute('href') == PEER + '/'
+    assert 'Save Settings' not in _labels(page)
+    own = _notes(page, 'own').first.inner_text()
+    shared = _notes(page, 'shared').first.inner_text()
+    if serve:
+        assert own.startswith('This instance does not save these settings.'), own
+        assert 'everything else on the leader' in own, own
+        assert 'Change them on the leader; they arrive here with the next sync.' in shared, shared
+        assert 'standby' not in (own + shared).lower() and 'active instance' not in own + shared
+        assert link.inner_text().strip() == 'Open on the leader'
+    else:
+        assert own.startswith('A standby does not save these settings.'), own
+        assert 'Change them on the active instance' in shared, shared
+        assert link.inner_text().strip() == ON_ACTIVE
+    assert not app.errors, app.errors
+
+
+
+# -- review of the serving members: consoles with the leader away, its lists, the rebuild, words --
+#
+# A member that serves users opens consoles with its leader away too, so a console entry asks
+# what the account holds, not the read-only rule. The lists only the leader keeps (drift, firing
+# alerts, the push inbox) answer 503 while it is away, and each view says so in place of the
+# list. The HA tab shows a cluster connection rebuild that waits and one that failed, and the
+# texts a serving member shows name the leader where a standby's say "the active instance".
+
+def test_the_context_derives_the_serving_flag(ctx):
+    assert 'const haServing = haStandby && ha.serving === true;' in ctx
+    provider = ctx[ctx.index('<AuthContext.Provider value={{'):]
+    provider = provider[:provider.index('}}>')]
+    assert re.search(r'\bhaServing\b', provider)
+
+
+def test_the_serving_flag_answers_as_agreed(ctx):
+    import shutil
+    import subprocess
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('node is not installed')
+    lines = _block(ctx, 'const haStandby = ', 'return(')
+    script = """
+    const out = [];
+    for (const role of ['standalone', 'active', 'standby'])
+      for (const serving of [true, false, undefined]) {
+        const ha = { role, forwarding: true, serving };
+        %s
+        out.push([role, String(serving), haServing, haConsolesElsewhere]);
+      }
+    console.log(JSON.stringify(out));
+    """ % lines
+    res = subprocess.run([node, '-e', script], capture_output=True, text=True, timeout=30)
+    assert res.returncode == 0, res.stderr
+    for role, serving, flag, elsewhere in json.loads(res.stdout):
+        assert flag == (role == 'standby' and serving == 'true'), (role, serving)
+        # on a standby the two are each other's opposite
+        if role == 'standby':
+            assert flag != elsewhere
+
+
+def test_a_console_entry_in_the_menu_asks_what_the_account_holds(dash):
+    raw = _block(dash, 'const buildContextMenuItemsRaw = ', 'const buildContextMenuItems = ')
+    # the three that open something here: the node shell, the console and SPICE
+    shell = raw[raw.index("{ perm: 'node.shell', label: t('sshConsole')"):]
+    assert shell[:shell.index('\n')].endswith('disabled: !online, console: true },')
+    con = raw[raw.index("{ perm: 'vm.console', label: t('console')"):]
+    assert con[:con.index('\n')].endswith('disabled: !isRunning, console: true },')
+    spice = raw[raw.index("[{ perm: 'vm.console', label: t('spiceConsole')"):]
+    assert spice[:spice.index('\n')].endswith('disabled: !isRunning, console: true }] : []),')
+    assert len(re.findall(r'console: true', raw)) == 3
+    menu = _block(dash, 'const buildContextMenuItems = ', 'while (out.length')
+    assert '.filter(menuAllows);' in menu and 'item.submenu.filter(menuAllows);' in menu
+    assert 'can(i.perm)' not in menu
+    # only on a member that serves users are they in the menu at all; elsewhere the way to
+    # the active stands in their place
+    assert "...(haConsolesElsewhere ? onActiveItems('node.shell', '', !online) : [" in raw
+    assert "...(haConsolesElsewhere ? onActiveItems('vm.console', haConsoleSearch(vm), !isRunning) : [" in raw
+
+
+def test_the_leader_only_lists_say_when_the_leader_is_away(ctx, dash):
+    helper = _block(ctx, 'async function haLeaderAway(res) {', '\n        }')
+    assert "if (!res || res.status !== 503) return false;" in helper
+    assert "return !!body && body.code === 'HA_ACTIVE_UNREACHABLE';" in helper
+    drift = _function(dash, 'DriftTab')
+    assert 'const away = (await haLeaderAway(sr)) || (await haLeaderAway(er));' in drift
+    assert 'if (away) { setStatus(null); setEvents([]); return; }' in drift
+    assert '}, [clusterId, filter, haReadOnly]);' in drift
+    assert drift.index('{leaderAway ? (') < drift.index('events.length === 0 ? (')
+    bell = _function(dash, 'PushBellButton')
+    assert 'const away = await haLeaderAway(r);' in bell
+    assert 'if (away) { setItems([]); setUnread(0); return; }' in bell
+    assert '{items.length === 0 && !leaderAway && (' in bell
+    alerts = _block(dash, 'const loadActiveAlerts = async (clusterId) => {', 'const ackAlert = ')
+    assert 'setActiveAlertsAway(await haLeaderAway(r));' in alerts
+    for where in ('drift', 'inbox', 'alerts'):
+        at = dash.index(f'data-ha-leader-away="{where}"')
+        assert "{t('pgHaLeaderAwayView')}" in dash[at:at + 400], where
+
+
+def test_the_panel_shows_the_rebuild(panel):
+    body = _function(panel, 'HaPanel')
+    assert "const reloadPending = standby && sync.reload_pending ? sync.reload_pending : null;" in body
+    assert "const lastReload = standby && sync.last_reload && typeof sync.last_reload === 'object' ? sync.last_reload : null;" in body
+    card = body[body.index('const liveViewCard = ('):body.index('const forwardCard = (')]
+    assert "{lastReload && row(t('pgHaLastReload'), (" in card
+    assert '{reloadPending && (' in card and "{t('pgHaReloadPending')}" in card
+    assert '{reloadFailed.length > 0 && (' in card and "{t('pgHaReloadFailed')}" in card
+    assert '<button onClick={applyNow} disabled={!!busy} className={btnGhost}>' in card
+    apply = body[body.index('const applyNow = '):body.index('const WORD = ')]
+    assert "if (res.data.restarting) { setRestarting('standby'); return; }" in apply
+    assert "addToast?.(t(res.data.reloaded ? 'pgHaReloaded' : 'pgHaNothingToApply'), res.data.reloaded ? 'success' : 'info');" in apply
+
+
+# what each reworded text no longer claims, in English and German
+OLD_CLAIMS = {
+    'pgHaRestartPending': {'en': ('connection settings changed', 'restarts on its own'),
+                           'de': ('Verbindungsdaten', 'von selbst neu')},
+    'pgHaNoClustersHere': {'en': ('read-only',), 'de': ('schreibgeschützt',)},
+    'pgHaLiveViewHint': {'en': ('Actions and consoles stay on the active instance',),
+                         'de': ('Aktionen und Konsolen bleiben auf der aktiven Instanz',)},
+}
+SERVING_KEYS = ('pgHaSettingsOnLeader', 'pgHaOwnSettingsOnLeader', 'pgHaOpenOnLeader', 'pgHaServingRefused',
+                'pgHaLeaderUnreachable', 'pgHaNoClustersServing', 'pgHaLeaderAwayView', 'pgHaReloadPending',
+                'pgHaLastReload', 'pgHaReloadFailed', 'pgHaReloaded', 'pgHaNothingToApply')
+
+
+def test_the_reworded_and_new_strings():
+    blocks = _blocks()
+    for key, claims in OLD_CLAIMS.items():
+        for lang, words in claims.items():
+            line = re.search(r'^ +%s: (.*),$' % key, blocks[lang], re.M).group(1)
+            for w in words:
+                assert w not in line, (lang, key, w)
+    for key in SERVING_KEYS:
+        values = []
+        for lang, block in blocks.items():
+            line = re.search(r'^ +%s: (.*),$' % key, block, re.M)
+            assert line, (lang, key)
+            assert '\u2014' not in line.group(1), (lang, key)
+            values.append(line.group(1))
+        # translated, not English copied into every language
+        assert len(set(values)) == len(LANGS), key
+    # what a serving member shows names the leader and never calls it a standby
+    for key in ('pgHaSettingsOnLeader', 'pgHaOwnSettingsOnLeader', 'pgHaServingRefused', 'pgHaLeaderUnreachable',
+                'pgHaNoClustersServing'):
+        line = re.search(r'^ +%s: (.*),$' % key, blocks['en'], re.M).group(1)
+        assert 'leader' in line and 'standby' not in line.lower(), key
+    assert "{ code: 'de', flag: '\U0001F1E6\U0001F1F9'," in _read('web', 'src', 'contexts.js')
+
+
+# -- runtime ------------------------------------------------------------------------------------
+
+def _corp_menu(page, item):
+    item.wait_for(timeout=5000)
+    item.click(button='right')
+    menu = page.locator('.corp-context-menu').first
+    menu.wait_for(timeout=3000)
+    return menu, [x.strip() for x in menu.inner_text().split('\n') if x.strip()]
+
+
+def _close_menu(page):
+    page.keyboard.press('Escape')
+    page.mouse.click(5, 900)
+    page.wait_for_function('() => !document.querySelector(".corp-context-menu")', timeout=3000)
+
+
+@pytest.mark.parametrize('serve', [True, False])
+def test_runtime_a_serving_member_keeps_its_console_entries_with_the_leader_away(open_app, serve):
+    """(review) The leader stops answering: nothing is forwarded and can() keeps only the
+    reading permissions. A serving member still opens its consoles, as its banner says, so the
+    tree menus keep Console, SPICE Console and SSH Console, and Console asks this instance. A
+    plain standby (the counterproof) offers the way to the active instead."""
+    app = open_app(role='standby', layout='corporate', clusters=[CLUSTER], resources=[VM], metrics=NODE_METRICS,
+                   forward_writes=True, serve_users=serve, source_active=False)
+    page = app.page
+    banner = page.locator('[data-ha-banner="classic"]')
+    assert banner.get_attribute('data-ha-forwarding') == 'off'
+    assert banner.get_attribute('data-ha-leader') == ('down' if serve else None)
+    page.locator('.corp-tree-item', has_text='Testi').first.click()
+
+    _, vm = _corp_menu(page, page.locator('.corp-tree-child', has_text='web01').first)
+    assert ({'Console', 'SPICE Console'} <= set(vm)) == serve, vm
+    assert not ({'Console', 'SPICE Console'} & set(vm)) == serve, vm
+    assert (ON_ACTIVE in vm) != serve, vm
+    # nothing that acts comes back with them: the leader is away
+    assert not {'Start', 'Shutdown', 'Settings', 'Delete'} & set(vm), vm
+    _close_menu(page)
+
+    _, node = _corp_menu(page, page.locator('.corp-tree-child', has_text='pve1').first)
+    assert ('SSH Console' in node) == serve, node
+    assert (ON_ACTIVE in node) != serve, node
+    assert 'Enter Maintenance' not in node, node
+    _close_menu(page)
+
+    assert not app.errors, app.errors
+    if serve:
+        # it opens here: the ticket is asked of this instance (the fake has none to give)
+        menu, _ = _corp_menu(page, page.locator('.corp-tree-child', has_text='web01').first)
+        menu.get_by_text('Console', exact=True).click()
+        assert _wait_for_call(app, ('GET', '/api/clusters/c1/vms/pve1/qemu/100/console'), 5), app.server.calls[-8:]
+        assert not [t for t in _toasts(page) if 'active instance' in t], _toasts(page)
+
+
+VIEWER = ['cluster.view', 'node.view', 'vm.view']
+
+
+@pytest.mark.parametrize('extra_perms,shown', [(['vm.console', 'node.shell'], True), ([], False)])
+def test_runtime_with_the_leader_away_a_console_entry_still_needs_its_permission(open_app, extra_perms, shown):
+    """The entries stay for who holds vm.console and node.shell, and only for them: a viewer
+    without them (the counterproof) gets none, leader away or not."""
+    app = open_app(role='standby', layout='corporate', admin=False, permissions=VIEWER + extra_perms,
+                   clusters=[CLUSTER], resources=[VM], metrics=NODE_METRICS, forward_writes=True,
+                   serve_users=True, source_active=False)
+    page = app.page
+    page.locator('.corp-tree-item', has_text='Testi').first.click()
+    _, vm = _corp_menu(page, page.locator('.corp-tree-child', has_text='web01').first)
+    assert ({'Console', 'SPICE Console'} <= set(vm)) == shown, vm
+    assert not ({'Console', 'SPICE Console'} & set(vm)) == shown, vm
+    assert ON_ACTIVE not in vm, vm
+    _close_menu(page)
+    _, node = _corp_menu(page, page.locator('.corp-tree-child', has_text='pve1').first)
+    assert ('SSH Console' in node) == shown, node
+    assert not app.errors, app.errors
+
+
+AWAY_READ = (503, {'code': 'HA_ACTIVE_UNREACHABLE',
+                   'error': 'The active instance cannot be reached - act again once it is back, or promote this standby'})
+DRIFT_EVENT = {'id': 7, 'cluster_id': 'c1', 'kind': 'vm_config', 'scope': 'qemu/100', 'severity': 'warning',
+               'status': 'open', 'detected_at': '2026-09-30T10:00:00', 'diff': []}
+INBOX_ITEM = {'id': 3, 'title': 'Disk almost full', 'body': 'pve1 local 91%', 'severity': 'warning',
+              'created_at': '2026-09-30T10:00:00', 'read_at': None}
+FIRING = {'id': 'f1', 'severity': 'critical', 'message': 'CPU above 90 percent', 'triggered_at': '2026-09-30T10:00:00',
+          'escalation_step': 0, 'acked_at': None}
+LEADER_LISTS = ('/api/push/inbox', '/api/clusters/c1/drift/status', '/api/clusters/c1/drift/events',
+                '/api/clusters/c1/active-alerts')
+AWAY_VIEW = 'Only the leader (the active instance) keeps this list, and it does not answer right now.'
+
+
+def _leader_lists(away):
+    # the alert rules and scripts are shared configuration, read from this instance either way
+    rules = {('GET', '/api/clusters/c1/alerts'): (200, []), ('GET', '/api/clusters/c1/scripts'): (200, [])}
+    if away:
+        return {**rules, **{('GET', path): AWAY_READ for path in LEADER_LISTS}}
+    return {**rules,
+            ('GET', '/api/push/inbox'): (200, {'items': [INBOX_ITEM]}),
+            ('GET', '/api/clusters/c1/drift/status'): (200, {'baselines': 3, 'by_kind': {'vm_config': {'warning': 1}}}),
+            ('GET', '/api/clusters/c1/drift/events'): (200, {'events': [DRIFT_EVENT]}),
+            ('GET', '/api/clusters/c1/active-alerts'): (200, {'active_alerts': [FIRING]})}
+
+
+@pytest.mark.parametrize('away', [True, False])
+def test_runtime_the_lists_only_the_leader_keeps_say_when_it_is_away(open_app, away):
+    """(review) Drift, firing alerts and the push inbox are the leader's rows. While a member
+    cannot reach it they answer 503, not its own copy: each view says so in place of the list,
+    offers no Ack on a row from elsewhere, and no read puts a toast up, however often the bell
+    asks. Counterproof: the leader answers, and the rows show with their buttons."""
+    app = open_app(role='standby', layout='modern', clusters=[CLUSTER], resources=[VM], forward_writes=True,
+                   serve_users=True, extra={**_leader_lists(away), **SSE_TOKEN})
+    page = app.page
+    checks = app.server.calls.count(('GET', '/api/auth/check'))
+
+    # the bell asked on load; opening it asks again
+    page.locator('button[title="Notifications"]').first.click()
+    page.wait_for_timeout(500)
+    assert app.server.calls.count(('GET', '/api/push/inbox')) >= 2
+    assert (page.locator('[data-ha-leader-away="inbox"]').count() == 1) == away
+    assert (page.get_by_text('Disk almost full').count() > 0) != away
+    assert page.get_by_text('No notifications yet').count() == 0
+    if away:
+        assert AWAY_VIEW in page.locator('[data-ha-leader-away="inbox"]').inner_text()
+    # the popover's backdrop takes the click and closes it
+    page.locator('button[title="Notifications"]').first.click(force=True)
+    page.wait_for_timeout(200)
+
+    # drift, under Compliance
+    page.get_by_text('Testi').first.click()
+    page.locator('button', has_text='Compliance').first.click()
+    page.locator('button', has_text='Drift Detection').first.click()
+    page.wait_for_timeout(600)
+    assert (page.locator('[data-ha-leader-away="drift"]').count() == 1) == away
+    # an empty list would say the cluster matches its baseline: not while nobody knows
+    assert page.get_by_text('No open drift events').count() == 0
+    assert (page.get_by_text('qemu/100').count() > 0) != away
+    assert (page.get_by_role('button', name='Ack', exact=True).count() == 1) != away
+
+    # the firing alerts, under Automation > Alerts
+    page.locator('button', has_text='Automation').first.click()
+    page.get_by_role('button', name='Alerts', exact=True).first.click()
+    page.wait_for_timeout(600)
+    assert (page.locator('[data-ha-leader-away="alerts"]').count() == 1) == away
+    assert (page.get_by_text('CPU above 90 percent').count() > 0) != away
+    for path in LEADER_LISTS:
+        assert ('GET', path) in app.server.calls, path
+
+    # no toast for a read, and no burst of banner reads either
+    assert not [t for t in _toasts(page) if 'cannot be reached' in t or 'does not answer' in t], _toasts(page)
+    assert app.server.calls.count(('GET', '/api/auth/check')) - checks <= 1
+    assert not app.errors, app.errors
+
+
+def test_runtime_drift_reads_again_when_forwarding_comes_back(open_app):
+    """The drift list loaded while the leader was away is not kept once it is back: the tab
+    reads again when forwarding changes, so an Ack only ever names one of the leader's rows."""
+    app = open_app(role='standby', layout='modern', clusters=[CLUSTER], resources=[VM], forward_writes=True,
+                   serve_users=True, source_active=False, extra={**_leader_lists(True), **SSE_TOKEN})
+    page = app.page
+    page.get_by_text('Testi').first.click()
+    page.locator('button', has_text='Compliance').first.click()
+    page.locator('button', has_text='Drift Detection').first.click()
+    page.locator('[data-ha-leader-away="drift"]').wait_for(timeout=5000)
+    assert page.locator('[data-ha-banner="classic"]').get_attribute('data-ha-forwarding') == 'off'
+    reads = app.server.calls.count(('GET', '/api/clusters/c1/drift/events'))
+    # the leader answers again; "Sync now" reads the banner again, which brings forwarding back
+    app.server.extra.update(_leader_lists(False))
+    app.server.source_active = True
+    _open_ha(app, 'standby')
+    page.get_by_role('button', name='Sync now').click()
+    page.wait_for_function('() => document.querySelector("[data-ha-banner]")'
+                           '.getAttribute("data-ha-forwarding") === "on"', timeout=5000)
+    page.keyboard.press('Escape')
+    deadline = time.time() + 5
+    while time.time() < deadline and page.get_by_text('qemu/100').count() == 0:
+        page.wait_for_timeout(100)
+    assert app.server.calls.count(('GET', '/api/clusters/c1/drift/events')) > reads
+    assert page.locator('[data-ha-leader-away="drift"]').count() == 0
+    assert page.get_by_text('qemu/100').count() > 0
+    assert page.get_by_role('button', name='Ack', exact=True).count() == 1
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('failed', [['cluster:c2', 'pbs:p1'], []])
+def test_runtime_the_panel_shows_a_waiting_and_a_failed_rebuild(open_app, failed):
+    """A changed cluster connection is rebuilt in place now: the HA tab says one is waiting,
+    when the last ran and what it could not build. Apply now runs a waiting one at once and
+    says so. Counterproof: a rebuild that built everything shows no red box."""
+    app = open_app(role='standby', layout='modern', forward_writes=True,
+                   reload_pending={'since': _iso_ago(4), 'reason': '1 cluster changed'},
+                   last_reload={'at': _iso_ago(3600), 'reason': '2 clusters changed', 'failed': failed})
+    page = app.page
+    panel = _open_ha(app, 'standby')
+    card = panel.locator('[data-ha-live-view]')
+    waiting = card.locator('[data-ha-reload-pending]')
+    assert 'This instance rebuilds them in a few seconds.' in waiting.inner_text()
+    assert '1 cluster changed' in waiting.inner_text()
+    last = card.locator('[data-ha-last-reload]')
+    assert 'hour ago' in last.inner_text() and '2 clusters changed' in last.inner_text(), last.inner_text()
+    box = card.locator('[data-ha-reload-failed]')
+    assert box.count() == (1 if failed else 0)
+    if failed:
+        text = box.inner_text()
+        assert 'Could not be rebuilt' in text and 'cluster:c2' in text and 'pbs:p1' in text, text
+    # nothing waits for a restart: the restart note stays away
+    assert panel.locator('[data-ha-restart-pending]').count() == 0
+
+    waiting.get_by_role('button', name='Apply now').click()
+    assert _wait_for_toast(page, 'The cluster connections were rebuilt with the latest settings.'), _toasts(page)
+    assert app.server.calls.count(('POST', '/api/ha/apply-config')) == 1
+    assert page.get_by_text('Restarting PegaProx...').count() == 0
+    card.locator('[data-ha-reload-pending]').wait_for(state='detached', timeout=5000)
+    assert card.locator('[data-ha-reload-failed]').count() == 0
+    assert not app.errors, app.errors
+
+
+def test_runtime_a_rebuild_that_already_ran_says_so(open_app):
+    """The rebuild ran on its own between the last poll and the click: Apply now says that
+    nothing waits, instead of nothing at all."""
+    app = open_app(role='standby', layout='modern', reload_pending={'since': _iso_ago(9), 'reason': '1 cluster changed'})
+    page = app.page
+    panel = _open_ha(app, 'standby')
+    waiting = panel.locator('[data-ha-reload-pending]')
+    waiting.wait_for(timeout=5000)
+    app.server.reload_pending = None
+    waiting.get_by_role('button', name='Apply now').click()
+    assert _wait_for_toast(page, 'Nothing is waiting to be applied.'), _toasts(page)
+    waiting.wait_for(state='detached', timeout=5000)
+    assert panel.locator('[data-ha-last-reload]').count() == 0
+    assert not app.errors, app.errors
+
+
+def test_runtime_a_standby_with_nothing_rebuilt_shows_no_rebuild(open_app):
+    app = open_app(role='standby', layout='modern')
+    panel = _open_ha(app, 'standby')
+    for what in ('[data-ha-last-reload]', '[data-ha-reload-pending]', '[data-ha-reload-failed]'):
+        assert panel.locator(what).count() == 0, what
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('serve', [True, False])
+def test_runtime_a_refusal_on_a_serving_member_names_the_leader(open_app, serve):
+    """A change a member cannot carry out (409): on a serving member it is not possible here
+    and is made on the leader, a plain standby keeps its words (the counterproof)."""
+    refused = {('POST', '/api/clusters/c1/vms/pve1/qemu/100/shutdown'):
+               (409, {'code': 'HA_STANDBY', 'error': 'This is a standby instance.'})}
+    app = open_app(role='standby', layout='modern', clusters=[CLUSTER], resources=[VM], forward_writes=True,
+                   serve_users=serve, extra={**refused, **SSE_TOKEN})
+    page = app.page
+    page.on('dialog', lambda d: d.accept())
+    _open_resources(app)
+    page.locator('button[title="Shutdown"]').first.click()
+    words = ('This change cannot be made on this instance. Make it on the leader; it arrives here with the next sync.'
+             if serve else REFUSED['en'])
+    assert _wait_for_toast(page, words), _toasts(page)
+    page.wait_for_timeout(400)
+    assert len([t for t in _toasts(page) if words in t]) == 1
+    if serve:
+        assert not [t for t in _toasts(page) if 'standby' in t.lower()], _toasts(page)
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('serve', [True, False])
+def test_runtime_the_leader_out_of_reach_on_a_serving_member(open_app, serve):
+    """503 for a change: on a serving member the leader does not answer, changes are paused,
+    promote a member; a plain forwarding standby keeps its own words (the counterproof)."""
+    app = open_app(role='standby', layout='modern', clusters=[CLUSTER], resources=[VM], forward_writes=True,
+                   serve_users=serve, active_down=True, extra=SSE_TOKEN)
+    page = app.page
+    page.on('dialog', lambda d: d.accept())
+    _open_resources(app)
+    page.locator('button[title="Shutdown"]').first.click()
+    words = ('The leader does not answer, so changes are paused. Try again once it is back, or promote a member '
+             'under High Availability.' if serve else UNREACHABLE['en'])
+    assert _wait_for_toast(page, words), _toasts(page)
+    page.wait_for_timeout(400)
+    assert len([t for t in _toasts(page) if words in t]) == 1
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('serve', [True, False])
+def test_runtime_an_empty_list_on_a_serving_member(open_app, serve):
+    app = open_app(role='standby', layout='modern', forward_writes=True, serve_users=serve)
+    page = app.page
+    words = ('The clusters of the leader appear here after the next sync.' if serve
+             else 'This is a standby instance. Its clusters appear here after the next sync.')
+    app.see(words)
+    assert page.get_by_text(words).count() == 2
+    assert page.get_by_text('read-only, after the next sync').count() == 0
+    panel = _open_ha(app, 'standby')
+    hint = panel.locator('[data-ha-live-view]').inner_text()
+    assert 'consoles open on it only while it serves users' in hint, hint
+    assert 'Actions and consoles stay on the active instance' not in hint
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('serve', [True, False])
+def test_runtime_cloud_keeps_the_consoles_of_a_serving_member_with_the_leader_away(open_app, serve):
+    """Cloud hands its shell the console handlers by the console flag alone, so with the
+    leader away a serving member keeps Console and SPICE there too, and nothing that acts.
+    A plain standby (the counterproof) offers the way to the active."""
+    app = open_app(role='standby', layout='cloud', clusters=[CLUSTER], resources=[VM], forward_writes=True,
+                   serve_users=serve, source_active=False)
+    page = app.page
+    assert page.locator('[data-ha-banner="cloud"]').get_attribute('data-ha-forwarding') == 'off'
+    page.get_by_text('Virtual Machines').first.click()
+    page.get_by_text('web01').first.wait_for(timeout=5000)
+    page.get_by_text('web01').first.click()
+    bar = page.locator('.cloud-detail-actions')
+    bar.wait_for(timeout=3000)
+    text = bar.inner_text()
+    assert 'Shutdown' not in text, text
+    assert ('SPICE' in text) == serve, text
+    assert bar.locator('a[data-ha-on-active]').count() == (0 if serve else 1)
+    page.locator('.cloud-detail-actions button', has_text='Actions').click()
+    page.wait_for_timeout(300)
+    menu = page.evaluate('() => Array.from(document.querySelectorAll("[role=menu], .cloud-menu"))'
+                         '.map(m => m.innerText).join("\\n")').split('\n')
+    menu = [x.strip() for x in menu if x.strip()]
+    assert ('Console' in menu) == serve, menu
+    assert (ON_ACTIVE in menu) != serve, menu
+    assert not {'Start', 'Shutdown', 'Migrate', 'Delete'} & set(menu), menu
     assert not app.errors, app.errors

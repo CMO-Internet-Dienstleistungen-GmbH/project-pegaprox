@@ -257,13 +257,16 @@
         // it opens that guest's console window there, without one the start page. Nothing
         // on any other role, or while the address of the active is not known. button: for
         // a toolbar whose styles are written for buttons only.
-        function HaOnActiveLink({ vm, clusterId, className = '', style, iconOnly = false, iconClass, button = false }) {
-            const { ha } = useAuth();
+        // A member that serves users opens its consoles itself and shows no link, except
+        // the one next to a settings note (settings), which stays on every standby and
+        // names the leader there.
+        function HaOnActiveLink({ vm, clusterId, className = '', style, iconOnly = false, iconClass, button = false, settings = false }) {
+            const { ha, haStandby, haConsolesElsewhere, haServing } = useAuth();
             const { t } = useTranslation();
-            if (ha?.role !== 'standby') return null;
+            if (!(settings ? haStandby : haConsolesElsewhere)) return null;
             const href = haActiveHref(ha.peer_url, vm ? haConsoleSearch(vm, clusterId) : '');
             if (!href) return null;
-            const label = t('pgHaOpenOnActive');
+            const label = haServing ? t('pgHaOpenOnLeader') : t('pgHaOpenOnActive');
             const inner = (
                 <>
                     <Icons.ExternalLink className={iconClass} />
@@ -304,14 +307,18 @@
 
         // in place of a save button whose route no standby carries out, forwarding or not
         // (_STANDBY_NOT_FORWARDED in app.py). own: a form that holds this instance's own
-        // settings (address, port, certificate...), which no sync brings either
+        // settings (address, port, certificate...), which no sync brings either. A member
+        // that serves users is no standby to them: the same note names the leader
         function HaSettingsOnActive({ own = false, className = '' }) {
             const { t } = useTranslation();
+            const { haServing } = useAuth();
+            const text = haServing ? (own ? t('pgHaOwnSettingsOnLeader') : t('pgHaSettingsOnLeader'))
+                : (own ? t('pgHaOwnSettingsHere') : t('pgHaSettingsOnActive'));
             return (
                 <div data-ha-settings-on-active={own ? 'own' : 'shared'}
                     className={`flex flex-wrap items-center gap-x-4 gap-y-1 px-3 py-2 rounded-lg bg-yellow-500/10 border border-yellow-500/30 text-xs text-yellow-400 ${className}`}>
-                    <span className="flex-1 min-w-0">{own ? t('pgHaOwnSettingsHere') : t('pgHaSettingsOnActive')}</span>
-                    <HaOnActiveLink className="inline-flex items-center gap-1 font-medium text-proxmox-orange hover:underline" iconClass="w-3.5 h-3.5" />
+                    <span className="flex-1 min-w-0">{text}</span>
+                    <HaOnActiveLink settings className="inline-flex items-center gap-1 font-medium text-proxmox-orange hover:underline" iconClass="w-3.5 h-3.5" />
                 </div>
             );
         }

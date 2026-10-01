@@ -190,7 +190,8 @@
             // LW Sep 2026 (#625) - role of this instance in a warm standby pair, as the
             // server reports it on login and /auth/check. A standby also sends peer_url
             // and last_sync_at for the banner, and forwarding: true while it hands
-            // changes to the active.
+            // changes to the active. serving: true on a member that serves users as an
+            // active instance, leader_reachable: false once the leader stops answering.
             const [ha, setHa] = useState({ role: 'standalone' });
             
             // Check session on mount
@@ -520,13 +521,19 @@
             // as it is, the HA tab and the promote flow hang off it.
             // A standby that forwards hands every change to the active, so it shows the
             // actions again. It is read-only while it does not (switched off here, or the
-            // active it follows does not answer). haStandby holds on every standby: consoles,
-            // shells, SPICE and the console preview never run on one, forwarding or not.
+            // active it follows does not answer). haStandby holds on every standby: the
+            // settings that belong to this instance or are saved on the leader only.
+            // haConsolesElsewhere: consoles, shells, SPICE and the console preview run on the
+            // leader, except on a member that serves users, which opens them itself.
+            // haServing: that member, an active instance to its users, so its texts name
+            // the leader where a standby's say "the active instance".
             const haStandby = ha.role === 'standby';
             const haReadOnly = haStandby && ha.forwarding !== true;
+            const haConsolesElsewhere = haStandby && ha.serving !== true;
+            const haServing = haStandby && ha.serving === true;
 
             return(
-                <AuthContext.Provider value={{ user, sessionId, isAuthenticated, loading, error, login, logout, getAuthHeaders, isAdmin: user?.role === 'admin', passwordExpiry, requires2FASetup, setRequires2FASetup, updatePreferences, updateCurrentUser, ldapEnabled, oidcEnabled, oidcButtonText, loginBackground, reverseProxyEnabled, needsSetup, setNeedsSetup, ha, refreshHa, haReadOnly, haStandby }}>
+                <AuthContext.Provider value={{ user, sessionId, isAuthenticated, loading, error, login, logout, getAuthHeaders, isAdmin: user?.role === 'admin', passwordExpiry, requires2FASetup, setRequires2FASetup, updatePreferences, updateCurrentUser, ldapEnabled, oidcEnabled, oidcButtonText, loginBackground, reverseProxyEnabled, needsSetup, setNeedsSetup, ha, refreshHa, haReadOnly, haStandby, haConsolesElsewhere, haServing }}>
                     {children}
                 </AuthContext.Provider>
             );
@@ -535,6 +542,16 @@
         // #625 v2 - what a standby still lets through the permission helpers: the *.view ones
         function haReadPermission(permission) {
             return typeof permission === 'string' && permission.endsWith('.view');
+        }
+
+        // #625 - a list only the leader keeps (drift, firing alerts, the push inbox) answers
+        // 503 HA_ACTIVE_UNREACHABLE on a member while the leader does not answer, rather
+        // than this instance's own rows. The view that asked says so instead of showing an
+        // empty list; authFetch leaves such a read without a toast.
+        async function haLeaderAway(res) {
+            if (!res || res.status !== 503) return false;
+            const body = await res.clone().json().catch(() => null);
+            return !!body && body.code === 'HA_ACTIVE_UNREACHABLE';
         }
 
         // #625 - this view on the active instance, for what a standby never runs itself.

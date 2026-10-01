@@ -1298,13 +1298,13 @@
         // NS: filtering + sorting uses useMemo below (lines 1320+)
         function ResourceTable({ resources, clusterId, clusters, sourceCluster, onVmAction, onOpenConsole, onOpenSpice, onOpenConfig, onMigrate, onBulkMigrate, onDelete, onClone, onForceStop, onCrossClusterMigrate, nodes, datastores, onOpenTags, highlightedVm, addToast, pendingVmAction, onPendingActionConsumed, onVmNavigate, backupStatus }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, user, haReadOnly, haStandby } = useAuth();
+            const { getAuthHeaders, user, haReadOnly, haConsolesElsewhere } = useAuth();
             // #625 v2 - a standby shows the guests live but acts on none of them: no power,
             // console, migrate, clone or delete buttons. Config, metrics and Proxmox links stay.
-            // One that forwards acts through the active again, but a console never runs
-            // on a standby: in its place a link opens the guest's console on the active
+            // One that forwards acts through the active again, but a console only runs on a
+            // standby that serves users: elsewhere a link opens the guest's console on the active
             const acts = !haReadOnly;
-            const consoles = !haStandby;
+            const consoles = !haConsolesElsewhere;
             const { isCorporate } = useLayout(); // LW: Feb 2026 - corporate defaults to table view
             // NS Mar 2026 - per-VM sparkline history for table view
             const vmHistRef = useRef({});

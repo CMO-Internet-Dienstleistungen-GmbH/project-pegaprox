@@ -830,9 +830,9 @@
         // LW: this shows when you click a VM in detail view mode
         function VmDetailPanel({ vm, clusterId, onAction, onOpenConsole, onOpenSpice, onOpenLxcShell, onOpenConfig, onMigrate, onClone, onForceStop, onDelete, onCrossClusterMigrate, showCrossCluster, actionLoading, onShowMetrics, addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, haReadOnly, haStandby } = useAuth();
+            const { getAuthHeaders, haReadOnly, haConsolesElsewhere } = useAuth();
             const acts = !haReadOnly;  // #625: a standby shows this VM, the active acts on it
-            const consoles = !haStandby;  // forwarding or not, a standby opens the console on the active
+            const consoles = !haConsolesElsewhere;  // a standby opens the console on the active, unless it serves users
             
             // some quick helpers
             const isQemu = vm.type === 'qemu';
@@ -1563,13 +1563,14 @@
         // LW: Feb 2026 - Corporate VM Detail View (experimental)
         function CorporateVmDetailView({ vm, clusterId, onAction, onOpenConsole, onOpenSpice, onOpenConfig, onBack, onMigrate, onClone, onForceStop, onDelete, onCrossClusterMigrate, showCrossCluster, actionLoading, onShowMetrics, addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, haReadOnly, haStandby } = useAuth();
+            const { getAuthHeaders, haReadOnly, haStandby, haConsolesElsewhere } = useAuth();
             // #625 v2 - on a standby: no power, console, SPICE, snapshot or HA changes, and no
             // console preview either, since the grab runs on the node
-            // A forwarding standby changes things through the active again; consoles, the
-            // preview and the snapshot refresh (it runs lvs on the node) stay off on every one
+            // A forwarding standby changes things through the active again. Consoles and the
+            // preview stay off unless it serves users, the snapshot refresh (it runs lvs on
+            // the node) on every one
             const acts = !haReadOnly;
-            const consoles = !haStandby;
+            const consoles = !haConsolesElsewhere;
             const [activeDetailTab, setActiveDetailTab] = useState('summary');
             const [showActionsMenu, setShowActionsMenu] = useState(false);
             const [snapshots, setSnapshots] = useState([]);
@@ -5178,7 +5179,9 @@
             const haInfo = (useAuth() || {}).ha || {};
             const haStandby = haInfo.role === 'standby';
             const { t } = useTranslation();
-            const haNoClusters = haInfo.live_view === false ? t('pgHaNoClustersLiveOff') : t('pgHaNoClustersHere');
+            // a member that serves users is no standby to them
+            const haNoClusters = haInfo.live_view === false ? t('pgHaNoClustersLiveOff')
+                : haInfo.serving === true ? t('pgHaNoClustersServing') : t('pgHaNoClustersHere');
             const { isCorporate } = useLayout();
             const [sortBy, setSortBy] = useState('name');
             const [sortDir, setSortDir] = useState('asc');

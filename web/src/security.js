@@ -2083,7 +2083,7 @@
         // update Manager Section Component (for Settings tab)
         function UpdateManagerSection({ clusterId, addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, isAdmin, user, haReadOnly } = useAuth();
+            const { getAuthHeaders, isAdmin, user, haReadOnly, haServing } = useAuth();
             // #644-class: gate the update-manager controls on the backend perms they
             // actually call (backup.schedule / node.update), not a blanket isAdmin.
             // Nothing here is a reading permission, so a standby (#625) shows none of them.
@@ -2286,7 +2286,8 @@
                             addToast(t('noUpdatesAvailable'), 'success');
                         }
                     } else {
-                        addToast(json.code === 'HA_STANDBY' ? t('pgHaStandbyRefused') : (json.error || 'Error checking updates'), 'error');
+                        addToast(json.code === 'HA_STANDBY' ? (haServing ? t('pgHaServingRefused') : t('pgHaStandbyRefused'))
+                            : (json.error || 'Error checking updates'), 'error');
                     }
                 } catch (err) {
                     console.error('Update check error:', err);

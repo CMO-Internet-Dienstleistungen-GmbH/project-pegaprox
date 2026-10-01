@@ -36,7 +36,13 @@ def test_the_wrapper_filters_on_the_callers_permissions():
     s = open(DASH, encoding='utf-8').read()
 
     assert 'const buildContextMenuItemsRaw' in s, 'the raw builder is gone'
-    assert '.filter(i => !i.perm || can(i.perm))' in s, 'entries are no longer filtered'
+    # a console entry asks what the account holds: a member that serves users opens consoles
+    # with its leader away too, when can() keeps only the reading permissions (#625)
+    assert 'const menuAllows = (i) => !i.perm || (i.console ? holds(i.perm) : can(i.perm));' in s
+    menu = s[s.index('const buildContextMenuItems = (type, target) => {'):]
+    menu = menu[:menu.index('return out;')]
+    assert '.filter(menuAllows);' in menu, 'entries are no longer filtered'
+    assert 'item.submenu.filter(menuAllows);' in menu, 'submenu entries are no longer filtered'
     # a submenu that loses all its children must not stay behind as a dead parent
     assert 'if (!sub.length) continue;' in s
 
