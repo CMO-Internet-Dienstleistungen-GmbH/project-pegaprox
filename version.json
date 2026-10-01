@@ -119,6 +119,7 @@
     "pegaprox/core/dbcrypto.py",
     "pegaprox/core/esxi_cluster.py",
     "pegaprox/core/ha.py",
+    "pegaprox/core/ha_vote.py",
     "pegaprox/core/incremental_repl.py",
     "pegaprox/core/keystore.py",
     "pegaprox/core/manager.py",
