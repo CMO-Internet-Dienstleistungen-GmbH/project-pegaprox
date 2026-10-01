@@ -3491,11 +3491,21 @@ def index():
         return send_from_directory(WEB_DIR, 'index.html')
 
 
+def _plugin_page_here(plugin_id):
+    """Whether a plugin's own page is served here. MK Oct 2026 (#625) - on a standby the
+    module stays loaded until a restart after the leader switched the plugin off, so it
+    goes by the synced plugin state there as well (api/plugins.py plugin_runs_here)."""
+    from pegaprox.api.plugins import _loaded_plugins, plugin_runs_here
+    from pegaprox.core import ha
+    if ha.is_standby():
+        return plugin_runs_here(plugin_id)
+    return plugin_id in _loaded_plugins
+
+
 @bp.route('/status')
 def status_page():
     """Serve public status page — only if plugin is enabled"""
-    from pegaprox.api.plugins import _loaded_plugins
-    if 'status_page' not in _loaded_plugins:
+    if not _plugin_page_here('status_page'):
         return '<h1>Status Page not available</h1><p>The Status Page plugin is not enabled.</p>', 404
     import os
     path = os.path.join(os.path.dirname(__file__), '..', '..', 'plugins', 'status_page', 'status.html')
@@ -3506,8 +3516,7 @@ def status_page():
 @bp.route('/api/public/status-page', methods=['GET'])
 def public_status_api():
     """NS: Apr 2026 — Public status endpoint, auth via URL key (no session)."""
-    from pegaprox.api.plugins import _loaded_plugins
-    if 'status_page' not in _loaded_plugins:
+    if not _plugin_page_here('status_page'):
         return jsonify({'error': 'Status Page plugin not enabled'}), 404
     try:
         from plugins.status_page import _public_status
@@ -3524,8 +3533,7 @@ def public_status_api():
 @bp.route('/portal/<path:subpath>')
 def client_portal_page(subpath=None):
     """Serve client portal — only if plugin is enabled"""
-    from pegaprox.api.plugins import _loaded_plugins
-    if 'client_portal' not in _loaded_plugins:
+    if not _plugin_page_here('client_portal'):
         return '<h1>Client Portal not available</h1><p>The Client Portal plugin is not enabled.</p>', 404
     import os
     portal_path = os.path.join(os.path.dirname(__file__), '..', '..', 'plugins', 'client_portal', 'portal.html')

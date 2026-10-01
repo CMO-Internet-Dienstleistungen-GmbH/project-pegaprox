@@ -197,6 +197,28 @@ FORWARDED_READS = LEADER_ONLY_READS | frozenset((
     '/api/site-recovery/plans/<plan_id>/events',
     '/api/clusters/<cluster_id>/snapshot-policies/<pid>/runs',
 ))
+# The one rule every plugin route is served behind (api/plugins.py plugin_proxy). A
+# plugin handler serves every method from one function and most never look at which
+# one they got, so a GET of a plugin may change something as well: a forwarding
+# standby reads it from the active, like the reads above, and runs none here. Not the
+# ones that open a console (PLUGIN_CONSOLE_PATHS): the browser connects to the
+# instance that opened it, so a standby that serves users opens them itself, any
+# other refuses them (app.py).
+PLUGIN_PROXY_RULE = '/api/plugins/<plugin_id>/api/<path:subpath>'
+PLUGIN_CONSOLE_PATHS = frozenset(('vm/console',))
+# The writes that open a console. Every caller of the console token opens one; the
+# others hand out a ticket or carry the session (vnc-poll is a whole VNC transport over
+# POST). A console belongs to the instance the browser is on: a standby that serves
+# users opens them itself, any other refuses them (app.py), and none is ever handed to
+# the active (api/ha.py _forward_envelope). The GET routes and the WebSockets ask
+# api/ha.py standby_console_refusal / consoles_here themselves.
+CONSOLE_WRITES = frozenset((
+    ('POST', '/api/ws/token'),
+    ('POST', '/api/clusters/<cluster_id>/nodes/<node>/shell'),
+    ('POST', '/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/termproxy'),
+    ('POST', '/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/vnc-poll'),
+    ('POST', '/api/vmware/<vmware_id>/vms/<vm_id>/console'),
+))
 
 # Shared configuration. Everything else in the database is per host: sessions,
 # audit trail, metrics, run and event history, runtime alerts. A table that is in
@@ -1025,6 +1047,20 @@ def _hand_over_ha_view(mgr, cfg):
     settings = getattr(cfg, 'ha_settings', None)
     mgr.ha_enabled = bool(getattr(cfg, 'ha_enabled', False))
     apply(settings if isinstance(settings, dict) else {})
+
+
+def _follow_plugin_state():
+    """A standby runs a plugin exactly when the leader's synced state says so
+    (api/plugins.py follow_synced_state). Never raises."""
+    if not is_standby():
+        return
+    try:
+        from pegaprox.api.plugins import follow_synced_state
+        loaded, unloaded = follow_synced_state()
+        if loaded or unloaded:
+            logging.info(f"[HA] sync: plugins loaded {loaded or '-'}, unloaded {unloaded or '-'}")
+    except Exception as e:
+        logging.warning(f"[HA] could not follow the plugin state after a sync: {e}")
 
 
 def _after_sync_applied():
@@ -3649,6 +3685,7 @@ def _pull_detail(timeout):
         # restart anything while that failure lasts
         if committed:
             _after_sync_applied()
+            _follow_plugin_state()
 
 
 def _hand_back_tombstones(src, owed):

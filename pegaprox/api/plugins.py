@@ -38,6 +38,9 @@ _SAFE_PATH_SEG = re.compile(r'^[A-Za-z0-9_.-]+$')
 _plugin_lock = threading.RLock()
 _loaded_plugins = {}   # {plugin_id: module}
 _plugin_routes = {}    # {plugin_id: {path: handler_fn}}
+# the app the plugins were loaded into at startup, for a standby that follows the
+# leader's plugin state later (follow_synced_state)
+_app = None
 
 
 # NS Apr 2026 — CodeQL flagged plugin_id as a path-injection vector (admin-only
@@ -137,6 +140,24 @@ def _get_plugin_states():
         state['clusters'] = _parse_cluster_scope(state.get('clusters'))
         out[state['plugin_id']] = state
     return out
+
+
+def plugin_runs_here(plugin_id):
+    """Whether plugin_id is loaded in this process and its plugin_state row says it is
+    switched on. MK Oct 2026 (#625) - on a standby the row is the leader's, it syncs; the
+    module stays loaded here until a restart when the leader switches the plugin off, so
+    being loaded alone says nothing. False when the row cannot be read."""
+    if not _valid_plugin_id(plugin_id):
+        return False
+    with _plugin_lock:
+        if plugin_id not in _loaded_plugins:
+            return False
+    try:
+        row = get_db().query_one('SELECT enabled FROM plugin_state WHERE plugin_id = ?', (plugin_id,))
+    except Exception as e:
+        logging.warning(f"[PLUGINS] could not read the state of {plugin_id}: {e}")
+        return False
+    return bool(row and row['enabled'])
 
 
 def _set_plugin_state(plugin_id, enabled, error=''):
@@ -239,6 +260,8 @@ def unload_plugin(plugin_id):
 
 def load_enabled_plugins(app):
     """Called once at startup — load all enabled plugins"""
+    global _app
+    _app = app
     states = _get_plugin_states()
     discovered = _discover_plugins()
 
@@ -258,6 +281,31 @@ def load_enabled_plugins(app):
 
     if loaded:
         logging.info(f"[PLUGINS] {len(loaded)} plugin(s) loaded: {', '.join(loaded)}")
+
+
+def follow_synced_state():
+    """A standby, after a sync: load the plugins the leader has switched on and unload the
+    ones it switched off, so a plugin runs here exactly when the leader says so. MK Oct
+    2026 (#625) - a standby starts before its first sync, and the plugin state that sync
+    brings was never acted on. Writes nothing (plugin_state is the leader's) and starts
+    no background tasks (only an active one runs those). Returns (loaded, unloaded)."""
+    if _app is None:
+        return [], []
+    states = _get_plugin_states()
+    wanted = {pid for pid, st in states.items() if st.get('enabled') and _valid_plugin_id(pid)}
+    with _plugin_lock:
+        running = set(_loaded_plugins)
+    loaded, unloaded = [], []
+    for pid in sorted(running - wanted):
+        unload_plugin(pid)
+        unloaded.append(pid)
+    for pid in sorted(wanted - running):
+        ok, err = load_plugin(_app, pid)
+        if ok:
+            loaded.append(pid)
+        else:
+            logging.warning(f"[PLUGINS] the leader runs {pid}, this instance could not load it: {err}")
+    return loaded, unloaded
 
 
 def start_plugin_backgrounds():

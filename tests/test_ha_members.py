@@ -185,6 +185,10 @@ def group(api, tmp_path, monkeypatch):
     monkeypatch.setattr(ha, '_install_field_key', g.installed.append)
     monkeypatch.setattr(ha, '_peer_call', g.call)
     monkeypatch.setattr(ha, '_fan_out', _one_after_the_other)
+    # The instances here share one process, so a standby that loads or unloads plugins
+    # after a sync would do it for all of them; the test of that turns it back on.
+    g.follow_plugin_state = ha._follow_plugin_state
+    monkeypatch.setattr(ha, '_follow_plugin_state', lambda: None)
     _fresh_windows(ha_api)
     # the replay cache lives as long as the process; each test starts it over
     ha.forget_seen_nonces()

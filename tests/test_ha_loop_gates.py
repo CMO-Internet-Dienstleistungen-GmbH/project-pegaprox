@@ -518,8 +518,9 @@ def test_xcpng_pool_loop_refreshes_but_does_not_balance_on_a_standby(which, role
         def wait(self, timeout):
             raise _Stop()
 
+    # not logged in yet, as at boot: the loop logs in first
     fake = types.SimpleNamespace(
-        stop_event=_Event(), is_connected=True, logger=MagicMock(), last_run=None,
+        stop_event=_Event(), is_connected=True, _session=None, logger=MagicMock(), last_run=None,
         config=types.SimpleNamespace(check_interval=300, auto_migrate=True),
         _last_balance_check=0, _last_reconnect_attempt=0,
         connect=lambda: calls.append('connect'),

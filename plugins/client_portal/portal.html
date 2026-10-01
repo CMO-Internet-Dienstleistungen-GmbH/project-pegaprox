@@ -351,6 +351,8 @@ async function vmAction(vm,action){
 async function openConsole(vm){
     try{const r=await api(`${P}/vm/console?cluster_id=${vm.cluster_id}&vmid=${vm.vmid}`);
     if(r&&r.ok){const d=await r.json();if(d.success){S.modal={type:'console',vm,ticket:d.ticket,ws_token:d.ws_token,port:d.port,host:d.host,node:d.node,vncStatus:'connecting'};render();}else toast(d.error,'error');}
+    // LW Oct 2026 (#625) - a standby that does not open consoles says why (409)
+    else if(r){let msg='Console not available here';try{const d=await r.json();if(d&&d.error)msg=d.error;}catch(_){}toast(msg,'error');}
     }catch(e){toast('Error','error');}
 }
 

@@ -444,23 +444,10 @@ def create_app():
         ('DELETE', '/api/security/locked-ips'),
         ('DELETE', '/api/security/locked-users'),
     ))
-    # A plugin handler serves every method from one function and most never look at
-    # which one it got, so a GET reaches their write paths too. On a standby the whole
-    # proxy is shut, whatever the method.
-    _PLUGIN_PROXY_RULE = '/api/plugins/<plugin_id>/api/<path:subpath>'
     # Consoles: a standby that serves users opens them itself, for the browser sessions
     # it serves, the way an active instance does. Any other standby opens none and hands
-    # none on, the UI offers the active instance instead. Every caller of the console
-    # token opens one; the others hand out a ticket or carry the session (vnc-poll is a
-    # whole VNC transport over POST). The GET routes and the WebSockets ask
-    # api/ha.py standby_console_refusal / ha.consoles_here themselves.
-    _STANDBY_CONSOLES = frozenset((
-        ('POST', '/api/ws/token'),
-        ('POST', '/api/clusters/<cluster_id>/nodes/<node>/shell'),
-        ('POST', '/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/termproxy'),
-        ('POST', '/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/vnc-poll'),
-        ('POST', '/api/vmware/<vmware_id>/vms/<vm_id>/console'),
-    ))
+    # none on, the UI offers the active instance instead (ha.CONSOLE_WRITES).
+    from pegaprox.core.ha import CONSOLE_WRITES as _STANDBY_CONSOLES
     # v3: a write refused here goes to the active instead, when a signed-in browser sent
     # it (api/ha.py forward_to_active). These stay refused.
     _STANDBY_NOT_FORWARDED = frozenset((
@@ -495,10 +482,14 @@ def create_app():
         ('DELETE', '/api/auto-install/runs/<run_id>'),
         ('POST', '/api/insights/force-snapshot'),
     ))
-    # a plugin route that opens a console, behind the one proxy rule: refused on every
-    # standby, and never forwarded
-    _PLUGIN_CONSOLE_PATHS = frozenset(('vm/console',))
-    from pegaprox.core.ha import FORWARDED_READS as _ha_forwarded_reads
+    # The plugin proxy, and the plugin routes behind it that open a console. A plugin
+    # handler serves every method from one function and most never look at which one
+    # they got, so a GET reaches their write paths too: on a standby nothing of a plugin
+    # runs but its console where consoles open. Its GETs are read on the active while
+    # this standby forwards, its writes go there like any other.
+    from pegaprox.core.ha import (FORWARDED_READS as _ha_forwarded_reads,
+                                  PLUGIN_PROXY_RULE as _PLUGIN_PROXY_RULE,
+                                  PLUGIN_CONSOLE_PATHS as _PLUGIN_CONSOLE_PATHS)
 
     @app.before_request
     def refuse_writes_on_standby():
@@ -522,15 +513,31 @@ def create_app():
         from pegaprox.core import ha
         if not ha.is_standby():
             return None
-        if plugin_call and (request.view_args or {}).get('subpath') in _PLUGIN_CONSOLE_PATHS:
-            # not even where consoles open: the plugin answers from what this process
-            # loaded, and a plugin switched off on the leader stays loaded here. Its UI
-            # works on the leader only anyway (its reads are refused below)
+        view_args = request.view_args or {}
+        if plugin_call and view_args.get('subpath') in _PLUGIN_CONSOLE_PATHS:
+            # never forwarded: the browser connects to the instance that opened it. Where
+            # consoles open, only for a plugin the leader runs as well - one switched off
+            # there stays loaded in this process until it restarts, so the synced
+            # plugin_state decides, not what is loaded here
+            from pegaprox.api.ha import by_api_token, PLUGIN_CONSOLE_ERROR
+            if ha.consoles_here() and not by_api_token():
+                from pegaprox.api.plugins import plugin_runs_here
+                if plugin_runs_here(view_args.get('plugin_id')):
+                    return None
+                return jsonify({'error': PLUGIN_CONSOLE_ERROR, 'code': 'HA_STANDBY'}), 409
             forwardable = False
         elif (request.method, rule) in _STANDBY_CONSOLES:
             from pegaprox.api.ha import by_api_token
             if ha.consoles_here() and not by_api_token():
                 return None
+            forwardable = False
+        elif plugin_call and request.method not in ('POST', 'PUT', 'PATCH', 'DELETE'):
+            # a GET of a plugin is read on the active, and nowhere when that does not
+            # answer: run here it could change this copy. HEAD and OPTIONS go nowhere
+            from pegaprox.api.ha import forward_to_active
+            read = forward_to_active(read=True)
+            if read is not None:
+                return read
             forwardable = False
         else:
             # a path no route serves goes nowhere: forwarded, it would only cost the active

@@ -223,6 +223,10 @@ def _status_body():
 # (ha.serving) opens them itself, as an active instance does: the console is the
 # user's, and nothing that acts on its own starts there.
 STANDBY_CONSOLE_ERROR = 'Consoles are only available on the active instance.'
+# a plugin console on a standby that serves users, for a plugin it does not run as the
+# leader does (app.py)
+PLUGIN_CONSOLE_ERROR = ('This plugin is not running on this instance - open its console '
+                        'on the leader.')
 
 
 def by_api_token():
@@ -249,10 +253,11 @@ def forward_to_active(read=False):
     not seen active.
 
     read: a GET of ha.FORWARDED_READS, the progress of a job the active runs or a view
-    only its own tables hold. The same way there, with a short timeout. When it does not
-    come back whole: None for the progress of a job, and the route answers from this
-    instance; 503 HA_ACTIVE_UNREACHABLE for a view of ha.LEADER_ONLY_READS, whose rows
-    here are not the active's.
+    only its own tables hold, or a GET of a plugin (ha.PLUGIN_PROXY_RULE). The same way
+    there, with a short timeout. When it does not come back whole: None for the progress
+    of a job, and the route answers from this instance; None for a plugin as well, which
+    app.py refuses; 503 HA_ACTIVE_UNREACHABLE for a view of ha.LEADER_ONLY_READS, whose
+    rows here are not the active's.
 
     The active runs the request as the signed-in user, checked against its own
     accounts, and its status, body and content headers come back as they are. 413
@@ -1216,8 +1221,8 @@ def peer_forward():
     change on the way. Only on the active (409 anywhere else, which also stops a write
     that would travel on), only from a member that signs its calls, only a write under
     /api/ and never under /api/ha/ - or a GET of ha.FORWARDED_READS, the progress of a
-    job or a view only our tables hold - and only for an account that exists and is
-    enabled here. sign_in is the
+    job or a view only our tables hold, or of a plugin route that opens no console -
+    and only for an account that exists and is enabled here. sign_in is the
     standby's digest of the account's password (ha.sign_in_digest): 403
     HA_FORWARD_STALE_SIGN_IN when ours differs, the password changed here since.
     The request then goes through our routing and every check on the way, CSRF and
@@ -1274,8 +1279,11 @@ def _forward_envelope(data):
     # redirects), so the prefix is what decides
     if not _text(path, 4096) or not path.startswith('/api/') or path.startswith('/api/ha/'):
         return None, 'path is under /api/, and not under /api/ha/'
-    if method == 'GET' and _read_rule(path) not in ha.FORWARDED_READS:
-        return None, 'a read is the progress of a job or a view only the active holds'
+    if method == 'GET' and not _forwarded_read(path):
+        return None, 'a read is the progress of a job, a view only the active holds or a plugin\'s'
+    if method != 'GET' and _opens_a_console(method, path):
+        # a standby never hands one on: the browser connects where the console opened
+        return None, 'a console opens on the instance the browser is on'
     sign_in = data.get('sign_in')
     if not isinstance(sign_in, str) or not (sign_in == '' or re.fullmatch(r'[0-9a-f]{64}', sign_in)):
         return None, 'sign_in is the digest of the account\'s sign-in'
@@ -1304,13 +1312,27 @@ def _forward_envelope(data):
             'body': body, 'user': user, 'sign_in': sign_in, 'client_ip': client_ip}, None
 
 
-def _read_rule(path):
-    """The GET rule this app serves `path` with, or None."""
+def _opens_a_console(method, path):
     try:
-        rule, _ = current_app.url_map.bind('localhost').match(path, method='GET', return_rule=True)
+        rule, args = current_app.url_map.bind('localhost').match(path, method=method, return_rule=True)
     except Exception:
-        return None
-    return rule.rule
+        return False
+    if rule.rule == ha.PLUGIN_PROXY_RULE:
+        return args.get('subpath') in ha.PLUGIN_CONSOLE_PATHS
+    return (method, rule.rule) in ha.CONSOLE_WRITES
+
+
+def _forwarded_read(path):
+    """Whether a standby may hand us a GET of `path`: one of ha.FORWARDED_READS, or a
+    plugin route that opens no console. A standby opens a plugin console itself or not
+    at all, and one opened here would be no use to the browser there."""
+    try:
+        rule, args = current_app.url_map.bind('localhost').match(path, method='GET', return_rule=True)
+    except Exception:
+        return False
+    if rule.rule == ha.PLUGIN_PROXY_RULE:
+        return args.get('subpath') not in ha.PLUGIN_CONSOLE_PATHS
+    return rule.rule in ha.FORWARDED_READS
 
 
 def _run_forwarded(call, user, via):

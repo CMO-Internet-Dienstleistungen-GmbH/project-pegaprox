@@ -9943,8 +9943,13 @@ async def ssh_handler(websocket):
     class _TofuPolicy(paramiko.MissingHostKeyPolicy):
         def missing_host_key(self, _c, _h, _k):
             if known_only:
-                raise paramiko.SSHException("host key of " + str(node) + " is not known here yet"
-                                            " - open a shell to it on the leader once")
+                # the address tried, not the node name: the leader pins a key under the
+                # address it reaches the node at (as utils/ssh_security.py says it)
+                raise paramiko.SSHException(
+                    f"host key of {_h} is not known here yet - open a shell to it on the "
+                    "leader once. This standby only has the keys the leader pinned; if the "
+                    f"leader reaches this node at another address than {_h}, its key is "
+                    "pinned under that one")
             if os.environ.get('PEGAPROX_SSH_STRICT_HOST_KEYS', '').strip().lower() in ('1', 'true', 'yes', 'on'):
                 raise paramiko.SSHException("strict host-key checking: unknown SSH host key for " + str(_h))
             try:

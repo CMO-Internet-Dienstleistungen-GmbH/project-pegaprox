@@ -530,16 +530,78 @@ def test_the_console_token_is_not_forwarded(fwd, seed):
     assert _forward_calls(g) == [] and set(ws_tokens) == before
 
 
-def test_a_read_is_not_forwarded(fwd, seed, probe):
-    """The plugin proxy is shut on a standby for every method, a GET too; a GET is no
-    write to hand over."""
+def test_a_plugin_is_read_on_the_active(fwd, seed, probe):
+    """A plugin handler serves every method from one function, so a GET of a plugin may
+    write as well: a forwarding standby runs none of it, it reads it from the active."""
     g = fwd
     admin = _built(g, seed, 'b')
     g.calls.clear()
     with g.at('b'):
+        r = admin.get('/api/plugins/probe/api/record?x=1', headers=FROM_CLIENT)
+    assert r.status_code == 200 and r.get_json() == {'written': True}, r.data
+    assert _forward_calls(g) == [('b', 'a', 'POST', FORWARD)]
+    assert len(probe) == 1
+    seen = probe[0]
+    assert (seen['role'], seen['method'], seen['args'], seen['body']) == ('active', 'GET', {'x': '1'}, b'')
+    assert seen['mark']['via'] == URLS['b'] and seen['remote_addr'] == CLIENT
+    # a read: no sync after it
+    assert g.pulls == []
+    # counterproof: on the active the same call runs in place, nothing is forwarded
+    g.calls.clear()
+    with g.at('a'):
+        assert admin.get('/api/plugins/probe/api/record').status_code == 200
+    assert _forward_calls(g) == [] and probe[-1]['role'] == 'active' and probe[-1]['mark'] is None
+
+
+def test_a_plugin_read_the_active_does_not_answer_is_refused(fwd, seed, probe):
+    """Forwarding off, the active gone, an API token or HEAD: 409 as before, and the
+    plugin does not run here instead."""
+    from pegaprox.utils.auth import create_api_token
+    g = fwd
+    admin = _built(g, seed, 'b')
+    token = {'Authorization': f"Bearer {create_api_token('root', 'automation', role='admin')['token']}"}
+    g.calls.clear()
+    with g.at('b') as ha:
+        for call in (lambda: g.api.anon().get('/api/plugins/probe/api/record', headers=token),
+                     lambda: admin._call('head', '/api/plugins/probe/api/record', False)):
+            r = call()
+            assert r.status_code == 409, r.data
+        ha.set_forward_writes(False)
+        r = admin.get('/api/plugins/probe/api/record')
+        assert r.status_code == 409 and r.get_json()['code'] == 'HA_STANDBY'
+        ha.set_forward_writes(True)
+    assert _forward_calls(g) == [] and probe == []
+    g.down.add('a')
+    with g.at('b'):
         r = admin.get('/api/plugins/probe/api/record')
     assert r.status_code == 409 and r.get_json()['code'] == 'HA_STANDBY'
-    assert _forward_calls(g) == [] and probe == []
+    assert probe == []
+    # counterproof: back, and it is read there again
+    g.down.discard('a')
+    _watch(g, 'b')
+    with g.at('b'):
+        assert admin.get('/api/plugins/probe/api/record').status_code == 200
+    assert [s['role'] for s in probe] == ['active']
+
+
+def test_the_active_reads_a_plugin_but_opens_no_console_for_a_standby(fwd, seed, probe, monkeypatch):
+    import pegaprox.api.plugins as plugins
+    g = fwd
+    admin = _built(g, seed, 'b')
+    opened = []
+    monkeypatch.setitem(plugins._plugin_routes, 'probe', dict(
+        plugins._plugin_routes['probe'], **{'vm/console': lambda: opened.append(1) or {'ticket': 'x'}}))
+    r = _forward_as(g, 'b', _envelope(method='GET', path='/api/plugins/probe/api/vm/console', body_b64=''))
+    assert r.status_code == 400 and r.get_json()['code'] == 'HA_FORWARD_INVALID', r.data
+    assert opened == []
+    # counterproof: the plugin's other routes are read there, and the console opens on
+    # the active for its own browsers
+    r = _forward_as(g, 'b', _envelope(method='GET', path='/api/plugins/probe/api/record', body_b64=''))
+    assert r.status_code == 200 and r.get_json()['status'] == 200
+    assert probe[-1]['role'] == 'active'
+    with g.at('a'):
+        assert admin.get('/api/plugins/probe/api/vm/console').status_code == 200
+    assert opened == [1]
 
 
 def test_when_the_active_cannot_be_reached(fwd, seed):
@@ -1312,3 +1374,24 @@ def test_signed_member_calls_do_not_count_against_the_address(fwd, seed, monkeyp
     charged.clear()
     r = _send(g, 'a', {g.ha.PEER_HEADER: IDS['b']})
     assert r.status_code == 429 and charged == ['127.0.0.1']
+
+
+@pytest.mark.parametrize('path', ['/api/ws/token', '/api/clusters/c1/nodes/n1/shell',
+                                  '/api/clusters/c1/vms/n1/qemu/100/termproxy',
+                                  '/api/clusters/c1/vms/n1/qemu/100/vnc-poll',
+                                  '/api/vmware/v1/vms/vm-1/console',
+                                  '/api/plugins/probe/api/vm/console'])
+def test_the_active_opens_no_console_for_a_standby(fwd, seed, path):
+    """A standby never hands a console on - the browser connects where it opened - and
+    the active does not take one either, whoever signs the envelope."""
+    from pegaprox.globals import ws_tokens
+    g = fwd
+    _built(g, seed, 'b')
+    before = set(ws_tokens)
+    r = _forward_as(g, 'b', _envelope(method='POST', path=path,
+                                      body_b64=base64.b64encode(b'{}').decode()))
+    assert r.status_code == 400 and r.get_json()['code'] == 'HA_FORWARD_INVALID', (path, r.data)
+    assert 'console' in r.get_json()['error'] and set(ws_tokens) == before
+    # counterproof: another write of the same envelope goes through
+    r = _forward_as(g, 'b', _envelope())
+    assert r.status_code == 200 and r.get_json()['status'] == 200

@@ -1046,10 +1046,14 @@ def test_a_standby_shuts_the_plugin_proxy_for_every_method(ha_env, seed, probe_p
 
 
 def test_the_rule_the_block_matches_is_the_plugin_proxy(api):
-    from pegaprox import app as app_mod
-    src = inspect.getsource(app_mod.create_app)
+    from pegaprox.core import ha
     rule = next(r for r in api.app.url_map.iter_rules() if r.endpoint == 'plugins.plugin_proxy')
-    assert f"_PLUGIN_PROXY_RULE = '{rule.rule}'" in src
+    assert ha.PLUGIN_PROXY_RULE == rule.rule
+    # and it is the one the block in app.py goes by
+    hook = next(f for f in api.app.before_request_funcs[None] if f.__name__ == 'refuse_writes_on_standby')
+    held = dict(zip(hook.__code__.co_freevars, (c.cell_contents for c in hook.__closure__)))
+    assert held['_PLUGIN_PROXY_RULE'] == rule.rule
+    assert held['_PLUGIN_CONSOLE_PATHS'] is ha.PLUGIN_CONSOLE_PATHS
 
 
 def _local_writes():

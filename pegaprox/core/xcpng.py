@@ -225,14 +225,13 @@ class XcpngManager:
                     self.config.user, self.config.pass_,
                     '1.0', 'PegaProx'
                 )
-                self._session = session
+                replaced, self._session = self._session, session
                 self.is_connected = True
                 self.connection_error = None
                 self.current_host = self.config.host
                 self._consecutive_failures = 0
                 self._last_keepalive = time.time()
                 self.logger.info(f"Connected to XCP-ng pool: {self.config.host}")
-                return True
             except Exception as e:
                 self.is_connected = False
                 self.connection_error = str(e)
@@ -241,6 +240,14 @@ class XcpngManager:
                 if self._consecutive_failures <= 3:
                     self.logger.error(f"XAPI connect failed: {e}")
                 return False
+        if replaced is not None:
+            # the session this one takes over from (it expired, or failed too often): the
+            # pool master keeps it open until it times out otherwise
+            try:
+                replaced.xenapi.session.logout()
+            except Exception:
+                pass
+        return True
 
     # compat alias for API layer
     def connect_to_proxmox(self) -> bool:
@@ -302,8 +309,10 @@ class XcpngManager:
 
     def _run_loop(self):
         """Background loop - periodic status refresh & task polling."""
-        # initial connect
-        self.connect()
+        # initial connect, unless the caller logged in already: adding and reconfiguring
+        # a pool test the login before they start us, and that session is the one to use
+        if not (self._session and self.is_connected):
+            self.connect()
         while not self.stop_event.is_set():
             try:
                 if self.is_connected:

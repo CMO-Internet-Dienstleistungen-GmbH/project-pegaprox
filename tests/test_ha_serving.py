@@ -321,32 +321,186 @@ def test_the_console_posts_run_here_on_a_serving_standby(fwd, seed, monkeypatch)
     assert _forward_calls(g) == []
 
 
-def test_a_plugin_console_stays_on_the_leader_even_from_a_serving_standby(fwd, seed, probe, monkeypatch):
-    """The plugin answers from what this process loaded, and one switched off on the
-    leader stays loaded on a member. Its UI works on the leader only anyway."""
+PLUGIN_CONSOLE = '/api/plugins/probe/api/vm/console'
+
+
+def _plugin_state(plugin_id, enabled):
+    """The plugin_state row as a sync leaves it, None for none."""
+    from pegaprox.core.db import get_db
+    db = get_db()
+    db.execute('DELETE FROM plugin_state WHERE plugin_id = ?', (plugin_id,))
+    if enabled is not None:
+        db.execute('INSERT INTO plugin_state (plugin_id, enabled) VALUES (?, ?)', (plugin_id, int(enabled)))
+
+
+@pytest.fixture
+def plugin_console(fwd, probe, monkeypatch):
+    """The probe plugin with a console route that notes where it opened."""
+    import pegaprox.api.plugins as plugins
+    opened = []
+
+    def console():
+        from pegaprox.core import ha
+        opened.append(ha.role())
+        return {'ticket': 'x'}
+    monkeypatch.setitem(plugins._plugin_routes, 'probe', dict(plugins._plugin_routes['probe'],
+                                                               **{'vm/console': console}))
+    return opened
+
+
+def test_a_serving_standby_opens_a_plugin_console_the_leader_runs(fwd, seed, plugin_console):
+    """Consoles are local where users are served, a plugin's too: the browser connects to
+    the instance that opened it. Only for a plugin loaded here that the synced
+    plugin_state says is switched on, any method, and never forwarded."""
+    g = fwd
+    admin = _built(g, seed, 'b')
+    _plugin_state('probe', True)
+    _serve(g, 'b')
+    g.calls.clear()
+    with g.at('b'):
+        assert admin.get(f'{PLUGIN_CONSOLE}?cluster_id=c1&vmid=100').get_json() == {'ticket': 'x'}
+        assert admin.post(PLUGIN_CONSOLE, json={}).status_code == 200
+    assert plugin_console == ['standby', 'standby'] and _forward_calls(g) == []
+
+
+@pytest.mark.parametrize('state', [False, None, 'unloaded'])
+def test_a_plugin_the_leader_does_not_run_opens_no_console_here(fwd, seed, plugin_console, monkeypatch, state):
+    """Switched off on the leader (the module stays loaded here until a restart), never
+    switched on, or switched on there and not loaded here: 409, the console is the
+    leader's."""
     import pegaprox.api.plugins as plugins
     g = fwd
     admin = _built(g, seed, 'b')
-    monkeypatch.setitem(plugins._plugin_routes, 'probe', dict(plugins._plugin_routes['probe'],
-                                                               **{'vm/console': lambda: {'ticket': 'x'}}))
-    for serving in (True, False):
-        _serve(g, 'b', serving)
-        g.calls.clear()
-        with g.at('b'):
-            for call in (admin.post, admin.get):
-                r = call('/api/plugins/probe/api/vm/console', **({'json': {}} if call == admin.post else {}))
-                assert r.status_code == 409 and r.get_json()['code'] == 'HA_STANDBY', (serving, r.data)
-        assert _forward_calls(g) == []
-    # counterproof: the core console token opens on the serving standby, the plugin
-    # console on the leader, and the plugin's other writes still go to the leader
+    _plugin_state('probe', True if state == 'unloaded' else state)
+    if state == 'unloaded':
+        monkeypatch.delitem(plugins._loaded_plugins, 'probe')
+    _serve(g, 'b')
+    g.calls.clear()
+    with g.at('b'):
+        for call in (admin.get, admin.post):
+            r = call(PLUGIN_CONSOLE)
+            assert r.status_code == 409, (call, r.data)
+            assert r.get_json() == {'code': 'HA_STANDBY', 'error': 'This plugin is not running on this '
+                                    'instance - open its console on the leader.'}
+    assert plugin_console == [] and _forward_calls(g) == []
+    # counterproof: switched on and loaded, the same call opens here
+    _plugin_state('probe', True)
+    monkeypatch.setitem(plugins._loaded_plugins, 'probe', types.SimpleNamespace())
+    with g.at('b'):
+        assert admin.get(PLUGIN_CONSOLE).status_code == 200
+    assert plugin_console == ['standby']
+
+
+def test_a_plugin_console_stays_refused_where_no_console_opens(fwd, seed, plugin_console):
+    """A standby that does not serve users, and an API token on one that does: refused
+    as before, and nothing reaches the leader."""
+    g = fwd
+    admin = _built(g, seed, 'b')
+    _plugin_state('probe', True)
+    token = _api_token()
+    g.calls.clear()
+    with g.at('b'):
+        for call in (admin.post, admin.get):
+            r = call(PLUGIN_CONSOLE)
+            assert r.status_code == 409 and r.get_json()['code'] == 'HA_STANDBY', r.data
+            assert 'open its console on the leader' not in r.get_json()['error']
     _serve(g, 'b')
     with g.at('b'):
-        assert admin.post('/api/ws/token', json={}).status_code == 200
+        r = g.api.anon().get(PLUGIN_CONSOLE, headers=token)
+        assert r.status_code == 409 and r.get_json()['code'] == 'HA_STANDBY', r.data
+    assert plugin_console == [] and _forward_calls(g) == []
+    # counterproof: the browser session on the serving standby opens it here, the
+    # plugin's other calls go to the leader, and the leader opens it for its own
+    with g.at('b'):
+        assert admin.get(PLUGIN_CONSOLE).status_code == 200
         assert admin.post('/api/plugins/probe/api/record', json={}).status_code == 200
-    assert len(_forward_calls(g)) == 1 and probe[-1]['role'] == 'active'
+        assert admin.get('/api/plugins/probe/api/record').status_code == 200
+    assert len(_forward_calls(g)) == 2 and plugin_console == ['standby']
     with g.at('a'):
-        r = admin.post('/api/plugins/probe/api/vm/console', json={})
-    assert r.status_code == 200 and r.get_json() == {'ticket': 'x'}, r.data
+        assert admin.get(PLUGIN_CONSOLE).status_code == 200
+    assert plugin_console == ['standby', 'active']
+
+
+def test_the_client_portal_console_hands_out_a_token_of_the_serving_standby(fwd, seed, monkeypatch):
+    """The portal opens its noVNC socket on the instance it was loaded from, with the ws
+    token and the VNC ticket vm/console handed it: both from this process."""
+    import pegaprox.api.plugins as plugins
+    import plugins.client_portal as portal
+    from pegaprox.globals import ws_tokens
+    g = fwd
+    admin = _built(g, seed, 'b')
+    monkeypatch.setitem(plugins._loaded_plugins, 'client_portal', portal)
+    monkeypatch.setitem(plugins._plugin_routes, 'client_portal', {})
+    portal.register(None)
+    mgr = _fake_manager(g.api)
+    mgr.get_vm_resources.return_value = [{'vmid': 100, 'node': 'n1', 'type': 'qemu'}]
+    mgr.get_vnc_ticket.return_value = {'success': True, 'ticket': 'PVEVNC:x', 'port': '5900'}
+    monkeypatch.setattr(portal, 'cluster_managers', {CID: mgr})
+    _plugin_state('client_portal', True)
+    _serve(g, 'b')
+    before = set(ws_tokens)
+    path = f'/api/plugins/client_portal/api/vm/console?cluster_id={CID}&vmid=100'
+    g.calls.clear()
+    with g.at('b'):
+        r = admin.get(path)
+    assert r.status_code == 200 and r.get_json()['success'] is True, r.data
+    token = r.get_json()['ws_token']
+    assert token in ws_tokens and token not in before
+    assert mgr.get_vnc_ticket.call_count == 1 and _forward_calls(g) == []
+    # counterproof: switched off on the leader, the portal console is not handed out here
+    _plugin_state('client_portal', False)
+    with g.at('b'):
+        r = admin.get(path)
+    assert r.status_code == 409 and 'on the leader' in r.get_json()['error']
+    assert set(ws_tokens) - before == {token} and mgr.get_vnc_ticket.call_count == 1
+
+
+_CONSOLE_MARKERS = ('create_ws_token', 'get_vnc_ticket', 'get_spice_ticket', 'vncproxy',
+                    'termproxy', 'spiceproxy', 'vnc-poll', '/api/ws/token')
+
+
+def _plugin_routes_that_open_a_console():
+    """{(plugin dir, route path)} of the bundled plugins whose handler, or a function of
+    the plugin it calls, hands out a console ticket or a ws token."""
+    import ast
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parent.parent / 'plugins'
+    found = set()
+    for init in sorted(root.glob('*/__init__.py')):
+        src = init.read_text(encoding='utf-8')
+        tree = ast.parse(src)
+        funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+
+        def reaches_a_console(name, seen):
+            if name in seen or name not in funcs:
+                return False
+            seen.add(name)
+            body = ast.get_source_segment(src, funcs[name])
+            if any(m in body for m in _CONSOLE_MARKERS):
+                return True
+            called = {c.func.id for c in ast.walk(funcs[name])
+                      if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+            return any(reaches_a_console(c, seen) for c in called)
+
+        for call in ast.walk(tree):
+            if not (isinstance(call, ast.Call) and getattr(call.func, 'id', '') == 'register_plugin_route'):
+                continue
+            path, handler = call.args[1], call.args[2]
+            assert isinstance(path, ast.Constant) and isinstance(handler, ast.Name), ast.dump(call)
+            if reaches_a_console(handler.id, set()):
+                found.add((init.parent.name, path.value))
+    return found
+
+
+def test_every_plugin_route_that_hands_out_a_console_is_a_console_path():
+    """Read on the leader like the rest of a plugin, its ticket and token would be the
+    leader's and the browser here could not use them; refused like a write on a standby
+    that does not serve users. ha.PLUGIN_CONSOLE_PATHS is what keeps them local."""
+    from pegaprox.core import ha
+    found = _plugin_routes_that_open_a_console()
+    # counterproof: the scan sees the one the portal has
+    assert ('client_portal', 'vm/console') in found
+    assert {path for _plugin, path in found} <= ha.PLUGIN_CONSOLE_PATHS, found
 
 
 # --- consoles: the WebSockets ------------------------------------------------------------------
@@ -532,7 +686,11 @@ def test_the_ssh_server_pins_nothing_on_a_standby(tmp_path, monkeypatch, known_o
     asyncio.run(ns['ssh_handler'](ws))
     said = ''.join(m for m in ws.sent if isinstance(m, str))
     if known_only and not known:
-        assert f'host key of n1 {NOT_KNOWN}' in said, ws.sent
+        # the address tried, as the main app says it (the leader may know the node under
+        # another one), and not the node's name
+        from pegaprox.utils.ssh_security import _not_known_here
+        assert _not_known_here('192.0.2.10') in said, ws.sent
+        assert 'another address than 192.0.2.10,' in said and 'host key of n1' not in said
         assert fake.saved == []
     elif known_only:
         # a key it holds: the shell opens (and fails in this test), and nothing is saved
@@ -851,3 +1009,80 @@ def test_the_inbox_clear_runs_on_the_leader_as_the_user(fwd, seed):
         items = admin.get('/api/push/inbox').get_json()['items']
     assert _forward_calls(g) == [('b', 'a', 'POST', FORWARD)] * 2
     assert items and all(i['read_at'] for i in items)
+
+
+# --- a plugin's own page on a standby -----------------------------------------------------
+
+@pytest.mark.parametrize('page,plugin', [('/portal', 'client_portal'), ('/status', 'status_page'),
+                                         ('/api/public/status-page', 'status_page')])
+def test_a_plugin_page_on_a_standby_goes_by_the_synced_state(fwd, seed, monkeypatch, page, plugin):
+    """The module stays loaded on a standby until a restart after the leader switched the
+    plugin off: its page goes by the plugin state the sync brought, not by being loaded."""
+    import types as _types
+    import pegaprox.api.plugins as plugins
+    g = fwd
+    _built(g, seed, 'b')
+    monkeypatch.setitem(plugins._loaded_plugins, plugin, _types.SimpleNamespace())
+    _plugin_state(plugin, False)
+    with g.at('b'):
+        r = g.api.anon().get(page)
+    assert r.status_code == 404, (page, r.status_code)
+    # counterproof: switched on in the synced state, the page is there
+    _plugin_state(plugin, True)
+    with g.at('b'):
+        r = g.api.anon().get(page)
+    assert r.status_code != 404 or b'not installed' in r.data, (page, r.status_code, r.data[:120])
+    # and the leader still goes by what it has loaded, as before
+    _plugin_state(plugin, False)
+    with g.at('a'):
+        r = g.api.anon().get(page)
+    assert r.status_code != 404 or b'not installed' in r.data, (page, r.status_code, r.data[:120])
+
+
+def test_the_portal_says_why_a_console_does_not_open():
+    """portal.html shows the server's reason for a refused console (a standby's 409)
+    instead of doing nothing."""
+    import os
+    html = open(os.path.join(os.path.dirname(__file__), '..', 'plugins', 'client_portal', 'portal.html')).read()
+    start = html.index('async function openConsole(vm)')
+    body = html[start:html.index('\n}\n', start)]
+    assert "else if(r){" in body and "toast(msg,'error')" in body and 'd.error' in body
+
+
+def test_a_standby_runs_a_plugin_exactly_when_the_leader_does(fwd, seed, monkeypatch):
+    """A standby starts before its first sync, so the plugin state that sync brings was
+    never acted on: after each applied sync it loads what the leader switched on and
+    unloads what it switched off, and writes nothing back."""
+    import pegaprox.api.plugins as plugins
+    g = fwd
+    _built(g, seed, 'b')
+    calls = []
+
+    def load(app, pid):
+        calls.append(('load', pid))
+        plugins._loaded_plugins[pid] = object()
+        return True, ''
+
+    def unload(pid):
+        calls.append(('unload', pid))
+        plugins._loaded_plugins.pop(pid, None)
+    monkeypatch.setattr(plugins, '_app', object())
+    monkeypatch.setattr(plugins, '_loaded_plugins', {'gone_one': object()})
+    monkeypatch.setattr(plugins, 'load_plugin', load)
+    monkeypatch.setattr(plugins, 'unload_plugin', unload)
+    monkeypatch.setattr(g.ha, '_follow_plugin_state', g.follow_plugin_state)
+    _plugin_state('hello_world', True)
+    _plugin_state('gone_one', False)
+    with g.at('b') as ha:
+        assert ha.pull_once() == 'applied'
+    assert calls == [('unload', 'gone_one'), ('load', 'hello_world')]
+    # the state rows are the leader's: nothing written back
+    from pegaprox.core.db import get_db
+    rows = {r['plugin_id']: r['enabled'] for r in get_db().query('SELECT plugin_id, enabled FROM plugin_state')}
+    assert rows.get('hello_world') == 1 and rows.get('gone_one') == 0
+    # counterproof: the leader follows nobody
+    calls.clear()
+    plugins._loaded_plugins['gone_one'] = object()
+    with g.at('a') as ha:
+        ha._follow_plugin_state()
+    assert calls == []

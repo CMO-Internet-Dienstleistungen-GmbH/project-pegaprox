@@ -918,3 +918,85 @@ def test_a_pool_stopped_in_the_middle_of_a_fetch_leaves_no_session_open(monkeypa
     mgr.thread.join(10)
     assert not mgr.thread.is_alive()
     assert pool.logins == ['S1'] and pool.logouts == ['S1'] and pool.live == set()
+
+
+def _stop_and_join(mgr, pool):
+    try:
+        mgr.stop()
+    finally:
+        pool.release.set()
+    mgr.thread.join(10)
+    assert not mgr.thread.is_alive()
+
+
+def test_a_pool_started_after_its_login_goes_on_with_that_session(monkeypatch):
+    """Adding and reconfiguring a pool log in to test it, then start it. The loop used to
+    log in once more over the top, and the first session stayed open on the pool master
+    until it timed out: one per reconfigure."""
+    pool = _xenapi(monkeypatch)
+    pool.hold = True
+    mgr = _pool_manager()
+    assert mgr.connect() is True
+    mgr.start()
+    try:
+        assert pool.fetching.wait(10)
+        assert pool.logins == ['S1'] and pool.live == {'S1'}
+    finally:
+        _stop_and_join(mgr, pool)
+    assert pool.logouts == ['S1'] and pool.live == set()
+
+    # counterproof: started without a login (the boot path), the loop logs in itself
+    pool = _xenapi(monkeypatch)
+    pool.hold = True
+    mgr = _pool_manager()
+    mgr.start()
+    try:
+        assert pool.fetching.wait(10)
+        assert pool.logins == ['S1']
+    finally:
+        _stop_and_join(mgr, pool)
+    assert pool.live == set()
+
+
+def test_a_new_login_logs_out_the_session_it_takes_over_from(monkeypatch):
+    """The loop gives up on a session after a run of failed fetches and logs in again; the
+    session it gave up on may still be open there."""
+    import pegaprox.core.xcpng as xcpmod
+    pool = _xenapi(monkeypatch)
+    mgr = _pool_manager()
+    try:
+        assert mgr.connect() is True
+        mgr.is_connected = False
+        assert mgr._api() is not None
+        assert pool.logins == ['S1', 'S2'] and pool.logouts == ['S1'] and pool.live == {'S2'}
+        # counterproof: a login that fails leaves the session it has alone
+        mgr.is_connected = False
+
+        def refused(url, ignore_ssl=False):
+            raise RuntimeError('HOST_IS_SLAVE')
+        monkeypatch.setattr(xcpmod.XenAPI, 'Session', refused)
+        assert mgr.connect() is False
+        assert pool.logouts == ['S1'] and pool.live == {'S2'}
+    finally:
+        mgr.stop()
+    assert pool.live == set()
+
+
+def test_reconfiguring_a_pool_leaves_one_session_open(api, seed, monkeypatch):
+    pool = _xenapi(monkeypatch)
+    pool.hold = True
+    admin = _admin(api, seed)
+    old = api.set_manager('xcp1', api.make_fake_manager('xcp1', cluster_type='xcpng'))
+    r = admin.post('/api/clusters/xcp1/reconfigure', json={
+        'name': 'pool', 'host': '10.0.1.1', 'user': 'root', 'pass': 'pw',
+        'cluster_type': 'xcpng', 'current_password': ADMIN_PW})
+    new = gl.cluster_managers.get('xcp1')
+    assert r.status_code == 200, r.data
+    assert new is not old and old.stop.called and new.cluster_type == 'xcpng'
+    try:
+        assert pool.fetching.wait(10)
+        # the login that tested the new credentials is the one the loop runs on
+        assert pool.logins == ['S1'] and pool.live == {'S1'}
+    finally:
+        _stop_and_join(new, pool)
+    assert pool.live == set()
