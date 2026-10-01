@@ -55,6 +55,12 @@ user and with that user's rights there (api/ha.py peer_forward). An API token is
 nobody the standby can vouch for, its writes are refused as before. A write that went
 through is followed by a pull right away (pull_soon), so it shows here at once.
 
+Active members: the leader makes up to two of its members active as well, on its own
+HA page (set_member_serve, ACTIVE_LIMIT). Users are served there as on the leader -
+they sign in, see the clusters live and open consoles there, and every change is
+forwarded. The flag travels with the member list; the role stays standby, so the
+leader alone runs what acts on its own.
+
 What travels:
   * pairing - the standby POSTs the one-time code and its public key to the active
     and gets back the field key (.pegaprox_aes256.key), the active's public key and
@@ -132,6 +138,11 @@ MAX_MEMBERS = 4
 MAX_TOMBSTONES = 16
 GROUP_FULL_ERROR = f'This group already has {MAX_MEMBERS - 1} standbys - remove one first'
 REMOVED_ERROR = 'This instance was removed from the group'
+# the instances users are served on: the leader and up to two members it makes active
+# (set_member_serve). Whoever is left of a full group stays a standby
+ACTIVE_LIMIT = 3
+ACTIVE_LIMIT_ERROR = (f'A group has at most {ACTIVE_LIMIT} active instances, the leader '
+                      'included - make one of the others a standby first')
 # the pull of a pass: at most this long, at least the floor whatever the interval,
 # and short when the watch of the same pass could not reach the source
 PULL_TIMEOUT = 60
@@ -393,6 +404,10 @@ class RemoveUnconfirmed(HaError):
     """remove_member: the member was not seen as a standby under the current epoch."""
 
 
+class ActiveLimit(HaError):
+    """set_member_serve: one more active member would make more than ACTIVE_LIMIT."""
+
+
 # --- state ---------------------------------------------------------------------
 
 def _now():
@@ -412,8 +427,9 @@ def _default_state():
         # holds our public key
         'member_secret': None,
         # every OTHER member: {instance id: {url, fingerprint, public_key, secret_hash,
-        # pair_secret, role_seen, epoch_seen, serving_seen, last_contact, last_error,
-        # joined_at, group_seen, key_acked}}
+        # serve, pair_secret, role_seen, epoch_seen, serving_seen, last_contact,
+        # last_error, joined_at, group_seen, key_acked}}. serve is the leader's word
+        # and travels with the member list; the rest is what this instance noted
         'members': {},
         # members the active took out: {instance id: {epoch, at, by, public_key,
         # secret_hash}}, so their calls get 410 and no stale list takes them back
@@ -512,6 +528,9 @@ def _load():
             base[field] = {k: v for k, v in ms.items() if isinstance(k, str) and isinstance(v, dict)}
         if not isinstance(base.get('removed'), dict):
             base['removed'] = None
+        # the per-instance switch of a build before the leader decided who serves:
+        # read as nothing, and gone from the file with the next write
+        base.pop('serve_users', None)
         # nothing is written until something changes: an instance that never pairs
         # never grows a state file
         _state = base
@@ -796,40 +815,70 @@ def forwarding():
 
 # --- serving users ---------------------------------------------------------------
 
-def serve_users():
-    """Whether this instance, as a standby, serves users the way an active instance
-    does: they sign in here, see the clusters live and open their consoles here, and
-    every change goes to the leader. The role stays standby, so nothing that acts on
-    its own starts here (is_active).
+def serve_assigned():
+    """Whether the leader made this standby one of the group's active instances: its
+    own entry in the member list from the leader says serve. Users are served here
+    then the way the leader serves them: they sign in here, see the clusters live and
+    open their consoles here, and every change goes to the leader. The role stays
+    standby, so nothing that acts on its own starts here (is_active).
 
-    Per instance and never part of a snapshot; off until an admin switches it on."""
-    value = _load().get('serve_users', False)
-    return value if isinstance(value, bool) else False
+    Set on the leader (set_member_serve) and taken with each sync (_adopt_group).
+    False on every other instance: the leader is active anyway, and a member that was
+    promoted has nobody above it to say so."""
+    st = _load()
+    return st['role'] == ROLE_STANDBY and st.get('serve_assigned') is True
 
 
-def set_serve_users(value):
-    """Switch serve_users. Returns True when it changed. Nothing holds on to the value,
-    the next request goes by it."""
+def actives():
+    """How many instances of the group serve users, as this instance knows the group:
+    the leader and every member it made active. 1 on a standalone instance. A standby
+    does not count the flag of the member it pulls from: that one is the leader, and
+    a flag it had before its promotion is gone with the next sync."""
+    st = _load()
+    src = st.get('source') if st['role'] == ROLE_STANDBY else None
+    n = 1 + sum(1 for mid, rec in (st.get('members') or {}).items()
+                if mid != src and rec.get('serve') is True)
+    return n + (1 if serve_assigned() else 0)
+
+
+def set_member_serve(member_id, value):
+    """Leader: make the member one of the group's active instances (True), or a standby
+    again (False). Returns (changed, actives after it). The flag goes out with the
+    member list, and the member takes it with its next sync.
+
+    At most ACTIVE_LIMIT, the leader included: one more raises ActiveLimit. Counted and
+    written under the state lock, so two admins asking at once cannot both take the
+    last place. Back to standby always goes through."""
     if not isinstance(value, bool):
-        raise HaError('serve_users is true or false')
+        raise HaError('serve is true or false')
     with _lock:
-        if value == serve_users():
-            return False
-        _update(serve_users=value)
-    return True
+        st = _load()
+        if st['role'] != ROLE_ACTIVE:
+            raise HaError('Only the leader sets which instances are active')
+        ms = dict(st.get('members') or {})
+        if not isinstance(member_id, str) or member_id not in ms:
+            raise HaError('That instance is not a member of this group')
+        count = actives()
+        if (ms[member_id].get('serve') is True) == value:
+            return False, count
+        if value and count >= ACTIVE_LIMIT:
+            raise ActiveLimit(ACTIVE_LIMIT_ERROR)
+        ms[member_id] = dict(ms[member_id], serve=value)
+        _commit_locked(dict(st, members=ms))
+    return True, count + (1 if value else -1)
 
 
 def serving():
-    """True when this standby serves users now: the switch is on, and so are the two it
-    needs, the live view (clusters to show and consoles to open) and forwarding (the
-    changes go to the leader). False on every other instance, and on a standby that was
-    removed from the group or has lost the member it pulls from: its accounts and rights
-    are those of its last sync, and nothing the leader changes reaches it any more. A
-    leader that is only out of reach keeps it serving."""
+    """True when this standby serves users now: the leader made it active, and the two
+    it needs are on, the live view (clusters to show and consoles to open) and
+    forwarding (the changes go to the leader). False on every other instance, and on a
+    standby that was removed from the group or has lost the member it pulls from: its
+    accounts and rights are those of its last sync, and nothing the leader changes
+    reaches it any more. A leader that is only out of reach keeps it serving."""
     st = _load()
     if st['role'] != ROLE_STANDBY or st.get('removed') or source_id() is None:
         return False
-    return serve_users() and live_view() and forward_writes()
+    return serve_assigned() and live_view() and forward_writes()
 
 
 def consoles_here():
@@ -1844,7 +1893,8 @@ def _credentials(rec):
 def _member_list(st):
     """The group as the active hands it out: the active itself and every member, each
     with address, pin, public key and, for a member paired before the keys, the hash
-    of its secret. Sorted, so the etag stays put."""
+    of its secret. A member also with serve, whether the active made it one of the
+    active instances; the active itself is one anyway. Sorted, so the etag stays put."""
     out = []
     own = {'public_key': '', 'secret_hash': ''}
     if st.get('signing_key'):
@@ -1859,15 +1909,16 @@ def _member_list(st):
                         fingerprint=st.get('own_fingerprint') or ''))
     for mid, rec in (st.get('members') or {}).items():
         out.append(dict(_credentials(rec), instance_id=mid, url=rec.get('url') or '',
-                        fingerprint=rec.get('fingerprint') or ''))
+                        fingerprint=rec.get('fingerprint') or '', serve=rec.get('serve') is True))
     return sorted(out, key=lambda e: e['instance_id'])
 
 
 def _clean_entries(entries):
-    """{instance id: {url, fingerprint, public_key, secret_hash}} from a member list as
-    it arrives, one entry per id. Each needs a public key or the hash of a secret.
-    Whatever is not well formed is left out; an address that is not plain https
-    counts as unknown, and a pin without an address as none."""
+    """{instance id: {url, fingerprint, public_key, secret_hash, serve}} from a member
+    list as it arrives, one entry per id. Each needs a public key or the hash of a
+    secret. Whatever is not well formed is left out; an address that is not plain https
+    counts as unknown, a pin without an address as none, and serve as False unless it
+    is true."""
     out = {}
     if not isinstance(entries, list):
         return out
@@ -1886,7 +1937,8 @@ def _clean_entries(entries):
         fp = fp.strip().upper() if isinstance(fp, str) and url else ''
         if fp and not _FP_RE.fullmatch(fp):
             fp = ''
-        out.setdefault(mid, {'url': url, 'fingerprint': fp, 'public_key': key, 'secret_hash': digest})
+        out.setdefault(mid, {'url': url, 'fingerprint': fp, 'public_key': key, 'secret_hash': digest,
+                             'serve': e.get('serve') is True})
     return out
 
 
@@ -2109,7 +2161,7 @@ def join(code, own_url, own_fingerprint):
             _commit_locked(dict(st, role=ROLE_STANDBY, epoch=new_epoch, pairing=None, sync={},
                                 signing_key=my_key, member_secret=None, members=ms,
                                 tombstones=_bounded_tombstones(tombs), removed=None,
-                                source=info['instance_id']))
+                                source=info['instance_id'], serve_assigned=False))
             try:
                 _install_field_key(field_key)
             except Exception as e:
@@ -2180,7 +2232,8 @@ def unpair():
         # standalone has nobody to be ordered against, and the next group counts anew
         # (one at the ceiling would otherwise refuse every promotion there as well)
         new.update(members={}, source=None, member_secret=None, signing_key=None, pairing=None,
-                   sync={}, tombstones={}, removed=None, role=ROLE_STANDALONE, epoch=0)
+                   sync={}, tombstones={}, removed=None, role=ROLE_STANDALONE, epoch=0,
+                   serve_assigned=False)
         _commit_locked(new)
         return was
 
@@ -2202,7 +2255,8 @@ def _mark_removed(by, their_epoch):
             was = st['role']
             _commit_locked(dict(st, role=ROLE_STANDBY, members={}, source=None, sync={}, pairing=None,
                                 epoch=max(int(st.get('epoch') or 0), their_epoch),
-                                removed={'epoch': their_epoch, 'at': _now(), 'by': by}))
+                                removed={'epoch': their_epoch, 'at': _now(), 'by': by},
+                                serve_assigned=False))
     except Exception as e:
         logging.error(f"[HA] member {by} says this instance was removed, and that could not be "
                       f"saved: {e}")
@@ -2462,7 +2516,10 @@ def promote():
         # whoever was active may not be once it hears about us
         ms = {mid: dict(rec, role_seen=None) if rec.get('role_seen') == ROLE_ACTIVE else dict(rec)
               for mid, rec in ms.items()}
-        _commit_locked(dict(st, epoch=new_epoch, role=ROLE_ACTIVE, members=ms, source=None))
+        # the members keep the serve flags the old leader gave them; ours is no flag
+        # any more, the leader is active anyway
+        _commit_locked(dict(st, epoch=new_epoch, role=ROLE_ACTIVE, members=ms, source=None,
+                            serve_assigned=False))
         return new_epoch
 
 
@@ -2804,8 +2861,8 @@ def snapshot_meta():
 
 def _group_etag(etag, meta):
     """The etag of tables and files, with the member list and the tombstones folded in
-    when there are any: a standby added or removed reaches every standby with its next
-    poll, not only once the configuration changes as well."""
+    when there are any: a standby added or removed, or made active, reaches every
+    standby with its next poll, not only once the configuration changes as well."""
     group, tombs = meta.get('members'), meta.get('tombstones')
     if not group and not tombs:
         return etag
@@ -2816,6 +2873,9 @@ def _group_etag(etag, meta):
     for e in group or []:
         for key in ('instance_id', 'url', 'fingerprint', 'public_key', 'secret_hash'):
             _hash_value(h, e.get(key))
+        # only when set: a group where nobody serves keeps the etag it had before
+        if e.get('serve') is True:
+            h.update(b'S')
     for t in tombs or []:
         h.update(b'R')
         for key in ('instance_id', 'epoch', 'at', 'by', 'public_key', 'secret_hash'):
@@ -2972,8 +3032,8 @@ def _merged_members(st, sender, entries, tombstones=None):
     back), and we never list ourselves. The sender stays whatever its list says, and
     keeps the address we reached it on; for the others the list is the word on
     address, pin and keys, except that a key we hold is not given up for the hash of a
-    secret. What we noted about each member ourselves (roles seen, contact, errors)
-    stays."""
+    secret, and on whether the active made them active (serve). What we noted about
+    each member ourselves (roles seen, contact, errors) stays."""
     me, local = st['instance_id'], st.get('members') or {}
     tombs = (st.get('tombstones') or {}) if tombstones is None else tombstones
     listed = _clean_entries(entries)
@@ -2998,6 +3058,7 @@ def _merged_members(st, sender, entries, tombstones=None):
             rec['url'], rec['fingerprint'] = entry['url'], entry['fingerprint']
         rec.setdefault('url', '')
         rec.setdefault('fingerprint', '')
+        rec['serve'] = entry['serve']
         if mid != sender and _matches_tombstone(rec, tombs.get(mid)):
             continue
         out[mid] = rec
@@ -3008,10 +3069,11 @@ def _merged_members(st, sender, entries, tombstones=None):
 
 def _adopt_group(snap):
     """A standby takes the member list, the tombstones and the epoch of the active it
-    pulled from, once the rows are in. Tombstones add up: an active that stepped down
-    keeps the ones it made. An active from before the groups sends no list: ours
-    stays. Never raises; returns what the sync status should say when the state could
-    not be saved."""
+    pulled from, once the rows are in, and from its own entry in that list whether the
+    active made it one of the active instances (serve_assigned): from the next request
+    on, no restart. Tombstones add up: an active that stepped down keeps the ones it
+    made. An active from before the groups sends no list: ours stays. Never raises;
+    returns what the sync status should say when the state could not be saved."""
     try:
         with _lock:
             st = _load()
@@ -3026,6 +3088,9 @@ def _adopt_group(snap):
                 new['tombstones'] = tombs
             if isinstance(snap.get('members'), list):
                 new['members'] = _merged_members(st, sender, snap['members'], tombs)
+                # not listed at all is no flag either
+                own = _clean_entries(snap['members']).get(st['instance_id']) or {}
+                new['serve_assigned'] = own.get('serve') is True
             their_epoch = _epoch_value(snap.get('epoch') or 0)
             if their_epoch is not None and their_epoch > int(st.get('epoch') or 0):
                 # never back to an active from before this one
@@ -4057,7 +4122,9 @@ def _member_view(rec, src, st):
         'role_seen': rec.get('role_seen'),
         'epoch_seen': rec.get('epoch_seen'),
         'confirmed_standby': _confirmed_standby(rec, st),
-        # the member said it serves users (a standby of theirs the UI calls active)
+        # the leader made it active, and the member said it serves users (a standby of
+        # theirs the UI calls active)
+        'serve': rec.get('serve') is True,
         'serving_seen': rec.get('serving_seen') is True,
         'key_fingerprint': peer_key_fingerprint(rec.get('public_key')),
         'last_contact': rec.get('last_contact'),
@@ -4082,9 +4149,12 @@ def public_status():
         # the switch, and whether a refused write goes to the active right now
         'forward_writes': forward_writes(),
         'forwarding': forwarding(),
-        # the switch, and whether this standby serves users right now
-        'serve_users': serve_users(),
+        # whether the leader made this standby active, and whether it serves users right
+        # now; how many instances serve them, and how many may
+        'serve_assigned': serve_assigned(),
         'serving': serving(),
+        'actives': actives(),
+        'active_limit': ACTIVE_LIMIT,
         'managers_running': bool(_run['managers']),
         'broken': st.get('broken') or '',
         # set once a member told this instance it was removed; it is passive then

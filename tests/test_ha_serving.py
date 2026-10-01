@@ -1,8 +1,12 @@
-"""Serving members (#625): a standby switched to serve users is an active instance to
-them. They sign in there, see the clusters live and open consoles, shells and SPICE
+"""Serving members (#625): a standby the leader made active is an active instance to the
+users. They sign in there, see the clusters live and open consoles, shells and SPICE
 there; every change goes to the leader (tests/test_ha_forward.py). Its role stays
 standby, so nothing that acts on its own starts there, and tests/test_ha_loop_gates.py
 holds as it is.
+
+Who is active is set on the leader, for every member (PUT /api/ha/members/<id>/serve):
+up to three instances, the leader included. The flag travels with the member list, and
+a member takes it with its next sync.
 
 Runs on the in-process group of tests/test_ha_members.py with the forwarding of
 tests/test_ha_forward.py: a is the leader, b its standby. Every console path is taken
@@ -14,13 +18,16 @@ MK Oct 2026
 import asyncio
 import json
 import subprocess
+import threading
+import time
 import types
 from urllib.parse import parse_qsl, urlsplit
 
 import pytest
 
 from test_ha_api import _admin, _audit, _local_user, ADMIN_PW  # noqa: F401
-from test_ha_members import group, _built, _post, _send, _sync, _watch, IDS, URLS  # noqa: F401
+from test_ha_members import (group, _built, _pair, _post, _promote, _pub, _send, _sync,  # noqa: F401
+                             _watch, IDS, URLS)
 from test_ha_forward import fwd, probe, _forward_calls, _hook_lists, _concrete, FORWARD  # noqa: F401
 from test_ha_v2_surface import (CID, VM, SHELL, STANDBY_ANSWER, _registry, _fake_manager,
                                 _console_calls, _SyncWS, _AsyncWS, _sock_handler,
@@ -28,11 +35,20 @@ from test_ha_v2_surface import (CID, VM, SHELL, STANDBY_ANSWER, _registry, _fake
 
 VNC_SOCKET = '/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/vncwebsocket'
 NOT_KNOWN = 'is not known here yet - open a shell to it on the leader once'
+ON_LEADER = {'code': 'HA_SERVE_ON_LEADER', 'error': 'Which instances are active is set on the leader'}
 
 
 def _serve(g, n='b', on=True):
+    """The leader a makes `n` active (or a standby again), and `n` takes it with a sync,
+    as it does within seconds of the leader's note."""
+    with g.at('a') as ha:
+        ha.set_member_serve(IDS[n], on)
     with g.at(n) as ha:
-        ha.set_serve_users(on)
+        assert ha.pull_once() in ('applied', 'unchanged')
+
+
+def _put_serve(admin, n, body):
+    return admin.put(f'/api/ha/members/{IDS[n]}/serve', json=body)
 
 
 def _api_token():
@@ -45,28 +61,110 @@ def _members(g, admin, n):
         return {m['instance_id']: m for m in admin.get('/api/ha/status').get_json()['members']}
 
 
-# --- the switch ----------------------------------------------------------------------------
+# --- the leader decides ------------------------------------------------------------------------
 
-def test_the_switch_is_off_until_an_admin_turns_it_on(fwd, seed):
+def test_the_leader_makes_a_member_active_and_it_takes_that_with_its_sync(fwd, seed):
     g = fwd
-    admin = _built(g, seed, 'b')
+    admin = _built(g, seed, 'bc')
+    restarts = list(g.restarts)
     with g.at('b') as ha:
-        assert (ha.serve_users(), ha.serving(), ha.consoles_here()) == (False, False, False)
-        assert ha.set_serve_users(True) is True
-        assert ha.set_serve_users(True) is False
-        assert (ha.serve_users(), ha.serving(), ha.consoles_here()) == (True, True, True)
-        with pytest.raises(ha.HaError):
-            ha.set_serve_users('yes')
+        assert (ha.serve_assigned(), ha.serving(), ha.consoles_here()) == (False, False, False)
+    with g.at('a') as ha:
+        assert ha.set_member_serve(IDS['b'], True) == (True, 2)
+        assert ha.set_member_serve(IDS['b'], True) == (False, 2)
+        for who, value in ((IDS['b'], 'yes'), (IDS['e'], True), (IDS['a'], True)):
+            with pytest.raises(ha.HaError):
+                ha.set_member_serve(who, value)
+        # the leader is active anyway and has no flag of its own
+        assert (ha.serve_assigned(), ha.serving(), ha.actives()) == (False, False, 2)
+    assert g.file('a')['members'][IDS['b']]['serve'] is True
+    assert 'serve_assigned' not in g.file('a')
+    # nothing on b until it syncs, and b decides nothing itself
+    with g.at('b') as ha:
+        assert (ha.serve_assigned(), ha.serving()) == (False, False)
+        with pytest.raises(ha.HaError, match='Only the leader'):
+            ha.set_member_serve(IDS['c'], True)
+    assert _sync(g, admin, 'b') == 'applied'
+    with g.at('b') as ha:
+        assert (ha.serve_assigned(), ha.serving(), ha.consoles_here(), ha.actives()) == (True, True, True, 2)
         # still a standby: nothing that acts on its own starts here
         assert ha.is_standby() and ha.is_active() is False and ha.managers_wanted() is True
-    assert g.file('b')['serve_users'] is True and 'serve_users' not in g.file('a')
+        st = admin.get('/api/ha/status').get_json()
+    assert (st['serve_assigned'], st['serving'], st['actives'], st['active_limit']) == (True, True, 2, 3)
+    assert 'serve_users' not in st
+    assert g.file('b')['serve_assigned'] is True and IDS['b'] not in g.file('b')['members']
 
-    # this instance's own: the leader switching it on changes nothing on b
-    _serve(g, 'b', False)
-    _serve(g, 'a')
-    _sync(g, admin, 'b')
+    # c learns who serves with its own sync, and serves nobody itself
+    assert _sync(g, admin, 'c') == 'applied'
+    c = g.state('c')
+    assert c['members'][IDS['b']]['serve'] is True and c['members'][IDS['a']]['serve'] is False
+    with g.at('c') as ha:
+        assert (ha.serve_assigned(), ha.serving(), ha.actives()) == (False, False, 2)
+        st = admin.get('/api/ha/status').get_json()
+    assert {m['instance_id']: m['serve'] for m in st['members']} == {IDS['a']: False, IDS['b']: True}
+
+    # a standby again: b stops with its next sync
+    with g.at('a') as ha:
+        assert ha.set_member_serve(IDS['b'], False) == (True, 1)
+    assert _sync(g, admin, 'b') == 'applied'
     with g.at('b') as ha:
-        assert ha.serve_users() is False
+        assert (ha.serve_assigned(), ha.serving(), ha.consoles_here(), ha.actives()) == (False, False, False, 1)
+    # no restart either way: it counts from the next request
+    assert g.restarts == restarts
+
+
+def test_the_etag_carries_the_flag(fwd, seed):
+    """A poll after the leader changed who is active is no 304, though no table changed."""
+    g = fwd
+    admin = _built(g, seed, 'b')
+    assert _sync(g, admin, 'b') == 'unchanged'
+    with g.at('a') as ha:
+        etag = ha.snapshot_etag()
+        ha.set_member_serve(IDS['b'], True)
+        assert ha.snapshot_etag() != etag
+        snap = ha.build_snapshot()
+        assert [(e['instance_id'], e.get('serve')) for e in snap['members']] == [(IDS['a'], None),
+                                                                                 (IDS['b'], True)]
+    assert _sync(g, admin, 'b') == 'applied'
+    assert _sync(g, admin, 'b') == 'unchanged'
+    # counterproof: back to a standby, back to the etag of before
+    with g.at('a') as ha:
+        ha.set_member_serve(IDS['b'], False)
+        assert ha.snapshot_etag() == etag
+
+
+def test_only_a_true_serve_counts(fwd, seed):
+    g = fwd
+    _built(g, seed, 'b')
+    entry = {'instance_id': IDS['c'], 'url': URLS['c'], 'fingerprint': '', 'public_key': _pub(g, 'b')}
+    with g.at('b') as ha:
+        got = [ha._clean_entries([dict(entry, serve=v)])[IDS['c']]['serve'] for v in (True, 'yes', 1, None)]
+        assert got == [True, False, False, False]
+        assert ha._clean_entries([entry])[IDS['c']]['serve'] is False
+
+
+def test_a_switch_of_its_own_is_gone(fwd, seed):
+    """The per-instance switch of the build before: a value left in the state file serves
+    nobody and goes with the next write, and the settings route refuses it before it
+    saves anything else of the body."""
+    g = fwd
+    admin = _built(g, seed, 'b')
+    g.write('b', dict(g.file('b'), serve_users=True))
+    with g.at('b') as ha:
+        assert (ha.serve_assigned(), ha.serving(), ha.consoles_here()) == (False, False, False)
+    before = g.file('b')
+    for n in 'ab':
+        with g.at(n):
+            for body in ({'serve_users': True}, {'serve_users': False, 'interval': 60},
+                         {'serve_users': 'yes', 'forward_writes': False}):
+                r = admin.put('/api/ha/settings', json=body)
+                assert r.status_code == 400 and r.get_json() == ON_LEADER, (n, body, r.data)
+    assert g.file('b') == before and g.file('b')['interval'] == 30
+    # counterproof: the rest of the settings still go through, and the old value goes
+    with g.at('b'):
+        r = admin.put('/api/ha/settings', json={'interval': 60})
+        assert r.status_code == 200 and r.get_json() == {'success': True, 'interval': 60}, r.data
+    assert 'serve_users' not in g.file('b') and g.file('b')['interval'] == 60
 
 
 def test_serving_needs_the_live_view_and_forwarding(fwd, seed):
@@ -81,36 +179,247 @@ def test_serving_needs_the_live_view_and_forwarding(fwd, seed):
         assert (ha.serving(), ha.consoles_here()) == (False, False)
         ha.set_forward_writes(True)
         assert (ha.serving(), ha.consoles_here()) == (True, True)
-    # an instance that acts opens consoles anyway; it is not a serving standby
+    # an instance that acts opens consoles anyway; it is not a serving standby, whatever
+    # its state file says
     for n in 'ae':
-        _serve(g, n)
         with g.at(n) as ha:
+            ha._update(serve_assigned=True)
             assert ha.role() == ('active' if n == 'a' else 'standalone')
-            assert (ha.serving(), ha.consoles_here()) == (False, True)
+            assert (ha.serve_assigned(), ha.serving(), ha.consoles_here()) == (False, False, True)
 
 
-def test_the_settings_route_takes_the_switch_and_audits_it(fwd, seed):
+# --- the route on the leader ----------------------------------------------------------------------
+
+def test_the_serve_route_answers_on_the_leader_only_and_audits(fwd, seed):
+    g = fwd
+    admin = _built(g, seed, 'bc')
+    restarts = list(g.restarts)
+    with g.at('a'):
+        st = admin.get('/api/ha/status').get_json()
+        assert (st['serve_assigned'], st['serving'], st['actives'], st['active_limit']) == (False, False, 1, 3)
+        assert [m['serve'] for m in st['members']] == [False, False]
+        before = g.file('a')
+        for body in (None, {}, {'serve': 'yes'}, {'serve': 1}, {'serve': None}):
+            r = _put_serve(admin, 'b', body)
+            assert r.status_code == 400 and r.get_json()['error'] == 'serve is true or false', body
+        assert _put_serve(admin, 'e', {'serve': True}).status_code == 404
+        assert g.file('a') == before
+
+        r = _put_serve(admin, 'b', {'serve': True})
+        assert r.status_code == 200, r.data
+        assert r.get_json() == {'success': True, 'serve': True, 'actives': 2}
+        # the same again changes nothing and says so the same way
+        r = _put_serve(admin, 'b', {'serve': True})
+        assert r.get_json() == {'success': True, 'serve': True, 'actives': 2}
+        st = admin.get('/api/ha/status').get_json()
+    assert st['actives'] == 2
+    assert {m['instance_id']: m['serve'] for m in st['members']} == {IDS['b']: True, IDS['c']: False}
+
+    # a standby, and an instance outside any group, decide nothing
+    files = {n: g.file(n) for n in 'bc'}
+    for n, other in (('b', 'c'), ('c', 'a'), ('e', 'b')):
+        with g.at(n):
+            r = _put_serve(admin, other, {'serve': True})
+        assert r.status_code == 409, (n, r.data)
+        assert r.get_json() == {'code': 'HA_STANDBY', 'error': 'Which instances are active is set on the leader'}
+    assert {n: g.file(n) for n in 'bc'} == files
+
+    with g.at('a'):
+        assert _put_serve(admin, 'b', {'serve': False}).get_json() == {'success': True, 'serve': False,
+                                                                       'actives': 1}
+    rows = [row['details'] for row in _audit('ha.member_serve_changed')]
+    assert rows == [f"{URLS['b']} is active from its next sync (2 of 3 instances active)",
+                    f"{URLS['b']} is a standby from its next sync (1 of 3 instances active)"]
+    assert g.restarts == restarts
+
+
+def test_the_members_hear_about_it_at_once(fwd, seed, monkeypatch):
+    """The HA routes tell nobody by themselves (app.py): the route sends the note."""
+    g = fwd
+    admin = _built(g, seed, 'bc')
+    timers = []
+    monkeypatch.setattr(g.ha, '_later', lambda delay, fn, name: timers.append((g.name(), fn, name)))
+    with g.at('a'):
+        assert _put_serve(admin, 'b', {'serve': True}).status_code == 200
+    assert [(n, name) for n, _fn, name in timers] == [('a', 'ha-nudge')]
+    g.pulls.clear()
+    n, fn, _name = timers.pop()
+    with g.at(n):
+        fn()
+    assert g.pulls == ['b', 'c']
+    with g.at('b') as ha:
+        assert ha.serving() is True
+    assert g.state('c')['members'][IDS['b']]['serve'] is True
+    # counterproof: nothing changed, no note
+    with g.at('a'):
+        assert _put_serve(admin, 'b', {'serve': True}).status_code == 200
+    assert timers == []
+
+
+def test_three_instances_at_most_are_active(fwd, seed):
+    g = fwd
+    admin = _built(g, seed, 'bcd')
+    with g.at('a') as ha:
+        assert _put_serve(admin, 'b', {'serve': True}).get_json()['actives'] == 2
+        assert _put_serve(admin, 'c', {'serve': True}).get_json()['actives'] == 3
+        before = g.file('a')
+        r = _put_serve(admin, 'd', {'serve': True})
+        assert r.status_code == 409
+        assert r.get_json() == {'code': 'HA_ACTIVE_LIMIT', 'error': ha.ACTIVE_LIMIT_ERROR}
+        assert 'at most 3 active instances' in r.get_json()['error']
+        with pytest.raises(ha.ActiveLimit):
+            ha.set_member_serve(IDS['d'], True)
+        assert g.file('a') == before
+        # a standby stays one, which always goes through, and a member back to a
+        # standby frees its place
+        assert _put_serve(admin, 'd', {'serve': False}).get_json() == {'success': True, 'serve': False,
+                                                                       'actives': 3}
+        assert _put_serve(admin, 'c', {'serve': False}).get_json()['actives'] == 2
+        assert _put_serve(admin, 'd', {'serve': True}).get_json()['actives'] == 3
+        st = admin.get('/api/ha/status').get_json()
+    assert st['actives'] == 3
+    assert {m['instance_id']: m['serve'] for m in st['members']} == {IDS['b']: True, IDS['c']: False,
+                                                                    IDS['d']: True}
+    for n in 'bcd':
+        assert _sync(g, admin, n) == 'applied'
+    for n in 'bcd':
+        with g.at(n) as ha:
+            assert (ha.serving(), ha.actives()) == (n != 'c', 3), n
+
+
+def test_two_admins_at_once_cannot_both_take_the_last_place(fwd, seed, monkeypatch):
+    """Counted and written under the state lock: the second call waits for the first and
+    then finds the group full."""
+    g = fwd
+    _built(g, seed, 'bcd', sync=False)
+    ha = g.ha
+    real = ha._commit_locked
+    inside = threading.Event()
+    out = {}
+
+    def slow(new):
+        inside.set()
+        time.sleep(0.3)            # the second call is under way by now
+        real(new)
+
+    def take(n):
+        try:
+            out[n] = ha.set_member_serve(IDS[n], True)
+        except ha.ActiveLimit as e:
+            out[n] = e
+    with g.at('a'):
+        ha.set_member_serve(IDS['b'], True)
+        monkeypatch.setattr(ha, '_commit_locked', slow)
+        first = threading.Thread(target=take, args=('c',))
+        first.start()
+        assert inside.wait(5)
+        take('d')
+        first.join(5)
+        monkeypatch.setattr(ha, '_commit_locked', real)
+        assert out['c'] == (True, 3) and isinstance(out['d'], ha.ActiveLimit), out
+        assert ha.actives() == 3
+    assert {mid: rec.get('serve') for mid, rec in g.file('a')['members'].items()} == \
+        {IDS['b']: True, IDS['c']: True, IDS['d']: None}
+
+
+# --- a promotion, a removal ----------------------------------------------------------------------
+
+def test_a_promotion_keeps_the_flags_and_the_new_leader_has_none(fwd, seed):
+    """c, an active member, is promoted: it leads now, and its own flag counts no more.
+    The others keep theirs, and the old leader follows it as a standby."""
+    g = fwd
+    admin = _built(g, seed, 'bcd')
+    with g.at('a') as ha:
+        ha.set_member_serve(IDS['b'], True)
+        ha.set_member_serve(IDS['c'], True)
+    for n in 'bcd':
+        assert _sync(g, admin, n) == 'applied'
+    assert [g.state(n)['serve_assigned'] for n in 'bcd'] == [True, True, False]
+
+    r = _promote(g, admin, 'c')
+    assert r.status_code == 200, r.data
+    c = g.state('c')
+    assert c['role'] == 'active' and c['serve_assigned'] is False
+    assert {mid: rec['serve'] for mid, rec in c['members'].items()} == \
+        {IDS['a']: False, IDS['b']: True, IDS['d']: False}
+    with g.at('c') as ha:
+        assert (ha.serve_assigned(), ha.serving(), ha.actives()) == (False, False, 2)
+        assert admin.get('/api/ha/status').get_json()['actives'] == 2
+
+    for n in 'bd':
+        assert _watch(g, n) == 'source switched'
+    # b follows c and still holds the flag the old list gave c: the leader counts once
+    assert g.state('b')['members'][IDS['c']]['serve'] is True
+    with g.at('b') as ha:
+        assert (ha.serving(), ha.actives()) == (True, 2)
+    for n in 'abd':
+        assert _sync(g, admin, n) == 'applied'
+    assert [g.state(n)['serve_assigned'] for n in 'abd'] == [False, True, False]
+    with g.at('a') as ha:
+        assert (ha.role(), ha.serving(), ha.actives()) == ('standby', False, 2)
+    with g.at('b') as ha:
+        assert (ha.serving(), ha.actives()) == (True, 2)
+    # the new leader decides from now on, with the same limit
+    with g.at('c'):
+        assert _put_serve(admin, 'd', {'serve': True}).get_json()['actives'] == 3
+        r = _put_serve(admin, 'a', {'serve': True})
+        assert r.status_code == 409 and r.get_json()['code'] == 'HA_ACTIVE_LIMIT'
+    with g.at('a'):
+        r = _put_serve(admin, 'b', {'serve': False})
+        assert r.status_code == 409 and r.get_json()['code'] == 'HA_STANDBY'
+
+
+def test_a_serving_member_removed_while_away_stops_at_its_next_sync(fwd, seed):
     g = fwd
     admin = _built(g, seed, 'b')
-    restarts = list(g.restarts)
+    _serve(g, 'b')
+    g.down.add('b')
+    with g.at('a'):
+        r = _post(admin, f"/api/ha/members/{IDS['b']}/remove",
+                  {'confirm': 'REMOVE', 'user_password': ADMIN_PW})
+    assert r.status_code == 200 and r.get_json()['told'] is False, r.data
+    assert g.state('a')['members'] == {}
+    g.down.discard('b')
+    # it has not heard yet
+    with g.at('b') as ha:
+        assert ha.serving() is True
+    assert _sync(g, admin, 'b') == 'removed'
+    with g.at('b') as ha:
+        assert (ha.serve_assigned(), ha.serving(), ha.consoles_here()) == (False, False, False)
+    assert g.state('b')['serve_assigned'] is False
+
+    # it unpairs and joins again: a record of its own, a standby like any newcomer
     with g.at('b'):
-        st = admin.get('/api/ha/status').get_json()
-        assert (st['serve_users'], st['serving']) == (False, False)
-        assert admin.put('/api/ha/settings', json={'serve_users': 'yes'}).status_code == 400
-        r = admin.put('/api/ha/settings', json={'serve_users': True})
+        r = _post(admin, '/api/ha/unpair', {'confirm': 'UNPAIR', 'user_password': ADMIN_PW})
         assert r.status_code == 200, r.data
-        assert r.get_json() == {'success': True, 'serve_users': True, 'serving': True}
-        st = admin.get('/api/ha/status').get_json()
-        assert (st['serve_users'], st['serving']) == (True, True)
-        # forwarding off: the switch stays, the effect goes
-        r = admin.put('/api/ha/settings', json={'serve_users': True, 'forward_writes': False})
-        assert r.get_json()['serving'] is False
-        st = admin.get('/api/ha/status').get_json()
-        assert (st['serve_users'], st['serving']) == (True, False)
-    # no restart: it counts from the next request
-    assert g.restarts == restarts
-    rows = [row['details'] for row in _audit('ha.settings_changed') if 'serving users' in row['details']]
-    assert rows == ['serving users as a standby on']
+    _pair(g, admin, 'b')
+    assert _sync(g, admin, 'b') == 'applied'
+    assert g.state('a')['members'][IDS['b']].get('serve') is None
+    with g.at('b') as ha:
+        assert (ha.serve_assigned(), ha.serving()) == (False, False)
+
+
+def test_a_member_that_leaves_takes_no_flag_along(fwd, seed):
+    """Neither out of the group nor into the next one: a newcomer serves once the leader
+    of its group says so, not from its first request on."""
+    g = fwd
+    admin = _built(g, seed, 'b')
+    _serve(g, 'b')
+    with g.at('b'):
+        r = _post(admin, '/api/ha/unpair', {'confirm': 'UNPAIR', 'user_password': ADMIN_PW})
+    assert r.status_code == 200, r.data
+    b = g.state('b')
+    assert (b['role'], b['serve_assigned']) == ('standalone', False)
+    # the leader dropped it with its record
+    assert g.state('a')['members'] == {}
+
+    # a flag left in the file of a standalone instance does not survive its join
+    g.write('b', dict(g.file('b'), serve_assigned=True))
+    _pair(g, admin, 'b')
+    with g.at('b') as ha:
+        assert ha.source_id() == IDS['a'] and ha.live_view() and ha.forward_writes()
+        assert (ha.serve_assigned(), ha.serving(), ha.consoles_here()) == (False, False, False)
+    assert g.state('b')['serve_assigned'] is False
 
 
 # --- what the others see ---------------------------------------------------------------------
@@ -135,18 +444,27 @@ def test_the_members_see_who_serves(fwd, seed, monkeypatch):
     _watch(g, 'c')
     ms = _members(g, admin, 'a')
     assert ms[IDS['b']]['serving_seen'] is True and ms[IDS['c']]['serving_seen'] is False
+    # what the leader set, next to what the member says
+    assert ms[IDS['b']]['serve'] is True and ms[IDS['c']]['serve'] is False
     ms = _members(g, admin, 'c')
     assert ms[IDS['b']]['serving_seen'] is True and ms[IDS['a']]['serving_seen'] is False
 
     # anything but true is not serving
     from pegaprox.core import ha as ha_mod
-    monkeypatch.setattr(ha_mod, 'serving', lambda: 'yes')
+    # a context of its own: undoing the test's monkeypatch would undo the harness too,
+    # and every call after it would go out to the network
+    with monkeypatch.context() as m:
+        m.setattr(ha_mod, 'serving', lambda: 'yes')
+        _watch(g, 'a')
+        assert _members(g, admin, 'a')[IDS['b']]['serving_seen'] is False
     _watch(g, 'a')
-    assert _members(g, admin, 'a')[IDS['b']]['serving_seen'] is False
-    monkeypatch.undo()
+    assert _members(g, admin, 'a')[IDS['b']]['serving_seen'] is True
+    # a standby again: b says so with the next look at it
     _serve(g, 'b', False)
     _watch(g, 'a')
-    assert _members(g, admin, 'a')[IDS['b']]['serving_seen'] is False
+    ms = _members(g, admin, 'a')
+    assert (ms[IDS['b']]['serve'], ms[IDS['b']]['serving_seen']) == (False, False)
+    assert not g.state('a')['members'][IDS['b']]['last_error']
 
 
 def test_the_banner_of_a_serving_standby(fwd, seed, db, tmp_path, monkeypatch):
@@ -183,7 +501,7 @@ def test_the_banner_of_a_serving_standby(fwd, seed, db, tmp_path, monkeypatch):
 def test_a_member_removed_from_the_group_serves_nobody(fwd, seed, monkeypatch):
     """Its accounts and rights stay those of its last sync, and nothing the leader
     changes reaches it any more: no consoles there, and it does not call itself active.
-    The switch stays as the admin left it."""
+    Its flag goes with its record on the leader."""
     g = fwd
     admin = _built(g, seed, 'b')
     mgr = _fake_manager(g.api)
@@ -200,9 +518,10 @@ def test_a_member_removed_from_the_group_serves_nobody(fwd, seed, monkeypatch):
                   {'confirm': 'REMOVE', 'user_password': ADMIN_PW})
     assert r.status_code == 200 and r.get_json()['told'] is True, r.data
     assert g.state('b')['removed'] and g.state('b')['role'] == 'standby'
+    assert IDS['b'] not in g.state('a')['members']
     g.calls.clear()
     with g.at('b') as ha:
-        assert ha.serve_users() is True
+        assert (ha.serve_assigned(), ha.actives()) == (False, 1)
         assert (ha.serving(), ha.consoles_here(), ha.leader_reachable()) == (False, False, False)
         r = admin.get(f'{VM}/console')
         assert r.status_code == 409 and r.get_json() == STANDBY_ANSWER
@@ -724,7 +1043,7 @@ def _roles(g):
     g.write('a', {'role': 'active', 'epoch': 1, 'instance_id': IDS['a'], 'interval': 30,
                   'pairing': None, 'sync': {}})
     g.write('b', {'role': 'standby', 'epoch': 1, 'instance_id': IDS['b'], 'interval': 30,
-                  'pairing': None, 'sync': {}, 'serve_users': True})
+                  'pairing': None, 'sync': {}, 'serve_assigned': True})
 
 
 def test_a_standby_pins_no_host_key_and_takes_the_ones_it_holds(group, known_hosts):

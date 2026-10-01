@@ -466,7 +466,10 @@ def ha_status():
     standby pulls from; peer is that one (or the first member) for older readers.
     suggested_url and own_fingerprint are what a pairing code made here would carry,
     so the UI can prefill the form. forward_writes is this instance's switch, forwarding
-    whether a standby hands its writes to the active right now."""
+    whether a standby hands its writes to the active right now. serve_assigned says the
+    leader made this standby active, serving that it serves users right now, actives
+    and active_limit how many instances do and may; serve on a member is the leader's
+    word, serving_seen what the member said."""
     denied = _refuse_confined_admin()
     if denied:
         return denied
@@ -738,6 +741,49 @@ def remove_member(instance_id):
     return jsonify({'success': True, 'told': told, 'members': ha.public_status()['members']})
 
 
+@bp.route('/api/ha/members/<instance_id>/serve', methods=['PUT'])
+@require_auth(roles=[ROLE_ADMIN])
+def set_member_serve(instance_id):
+    """Make a member one of the group's active instances (serve: true), or a standby
+    again (serve: false), on the leader.
+
+    An active member serves users as the leader does: they sign in there, see the
+    clusters live and open their consoles there, and every change goes to the leader.
+    Its role stays standby, so the leader alone runs the automation. Up to three
+    active instances, the leader included; one more is 409 HA_ACTIVE_LIMIT, and serve:
+    false always goes through. The member takes it with its next sync, which every
+    member is asked for right away. No password: this decides where users are served,
+    not which instance acts on the clusters. actives in the answer counts the leader
+    and every member it made active."""
+    denied = _refuse_confined_admin()
+    if denied:
+        return denied
+    serve = _body().get('serve')
+    if not isinstance(serve, bool):
+        return jsonify({'error': 'serve is true or false'}), 400
+    if ha.role() != ha.ROLE_ACTIVE:
+        return jsonify({'code': 'HA_STANDBY',
+                        'error': 'Which instances are active is set on the leader'}), 409
+    if not ha.member(instance_id):
+        return jsonify({'error': 'That instance is not a member of this group'}), 404
+    try:
+        changed, actives = ha.set_member_serve(instance_id, serve)
+    except ha.ActiveLimit as e:
+        return jsonify({'code': 'HA_ACTIVE_LIMIT', 'error': str(e)}), 409
+    except ha.HaError as e:
+        return jsonify({'error': str(e)}), 409
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Could not save which instances are active')}), 500
+    if changed:
+        rec = ha.member(instance_id) or {}
+        log_audit(_user(), 'ha.member_serve_changed',
+                  f"{rec.get('url') or instance_id} is {'active' if serve else 'a standby'} from "
+                  f"its next sync ({actives} of {ha.ACTIVE_LIMIT} instances active)")
+        # the HA routes tell nobody by themselves (app.py): the member list changed
+        ha.nudge_members()
+    return jsonify({'success': True, 'serve': serve, 'actives': actives})
+
+
 @bp.route('/api/ha/settings', methods=['PUT'])
 @require_auth(roles=[ROLE_ADMIN])
 def update_settings():
@@ -749,18 +795,21 @@ def update_settings():
     restarts when live_view changes, because it sets its connections up once per
     process; any other role only keeps the value for when it follows. forward_writes,
     also this instance's own: on, a standby hands the writes of its signed-in users to
-    the active; off, it refuses them. It counts from the next write. serve_users, this
-    instance's own as well: on, a standby serves users like an active instance, with
-    their consoles opened here and every change forwarded, as long as the live view and
-    forwarding are on too (serving in the answer says whether they are). No restart,
-    it counts from the next request. Any of the four, or several."""
+    the active; off, it refuses them. It counts from the next write. Any of the three,
+    or several. Whether a standby serves users is not its own switch: the leader sets
+    it for every member (PUT /api/ha/members/<instance_id>/serve), and serve_users here
+    gets 400 HA_SERVE_ON_LEADER."""
     denied = _refuse_confined_admin()
     if denied:
         return denied
     data = _body()
-    if not any(k in data for k in ('interval', 'live_view', 'forward_writes', 'serve_users')):
-        return jsonify({'error': 'Nothing to change - send interval, live_view, forward_writes, '
-                                 'serve_users or several of them'}), 400
+    if 'serve_users' in data:
+        # before anything else in the body is saved: the admin is on the wrong page
+        return jsonify({'code': 'HA_SERVE_ON_LEADER',
+                        'error': 'Which instances are active is set on the leader'}), 400
+    if not any(k in data for k in ('interval', 'live_view', 'forward_writes')):
+        return jsonify({'error': 'Nothing to change - send interval, live_view, forward_writes '
+                                 'or several of them'}), 400
     interval = data.get('interval')
     if 'interval' in data and (isinstance(interval, bool) or not isinstance(interval, int)
                                or not _MIN_INTERVAL <= interval <= _MAX_INTERVAL):
@@ -772,9 +821,6 @@ def update_settings():
     forward = data.get('forward_writes')
     if 'forward_writes' in data and not isinstance(forward, bool):
         return jsonify({'error': 'forward_writes is true or false'}), 400
-    serve = data.get('serve_users')
-    if 'serve_users' in data and not isinstance(serve, bool):
-        return jsonify({'error': 'serve_users is true or false'}), 400
     status = ha.public_status()
     if status['broken']:
         # saving now would write the placeholder state over the file that could not be
@@ -808,18 +854,6 @@ def update_settings():
                       f"forwarding writes to the active instance {'on' if forward else 'off'}")
         out['forward_writes'] = forward
 
-    if 'serve_users' in data:
-        try:
-            changed = ha.set_serve_users(serve)
-        except ha.HaError as e:
-            return jsonify({'error': str(e)}), 409
-        except Exception as e:
-            return jsonify({'error': safe_error(e, 'Could not save the serving switch')}), 500
-        if changed:
-            log_audit(_user(), 'ha.settings_changed',
-                      f"serving users as a standby {'on' if serve else 'off'}")
-        out['serve_users'] = serve
-
     if 'live_view' in data:
         was = ha.live_view()
         try:
@@ -837,8 +871,6 @@ def update_settings():
             if standby:
                 restarting = ha.apply_config_now() == 'restart'
         out.update(live_view=live, restarting=restarting)
-    if 'serve_users' in data:
-        out['serving'] = ha.serving()
     return jsonify(out)
 
 

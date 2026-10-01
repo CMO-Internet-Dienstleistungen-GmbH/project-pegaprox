@@ -65,7 +65,7 @@ V2_STANDBY = {
 
 MEMBER_KEYS = {'instance_id', 'url', 'fingerprint', 'role_seen', 'epoch_seen', 'last_contact',
                'last_error', 'joined_at', 'is_source', 'confirmed_standby', 'key_fingerprint',
-               'serving_seen'}
+               'serve', 'serving_seen'}
 
 
 def _one_after_the_other(jobs, timeout):
@@ -449,10 +449,13 @@ def test_the_etag_carries_the_member_list_and_nothing_that_moves(group, seed):
         etag = ha.snapshot_etag()
         snap = ha.build_snapshot()
         assert snap['etag'] == etag
-        # addresses, pins and public keys, nothing private
+        # addresses, pins and public keys, nothing private; for a member whether the
+        # active made it active too (tests/test_ha_serving.py)
         assert {tuple(sorted(e)) for e in snap['members']} == \
-            {('fingerprint', 'instance_id', 'public_key', 'secret_hash', 'url')}
+            {('fingerprint', 'instance_id', 'public_key', 'secret_hash', 'url'),
+             ('fingerprint', 'instance_id', 'public_key', 'secret_hash', 'serve', 'url')}
         assert [e['instance_id'] for e in snap['members']] == [IDS[n] for n in 'abc']
+        assert [e.get('serve') for e in snap['members']] == [None, False, False]
         assert all(e['public_key'] and e['secret_hash'] == '' for e in snap['members'])
         assert ha._load()['signing_key'] not in json.dumps(snap)
         assert snap['group'] == 1 and snap['tombstones'] == []

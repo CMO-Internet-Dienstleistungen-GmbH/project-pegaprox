@@ -42,6 +42,7 @@ ADMIN_ROUTES = [
     ('put', '/api/ha/settings', {'interval': 60}),
     ('post', '/api/ha/apply-config', None),
     ('post', f'/api/ha/members/{B_ID}/remove', {'confirm': 'REMOVE', 'user_password': ADMIN_PW}),
+    ('put', f'/api/ha/members/{B_ID}/serve', {'serve': True}),
 ]
 PEER_ROUTES = [
     ('POST', '/api/ha/peer/pair'),
@@ -331,6 +332,7 @@ def test_an_admin_reaches_every_route(ha_env, seed):
         '/api/ha/settings': 200,
         '/api/ha/apply-config': 409,  # not a standby
         f'/api/ha/members/{B_ID}/remove': 409,  # not active
+        f'/api/ha/members/{B_ID}/serve': 409,   # not the leader
     }
     for method, path, body in ADMIN_ROUTES:
         r = _send(c, method, path, body)

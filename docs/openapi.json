@@ -43283,7 +43283,7 @@
           }
         },
         "summary": "Role, epoch, members and last sync of this instance.",
-        "description": "members lists every other instance of the group, is_source marks the one a\nstandby pulls from; peer is that one (or the first member) for older readers.\nsuggested_url and own_fingerprint are what a pairing code made here would carry,\nso the UI can prefill the form. forward_writes is this instance's switch, forwarding\nwhether a standby hands its writes to the active right now.",
+        "description": "members lists every other instance of the group, is_source marks the one a\nstandby pulls from; peer is that one (or the first member) for older readers.\nsuggested_url and own_fingerprint are what a pairing code made here would carry,\nso the UI can prefill the form. forward_writes is this instance's switch, forwarding\nwhether a standby hands its writes to the active right now. serve_assigned says the\nleader made this standby active, serving that it serves users right now, actives\nand active_limit how many instances do and may; serve on a member is the leader's\nword, serving_seen what the member said.",
         "x-pegaprox-auth": "decorator",
         "security": [
           {
@@ -43583,6 +43583,62 @@
         ]
       }
     },
+    "/api/ha/members/{instance_id}/serve": {
+      "put": {
+        "operationId": "ha.set_member_serve_put",
+        "tags": [
+          "ha"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Make a member one of the group's active instances (serve: true), or a standby again (serve: false), on the leader.",
+        "description": "An active member serves users as the leader does: they sign in there, see the\nclusters live and open their consoles there, and every change goes to the leader.\nIts role stays standby, so the leader alone runs the automation. Up to three\nactive instances, the leader included; one more is 409 HA_ACTIVE_LIMIT, and serve:\nfalse always goes through. The member takes it with its next sync, which every\nmember is asked for right away. No password: this decides where users are served,\nnot which instance acts on the clusters. actives in the answer counts the leader\nand every member it made active.",
+        "parameters": [
+          {
+            "name": "instance_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-roles": [
+          "admin"
+        ]
+      }
+    },
     "/api/ha/settings": {
       "put": {
         "operationId": "ha.update_settings_put",
@@ -43604,7 +43660,7 @@
           }
         },
         "summary": "How often the standby pulls and the active looks at its peer, the live view, and whether this instance as a standby forwards writes.",
-        "description": "interval is in seconds. live_view is this instance's own switch: on, a standby\nconnects to the clusters read-only; off, it holds no connection at all. A standby\nrestarts when live_view changes, because it sets its connections up once per\nprocess; any other role only keeps the value for when it follows. forward_writes,\nalso this instance's own: on, a standby hands the writes of its signed-in users to\nthe active; off, it refuses them. It counts from the next write. serve_users, this\ninstance's own as well: on, a standby serves users like an active instance, with\ntheir consoles opened here and every change forwarded, as long as the live view and\nforwarding are on too (serving in the answer says whether they are). No restart,\nit counts from the next request. Any of the four, or several.",
+        "description": "interval is in seconds. live_view is this instance's own switch: on, a standby\nconnects to the clusters read-only; off, it holds no connection at all. A standby\nrestarts when live_view changes, because it sets its connections up once per\nprocess; any other role only keeps the value for when it follows. forward_writes,\nalso this instance's own: on, a standby hands the writes of its signed-in users to\nthe active; off, it refuses them. It counts from the next write. Any of the three,\nor several. Whether a standby serves users is not its own switch: the leader sets\nit for every member (PUT /api/ha/members/<instance_id>/serve), and serve_users here\ngets 400 HA_SERVE_ON_LEADER.",
         "requestBody": {
           "required": false,
           "content": {
