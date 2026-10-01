@@ -4911,6 +4911,12 @@ def get_node_shell_ticket(cluster_id, node):
     """Get shell ticket for node - requires node.shell permission"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    # a root shell on a node: not for a caller who reaches this cluster only through a VM
+    # ACL or a pool grant, the same rule as /api/internal/cluster-creds
+    from pegaprox.api.helpers import require_unconfined
+    denied = require_unconfined(cluster_id)
+    if denied:
+        return denied
     
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -11022,6 +11028,9 @@ BIND_HOST = os.environ.get('SSH_WS_HOST', '0.0.0.0')
 SSL_CERT = os.environ.get('SSH_WS_SSL_CERT', '')
 SSL_KEY = os.environ.get('SSH_WS_SSL_KEY', '')
 PEGAPROX_URL = os.environ.get('PEGAPROX_URL', 'http://127.0.0.1:5000')
+# shows the main app it is talking to the console server it started (api/realtime.py
+# CONSOLE_SERVER_HEADER); only then does /validate hand back the cluster context
+CONSOLE_HEADERS = {'X-PegaProx-Console-Server': os.environ.get('PEGAPROX_CONSOLE_SECRET', '')}
 
 try:
     import websockets
@@ -11127,7 +11136,7 @@ async def ssh_handler(websocket):
             validate_url = f"{PEGAPROX_URL}/api/auth/validate"
             print("Validating session (legacy)...")
 
-        headers = {'X-Session-ID': session_id} if session_id else {}
+        headers = dict(CONSOLE_HEADERS, **({'X-Session-ID': session_id} if session_id else {}))
         cookies = {'session': session_id} if session_id else {}
         # nosec B501 — localhost-to-PegaProx (PEGAPROX_URL = 127.0.0.1:port) with our
         # own self-signed cert. Same-host trust boundary; attacker with local
@@ -11459,7 +11468,7 @@ async def termproxy_handler(client_ws, query, m_term, ws_token, session_id):
             )
         else:
             validate_url = f"{PEGAPROX_URL}/api/auth/validate"
-        headers = {'X-Session-ID': session_id} if session_id else {}
+        headers = dict(CONSOLE_HEADERS, **({'X-Session-ID': session_id} if session_id else {}))
         cookies = {'session': session_id} if session_id else {}
         # nosec B501 — localhost-to-PegaProx (PEGAPROX_URL = 127.0.0.1:port) with our
         # own self-signed cert. Same-host trust boundary; attacker with local
@@ -11817,6 +11826,8 @@ if __name__ == '__main__':
         env['SSH_WS_HOST'] = host  # Issue #71: IPv6 support
         main_port = port - 2
         env['PEGAPROX_URL'] = _ws_subprocess_base_url(main_port, ssl_cert)   # #957
+        from pegaprox.api.realtime import console_server_secret
+        env['PEGAPROX_CONSOLE_SECRET'] = console_server_secret()
         if ssl_cert:
             env['SSH_WS_SSL_CERT'] = ssl_cert
         if ssl_key:
@@ -11905,6 +11916,17 @@ def node_shell_websocket_proxy(ws, cluster_id, node):
         logging.error(f"SHELL WS: User {session['user']} denied access to cluster {cluster_id}")
         try:
             ws.send('{"status":"error","message":"Access denied to this cluster"}')
+        except:
+            pass
+        return
+    # confined to single VMs or a pool here (a portal user, say): no node shell, the same
+    # rule as /api/internal/cluster-creds
+    from pegaprox.api.helpers import caller_is_scoped
+    from pegaprox.utils.auth import build_authz_user
+    if caller_is_scoped(build_authz_user(session['user'], session), cluster_id):
+        logging.error(f"SHELL WS: User {session['user']} is confined on cluster {cluster_id}")
+        try:
+            ws.send('{"status":"error","message":"Access denied: this action affects the whole cluster"}')
         except:
             pass
         return

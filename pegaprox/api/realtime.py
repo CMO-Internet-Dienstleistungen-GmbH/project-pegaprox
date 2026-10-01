@@ -4,8 +4,10 @@ PegaProx Realtime API Routes - Layer 6
 WebSocket, SSE, and email test endpoints.
 """
 
+import hmac
 import json
 import logging
+import secrets
 import threading
 import time
 import uuid
@@ -192,6 +194,25 @@ def narrow_stream_scope(previous, fresh_allowed):
     if previous is None:
         return list(fresh_allowed)            # was unrestricted, now is not
     return [c for c in previous if c in fresh_allowed]
+
+
+# The SSH console server this process starts (api/vms.py start_ssh_websocket_server) gets
+# this in its environment and sends it back with every validate call. Only that caller is
+# handed the cluster context, and the PVE session ticket in it is one of the cluster's own
+# account - root@pam unless an admin set another, so root on every node. Any other holder
+# of a ws token learns whether the token is good and nothing else. New with every start:
+# the console server is restarted with the app.
+CONSOLE_SERVER_HEADER = 'X-PegaProx-Console-Server'
+_CONSOLE_SERVER_SECRET = secrets.token_urlsafe(32)
+
+
+def console_server_secret():
+    return _CONSOLE_SERVER_SECRET
+
+
+def _from_console_server():
+    sent = request.headers.get(CONSOLE_SERVER_HEADER) or ''
+    return hmac.compare_digest(sent.encode(), _CONSOLE_SERVER_SECRET.encode())
 
 
 def _floor_by_token_role(user, token_role):
@@ -398,6 +419,13 @@ def validate_ws_token_api():
                 if not has_permission(user, 'node.shell'):
                     logging.warning(f"[WS-TOKEN] user '{_sl(data['user'])}' lacks node.shell for a node shell on '{_sl(requested_cluster)}'")
                     return jsonify({'error': 'node.shell permission required'}), 403
+                # a root shell on a node is as whole-cluster as it gets: a caller who
+                # reaches this cluster only through a VM ACL or a pool grant gets none,
+                # the same answer /api/internal/cluster-creds gives (require_unconfined)
+                from pegaprox.api.helpers import caller_is_scoped
+                if caller_is_scoped({**user, 'username': data['user']}, requested_cluster):
+                    logging.warning(f"[WS-TOKEN] user '{_sl(data['user'])}' is confined on '{_sl(requested_cluster)}', no node shell")
+                    return jsonify({'error': 'Access denied: this action affects the whole cluster'}), 403
 
             # MK May 2026 - lightweight cluster context for the SSH/VNC proxy.
             # We intentionally do NOT call mgr._get_node_ip() here: that has a
@@ -410,7 +438,8 @@ def validate_ws_token_api():
             try:
                 from pegaprox.globals import cluster_managers
                 mgr = cluster_managers.get(requested_cluster)
-                if mgr is not None:
+                # only for our own console server, see CONSOLE_SERVER_HEADER
+                if mgr is not None and _from_console_server():
                     cluster_host = getattr(mgr, 'host', None)
                     cfg = getattr(mgr, 'config', None)
                     node_ips = {}
