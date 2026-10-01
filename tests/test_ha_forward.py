@@ -1100,20 +1100,24 @@ def _concrete(rule):
 
 
 def test_every_route_kept_from_forwarding_exists(api):
-    """A typo in the list would forward the route it meant to keep."""
+    """A typo in the list would forward the route it meant to keep. The consoles have a
+    list of their own: a standby that serves users opens them (tests/test_ha_serving.py)."""
     lists = _hook_lists(api.app)
     served = {(m, r.rule) for r in api.app.url_map.iter_rules() for m in r.methods}
-    missing = [e for e in lists['_STANDBY_NOT_FORWARDED'] if e not in served]
+    kept = lists['_STANDBY_NOT_FORWARDED'] | lists['_STANDBY_CONSOLES']
+    missing = [e for e in kept if e not in served]
     assert missing == []
-    assert len(lists['_STANDBY_NOT_FORWARDED']) >= 27
+    assert len(lists['_STANDBY_NOT_FORWARDED']) >= 19 and len(lists['_STANDBY_CONSOLES']) == 5
 
 
 def test_a_standby_forwards_none_of_them(fwd, seed):
     """Consoles, this instance's own settings, its code and plugins, security keys and
-    rows of its own tables: refused as before, and nothing reaches the active."""
+    rows of its own tables: refused as before, and nothing reaches the active. The
+    consoles on a standby that does not serve users, which is every standby here."""
     g = fwd
     admin = _built(g, seed, 'b')
-    entries = sorted(_hook_lists(g.api.app)['_STANDBY_NOT_FORWARDED'])
+    lists = _hook_lists(g.api.app)
+    entries = sorted(lists['_STANDBY_NOT_FORWARDED'] | lists['_STANDBY_CONSOLES'])
     g.calls.clear()
     with g.at('b'):
         for method, rule in entries:

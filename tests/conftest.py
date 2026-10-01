@@ -98,6 +98,13 @@ def _ha_state_out_of_the_checkout(tmp_path, monkeypatch):
     monkeypatch.setattr(ha, '_PROCESS_STARTED', 0)
     # a standby's note that its active did not answer lives as long as the process
     monkeypatch.setattr(ha, '_silent_source', {'id': None})
+    # A timer of core/ha.py (the active's note to its members after a write, a standby's
+    # reload once a change has settled) fires seconds later on a thread of its own, in
+    # whatever state file a later test holds by then. None starts here; a test that
+    # wants one replaces ha._later and runs what it was handed.
+    monkeypatch.setattr(ha, '_later', lambda delay, fn, name: None)
+    monkeypatch.setattr(ha, '_nudge', {'due': False, 'last': None})
+    monkeypatch.setattr(ha, '_run', ha._fresh_run())
     ha.reset_for_tests()
     yield
     ha.reset_for_tests()

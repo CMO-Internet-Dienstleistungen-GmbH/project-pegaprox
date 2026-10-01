@@ -1882,15 +1882,18 @@ class VMwareManager:
         }
 
 
-def load_vmware_servers():
-    """Load all VMware server configs from DB and create managers"""
+def load_vmware_servers(only=None):
+    """Load all VMware server configs from DB and create managers. `only` limits it to
+    those ids (a warm standby rebuilding a few, core/ha.py reload_managers)."""
     global vmware_managers
     try:
         db = get_db()
         cursor = db.conn.cursor()
         cursor.execute("SELECT * FROM vmware_servers WHERE enabled = 1")
         rows = cursor.fetchall()
-        
+        if only is not None:
+            rows = [r for r in rows if r['id'] in only]
+
         for row in rows:
             row_dict = dict(row)
             vmware_id = row_dict['id']

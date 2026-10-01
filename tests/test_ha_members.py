@@ -64,7 +64,8 @@ V2_STANDBY = {
 }
 
 MEMBER_KEYS = {'instance_id', 'url', 'fingerprint', 'role_seen', 'epoch_seen', 'last_contact',
-               'last_error', 'joined_at', 'is_source', 'confirmed_standby', 'key_fingerprint'}
+               'last_error', 'joined_at', 'is_source', 'confirmed_standby', 'key_fingerprint',
+               'serving_seen'}
 
 
 def _one_after_the_other(jobs, timeout):

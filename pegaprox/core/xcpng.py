@@ -211,6 +211,13 @@ class XcpngManager:
             return False
 
         with self._session_lock:
+            # MK Oct 2026 - a stopped manager logs in no more, as PegaProxManager.stop()
+            # blocks it (#444). The loop may still be in a fetch when stop() logs out, and
+            # its next _api() would open a session nobody ever logs out (a pool reloaded
+            # on a standby, #625, or reconfigured on the leader)
+            if self.stop_event.is_set():
+                self.is_connected = False
+                return False
             try:
                 url = self._get_xapi_url()
                 session = XenAPI.Session(url, ignore_ssl=not self.config.ssl_verification)
@@ -264,7 +271,9 @@ class XcpngManager:
             self.connect()
 
     def _api(self):
-        """Get the xenapi proxy, reconnecting if needed."""
+        """Get the xenapi proxy, reconnecting if needed. None once stopped."""
+        if self.stop_event.is_set():
+            return None
         if not self._session or not self.is_connected:
             if not self.connect():
                 return None

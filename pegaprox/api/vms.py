@@ -8308,8 +8308,9 @@ def handle_vnc_websocket(ws, cluster_id, node, vm_type, vmid):
     print(f"VNC WEBSOCKET: {vm_type}/{vmid} on {node}")
     print(f"{'='*60}")
     
-    # #625 - keyboard and mouse on a guest are the active's to hand out
-    if ha.is_standby():
+    # #625 - keyboard and mouse on a guest: the active's to hand out, or a standby's
+    # that serves users
+    if not ha.consoles_here():
         try:
             ws.close(1008, STANDBY_CONSOLE_ERROR)
         except Exception:
@@ -8613,9 +8614,9 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
         print(f"VNC WebSocket connected: {path}")
         print(f"{'='*60}")
 
-        # #625 - the console port runs on a standby too; the answer there is no, before
-        # a token is spent or a stable-mode key is claimed
-        if ha.is_standby():
+        # #625 - the console port runs on a standby too; unless it serves users the
+        # answer there is no, before a token is spent or a stable-mode key is claimed
+        if not ha.consoles_here():
             await websocket.close(1008, STANDBY_CONSOLE_ERROR)
             return
         
@@ -9262,7 +9263,7 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
     print(f"{'='*60}")
     
     # #625 - see handle_vnc_websocket
-    if ha.is_standby():
+    if not ha.consoles_here():
         try:
             ws.send(STANDBY_CONSOLE_ERROR)
             ws.close(reason=1008, message=STANDBY_CONSOLE_ERROR)
@@ -9750,6 +9751,7 @@ async def ssh_handler(websocket):
     node_ip = None
     cluster_host = None
     node_ips = {}
+    known_only = False
     try:
         if ws_token:
             # NS Aug 2026 (Aikido pentest) — shell=node makes /validate enforce the node.shell
@@ -9782,6 +9784,13 @@ async def ssh_handler(websocket):
             await websocket.send('{"status":"error","message":"Session ungültig - bitte neu einloggen"}')
             await websocket.close(1008, "Invalid auth")
             return
+
+        # #625 - a standby holds the leader's known_hosts and the next sync replaces it:
+        # the main app says so, and a host key it does not know yet is refused below
+        try:
+            known_only = bool((r.json() or {}).get('known_hosts_only'))
+        except Exception:
+            known_only = False
 
         # Pull the cluster context out of the validate response (ws-token path only)
         if ws_token:
@@ -9933,6 +9942,9 @@ async def ssh_handler(websocket):
         pass
     class _TofuPolicy(paramiko.MissingHostKeyPolicy):
         def missing_host_key(self, _c, _h, _k):
+            if known_only:
+                raise paramiko.SSHException("host key of " + str(node) + " is not known here yet"
+                                            " - open a shell to it on the leader once")
             if os.environ.get('PEGAPROX_SSH_STRICT_HOST_KEYS', '').strip().lower() in ('1', 'true', 'yes', 'on'):
                 raise paramiko.SSHException("strict host-key checking: unknown SSH host key for " + str(_h))
             try:
@@ -9941,6 +9953,8 @@ async def ssh_handler(websocket):
                 pass
     ssh.set_missing_host_key_policy(_TofuPolicy())
     def _persist_ssh_hostkeys():
+        if known_only:
+            return
         try:
             with _KH_WRITE_LOCK:
                 ssh.save_host_keys(_ssh_kh)
@@ -10460,8 +10474,8 @@ if __name__ == '__main__':
 def node_shell_websocket_proxy(ws, cluster_id, node):
     """WebSocket proxy for node shell via SSH"""
 
-    # #625 - a root shell on a hypervisor node is the active's alone
-    if ha.is_standby():
+    # #625 - a root shell on a hypervisor node: not from a standby unless it serves users
+    if not ha.consoles_here():
         try:
             ws.send(json.dumps({'status': 'error', 'message': STANDBY_CONSOLE_ERROR}))
         except Exception:

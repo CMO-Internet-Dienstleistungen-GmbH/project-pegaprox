@@ -5,8 +5,9 @@ active instance, so the UI shows the clusters as they are. Everything in them th
 would act asks ha.is_active() and holds back. What that needs, tested here:
 
   * the contract in core/ha.py - the live view switch, managers_wanted(), the
-    signature of how the managers connect, the restart once a change to it has
-    settled, the settings handed to running managers in place after each sync;
+    signature of how the managers connect, the reload once a change to it has
+    settled (what a reload does is tests/test_ha_reload.py), the settings handed to
+    running managers in place after each sync;
   * the gates in the managers that only never ran on a v1 standby because it had
     no managers: save_config, the API token, stopping the HA agents on the nodes,
     the HA monitor and recovery, the XCP-ng id map and balancer, the snapshot
@@ -117,9 +118,13 @@ def env(db, registries, monkeypatch):
     # a fresh process as far as the managers are concerned
     monkeypatch.setattr(ha, '_run', ha._fresh_run())
     monkeypatch.setattr(ha, '_etag_checked', False)
-    restarts, audits = [], []
+    restarts, audits, reloads = [], [], []
     monkeypatch.setattr(ha, 'restart_process', restarts.append)
     monkeypatch.setattr(ha, '_audit', lambda action, details: audits.append((action, details)))
+    # when the managers are reloaded, not how: what a reload stops and builds is
+    # tests/test_ha_reload.py, with stand-ins for the managers
+    monkeypatch.setattr(ha, '_rebuild', lambda added, removed, changed, clusters:
+                        reloads.append((added, removed, changed)) or [])
     serving = [None]
 
     def peer_call(method, base_url, fingerprint, path, json_body=None, auth='peer',
@@ -131,7 +136,7 @@ def env(db, registries, monkeypatch):
     monkeypatch.setattr(ha, '_peer_call', peer_call)
     ha.reset_for_tests()
     return types.SimpleNamespace(db=db, clock=clock, restarts=restarts, audits=audits,
-                                 serving=serving, mp=monkeypatch)
+                                 reloads=reloads, serving=serving, mp=monkeypatch)
 
 
 def _active_meta():
@@ -373,7 +378,7 @@ def test_the_signature_ignores_what_changes_without_a_new_connection(env, change
 
 
 def test_a_secret_that_cannot_be_opened_is_a_stable_value(env):
-    """Not a crash, and no restart for a nonce either."""
+    """Not a crash, and no reload for a nonce either."""
     _seed_all(env.db)
     _update(env.db, 'clusters', 'pve1', pass_encrypted='aes256:bm90IGEgY2lwaGVydGV4dA==')
     first = ha.manager_signature()
@@ -389,16 +394,19 @@ def test_the_signature_never_leaves_memory(env):
     baseline, items = ha._run['signature'], dict(ha._run['items'])
     env.clock.advance(300)
     assert _sync(env, lambda: _update(env.db, 'clusters', 'pve1', host='10.0.0.9')) == 'applied'
-    env.clock.advance(600)
-    assert _poll(env) == 'unchanged' and len(env.restarts) == 1   # the state file was written
+    pending = json.dumps(ha.public_status())
+    env.clock.advance(ha.RELOAD_SETTLE)
+    assert _poll(env) == 'unchanged' and len(env.reloads) == 1
     with open(ha.STATE_FILE, encoding='utf-8') as fh:
         text = fh.read()
     shown = json.dumps(ha.public_status())
-    for secret in [baseline, ha.manager_signature()] + list(items.values()):
-        assert secret not in text and secret not in shown
+    for secret in [baseline, ha.manager_signature()] + list(items.values()) + list(ha._run['items'].values()):
+        assert secret not in text and secret not in shown and secret not in pending
 
 
-# --- the restart after a sync ---------------------------------------------------------
+# --- the reload after a sync ----------------------------------------------------------
+# (it used to be a restart of the whole process, which signed out every user of the
+# standby; tests/test_ha_reload.py has what a reload stops and builds)
 
 def _standby_with_managers(env, **state):
     _be('standby', **state)
@@ -407,26 +415,27 @@ def _standby_with_managers(env, **state):
     _started(env)
 
 
-def test_new_connection_settings_restart_a_standby_once_they_have_settled(env):
+def test_new_connection_settings_reload_a_standby_once_they_have_settled(env):
     _standby_with_managers(env)
-    env.clock.advance(300)                  # long past the first minutes
+    env.clock.advance(300)
 
     assert _sync(env, lambda: _update(env.db, 'clusters', 'pve1', host='10.0.0.9')) == 'applied'
-    pending = ha.public_status()['sync']['restart_pending']
-    assert pending['reason'] == '1 cluster changed' and pending['since']
-    assert env.restarts == []
+    st = ha.public_status()['sync']
+    assert st['reload_pending']['reason'] == '1 cluster changed' and st['reload_pending']['since']
+    assert st['restart_pending'] is None and env.reloads == []
 
-    env.clock.advance(59)
-    assert _poll(env) == 'unchanged' and env.restarts == []
+    env.clock.advance(ha.RELOAD_SETTLE - 1)
+    assert _poll(env) == 'unchanged' and env.reloads == []
     env.clock.advance(1)
     assert _poll(env) == 'unchanged'
-    assert env.restarts == ['configuration changed on the active instance: 1 cluster changed']
-    assert env.audits == [('ha.restart_for_config', '1 cluster changed')]
-    assert ha._load()['last_config_restart'] == int(env.clock.wall)
-    # the restart is on its way; asking again does not send a second one, nor does an
-    # admin who presses "apply now" meanwhile
-    assert _poll(env) == 'unchanged' and len(env.restarts) == 1
-    assert ha.apply_config_now() is False and len(env.restarts) == 1
+    assert env.reloads == [([], [], ['cluster:pve1'])]
+    assert env.audits == [('ha.managers_reloaded', '1 cluster changed')]
+    assert ha.public_status()['sync']['reload_pending'] is None
+    # and no restart, nor a stamp of one
+    assert env.restarts == [] and 'last_config_restart' not in ha._load()
+    # done: asking again reloads nothing, nor does an admin who presses "apply now"
+    assert _poll(env) == 'unchanged' and len(env.reloads) == 1
+    assert ha.apply_config_now() is False and len(env.reloads) == 1
 
 
 def test_the_reason_names_kinds_and_counts(env):
@@ -439,61 +448,62 @@ def test_the_reason_names_kinds_and_counts(env):
         env.db.conn.execute("DELETE FROM vmware_servers WHERE id = 'esx1'")
         env.db.conn.commit()
     assert _sync(env, change) == 'applied'
-    assert ha.public_status()['sync']['restart_pending']['reason'] == \
+    assert ha.public_status()['sync']['reload_pending']['reason'] == \
         '1 cluster added, 1 PBS server changed, 1 ESXi server removed'
 
 
-def test_no_config_restart_in_the_first_two_minutes_of_a_process(env):
+def test_a_reload_does_not_wait_for_the_process_to_have_run_a_while(env):
+    """A restart waited two minutes after a start, against a restart loop. A reload
+    starts nothing over and has no such loop to fear."""
     _standby_with_managers(env)
-    env.clock.advance(10)
-    assert _sync(env, lambda: _update(env.db, 'clusters', 'pve1', host='10.0.0.9')) == 'applied'
-    env.clock.advance(60)                   # settled, but up for 70 s only
-    assert _poll(env) == 'unchanged' and env.restarts == []
-    env.clock.advance(49)
-    assert _poll(env) == 'unchanged' and env.restarts == []
     env.clock.advance(1)
-    assert _poll(env) == 'unchanged' and len(env.restarts) == 1
-
-
-def test_at_most_one_config_restart_in_ten_minutes_across_restarts(env):
-    """The last one is in the state file, so the process that came out of it knows."""
-    last = int(env.clock.wall) - 300        # five minutes ago, before this process
-    _standby_with_managers(env, last_config_restart=last)
-    env.clock.advance(200)
     assert _sync(env, lambda: _update(env.db, 'clusters', 'pve1', host='10.0.0.9')) == 'applied'
-    env.clock.advance(60)                   # settled and up long enough: ten minutes are not over
-    assert _poll(env) == 'unchanged' and env.restarts == []
-    env.clock.wall = last + 599
-    assert _poll(env) == 'unchanged' and env.restarts == []
-    env.clock.wall = last + 600
-    assert _poll(env) == 'unchanged' and len(env.restarts) == 1
+    env.clock.advance(ha.RELOAD_SETTLE)
+    assert _poll(env) == 'unchanged' and len(env.reloads) == 1
 
 
-def test_a_further_change_starts_the_minute_again(env):
-    _standby_with_managers(env)
+def test_a_second_change_is_reloaded_without_waiting_ten_minutes(env):
+    """Restarts were at most one in ten minutes. Reloads are as often as changes settle,
+    and a stamp an older release left in the state file changes nothing."""
+    stamp = int(env.clock.wall) - 60
+    _standby_with_managers(env, last_config_restart=stamp)
     env.clock.advance(300)
     assert _sync(env, lambda: _update(env.db, 'clusters', 'pve1', host='10.0.0.9')) == 'applied'
-    env.clock.advance(50)
-    assert _sync(env, lambda: _update(env.db, 'clusters', 'pve1', user='admin@pve')) == 'applied'
-    env.clock.advance(59)
-    assert _poll(env) == 'unchanged' and env.restarts == []
-    env.clock.advance(1)
-    assert _poll(env) == 'unchanged' and len(env.restarts) == 1
-
-
-def test_a_change_undone_before_it_settled_restarts_nothing(env):
-    _standby_with_managers(env)
-    env.clock.advance(300)
-    assert _sync(env, lambda: _update(env.db, 'clusters', 'pve1', host='10.0.0.9')) == 'applied'
-    assert ha.public_status()['sync']['restart_pending']
+    env.clock.advance(ha.RELOAD_SETTLE)
+    assert _poll(env) == 'unchanged' and len(env.reloads) == 1
     env.clock.advance(30)
+    assert _sync(env, lambda: _update(env.db, 'clusters', 'pve1', user='admin@pve')) == 'applied'
+    env.clock.advance(ha.RELOAD_SETTLE)
+    assert _poll(env) == 'unchanged'
+    assert env.reloads == [([], [], ['cluster:pve1'])] * 2
+    assert ha._load()['last_config_restart'] == stamp and env.restarts == []
+
+
+def test_a_further_change_starts_the_settle_time_again(env):
+    _standby_with_managers(env)
+    env.clock.advance(300)
+    assert _sync(env, lambda: _update(env.db, 'clusters', 'pve1', host='10.0.0.9')) == 'applied'
+    env.clock.advance(ha.RELOAD_SETTLE - 2)
+    assert _sync(env, lambda: _update(env.db, 'clusters', 'pve1', user='admin@pve')) == 'applied'
+    env.clock.advance(ha.RELOAD_SETTLE - 1)
+    assert _poll(env) == 'unchanged' and env.reloads == []
+    env.clock.advance(1)
+    assert _poll(env) == 'unchanged' and len(env.reloads) == 1
+
+
+def test_a_change_undone_before_it_settled_reloads_nothing(env):
+    _standby_with_managers(env)
+    env.clock.advance(300)
+    assert _sync(env, lambda: _update(env.db, 'clusters', 'pve1', host='10.0.0.9')) == 'applied'
+    assert ha.public_status()['sync']['reload_pending']
+    env.clock.advance(ha.RELOAD_SETTLE - 5)
     assert _sync(env, lambda: _update(env.db, 'clusters', 'pve1', host='10.0.0.1')) == 'applied'
-    assert ha.public_status()['sync']['restart_pending'] is None
+    assert ha.public_status()['sync']['reload_pending'] is None
     env.clock.advance(3600)
-    assert _poll(env) == 'unchanged' and env.restarts == []
+    assert _poll(env) == 'unchanged' and env.reloads == [] and env.restarts == []
 
 
-def test_what_the_active_rewrites_on_its_own_restarts_nothing(env):
+def test_what_the_active_rewrites_on_its_own_reloads_nothing(env):
     _standby_with_managers(env)
     env.clock.advance(300)
 
@@ -502,28 +512,29 @@ def test_what_the_active_rewrites_on_its_own_restarts_nothing(env):
             p.values[0](env.db)
         env.db.conn.commit()
     assert _sync(env, churn) == 'applied'
-    assert ha.public_status()['sync']['restart_pending'] is None
+    assert ha.public_status()['sync']['reload_pending'] is None
     env.clock.advance(3600)
-    assert _poll(env) == 'unchanged' and env.restarts == []
+    assert _poll(env) == 'unchanged' and env.reloads == [] and env.restarts == []
 
 
-def test_a_failed_poll_still_lets_a_due_restart_go(env, monkeypatch):
+def test_a_failed_poll_still_lets_a_due_reload_go(env, monkeypatch):
     """The new configuration is in the database already; an active that went away
     must not keep the managers on the old one."""
     _standby_with_managers(env)
     env.clock.advance(300)
     assert _sync(env, lambda: _update(env.db, 'clusters', 'pve1', host='10.0.0.9')) == 'applied'
-    env.clock.advance(60)
+    env.clock.advance(ha.RELOAD_SETTLE)
 
     def unreachable(*a, **kw):
         raise ha.HaError('Cannot reach the peer: ConnectTimeout')
     monkeypatch.setattr(ha, '_peer_call', unreachable)
     assert ha.pull_once() == 'failed'
-    assert len(env.restarts) == 1
+    assert len(env.reloads) == 1
 
 
-def test_the_loop_wakes_for_a_restart_that_falls_due(env):
-    """With an interval of an hour a due restart must not wait for the next poll."""
+def test_the_loop_wakes_for_a_reload_that_falls_due(env):
+    """With an interval of an hour a due reload must not wait for the next poll, should
+    its own timer not come."""
     _standby_with_managers(env, interval=3600)
     env.clock.advance(300)
     assert _sync(env, lambda: _update(env.db, 'clusters', 'pve1', host='10.0.0.9')) == 'applied'
@@ -539,57 +550,59 @@ def test_the_loop_wakes_for_a_restart_that_falls_due(env):
     env.mp.setattr(ha, 'pull_once', lambda **kw: None)
     with pytest.raises(_Stop):
         ha._loop()
-    assert env.clock.naps == [5, 61]
+    assert env.clock.naps == [5, ha.RELOAD_SETTLE + 1]
 
 
-def test_a_state_file_that_cannot_be_written_holds_the_restart_back(env, monkeypatch):
-    """Otherwise the uptime rule would be the only brake: a restart every two minutes."""
+def test_the_reload_goes_on_its_own_timer(env, monkeypatch):
+    """Noted by the sync, a second past the settle time, and not before it has settled."""
+    timers = []
+    monkeypatch.setattr(ha, '_later', lambda delay, fn, name: timers.append((delay, fn, name)))
     _standby_with_managers(env)
     env.clock.advance(300)
     assert _sync(env, lambda: _update(env.db, 'clusters', 'pve1', host='10.0.0.9')) == 'applied'
-    env.clock.advance(60)
+    assert [(delay, name) for delay, _fn, name in timers] == [(ha.RELOAD_SETTLE + 1, 'ha-reload')]
+    fire = timers[0][1]
+    env.clock.advance(ha.RELOAD_SETTLE - 1)
+    assert fire() is False and env.reloads == []
+    env.clock.advance(2)
+    assert fire() is True and len(env.reloads) == 1
+
+
+def test_a_state_file_that_cannot_be_written_holds_no_reload_back(env, monkeypatch):
+    """A restart had to note itself in the state file first, or it would have come again
+    every two minutes. A reload writes nothing there."""
+    _standby_with_managers(env)
+    env.clock.advance(300)
+    assert _sync(env, lambda: _update(env.db, 'clusters', 'pve1', host='10.0.0.9')) == 'applied'
+    env.clock.advance(ha.RELOAD_SETTLE)
 
     def refuse(st):
         raise OSError('No space left on device')
     monkeypatch.setattr(ha, '_write_locked', refuse)
-    assert ha._restart_for_config_if_due() is False
-    assert env.restarts == [] and ha.public_status()['sync']['restart_pending']
+    assert ha._reload_if_due() is True
+    assert len(env.reloads) == 1 and ha.public_status()['sync']['reload_pending'] is None
 
 
-def test_request_config_restart_waits_like_one_from_a_sync(env):
-    _be('active')
-    assert ha.request_config_restart('asked') is False
-    _switch_role('standby')
-    assert ha.request_config_restart('the plugin configuration changed') is True
-    assert ha.public_status()['sync']['restart_pending']['reason'] == 'the plugin configuration changed'
-    env.clock.advance(119)
-    assert ha._restart_for_config_if_due() is False
-    env.clock.advance(1)
-    assert ha._restart_for_config_if_due() is True
-    assert env.restarts == ['configuration changed on the active instance: '
-                            'the plugin configuration changed']
-
-
-def test_apply_now_restarts_at_once_when_there_is_something_to_apply(env):
+def test_apply_now_reloads_at_once_when_there_is_something_to_apply(env):
     _be('active')
     with pytest.raises(ha.HaError):
         ha.apply_config_now()
 
     _standby_with_managers(env)
-    assert ha.apply_config_now() is False and env.restarts == []
-    # a change no sync has looked at yet is read fresh; no minute, no uptime rule
+    assert ha.apply_config_now() is False and env.reloads == []
+    # a change no sync has looked at yet is read fresh; no settle time
     _update(env.db, 'pbs_servers', 'pbs1', host='10.0.2.2')
-    assert ha.apply_config_now() is True
-    assert env.restarts == ['configuration changed on the active instance: 1 PBS server changed']
-    # asked for by an admin, so it does not count against the automatic ones
-    assert 'last_config_restart' not in ha._load()
+    assert ha.apply_config_now() == 'reload'
+    assert env.reloads == [([], [], ['pbs:pbs1'])]
+    assert env.restarts == [] and 'last_config_restart' not in ha._load()
 
 
-def test_apply_now_takes_a_pending_restart_past_its_rules(env):
+def test_apply_now_takes_a_waiting_reload_past_the_settle_time(env):
     _standby_with_managers(env)
     assert _sync(env, lambda: _update(env.db, 'clusters', 'pve1', host='10.0.0.9')) == 'applied'
-    assert _poll(env) == 'unchanged' and env.restarts == []
-    assert ha.apply_config_now() is True and len(env.restarts) == 1
+    assert _poll(env) == 'unchanged' and env.reloads == []
+    assert ha.apply_config_now() == 'reload' and len(env.reloads) == 1
+    assert ha.public_status()['sync']['reload_pending'] is None
 
 
 @pytest.mark.parametrize('start_with,switch_to', [(True, False), (False, True)])
@@ -599,16 +612,19 @@ def test_apply_now_restarts_for_a_switched_live_view(env, start_with, switch_to)
     if start_with:
         _started(env)
     assert ha.set_live_view(switch_to) is True
-    assert ha.apply_config_now() is True
+    assert ha.apply_config_now() == 'restart'
     assert env.restarts == [f'configuration changed on the active instance: '
                             f'the live view was switched {"on" if switch_to else "off"}']
+    # the restart is on its way: no second one, and no reload before it
+    _update(env.db, 'clusters', 'pve1', host='10.0.0.9')
+    assert ha.apply_config_now() is False and len(env.restarts) == 1 and env.reloads == []
 
 
 def test_a_live_view_switched_back_leaves_nothing_to_apply(env):
     _standby_with_managers(env)
     ha.set_live_view(False)
     ha.set_live_view(True)
-    assert ha.apply_config_now() is False and env.restarts == []
+    assert ha.apply_config_now() is False and env.restarts == [] and env.reloads == []
 
 
 # --- in place after a sync ------------------------------------------------------------
@@ -656,17 +672,17 @@ def test_a_sync_hands_the_managers_what_they_read_in_place(env):
     assert m.xcp.config.name == 'Pool A'
     assert (m.pbs.name, m.pbs.notes, m.pbs.linked_clusters) == ('Backup A', 'rack 4', ['pve1'])
     assert (m.esx.name, m.esx.notes) == ('Farm A', 'leaving')
-    # the same objects, nothing stopped, nothing restarted, the wrapper left alone
+    # the same objects, nothing stopped, nothing reloaded or restarted, the wrapper left alone
     assert g.cluster_managers['pve1'] is m.pve and g.cluster_managers['esx1'] is m.wrapper
     assert m.stops == [] and not hasattr(m.wrapper.config, 'name')
-    assert ha.public_status()['sync']['restart_pending'] is None
+    assert ha.public_status()['sync']['reload_pending'] is None
     env.clock.advance(3600)
-    assert _poll(env) == 'unchanged' and env.restarts == []
+    assert _poll(env) == 'unchanged' and env.reloads == [] and env.restarts == []
 
 
 def test_a_connection_setting_is_not_changed_in_place(env):
     """A running manager holds its host, auth mode and SSH pool; it gets a new
-    connection with the restart, not half of one now."""
+    connection with the reload, a new manager, not half of one now."""
     _be('standby')
     _seed_all(env.db)
     assert _sync(env) == 'applied'
@@ -675,11 +691,11 @@ def test_a_connection_setting_is_not_changed_in_place(env):
     assert _sync(env, lambda: _update(env.db, 'clusters', 'pve1', host='10.0.0.9', ssh_port=2222,
                                       name='Lab B')) == 'applied'
     assert (m.pve.config.host, m.pve.config.ssh_port, m.pve.config.name) == ('10.0.0.1', 22, 'Lab B')
-    assert ha.public_status()['sync']['restart_pending']['reason'] == '1 cluster changed'
+    assert ha.public_status()['sync']['reload_pending']['reason'] == '1 cluster changed'
 
 
 def test_with_the_live_view_off_a_standby_stays_as_in_v1(env):
-    """No managers were started, so there is nothing to refresh and nothing to restart."""
+    """No managers were started, so there is nothing to refresh and nothing to reload."""
     _be('standby', live_view=False)
     assert ha.managers_wanted() is False
     _seed_all(env.db)
@@ -689,7 +705,8 @@ def test_with_the_live_view_off_a_standby_stays_as_in_v1(env):
     env.clock.advance(3600)
     assert _poll(env) == 'unchanged'
     st = ha.public_status()
-    assert (st['managers_running'], st['sync']['restart_pending'], env.restarts) == (False, None, [])
+    assert (st['managers_running'], st['sync']['reload_pending'], env.reloads) == (False, None, [])
+    assert st['sync']['restart_pending'] is None and env.restarts == []
     assert g.cluster_managers == {}
 
 

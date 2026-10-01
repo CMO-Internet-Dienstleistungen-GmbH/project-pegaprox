@@ -1,8 +1,7 @@
 """The review round on the live view of a warm standby (#625, stage two).
 
-  * a config restart stamp from the future (a clock set back) counts from the moment
-    it is seen, and is written back that way;
-  * "apply now" and the automatic restart read the pending restart once;
+  * "apply now" and the automatic reload read the waiting reload once (they were a
+    restart then, with a stamp against a clock set back; a reload needs none);
   * the HA page of a standby follows the synced row: a PVE manager copies ha_enabled
     and ha_settings when it is built, so a sync hands those copies over as well;
   * a sync whose rows are committed notes a new connection setting even when a later
@@ -39,92 +38,40 @@ from test_ha_api import (  # noqa: F401  (ha_env is a fixture)
 )
 
 
-# --- a config restart stamp from the future --------------------------------------------
-
-def _stored_stamp():
-    with open(ha.STATE_FILE, encoding='utf-8') as fh:
-        return json.load(fh).get('last_config_restart')
-
-
-def test_a_restart_stamp_from_the_future_counts_from_when_it_is_seen(env):
-    """Stamped while the clock ran a day ahead, then the clock was set back: the next
-    restart comes ten minutes after the first poll that sees the stamp, not a day later."""
-    ahead = int(env.clock.wall) + 86400
-    _standby_with_managers(env, last_config_restart=ahead)
-    env.clock.advance(300)
-    assert _sync(env, lambda: _update(env.db, 'clusters', 'pve1', host='10.0.0.9')) == 'applied'
-    seen = int(env.clock.wall)
-    # the poll after the sync looked at it: written back as now, in the file too
-    assert _stored_stamp() == seen and ha._load()['last_config_restart'] == seen
-    assert 0 < ha._config_restart_wait() <= ha.CONFIG_RESTART_SPACING
-
-    env.clock.advance(599)
-    assert _poll(env) == 'unchanged' and env.restarts == []
-    assert ha._config_restart_wait() == 1
-    env.clock.advance(1)
-    assert _poll(env) == 'unchanged'
-    assert env.restarts == ['configuration changed on the active instance: 1 cluster changed']
-
-
-def test_a_restart_stamp_from_the_past_is_left_as_it_is(env):
-    """Counterproof: the ordinary ten minutes, and nothing rewritten."""
-    last = int(env.clock.wall) - 300
-    _standby_with_managers(env, last_config_restart=last)
-    env.clock.advance(200)
-    assert _sync(env, lambda: _update(env.db, 'clusters', 'pve1', host='10.0.0.9')) == 'applied'
-    assert _stored_stamp() == last
-    env.clock.advance(60)
-    assert _poll(env) == 'unchanged' and env.restarts == []
-    env.clock.wall = last + 600
-    assert _poll(env) == 'unchanged' and len(env.restarts) == 1
-
-
-def test_a_stamp_from_the_future_that_cannot_be_rewritten_still_caps_the_wait(env, monkeypatch):
-    _standby_with_managers(env)
-    env.clock.advance(300)
-    assert _sync(env, lambda: _update(env.db, 'clusters', 'pve1', host='10.0.0.9')) == 'applied'
-    ahead = int(env.clock.wall) + 86400
-    ha._state['last_config_restart'] = ahead
-
-    def refuse(st):
-        raise OSError('No space left on device')
-    monkeypatch.setattr(ha, '_write_locked', refuse)
-    # ten minutes from now at most, not a day and ten minutes
-    assert ha._config_restart_wait() == ha.CONFIG_RESTART_SPACING
-    assert ha._load()['last_config_restart'] == ahead
-
-
-# --- the pending restart is read once ---------------------------------------------------
+# --- the waiting reload is read once ----------------------------------------------------
+# (the config restart and its stamp against a clock set back are gone: a change to how
+# the managers connect reloads them in place, tests/test_ha_reload.py)
 
 class _Vanishing(dict):
-    """_run whose pending restart is gone after the first read: a sync that brought
-    the old settings back landed between two reads (threads with gevent off)."""
+    """_run whose waiting reload is gone after the first read: a sync that brought the
+    old settings back landed between two reads (threads with gevent off)."""
 
     def __getitem__(self, key):
         value = super().__getitem__(key)
-        if key == 'pending' and value:
-            super().__setitem__('pending', None)
+        if key == 'reload' and value:
+            super().__setitem__('reload', None)
         return value
 
 
-def test_apply_now_reads_the_pending_restart_once(env, monkeypatch):
+def test_apply_now_reads_the_waiting_reload_once(env, monkeypatch):
     _standby_with_managers(env)
     env.clock.advance(300)
     assert _sync(env, lambda: _update(env.db, 'clusters', 'pve1', host='10.0.0.9')) == 'applied'
     monkeypatch.setattr(ha, '_run', _Vanishing(ha._run))
-    assert ha.apply_config_now() is True
-    assert env.restarts == ['configuration changed on the active instance: 1 cluster changed']
+    assert ha.apply_config_now() == 'reload'
+    assert env.reloads == [([], [], ['cluster:pve1'])]
 
 
-def test_the_due_restart_reads_the_pending_restart_once(env, monkeypatch):
+def test_the_due_reload_reads_the_waiting_reload_once(env, monkeypatch):
     _standby_with_managers(env)
     env.clock.advance(300)
     assert _sync(env, lambda: _update(env.db, 'clusters', 'pve1', host='10.0.0.9')) == 'applied'
-    env.clock.advance(60)
+    env.clock.advance(ha.RELOAD_SETTLE)
+    # the old settings are back by the time it looks: nothing to reload, and no TypeError
+    _update(env.db, 'clusters', 'pve1', host='10.0.0.1')
     monkeypatch.setattr(ha, '_run', _Vanishing(ha._run))
-    # gone by the time it is asked about: nothing to restart for, and no TypeError
-    assert ha._restart_for_config_if_due() is False
-    assert env.restarts == []
+    assert ha._reload_if_due() is False
+    assert env.reloads == [] and env.restarts == []
 
 
 # --- the HA page of a standby -----------------------------------------------------------
@@ -199,10 +146,10 @@ def test_the_ha_page_of_a_standby_follows_the_synced_row(env, pve):
     # switched on again on the active: shown, and still no monitor here
     assert _sync(env, lambda: _ha_row(env, True, recovery_delay=90)) == 'applied'
     assert _view(mgr)[:3] == (True, 3, 90) and mgr.ha_thread is None
-    # a view, not a new connection: nothing to restart for
-    assert ha.public_status()['sync']['restart_pending'] is None
+    # a view, not a new connection: nothing to reload for
+    assert ha.public_status()['sync']['reload_pending'] is None
     env.clock.advance(3600)
-    assert _poll(env) == 'unchanged' and env.restarts == [] and ha.apply_config_now() is False
+    assert _poll(env) == 'unchanged' and env.reloads == [] and ha.apply_config_now() is False
 
 
 def test_the_ha_view_is_left_alone_where_this_instance_acts(env, pve):
@@ -275,14 +222,14 @@ def test_a_host_key_file_that_cannot_be_written_leaves_the_sync_applied(env, blo
         assert ha.pull_once() == 'applied'
         assert env.db.get_all_clusters()['pve1']['host'] == '10.0.0.9'
         sync = ha.public_status()['sync']
-        assert sync['restart_pending']['reason'] == '1 cluster changed'
+        assert sync['reload_pending']['reason'] == '1 cluster changed'
         assert sync['last_error'].startswith('The configuration was applied, but the SSH host key pins')
         assert sync['last_ok_at']
         # held less than the whole snapshot: the next poll fetches it all again
         assert ha._load()['sync'].get('etag') is None
-        env.clock.advance(60)
+        env.clock.advance(ha.RELOAD_SETTLE)
         assert ha.pull_once() == 'applied'
-        assert env.restarts == ['configuration changed on the active instance: 1 cluster changed']
+        assert env.reloads == [([], [], ['cluster:pve1'])]
     finally:
         if os.path.isdir(tmp):
             os.rmdir(tmp)
@@ -312,10 +259,10 @@ def test_a_failure_after_the_commit_still_notes_the_new_connection(env, monkeypa
     monkeypatch.setattr(ha, '_finish_pull', no_note)
 
     assert _sync(env, lambda: _update(env.db, 'clusters', 'pve1', host='10.0.0.9')) == 'failed'
-    assert ha._run['pending']['reason'] == '1 cluster changed'
-    env.clock.advance(60)
+    assert ha._run['reload']['reason'] == '1 cluster changed'
+    env.clock.advance(ha.RELOAD_SETTLE)
     assert ha.pull_once() == 'failed'
-    assert env.restarts == ['configuration changed on the active instance: 1 cluster changed']
+    assert env.reloads == [([], [], ['cluster:pve1'])]
 
 
 def test_a_sync_that_fails_before_the_commit_notes_nothing(env, monkeypatch):
@@ -372,9 +319,9 @@ def test_node_maintenance_on_a_standby_follows_the_sync(env, pve):
     assert mgr.nodes_in_maintenance['pve2'] is entered and entered.native_ha is True
 
     # a view, not a new connection
-    assert ha.public_status()['sync']['restart_pending'] is None
+    assert ha.public_status()['sync']['reload_pending'] is None
     env.clock.advance(3600)
-    assert _poll(env) == 'unchanged' and env.restarts == []
+    assert _poll(env) == 'unchanged' and env.reloads == [] and env.restarts == []
 
 
 def test_node_maintenance_is_left_alone_where_this_instance_acts(env, pve):
@@ -587,7 +534,7 @@ def test_two_pulls_never_apply_side_by_side(monkeypatch):
         inside.pop()
         return 'unchanged'
     monkeypatch.setattr(ha, '_pull', slow_pull)
-    monkeypatch.setattr(ha, '_restart_for_config_if_due', lambda: False)
+    monkeypatch.setattr(ha, '_reload_if_due', lambda: False)
 
     results = []
     threads = [threading.Thread(target=lambda: results.append(ha.pull_once(timeout=5))) for _ in range(3)]

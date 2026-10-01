@@ -420,7 +420,7 @@ def create_app():
         ('DELETE', '/api/user/sessions/<token>'),
         # the live stream: its short-lived token and which clusters it carries, both in
         # memory here. Not /api/ws/token - every caller of that one opens a console,
-        # and consoles belong to the active.
+        # which _STANDBY_CONSOLES below decides.
         ('POST', '/api/sse/token'),
         ('POST', '/api/sse/subscribe'),
         # a read that takes its filter in the body; the GET beside it is open anyway
@@ -448,17 +448,22 @@ def create_app():
     # which one it got, so a GET reaches their write paths too. On a standby the whole
     # proxy is shut, whatever the method.
     _PLUGIN_PROXY_RULE = '/api/plugins/<plugin_id>/api/<path:subpath>'
-    # v3: a write refused here goes to the active instead, when a signed-in browser sent
-    # it (api/ha.py forward_to_active). These stay refused.
-    _STANDBY_NOT_FORWARDED = frozenset((
-        # Consoles: a standby proxies none, the UI offers the active instance instead.
-        # Every caller of the console token opens one; the others hand out a ticket or
-        # carry the session (vnc-poll is a whole VNC transport over POST).
+    # Consoles: a standby that serves users opens them itself, for the browser sessions
+    # it serves, the way an active instance does. Any other standby opens none and hands
+    # none on, the UI offers the active instance instead. Every caller of the console
+    # token opens one; the others hand out a ticket or carry the session (vnc-poll is a
+    # whole VNC transport over POST). The GET routes and the WebSockets ask
+    # api/ha.py standby_console_refusal / ha.consoles_here themselves.
+    _STANDBY_CONSOLES = frozenset((
         ('POST', '/api/ws/token'),
         ('POST', '/api/clusters/<cluster_id>/nodes/<node>/shell'),
         ('POST', '/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/termproxy'),
         ('POST', '/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/vnc-poll'),
         ('POST', '/api/vmware/<vmware_id>/vms/<vm_id>/console'),
+    ))
+    # v3: a write refused here goes to the active instead, when a signed-in browser sent
+    # it (api/ha.py forward_to_active). These stay refused.
+    _STANDBY_NOT_FORWARDED = frozenset((
         # This instance's own settings: run on the active they would set the active's
         # port, domain, certificate and so on to what the form here shows. The server
         # form sends its local keys every time, whatever else changed.
@@ -484,14 +489,14 @@ def create_app():
         ('POST', '/api/webauthn/register/begin'),
         ('POST', '/api/webauthn/register/finish'),
         # rows of tables every instance keeps for itself, named by an id from this one's
-        # copy: on the active the same id is another row, or none
-        ('POST', '/api/drift/events/<int:eid>/acknowledge'),
-        ('POST', '/api/clusters/<cluster_id>/active-alerts/<fired_id>/ack'),
+        # copy: on the active the same id is another row, or none. Not the drift, alert
+        # and inbox acks: a forwarding standby reads those lists from the active
+        # (ha.FORWARDED_READS), so their ids are the active's
         ('DELETE', '/api/auto-install/runs/<run_id>'),
-        ('POST', '/api/push/inbox/clear'),
         ('POST', '/api/insights/force-snapshot'),
     ))
-    # a plugin route that opens a console, behind the one proxy rule
+    # a plugin route that opens a console, behind the one proxy rule: refused on every
+    # standby, and never forwarded
     _PLUGIN_CONSOLE_PATHS = frozenset(('vm/console',))
     from pegaprox.core.ha import FORWARDED_READS as _ha_forwarded_reads
 
@@ -499,8 +504,8 @@ def create_app():
     def refuse_writes_on_standby():
         rule = request.url_rule.rule if request.url_rule is not None else None
         if request.method == 'GET' and rule in _ha_forwarded_reads:
-            # the progress of a job the active runs: from there while this standby hands
-            # its writes on, else our own (empty) copy
+            # the progress of a job the active runs, or a view only its tables hold: from
+            # there while this standby hands its writes on, else our own (empty) copy
             from pegaprox.core import ha
             if ha.is_standby():
                 from pegaprox.api.ha import forward_to_active
@@ -517,10 +522,19 @@ def create_app():
         from pegaprox.core import ha
         if not ha.is_standby():
             return None
-        # a path no route serves goes nowhere: forwarded, it would only cost the active
-        forwardable = rule is not None and (request.method, rule) not in _STANDBY_NOT_FORWARDED
         if plugin_call and (request.view_args or {}).get('subpath') in _PLUGIN_CONSOLE_PATHS:
+            # not even where consoles open: the plugin answers from what this process
+            # loaded, and a plugin switched off on the leader stays loaded here. Its UI
+            # works on the leader only anyway (its reads are refused below)
             forwardable = False
+        elif (request.method, rule) in _STANDBY_CONSOLES:
+            from pegaprox.api.ha import by_api_token
+            if ha.consoles_here() and not by_api_token():
+                return None
+            forwardable = False
+        else:
+            # a path no route serves goes nowhere: forwarded, it would only cost the active
+            forwardable = rule is not None and (request.method, rule) not in _STANDBY_NOT_FORWARDED
         if forwardable:
             from pegaprox.api.ha import forward_to_active
             forwarded = forward_to_active()
@@ -531,6 +545,30 @@ def create_app():
                      'instance; its configuration arrives here with the next sync.',
             'code': 'HA_STANDBY',
         }), 409
+
+    # The active tells its members after a write, so the change shows there in seconds
+    # and not at their next poll (ha.nudge_members, one call for a burst). A forwarded
+    # write runs through here on the active as well. Not for the HA routes, not for the
+    # writes above that only ever change this instance (signing in, the live stream)
+    # and not for the consoles: the members would only find nothing new, and a console
+    # over vnc-poll sends a POST for every screen update and key press while it is open.
+    @app.after_request
+    def tell_the_members_about_a_write(response):
+        try:
+            if request.method in ('POST', 'PUT', 'PATCH', 'DELETE') and 200 <= response.status_code < 300:
+                path = request.path
+                rule = request.url_rule.rule if request.url_rule is not None else None
+                if (path.startswith('/api/') and not path.startswith('/api/ha/')
+                        and path not in _STANDBY_WRITABLE
+                        and (request.method, rule) not in _STANDBY_LOCAL_WRITES
+                        and (request.method, rule) not in _STANDBY_CONSOLES
+                        and not (rule == _PLUGIN_PROXY_RULE and (request.view_args or {}).get(
+                            'subpath') in _PLUGIN_CONSOLE_PATHS)):
+                    from pegaprox.core import ha
+                    ha.nudge_members()
+        except Exception as e:
+            logging.debug(f"[HA] no note to the members after {request.path}: {e}")
+        return response
 
     # Load enabled plugins
     from pegaprox.api.plugins import load_enabled_plugins
@@ -954,12 +992,14 @@ def _resolve_ssl_context(reverse_proxy, domain='', app_name='PegaProx',
     return (cert_file, key_file)
 
 
-def _start_managers(config):
+def _start_managers(config, only=None):
     """Cluster managers (Proxmox and XCP-ng) for `config` as load_config() returns it,
     then the PBS and ESXi servers and the ESXi hosts XHM treats as clusters.
 
     The same in every role: on a standby with the live view they start as well and
-    only read, since everything in them that acts asks ha.is_active() first."""
+    only read, since everything in them that acts asks ha.is_active() first. A standby
+    that reloads some of them (ha.reload_managers) passes those clusters in `config`
+    and the servers in `only`, as 'pbs:<id>' and 'vmware:<id>'; None is every server."""
     from pegaprox.core.pbs import load_pbs_servers
     from pegaprox.core.vmware import load_vmware_servers
     from pegaprox.models.tasks import PegaProxConfig
@@ -980,16 +1020,25 @@ def _start_managers(config):
             g.cluster_managers[cluster_id] = manager
             print(f"Started PegaProx manager for cluster: {cluster_data['name']}")
 
+    pbs_ids = vmw_ids = None
+    if only is not None:
+        pbs_ids = {key[4:] for key in only if key.startswith('pbs:')}
+        vmw_ids = {key[7:] for key in only if key.startswith('vmware:')}
+        if not pbs_ids and not vmw_ids:
+            return
+
     try:
-        load_pbs_servers()
+        load_pbs_servers(only=pbs_ids)
     except Exception as e:
         logging.warning(f"Failed to load PBS servers at startup: {e}")
 
     try:
-        load_vmware_servers()
+        load_vmware_servers(only=vmw_ids)
         # NS: register ESXi hosts as XHM-capable clusters
         from pegaprox.core.esxi_cluster import ESXiClusterManager
-        for vmw_id, vmw_mgr in g.vmware_managers.items():
+        for vmw_id, vmw_mgr in list(g.vmware_managers.items()):
+            if vmw_ids is not None and vmw_id not in vmw_ids:
+                continue
             if getattr(vmw_mgr, 'server_type', '') == 'esxi':
                 g.cluster_managers[vmw_id] = ESXiClusterManager(vmw_id, vmw_mgr)
                 logging.info(f"Registered ESXi host '{vmw_mgr.name}' as XHM cluster {vmw_id}")

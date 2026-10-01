@@ -450,7 +450,10 @@ def validate_ws_token_api():
             # fail closed
             return jsonify({'error': 'Authorization check failed'}), 500
 
-    resp = {'valid': True, 'user': data['user'], 'role': data['role']}
+    from pegaprox.core import ha
+    # #625 - a standby holds the leader's known_hosts: the SSH server pins nothing new there
+    resp = {'valid': True, 'user': data['user'], 'role': data['role'],
+            'known_hosts_only': ha.is_standby()}
     if cluster_context is not None:
         resp['cluster_context'] = cluster_context
     return jsonify(resp)

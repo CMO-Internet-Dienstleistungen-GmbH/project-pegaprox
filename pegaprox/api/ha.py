@@ -20,7 +20,8 @@ CSRF gate in app.py already accepts, so none of this is exempted there.
 A write the block in app.py would refuse on a standby goes to the active instead
 (forward_to_active): the browser's request, the signed-in user and the client address
 travel as the body of a signed peer call, and the active runs the request as that user
-by its own accounts (peer_forward). The consoles are not among them, see app.py.
+by its own accounts (peer_forward). The consoles are not among them: a standby that
+serves users opens them itself, any other refuses them, see app.py.
 
 The state machine behind all of it is pegaprox/core/ha.py; nothing here decides a
 role on its own.
@@ -218,13 +219,22 @@ def _status_body():
 # through them. A console is not a read: keyboard and mouse on a guest, a root shell
 # on a node, a SPICE ticket that goes to the node directly. Every console path asks
 # this before it looks for a manager - the WebSocket ones too, since the old ?session=
-# login reaches them without ever minting a ws token.
+# login reaches them without ever minting a ws token. A standby that serves users
+# (ha.serving) opens them itself, as an active instance does: the console is the
+# user's, and nothing that acts on its own starts there.
 STANDBY_CONSOLE_ERROR = 'Consoles are only available on the active instance.'
 
 
+def by_api_token():
+    """Whether this request comes with an API token rather than a browser session."""
+    return request.headers.get('Authorization', '').startswith('Bearer pgx_')
+
+
 def standby_console_refusal():
-    """The answer a console route gives on a standby, None anywhere else."""
-    if not ha.is_standby():
+    """The answer a console route gives where it opens none, None where it opens: on a
+    standby that does not serve users, and on one that does for an API token, which
+    gets the standby answer there like for any change (scripts use the leader)."""
+    if ha.consoles_here() and not (ha.is_standby() and by_api_token()):
         return None
     return jsonify({'code': 'HA_STANDBY', 'error': STANDBY_CONSOLE_ERROR}), 409
 
@@ -238,9 +248,11 @@ def forward_to_active(read=False):
     the standby can vouch for), forwarding switched off, or the member it pulls from
     not seen active.
 
-    read: a GET of ha.FORWARDED_READS, the progress of a job the active runs. The same
-    way there, with a short timeout; None whenever it does not come back whole, and
-    the route answers from this instance.
+    read: a GET of ha.FORWARDED_READS, the progress of a job the active runs or a view
+    only its own tables hold. The same way there, with a short timeout. When it does not
+    come back whole: None for the progress of a job, and the route answers from this
+    instance; 503 HA_ACTIVE_UNREACHABLE for a view of ha.LEADER_ONLY_READS, whose rows
+    here are not the active's.
 
     The active runs the request as the signed-in user, checked against its own
     accounts, and its status, body and content headers come back as they are. 413
@@ -364,21 +376,34 @@ def _envelope_for(session, body):
     }
 
 
+LEADER_READ_ERROR = ('The active instance did not answer - this list is kept there. Try '
+                     'again in a moment')
+
+
 def _forward_read(session):
-    """A job's progress from the active, or None for our own copy."""
+    """The active's answer to a read of ha.FORWARDED_READS. Without one, None for our own
+    copy, or the 503 a view of ha.LEADER_ONLY_READS answers instead: its rows here are
+    this instance's own, and an ack picked from them would name another row there."""
     try:
         resp = ha.forward_write(_envelope_for(session, b''), timeout=ha.FORWARD_READ_TIMEOUT)
     except ha.HaError as e:
         logging.debug(f"[HA] could not fetch {sanitize_log_message(request.path)} from the "
                       f"active: {ha._error_text(e)}")
-        return None
+        return _no_leader_read()
     answer = _forwarded_answer(resp) if resp.status_code == 200 else None
     if answer is None:
         if resp.status_code == 403 and _answer_code(resp) == 'HA_FORWARD_STALE_SIGN_IN':
             ha.pull_soon()
-        return None
+        return _no_leader_read()
     status, headers, content = answer
     return Response(content, status=status, headers=headers)
+
+
+def _no_leader_read():
+    rule = request.url_rule.rule if request.url_rule is not None else None
+    if rule not in ha.LEADER_ONLY_READS:
+        return None
+    return jsonify({'code': 'HA_ACTIVE_UNREACHABLE', 'error': LEADER_READ_ERROR}), 503
 
 
 def _plain_client_ip():
@@ -719,15 +744,18 @@ def update_settings():
     restarts when live_view changes, because it sets its connections up once per
     process; any other role only keeps the value for when it follows. forward_writes,
     also this instance's own: on, a standby hands the writes of its signed-in users to
-    the active; off, it refuses them. It counts from the next write. Any of the three,
-    or several."""
+    the active; off, it refuses them. It counts from the next write. serve_users, this
+    instance's own as well: on, a standby serves users like an active instance, with
+    their consoles opened here and every change forwarded, as long as the live view and
+    forwarding are on too (serving in the answer says whether they are). No restart,
+    it counts from the next request. Any of the four, or several."""
     denied = _refuse_confined_admin()
     if denied:
         return denied
     data = _body()
-    if 'interval' not in data and 'live_view' not in data and 'forward_writes' not in data:
-        return jsonify({'error': 'Nothing to change - send interval, live_view, forward_writes '
-                                 'or several of them'}), 400
+    if not any(k in data for k in ('interval', 'live_view', 'forward_writes', 'serve_users')):
+        return jsonify({'error': 'Nothing to change - send interval, live_view, forward_writes, '
+                                 'serve_users or several of them'}), 400
     interval = data.get('interval')
     if 'interval' in data and (isinstance(interval, bool) or not isinstance(interval, int)
                                or not _MIN_INTERVAL <= interval <= _MAX_INTERVAL):
@@ -739,6 +767,9 @@ def update_settings():
     forward = data.get('forward_writes')
     if 'forward_writes' in data and not isinstance(forward, bool):
         return jsonify({'error': 'forward_writes is true or false'}), 400
+    serve = data.get('serve_users')
+    if 'serve_users' in data and not isinstance(serve, bool):
+        return jsonify({'error': 'serve_users is true or false'}), 400
     status = ha.public_status()
     if status['broken']:
         # saving now would write the placeholder state over the file that could not be
@@ -772,6 +803,18 @@ def update_settings():
                       f"forwarding writes to the active instance {'on' if forward else 'off'}")
         out['forward_writes'] = forward
 
+    if 'serve_users' in data:
+        try:
+            changed = ha.set_serve_users(serve)
+        except ha.HaError as e:
+            return jsonify({'error': str(e)}), 409
+        except Exception as e:
+            return jsonify({'error': safe_error(e, 'Could not save the serving switch')}), 500
+        if changed:
+            log_audit(_user(), 'ha.settings_changed',
+                      f"serving users as a standby {'on' if serve else 'off'}")
+        out['serve_users'] = serve
+
     if 'live_view' in data:
         was = ha.live_view()
         try:
@@ -787,34 +830,41 @@ def update_settings():
                       f"live view {'on' if live else 'off'}"
                       f"{', restarting this standby' if standby else ', takes effect as a standby'}")
             if standby:
-                restarting = ha.apply_config_now() is not False
+                restarting = ha.apply_config_now() == 'restart'
         out.update(live_view=live, restarting=restarting)
+    if 'serve_users' in data:
+        out['serving'] = ha.serving()
     return jsonify(out)
 
 
 @bp.route('/api/ha/apply-config', methods=['POST'])
 @require_auth(roles=[ROLE_ADMIN])
 def apply_config():
-    """Restart this standby now to take up a configuration change that is waiting.
+    """Take up a configuration change that is waiting on this standby, now.
 
-    A sync that changes how the clusters are reached leaves a restart pending, which a
-    standby takes by itself once the change holds still. This skips the wait. No
-    password: it only decides when this standby restarts, not what it does."""
+    A sync that changes how the clusters are reached leaves a reload of those managers
+    waiting, which a standby does by itself once the change holds still; a switched
+    live view waits for a restart. This does either at once: reloaded says the
+    managers were rebuilt in place, restarting that the process restarts. No password:
+    it only decides when, not what."""
     denied = _refuse_confined_admin()
     if denied:
         return denied
     if not ha.is_standby():
         return jsonify({'error': 'Only a standby takes its configuration from the active instance'}), 409
-    pending = (ha.public_status().get('sync') or {}).get('restart_pending') or {}
+    sync = ha.public_status().get('sync') or {}
+    pending = sync.get('restart_pending') or sync.get('reload_pending') or {}
     try:
-        restarting = ha.apply_config_now() is not False
+        done = ha.apply_config_now()
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Could not apply the configuration')}), 500
-    if restarting:
+    restarting, reloaded = done == 'restart', done == 'reload'
+    if restarting or reloaded:
         reason = pending.get('reason') if isinstance(pending, dict) else ''
-        log_audit(_user(), 'ha.config_applied', 'restarting this standby now'
+        log_audit(_user(), 'ha.config_applied',
+                  ('restarting this standby now' if restarting else 'reloaded the managers now')
                   + (f' for the waiting change: {reason}' if reason else ''))
-    return jsonify({'success': True, 'restarting': restarting})
+    return jsonify({'success': True, 'restarting': restarting, 'reloaded': reloaded})
 
 
 # --- peer ------------------------------------------------------------------------
@@ -954,12 +1004,13 @@ def peer_pair():
 @bp.route('/api/ha/peer/status', methods=['GET'])
 def peer_status():
     """Role and epoch, for the watch loop of every other member. group says this
-    release takes calls from every member, not only from one peer."""
+    release takes calls from every member, not only from one peer; serving that this
+    standby serves users, which the others show."""
     _p, refused = _peer_or_refuse()
     if refused:
         return refused
     return jsonify({'instance_id': ha.instance_id(), 'role': ha.role(), 'epoch': ha.epoch(),
-                    'group': ha.GROUP_MARK})
+                    'group': ha.GROUP_MARK, 'serving': ha.serving()})
 
 
 def _if_none_match():
@@ -1002,6 +1053,14 @@ def _off_hub(fn):
         return get_hub().threadpool.apply(fn)
 
 
+def current_etag(meta=None):
+    """The etag a poll of the snapshot gets now, without the body: for the poll, and
+    for the note the active sends its members after a change (ha.nudge_members).
+    `meta` read on the hub, from ha.snapshot_meta(); the worker never touches the state."""
+    meta = meta or ha.snapshot_meta()
+    return _off_hub(lambda: ha.snapshot_etag(meta))
+
+
 @bp.route('/api/ha/peer/snapshot', methods=['GET'])
 def peer_snapshot():
     """The shared configuration as gzip-compressed JSON, for the standby.
@@ -1025,7 +1084,7 @@ def peer_snapshot():
         # read on the hub, member list included: the worker never touches the state
         meta = ha.snapshot_meta()
         # the etag alone first: most polls end in a 304 and never build the body
-        etag = _off_hub(lambda: ha.snapshot_etag(meta))
+        etag = current_etag(meta)
         headers = {'ETag': f'"{etag}"', 'Cache-Control': 'no-store'}
         if etag in _if_none_match():
             return Response(status=304, headers=headers)
@@ -1126,6 +1185,25 @@ def peer_tombstones():
     return jsonify({'success': True, 'taken': taken})
 
 
+@bp.route('/api/ha/peer/changed', methods=['POST'])
+def peer_changed():
+    """The active changed its configuration (ha.nudge_members): pull now instead of at
+    the next poll. Taken from the member this standby pulls from, and the pull is one
+    like any other, from that member; from any other member nothing happens. etag is
+    the configuration the active holds now: a standby whose last sync was that one has
+    nothing to pull. A note without it (an active of an earlier release) is a pull.
+    pull says whether it was taken."""
+    p, refused = _peer_or_refuse()
+    if refused:
+        return refused
+    taken = (ha.is_standby() and p['instance_id'] == ha.source_id()
+             and not ha.holds_etag(_peer_body().get('etag')))
+    if taken:
+        # runs in the background, and asks that come in meanwhile make one more pull
+        ha.pull_soon()
+    return jsonify({'success': True, 'pull': taken})
+
+
 # --- forwarded writes, the active's half ---------------------------------------------
 
 @bp.route('/api/ha/peer/forward', methods=['POST'])
@@ -1138,7 +1216,8 @@ def peer_forward():
     change on the way. Only on the active (409 anywhere else, which also stops a write
     that would travel on), only from a member that signs its calls, only a write under
     /api/ and never under /api/ha/ - or a GET of ha.FORWARDED_READS, the progress of a
-    job - and only for an account that exists and is enabled here. sign_in is the
+    job or a view only our tables hold - and only for an account that exists and is
+    enabled here. sign_in is the
     standby's digest of the account's password (ha.sign_in_digest): 403
     HA_FORWARD_STALE_SIGN_IN when ours differs, the password changed here since.
     The request then goes through our routing and every check on the way, CSRF and
@@ -1196,7 +1275,7 @@ def _forward_envelope(data):
     if not _text(path, 4096) or not path.startswith('/api/') or path.startswith('/api/ha/'):
         return None, 'path is under /api/, and not under /api/ha/'
     if method == 'GET' and _read_rule(path) not in ha.FORWARDED_READS:
-        return None, 'a read is the progress of a job, nothing else'
+        return None, 'a read is the progress of a job or a view only the active holds'
     sign_in = data.get('sign_in')
     if not isinstance(sign_in, str) or not (sign_in == '' or re.fullmatch(r'[0-9a-f]{64}', sign_in)):
         return None, 'sign_in is the digest of the account\'s sign-in'

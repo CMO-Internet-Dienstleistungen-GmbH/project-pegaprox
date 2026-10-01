@@ -887,7 +887,8 @@ def test_step_down_needs_a_newer_epoch_from_the_peer(env):
     assert ha.role() == 'standby' and ha.epoch() == 6
     assert (ha.peer()['role_seen'], ha.peer()['epoch_seen']) == ('active', 6)
     assert ha.source_id() == A
-    assert ha.public_status()['sync'] == {'etag': None, 'restart_pending': None}
+    assert ha.public_status()['sync'] == {'etag': None, 'restart_pending': None,
+                                          'reload_pending': None, 'last_reload': None}
     # already a standby: nothing left to step down from
     assert ha.step_down(7, A) is False and ha.epoch() == 6
     assert env.restarts == []  # step_down leaves the restart to its caller

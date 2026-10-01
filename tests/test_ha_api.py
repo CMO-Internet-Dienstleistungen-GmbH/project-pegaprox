@@ -52,6 +52,7 @@ PEER_ROUTES = [
     ('POST', '/api/ha/peer/member-removed'),
     ('POST', '/api/ha/peer/tombstones'),
     ('POST', '/api/ha/peer/forward'),
+    ('POST', '/api/ha/peer/changed'),
 ]
 
 
@@ -367,7 +368,8 @@ def test_peer_routes_want_the_peer_header(ha_env):
 
     r = _peer(api, 'GET', '/api/ha/peer/status', GOOD)
     assert r.status_code == 200
-    assert r.get_json() == {'instance_id': A_ID, 'role': 'active', 'epoch': 2, 'group': 1}
+    assert r.get_json() == {'instance_id': A_ID, 'role': 'active', 'epoch': 2, 'group': 1,
+                            'serving': False}
     assert _peer(api, 'GET', '/api/ha/peer/snapshot', GOOD).status_code == 200
     r = _peer(api, 'POST', '/api/ha/peer/step-down', GOOD, json={'epoch': 1})
     assert r.status_code == 200 and r.get_json()['stepped_down'] is False
@@ -1157,7 +1159,8 @@ def test_a_standby_still_signs_people_in_and_out(ha_env, db, tmp_path, monkeypat
     assert r.status_code == 200, r.data
     body = r.get_json()
     banner = {'role': 'standby', 'peer_url': ACTIVE_URL, 'last_sync_at': '2026-09-29T10:00:00+00:00',
-              'live_view': True, 'forwarding': False}
+              'live_view': True, 'forwarding': False, 'serving': False, 'leader_reachable': True,
+              'removed': False}
     assert body['ha'] == banner
     sid = {'X-Session-ID': body['session_id']}
     check = api.anon().get('/api/auth/check', headers=sid)

@@ -59,6 +59,30 @@ def strict_host_keys_enabled() -> bool:
         '1', 'true', 'yes', 'on')
 
 
+def pins_host_keys_here() -> bool:
+    """False on a warm standby (#625). Its known_hosts is the leader's copy and the next
+    sync replaces the file, so a key pinned here would not last, and one pinned through
+    a man in the middle would be trusted until then. A standby checks against the keys
+    it holds and refuses a host it does not know yet.
+
+    Imported when asked, not at the top: this module stays importable from anywhere."""
+    try:
+        from pegaprox.core import ha
+    except Exception:
+        return True
+    return not ha.is_standby()
+
+
+def _not_known_here(address):
+    # the leader pins a key under the address it connects to, and a standby looks it up
+    # under the one it tried: a member that reaches the node elsewhere (another site or
+    # VLAN) finds no key, whatever the leader holds
+    return (f"host key of {address} is not known here yet - open a shell to it on the "
+            f"leader once. This standby only has the keys the leader pinned; if the leader "
+            f"reaches this node at another address than {address}, its key is pinned under "
+            "that one")
+
+
 def cli_hostkey_opts():
     """Host-key options for subprocess ``ssh``/``scp``/``sshfs`` commands.
 
@@ -68,8 +92,9 @@ def cli_hostkey_opts():
       upgraded to ``yes`` (reject unknown too) under strict mode;
     * pinned to the SAME known_hosts file the paramiko paths use, so a key learned
       by one path is verified by the other.
+    ``yes`` on a standby as well, which pins nothing (pins_host_keys_here).
     """
-    hkc = 'yes' if strict_host_keys_enabled() else 'accept-new'
+    hkc = 'yes' if strict_host_keys_enabled() or not pins_host_keys_here() else 'accept-new'
     return hkc, _KNOWN_HOSTS
 
 
@@ -86,6 +111,8 @@ def _make_policy(paramiko):
                 fp = key.get_fingerprint().hex()
             except Exception:
                 pass
+            if not pins_host_keys_here():
+                raise paramiko.SSHException(_not_known_here(hostname))
             if strict:
                 raise paramiko.SSHException(
                     "strict host-key checking: unknown SSH host key for "
@@ -139,7 +166,11 @@ def persist_host_keys(client):
     silently, and for exactly the hosts that had just been pinned. So merge instead, and
     let the file win wherever it already has a key for that host and type: an entry on
     disk is either a deliberate pin or newer than what this client is carrying.
+
+    Nothing on a standby (pins_host_keys_here).
     """
+    if not pins_host_keys_here():
+        return
     try:
         import paramiko as _pk
         with _persist_lock:
@@ -243,7 +274,7 @@ def verify_transport_host_key(transport, hostname, paramiko, port=22):
     * known host, key matches  -> return (ok)
     * known host, key changed  -> raise BadHostKeyException (MitM protection)
     * unknown host, strict off -> record (TOFU) + persist
-    * unknown host, strict on  -> raise SSHException
+    * unknown host, strict on or on a standby -> raise SSHException
     """
     try:
         key = transport.get_remote_server_key()
@@ -286,6 +317,8 @@ def verify_transport_host_key(transport, hostname, paramiko, port=22):
             f"({keytype}) — refusing (possible downgrade/MitM). Remove its "
             "config/.ssh_known_hosts entry to re-pin.")
     # genuinely unknown host — first time we see it at all
+    if not pins_host_keys_here():
+        raise paramiko.SSHException(_not_known_here(lookup_name))
     if strict_host_keys_enabled():
         raise paramiko.SSHException(
             "strict host-key checking: unknown SSH host key for "

@@ -583,12 +583,16 @@ def _directory_agrees_with_synced_row(ldap_result, row):
 def _ha_banner():
     """ha.banner(), and on a standby whether it shows the clusters live. With the live
     view off its cluster list is empty on purpose, and the UI has to say so. forwarding
-    says whether a change made here goes to the active right now or is refused."""
+    says whether a change made here goes to the active right now or is refused, serving
+    whether this standby serves its users like an active instance (consoles here), and
+    leader_reachable whether the leader answered the last time this instance asked."""
     from pegaprox.core import ha
     out = ha.banner()
     if out.get('role') == ha.ROLE_STANDBY:
         out['live_view'] = bool(ha.live_view())
         out['forwarding'] = bool(ha.forwarding())
+        out['serving'] = bool(ha.serving())
+        out['leader_reachable'] = bool(ha.leader_reachable())
     return out
 
 
@@ -1349,10 +1353,13 @@ def auth_validate():
     if _u is not None and not _u.get('enabled', True):
         return jsonify({'valid': False, 'error': 'Account disabled'}), 401
 
+    from pegaprox.core import ha
     return jsonify({
         'valid': True,
         'user': session['user'],
-        'role': session['role']
+        'role': session['role'],
+        # #625 - the SSH server pins no new host key on a standby (see ssh_security)
+        'known_hosts_only': ha.is_standby(),
     })
 
 

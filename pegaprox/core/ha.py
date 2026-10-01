@@ -38,8 +38,13 @@ The live view (on unless an admin switches it off, per instance): a standby star
 its cluster, PBS and ESXi managers as well and lets them read, so the UI shows the
 clusters as they are. They act on nothing - every path that would is gated on
 is_active(). Settings the managers read when they use them are handed over in
-place after each sync; a change to how they connect restarts the standby once the
-change has settled. With the live view off a standby starts no managers at all.
+place after each sync; once a change to how they connect has settled, the managers
+it concerns are stopped and built again in this process (reload_managers), so the
+users signed in here stay signed in. Only a switched live view or a new role
+restarts the process. With the live view off a standby starts no managers at all.
+
+The active tells its members after each change it takes (nudge_members, POST
+/api/ha/peer/changed), and they pull within seconds instead of at their next poll.
 
 Forwarded writes (on unless an admin switches them off, per instance): a write the
 standby would refuse goes to the active it follows instead, when a user signed in on
@@ -150,9 +155,26 @@ _FORWARD_CHUNK = 1024 * 1024
 # The reads a forwarding standby hands on as well: the progress of jobs that live in the
 # process, or in the tables of its own, of the instance that started them. A job
 # started through a standby runs on the active, and without these the standby would
-# show no progress at all (nor the cutover of a migration that waits for one). A GET
-# rule, as app.url_map writes it; the active serves nothing else as a forwarded read.
-FORWARDED_READS = frozenset((
+# show no progress at all (nor the cutover of a migration that waits for one). And the
+# views only the active's own tables hold, because only its loops fill them
+# (LEADER_ONLY_READS). A GET rule, as app.url_map writes it; the active serves nothing
+# else as a forwarded read.
+#
+# Leader-only: the alerts that fire, drift, the push inbox and the migration history.
+# A standby has rows of its own in those tables, under ids of its own (from when it
+# acted, or from before it joined), and an ack picked from such a list would name
+# another row on the active. When the active does not answer, a forwarding standby
+# says so (api/ha.py _forward_read) instead of showing its own; the progress of a job
+# falls back to the standby's copy.
+LEADER_ONLY_READS = frozenset((
+    '/api/clusters/<cluster_id>/active-alerts',
+    '/api/clusters/<cluster_id>/drift/status',
+    '/api/clusters/<cluster_id>/drift/events',
+    '/api/push/inbox',
+    '/api/migration-history',
+    '/api/clusters/<cluster_id>/vms/<int:vmid>/migration-history',
+))
+FORWARDED_READS = LEADER_ONLY_READS | frozenset((
     '/api/vmware/migrations',
     '/api/vmware/migrations/<mid>',
     '/api/xhm/migrations',
@@ -260,13 +282,28 @@ _NONCE_RE = re.compile(r'[A-Za-z0-9_-]{16,64}')
 _TS_RE = re.compile(r'[0-9]{1,12}')
 _DIGEST_RE = re.compile(r'[0-9a-f]{64}')
 
-# A standby restarts to pick up new connection settings for its managers: once
-# the new ones have held for CONFIG_SETTLE seconds, not before the process has run
-# for CONFIG_MIN_UPTIME, and at most once per CONFIG_RESTART_SPACING.
-CONFIG_SETTLE = 60
-CONFIG_MIN_UPTIME = 120
-CONFIG_RESTART_SPACING = 600
+# A standby reloads the managers a change to how they connect is about once the new
+# settings have held for RELOAD_SETTLE seconds, so a burst of edits is one reload.
+# The active tells its members about NUDGE_DELAY seconds after a change, so edits made
+# in one go (a dialog that saves twice, the API token the active makes on the first
+# connect and saves right after) reach a member with the same note, or with the next
+# one NUDGE_SPACING later. A later edit costs one more reconnect of that one manager,
+# nobody's session: the minute this was before was for a restart.
+RELOAD_SETTLE = 10
 BOOT_PULL_TIMEOUT = 10
+
+# The active's note to its members after a change: NUDGE_DELAY seconds after the first
+# write, and while writes keep coming one every NUDGE_SPACING seconds, the last one
+# after the last write. Each note carries the etag of the configuration, worked out
+# once for every member, and a member that holds it pulls nothing. That walk over the
+# shared tables is what a note costs the active (about 0.4 s at 40k synced rows): at
+# most one per NUDGE_SPACING, under 5% of one core however busy it is. Ten seconds is
+# also the RELOAD_SETTLE a member waits before a new connection takes effect, and a
+# third of the default poll.
+NUDGE_PATH = '/api/ha/peer/changed'
+NUDGE_DELAY = 2
+NUDGE_SPACING = 10
+NUDGE_TIMEOUT = 5
 
 _lock = threading.RLock()
 _state = None
@@ -280,19 +317,22 @@ def _fresh_run():
     return {
         'started': time.monotonic(),
         'managers': False,          # main() started the cluster, PBS and ESXi managers
-        'signature': None,          # manager_signature() they started from
+        'signature': None,          # manager_signature() the running managers stand for
         'items': None,              # the per-connection digests behind it, to name a change
         'live_view': None,          # the live view this process runs with, once known
         'live_view_changed': None,  # when set_live_view last changed it
-        'pending': None,            # a config restart waiting for its rules
+        'reload': None,             # a change to how they connect, waiting to settle
+        'last_reload': None,        # when the last reload ran, why, and what it could not build
         'restarting': False,
     }
 
 
-# What this process started its managers from. Memory only: the signature is taken
+# What the running managers were built from. Memory only: the signature is taken
 # from the decrypted passwords and keys, so it never goes near the state file.
 _run = _fresh_run()
 _pull_lock = threading.Lock()
+# one reload at a time, whoever asks: its timer, a pull, the admin's "apply now"
+_reload_lock = threading.Lock()
 # the nonces of signed calls taken within the window, per (receiver, sender). Memory
 # only, so a call signed before this process started is not taken at all
 _nonce_lock = threading.Lock()
@@ -350,8 +390,8 @@ def _default_state():
         # holds our public key
         'member_secret': None,
         # every OTHER member: {instance id: {url, fingerprint, public_key, secret_hash,
-        # pair_secret, role_seen, epoch_seen, last_contact, last_error, joined_at,
-        # group_seen, key_acked}}
+        # pair_secret, role_seen, epoch_seen, serving_seen, last_contact, last_error,
+        # joined_at, group_seen, key_acked}}
         'members': {},
         # members the active took out: {instance id: {epoch, at, by, public_key,
         # secret_hash}}, so their calls get 410 and no stale list takes them back
@@ -714,17 +754,66 @@ def set_forward_writes(value):
     return True
 
 
-def forwarding():
-    """True when a write this standby refuses goes to the active right now: forwarding
-    is on and the member it pulls from last answered as active, and did answer the
-    last time this instance tried. False on every other instance. A standby that was
-    removed, or cannot read its state file, has no such member."""
+def leader_reachable():
+    """On a standby: the member it pulls from last answered as active, and did answer
+    the last time this instance tried. False on every other instance. A standby that
+    was removed, or cannot read its state file, has no such member."""
     st = _load()
     if st['role'] != ROLE_STANDBY:
         return False
     rec = (st.get('members') or {}).get(st.get('source'))
-    return (bool(rec) and rec.get('role_seen') == ROLE_ACTIVE and forward_writes()
+    return (bool(rec) and rec.get('role_seen') == ROLE_ACTIVE
             and _silent_source['id'] != st.get('source'))
+
+
+def forwarding():
+    """True when a write this standby refuses goes to the active right now: forwarding
+    is on and the leader is reachable. False on every other instance."""
+    return leader_reachable() and forward_writes()
+
+
+# --- serving users ---------------------------------------------------------------
+
+def serve_users():
+    """Whether this instance, as a standby, serves users the way an active instance
+    does: they sign in here, see the clusters live and open their consoles here, and
+    every change goes to the leader. The role stays standby, so nothing that acts on
+    its own starts here (is_active).
+
+    Per instance and never part of a snapshot; off until an admin switches it on."""
+    value = _load().get('serve_users', False)
+    return value if isinstance(value, bool) else False
+
+
+def set_serve_users(value):
+    """Switch serve_users. Returns True when it changed. Nothing holds on to the value,
+    the next request goes by it."""
+    if not isinstance(value, bool):
+        raise HaError('serve_users is true or false')
+    with _lock:
+        if value == serve_users():
+            return False
+        _update(serve_users=value)
+    return True
+
+
+def serving():
+    """True when this standby serves users now: the switch is on, and so are the two it
+    needs, the live view (clusters to show and consoles to open) and forwarding (the
+    changes go to the leader). False on every other instance, and on a standby that was
+    removed from the group or has lost the member it pulls from: its accounts and rights
+    are those of its last sync, and nothing the leader changes reaches it any more. A
+    leader that is only out of reach keeps it serving."""
+    st = _load()
+    if st['role'] != ROLE_STANDBY or st.get('removed') or source_id() is None:
+        return False
+    return serve_users() and live_view() and forward_writes()
+
+
+def consoles_here():
+    """Whether consoles, shells and SPICE open on this instance: everywhere but on a
+    standby that does not serve users."""
+    return not is_standby() or serving()
 
 
 def sign_in_digest(username):
@@ -756,10 +845,10 @@ def _note_source_heard(member_id, heard):
 # --- what the managers connect with -----------------------------------------------
 
 # Everything a manager is built from and holds on to once connected (the current
-# host, the auth mode, the SSH pool). A change here needs a new manager, which on
-# a standby means a restart. Fallback hosts, the HA settings, updated_at and the
-# display and balancing fields stay out: the active rewrites some of them on its
-# own, and the managers read the rest each time they use them.
+# host, the auth mode, the SSH pool). A change here needs a new manager, which a
+# standby builds in place of the old one. Fallback hosts, the HA settings, updated_at
+# and the display and balancing fields stay out: the active rewrites some of them on
+# its own, and the managers read the rest each time they use them.
 # (kind, table, only enabled rows, columns)
 _IDENTITY = (
     ('cluster', 'clusters', False,
@@ -808,7 +897,7 @@ def _identity_items():
     """{'<kind>:<id>': digest} over every cluster and every enabled PBS and ESXi server.
 
     Taken from the decrypted values: each save on the active seals the secrets
-    again under a new nonce, and that alone must not restart anything."""
+    again under a new nonce, and that alone must not reload anything."""
     from pegaprox.core.db import get_db
     db = get_db()
     cur = db.conn.cursor()
@@ -861,7 +950,8 @@ def _describe_change(before, after):
 
 def note_managers_started(signature):
     """main(), right after the managers came up: the manager_signature() they started
-    from. A sync that changes it restarts a standby (see pull_once)."""
+    from. A sync that changes it reloads the managers it concerns on a standby
+    (reload_managers)."""
     try:
         items = _identity_items()
     except Exception as e:
@@ -869,7 +959,7 @@ def note_managers_started(signature):
         items = None
     with _lock:
         _run.update(managers=True, signature=signature, items=items, live_view=live_view(),
-                    pending=None)
+                    reload=None)
 
 
 def _refresh_managers():
@@ -939,7 +1029,7 @@ def _hand_over_ha_view(mgr, cfg):
 
 def _after_sync_applied():
     """A sync changed our database: refresh the running managers in place, and when
-    their connection settings changed, note a restart. Never raises."""
+    their connection settings changed, note a reload. Never raises."""
     if not _run['managers']:
         return
     try:
@@ -958,34 +1048,40 @@ def _after_sync_applied():
 
 def _note_signature(sig, items):
     with _lock:
-        pending = _run['pending']
+        pending = _run['reload']
         if sig == _run['signature']:
-            if pending and pending.get('signature'):
+            if pending:
                 # changed and changed back before it settled
-                _run['pending'] = None
+                _run['reload'] = None
                 logging.warning("[HA] the connection settings are back to what the managers "
-                                "started with - no restart needed")
+                                "run with - nothing to reload")
             return
-        if pending and pending.get('signature') == sig:
+        if pending and pending['signature'] == sig:
             return
         reason = _describe_change(_run['items'], items)
-        _run['pending'] = {'signature': sig, 'since': time.monotonic(), 'since_iso': _now(),
-                           'reason': reason}
+        _run['reload'] = {'signature': sig, 'since': time.monotonic(), 'since_iso': _now(),
+                          'reason': reason}
     logging.warning(f"[HA] connection settings changed on the active instance ({reason}) - "
-                    f"restarting once they have held for {CONFIG_SETTLE}s")
+                    f"reloading those managers once they have held for {RELOAD_SETTLE}s")
+    # a second past it: the timer's clock and time.monotonic() need not agree to the
+    # millisecond, and a timer that comes early finds nothing due
+    _reload_later(RELOAD_SETTLE + 1)
 
 
-def request_config_restart(reason):
-    """Ask for a restart that picks up the configuration, under the rules a sync goes by:
-    settled for a minute, not right after a start, at most one every ten minutes.
-    Only a standby restarts for this. Returns True when it is pending now."""
-    if not is_standby():
-        return False
-    with _lock:
-        if not _run['pending']:
-            _run['pending'] = {'signature': None, 'since': time.monotonic(), 'since_iso': _now(),
-                               'reason': str(reason or 'restart requested')[:200]}
-    return True
+def _later(delay, fn, name):
+    """fn in a thread of its own, `delay` seconds from now (a greenlet under gevent)."""
+    t = threading.Timer(delay, fn)
+    t.daemon = True
+    t.name = name
+    t.start()
+
+
+def _reload_later(delay):
+    try:
+        _later(delay, _reload_if_due, 'ha-reload')
+    except Exception as e:
+        # the next pull looks again
+        logging.warning(f"[HA] could not schedule the reload of the managers: {e}")
 
 
 def _live_view_switch():
@@ -997,43 +1093,199 @@ def _live_view_switch():
     return '' if now == running else ('on' if now else 'off')
 
 
-def _config_restart_wait():
-    """Seconds until the pending config restart may run, 0 once it may, None when
-    none is pending."""
-    pending = _run['pending']
-    if not pending or _run['restarting']:
+def _reload_wait():
+    """Seconds until the waiting reload may run, 0 once it may, None when none waits."""
+    # read once: a sync that brings the old settings back clears it meanwhile
+    pending = _run['reload']
+    if not pending or _run['restarting'] or not is_standby():
         return None
-    mono = time.monotonic()
-    waits = [pending['since'] + CONFIG_SETTLE - mono, _run['started'] + CONFIG_MIN_UPTIME - mono]
-    last = _load().get('last_config_restart')
-    if isinstance(last, (int, float)) and not isinstance(last, bool):
-        now = time.time()
-        if last > now:
-            # stamped under a clock that was set back since: count the ten minutes from
-            # the moment we noticed, not from a time still to come. Written back, so the
-            # next process spaces from it too.
+    return max(0.0, pending['since'] + RELOAD_SETTLE - time.monotonic())
+
+
+def _reload_if_due():
+    """The reload that waits, once it has settled: from its timer, and after every pull
+    in case the timer never came. Returns True when it reloaded something."""
+    if _reload_wait() != 0:
+        return False
+    return reload_managers()
+
+
+def reload_managers(wait=False):
+    """A standby with the live view: bring the running managers in line with how the
+    configuration says they connect, in this process. A cluster, PBS or ESXi server
+    that is new is built and started the way main() starts it (app._start_managers),
+    read-only like every manager on a standby; one that is gone is stopped and dropped;
+    one whose connection changed is stopped and built again. The others keep running,
+    and so does every session and console of this instance.
+
+    One at a time. Another caller gets False at once, or with `wait` (the admin's
+    "apply now") waits for the one that runs. The configuration is read under the pull
+    lock, never halfway through a sync; a sync that lands while the managers are being
+    rebuilt notes its change, which is reloaded after this one. Returns True when a
+    manager was added, dropped or rebuilt."""
+    got = _reload_lock.acquire(timeout=PULL_TIMEOUT + 5) if wait else _reload_lock.acquire(False)
+    if not got:
+        return False
+    started_with = _run['reload']
+    try:
+        return _reload_locked()
+    finally:
+        _reload_lock.release()
+        pending = _run['reload']
+        if pending and pending is not started_with:
+            # came in meanwhile, and its timer may have found the lock taken
+            _reload_later(max(0.0, pending['since'] + RELOAD_SETTLE - time.monotonic()) + 1)
+
+
+def _reload_locked():
+    # a restart is on its way, or about to be asked for: it takes the managers along
+    if not is_standby() or not _run['managers'] or _run['restarting'] or _live_view_switch():
+        return False
+    if not _pull_lock.acquire(timeout=PULL_TIMEOUT + 5):
+        logging.warning("[HA] a sync is taking long - the managers are reloaded after it")
+        return False
+    try:
+        from pegaprox.core.db import get_db
+        items = _identity_items()
+        clusters = get_db().get_all_clusters()
+    except Exception as e:
+        logging.warning(f"[HA] could not read the connection settings to reload the managers: {e}")
+        return False
+    finally:
+        _pull_lock.release()
+    before = _run['items']
+    if before is None:
+        # what they started from could not be read at the start: every running one
+        # counts as changed
+        before = {key: None for key in _running_keys()}
+    added = sorted(items.keys() - before.keys())
+    removed = sorted(before.keys() - items.keys())
+    changed = sorted(k for k in items.keys() & before.keys() if items[k] != before[k])
+    sig = _signature_of(items)
+    reason = _describe_change(before, items)
+    failed = _rebuild(added, removed, changed, clusters) if added or removed or changed else None
+    with _lock:
+        _run.update(signature=sig, items=dict(items))
+        pending = _run['reload']
+        if pending and pending['signature'] == sig:
+            _run['reload'] = None
+        if failed is not None:
+            _run['last_reload'] = {'at': _now(), 'reason': reason, 'failed': failed}
+    if failed is None:
+        return False
+    _after_rebuild(items)
+    note = f" - could not build {', '.join(failed)}" if failed else ''
+    _audit('ha.managers_reloaded', reason + note)
+    logging.warning(f"[HA] reloaded the managers for the configuration of the active "
+                    f"instance: {reason}{note}")
+    return True
+
+
+def _after_rebuild(built):
+    """A sync that landed while the managers were being rebuilt handed its rows to the
+    old, stopped ones and was compared with what ran before, so one that undid the
+    change cleared the reload it is owed now. Once more under the pull lock, against the
+    managers that run now: hand the rows over in place, and note a reload when how they
+    connect is no longer `built`. A sync that holds the lock meanwhile does both itself."""
+    if not _pull_lock.acquire(timeout=PULL_TIMEOUT + 5):
+        return
+    try:
+        try:
+            _refresh_managers()
+        except Exception as e:
+            logging.warning(f"[HA] could not refresh the reloaded managers: {e}")
+        items = _identity_items()
+    except Exception as e:
+        logging.warning(f"[HA] could not read the connection settings after the reload: {e}")
+        return
+    finally:
+        _pull_lock.release()
+    if items != built:
+        _note_signature(_signature_of(items), items)
+
+
+def _registries():
+    from pegaprox import globals as g
+    return {'cluster': g.cluster_managers, 'pbs': g.pbs_managers, 'vmware': g.vmware_managers}
+
+
+def _running_keys():
+    regs = _registries()
+    keys = {f'pbs:{mid}' for mid in list(regs['pbs'])} | {f'vmware:{mid}' for mid in list(regs['vmware'])}
+    # an ESXi host is listed among the clusters too (XHM), and counts as its vmware entry
+    return keys | {f'cluster:{mid}' for mid, mgr in list(regs['cluster'].items())
+                   if getattr(mgr, 'cluster_type', None) != 'esxi'}
+
+
+def _drop(regs, kind, mid, mgr):
+    """Take `mgr` out of its registry, and an ESXi host's cluster entry with it. Only
+    that object: a newer one under the same id stays."""
+    if mgr is None:
+        return
+    if regs[kind].get(mid) is mgr:
+        regs[kind].pop(mid, None)
+    if kind == 'vmware':
+        entry = regs['cluster'].get(mid)
+        if getattr(entry, 'cluster_type', None) == 'esxi' and getattr(entry, '_vmware', None) is mgr:
+            regs['cluster'].pop(mid, None)
+
+
+def _rebuild(added, removed, changed, clusters):
+    """Stop what is gone or changed, build what is new or changed, drop what is gone.
+    Returns the keys that could not be built; their managers are gone as well, like
+    the ones a start cannot build.
+
+    A changed manager stays in its registry, stopped, until the new one takes its
+    place, so a request in between still finds the cluster. stop() acts on nothing
+    here: it ends the manager's own threads, and the self-fence agents are stopped only
+    where the HA monitor ran and this instance acts (manager.stop_ha_monitor)."""
+    from pegaprox.app import _start_managers
+    regs = _registries()
+    old = {}
+    for key in removed + changed:
+        kind, _, mid = key.partition(':')
+        mgr = old[key] = regs[kind].get(mid)
+        # PBS and ESXi servers have no loop of their own to stop
+        if kind == 'cluster' and mgr is not None:
             try:
-                _update(last_config_restart=int(now))
+                mgr.stop()
             except Exception as e:
-                logging.warning(f"[HA] could not correct a config restart stamp from the future: {e}")
-            last = now
-        waits.append(last + CONFIG_RESTART_SPACING - now)
-    return max(0.0, *waits)
+                logging.warning(f"[HA] could not stop the manager of cluster {mid}: {e}")
+    fresh = added + changed
+    for key in fresh:
+        kind, _, mid = key.partition(':')
+        if kind == 'cluster' and mid in clusters:
+            # one at a time: a cluster that cannot be built keeps none of the others back
+            try:
+                _start_managers({mid: clusters[mid]}, only=())
+            except Exception as e:
+                logging.warning(f"[HA] could not start the manager of cluster {mid}: {e}")
+    servers = [key for key in fresh if not key.startswith('cluster:')]
+    if servers:
+        try:
+            _start_managers({}, only=servers)
+        except Exception as e:
+            logging.warning(f"[HA] could not start the PBS and ESXi managers: {e}")
+    for key in removed:
+        kind, _, mid = key.partition(':')
+        _drop(regs, kind, mid, old[key])
+    failed = []
+    for key in fresh:
+        kind, _, mid = key.partition(':')
+        mgr = regs[kind].get(mid)
+        if mgr is None or mgr is old.get(key):
+            failed.append(key)
+            _drop(regs, kind, mid, old.get(key))
+        elif kind == 'vmware':
+            # rebuilt, and no ESXi host any more: its old cluster entry goes
+            _drop(regs, 'vmware', mid, old.get(key))
+    return failed
 
 
-def _restart_for_config(reason, automatic):
+def _restart_for_config(reason):
     with _lock:
         if _run['restarting']:
             return False
-        if automatic:
-            try:
-                # noted before the restart: without it a state file we cannot write
-                # would restart us again every two minutes
-                _update(last_config_restart=int(time.time()))
-            except Exception as e:
-                logging.error(f"[HA] not restarting for the new configuration, the state "
-                              f"file cannot be written: {e}")
-                return False
         _run['restarting'] = True
     _audit('ha.restart_for_config', reason)
     logging.warning(f"[HA] restarting to pick up the configuration of the active instance: {reason}")
@@ -1041,55 +1293,40 @@ def _restart_for_config(reason, automatic):
     return True
 
 
-def _restart_for_config_if_due():
-    if not is_standby():
-        return False
-    # read once: a sync that brings the old settings back clears it meanwhile
-    pending = _run['pending']
-    if not pending or _config_restart_wait() != 0:
-        return False
-    return _restart_for_config(pending['reason'], automatic=True)
-
-
 def apply_config_now():
-    """The admin's "apply now" on a standby: restart at once, past the rules above,
-    when a restart is pending, the live view was switched, or the connection settings
-    differ from what the managers started with.
+    """The admin's "apply now" on a standby. A live view switched since this process
+    started restarts it at once. A change to how the managers connect, waiting or not
+    looked at yet, is reloaded now, past the settle time.
 
-    Returns True when a restart is on its way, False when there is nothing to apply.
-    Raises HaError anywhere but on a standby."""
+    Returns 'restart' when a restart is on its way, 'reload' when managers were
+    reloaded, False when there is nothing to apply. Raises HaError anywhere but on a
+    standby."""
     if not is_standby():
         raise HaError('Only a standby takes its configuration from the active instance')
     switch = _live_view_switch()
-    reason = f'the live view was switched {switch}' if switch else ''
-    pending = _run['pending']
-    if not reason and pending:
-        reason = pending['reason']
-    if not reason and _run['managers']:
-        try:
-            items = _identity_items()
-        except Exception as e:
-            logging.warning(f"[HA] could not read the connection settings: {e}")
-        else:
-            if _signature_of(items) != _run['signature']:
-                reason = _describe_change(_run['items'], items)
-    if not reason:
-        return False
-    return _restart_for_config(reason, automatic=False)
+    if switch:
+        return 'restart' if _restart_for_config(f'the live view was switched {switch}') else False
+    if _run['managers'] and reload_managers(wait=True):
+        return 'reload'
+    return False
 
 
 def _restart_pending():
-    """public_status: None, or since and reason of the restart this standby waits for."""
+    """public_status: None, or since and reason of the restart this standby waits for:
+    a live view switched since it started."""
     if not is_standby():
         return None
     switch = _live_view_switch()
     if switch:
         return {'since': _run['live_view_changed'] or _now(),
                 'reason': f'the live view was switched {switch}'}
-    pending = _run['pending']
-    if pending:
-        return {'since': pending['since_iso'], 'reason': pending['reason']}
     return None
+
+
+def _reload_pending():
+    """public_status: None, or since and reason of the reload that waits to settle."""
+    pending = _run['reload'] if is_standby() else None
+    return {'since': pending['since_iso'], 'reason': pending['reason']} if pending else None
 
 
 # --- secrets and codes ---------------------------------------------------------
@@ -1969,7 +2206,7 @@ def _speaks_for_group(peer_id, timeout=3):
     if st['role'] == ROLE_STANDBY and (peer_id == st.get('source') or rec.get('role_seen') == ROLE_ACTIVE):
         return max(mine, int(rec.get('epoch_seen') or 0))
     try:
-        their_role, their_epoch, _group = _ask(dict(rec, instance_id=peer_id), _signer(), timeout)
+        their_role, their_epoch = _ask(dict(rec, instance_id=peer_id), _signer(), timeout)[:2]
     except Exception as e:
         logging.warning(f"[HA] could not ask member {peer_id} whether it is active: {e}")
         return None
@@ -2040,12 +2277,12 @@ def refresh_member(member_id, timeout=5):
     if not rec:
         return
     try:
-        their_role, their_epoch, mark = _ask(rec, _signer(), timeout)
+        their_role, their_epoch, mark, serving_seen = _ask(rec, _signer(), timeout)
     except Exception as e:
         logging.info(f"[HA] member {rec.get('url') or member_id} did not answer the check: {e}")
         return
     note = {'last_contact': _now(), 'role_seen': their_role, 'epoch_seen': their_epoch,
-            'last_error': ''}
+            'serving_seen': serving_seen, 'last_error': ''}
     if mark == GROUP_MARK:
         note['group_seen'] = True
     try:
@@ -3085,11 +3322,11 @@ def _fan_out(jobs, timeout):
     return [r if r is not None else (None, late) for r in list(results)]
 
 
-def tell_members(method, path, json_body=None, timeout=10, only=None):
+def tell_members(method, path, json_body=None, timeout=10, only=None, note=True):
     """The same call to every member, or to the ids in `only`, side by side.
 
     Returns {member id: None when it answered 200, else what went wrong}, and notes
-    the failures on the member records. Never raises."""
+    the failures on the member records unless `note` is False. Never raises."""
     try:
         signer = _signer()
         targets = [m for m in members() if only is None or m['instance_id'] in only]
@@ -3105,7 +3342,7 @@ def tell_members(method, path, json_body=None, timeout=10, only=None):
         if err is None and resp.status_code != 200:
             err = HaError(_peer_error(resp, f'The member refused {path}'))
         out[mid] = None if err is None else _error_text(err)
-        if err is not None:
+        if err is not None and note:
             notes[mid] = {'last_error': out[mid]}
     try:
         _note_members(notes)
@@ -3118,8 +3355,9 @@ def pull_once(timeout=PULL_TIMEOUT):
     """Standby: fetch and apply one snapshot from the member it pulls from. Returns a
     short status string.
 
-    Also where a config restart that has fallen due goes out (see
-    note_managers_started): after a sync, and on the polls that find nothing new."""
+    Also where a reload of the managers that has settled goes out, should its timer
+    not have come (see reload_managers): after a sync, and on the polls that find
+    nothing new."""
     # one pull at a time: "sync now" and the loop would otherwise apply side by side,
     # and the file writes share their temporary names
     if not _pull_lock.acquire(timeout=timeout + 5):
@@ -3129,7 +3367,7 @@ def pull_once(timeout=PULL_TIMEOUT):
     finally:
         _pull_lock.release()
     if result in ('applied', 'unchanged', 'failed'):
-        _restart_for_config_if_due()
+        _reload_if_due()
     return result
 
 
@@ -3165,9 +3403,10 @@ def _in_background(fn, name):
 
 def pull_soon():
     """Standby: one pull right away, in the background, after a write it forwarded went
-    through, so the change shows here without waiting for the interval. Writes that
-    come in while that pull runs get one more pull after it, not one each. Returns
-    True when it started a run."""
+    through or once the active said its configuration changed (/api/ha/peer/changed),
+    so the change shows here without waiting for the interval. Asks that come in
+    while that pull runs get one more pull after it, not one each. Returns True when
+    it started a run."""
     with _soon_lock:
         _soon['wanted'] = True
         if _soon['running']:
@@ -3178,7 +3417,7 @@ def pull_soon():
     except Exception as e:
         with _soon_lock:
             _soon['running'] = False
-        logging.warning(f"[HA] could not start the sync after a forwarded write: {e}")
+        logging.warning(f"[HA] could not start a sync out of turn: {e}")
         return False
     return True
 
@@ -3197,12 +3436,83 @@ def _pull_soon_run():
                 if is_standby() and peer():
                     pull_once(timeout=PULL_TIMEOUT_FLOOR)
             except Exception as e:
-                logging.warning(f"[HA] the sync after a forwarded write failed: {_error_text(e)}")
+                logging.warning(f"[HA] a sync out of turn failed: {_error_text(e)}")
     finally:
         if not finished:
-            # killed halfway: the next forwarded write starts a run of its own
+            # killed halfway: the next ask starts a run of its own
             with _soon_lock:
                 _soon['running'] = False
+
+
+_nudge_lock = threading.Lock()
+# last: when the last note went out (monotonic), for the spacing under a run of writes
+_nudge = {'due': False, 'last': None}
+
+
+def nudge_members():
+    """The active, after a write went through (app.py): tell every member that the
+    configuration changed, and one that does not hold it yet pulls it now rather than
+    at its next poll. The note goes NUDGE_DELAY seconds after the write, and no sooner
+    than NUDGE_SPACING after the one before; writes until then go with the same note.
+    Returns True when it set one up. Never raises: the write is done either way."""
+    try:
+        st = _load()
+        if st['role'] != ROLE_ACTIVE or not st.get('members'):
+            return False
+        with _nudge_lock:
+            if _nudge['due']:
+                return False
+            _nudge['due'] = True
+            last = _nudge.get('last')
+        delay = NUDGE_DELAY
+        if last is not None:
+            delay = max(delay, last + NUDGE_SPACING - time.monotonic())
+        _later(delay, _nudge_run, 'ha-nudge')
+    except Exception as e:
+        with _nudge_lock:
+            _nudge['due'] = False
+        logging.warning(f"[HA] could not set up the note to the members about a change: {e}")
+        return False
+    return True
+
+
+def _nudge_run():
+    # cleared first: a write that comes in while the calls are out gets a call of its
+    # own, its change may be newer than what the members fetch now
+    with _nudge_lock:
+        _nudge['due'] = False
+        _nudge['last'] = time.monotonic()
+    try:
+        if role() != ROLE_ACTIVE:
+            return
+        body = None
+        try:
+            # once for all of them, off the hub like the etag of a poll: a write that
+            # changed nothing they hold (a VM started, a test mail) costs no member a pull
+            from pegaprox.api.ha import current_etag
+            body = {'etag': current_etag()}
+        except Exception as e:
+            # without one every member pulls, as from a release before the etag
+            logging.warning(f"[HA] could not work out the etag for the note to the members: {e}")
+        # not noted on the member records: a member that misses one (down, or on a
+        # release without the route) is not wrong, it pulls at its next poll
+        missed = {mid: err for mid, err in tell_members(
+            'POST', NUDGE_PATH, json_body=body, timeout=NUDGE_TIMEOUT, note=False).items() if err}
+    except Exception as e:
+        logging.warning(f"[HA] could not tell the members about a change: {e}")
+        return
+    for mid, err in missed.items():
+        logging.info(f"[HA] member {mid} did not take the note about a change ({err}) - "
+                     "it pulls at its next poll")
+
+
+def holds_etag(etag):
+    """Standby: whether the last sync it applied is the configuration `etag` stands for,
+    as the active's note about a change names it (nudge_members). Never before the first
+    pull of this process, which is a full one whatever the etag says."""
+    if not _etag_checked or not isinstance(etag, str) or not etag:
+        return False
+    return etag == (_load().get('sync') or {}).get('etag')
 
 
 def pull_before_promote(timeout=15):
@@ -3401,7 +3711,7 @@ def _take_follow_hint(src, resp, timeout):
         return None
     rec = dict(known or entry, instance_id=hid)
     try:
-        their_role, their_epoch, group = _ask(rec, _signer(), timeout=min(10, timeout))
+        their_role, their_epoch, group = _ask(rec, _signer(), timeout=min(10, timeout))[:3]
     except Exception as e:
         logging.warning(f"[HA] {src.get('url')} follows {entry['url']}, which did not confirm it: {e}")
         return None
@@ -3427,8 +3737,9 @@ def _take_follow_hint(src, resp, timeout):
 
 
 def _ask(rec, signer, timeout):
-    """(role, epoch, group mark) as the member `rec` reports them. Raises PeerRefused
-    when it turns us away (401, 410), HaError when it does not answer usably."""
+    """(role, epoch, group mark, serving) as the member `rec` reports them, serving False
+    from a release that does not say. Raises PeerRefused when it turns us away (401,
+    410), HaError when it does not answer usably."""
     resp = call_member(rec, 'GET', '/api/ha/peer/status', timeout=timeout, signer=signer)
     if resp.status_code in (401, 410):
         try:
@@ -3455,7 +3766,7 @@ def _ask(rec, signer, timeout):
         their_role = None
     if their_epoch is None:
         raise HaError('The member sent an epoch this version does not read')
-    return their_role, their_epoch, data.get('group')
+    return their_role, their_epoch, data.get('group'), data.get('serving') is True
 
 
 def _ask_members(timeout, refused=None):
@@ -3484,7 +3795,7 @@ def _ask_members(timeout, refused=None):
             continue
         answers[mid] = value[:2]
         notes[mid] = {'last_contact': now, 'role_seen': value[0], 'epoch_seen': value[1],
-                      'last_error': ''}
+                      'serving_seen': value[3], 'last_error': ''}
         if value[2] == GROUP_MARK:
             notes[mid]['group_seen'] = True
     _last_watch.update(at=time.monotonic(), unreachable=frozenset(unreachable))
@@ -3681,8 +3992,9 @@ def _loop():
         except Exception as e:
             logging.error(f"[HA] loop: {e}")
         interval = int(_load().get('interval') or DEFAULT_INTERVAL)
-        # a pending config restart goes out when it falls due, not up to an hour later
-        wait = _config_restart_wait() if is_standby() else None
+        # a reload of the managers goes out on its timer; should that not come, still
+        # when it has settled and not up to an hour later
+        wait = _reload_wait()
         if wait is not None:
             interval = min(interval, int(wait) + 1)
         time.sleep(max(5, min(interval, 3600)))
@@ -3708,6 +4020,8 @@ def _member_view(rec, src, st):
         'role_seen': rec.get('role_seen'),
         'epoch_seen': rec.get('epoch_seen'),
         'confirmed_standby': _confirmed_standby(rec, st),
+        # the member said it serves users (a standby of theirs the UI calls active)
+        'serving_seen': rec.get('serving_seen') is True,
         'key_fingerprint': peer_key_fingerprint(rec.get('public_key')),
         'last_contact': rec.get('last_contact'),
         'last_error': rec.get('last_error') or '',
@@ -3731,6 +4045,9 @@ def public_status():
         # the switch, and whether a refused write goes to the active right now
         'forward_writes': forward_writes(),
         'forwarding': forwarding(),
+        # the switch, and whether this standby serves users right now
+        'serve_users': serve_users(),
+        'serving': serving(),
         'managers_running': bool(_run['managers']),
         'broken': st.get('broken') or '',
         # set once a member told this instance it was removed; it is passive then
@@ -3752,7 +4069,8 @@ def public_status():
         'members': [_member_view(rec, src, st) for rec in members()],
         'max_members': MAX_MEMBERS,
         'standby_count': standby_count(),
-        'sync': dict(st.get('sync') or {}, etag=None, restart_pending=_restart_pending()),
+        'sync': dict(st.get('sync') or {}, etag=None, restart_pending=_restart_pending(),
+                     reload_pending=_reload_pending(), last_reload=_run['last_reload']),
     }
 
 
@@ -3762,5 +4080,7 @@ def banner():
     if st['role'] != ROLE_STANDBY:
         return {'role': st['role']}
     p = peer() or {}
+    # removed: the group took it out, and it stays passive until an admin unpairs it
     return {'role': st['role'], 'peer_url': p.get('url') or '',
-            'last_sync_at': (st.get('sync') or {}).get('last_ok_at') or ''}
+            'last_sync_at': (st.get('sync') or {}).get('last_ok_at') or '',
+            'removed': bool(st.get('removed'))}

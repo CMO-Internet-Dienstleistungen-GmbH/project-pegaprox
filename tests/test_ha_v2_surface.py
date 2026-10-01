@@ -560,8 +560,9 @@ def test_an_acting_instance_still_makes_and_migrates_its_vapid_key(ha_env, seed)
 
 @pytest.fixture
 def live(ha_env, monkeypatch):
-    """The core half of the contract, as the routes see it."""
-    box = types.SimpleNamespace(value=True, sets=[], applied=[], apply_result=True)
+    """The core half of the contract, as the routes see it. apply_config_now says what it
+    did: 'restart', 'reload' (the managers rebuilt in place) or False."""
+    box = types.SimpleNamespace(value=True, sets=[], applied=[], apply_result='restart')
 
     def set_live_view(value):
         box.sets.append(value)
@@ -650,14 +651,16 @@ def test_apply_config_on_a_standby(ha_env, seed, live, monkeypatch):
     admin = _admin(ha_env.api, seed)
     _standby_of_active(ha_env)
     real = ha.public_status
-    pending = {'since': '2026-09-30T08:00:00+00:00', 'reason': 'the connection of cluster c1 changed'}
+    pending = {'since': '2026-09-30T08:00:00+00:00', 'reason': 'the live view was switched off'}
     monkeypatch.setattr(ha, 'public_status',
                         lambda: dict(real(), sync=dict(real()['sync'], restart_pending=pending)))
     # no password: it only moves the restart forward
     r = admin.post('/api/ha/apply-config', json={})
-    assert r.status_code == 200 and r.get_json() == {'success': True, 'restarting': True}, r.data
+    assert r.status_code == 200, r.data
+    assert r.get_json() == {'success': True, 'restarting': True, 'reloaded': False}
     assert live.applied == ['standby']
-    assert 'the connection of cluster c1 changed' in _audit('ha.config_applied')[-1]['details']
+    assert _audit('ha.config_applied')[-1]['details'] == (
+        'restarting this standby now for the waiting change: the live view was switched off')
 
     # an admin API token may do it too
     from pegaprox.utils.auth import create_api_token
@@ -665,11 +668,21 @@ def test_apply_config_on_a_standby(ha_env, seed, live, monkeypatch):
     r = ha_env.api.anon().post('/api/ha/apply-config', json={}, headers={'Authorization': f'Bearer {tok}'})
     assert r.status_code == 200, r.data
 
+    # a changed connection: the managers reloaded in place, no restart
+    pending = {'since': '2026-09-30T08:00:00+00:00', 'reason': '1 cluster changed'}
+    monkeypatch.setattr(ha, 'public_status',
+                        lambda: dict(real(), sync=dict(real()['sync'], reload_pending=pending)))
+    live.apply_result = 'reload'
+    r = admin.post('/api/ha/apply-config', json={})
+    assert r.get_json() == {'success': True, 'restarting': False, 'reloaded': True}
+    assert _audit('ha.config_applied')[-1]['details'] == (
+        'reloaded the managers now for the waiting change: 1 cluster changed')
+
     # nothing to apply: no restart, no audit line claiming one
     live.apply_result = False
     r = admin.post('/api/ha/apply-config', json={})
-    assert r.get_json() == {'success': True, 'restarting': False}
-    assert len(_audit('ha.config_applied')) == 2
+    assert r.get_json() == {'success': True, 'restarting': False, 'reloaded': False}
+    assert len(_audit('ha.config_applied')) == 3
 
 
 def test_apply_config_is_a_standbys_alone(ha_env, seed, live):
@@ -704,7 +717,8 @@ def test_the_standby_banner_says_whether_the_view_is_live(ha_env, db, tmp_path, 
     live.value = on
     body = api.anon().post('/api/auth/login', json=creds).get_json()
     want = {'role': 'standby', 'peer_url': ACTIVE_URL,
-            'last_sync_at': '2026-09-30T08:00:00+00:00', 'live_view': on, 'forwarding': False}
+            'last_sync_at': '2026-09-30T08:00:00+00:00', 'live_view': on, 'forwarding': False,
+            'serving': False, 'leader_reachable': True, 'removed': False}
     assert body['ha'] == want
     check = api.anon().get('/api/auth/check', headers={'X-Session-ID': body['session_id']})
     assert check.get_json()['ha'] == want

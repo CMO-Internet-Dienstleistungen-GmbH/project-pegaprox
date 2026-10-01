@@ -43604,7 +43604,7 @@
           }
         },
         "summary": "How often the standby pulls and the active looks at its peer, the live view, and whether this instance as a standby forwards writes.",
-        "description": "interval is in seconds. live_view is this instance's own switch: on, a standby\nconnects to the clusters read-only; off, it holds no connection at all. A standby\nrestarts when live_view changes, because it sets its connections up once per\nprocess; any other role only keeps the value for when it follows. forward_writes,\nalso this instance's own: on, a standby hands the writes of its signed-in users to\nthe active; off, it refuses them. It counts from the next write. Any of the three,\nor several.",
+        "description": "interval is in seconds. live_view is this instance's own switch: on, a standby\nconnects to the clusters read-only; off, it holds no connection at all. A standby\nrestarts when live_view changes, because it sets its connections up once per\nprocess; any other role only keeps the value for when it follows. forward_writes,\nalso this instance's own: on, a standby hands the writes of its signed-in users to\nthe active; off, it refuses them. It counts from the next write. serve_users, this\ninstance's own as well: on, a standby serves users like an active instance, with\ntheir consoles opened here and every change forwarded, as long as the live view and\nforwarding are on too (serving in the answer says whether they are). No restart,\nit counts from the next request. Any of the four, or several.",
         "requestBody": {
           "required": false,
           "content": {
@@ -43649,8 +43649,8 @@
             "description": "Insufficient permissions"
           }
         },
-        "summary": "Restart this standby now to take up a configuration change that is waiting.",
-        "description": "A sync that changes how the clusters are reached leaves a restart pending, which a\nstandby takes by itself once the change holds still. This skips the wait. No\npassword: it only decides when this standby restarts, not what it does.",
+        "summary": "Take up a configuration change that is waiting on this standby, now.",
+        "description": "A sync that changes how the clusters are reached leaves a reload of those managers\nwaiting, which a standby does by itself once the change holds still; a switched\nlive view waits for a restart. This does either at once: reloaded says the\nmanagers were rebuilt in place, restarting that the process restarts. No password:\nit only decides when, not what.",
         "requestBody": {
           "required": false,
           "content": {
@@ -43728,7 +43728,7 @@
             "description": "HA_REMOVED: the caller was removed from the group"
           }
         },
-        "summary": "Role and epoch, for the watch loop of every other member. group says this release takes calls from every member, not only from one peer.",
+        "summary": "Role and epoch, for the watch loop of every other member. group says this release takes calls from every member, not only from one peer; serving that this standby serves users, which the others show.",
         "x-pegaprox-auth": "inline",
         "security": [
           {
@@ -43925,6 +43925,45 @@
         ]
       }
     },
+    "/api/ha/peer/changed": {
+      "post": {
+        "operationId": "ha.peer_changed_post",
+        "tags": [
+          "ha"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not the paired instance"
+          },
+          "410": {
+            "description": "HA_REMOVED: the caller was removed from the group"
+          }
+        },
+        "summary": "The active changed its configuration (ha.nudge_members): pull now instead of at the next poll. Taken from the member this standby pulls from, and the pull is one like any other, from that member; from any other member nothing happens. etag is the configuration the active holds now: a standby whose last sync was that one has nothing to pull. A note without it (an active of an earlier release) is a pull. pull says whether it was taken.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "inline",
+        "security": [
+          {
+            "haPeer": []
+          }
+        ]
+      }
+    },
     "/api/ha/peer/forward": {
       "post": {
         "operationId": "ha.peer_forward_post",
@@ -43946,7 +43985,7 @@
           }
         },
         "summary": "A write a standby would have refused, handed to us to run as the user it names.",
-        "description": "The body is {method, path, query, content_type, body_b64, user, sign_in,\nclient_ip}, the browser's request as the standby took it, and the peer signature\ncovers it like the body of every peer call: neither the request nor the user can\nchange on the way. Only on the active (409 anywhere else, which also stops a write\nthat would travel on), only from a member that signs its calls, only a write under\n/api/ and never under /api/ha/ - or a GET of ha.FORWARDED_READS, the progress of a\njob - and only for an account that exists and is enabled here. sign_in is the\nstandby's digest of the account's password (ha.sign_in_digest): 403\nHA_FORWARD_STALE_SIGN_IN when ours differs, the password changed here since.\nThe request then goes through our routing and every check on the way, CSRF and\nthe IP list included, under a session for that user that holds for this one\nrequest: role, tenant and permissions are ours, whatever the standby thinks of\nthem. Its audit lines name the standby and carry the client address the standby\nsaw. The answer is {status, headers, body_b64}.",
+        "description": "The body is {method, path, query, content_type, body_b64, user, sign_in,\nclient_ip}, the browser's request as the standby took it, and the peer signature\ncovers it like the body of every peer call: neither the request nor the user can\nchange on the way. Only on the active (409 anywhere else, which also stops a write\nthat would travel on), only from a member that signs its calls, only a write under\n/api/ and never under /api/ha/ - or a GET of ha.FORWARDED_READS, the progress of a\njob or a view only our tables hold - and only for an account that exists and is\nenabled here. sign_in is the\nstandby's digest of the account's password (ha.sign_in_digest): 403\nHA_FORWARD_STALE_SIGN_IN when ours differs, the password changed here since.\nThe request then goes through our routing and every check on the way, CSRF and\nthe IP list included, under a session for that user that holds for this one\nrequest: role, tenant and permissions are ours, whatever the standby thinks of\nthem. Its audit lines name the standby and carry the client address the standby\nsaw. The answer is {status, headers, body_b64}.",
         "requestBody": {
           "required": false,
           "content": {

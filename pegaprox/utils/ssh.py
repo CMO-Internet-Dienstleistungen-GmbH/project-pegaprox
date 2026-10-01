@@ -350,13 +350,13 @@ def _ssh_exec(host, user, password, cmd, timeout=30, use_controlmaster=False,
     # Fallback: sshpass + ssh subprocess (handles keyboard-interactive via PreferredAuthentications)
     try:
         import subprocess
-        from pegaprox.utils.ssh_security import strict_host_keys_enabled
+        from pegaprox.utils.ssh_security import cli_hostkey_opts
         env = os.environ.copy()
         env['SSHPASS'] = password
-        # accept-new = TOFU (accept unknown, REJECT a changed key). strict mode
-        # upgrades to `yes` (reject unknown too). Keeps the system-ssh fallback's
+        # accept-new = TOFU (accept unknown, REJECT a changed key). strict mode and a
+        # standby upgrade to `yes` (reject unknown too). Keeps the system-ssh fallback's
         # host-key behaviour in lock-step with the paramiko paths.
-        _hkc = 'yes' if strict_host_keys_enabled() else 'accept-new'
+        _hkc = cli_hostkey_opts()[0]
         ssh_args = ['sshpass', '-e', 'ssh',
              '-o', f'StrictHostKeyChecking={_hkc}',
              '-o', f'UserKnownHostsFile={_known_hosts}',

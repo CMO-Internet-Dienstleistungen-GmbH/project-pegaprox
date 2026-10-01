@@ -1074,15 +1074,18 @@ class PBSManager:
         }
 
 
-def load_pbs_servers():
-    """Load all PBS server configs from DB and create managers"""
+def load_pbs_servers(only=None):
+    """Load all PBS server configs from DB and create managers. `only` limits it to
+    those ids (a warm standby rebuilding a few, core/ha.py reload_managers)."""
     global pbs_managers
     try:
         db = get_db()
         cursor = db.conn.cursor()
         cursor.execute("SELECT * FROM pbs_servers WHERE enabled = 1")
         rows = cursor.fetchall()
-        
+        if only is not None:
+            rows = [r for r in rows if r['id'] in only]
+
         for row in rows:
             row_dict = dict(row)
             pbs_id = row_dict['id']
