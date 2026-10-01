@@ -1111,6 +1111,16 @@ def main(debug_mode=False):
         logging.getLogger('gevent').setLevel(logging.ERROR)
         logging.getLogger('urllib3').setLevel(logging.ERROR)
 
+    # MK Oct 2026 (#625) - one process per config directory, before anything here writes
+    # to it (the DB encryption below already does). A second one - started by hand next
+    # to the service, say - shares the database and the HA state and acts next to it.
+    from pegaprox.core import ha
+    try:
+        ha.lock_config_dir()
+    except ha.HaError as e:
+        print(f"\n[FATAL] {e}\n")
+        sys.exit(1)
+
     if debug_mode:
         print("=" * 50)
         print("DEBUG MODE ENABLED")
@@ -1199,7 +1209,10 @@ def main(debug_mode=False):
     # standby without a restart, so the role read further down is already the right one.
     # An unreachable peer changes nothing: every acting loop started below checks
     # ha.is_active() on each tick, so it stops the moment the ha loop steps us down.
-    from pegaprox.core import ha
+    # The markers go first: a member whose state file is gone comes up passive.
+    _ha_markers = ha.check_markers_at_boot()
+    if _ha_markers == 'missing':
+        print("HA state file missing on a group member - staying passive until it is restored or unpaired")
     try:
         _ha_boot = ha.check_peer_at_boot(timeout=5)
     except Exception as e:
@@ -1309,23 +1322,11 @@ def main(debug_mode=False):
     except Exception as e:
         logging.warning(f"Syslog server failed to start: {e}")
 
-    # #238: reset stuck DR plans from a previous crash/restart
     # #625: not on a standby - the plans are the active's, and so is any run in flight.
-    # start_heartbeat() stays out too: it repeats that reset (recover_orphan_runs)
-    # before it starts the auto-failover loop.
+    # The reset of DR plans a crash left running or testing (#238) is start_heartbeat's
+    # recover_orphan_runs, which asks ha.is_active() right before it writes. A copy of
+    # it here wrote on the role read once above.
     if not standby:
-        try:
-            from datetime import datetime as _dt
-            from pegaprox.core.db import get_db
-            _db = get_db()
-            stuck = _db.query("SELECT id, name FROM site_recovery_plans WHERE status IN ('running', 'testing')")
-            for p in (stuck or []):
-                _db.execute("UPDATE site_recovery_plans SET status = 'failed', updated_at = ? WHERE id = ?",
-                            (_dt.now().isoformat(), p['id']))
-                print(f"  Reset stuck DR plan '{p['name']}' → failed")
-        except Exception as e:
-            print(f"  DR plan reset check failed: {e}")
-
         from pegaprox.background.site_recovery import start_heartbeat
         start_heartbeat()
         print("Started site recovery heartbeat monitor")

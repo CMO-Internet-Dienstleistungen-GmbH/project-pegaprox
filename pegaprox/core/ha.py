@@ -80,6 +80,7 @@ It is never part of a snapshot.
 MK Sep 2026
 """
 import base64
+import errno
 import gzip
 import hashlib
 import hmac
@@ -91,7 +92,6 @@ import os
 import re
 import secrets
 import stat
-import subprocess
 import sys
 import threading
 import time
@@ -108,6 +108,16 @@ ROLE_STANDBY = 'standby'
 STATE_FILE = os.path.join(CONFIG_DIR, 'ha_state.json')
 AES_KEY_FILE = os.path.join(CONFIG_DIR, '.pegaprox_aes256.key')
 KNOWN_HOSTS_FILE = os.path.join(CONFIG_DIR, '.ssh_known_hosts')
+# held by the one process that runs on this config directory (lock_config_dir)
+LOCK_FILE = os.path.join(CONFIG_DIR, '.pegaprox.lock')
+# Lies next to the state file while this instance is in a group, and the database holds
+# the same fact as a local setting, so a restored database carries it along. With the
+# state file gone, either one keeps the instance passive (_load, check_markers_at_boot).
+MEMBER_MARKER = '.ha-member'
+MEMBER_SETTING = 'ha_member_of'
+# what this process exits with when something is meant to start it again: systemd
+# restarts on it (Restart=on-failure), Docker by its restart policy. Never 0
+EXIT_RESTART = 75
 
 SNAPSHOT_FORMAT = 1
 CODE_PREFIX = 'pgxha1_'
@@ -261,7 +271,7 @@ LOCAL_SETTING_KEYS = frozenset((
     'domain', 'port', 'ssl_enabled', 'http_redirect_port', 'reverse_proxy_enabled',
     'trusted_proxies', 'proxy_bind_address', 'oidc_redirect_uri', 'syslog_enabled',
     'syslog_retention_days', 'alert_last_notified_version', 'hardware_monitoring',
-    'hardware_monitoring_redfish',
+    'hardware_monitoring_redfish', MEMBER_SETTING,
 ))
 LOCAL_SETTING_PREFIXES = ('acme_',)
 
@@ -488,6 +498,33 @@ def _key_backups():
         return []
 
 
+def _marker_path():
+    return os.path.join(os.path.dirname(STATE_FILE) or '.', MEMBER_MARKER)
+
+
+def _in_group(st):
+    return bool(st.get('members')) or st.get('role') in (ROLE_ACTIVE, ROLE_STANDBY)
+
+
+def _membership_left_behind():
+    """Why this instance was in a group although no state file says so: a .pre-ha key
+    backup (it joined once) or the member marker. None when neither is there."""
+    if _key_backups():
+        return 'joined a pair before'
+    if os.path.exists(_marker_path()):
+        return 'belongs to a group'
+    return None
+
+
+def _missing_state(why):
+    """The stand-in for a state file that is gone from an instance that was in a group:
+    an acting standalone here would run next to the group on its key and its
+    configuration."""
+    return dict(_default_state(), role=ROLE_STANDBY,
+                broken=f'The HA state file is missing, but this instance {why} - restore '
+                       'config/ha_state.json and restart, or unpair it')
+
+
 def _load():
     global _state
     with _lock:
@@ -503,15 +540,13 @@ def _load():
             st.pop('broken', None)
         except FileNotFoundError:
             st = None
-            if _key_backups():
-                # joined once and the file is gone (a restore from before the
-                # pairing, a hand-made "reset"): an acting standalone here would
-                # run next to the active on its key and its configuration
-                logging.error(f"[HA] {STATE_FILE} is missing but this instance joined a pair "
-                              "before - staying passive until it is restored or unpaired")
-                st = dict(_default_state(), role=ROLE_STANDBY,
-                          broken='The HA state file is missing, but this instance joined a pair '
-                                 'before - restore config/ha_state.json and restart, or unpair it')
+            why = _membership_left_behind()
+            if why:
+                # in a group once and the file is gone (a restore from before the
+                # pairing, a hand-made "reset")
+                logging.error(f"[HA] {STATE_FILE} is missing but this instance {why} - "
+                              "staying passive until it is restored or unpaired")
+                st = _missing_state(why)
         except Exception as e:
             # a state file we cannot read must not turn a standby into an acting
             # instance: stay standby until someone looks
@@ -562,18 +597,107 @@ def _write_locked(st):
             pass
         raise
     os.replace(tmp, STATE_FILE)
+    # the rename is only on disk once the directory is: until then a power cut can bring
+    # back the file from before, epoch and all
+    _fsync_dir(STATE_FILE)
     try:
         os.chmod(STATE_FILE, 0o600)
     except OSError:
         pass
 
 
+def _fsync_dir(path):
+    """fsync the directory `path` sits in. Never raises: the file itself is written
+    already, and a filesystem that cannot sync a directory says so in the log."""
+    try:
+        fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError as e:
+        logging.warning(f"[HA] could not sync the directory of {path}: {e}")
+    finally:
+        os.close(fd)
+
+
+def _note_marker(st):
+    """MEMBER_MARKER in step with `st`: there while it is in a group, gone once it is a
+    standalone again. A failed write costs the marker, never the commit."""
+    path = _marker_path()
+    try:
+        if _in_group(st):
+            if not os.path.exists(path):
+                _write_private(path, (st['instance_id'] + '\n').encode())
+                _fsync_dir(path)
+        elif os.path.exists(path):
+            os.unlink(path)
+            _fsync_dir(path)
+    except OSError as e:
+        logging.warning(f"[HA] could not update {path}: {e}")
+
+
 def _commit_locked(new):
     """Write `new`, then make it the state. Memory never runs ahead of the file:
     a failed write leaves both as they were."""
     _write_locked(new)
+    _note_marker(new)
     _state.clear()
     _state.update(new)
+
+
+def _note_member_in_db(instance):
+    """MEMBER_SETTING in this instance's database: its id while it is in a group, ''
+    once it is not. Never raises."""
+    try:
+        from pegaprox.core.db import get_db
+        get_db().save_server_setting(MEMBER_SETTING, instance)
+    except Exception as e:
+        logging.warning(f"[HA] could not note the group membership in the database: {e}")
+
+
+def _drop_recovery_locks(instance):
+    """This instance's recovery lock files on the clusters' shared storage go when its
+    epoch starts to count in another group, or in none: a file from before stands in the
+    way of that group's active (PegaProxManager._ha_acquire_recovery_lock). Never raises."""
+    try:
+        from pegaprox.core.manager import drop_own_recovery_locks
+        drop_own_recovery_locks(instance)
+    except Exception as e:
+        logging.warning(f"[HA] could not remove this instance's recovery lock files: {e}")
+
+
+def check_markers_at_boot():
+    """main(), before the boot check. The state file decides when it is there: the
+    database marker follows it, and an instance paired before the markers existed gets
+    its marker file now. When the file is gone and only the database says this instance
+    is in a group (a database restored without its config directory), it stays passive
+    like _load does for the marker file. Never raises; returns a short status string."""
+    global _state
+    try:
+        from pegaprox.core.db import get_db
+        held = get_db().get_server_setting(MEMBER_SETTING) or ''
+    except Exception as e:
+        logging.warning(f"[HA] could not read {MEMBER_SETTING} from the database: {e}")
+        return 'no database'
+    with _lock:
+        st = _load()
+        if st.get('broken'):
+            return 'broken'
+        if _in_group(st):
+            _note_marker(st)
+            mine = st['instance_id']
+        elif held and not os.path.exists(STATE_FILE):
+            why = 'belongs to a group, as its database says'
+            logging.error(f"[HA] {STATE_FILE} is missing but this instance {why} - staying "
+                          "passive until it is restored or unpaired")
+            _state = _missing_state(why)
+            return 'missing'
+        else:
+            mine = ''
+    if held != mine:
+        _note_member_in_db(mine)
+    return 'member' if mine else 'standalone'
 
 
 def _update(**changes):
@@ -639,6 +763,17 @@ def instance_id():
 
 def epoch():
     return int(_load().get('epoch') or 0)
+
+
+def lock_holder():
+    """(instance id, epoch) for a lock on shared storage. The id goes to disk first: a
+    standalone that never paired has saved nothing, gets a new id at every start, and
+    would read its own lock from before a restart as somebody else's."""
+    with _lock:
+        st = _load()
+        if not st.get('broken') and not os.path.exists(STATE_FILE):
+            _commit_locked(dict(st))
+        return st['instance_id'], int(st.get('epoch') or 0)
 
 
 def _epoch_value(value, low=0):
@@ -2067,6 +2202,8 @@ def accept_pairing(code_secret, standby_id, standby_url, standby_fp, standby_pub
         new = dict(st, role=ROLE_ACTIVE, epoch=new_epoch, pairing=None, signing_key=signing_key,
                    members=ms, source=None, tombstones=tombs, removed=None)
         _commit_locked(new)
+        _note_member_in_db(st['instance_id'])
+        _drop_recovery_locks(st['instance_id'])
         # the member list too, so the new standby can verify every other member the
         # day one of them is promoted, and who is out
         sealed = _seal(code_secret, {'field_key': base64.b64encode(field_key).decode(),
@@ -2172,6 +2309,8 @@ def join(code, own_url, own_fingerprint):
                     logging.warning(f"[HA] could not note the failed key write either: {e2}")
                 raise HaError('Paired, but the field key could not be written - check the config '
                               'directory and pair again')
+            _note_member_in_db(me)
+            _drop_recovery_locks(me)
             return peer()
 
     # something paired with us while the call was out. The active has taken us as
@@ -2235,7 +2374,10 @@ def unpair():
                    sync={}, tombstones={}, removed=None, role=ROLE_STANDALONE, epoch=0,
                    serve_assigned=False)
         _commit_locked(new)
-        return was
+    # now, not at the next boot: the route restarts only a former standby
+    _note_member_in_db('')
+    _drop_recovery_locks(st['instance_id'])
+    return was
 
 
 def _mark_removed(by, their_epoch):
@@ -2342,10 +2484,13 @@ def forget_peer(peer_id, whole_group=False):
         new = dict(st, members=ms)
         if new.get('source') not in ms:
             new['source'] = None
-        if not ms and was == ROLE_ACTIVE:
+        alone = not ms and was == ROLE_ACTIVE
+        if alone:
             new.update(role=ROLE_STANDALONE, member_secret=None)
         _commit_locked(new)
-        return 'member'
+    if alone:
+        _note_member_in_db('')
+    return 'member'
 
 
 REMOVE_UNCONFIRMED_ERROR = ('This instance has not answered as a standby under the current '
@@ -2412,6 +2557,8 @@ def remove_member(member_id, shut_down=False):
         if not ms:
             new.update(role=ROLE_STANDALONE, member_secret=None)
         _commit_locked(new)
+    if not ms:
+        _note_member_in_db('')
     return rec
 
 
@@ -2569,27 +2716,148 @@ def step_aside(new_epoch, reason):
 
 
 def restart_process(reason):
-    """Restart so managers and loops come up in the new role. Same order as the
-    other restart paths: systemd if it runs us, else exec ourselves."""
+    """Restart so managers and loops come up in the new role, a moment from now so the
+    answer to whoever asked gets out first. See leave_process for how."""
     def _go():
         time.sleep(1.5)
         logging.warning(f"[HA] restarting: {reason}")
+        leave_process()
+    threading.Thread(target=_go, daemon=True, name='ha-restart').start()
+
+
+# --- this process --------------------------------------------------------------
+#
+# MK Oct 2026 (#625) - a role change is a restart, and the restart is what stops every
+# thread still at work in the old role. Children were left out of it: an execv keeps
+# the pid, so an ssh or ipmitool started by the old role ran on next to the new one,
+# and `sudo systemctl restart` cannot work under the unit's NoNewPrivileges anyway.
+
+# process groups of children started for a step that must not outlive this process
+# (ssh, ipmitool), in a session of their own
+_child_lock = threading.Lock()
+_child_groups = set()
+_config_lock = {'fd': None}
+
+
+def register_child_group(pgid):
+    with _child_lock:
+        _child_groups.add(int(pgid))
+
+
+def forget_child_group(pgid):
+    with _child_lock:
+        _child_groups.discard(int(pgid))
+
+
+def _children():
+    """[(pid, process group)] of this process's children, from /proc. Empty without it."""
+    me, out = os.getpid(), []
+    try:
+        names = os.listdir('/proc')
+    except OSError:
+        return out
+    for name in names:
+        if not name.isdigit():
+            continue
         try:
-            r = subprocess.run(['systemctl', 'is-active', 'pegaprox'],
-                               capture_output=True, text=True, timeout=5)
-            if r.returncode == 0:
-                cmd = ['systemctl', 'restart', 'pegaprox']
-                if hasattr(os, 'geteuid') and os.geteuid() != 0:
-                    cmd = ['sudo', '-n'] + cmd
-                if subprocess.run(cmd, capture_output=True, timeout=30).returncode == 0:
-                    return
-        except Exception:
+            with open(f'/proc/{name}/stat', 'rb') as fh:
+                raw = fh.read()
+            # "pid (comm) state ppid pgrp ...", and comm may hold spaces and parentheses
+            fields = raw[raw.rindex(b')') + 2:].split()
+            if int(fields[1]) == me:
+                out.append((int(name), int(fields[2])))
+        except (OSError, ValueError, IndexError):
+            continue
+    return out
+
+
+def kill_children():
+    """SIGKILL every registered process group and every child of this process: a child
+    in a group of its own takes its group along, one in ours goes alone. Never raises."""
+    import signal
+    own = os.getpgrp()
+    with _child_lock:
+        groups = set(_child_groups)
+    loners = []
+    for pid, pgrp in _children():
+        if pgrp == own:
+            loners.append(pid)
+        else:
+            groups.add(pgrp)
+    for pgrp in groups:
+        if pgrp > 1 and pgrp != own:
+            try:
+                os.killpg(pgrp, signal.SIGKILL)
+            except OSError:
+                pass
+    for pid in loners:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
             pass
+
+
+def _supervised():
+    """Only when the admin says so (PEGAPROX_SUPERVISED=1): something starts this process
+    again once it exits. Not guessed from systemd: an exit counts against the unit's
+    start limit (5 in 120 s in systemd/pegaprox.service), and a few role changes in a
+    row would leave the service failed. Without it the children die first and the
+    process execs itself, as before."""
+    return os.environ.get('PEGAPROX_SUPERVISED', '').strip().lower() in ('1', 'true', 'yes')
+
+
+def leave_process():
+    """The way out for a restart. The children die first, then the process exits with
+    EXIT_RESTART where a supervisor starts it again (systemd also kills what is left in
+    the unit's cgroup, Docker the container), or it execs itself. Never returns."""
+    kill_children()
+    if not _supervised():
         try:
             os.execv(sys.executable, [sys.executable] + sys.argv)
-        except Exception:
-            os._exit(0)
-    threading.Thread(target=_go, daemon=True, name='ha-restart').start()
+        except Exception as e:
+            logging.error(f"[HA] could not exec PegaProx again ({e}) - exiting with {EXIT_RESTART}")
+    os._exit(EXIT_RESTART)
+
+
+def lock_config_dir(path=None):
+    """F1: hold an exclusive flock on LOCK_FILE for as long as this process runs. Two
+    processes on one config directory share the database, the state file and the
+    instance id, and both act. The descriptor is close-on-exec, so an execv restart
+    lets go of it and the new image takes it again.
+
+    Raises HaError when another process holds it. Without flock (no fcntl, a
+    filesystem that has no locks) it warns and goes on; returns the descriptor or None."""
+    path = path or LOCK_FILE
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as e:
+        logging.warning(f"[HA] cannot open {path} ({e}) - running without the config directory lock")
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        try:
+            holder = os.pread(fd, 16, 0).decode(errors='replace').strip()
+        except OSError:
+            holder = ''
+        os.close(fd)
+        if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            who = f'process {holder}' if holder.isdigit() else 'process'
+            raise HaError(f'Another PegaProx {who} runs on {os.path.dirname(os.path.abspath(path))} '
+                          '- one config directory takes one process')
+        logging.warning(f"[HA] cannot lock {path} ({e}) - running without the config directory lock")
+        return None
+    try:
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, f'{os.getpid()}\n'.encode(), 0)
+    except OSError:
+        pass
+    _config_lock['fd'] = fd
+    return fd
 
 
 # --- snapshot ------------------------------------------------------------------
@@ -3278,11 +3546,59 @@ def _after_apply():
 
 # --- talking to the other members ----------------------------------------------
 
+def _new_session(fingerprint):
+    import requests
+    sess = requests.Session()
+    if fingerprint:
+        from pegaprox.core.pbs import _PinnedFingerprintAdapter
+        sess.mount('https://', _PinnedFingerprintAdapter(fingerprint))
+    return sess
+
+
+# F9: one pinned session per member address for the calls that come every few seconds,
+# so they ride on a kept-alive connection instead of a TLS handshake each. {base url:
+# (fingerprint, session)}; a new pin or address gets a new session.
+_sessions_lock = threading.Lock()
+_kept_sessions = {}
+_MAX_KEPT_SESSIONS = 2 * MAX_MEMBERS
+
+
+def _kept_session(base_url, fingerprint):
+    key = base_url.rstrip('/')
+    gone = []
+    with _sessions_lock:
+        held = _kept_sessions.pop(key, None)
+        if held and held[0] == fingerprint:
+            _kept_sessions[key] = held
+            return held[1]
+        if held:
+            gone.append(held[1])
+        sess = _new_session(fingerprint)
+        _kept_sessions[key] = (fingerprint, sess)
+        # a member that moved leaves its old address behind
+        while len(_kept_sessions) > _MAX_KEPT_SESSIONS:
+            gone.append(_kept_sessions.pop(next(iter(_kept_sessions)))[1])
+    for old in gone:
+        old.close()
+    return sess
+
+
+def drop_kept_session(base_url, sess=None):
+    """Close the kept session for `base_url` (only if it is still `sess`, when given)."""
+    with _sessions_lock:
+        held = _kept_sessions.get(base_url.rstrip('/'))
+        if not held or (sess is not None and held[1] is not sess):
+            return
+        del _kept_sessions[base_url.rstrip('/')]
+    held[1].close()
+
+
 def _peer_call(method, base_url, fingerprint, path, json_body=None, auth=None,
-               headers=None, timeout=15):
+               headers=None, timeout=15, keep_alive=False):
     """One HTTPS call to another instance. `auth` is None (the pairing call) or a
     callable (method, path, body) -> headers, from _auth_for, that signs exactly the
-    bytes sent here."""
+    bytes sent here. `keep_alive` sends it on the member's kept session (F9) instead
+    of one of its own."""
     import requests
     from pegaprox.utils.url_security import is_safe_outbound_url
     url = base_url.rstrip('/') + path
@@ -3297,13 +3613,9 @@ def _peer_call(method, base_url, fingerprint, path, json_body=None, auth=None,
         h.update(auth(method, path, body))
     if headers:
         h.update(headers)
-    sess = requests.Session()
-    if fingerprint:
-        from pegaprox.core.pbs import _PinnedFingerprintAdapter
-        sess.mount('https://', _PinnedFingerprintAdapter(fingerprint))
-        verify = False
-    else:
-        verify = True
+    sess = _kept_session(base_url, fingerprint) if keep_alive else _new_session(fingerprint)
+    verify = not fingerprint
+    answered = False
     try:
         import urllib3
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -3316,8 +3628,10 @@ def _peer_call(method, base_url, fingerprint, path, json_body=None, auth=None,
         # Sent in chunks, it meets the cap the forward route sets for itself instead.
         data = (body[i:i + _FORWARD_CHUNK] for i in range(0, len(body), _FORWARD_CHUNK))
     try:
-        return sess.request(method, url, data=data, headers=h, verify=verify,
+        resp = sess.request(method, url, data=data, headers=h, verify=verify,
                             timeout=timeout, allow_redirects=False)
+        answered = True
+        return resp
     except requests.exceptions.SSLError as e:
         if fingerprint:
             raise PeerUnreachable(f'The peer certificate does not match the pinned fingerprint ({type(e).__name__})')
@@ -3336,7 +3650,11 @@ def _peer_call(method, base_url, fingerprint, path, json_body=None, auth=None,
     except requests.exceptions.RequestException as e:
         raise PeerUnreachable(f'Cannot reach the peer: {type(e).__name__}')
     finally:
-        sess.close()
+        if not keep_alive:
+            sess.close()
+        elif not answered:
+            # whatever broke may still sit in its pool: the next call starts afresh
+            drop_kept_session(base_url, sess)
 
 
 def _peer_error(resp, fallback):

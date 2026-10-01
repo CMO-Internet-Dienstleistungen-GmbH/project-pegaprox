@@ -2312,6 +2312,10 @@ def backup_config():
         
         # Server settings
         backup_data['server_settings'] = load_server_settings()
+        # MK Oct 2026 (#625) - whether this instance is in an HA group is its own fact: a
+        # standalone that restored it came up passive at its next start
+        from pegaprox.core import ha
+        backup_data['server_settings'].pop(ha.MEMBER_SETTING, None)
         # Remove sensitive data if not requested
         if not include_secrets:
             if 'smtp_password' in backup_data['server_settings']:
@@ -2632,8 +2636,12 @@ def restore_config():
                     # neither enable nor disable it, so we drop the backup's values and
                     # preserve the live consent state for BOTH keys.
                     _PROTECTED_CONSENT = ('hardware_monitoring', 'hardware_monitoring_redfish')
+                    # MK Oct 2026 (#625) - nor the HA member marker, which says whether this
+                    # instance is in a group. The export leaves it out; an older backup
+                    # still carries it.
+                    from pegaprox.core import ha
                     incoming_ss = {k: v for k, v in (data['server_settings'] or {}).items()
-                                   if k not in _PROTECTED_CONSENT}
+                                   if k not in _PROTECTED_CONSENT and k != ha.MEMBER_SETTING}
                     if mode == 'merge':
                         # Only update non-empty values
                         for key, value in incoming_ss.items():

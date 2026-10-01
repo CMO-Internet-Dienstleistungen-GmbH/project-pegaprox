@@ -380,6 +380,63 @@ def _extract_node_metric_rows(resp):
     return out
 
 
+# MK Oct 2026 (#625) - the recovery lock file names the instance, not the manager, so two
+# managers of this process on one node directory (the same cluster added twice, or two
+# clusters with a node of one name on one heartbeat path) each took the file for their
+# own. One holder per directory in this process: {lock directory: (manager, the Event
+# that ends its refreshing)}, the Event None while the manager is still taking it.
+_recovery_lock_guard = threading.Lock()
+_recovery_lock_owners = {}
+
+
+def drop_own_recovery_locks(instance_id):
+    """Remove the recovery lock files of `instance_id` from the heartbeat path of every
+    running manager, except in a directory a recovery of this process holds right now.
+    ha.py calls it when this instance leaves a group or joins one: its epoch counts
+    anew from then on, and a file from before stands in the way of that group's active.
+    Returns how many went."""
+    if not isinstance(instance_id, str) or not re.fullmatch(r'[0-9a-f]{32}', instance_id):
+        return 0
+    removed, seen = 0, set()
+    for mgr in list(_g.cluster_managers.values()):
+        cfg = getattr(mgr, 'ha_config', None)
+        storage = cfg.get('storage_heartbeat_path') if isinstance(cfg, dict) else None
+        if not storage or not isinstance(storage, str):
+            continue
+        root = os.path.realpath(os.path.join(storage, '.pegaprox', 'recovery'))
+        if root in seen:
+            continue
+        seen.add(root)
+        try:
+            nodes = os.listdir(root)
+        except OSError:
+            continue
+        for node in nodes:
+            lock_dir = os.path.realpath(os.path.join(root, node))
+            if os.path.dirname(lock_dir) != root:
+                continue
+            # under the guard, so no recovery takes the directory while we clear it
+            with _recovery_lock_guard:
+                if lock_dir in _recovery_lock_owners:
+                    continue
+                try:
+                    names = os.listdir(lock_dir)
+                except OSError:
+                    continue
+                for name in names:
+                    m = PegaProxManager._LOCK_NAME_RE.match(name)
+                    if not m or m.group(2) != instance_id:
+                        continue
+                    try:
+                        os.remove(os.path.join(lock_dir, name))
+                        removed += 1
+                    except OSError:
+                        pass
+    if removed:
+        logging.info(f"[HA] removed {removed} recovery lock file(s) this instance left behind")
+    return removed
+
+
 class PegaProxManager:
     """
     main cluster manager - NS
@@ -460,6 +517,7 @@ class PegaProxManager:
         self.ha_node_status = {}  # node -> status dict
         self.ha_lock = threading.Lock()
         self.ha_recovery_in_progress = {}
+        self.ha_recovery_locks = {}  # node -> the lock file this process created for it
         
         # load saved HA settings
         self._apply_ha_settings(getattr(config, 'ha_settings', {}) or {})
@@ -4572,6 +4630,7 @@ class PegaProxManager:
             self.ha_recovery_in_progress.pop(failed_node, None)
             return
         
+        locked = False
         try:
             # ============================================
             # STEP 0: Try to acquire recovery lock (if storage configured)
@@ -4580,6 +4639,7 @@ class PegaProxManager:
                 if not self._ha_acquire_recovery_lock(failed_node):
                     self.logger.warning(f"[HA] Another instance is already recovering {failed_node}")
                     return
+                locked = True
             
             # ============================================
             # SPLIT-BRAIN PREVENTION STEP 1: Wait period
@@ -4861,8 +4921,10 @@ class PegaProxManager:
         except Exception as e:
             self.logger.error(f"[HA] Error in recovery worker: {e}")
         finally:
-            # Release recovery lock
-            self._ha_release_recovery_lock(failed_node)
+            # only a lock this worker took: after a failed acquire the lock is the
+            # other instance's, and deleting it let both recover (#625)
+            if locked:
+                self._ha_release_recovery_lock(failed_node)
             
             # Keep recovery flag for a while to prevent duplicate recovery
             time.sleep(60)  # 60s cooldown, maybe make this configurable?
@@ -7106,6 +7168,9 @@ echo "AGENT_INSTALLED_OK"
                 heartbeat_file = os.path.join(heartbeat_dir, f'heartbeat_pegaprox_{self.id}')
                 heartbeat_data = {
                     'timestamp': datetime.now().isoformat(),
+                    # which PegaProx writes it, and under which epoch (#625)
+                    'instance_id': ha.instance_id(),
+                    'epoch': ha.epoch(),
                     'cluster_id': self.id,
                     'cluster_name': self.config.name,
                     'connected_to': self.current_host,
@@ -7192,7 +7257,10 @@ echo "AGENT_INSTALLED_OK"
                 'timestamp': datetime.now().isoformat(),
                 'target_node': target_node,
                 'reason': reason,
-                'issued_by': f'pegaprox_{self.id}',
+                # the instance, not the cluster: every instance has the same cluster id (#625)
+                'issued_by': f'pegaprox_{ha.instance_id()}',
+                'epoch': ha.epoch(),
+                'cluster_id': self.id,
                 'action_required': 'STOP_ALL_VMS',
                 'recovery_will_start_after': (datetime.now() + timedelta(seconds=60)).isoformat()
             }
@@ -7315,78 +7383,212 @@ echo "AGENT_INSTALLED_OK"
         self.logger.info(f"[HA] Node {target_node} heartbeat is stale - safe to proceed")
         return True
     
+    # MK Oct 2026 (#625) - one lock file per epoch and instance. The single file before
+    # named every instance "pegaprox_<cluster id>", so each one read it as its own, it
+    # was checked and then written, and a worker that lost returned through a finally
+    # that deleted the winner's lock. The directory stays per node name, not per
+    # cluster id: two instances that each added the same cluster have different ids
+    # for it and must still see each other's locks.
+    RECOVERY_LOCK_STALE = 300     # a same-epoch lock this old is a crashed holder's
+    RECOVERY_LOCK_SWEEP = 3600    # any other instance's lock this old is removed
+    RECOVERY_LOCK_REFRESH = 30    # the holder touches its file this often while it recovers
+    _LOCK_NAME_RE = re.compile(r'^(\d{1,10})-([0-9a-f]{32})$')
+    _LOCK_NODE_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
+
+    def _ha_recovery_lock_dir(self, failed_node: str):
+        """<storage>/.pegaprox/recovery/<node>, None without a storage path."""
+        storage_path = self.ha_config.get('storage_heartbeat_path')
+        if not storage_path:
+            return None
+        if not self._LOCK_NODE_RE.match(failed_node or ''):
+            raise ValueError(f'not a node name: {failed_node!r}')
+        heartbeat_dir = os.path.join(storage_path, '.pegaprox')
+        if not os.path.isdir(heartbeat_dir):
+            # the shared storage is not mounted here; never make the path ourselves
+            raise FileNotFoundError(heartbeat_dir)
+        base_real = os.path.realpath(heartbeat_dir)
+        lock_dir = os.path.realpath(os.path.join(heartbeat_dir, 'recovery', failed_node))
+        if os.path.commonpath([base_real, lock_dir]) != base_real:
+            raise ValueError('lock path escaped base directory')
+        return lock_dir
+
+    def _ha_lock_conflict(self, failed_node: str, details: str, action='ha.recovery_lock_conflict',
+                          log=None):
+        (log or self.logger.critical)(f"[HA] Recovery lock for {failed_node}: {details}")
+        try:
+            from pegaprox.utils.audit import log_audit
+            log_audit('system', action,
+                      f"Cluster {self.config.name}, node {failed_node}: {details}",
+                      cluster=self.config.name)
+        except Exception:
+            pass
+
+    def _ha_keep_recovery_lock(self, failed_node: str, path: str, stop):
+        """Touch our lock file until the recovery lets go of it. The others tell a live
+        holder from a dead one by the file's age, and a recovery can take longer than
+        RECOVERY_LOCK_STALE."""
+        while not stop.wait(self.RECOVERY_LOCK_REFRESH):
+            try:
+                os.utime(path)
+            except FileNotFoundError:
+                if not stop.is_set():
+                    self.logger.error(f"[HA] Recovery lock for {failed_node} is gone: {path}")
+                return
+            except OSError as e:
+                self.logger.warning(f"[HA] Could not refresh the recovery lock {path}: {e}")
+
     def _ha_acquire_recovery_lock(self, failed_node: str) -> bool:
         """Try to acquire a distributed lock for recovery
         
         Only one PegaProx instance should perform recovery at a time.
         This prevents multiple recovery attempts from different sources.
+
+        One manager of this process holds a node directory at a time. With that settled,
+        every file of this instance in it is one a recovery left behind (a restart, an
+        unpairing since), whatever its epoch: ours to take or to remove. Our file is
+        `<epoch>-<instance id>`, made with O_EXCL. Then the directory decides: a higher
+        epoch means this instance is the stale one, until that file has gone without a
+        refresh for RECOVERY_LOCK_SWEEP; the same epoch from another instance is a second
+        PegaProx on this cluster (until its file is RECOVERY_LOCK_STALE old); lower
+        epochs are a former holder's and do not count. The holder refreshes its file
+        every RECOVERY_LOCK_REFRESH until it lets go.
         """
-        storage_path = self.ha_config.get('storage_heartbeat_path')
-        if not storage_path:
-            return True  # No storage path, can't lock
-        
-        heartbeat_dir = os.path.join(storage_path, '.pegaprox')
-        lock_file = os.path.join(heartbeat_dir, f'recovery_lock_{failed_node}')
-        
+        path = lock_dir = None
+        reserved = acquired = False
         try:
-            # Check if lock exists and is recent
-            if os.path.exists(lock_file):
-                mtime = datetime.fromtimestamp(os.path.getmtime(lock_file))
-                age = (datetime.now() - mtime).total_seconds()
-                
-                if age < 300:  # Lock valid for 5 minutes
-                    # MK May 2026 (CodeAnt #507) — confine lock read to heartbeat_dir.
-                    base_real = os.path.realpath(heartbeat_dir)
-                    target_real = os.path.realpath(lock_file)
-                    if os.path.commonpath([base_real, target_real]) != base_real:
-                        raise Exception('lock path escaped base directory')
-                    with open(target_real, 'r') as f:
-                        import json
-                        lock_data = json.load(f)
+            lock_dir = self._ha_recovery_lock_dir(failed_node)
+            if lock_dir is None:
+                return True  # No storage path, can't lock
+            with _recovery_lock_guard:
+                owner = _recovery_lock_owners.get(lock_dir, (None, None))[0]
+                if owner is None:
+                    _recovery_lock_owners[lock_dir] = (self, None)
+                    reserved = True
+            if not reserved:
+                other = getattr(getattr(owner, 'config', None), 'name', '?')
+                self._ha_lock_conflict(failed_node, f"{lock_dir} is held by the recovery of cluster "
+                                       f"{other} in this PegaProx - one recovery per node directory; "
+                                       "is a cluster added twice, or do two clusters with this "
+                                       "node name share the heartbeat path?")
+                return False
+            me, my_epoch = ha.lock_holder()
+            name = f'{my_epoch}-{me}'
+            os.makedirs(lock_dir, exist_ok=True)
+            path = os.path.join(lock_dir, name)
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                # ours from before a restart (nobody in this process holds the
+                # directory): held from now on
+                os.utime(path)
+            else:
+                with os.fdopen(fd, 'w') as f:
+                    json.dump({'instance_id': me, 'epoch': my_epoch, 'cluster': self.config.name,
+                               'cluster_id': self.id, 'node': failed_node,
+                               'timestamp': datetime.now().isoformat()}, f)
+                    f.flush()
+                    os.fsync(f.fileno())
 
-                    if lock_data.get('holder') != f'pegaprox_{self.id}':
-                        self.logger.warning(f"[HA] Recovery lock held by {lock_data.get('holder')}")
-                        return False
+            now = time.time()
+            for other in sorted(os.listdir(lock_dir)):
+                m = self._LOCK_NAME_RE.match(other)
+                if not m or other == name:
+                    continue
+                their_epoch, them = int(m.group(1)), m.group(2)
+                other_path = os.path.join(lock_dir, other)
+                if them == me:
+                    # ours under another epoch, from a recovery cut short (a restart, then
+                    # an unpairing or a pairing). One above our epoch used to refuse us
+                    # for good
+                    try:
+                        os.remove(other_path)
+                    except OSError:
+                        pass
+                    continue
+                try:
+                    age = now - os.path.getmtime(other_path)
+                except OSError:
+                    continue   # released while we looked
+                if their_epoch > my_epoch:
+                    if age > self.RECOVERY_LOCK_SWEEP:
+                        # its holder refreshes it while it recovers: an hour without that
+                        # is a holder that died, or one that is in another group by now
+                        try:
+                            os.remove(other_path)
+                        except OSError:
+                            pass
+                        self._ha_lock_conflict(failed_node, f"{other_path} expired: instance {them} "
+                                               f"took it under epoch {their_epoch}, above ours "
+                                               f"({my_epoch}), and has not refreshed it for "
+                                               f"{int(age // 60)} min - removed",
+                                               action='ha.recovery_lock_expired',
+                                               log=self.logger.warning)
+                        continue
+                    self._ha_lock_conflict(failed_node, f"{other_path} is held by instance {them} "
+                                           f"under epoch {their_epoch}, above ours ({my_epoch}) - "
+                                           "this instance is the stale one and does not recover")
+                    os.remove(path)
+                    return False
+                if their_epoch == my_epoch and age < self.RECOVERY_LOCK_STALE:
+                    self._ha_lock_conflict(failed_node, f"{other_path} is held by instance {them} "
+                                           f"under the same epoch ({my_epoch}) - two PegaProx "
+                                           "instances manage this cluster; neither recovers "
+                                           "until one lets go")
+                    os.remove(path)
+                    return False
+                if age > self.RECOVERY_LOCK_SWEEP:
+                    try:
+                        os.remove(other_path)
+                    except OSError:
+                        pass
 
-            # Acquire lock
-            lock_data = {
-                'timestamp': datetime.now().isoformat(),
-                'holder': f'pegaprox_{self.id}',
-                'target_node': failed_node,
-                'cluster': self.config.name
-            }
-
-            # MK May 2026 (CodeAnt #507) — same gate on the write.
-            base_real = os.path.realpath(heartbeat_dir)
-            target_real = os.path.realpath(lock_file)
-            if os.path.commonpath([base_real, target_real]) != base_real:
-                raise Exception('lock path escaped base directory')
-            with open(target_real, 'w') as f:
-                import json
-                json.dump(lock_data, f)
-            
+            stop = threading.Event()
+            with _recovery_lock_guard:
+                _recovery_lock_owners[lock_dir] = (self, stop)
+            self.ha_recovery_locks[failed_node] = path
+            acquired = True
+            threading.Thread(target=self._ha_keep_recovery_lock, args=(failed_node, path, stop),
+                             daemon=True, name=f'ha-lock-{failed_node}').start()
             self.logger.info(f"[HA] ✓ Acquired recovery lock for {failed_node}")
             return True
             
         except Exception as e:
             self.logger.error(f"[HA] Error acquiring recovery lock: {e}")
+            if path and not acquired:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
             return False
+        finally:
+            if reserved and not acquired:
+                with _recovery_lock_guard:
+                    _recovery_lock_owners.pop(lock_dir, None)
     
     def _ha_release_recovery_lock(self, failed_node: str):
-        """Release the recovery lock"""
-        storage_path = self.ha_config.get('storage_heartbeat_path')
-        if not storage_path:
+        """Release the recovery lock: our own file, and only one this process took."""
+        path = self.ha_recovery_locks.pop(failed_node, None)
+        if not path:
             return
-        
-        heartbeat_dir = os.path.join(storage_path, '.pegaprox')
-        lock_file = os.path.join(heartbeat_dir, f'recovery_lock_{failed_node}')
-        
+        lock_dir = os.path.dirname(path)
+        with _recovery_lock_guard:
+            owner, stop = _recovery_lock_owners.get(lock_dir, (None, None))
+        if owner is self and stop is not None:
+            stop.set()
         try:
-            if os.path.exists(lock_file):
-                os.remove(lock_file)
-                self.logger.info(f"[HA] Released recovery lock for {failed_node}")
+            os.remove(path)
+            self.logger.info(f"[HA] Released recovery lock for {failed_node}")
+        except FileNotFoundError:
+            pass
         except Exception as e:
             self.logger.error(f"[HA] Error releasing recovery lock: {e}")
+        finally:
+            # the directory only after the file: a manager here that took it in between
+            # would meet our file under its own name
+            if owner is self:
+                with _recovery_lock_guard:
+                    if _recovery_lock_owners.get(lock_dir, (None,))[0] is self:
+                        del _recovery_lock_owners[lock_dir]
     
     def _ha_try_force_quorum(self, target_node: str) -> bool:
         """Force quorum on the surviving node in a 2-node cluster
