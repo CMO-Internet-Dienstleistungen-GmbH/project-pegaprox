@@ -9757,6 +9757,8 @@
         // v5: the switch that has a standby carry out what is done on it through the active
         // v6: the switch that has a standby serve users as an active instance; the active is
         //     the leader, the one that runs the automation
+        // v7: the words for the three kinds, the leader, a member that serves users and a plain
+        //     standby; read-only only where it is
         // ═══════════════════════════════════════════════
 
         // "3 minutes ago" in the UI language. Intl speaks all nine, so no keys for it.
@@ -9916,6 +9918,9 @@
             }, [code]);
 
             const role = status?.role || 'standalone';
+            // a standby that serves users is an active instance to them and gets its own words:
+            // consoles open here, a promote makes it the leader
+            const serving = role === 'standby' && status?.serving === true;
             // up to four instances: the active and the standbys that follow it. members is
             // everyone but this instance, so the count adds one for it
             const members = Array.isArray(status?.members) ? status.members : [];
@@ -10297,7 +10302,7 @@
                     {standby && (
                         <>
                             {row(t('pgHaManagers'), status.managers_running
-                                ? <span className="text-green-300">{t('pgHaManagersRunning')}</span>
+                                ? <span className="text-green-300">{t(serving ? 'pgHaManagersServing' : 'pgHaManagersRunning')}</span>
                                 : <span className="text-gray-400">{t('pgHaManagersOff')}</span>)}
                             {lastReload && row(t('pgHaLastReload'), (
                                 <span data-ha-last-reload>
@@ -10332,7 +10337,8 @@
             );
 
             // next to the live view in every role; a standby also says when it is on but has
-            // no active to hand things to
+            // no active to hand things to. A serving member keeps its consoles then, only the
+            // changes wait
             const forwardPaused = standby && forwardWrites && status?.forwarding === false;
             const forwardCard = (
                 <div className={card} data-ha-forward={forwardWrites ? 'on' : 'off'}>
@@ -10346,7 +10352,9 @@
                             className={`toggle-switch flex-shrink-0 disabled:opacity-50 disabled:cursor-not-allowed ${forwardWrites ? 'active' : ''}`} />
                     </div>
                     {forwardPaused && (
-                        <p className="text-xs text-yellow-300" data-ha-forward-paused>{t('pgHaForwardPaused')}</p>
+                        <p className="text-xs text-yellow-300" data-ha-forward-paused={serving ? 'serving' : 'standby'}>
+                            {t(serving ? 'pgHaForwardPausedServing' : 'pgHaForwardPaused')}
+                        </p>
                     )}
                 </div>
             );
@@ -10398,7 +10406,7 @@
             const typedBox = confirmAction && !(confirmAction === 'promote' && broken) && !removeStale && (
                 <div className="rounded-xl p-4 space-y-3 border bg-red-500/10 border-red-500/30" data-ha-confirm={confirmAction}>
                     <p className="text-sm text-red-300">
-                        {confirmAction === 'promote' ? `${t('pgHaPromoteDesc')} ${t('pgHaPromoteSyncFirst')}`
+                        {confirmAction === 'promote' ? (serving ? t('pgHaPromoteLeaderDesc') : `${t('pgHaPromoteDesc')} ${t('pgHaPromoteSyncFirst')}`)
                             : confirmAction === 'remove' ? t('pgHaRemoveDesc').replace('{name}', removing.url || removing.instance_id.slice(0, 8))
                             : role === 'standby' ? t('pgHaUnpairStandbyDesc') : t('pgHaUnpairActiveDesc')}
                     </p>
@@ -10406,7 +10414,7 @@
                         <div className="rounded-lg p-3 space-y-2 border bg-yellow-500/10 border-yellow-500/40" data-ha-promote-sync>
                             <div className="flex items-start gap-2 text-sm text-yellow-200">
                                 <span className="mt-0.5 flex-shrink-0"><Icons.AlertTriangle /></span>
-                                <span>{t('pgHaPromoteSyncFailed')}</span>
+                                <span>{t(serving ? 'pgHaPromoteLeaderSyncFailed' : 'pgHaPromoteSyncFailed')}</span>
                             </div>
                             <label className="flex items-start gap-2 text-sm text-gray-200 cursor-pointer">
                                 <input type="checkbox" checked={forcePromote} onChange={e => setForcePromote(e.target.checked)} className="mt-0.5" />
@@ -10440,7 +10448,7 @@
                     <div className="flex flex-wrap items-center gap-2">
                         <button onClick={confirmed} disabled={typed !== WORD[confirmAction] || needsPassword('confirm') || (needShutDown && !shutDown) || (needForce && !forcePromote) || !!busy}
                             className={`${btn} bg-red-600 hover:bg-red-700 text-white`}>
-                            {confirmAction === 'promote' ? t('pgHaPromote')
+                            {confirmAction === 'promote' ? t(serving ? 'pgHaPromoteLeader' : 'pgHaPromote')
                                 : confirmAction === 'remove' ? (needShutDown ? t('pgHaRemoveAnyway') : t('pgHaRemove'))
                                 : t('pgHaUnpair')}
                         </button>
@@ -10566,6 +10574,12 @@
                 );
             }
 
+            // what this instance is in its group: the leader, a member that serves users, or a
+            // plain standby. A removed one waits for nothing, the note below says what it is
+            const roleDesc = role === 'active' ? t('pgHaRoleDescLeader')
+                : serving ? t('pgHaRoleDescActive')
+                : role === 'standby' && !status.removed ? t('pgHaRoleDescStandby') : '';
+
             return (
                 <div className="space-y-4" data-ha-role={role}>
                     {restarting && <HaRestartOverlay t={t} expectRole={restarting} />}
@@ -10580,9 +10594,9 @@
                         </div>
                         <p className="text-sm text-gray-400 max-w-3xl">{t('pgHaIntro')}</p>
                         {role !== 'standalone' && (
-                            <p className="text-xs text-gray-400 max-w-3xl flex items-start gap-2" data-ha-automation>
+                            <p className="text-xs text-gray-400 max-w-3xl flex items-start gap-2" data-ha-automation={serving ? 'serving' : role}>
                                 <span className="flex-shrink-0"><Icons.Zap /></span>
-                                <span>{t('pgHaAutomationLeader')}</span>
+                                <span>{roleDesc ? `${roleDesc} ${t('pgHaAutomationLeader')}` : t('pgHaAutomationLeader')}</span>
                             </p>
                         )}
                         <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-gray-400">
@@ -10717,7 +10731,7 @@
                                     <button onClick={() => openConfirm('promote')} disabled={!!busy}
                                         className={`${btn} bg-yellow-600 hover:bg-yellow-700 text-white`}>
                                         <Icons.Zap />
-                                        {t('pgHaPromote')}
+                                        {t(serving ? 'pgHaPromoteLeader' : 'pgHaPromote')}
                                     </button>
                                 )}
                                 <button onClick={() => openConfirm('unpair')} disabled={!!busy} className={btnGhost}>

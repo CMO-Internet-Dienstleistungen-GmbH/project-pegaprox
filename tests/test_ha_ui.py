@@ -1558,7 +1558,7 @@ def test_runtime_the_live_view_switch_restarts_a_standby(open_app):
     app.see('This is a standby instance. Its clusters appear here after the next sync.')
     assert page.get_by_text('This is a standby instance. Its clusters appear here after the next sync.').count() == 2
     panel = _open_ha(app, 'standby')
-    switch = page.get_by_role('switch', name='Connect to the clusters while standing by (read only)')
+    switch = page.get_by_role('switch', name='Connect to the clusters while following the leader')
     assert switch.get_attribute('aria-checked') == 'true'
     text = panel.inner_text()
     assert 'Connected, read only' in text and 'Changing this restarts this instance.' in text
@@ -1573,7 +1573,7 @@ def test_runtime_the_live_view_switch_restarts_a_standby(open_app):
     app.see('It does not connect to the clusters while its live view is off.')
     assert page.get_by_text('It does not connect to the clusters while its live view is off.').count() == 2
     panel = _open_ha(app, 'standby')
-    switch = page.get_by_role('switch', name='Connect to the clusters while standing by (read only)')
+    switch = page.get_by_role('switch', name='Connect to the clusters while following the leader')
     assert switch.get_attribute('aria-checked') == 'false'
     assert 'Not connected' in panel.inner_text()
     assert not app.errors, app.errors
@@ -1586,9 +1586,9 @@ def test_runtime_the_live_view_switch_only_saves_elsewhere(open_app):
     text = panel.inner_text()
     assert 'unless its live view is off' in text          # the join warning
     assert 'Connected, read only' not in text and 'Changing this restarts' not in text
-    switch = page.get_by_role('switch', name='Connect to the clusters while standing by (read only)')
+    switch = page.get_by_role('switch', name='Connect to the clusters while following the leader')
     switch.click()
-    app.see('Saved. It applies once this instance runs as a standby.')
+    app.see('Saved. It applies once this instance follows a leader.')
     page.wait_for_function('() => document.querySelector("#pgha-live-view").getAttribute("aria-checked") === "false"',
                            timeout=3000)
     assert app.server.bodies['/api/ha/settings'] == [{'live_view': False}]
@@ -3281,7 +3281,8 @@ def test_the_panel_speaks_the_forwarding_contract(panel):
     assert 'disabled={!!busy || broken}' in card
     assert "{t('pgHaForwardWrites')}" in card and "{t('pgHaForwardWritesHint')}" in card
     assert 'const forwardPaused = standby && forwardWrites && status?.forwarding === false;' in body
-    assert "{forwardPaused && (" in card and "{t('pgHaForwardPaused')}" in card
+    assert "{forwardPaused && (" in card
+    assert "{t(serving ? 'pgHaForwardPausedServing' : 'pgHaForwardPaused')}" in card
     # next to the live view, in every role
     standalone = body[body.index("{role === 'standalone' && ("):body.index("{role === 'active' && (")]
     active = body[body.index("{role === 'active' && ("):body.index("{role === 'standby' && (")]
@@ -3523,8 +3524,8 @@ def test_runtime_the_forward_switch_turns_a_standby_read_only(open_app):
     banner = page.locator('[data-ha-banner="classic"]')
     assert banner.get_attribute('data-ha-forwarding') == 'on'
     panel = _open_ha(app, 'standby')
-    switch = page.get_by_role('switch', name='Forward actions to the active instance')
-    live = page.get_by_role('switch', name='Connect to the clusters while standing by (read only)')
+    switch = page.get_by_role('switch', name='Carry out changes through the leader')
+    live = page.get_by_role('switch', name='Connect to the clusters while following the leader')
     assert switch.get_attribute('aria-checked') == 'true'
     # next to the live view
     assert page.evaluate('([a, b]) => document.getElementById(a).closest(".grid") === '
@@ -3532,7 +3533,7 @@ def test_runtime_the_forward_switch_turns_a_standby_read_only(open_app):
     assert live.is_visible()
     assert panel.locator('[data-ha-forward-paused]').count() == 0
     switch.click()
-    assert _wait_for_toast(page, 'Saved. A standby only shows and acts on nothing.'), _toasts(page)
+    assert _wait_for_toast(page, 'Saved. While following the leader, this instance only shows and changes nothing.'), _toasts(page)
     assert app.server.bodies['/api/ha/settings'][-1] == {'forward_writes': False}
     # no restart for this one, and the banner follows at once
     assert page.locator('[role="alertdialog"]').count() == 0
@@ -3548,10 +3549,10 @@ def test_runtime_the_forward_switch_only_saves_on_an_active(open_app):
     app = open_app(role='active', layout='modern', forward_writes=False)
     page = app.page
     _open_ha(app, 'active')
-    switch = page.get_by_role('switch', name='Forward actions to the active instance')
+    switch = page.get_by_role('switch', name='Carry out changes through the leader')
     assert switch.get_attribute('aria-checked') == 'false'
     switch.click()
-    assert _wait_for_toast(page, 'Saved. A standby carries out actions through the active instance.'), _toasts(page)
+    assert _wait_for_toast(page, 'Saved. While following the leader, this instance carries out changes through it.'), _toasts(page)
     assert app.server.bodies['/api/ha/settings'][-1] == {'forward_writes': True}
     page.wait_for_function('() => document.getElementById("pgha-forward").getAttribute("aria-checked") === "true"',
                            timeout=5000)
@@ -3570,7 +3571,7 @@ def test_runtime_forwarding_on_without_an_active_says_it_is_paused(open_app, sou
         ('on' if source_active else 'off')
     assert (page.locator('button[title="Manage Groups"]').count() > 0) == source_active
     panel = _open_ha(app, 'standby')
-    assert page.get_by_role('switch', name='Forward actions to the active instance').get_attribute('aria-checked') == 'true'
+    assert page.get_by_role('switch', name='Carry out changes through the leader').get_attribute('aria-checked') == 'true'
     paused = panel.locator('[data-ha-forward-paused]')
     assert paused.count() == (0 if source_active else 1)
     if not source_active:
@@ -4032,7 +4033,7 @@ def test_the_serving_strings_say_no_em_dash():
     for lang, block in blocks.items():
         hint = re.search(r'^ +pgHaForwardWritesHint: (.*),$', block, re.M).group(1)
         assert OLD_CONSOLE_CLAUSE[lang] not in hint, lang
-    assert 'consoles open on the active instance unless this instance serves users' in blocks['en']
+    assert 'consoles open on the leader unless this instance serves users' in blocks['en']
     assert "{ code: 'de', flag: '\U0001F1E6\U0001F1F9'," in _read('web', 'src', 'contexts.js')
 
 
@@ -4248,7 +4249,7 @@ def test_runtime_the_serve_switch(open_app, live, forward):
     assert panel.locator('[data-ha-badge]').first.inner_text().strip() == 'Standby'
 
     switch.click()
-    assert _wait_for_toast(page, 'Saved. As a standby, this instance serves users as an active instance.'), _toasts(page)
+    assert _wait_for_toast(page, 'Saved. While following the leader, this instance serves users as an active instance.'), _toasts(page)
     assert app.server.bodies['/api/ha/settings'][-1] == {'serve_users': True}
     assert page.locator('[role="alertdialog"]').count() == 0
     page.wait_for_function('() => document.getElementById("pgha-serve").getAttribute("aria-checked") === "true"',
@@ -4266,7 +4267,7 @@ def test_runtime_the_serve_switch(open_app, live, forward):
         assert panel.locator('[data-ha-badge]').first.inner_text().strip() == 'Standby'
 
     switch.click()
-    assert _wait_for_toast(page, 'Saved. As a standby, this instance only stands by.'), _toasts(page)
+    assert _wait_for_toast(page, 'Saved. While following the leader, this instance is a plain standby.'), _toasts(page)
     assert app.server.bodies['/api/ha/settings'][-1] == {'serve_users': False}
     page.wait_for_function('() => document.querySelector("[data-ha-banner]")'
                            '.getAttribute("data-ha-serving") === "off"', timeout=5000)
@@ -4279,7 +4280,7 @@ def test_runtime_the_serve_switch_only_saves_on_an_active(open_app):
     _open_ha(app, 'active')
     switch = page.get_by_role('switch', name=SERVE_SWITCH)
     switch.click()
-    assert _wait_for_toast(page, 'Saved. As a standby, this instance serves users as an active instance.'), _toasts(page)
+    assert _wait_for_toast(page, 'Saved. While following the leader, this instance serves users as an active instance.'), _toasts(page)
     assert app.server.bodies['/api/ha/settings'][-1] == {'serve_users': True}
     page.wait_for_function('() => document.getElementById("pgha-serve").getAttribute("aria-checked") === "true"',
                            timeout=5000)
@@ -4301,7 +4302,8 @@ def test_runtime_the_leader_names_its_members(open_app):
     # unknown and False both read as a plain standby
     assert _seen(card, 'c') == 'Standby' and _seen(card, 'd') == 'Standby'
     line = panel.locator('[data-ha-automation]')
-    assert line.inner_text().strip() == 'Automation such as HA, balancing, schedules and alerts runs only on the leader.'
+    assert line.inner_text().strip() == (f'{ROLE_DESC["leader"]} '
+                                         'Automation such as HA, balancing, schedules and alerts runs only on the leader.')
     assert not app.errors, app.errors
 
 
@@ -4778,7 +4780,7 @@ def test_runtime_an_empty_list_on_a_serving_member(open_app, serve):
     assert page.get_by_text('read-only, after the next sync').count() == 0
     panel = _open_ha(app, 'standby')
     hint = panel.locator('[data-ha-live-view]').inner_text()
-    assert 'consoles open on it only while it serves users' in hint, hint
+    assert 'consoles open here when this instance serves users' in hint, hint
     assert 'Actions and consoles stay on the active instance' not in hint
     assert not app.errors, app.errors
 
@@ -4809,4 +4811,218 @@ def test_runtime_cloud_keeps_the_consoles_of_a_serving_member_with_the_leader_aw
     assert ('Console' in menu) == serve, menu
     assert (ON_ACTIVE in menu) != serve, menu
     assert not {'Start', 'Shutdown', 'Migrate', 'Delete'} & set(menu), menu
+    assert not app.errors, app.errors
+
+
+# -- the three kinds of instance in the HA tab (#625) ------------------------------------------
+#
+# A group has one leader (the automation and the configuration), members that serve users as
+# active instances (consoles there, the leader carries out their changes) and plain standbys
+# that wait to take over. The tab says which one this is and calls an instance read-only only
+# where it is: no forwarding, or the leader does not answer. A serving member is an active
+# instance to its users already, so its promote makes it the leader.
+
+ROLE_DESC = {
+    'leader': ('This instance is the leader: it holds the configuration the others copy and carries out '
+               'the changes they hand it.'),
+    'serving': ('This instance serves users as an active instance: consoles open here, and the leader carries '
+                'out every change.'),
+    'standby': 'This instance is a plain standby: it copies the configuration of the leader and waits to take over.',
+}
+AUTOMATION = 'Automation such as HA, balancing, schedules and alerts runs only on the leader.'
+INTRO = ('Run up to four PegaProx instances as one group. One is the leader: it runs the automation and holds '
+         'the configuration, which the others copy.')
+# what the old texts said about every standby, in each language
+READ_ONLY = {'de': ('schreibgeschützt', 'nur lesend'), 'en': ('read-only', 'read only'), 'zh': ('只读',),
+             'pl': ('tylko do odczytu', 'tylko odczyt'), 'fr': ('lecture seule',), 'es': ('solo lectura',),
+             'pt': ('somente leitura', 'somente para leitura'), 'ko': ('읽기 전용',), 'it': ('sola lettura',)}
+KIND_KEYS = ('pgHaRoleDescLeader', 'pgHaRoleDescActive', 'pgHaRoleDescStandby', 'pgHaForwardPausedServing',
+             'pgHaManagersServing', 'pgHaPromoteLeader', 'pgHaPromoteLeaderDesc', 'pgHaPromoteLeaderSyncFailed')
+KIND_REWORDED = ('pgHaIntro', 'pgHaLiveView', 'pgHaLiveViewHint', 'pgHaLiveViewSaved', 'pgHaForwardWrites',
+                 'pgHaForwardWritesHint', 'pgHaForwardOn', 'pgHaForwardOff', 'pgHaServeUsersHint', 'pgHaServeOn',
+                 'pgHaServeOff', 'pgHaJoinWarning')
+
+
+def _value(block, key):
+    return re.search(r'^ +%s: (.*),$' % key, block, re.M).group(1)
+
+
+def test_the_panel_says_what_each_kind_is(panel):
+    body = _function(panel, 'HaPanel')
+    assert "const serving = role === 'standby' && status?.serving === true;" in body
+    at = body.index('const roleDesc = ')
+    desc = body[at:body.index('return (', at)]
+    assert "role === 'active' ? t('pgHaRoleDescLeader')" in desc
+    assert ": serving ? t('pgHaRoleDescActive')" in desc
+    # a removed member waits for nothing
+    assert ": role === 'standby' && !status.removed ? t('pgHaRoleDescStandby') : '';" in desc
+    assert "data-ha-automation={serving ? 'serving' : role}" in body
+    assert "{roleDesc ? `${roleDesc} ${t('pgHaAutomationLeader')}` : t('pgHaAutomationLeader')}" in body
+
+
+def test_a_serving_member_gets_its_own_words_in_the_tab(panel):
+    body = _function(panel, 'HaPanel')
+    live = body[body.index('const liveViewCard = ('):body.index('const forwardCard = (')]
+    assert "t(serving ? 'pgHaManagersServing' : 'pgHaManagersRunning')" in live
+    box = body[body.index('const typedBox = '):body.index('const removalNote = ')]
+    assert "(serving ? t('pgHaPromoteLeaderDesc') : `${t('pgHaPromoteDesc')} ${t('pgHaPromoteSyncFirst')}`)" in box
+    assert "t(serving ? 'pgHaPromoteLeaderSyncFailed' : 'pgHaPromoteSyncFailed')" in box
+    assert "confirmAction === 'promote' ? t(serving ? 'pgHaPromoteLeader' : 'pgHaPromote')" in box
+    standby = body[body.index("{role === 'standby' && ("):]
+    assert "{t(serving ? 'pgHaPromoteLeader' : 'pgHaPromote')}" in standby
+
+
+def test_the_words_for_the_three_kinds():
+    blocks = _blocks()
+    for key in KIND_KEYS + KIND_REWORDED:
+        values = [_value(blocks[lang], key) for lang in LANGS]
+        for lang, value in zip(LANGS, values):
+            assert '\u2014' not in value, (lang, key)
+        # translated, not English copied over; Spanish and Portuguese share "Promover a líder"
+        assert len(set(values)) >= len(LANGS) - 1, key
+    # read-only only where it is: never for the group as a whole, a joining instance, the card
+    # title, the role lines or what a serving member is told. The live view hint and a plain
+    # standby's paused note keep it, each with its condition
+    for lang, block in blocks.items():
+        for key in ('pgHaIntro', 'pgHaLiveView', 'pgHaJoinWarning', 'pgHaRoleDescLeader', 'pgHaRoleDescActive',
+                    'pgHaRoleDescStandby', 'pgHaForwardPausedServing', 'pgHaManagersServing', 'pgHaServeUsersHint',
+                    'pgHaPromoteLeaderDesc', 'pgHaForwardOn', 'pgHaServeOn'):
+            value = _value(block, key)
+            assert not any(w in value for w in READ_ONLY[lang]), (lang, key, value)
+        for key in ('pgHaLiveViewHint', 'pgHaForwardPaused', 'pgHaManagersRunning'):
+            assert any(w in _value(block, key) for w in READ_ONLY[lang]), (lang, key)
+    en = blocks['en']
+    intro = _value(en, 'pgHaIntro')
+    for words in ('the leader', 'serve users as active instances', 'plain standbys'):
+        assert words in intro, words
+    hint = _value(en, 'pgHaLiveViewHint')
+    assert 'read-only without forwarding or while the leader does not answer' in hint, hint
+    for key in ('pgHaForwardWritesHint', 'pgHaServeUsersHint'):
+        assert 'While the leader does not answer, changes are paused' in _value(en, key), key
+    for key in ('pgHaForwardWrites', 'pgHaForwardWritesHint', 'pgHaForwardOn', 'pgHaPromoteLeader'):
+        value = _value(en, key)
+        assert 'leader' in value and 'active instance' not in value, key
+    assert _value(en, 'pgHaPromoteLeader') == "'Promote to leader'"
+    assert "{ code: 'de', flag: '\U0001F1E6\U0001F1F9'," in _read('web', 'src', 'contexts.js')
+
+
+# -- runtime ------------------------------------------------------------------------------------
+
+def _kind_app(open_app, kind, **kw):
+    if kind == 'leader':
+        app = open_app(role='active', layout='modern', **kw)
+        return app, _open_ha(app, 'active')
+    app = open_app(role='standby', layout='modern', forward_writes=True, serve_users=kind == 'serving', **kw)
+    return app, _open_ha(app, 'standby')
+
+
+@pytest.mark.parametrize('kind', ['leader', 'serving', 'standby'])
+def test_runtime_the_tab_says_what_each_kind_is(open_app, kind):
+    """The intro is the same on every member and names all three kinds; the line below it says
+    which one this is. Each kind is the counterproof of the other two."""
+    app, panel = _kind_app(open_app, kind)
+    text = panel.inner_text()
+    assert INTRO in text, text
+    assert 'show the clusters read-only while they wait' not in text
+    line = panel.locator('[data-ha-automation]')
+    assert line.get_attribute('data-ha-automation') == {'leader': 'active'}.get(kind, kind)
+    assert line.inner_text().strip() == f'{ROLE_DESC[kind]} {AUTOMATION}'
+    for other, words in ROLE_DESC.items():
+        assert (words in text) == (other == kind), other
+    # the cards name the leader on every kind, and the live view title no longer says read only
+    assert app.page.get_by_role('switch', name='Connect to the clusters while following the leader').count() == 1
+    assert app.page.get_by_role('switch', name='Carry out changes through the leader').count() == 1
+    assert '(read only)' not in text
+    assert not app.errors, app.errors
+
+
+def test_runtime_a_removed_member_is_not_said_to_wait(open_app):
+    app = open_app(role='standby', layout='modern', members=[])
+    app.server.removed = {'epoch': 3, 'at': _iso_ago(300), 'by': 'd' * 32}
+    panel = _open_ha(app, 'standby')
+    panel.locator('[data-ha-removed]').wait_for(timeout=5000)
+    assert panel.locator('[data-ha-automation]').inner_text().strip() == AUTOMATION
+    assert ROLE_DESC['standby'] not in panel.inner_text()
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('serve', [True, False])
+def test_runtime_a_serving_member_is_not_called_read_only(open_app, serve):
+    """The leader answers. A serving member opens consoles over its cluster connections, so the
+    tab does not call them read only; a plain standby (the counterproof) keeps the words."""
+    app, panel = _kind_app(open_app, 'serving' if serve else 'standby')
+    live = panel.locator('[data-ha-live-view]').inner_text()
+    assert ('Connected, consoles open here' in live) == serve, live
+    assert ('Connected, read only' in live) != serve, live
+    assert panel.locator('[data-ha-forward-paused]').count() == 0
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('serve', [True, False])
+def test_runtime_with_the_leader_away_a_serving_member_only_pauses_changes(open_app, serve):
+    """The leader does not answer. A serving member's changes wait, its consoles do not; a plain
+    standby (the counterproof) is read-only until it answers again."""
+    app, panel = _kind_app(open_app, 'serving' if serve else 'standby', source_active=False)
+    paused = panel.locator('[data-ha-forward-paused]')
+    assert paused.get_attribute('data-ha-forward-paused') == ('serving' if serve else 'standby')
+    text = paused.inner_text()
+    assert ('The leader does not answer right now: changes are paused until it does, live data and consoles '
+            'keep working here.' in text) == serve, text
+    assert ('this standby is read-only' in text) != serve, text
+    assert ('Connected, consoles open here' in panel.locator('[data-ha-live-view]').inner_text()) == serve
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('serve', [True, False])
+def test_runtime_a_serving_member_promotes_to_leader(open_app, serve):
+    """Same request, other words: a serving member is promoted to leader, a plain standby (the
+    counterproof) still to active."""
+    app, panel = _kind_app(open_app, 'serving' if serve else 'standby')
+    page = app.page
+    label, other = ('Promote to leader', 'Promote to active') if serve else ('Promote to active', 'Promote to leader')
+    assert panel.locator('button', has_text=other).count() == 0
+    panel.get_by_role('button', name=label).click()
+    box = panel.locator('[data-ha-confirm="promote"]')
+    text = box.inner_text()
+    assert ('This instance then becomes the leader' in text) == serve, text
+    assert ('The current leader steps down as soon as it sees this one.' in text) == serve, text
+    assert ('The old active instance steps down to standby' in text) != serve, text
+    assert ('If the active instance still answers' in text) != serve, text
+    page.fill('#pgha-typed', 'PROMOTE')
+    page.fill('#pgha-confirm-password', PASSWORD)
+    box.locator('button', has_text=label).click()
+    app.see('Restarting PegaProx...', timeout=3000)
+    assert app.server.bodies['/api/ha/promote'] == [{'confirm': 'PROMOTE', 'user_password': PASSWORD}]
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('serve', [True, False])
+def test_runtime_a_failed_pull_before_promoting_names_the_leader(open_app, serve):
+    refused = {('POST', '/api/ha/promote'): (409, {'code': 'HA_PROMOTE_SYNC',
+                                                   'error': 'Could not pull the latest configuration'})}
+    app, panel = _kind_app(open_app, 'serving' if serve else 'standby', extra=refused)
+    page = app.page
+    label = 'Promote to leader' if serve else 'Promote to active'
+    panel.get_by_role('button', name=label).click()
+    page.fill('#pgha-typed', 'PROMOTE')
+    page.fill('#pgha-confirm-password', PASSWORD)
+    panel.locator('[data-ha-confirm="promote"] button', has_text=label).click()
+    note = panel.locator('[data-ha-promote-sync]')
+    note.wait_for(timeout=3000)
+    text = note.inner_text()
+    assert ('The leader answers, but its latest configuration could not be fetched.' in text) == serve, text
+    assert ('The active instance answers' in text) != serve, text
+    assert 'Promote anyway, without the latest configuration' in text
+    assert not app.errors, app.errors
+
+
+def test_runtime_a_serving_member_speaks_german(open_app):
+    app = open_app(role='standby', layout='modern', language='de', forward_writes=True, serve_users=True)
+    app.page.locator('[data-ha-banner="classic"]').get_by_role('button', name='Hochverfügbarkeit').click()
+    panel = app.page.locator('[data-ha-role="standby"]')
+    panel.wait_for(timeout=5000)
+    line = panel.locator('[data-ha-automation]').inner_text()
+    assert line.startswith('Diese Instanz bedient Benutzer als aktive Instanz: Konsolen öffnen sich hier'), line
+    assert panel.get_by_role('button', name='Zum Leader hochstufen').count() == 1
+    assert 'Verbunden, Konsolen öffnen sich hier' in panel.inner_text()
     assert not app.errors, app.errors
