@@ -9759,6 +9759,8 @@
         //     the leader, the one that runs the automation
         // v7: the words for the three kinds, the leader, a member that serves users and a plain
         //     standby; read-only only where it is
+        // v8: who is active is set on the leader, per member, up to three with the leader.
+        //     The switch of v6 is gone; a member shows what the leader made it
         // ═══════════════════════════════════════════════
 
         // "3 minutes ago" in the UI language. Intl speaks all nine, so no keys for it.
@@ -9784,17 +9786,19 @@
             standalone: 'bg-gray-500/20 text-gray-300 border-gray-500/30',
             active: 'bg-green-500/20 text-green-300 border-green-500/30',
             serving: 'bg-blue-500/20 text-blue-300 border-blue-500/30',
+            pending: 'bg-blue-500/10 text-blue-300 border-blue-500/30 border-dashed',
             standby: 'bg-yellow-500/20 text-yellow-300 border-yellow-500/40',
         };
 
         // the active is the leader, it runs the automation. A standby that serves users is
         // an active instance to them and shows as one, every other standby as a standby.
-        function HaRoleBadge({ role, serving = false, t }) {
-            const shown = role === 'standby' && serving ? 'serving' : role;
+        // pending: the leader made it active, and it has not said yet that it serves
+        function HaRoleBadge({ role, serving = false, pending = false, t }) {
+            const shown = role === 'standby' && serving ? (pending ? 'pending' : 'serving') : role;
             const label = { standalone: t('pgHaRoleStandalone'), active: t('pgHaRoleLeader'), serving: t('pgHaRoleActive'),
-                            standby: t('pgHaRoleStandby') }[shown] || role || '-';
+                            pending: t('pgHaRoleActivePending'), standby: t('pgHaRoleStandby') }[shown] || role || '-';
             return (
-                <span data-ha-badge={shown || undefined}
+                <span data-ha-badge={shown || undefined} title={shown === 'pending' ? t('pgHaRoleActivePendingHint') : undefined}
                     className={`px-2 py-0.5 rounded-full border text-xs font-medium ${HA_ROLE_STYLE[shown] || HA_ROLE_STYLE.standalone}`}>
                     {label}
                 </span>
@@ -9927,6 +9931,13 @@
             const maxMembers = status?.max_members || 4;
             const standbyCount = status?.standby_count || 0;
             const groupFull = standbyCount >= maxMembers - 1;
+            // who is active is set on the leader, per member: the leader and up to two members
+            // (the limit counts the leader). Every member gets the list with serve in it.
+            const activeLimit = status?.active_limit || 3;
+            const actives = typeof status?.actives === 'number' ? status.actives
+                : 1 + members.filter(m => m.serve === true).length;
+            const activesFull = actives >= activeLimit;
+            const memberName = (m) => m.url || (m.instance_id || '').slice(0, 8);
             // the code on screen is spent once someone pairs with it: this instance turns active,
             // or its group grows. A removal hides it as well, and the open-code note shows instead.
             useEffect(() => { setCode(null); }, [role, standbyCount]);
@@ -10039,17 +10050,20 @@
                 refreshHa?.();
             });
 
-            // Serving users is this instance's own too and takes effect at once. It counts only
-            // on a standby with live view and forwarding on (status.serving says whether it does
-            // now): its users get consoles here and see an active instance, the automation
-            // stays with the leader.
-            const serveUsers = status?.serve_users === true;
-            const setServeUsers = (on) => run('serve', async () => {
-                const res = await send('PUT', 'settings', { serve_users: on });
-                if (!res.ok) { addToast?.(res.error, 'error'); return; }
-                addToast?.(t(on ? 'pgHaServeOn' : 'pgHaServeOff'), 'success');
+            // The leader makes a member active (or a standby again); the member follows at its
+            // next sync, with its live view and forwarding on, and says so in serving_seen.
+            // Past the limit the server refuses (HA_ACTIVE_LIMIT), its words go to the toast.
+            const setMemberServe = (m, on) => run('serve', async () => {
+                const res = await send('PUT', `members/${encodeURIComponent(m.instance_id)}/serve`, { serve: on });
+                if (!res.ok) { addToast?.(res.error, 'error'); load(); return; }
+                const serve = res.data.serve === true;
+                setStatus(s => ({
+                    ...(s || {}),
+                    ...(typeof res.data.actives === 'number' ? { actives: res.data.actives } : {}),
+                    members: (s?.members || []).map(x => x.instance_id === m.instance_id ? { ...x, serve } : x),
+                }));
+                addToast?.(t(serve ? 'pgHaMemberServeOn' : 'pgHaMemberServeOff').replace('{name}', memberName(m)), 'success');
                 load();
-                refreshHa?.();
             });
 
             // a live view switched since this standby started waits for a restart, this does
@@ -10173,9 +10187,13 @@
 
             // Everyone else in the group, as this instance knows them: on the active its
             // standbys, each with Remove; on a standby the active and the other standbys, with
-            // the one it pulls from marked as its source.
+            // the one it pulls from marked as its source. The leader also sets who is active.
             const cell = 'py-2 pr-4';
             const canRemove = role === 'active';
+            const canSetActive = role === 'active';
+            // the leader is always active; a member is what the leader made it, and "pending"
+            // until it said it serves. One never reached yet shows what it was made too.
+            const memberRole = (m) => m.role_seen === 'active' ? 'active' : m.serve === true ? 'standby' : m.role_seen;
             const membersCard = (
                 <div className={card} data-ha-members={members.length}>
                     <div className="flex flex-wrap items-center justify-between gap-3">
@@ -10183,9 +10201,16 @@
                             <Icons.Users />
                             {t('pgHaMembers')}
                         </h4>
-                        <span className="text-xs text-gray-400" data-ha-count>
-                            {t('pgHaMemberCount').replace('{n}', members.length + 1).replace('{max}', maxMembers)}
-                        </span>
+                        <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+                            {canSetActive && (
+                                <span className={`text-xs ${activesFull ? 'text-yellow-300' : 'text-gray-400'}`} data-ha-actives={actives}>
+                                    {t('pgHaActiveCount').replace('{n}', actives).replace('{max}', activeLimit)}
+                                </span>
+                            )}
+                            <span className="text-xs text-gray-400" data-ha-count>
+                                {t('pgHaMemberCount').replace('{n}', members.length + 1).replace('{max}', maxMembers)}
+                            </span>
+                        </div>
                     </div>
                     {members.length > 0 ? (
                         <div className="overflow-x-auto">
@@ -10199,6 +10224,7 @@
                                         <th className={`${cell} font-medium`}>{t('pgHaKey')}</th>
                                         <th className={`${cell} font-medium whitespace-nowrap`}>{t('pgHaLastContact')}</th>
                                         <th className={`${cell} font-medium whitespace-nowrap`}>{t('pgHaLastError')}</th>
+                                        {canSetActive && <th className={`${cell} font-medium`} title={t('pgHaActiveHint')}>{t('pgHaRoleActive')}</th>}
                                         {canRemove && <th className="py-2" />}
                                     </tr>
                                 </thead>
@@ -10217,7 +10243,9 @@
                                             </td>
                                             <td className={`${cell} font-mono text-xs text-gray-200 whitespace-nowrap`}>{m.url || '-'}</td>
                                             <td className={`${cell} whitespace-nowrap`}>
-                                                {m.role_seen ? <HaRoleBadge role={m.role_seen} serving={m.serving_seen === true} t={t} /> : '-'}
+                                                {memberRole(m)
+                                                    ? <HaRoleBadge role={memberRole(m)} serving={m.serve === true} pending={m.serving_seen !== true} t={t} />
+                                                    : '-'}
                                                 {/* confirmed: a standby under the current epoch. Only the active warns
                                                     about the others, since a removal there needs the second step */}
                                                 {m.confirmed_standby === true && (
@@ -10244,6 +10272,18 @@
                                                     ? <span className="text-red-300 break-all">{m.last_error}</span>
                                                     : <span className="text-gray-500">-</span>}
                                             </td>
+                                            {canSetActive && (
+                                                <td className={cell}>
+                                                    {/* a standby can only be made active while there is room; off always works */}
+                                                    <button type="button" role="switch" aria-checked={m.serve === true}
+                                                        aria-label={t('pgHaServeMember').replace('{name}', memberName(m))}
+                                                        title={activesFull && m.serve !== true ? t('pgHaActiveLimit').replace('{max}', activeLimit) : undefined}
+                                                        onClick={() => setMemberServe(m, m.serve !== true)}
+                                                        disabled={!!busy || broken || (activesFull && m.serve !== true)}
+                                                        data-ha-serve={m.serve === true ? 'on' : 'off'}
+                                                        className={`toggle-switch flex-shrink-0 disabled:opacity-50 disabled:cursor-not-allowed ${m.serve === true ? 'active' : ''}`} />
+                                                </td>
+                                            )}
                                             {canRemove && (
                                                 <td className="py-2 text-right">
                                                     <button onClick={() => openConfirm('remove', m)} disabled={!!busy} className={`${btnGhost} ml-auto`}>
@@ -10259,6 +10299,16 @@
                         </div>
                     ) : (
                         <p className="text-sm text-gray-400">{t('pgHaNoMembers')}</p>
+                    )}
+                    {canSetActive && members.length > 0 && (
+                        <div className="space-y-1">
+                            <p className="text-xs text-gray-500">{t('pgHaActiveHint')}</p>
+                            {activesFull && (
+                                <p className="text-xs text-yellow-300" data-ha-active-limit>
+                                    {t('pgHaActiveLimit').replace('{max}', activeLimit)}
+                                </p>
+                            )}
+                        </div>
                     )}
                 </div>
             );
@@ -10359,22 +10409,24 @@
                 </div>
             );
 
-            // below the two it needs: without either it does nothing, and says so
-            const serveIdle = !liveView || !forwardWrites;
-            const serveCard = (
-                <div className={`${card} md:col-span-2`} data-ha-serve={serveUsers ? 'on' : 'off'}>
-                    <div className="flex items-start justify-between gap-4">
-                        <div className="min-w-0">
-                            <label className="block text-sm font-medium text-white" htmlFor="pgha-serve">{t('pgHaServeUsers')}</label>
-                            <p className="text-xs text-gray-500 mt-1">{t('pgHaServeUsersHint')}</p>
-                        </div>
-                        <button id="pgha-serve" type="button" role="switch" aria-checked={serveUsers}
-                            onClick={() => setServeUsers(!serveUsers)} disabled={!!busy || broken}
-                            className={`toggle-switch flex-shrink-0 disabled:opacity-50 disabled:cursor-not-allowed ${serveUsers ? 'active' : ''}`} />
-                    </div>
-                    {serveIdle && (
-                        <p className="text-xs text-yellow-300" data-ha-serve-idle>{t('pgHaServeNeeds')}</p>
+            // On a member, below the two it needs: whether the leader made it active. Read only,
+            // the leader sets it. Made active without either of the two, it serves nobody, and says so.
+            const assigned = status?.serve_assigned === true;
+            const assignedIdle = assigned && (!liveView || !forwardWrites);
+            const assignedCard = !status?.removed && (
+                <div className={`${card} md:col-span-2`} data-ha-assigned={assigned ? 'on' : 'off'}>
+                    <h4 className="font-medium text-white flex items-center gap-2">
+                        <Icons.Users />
+                        {t('pgHaAssignedTitle')}
+                    </h4>
+                    <p className="text-sm text-gray-300">{t(assigned ? 'pgHaAssignedOn' : 'pgHaAssignedOff')}</p>
+                    {assignedIdle && (
+                        <p className="text-xs text-yellow-300" data-ha-serve-idle>{t('pgHaAssignedNeeds')}</p>
                     )}
+                    <p className="text-xs text-gray-500 flex items-start gap-2">
+                        <span className="flex-shrink-0"><Icons.Lock className="w-4 h-4" /></span>
+                        <span>{t('pgHaAssignedHint')}</span>
+                    </p>
                 </div>
             );
 
@@ -10657,7 +10709,6 @@
                             </div>
                             {liveViewCard}
                             {forwardCard}
-                            {serveCard}
                         </div>
                     )}
 
@@ -10672,7 +10723,6 @@
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 {liveViewCard}
                                 {forwardCard}
-                                {serveCard}
                             </div>
                             <div className="flex flex-wrap gap-2">
                                 <button onClick={() => openConfirm('unpair')} disabled={!!busy} className={btnGhost}>
@@ -10719,7 +10769,7 @@
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 {liveViewCard}
                                 {forwardCard}
-                                {serveCard}
+                                {assignedCard}
                             </div>
                             <div className="flex flex-wrap gap-2">
                                 <button onClick={syncNow} disabled={!!busy}
