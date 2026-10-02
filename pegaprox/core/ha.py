@@ -890,8 +890,9 @@ def member(member_id):
 
 
 def own_url():
-    """The address this instance gave out with its last pairing code, '' when it never
-    made one: a standby that joined, or an instance that never paired."""
+    """The address this instance is known at in its group: the one it gave out with
+    its last pairing code, or the one it joined with (kept up to date from the
+    leader's member list). '' when it has neither."""
     return _load().get('own_url') or ''
 
 
@@ -2392,7 +2393,8 @@ def join(code, own_url, own_fingerprint):
                                 signing_key=my_key, member_secret=None, members=ms,
                                 tombstones=_bounded_tombstones(tombs), removed=None,
                                 source=info['instance_id'], serve_assigned=False,
-                                cv={'joined': True}, change_gap=None))
+                                cv={'joined': True}, change_gap=None,
+                                own_url=own_url or st.get('own_url') or ''))
             try:
                 _install_field_key(field_key)
             except Exception as e:
@@ -3653,6 +3655,10 @@ def _adopt_group(snap):
                 # not listed at all is no flag either
                 own = _clean_entries(snap['members']).get(st['instance_id']) or {}
                 new['serve_assigned'] = own.get('serve') is True
+                # MK Oct 2026 (#625) - where the leader reaches this member; after a
+                # promotion it is also what the node agents are given to ask
+                if own.get('url'):
+                    new['own_url'] = own['url']
             their_epoch = _epoch_value(snap.get('epoch') or 0)
             if their_epoch is not None and their_epoch > int(st.get('epoch') or 0):
                 # never back to an active from before this one

@@ -311,6 +311,35 @@ def test_three_standbys_pair_with_the_active(group, seed):
     assert body['standby_count'] == 3 and body['max_members'] == 4 and body['role'] == 'active'
 
 
+def test_the_address_is_kept_at_the_join_already(group, seed):
+    g = group
+    _built(g, seed, 'b', sync=False)
+    assert g.state('b')['own_url'] == URLS['b']
+
+
+def test_a_member_keeps_the_address_it_joined_with(group, seed):
+    """A member stored no address of its own: own_url was only set by a pairing code.
+    Once promoted, it gave the node agents an address made from the IP the cluster
+    sees and the bind port instead of the one the group knows it by."""
+    g = group
+    _built(g, seed, 'bc')
+    for n in 'bc':
+        assert g.state(n)['own_url'] == URLS[n]
+    # the leader's member list keeps it current
+    st = g.state('a')
+    st['members'][IDS['c']]['url'] = 'https://standby-c.example:5443'
+    g.write('a', st)
+    admin = _admin(g.api, seed)
+    _sync(g, admin, 'c')
+    assert g.state('c')['own_url'] == 'https://standby-c.example:5443'
+    assert _promote(g, admin, 'b').status_code == 200
+    from pegaprox.core.manager import PegaProxManager
+    m = PegaProxManager.__new__(PegaProxManager)
+    m._get_pegaprox_server_ip = lambda: pytest.fail('the cluster was asked for our address')
+    with g.at('b'):
+        assert URLS['b'] in m._ha_agent_members()
+
+
 def test_a_fourth_standby_is_refused(group, seed):
     g = group
     admin = _built(g, seed, 'bcd', sync=False)
