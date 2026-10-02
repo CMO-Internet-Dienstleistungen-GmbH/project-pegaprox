@@ -186,7 +186,9 @@ def test_a_manager_is_built_with_the_ha_settings_as_before(env, pve):
     assert mgr.ha_config['node_ips'] == {'pve1': '10.0.0.1'}
     assert mgr.ha_config['self_fence_installed'] is True
     assert mgr.ha_config['quorum_enabled'] is True and mgr.ha_config['node_timeout'] == 60
-    assert 'fence_strategy' not in mgr.ha_config and 'pegaprox_vmid' not in mgr.ha_config
+    assert 'fence_strategy' not in mgr.ha_config
+    # read back from the stored settings since S6 (it was saved and never loaded)
+    assert mgr.ha_config['pegaprox_vmid'] == ''
 
 
 # --- a sync that commits and then fails -------------------------------------------------

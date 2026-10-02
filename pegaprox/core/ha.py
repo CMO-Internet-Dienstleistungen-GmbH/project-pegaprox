@@ -889,6 +889,12 @@ def member(member_id):
     return dict(rec, instance_id=member_id) if rec else None
 
 
+def own_url():
+    """The address this instance gave out with its last pairing code, '' when it never
+    made one: a standby that joined, or an instance that never paired."""
+    return _load().get('own_url') or ''
+
+
 def source_id():
     """The member a standby pulls from, None on any other instance or when it has
     lost it (the active unpaired while this one could not be told)."""

@@ -979,6 +979,51 @@ def dismiss_orphan(name):
     return jsonify({'success': True, 'orphans': ha.orphans_summary()})
 
 
+# --- node agents -----------------------------------------------------------------
+
+_AGENT_CLUSTER = re.compile(r'[A-Za-z0-9_.-]{1,64}')
+_AGENT_HEX = re.compile(r'[0-9a-f]+')
+AGENT_NOT_LEADER = 'standby'
+
+
+def _agent_mac(token, text):
+    return hmac.new(token.encode(), text.encode(), 'sha256').hexdigest()
+
+
+@bp.route('/api/ha/agent', methods=['GET'])
+def agent_leader_check():
+    """What the self-fence agent of a node asks: does this instance lead? (#625)
+
+    No session. The node shows that it belongs to the cluster with sig, an HMAC-SHA256
+    under the cluster's agent token over "pegaprox-agent ask <cluster> <nonce>". The
+    answer is one line of text: "leader <epoch> <mac>" from the instance that acts on
+    the clusters, "standby" from any other. The mac is under the same token, over
+    "pegaprox-agent leader <cluster> <nonce> <epoch>". Neither side sends the token, the
+    agent does not have to trust the certificate, and an answer fits one nonce only.
+    400 for a question that has no shape, 403 for one the token does not sign - an
+    unknown cluster answers the same, so the route does not say which clusters exist."""
+    cluster = request.args.get('cluster', '')
+    nonce = request.args.get('nonce', '')
+    sig = request.args.get('sig', '')
+    if not (_AGENT_CLUSTER.fullmatch(cluster) and len(nonce) == 32 and _AGENT_HEX.fullmatch(nonce)
+            and len(sig) == 64 and _AGENT_HEX.fullmatch(sig)):
+        return Response('bad request\n', status=400, mimetype='text/plain')
+    from pegaprox.globals import cluster_managers
+    cfg = getattr(cluster_managers.get(cluster), 'ha_config', None)
+    token = cfg.get('agent_token') if isinstance(cfg, dict) else None
+    known = isinstance(token, str) and len(token) == 64 and bool(_AGENT_HEX.fullmatch(token))
+    # the same work for a cluster that is not there, so the time it takes says nothing
+    signed = hmac.compare_digest(
+        _agent_mac(token if known else '0' * 64, f'pegaprox-agent ask {cluster} {nonce}'), sig)
+    if not (signed and known):
+        return Response('forbidden\n', status=403, mimetype='text/plain')
+    if not ha.is_active():
+        return Response(f'{AGENT_NOT_LEADER}\n', mimetype='text/plain')
+    epoch = ha.epoch()
+    mac = _agent_mac(token, f'pegaprox-agent leader {cluster} {nonce} {epoch}')
+    return Response(f'leader {epoch} {mac}\n', mimetype='text/plain')
+
+
 # --- peer ------------------------------------------------------------------------
 
 # where request_peer keeps its verdict: on the request itself. flask.g belongs to the

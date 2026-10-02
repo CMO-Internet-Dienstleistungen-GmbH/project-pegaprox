@@ -867,6 +867,8 @@ def _recovery_fake():
     fake = MagicMock()
     fake.ha_config = {'recovery_delay': 30, 'quorum_enabled': True,
                       'verify_network_before_recovery': True, 'storage_heartbeat_enabled': True}
+    # what the worker waits: recovery_delay, on a node without the v2 agent
+    fake._ha_fence_timing.return_value = {'wait': 30}
     fake._ha_check_node_agent_heartbeat.return_value = {'alive': False, 'age_seconds': None}
     fake.ha_lock = threading.Lock()
     fake.ha_node_status = {'pve2': {'status': 'offline'}}
@@ -879,6 +881,9 @@ def _recovery_fake():
     fake._ha_check_quorum.return_value = True
     fake._ha_verify_network.return_value = True
     fake._ha_fence_node.return_value = True
+    # the safety rules of S6: a quorate cluster, so nothing to fence and read back
+    fake._ha_recovery_allowed.return_value = []
+    fake._ha_fence_verified.return_value = False
     fake._ha_get_vms_on_node.return_value = [{'vmid': 100, 'name': 'a', 'type': 'qemu'},
                                              {'vmid': 101, 'name': 'b', 'type': 'qemu'}]
     fake._ha_get_available_nodes.return_value = ['pve1']
@@ -935,6 +940,9 @@ def test_a_recovery_stops_at_the_next_step_once_this_instance_is_a_standby(
     mgrmod.PegaProxManager._ha_recovery_worker(fake, 'pve2')
 
     assert _acted(fake) == expected
+    # asking whether the recovery may run writes the cluster claim: after the delay,
+    # and not at all once this instance stepped down
+    assert fake._ha_recovery_allowed.call_count == (0 if step_down_at in ('start', 'delay') else 1)
     if step_down_at == 'start':
         assert naps == [] and fake._ha_release_recovery_lock.call_count == 0
         assert 'pve2' not in fake.ha_recovery_in_progress
@@ -1196,7 +1204,8 @@ def test_live_view_managers_leave_the_nodes_and_the_synced_rows_alone(which, env
                 h.close()
                 m.logger.removeHandler(h)
 
-    agents_stopped = [c for c in ssh[before_stop:] if 'systemctl stop pegaprox-agent' in ' '.join(map(str, c))]
+    agents_stopped = [c for c in ssh[before_stop:]
+                      if 'systemctl stop pegaprox-fence-agent.service' in ' '.join(map(str, c))]
     token_posts = [u for method, u in http if method == 'POST' and '/token/' in u]
     assert ('POST', 'https://10.0.0.1:8006/api2/json/access/ticket') in http
     if which == 'standby':

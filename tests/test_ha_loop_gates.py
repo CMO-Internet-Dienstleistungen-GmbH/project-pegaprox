@@ -74,7 +74,9 @@ GATES = [
      ['_ha_check_nodes', '_ha_update_fallback_hosts'], []),
     ('pegaprox/core/manager.py', 'PegaProxManager._ha_recovery_worker',
      ['_ha_acquire_recovery_lock', '_ha_ssh_stop_vms_on_node', '_ha_write_poison_pill',
-      '_ha_fence_node', '_ha_start_vm_on_node'], []),
+      '_ha_fence_node', '_ha_start_vm_on_node',
+      # the claim write and the fence that is read back (S6)
+      '_ha_recovery_allowed', '_ha_fence_outside'], []),
     ('pegaprox/core/manager.py', 'PegaProxManager.get_efficient_snapshots',
      ['_node_ssh_exec', 'update_efficient_snapshot_disks', 'update_efficient_snapshot_status'],
      ['get_efficient_snapshots']),

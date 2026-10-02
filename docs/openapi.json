@@ -5193,6 +5193,118 @@
         ]
       }
     },
+    "/api/clusters/{cluster_id}/ha/agent-check": {
+      "post": {
+        "operationId": "clusters.check_ha_agents_post",
+        "tags": [
+          "clusters"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "The install check: which agents every node of the cluster runs (#625).",
+        "description": "Read over SSH from each node. For every node: the self-fence agent's version\n(0 none, 1 the agent that pings one PegaProx address, 2 quorum first), its mode,\nwhether it runs and whether it is the script this instance would install now;\nwhether the node agent is there; and, where the agents ask the PegaProx instances\nfor the leader, the instances the node cannot reach. `outdated` names the nodes\nbelow the current version, `unreachable` the ones that did not answer. An outdated\nagent keeps running as it is: `outdated_warning` says so and that the install\nfrom the HA settings replaces it.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "ha.config"
+        ]
+      }
+    },
+    "/api/clusters/{cluster_id}/ha/claim": {
+      "post": {
+        "operationId": "clusters.set_cluster_claim_post",
+        "tags": [
+          "clusters"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Switch the cluster claim of one cluster on or off, or release a foreign claim (#625).",
+        "description": "The claim is off unless an admin switches it on. With it on, PegaProx writes\n/etc/pve/pegaprox/claim into the cluster's file system; node recovery then runs\nonly while that file names this instance, and its SSH steps are refused at the\nnode otherwise. The HA status of the cluster carries the full warning text.\n\naction \"enable\" wants confirm \"WRITE CLAIM\", \"release\" (write over the claim of\nanother instance) wants \"RELEASE CLAIM\", \"disable\" removes our claim again. All\nthree want user_password, like the instance HA routes; no API token.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-roles": [
+          "admin"
+        ]
+      }
+    },
     "/api/clusters/{cluster_id}/proxmox-ha/resources": {
       "get": {
         "operationId": "clusters.get_proxmox_ha_resources_get",
@@ -43839,6 +43951,25 @@
         "x-pegaprox-roles": [
           "admin"
         ]
+      }
+    },
+    "/api/ha/agent": {
+      "get": {
+        "operationId": "ha.agent_leader_check_get",
+        "tags": [
+          "ha"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          }
+        },
+        "summary": "What the self-fence agent of a node asks: does this instance lead? (#625)",
+        "description": "No session. The node shows that it belongs to the cluster with sig, an HMAC-SHA256\nunder the cluster's agent token over \"pegaprox-agent ask <cluster> <nonce>\". The\nanswer is one line of text: \"leader <epoch> <mac>\" from the instance that acts on\nthe clusters, \"standby\" from any other. The mac is under the same token, over\n\"pegaprox-agent leader <cluster> <nonce> <epoch>\". Neither side sends the token, the\nagent does not have to trust the certificate, and an answer fits one nonce only.\n400 for a question that has no shape, 403 for one the token does not sign - an\nunknown cluster answers the same, so the route does not say which clusters exist.",
+        "x-pegaprox-auth": "public"
       }
     },
     "/api/ha/peer/pair": {

@@ -4287,8 +4287,15 @@ class PegaProxManager:
         and the stored settings do not carry (fence_strategy, scsi_keys, node_ips)
         stay as they are."""
         previous = getattr(self, 'ha_config', None) or {}
+        # a stored value the timing cannot count with (a bool, a string) is not kept:
+        # see _ha_fence_timing
         self.ha_failure_threshold = saved_ha.get('failure_threshold', 3)
-        
+        if not self._ha_countable(self.ha_failure_threshold):
+            self.ha_failure_threshold = 3
+        recovery_delay = saved_ha.get('recovery_delay', 30)
+        if not self._ha_countable(recovery_delay):
+            recovery_delay = 30
+
         # split-brain stuff (complicated, dont touch) - NS
         ha_config = {
             'quorum_enabled': saved_ha.get('quorum_enabled', True),
@@ -4330,7 +4337,7 @@ class PegaProxManager:
             # Timing - defaults tuned for 3-node ceph setups (most common in the field)
             # for 2-node with shared storage, recovery_delay should be higher (45-60)
             # because the surviving node needs time to import the pool locks
-            'recovery_delay': saved_ha.get('recovery_delay', 30),  # seconds before recovery starts
+            'recovery_delay': recovery_delay,  # seconds before recovery starts
             'node_timeout': saved_ha.get('node_timeout', 60),  # node must be dead this long
             'ssh_connect_timeout': saved_ha.get('ssh_connect_timeout', 10),  # ssh timeout per node
             
@@ -4349,7 +4356,30 @@ class PegaProxManager:
             
             # Node IPs (auto-discovered but can be overridden)
             'node_ips': saved_ha.get('node_ips', {}),  # node_name -> ip
+
+            # was saved but never read back, so it was gone after a restart and the
+            # next agent deploy carried no VM
+            'pegaprox_vmid': saved_ha.get('pegaprox_vmid', ''),
+            # the key the self-fence agents and the instances share, and what each
+            # node was last seen running
+            'agent_token': saved_ha.get('agent_token', ''),
+            'fence_agent_versions': saved_ha.get('fence_agent_versions', {}),
+            # the cluster claim in /etc/pve/pegaprox: off unless an admin switched it on
+            'claim_enabled': saved_ha.get('claim_enabled') is True,
+            # how each node is powered off: {node: {type, host, user, password}}
+            'fencing': self._stored_fencing(saved_ha.get('fencing')),
         }
+        # MK Oct 2026 (#625) - node recovery follows the safety rules (quorate API host,
+        # quorum forced only after a fence that was read back) unless this is set. A
+        # setup that forced quorum before the rules existed has no such key yet: it
+        # keeps what it had, and the HA status says so. Every writer of the stored
+        # settings writes the key, and a node fence could not be stored before it
+        # existed, so a missing key is such a setup whatever else the row holds.
+        if 'unsafe_two_node_recovery' in saved_ha:
+            ha_config['unsafe_two_node_recovery'] = saved_ha['unsafe_two_node_recovery'] is True
+        else:
+            ha_config['unsafe_two_node_recovery'] = bool(
+                saved_ha.get('two_node_mode') or saved_ha.get('force_quorum_on_failure'))
         for key, value in previous.items():
             if key not in ha_config or (key == 'node_ips' and key not in saved_ha):
                 ha_config[key] = value
@@ -4443,10 +4473,24 @@ class PegaProxManager:
             self.logger.info("[HA] Split-brain protection: SSH verification active")
         
         # Restart self-fence agents if they were installed - NS Jan 2026
+        # and bring the script of the v2 ones up to date: this may be a new leader (#625)
         if self.ha_config.get('self_fence_installed'):
             self.logger.info("[HA] 🛡️ Restarting self-fence agents on nodes...")
-            threading.Thread(target=self._ha_start_self_fence_agents, daemon=True).start()
-    
+            threading.Thread(target=self._ha_bring_up_fence_agents, daemon=True).start()
+
+        # the switch goes into the stored settings with the next save, so it is this
+        # setup's from now on and not worked out again (#625)
+        stored = getattr(self.config, 'ha_settings', None)
+        if isinstance(stored, dict) and 'unsafe_two_node_recovery' not in stored:
+            stored['unsafe_two_node_recovery'] = self.ha_config.get('unsafe_two_node_recovery') is True
+        if self._ha_unsafe_two_node():
+            self.logger.warning("[HA] ⚠️ Unsafe two-node recovery is on for this cluster: quorum is "
+                                "forced without a verified fence, as before the update. Configure "
+                                "IPMI fencing and switch it off in the HA settings.")
+        # the cluster claim, where an admin switched it on
+        if self._ha_claim_enabled():
+            threading.Thread(target=self._ha_claim_ensure, daemon=True).start()
+
     def stop_ha_monitor(self):
         # MK Sep 2026 (#625) - self_fence_installed comes from the synced clusters row, so
         # on a PegaProx standby (or wherever the monitor never ran) it describes agents the
@@ -4491,12 +4535,15 @@ class PegaProxManager:
                 if update_counter >= 6:
                     self._ha_update_fallback_hosts()
                     update_counter = 0
-                    
+                    # a member was paired or removed: the agents still name the old group
+                    if self._ha_agent_members_changed():
+                        self._ha_redeploy_in_background('the PegaProx instances changed')
+
             except Exception as e:
                 self.logger.error(f"[HA] Error in HA monitor: {e}")
             
-            # Wait 10 seconds between checks
-            for _ in range(10):
+            # ha_check_interval (10 s) between checks, the number _ha_fence_timing counts with
+            for _ in range(self._ha_interval()):
                 if not self.ha_enabled or self.stop_event.is_set():
                     break
                 time.sleep(1)
@@ -4524,12 +4571,18 @@ class PegaProxManager:
             
             nodes = resp.json().get('data', [])
             current_time = datetime.now()
-            
+
+            # a node down, as this host sees it: is this host the one outside? Then
+            # the nodes are judged from the quorate side, on the next pass (#625)
+            if any(n.get('status') != 'online' for n in nodes) \
+                    and self._ha_cluster_quorum()[0] is False and self._ha_move_to_quorate_side():
+                return
+
             with self.ha_lock:
                 for node in nodes:
                     node_name = node.get('node')
                     node_status = node.get('status', 'unknown')
-                    
+
                     # init tracking for new nodes
                     if node_name not in self.ha_node_status:
                         self.ha_node_status[node_name] = {
@@ -4551,7 +4604,10 @@ class PegaProxManager:
                             self.ha_node_status[node_name]['status'] = 'online'
                             # Clear recovery flag
                             self.ha_recovery_in_progress.pop(node_name, None)
-                            
+                            self._ha_recovery_settled(node_name)
+                            # it may have been away while the agents were brought up to date
+                            self._ha_redeploy_in_background('node back online', node_name)
+
                             # NS: Restore quorum if all nodes are back online
                             self._ha_check_restore_quorum()
                             
@@ -4599,7 +4655,18 @@ class PegaProxManager:
                                 else:
                                     # Trigger HA recovery
                                     self._ha_trigger_recovery(node_name)
-                    
+                            elif (node_name in self.__dict__.get('_ha_recovery_retry', ())
+                                    and node_name not in self.nodes_in_maintenance
+                                    and node_name not in self.ha_recovery_in_progress):
+                                # MK Oct 2026 (#625) - the recovery above runs once, on the
+                                # pass that turns the node offline. A refusal for a reason
+                                # that passes (the claim lock busy for a moment, one read of
+                                # /cluster/status that timed out) ended it for good, with the
+                                # node still down. Such a refusal is tried again once the
+                                # cooldown of the last attempt is over.
+                                self.logger.info(f"[HA] Node {node_name} is still offline, trying its recovery again")
+                                self._ha_trigger_recovery(node_name)
+
                     self.ha_node_status[node_name]['last_status'] = node_status
                     
         except Exception as e:
@@ -4631,6 +4698,7 @@ class PegaProxManager:
             return
         
         locked = False
+        must_fence = []
         try:
             # ============================================
             # STEP 0: Try to acquire recovery lock (if storage configured)
@@ -4644,7 +4712,9 @@ class PegaProxManager:
             # ============================================
             # SPLIT-BRAIN PREVENTION STEP 1: Wait period
             # ============================================
-            recovery_delay = self.ha_config.get('recovery_delay', 30)
+            # recovery_delay, and where the node runs the v2 agent no less than that
+            # one needs to fence itself: see _ha_fence_timing
+            recovery_delay = self._ha_fence_timing(failed_node)['wait']
             self.logger.info(f"[HA] Waiting {recovery_delay}s before recovery (split-brain prevention)...")
             time.sleep(recovery_delay)
             
@@ -4658,7 +4728,13 @@ class PegaProxManager:
             if not ha.is_active():
                 self.logger.warning(f"[HA] Recovery of {failed_node} dropped - this PegaProx instance stepped down")
                 return
-            
+
+            # before anything is done to the node: only from the quorate side of the
+            # cluster, see _ha_recovery_allowed (#625)
+            must_fence = self._ha_recovery_allowed(failed_node)
+            if must_fence is None:
+                return
+
             # ============================================
             # SPLIT-BRAIN PREVENTION STEP 2: SSH CHECK (AUTOMATIC!)
             # ============================================
@@ -4827,7 +4903,10 @@ class PegaProxManager:
             if not ha.is_active():
                 self.logger.warning(f"[HA] Recovery of {failed_node} dropped - this PegaProx instance stepped down")
                 return
-            fenced = self._ha_fence_node(failed_node)
+            # quorum will be forced: not before every node outside is off, read back
+            if must_fence and not self._ha_fence_outside(failed_node, must_fence):
+                return
+            fenced = self._ha_fence_verified(failed_node) or self._ha_fence_node(failed_node)
             if fenced:
                 self.logger.info(f"[HA] ✓ Hardware fencing successful for {failed_node}")
             
@@ -4925,7 +5004,10 @@ class PegaProxManager:
             # other instance's, and deleting it let both recover (#625)
             if locked:
                 self._ha_release_recovery_lock(failed_node)
-            
+            # a fence that was read back covers this recovery only
+            for node in must_fence or ():
+                self.__dict__.get('_ha_verified_fences', {}).pop(node, None)
+
             # Keep recovery flag for a while to prevent duplicate recovery
             time.sleep(60)  # 60s cooldown, maybe make this configurable?
             self.ha_recovery_in_progress.pop(failed_node, None)
@@ -5218,9 +5300,14 @@ class PegaProxManager:
             two_node_mode = self.ha_config.get('two_node_mode', False)
             force_quorum = self.ha_config.get('force_quorum_on_failure', False)
             
-            if two_node_mode or force_quorum:
+            if (two_node_mode or force_quorum) and not self._ha_may_force_quorum(original_node):
+                # not without a fence of the other node that was read back. On a
+                # quorate cluster nothing needs forcing anyway.
+                self.logger.info(f"[HA] Quorum is not forced on {target_node}: no fence of "
+                                 f"{original_node} was read back")
+            elif two_node_mode or force_quorum:
                 self.logger.info(f"[HA] Forcing quorum on {target_node} (2-node mode)")
-                
+
                 if self._ha_try_force_quorum(target_node):
                     self.logger.info(f"[HA] ✓ Quorum forced successfully")
                     time.sleep(3)  # Give corosync/pmxcfs time to update
@@ -5312,6 +5399,673 @@ class PegaProxManager:
             self.logger.error(f"[HA] Error starting VM {vmid} on {target_node}: {e}")
             return False
     
+    # ═══════════════════════════════════════════════════════════════════════════
+    # NODE-HA SAFETY RULES AND THE CLUSTER CLAIM - MK Oct 2026 (#625)
+    #
+    # _ha_check_quorum below pings hosts outside the cluster and never asks
+    # corosync, so an instance next to the minority half of a split recovered
+    # from there, and two_node_mode / force_quorum_on_failure ran
+    # `pvecm expected 1` whether or not the other node was really off.
+    #
+    # Now a recovery runs only when the API host reports the cluster quorate, and
+    # quorum is forced only after a fence that was read back. Setups that had
+    # two_node_mode or force_quorum_on_failure before this keep the old way behind
+    # unsafe_two_node_recovery, which the HA status reports.
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    FENCE_VERIFY_READS = 6     # power status is asked this often after power off
+    FENCE_VERIFY_PAUSE = 3
+    FENCE_VERIFIED_FOR = 900   # a fence that was read back covers one recovery, not the next
+
+    def _ha_refuse(self, action, details, node=None):
+        """Log, audit and push why this instance does not act on the cluster. A
+        refusal for a node is tried again while the node stays down: the same one a
+        second time goes to the log only."""
+        if node is not None:
+            said = self.__dict__.setdefault('_ha_refusals', {})
+            if said.get(node) == (action, details):
+                self.logger.warning(f"[HA] still: {details}")
+                return
+            said[node] = (action, details)
+        self.logger.critical(f"[HA] {details}")
+        try:
+            from pegaprox.utils.audit import log_audit
+            log_audit('system', action, f"Cluster {self.config.name}: {details}", cluster=self.config.name)
+        except Exception:
+            pass
+        try:
+            broadcast_sse('ha_status', {'event': action, 'node': node, 'message': details,
+                                        'cluster_id': self.id, 'severity': 'critical'}, self.id)
+        except Exception:
+            pass
+
+    def _ha_forces_quorum(self):
+        return bool(self.ha_config.get('two_node_mode') or self.ha_config.get('force_quorum_on_failure'))
+
+    def _ha_unsafe_two_node(self):
+        """Whether this cluster recovers the way it did before the safety rules. The
+        switch only means something where quorum gets forced."""
+        return bool(self.ha_config.get('unsafe_two_node_recovery')) and self._ha_forces_quorum()
+
+    # --- the fence of each node ---
+    #
+    # {node: {type, host, user, password}} under 'fencing' in the HA settings. The
+    # code read it from config.fencing, which nothing ever set: no field, no column,
+    # no route, so the verified fence the rules ask for could not be configured on
+    # any cluster. It is stored with the HA settings (an encrypted column, rotated
+    # with the key) and set through PUT .../ha/config.
+
+    FENCE_TYPES = ('ipmi', 'ssh', 'proxmox')
+    _FENCE_NODE_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9.-]{0,62}')
+    _FENCE_HOST_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9.:-]{0,252}')
+    _FENCE_USER_RE = re.compile(r'[A-Za-z0-9_][A-Za-z0-9._@-]{0,63}')
+    _FENCE_PASSWORD_RE = re.compile(r'[^\x00-\x1f\x7f]{1,256}')
+
+    @classmethod
+    def _fence_entry(cls, entry, stored=None):
+        """One node's fence as it is stored. sec (audit): host and user end up on the
+        command line of ipmitool or ssh and the password in its environment, so each
+        is checked for its shape. A password that is left out keeps the stored one:
+        the status never hands it out, so a form cannot send it back. Raises
+        ValueError."""
+        if not isinstance(entry, dict):
+            raise ValueError('not a fence')
+        kind = str(entry.get('type') or '').lower()
+        if kind not in cls.FENCE_TYPES:
+            raise ValueError(f"type must be one of {', '.join(cls.FENCE_TYPES)}")
+        fence = {'type': kind}
+        host = entry.get('host')
+        if host not in (None, ''):
+            if not isinstance(host, str) or not cls._FENCE_HOST_RE.fullmatch(host):
+                raise ValueError('host must be a host name or an IP address')
+            fence['host'] = host
+        user = entry.get('user')
+        if user not in (None, ''):
+            if not isinstance(user, str) or not cls._FENCE_USER_RE.fullmatch(user):
+                raise ValueError('user has characters that cannot be used')
+            fence['user'] = user
+        password = entry.get('password')
+        if password in (None, '') and isinstance(stored, dict) and stored.get('type') == kind:
+            password = stored.get('password')
+        if password not in (None, ''):
+            if not isinstance(password, str) or not cls._FENCE_PASSWORD_RE.fullmatch(password):
+                raise ValueError('password is too long or has control characters')
+            fence['password'] = password
+        if kind == 'ipmi' and not (fence.get('host') and fence.get('password')):
+            raise ValueError('an IPMI fence needs the host and the password of the BMC')
+        return fence
+
+    @classmethod
+    def _stored_fencing(cls, saved):
+        """The fences of a stored row. One that has no shape is left out, not trusted."""
+        fencing = {}
+        for node, entry in (saved.items() if isinstance(saved, dict) else ()):
+            if isinstance(node, str) and cls._FENCE_NODE_RE.fullmatch(node):
+                try:
+                    fencing[node] = cls._fence_entry(entry)
+                except ValueError:
+                    continue
+        return fencing
+
+    def _fencing_from_request(self, sent):
+        """The fences of this cluster after a request: {node: fence} over what is
+        stored, a node sent as null (or with no type) loses its fence, a node that is
+        not named keeps it. Raises ValueError naming the node."""
+        if not isinstance(sent, dict) or len(sent) > 256:
+            raise ValueError('must be an object of node name to fence')
+        fencing = dict(self._ha_fencing())
+        for node, entry in sent.items():
+            if not isinstance(node, str) or not self._FENCE_NODE_RE.fullmatch(node):
+                raise ValueError('a node name has characters that cannot be used')
+            if entry is None or (isinstance(entry, dict) and not entry.get('type')):
+                fencing.pop(node, None)
+                continue
+            try:
+                fencing[node] = self._fence_entry(entry, fencing.get(node))
+            except ValueError as e:
+                raise ValueError(f'{node}: {e}')
+        return fencing
+
+    def _ha_fencing(self, node=None):
+        """Every node's fence, or the one of `node` ({} when it has none)."""
+        fencing = self.ha_config.get('fencing')
+        fencing = fencing if isinstance(fencing, dict) else {}
+        return fencing if node is None else (fencing.get(node) or {})
+
+    def _ha_fencing_status(self):
+        """The fences as the HA status shows them: no password, only whether one is set."""
+        return {node: {'type': f.get('type'), 'host': f.get('host', ''), 'user': f.get('user', ''),
+                       'password_set': bool(f.get('password')),
+                       'verifiable': self._ha_fence_readable(node)}
+                for node, f in sorted(self._ha_fencing().items())}
+
+    def _ha_has_verifiable_fence(self):
+        """Whether any node has a fence whose result can be read back (IPMI)."""
+        return any(self._ha_fence_readable(node) for node in self._ha_fencing())
+
+    def _ha_cluster_status(self, host=None, timeout=10):
+        """The entries of /cluster/status as `host` gives them, the API host when
+        None. None when it did not answer."""
+        where = self.host if host is None else self._bracket_ipv6(host)
+        try:
+            url = f"https://{where}:{self.api_port}/api2/json/cluster/status"
+            resp = self._create_session().get(url, timeout=timeout)
+            if resp.status_code != 200:
+                self.logger.warning(f"[HA] /cluster/status answered {resp.status_code}")
+                return None
+            entries = resp.json().get('data') or []
+        except Exception as e:
+            self.logger.warning(f"[HA] Could not read /cluster/status: {e}")
+            return None
+        return [e for e in entries if isinstance(e, dict)]
+
+    @staticmethod
+    def _ha_quorum_in(entries):
+        """(quorate, [nodes outside]) as one host's /cluster/status has it."""
+        nodes = [e for e in entries if e.get('type') == 'node']
+        cluster = next((e for e in entries if e.get('type') == 'cluster'), None)
+        outside = [e.get('name') for e in nodes if e.get('name') and not e.get('online')]
+        if cluster is None:
+            # a node in no cluster has no quorum to lose
+            return (True if nodes else None), outside
+        return bool(cluster.get('quorate')), outside
+
+    def _ha_cluster_quorum(self):
+        """(quorate, [nodes outside the API host's partition]) from one read of
+        /cluster/status. quorate is None when the host did not answer, and that is
+        not a yes."""
+        entries = self._ha_cluster_status()
+        if entries is None:
+            return None, None
+        # where the nodes outside can be asked, should this host be the one outside
+        self.__dict__['_ha_status_ips'] = {e.get('name'): e.get('ip') for e in entries
+                                           if e.get('type') == 'node' and e.get('name') and e.get('ip')}
+        return self._ha_quorum_in(entries)
+
+    QUORATE_LOOK_EVERY = 30    # seconds between two looks from the monitor
+    QUORATE_LOOK_HOSTS = 8     # hosts asked per look, side by side
+
+    def _ha_move_to_quorate_side(self, now=False) -> bool:
+        """The API host does not report the cluster quorate: look for a host of the
+        cluster that does, and talk to that one from here on. True when one was found.
+
+        MK Oct 2026 (#625) - next to the minority side of a split this instance kept
+        asking the minority node. That one calls the healthy majority offline, which
+        is not recovered (right), and nothing ever looked from the other side: the
+        node that is really outside was never seen as failed, and the guests its
+        agent stopped stayed down.
+
+        Asked are the nodes the API host has outside, then the registered host and
+        the fallback hosts, QUORATE_LOOK_HOSTS at a time and the next ones on the
+        next look. The monitor looks every QUORATE_LOOK_EVERY seconds at most,
+        `now` is for the recovery gate."""
+        at = time.monotonic()
+        if not now and at - self.__dict__.get('_ha_quorate_look_at', -self.QUORATE_LOOK_EVERY) \
+                < self.QUORATE_LOOK_EVERY:
+            return False
+        self.__dict__['_ha_quorate_look_at'] = at
+        here = {self.current_host, getattr(self, '_original_host', None)} - {None}
+        if not here:
+            here = {self.config.host}
+        ips = self.__dict__.get('_ha_status_ips') or {}
+        hosts = [ips[name] for name in sorted(ips)] + [self.config.host] \
+            + list(getattr(self.config, 'fallback_hosts', None) or [])
+        hosts = [h for h in dict.fromkeys(hosts) if isinstance(h, str) and h and h not in here]
+        if not hosts:
+            return False
+        start = self.__dict__.get('_ha_quorate_look_from', 0) % len(hosts)
+        asked = (hosts[start:] + hosts[:start])[:self.QUORATE_LOOK_HOSTS]
+        self.__dict__['_ha_quorate_look_from'] = start + len(asked)
+
+        def quorate(host):
+            entries = self._ha_cluster_status(host, timeout=5)
+            return entries is not None and self._ha_quorum_in(entries)[0] is True
+
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=self.QUORATE_LOOK_HOSTS) as pool:
+            found = next((h for h, yes in zip(asked, pool.map(quorate, asked)) if yes), None)
+        if found is None:
+            return False
+        self.logger.critical(f"[HA] {self.current_host or self.config.host} is not in the quorate part of "
+                             f"the cluster, {found} is - talking to {found} from now on")
+        self.current_host = found
+        self._original_host = found
+        # what was read from the other side is stale
+        self._node_status_cache = None
+        self.__dict__.pop('_ha_status_ips', None)
+        return True
+
+    def _ha_retry_recovery(self, node, again=True):
+        """Mark a node's recovery as refused for a reason that can pass, or take the
+        mark off. _ha_check_nodes tries a marked node again while it stays down."""
+        marked = self.__dict__.setdefault('_ha_recovery_retry', set())
+        if again:
+            marked.add(node)
+        else:
+            marked.discard(node)
+
+    def _ha_recovery_settled(self, node):
+        """The node is back, or its recovery goes ahead: nothing to try again, and
+        the next refusal is a new one."""
+        self._ha_retry_recovery(node, False)
+        self.__dict__.get('_ha_refusals', {}).pop(node, None)
+
+    def _ha_fence_node_verified(self, node: str) -> bool:
+        """Power the node off and read back that it is off. Only that counts as a
+        fence here: the fence types ssh and proxmox return without proof."""
+        cfg = self._ha_fencing(node)
+        if str(cfg.get('type') or '').lower() != 'ipmi':
+            return False
+        host, password = cfg.get('host'), cfg.get('password')
+        if not host or not password:
+            return False
+        base = ['ipmitool', '-I', 'lanplus', '-H', str(host), '-U', str(cfg.get('user', 'ADMIN')), '-E']
+        env = {**os.environ, 'IPMITOOL_PASSWORD': password, 'IPMI_PASSWORD': password}
+        try:
+            # the answer to "off" is not the proof, the status after it is
+            subprocess.run(base + ['power', 'off'], capture_output=True, timeout=30, env=env)
+            for _ in range(self.FENCE_VERIFY_READS):
+                status = subprocess.run(base + ['power', 'status'], capture_output=True, text=True,
+                                        timeout=15, env=env)
+                if status.returncode == 0 and re.search(r'power is off', status.stdout or '', re.I):
+                    self.__dict__.setdefault('_ha_verified_fences', {})[node] = time.monotonic()
+                    self.logger.info(f"[HA] ✓ {node} is powered off (read back from its BMC)")
+                    return True
+                time.sleep(self.FENCE_VERIFY_PAUSE)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            self.logger.error(f"[HA] Verified fence of {node} failed: {e}")
+            return False
+        self.logger.error(f"[HA] {node} did not read back as powered off")
+        return False
+
+    def _ha_fence_verified(self, node: str) -> bool:
+        at = self.__dict__.get('_ha_verified_fences', {}).get(node)
+        return at is not None and time.monotonic() - at < self.FENCE_VERIFIED_FOR
+
+    def _ha_may_force_quorum(self, failed_node: str) -> bool:
+        """`pvecm expected 1` only once the failed node is off for sure, or on a
+        setup that keeps the old behaviour."""
+        return self._ha_unsafe_two_node() or self._ha_fence_verified(failed_node)
+
+    def _ha_fence_readable(self, node: str) -> bool:
+        cfg = self._ha_fencing(node)
+        return bool(str(cfg.get('type') or '').lower() == 'ipmi' and cfg.get('host') and cfg.get('password'))
+
+    def _ha_no_verified_fence(self, failed_node: str, nodes):
+        self._ha_refuse('ha.recovery_refused',
+                        f"two-node cluster {self.config.name}: no verified fence of "
+                        f"{', '.join(nodes)} - quorum is not forced and {failed_node} is not "
+                        "recovered. Configure IPMI fencing for the nodes, or power the node off "
+                        "and recover by hand", node=failed_node)
+
+    def _ha_recovery_allowed(self, failed_node: str):
+        """The preconditions of a node recovery (#625, design 6.2), in every mode,
+        asked before anything is done to the failed node.
+
+        The API host must report the cluster quorate. Where it does not and quorum
+        would be forced, every node outside its partition has to be powered off and
+        read back as off first. With the cluster claim on, the cluster must carry
+        this instance's claim. A setup on unsafe_two_node_recovery skips the first
+        two, as before.
+
+        None when the recovery must not run. Otherwise the nodes that
+        _ha_fence_outside has to fence before quorum is forced, none on a quorate
+        cluster.
+
+        A refusal whose reason can pass (the claim could not be written just now,
+        the host not quorate or not answering) marks the node, and _ha_check_nodes
+        tries it again while it stays down. A foreign claim and a missing fence
+        stay refused."""
+        self._ha_retry_recovery(failed_node, False)
+        if self._ha_claim_enabled():
+            claim = self._ha_claim_ensure()
+            if claim.get('state') != 'ours':
+                self._ha_refuse('ha.recovery_refused',
+                                f"{failed_node} is not recovered: the cluster does not carry this "
+                                f"instance's claim ({claim.get('state')}"
+                                f"{', epoch ' + str(claim['epoch']) if claim.get('epoch') is not None else ''})",
+                                node=failed_node)
+                if claim.get('state') in self._CLAIM_PASSING:
+                    self._ha_retry_recovery(failed_node)
+                return None
+        if self._ha_unsafe_two_node():
+            self.logger.warning("[HA] ⚠️ unsafe two-node recovery is on: quorum is forced without a "
+                                "verified fence - SPLIT-BRAIN RISK EXISTS")
+            self._ha_recovery_settled(failed_node)
+            return []
+        quorate, outside = self._ha_cluster_quorum()
+        if quorate is not True and self._ha_move_to_quorate_side(now=True):
+            # asked again where the majority is: the node this instance took for
+            # failed may be a healthy member of it
+            quorate, outside = self._ha_cluster_quorum()
+            if quorate is True and failed_node not in (outside or ()):
+                self._ha_refuse('ha.recovery_refused',
+                                f"{failed_node} is not recovered: it is online in the quorate part of "
+                                f"the cluster, as {self.current_host} reports it - this instance was "
+                                "talking to a node outside of it", node=failed_node)
+                return None
+        if quorate is True:
+            self._ha_recovery_settled(failed_node)
+            return []
+        if not self._ha_forces_quorum():
+            self._ha_refuse('ha.recovery_refused',
+                            f"{failed_node} is not recovered: {self.current_host or self.host} does not "
+                            "report the cluster quorate, so this may be the minority side of a split",
+                            node=failed_node)
+            self._ha_retry_recovery(failed_node)
+            return None
+        if outside is None:
+            self._ha_refuse('ha.recovery_refused',
+                            f"{failed_node} is not recovered: /cluster/status could not be read, so "
+                            "which nodes are outside is not known", node=failed_node)
+            self._ha_retry_recovery(failed_node)
+            return None
+        targets = sorted(set(outside) | {failed_node})
+        missing = [n for n in targets if not self._ha_fence_readable(n)]
+        if missing:
+            self._ha_no_verified_fence(failed_node, missing)
+            return None
+        self._ha_recovery_settled(failed_node)
+        return targets
+
+    def _ha_fence_outside(self, failed_node: str, targets) -> bool:
+        """Power off every node of `targets` and read it back. False, and nothing is
+        recovered, unless all of them are off."""
+        unverified = [n for n in targets if not self._ha_fence_node_verified(n)]
+        if unverified:
+            self._ha_no_verified_fence(failed_node, unverified)
+            return False
+        return True
+
+    # --- the cluster claim (design 6.3), optional per cluster and off by default ---
+    #
+    # /etc/pve/pegaprox/claim holds one line, "<epoch> <instance id> <cfg id> <wall
+    # time> <forced 0|1>": which PegaProx instance acts on this cluster. pmxcfs takes
+    # writes only in a quorate partition, and the lock directory under priv/lock is
+    # the one PVE's own cfs_lock uses. With the claim on, every recovery SSH step
+    # that changes /etc/pve or corosync is refused at the node unless the claim is
+    # ours. Nothing is written to /etc/pve/pegaprox while it is off.
+
+    CLAIM_WARNING = ('With the cluster claim on, PegaProx writes the file /etc/pve/pegaprox/claim into '
+                     'the cluster file system of this cluster (and takes the lock directory '
+                     '/etc/pve/priv/lock/pegaprox-claim while it does). The file names the PegaProx '
+                     'instance that acts on the cluster. Node recovery then runs only while the claim '
+                     'is this instance\'s, and its SSH steps are refused at the node otherwise.')
+    CLAIM_RESIDUAL = ('The cluster claim is off: an SSH step that a former leader had already sent when '
+                      'it froze is not refused at the node.')
+    _CLAIM_INSTANCE_RE = re.compile(r'[0-9a-f]{32}')
+
+    @classmethod
+    def _claim_ident(cls, epoch, instance):
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+            raise ValueError('not an epoch')
+        if not isinstance(instance, str) or not cls._CLAIM_INSTANCE_RE.fullmatch(instance):
+            raise ValueError('not an instance id')
+        return str(epoch), instance
+
+    @classmethod
+    def _claim_prelude(cls, epoch, instance, pve):
+        e, i = cls._claim_ident(epoch, instance)
+        d = shlex.quote(f'{pve}/pegaprox')
+        lock = shlex.quote(f'{pve}/priv/lock/pegaprox-claim')
+        return f'''D={d}; F="$D/claim"; L={lock}; E={e}; I={i}
+rd() {{ ce=; ci=; [ -e "$F" ] || return 0; read -r ce ci _ < "$F" 2>/dev/null; case "$ce" in ''|*[!0-9]*) ce=bad ;; esac; }}
+take() {{
+    mkdir "$L" 2>/dev/null && return 0
+    # utime 0 asks pmxcfs to drop an expired lock, a live one stays
+    touch -d @0 "$L" 2>/dev/null
+    mkdir "$L" 2>/dev/null && return 0
+    if [ -d "$L" ]; then echo "CLAIM_BUSY"; else echo "CLAIM_READONLY"; fi
+    return 1
+}}
+'''
+
+    @classmethod
+    def _claim_write_cmd(cls, epoch, instance, cfg_id='-', forced=False, takeover=False, pve='/etc/pve'):
+        """Shell: make the claim ours, compare-and-swap under the pmxcfs lock.
+
+        Prints one line. CLAIM_OURS: it is ours, written now or before. CLAIM_HIGHER:
+        another instance holds it under a higher epoch, this one is stale.
+        CLAIM_SAME: another instance under our epoch. CLAIM_UNREADABLE: a file that is
+        no claim, which is not read as no claim. CLAIM_BUSY, CLAIM_READONLY (not
+        quorate), CLAIM_FAILED. `takeover` writes over whatever is there: the admin's
+        release of a foreign claim."""
+        cfg = cfg_id if isinstance(cfg_id, str) and re.fullmatch(r'[A-Za-z0-9._:-]{1,64}', cfg_id) else '-'
+        checks = '' if takeover else '''if [ "$ce" = bad ]; then echo "CLAIM_UNREADABLE"; exit 0; fi
+if [ -n "$ce" ] && [ "$ce" -gt "$E" ]; then echo "CLAIM_HIGHER $ce $ci"; exit 0; fi
+if [ -n "$ce" ] && [ "$ce" -eq "$E" ] && [ "$ci" != "$I" ]; then echo "CLAIM_SAME $ce $ci"; exit 0; fi
+'''
+        return cls._claim_prelude(epoch, instance, pve) + f'''rd
+if [ "$ce" = "$E" ] && [ "$ci" = "$I" ]; then echo "CLAIM_OURS $ce $ci"; exit 0; fi
+take || exit 0
+trap 'rmdir "$L" 2>/dev/null' EXIT
+rd
+{checks}mkdir -p "$D" && printf '%s %s %s %s %s\\n' "$E" "$I" {shlex.quote(cfg)} "$(date +%s)" {1 if forced else 0} > "$F.tmp.$$" && mv -f "$F.tmp.$$" "$F" && echo "CLAIM_OURS $E $I" || {{ rm -f "$F.tmp.$$"; echo "CLAIM_FAILED"; }}
+'''
+
+    @classmethod
+    def _claim_remove_cmd(cls, epoch, instance, pve='/etc/pve'):
+        """Shell: take our claim away again. Another instance's claim stays.
+
+        Ours is one that names this instance under its epoch, or under an earlier
+        one (it led before, and the write under the new epoch did not get through).
+        Under a later epoch it is somebody else's: a restored copy of this instance
+        must not take the claim of the one that still runs.
+
+        The lock comes before any answer. A node outside the quorum shows the
+        /etc/pve it had when it left: no claim yet, or a former leader's, while the
+        cluster carries ours. It cannot take the lock and answers CLAIM_READONLY,
+        which is not an answer for the cluster."""
+        return cls._claim_prelude(epoch, instance, pve) + '''ours() { [ "$ci" = "$I" ] && [ "$ce" != bad ] && [ "$ce" -le "$E" ]; }
+take || exit 0
+trap 'rmdir "$L" 2>/dev/null' EXIT
+rd
+if [ -z "$ce" ]; then echo "CLAIM_ABSENT"; exit 0; fi
+if ours; then rm -f "$F" && { rmdir "$D" 2>/dev/null; echo "CLAIM_REMOVED"; } || echo "CLAIM_FAILED"; else echo "CLAIM_NOT_OURS $ce $ci"; fi
+'''
+
+    @classmethod
+    def _claim_by_hand(cls, epoch, instance):
+        """The command an admin runs on one node to take this instance's claim away
+        when PegaProx could not: it removes the file only while it is ours, by the
+        rule of _claim_remove_cmd."""
+        e, i = cls._claim_ident(epoch, instance)
+        return (f'read -r e i _ < /etc/pve/pegaprox/claim && [ "$i" = {i} ] && [ "$e" -le {e} ] 2>/dev/null '
+                '&& rm -f /etc/pve/pegaprox/claim && rmdir /etc/pve/pegaprox')
+
+    @classmethod
+    def _claim_guard_cmd(cls, epoch, instance, cmd, exact=True, pve='/etc/pve'):
+        """`cmd` behind the claim, in one shell on the node: it runs only while the
+        claim there is ours, and exits 97 otherwise.
+
+        exact=False is for stopping guests on the failed node. That node is outside
+        the quorum and still shows the claim from before the split, so only a claim
+        that is newer than ours, or another instance's under our epoch, refuses."""
+        e, i = cls._claim_ident(epoch, instance)
+        f = shlex.quote(f'{pve}/pegaprox/claim')
+        read = f'ce=; ci=; [ -e {f} ] && read -r ce ci _ < {f} 2>/dev/null; '
+        if exact:
+            test = f'[ "$ce" = "{e}" ] && [ "$ci" = "{i}" ]'
+        else:
+            read += 'case "$ce" in \'\'|*[!0-9]*) ce= ;; esac; '
+            test = (f'{{ [ -z "$ce" ] || [ "$ce" -lt {e} ] || '
+                    f'{{ [ "$ce" -eq {e} ] && [ "$ci" = "{i}" ]; }}; }}')
+        return (f'{read}if {test}; then :; else echo "CLAIM_REFUSED ${{ce:-none}} $ci" >&2; exit 97; fi; '
+                f'{cmd}')
+
+    def _ha_claim_enabled(self):
+        return self.ha_config.get('claim_enabled') is True
+
+    def _ha_claimed(self, cmd, exact=True):
+        """A recovery SSH step as it goes to the node: behind the claim when this
+        cluster has it on, unchanged when not."""
+        if not self._ha_claim_enabled():
+            return cmd
+        instance, epoch = ha.lock_holder()
+        return self._claim_guard_cmd(epoch, instance, cmd, exact=exact)
+
+    def _ha_claim_nodes(self):
+        """Node names to try, the ones this instance sees online first."""
+        with self.ha_lock:
+            known = [(name, st.get('status') == 'online') for name, st in self.ha_node_status.items()]
+        if not known:
+            try:
+                known = [(name, True) for name in (self._ha_node_names() or [])]
+            except Exception:
+                known = []
+        return [n for n, up in known if up] + [n for n, up in known if not up]
+
+    def _ha_claim_run(self, cmd, prefix='CLAIM_', limit=None, past=()):
+        """Run a claim command on the first node that answers it. (words of its
+        answer line, node), ([], None) when no node did. `limit` is how many nodes
+        are tried: a request does not wait out every node of a cluster that is down.
+        An answer whose first word is in `past` speaks for that node alone: the next
+        node is asked, and the answer stands only when none says anything else."""
+        passed = ([], None)
+        for node in self._ha_claim_nodes()[:limit]:
+            out = self._ssh_node_output(node, cmd, timeout=30)
+            for line in (out or '').splitlines():
+                if line.startswith(prefix):
+                    if line.split()[0] not in past:
+                        return line.split(), node
+                    passed = (line.split(), node)
+                    break
+        return passed
+
+    _CLAIM_STATES = {'CLAIM_OURS': 'ours', 'CLAIM_HIGHER': 'higher', 'CLAIM_SAME': 'same',
+                     'CLAIM_UNREADABLE': 'unreadable', 'CLAIM_BUSY': 'busy',
+                     'CLAIM_READONLY': 'readonly', 'CLAIM_FAILED': 'failed',
+                     'CLAIM_REMOVED': 'removed', 'CLAIM_ABSENT': 'absent',
+                     'CLAIM_NOT_OURS': 'foreign'}
+    # why the claim is not ours when that can be over a moment later: the lock held
+    # by another writer, no node reached, the cluster not quorate, the write failed
+    _CLAIM_PASSING = ('busy', 'unreachable', 'readonly', 'failed')
+
+    def _ha_claim_result(self, words, node):
+        state = self._CLAIM_STATES.get(words[0], 'unreachable') if words else 'unreachable'
+        result = {'state': state, 'node': node, 'checked_at': datetime.now().isoformat(),
+                  'epoch': int(words[1]) if len(words) > 1 and words[1].isdigit() else None,
+                  'instance': words[2] if len(words) > 2 else None}
+        self.ha_config['claim_state'] = result
+        return result
+
+    def _ha_claim_ensure(self, takeover=False) -> dict:
+        """Make the claim of this cluster ours, or say whose it is. Writes nothing
+        while the claim is off for the cluster.
+
+        'ours' is the only state a recovery goes ahead on. A foreign claim under a
+        higher epoch means this instance is the stale one; under our epoch, that a
+        second PegaProx acts on this cluster. Both are refused and reported."""
+        if not self._ha_claim_enabled():
+            return {'state': 'off'}
+        if not ha.is_active():
+            return {'state': 'standby'}
+        instance, epoch = ha.lock_holder()
+        words, node = self._ha_claim_run(self._claim_write_cmd(epoch, instance, takeover=takeover))
+        result = self._ha_claim_result(words, node)
+        if result['state'] == 'higher':
+            self._ha_refuse('ha.claim_foreign',
+                            f"instance {result['instance']} holds the cluster claim under epoch "
+                            f"{result['epoch']}, above ours ({epoch}) - this instance is the stale "
+                            "one and does not act on the cluster")
+        elif result['state'] == 'same':
+            self._ha_refuse('ha.claim_foreign',
+                            f"instance {result['instance']} holds the cluster claim under our epoch "
+                            f"({epoch}) - two PegaProx instances act on this cluster")
+        elif result['state'] == 'unreadable':
+            self._ha_refuse('ha.claim_foreign', "/etc/pve/pegaprox/claim is there but is no claim - "
+                                                "release it from the HA settings")
+        elif result['state'] != 'ours':
+            self.logger.warning(f"[HA] The cluster claim could not be written ({result['state']})")
+        return result
+
+    def _ha_claim_remove(self, limit=None) -> dict:
+        """Take our claim off the cluster, when the claim is switched off. One of
+        another instance stays where it is."""
+        instance, epoch = ha.lock_holder()
+        # a node that takes no writes is outside the quorum: the next one may be in
+        # it. Its copy of /etc/pve can show the lock directory too, from a writer
+        # that held it when the node left, and then it answers busy for good
+        words, node = self._ha_claim_run(self._claim_remove_cmd(epoch, instance), limit=limit,
+                                         past=('CLAIM_READONLY', 'CLAIM_BUSY'))
+        result = self._ha_claim_result(words, node)
+        self.ha_config.pop('claim_state', None)
+        return result
+
+    CLAIM_RETIRE_NODES = 3     # nodes tried when the claim goes with HA or with the cluster
+    _CLAIM_NOT_REMOVED = {
+        'unreachable': 'no node of the cluster answered',
+        'readonly': 'the cluster is not quorate, so /etc/pve takes no writes',
+        'busy': 'the claim lock is held by another writer',
+        'failed': 'the file could not be removed',
+        'standby': 'this PegaProx instance is a standby and changes nothing on a cluster',
+    }
+
+    def _ha_claim_retire(self, every_node=False):
+        """HA is switched off for this cluster, the cluster leaves PegaProx, or the
+        claim is switched off in the HA settings (#625): our claim goes out of
+        /etc/pve/pegaprox and the claim is switched off. The file stayed behind
+        before, with nobody left to remove it once the cluster was deleted.
+
+        None while the claim is off. Otherwise what the response reports: `state`
+        (removed, absent, foreign, or why not), `removed`, and a `warning` where
+        something is left - with `by_hand`, the command that removes it on a node,
+        when it may be ours. A claim of another instance is never removed.
+
+        every_node: ask all of them, not CLAIM_RETIRE_NODES. The switch in the HA
+        settings does, HA disable and the delete have more to do in their request."""
+        if not self._ha_claim_enabled():
+            return None
+        holder = (None, None)
+        limit = None if every_node else self.CLAIM_RETIRE_NODES
+        try:
+            holder = ha.lock_holder()
+            result = self._ha_claim_remove(limit=limit) if ha.is_active() else {'state': 'standby'}
+        except Exception as e:
+            self.logger.error(f"[HA] Could not remove the cluster claim: {e}")
+            result = {'state': 'failed'}
+        self.ha_config['claim_enabled'] = False
+        self.ha_config.pop('claim_state', None)
+        state = result.get('state')
+        report = {'state': state, 'removed': state == 'removed', 'path': '/etc/pve/pegaprox/claim',
+                  'instance': result.get('instance'), 'epoch': result.get('epoch'),
+                  'warning': None, 'by_hand': None}
+        if state == 'foreign':
+            whose = (f"names another PegaProx instance ({result.get('instance')}, epoch {result['epoch']})"
+                     if result.get('epoch') is not None else "is not a claim of this instance")
+            report['warning'] = f"/etc/pve/pegaprox/claim {whose} and was left where it is."
+        elif state not in ('removed', 'absent'):
+            why = self._CLAIM_NOT_REMOVED.get(state, 'the file could not be removed')
+            try:
+                report['by_hand'] = self._claim_by_hand(holder[1], holder[0])
+            except ValueError:
+                pass
+            report['warning'] = (f"The cluster claim could not be removed ({why}): /etc/pve/pegaprox/claim "
+                                 "may still be there."
+                                 + (f" To remove it by hand, run on one node of the cluster, which has "
+                                    f"to be quorate for it: `{report['by_hand']}`" if report['by_hand'] else ''))
+        if report['warning']:
+            self.logger.warning(f"[HA] {report['warning']}")
+        else:
+            self.logger.info(f"[HA] Cluster claim switched off (our claim: {state})")
+        return report
+
+    def _ha_claim_status(self) -> dict:
+        """What the HA status says about the claim: the switch, the last look at the
+        file, and the text the UI shows before the switch and while it is off."""
+        on = self._ha_claim_enabled()
+        seen = self.ha_config.get('claim_state') or {}
+        return {
+            'enabled': on,
+            'path': '/etc/pve/pegaprox/claim',
+            'state': (seen.get('state') or 'unknown') if on else 'off',
+            'epoch': seen.get('epoch') if on else None,
+            'instance': seen.get('instance') if on else None,
+            'checked_at': seen.get('checked_at') if on else None,
+            'warning': self.CLAIM_WARNING,
+            'residual': None if on else self.CLAIM_RESIDUAL,
+        }
+
     def _ha_check_quorum(self) -> bool:
         """check if we have quorum by pinging external hosts
 
@@ -5451,12 +6205,11 @@ class PegaProxManager:
     def _ha_fence_node(self, node: str) -> bool:
         """fence (power off) a node via IPMI/iLO/DRAC"""
         # check fencing is configured for this node
-        fencing_config = getattr(self.config, 'fencing', {})
-        node_fencing = fencing_config.get(node, {})
-        
+        node_fencing = self._ha_fencing(node)
+
         if not node_fencing:
             self.logger.warning(f"[HA] No fencing configured for node {node}")
-            self.logger.warning(f"[HA] Configure fencing in config: fencing.{node}.type = 'ipmi'")
+            self.logger.warning(f"[HA] Set one for the node in the HA settings of the cluster (type ipmi)")
             return False
         
         fence_type = node_fencing.get('type', '').lower()
@@ -5703,12 +6456,25 @@ class PegaProxManager:
             
             stopped = []
             failed = []
-            
+
+            # sec: the ids can come from the heartbeat file on the shared storage and go
+            # into a root shell on the node. An id that is no number is not sent, and
+            # counts as not stopped.
+            not_ids = [str(i) for i in list(vmids or []) + list(ctids or []) if not str(i).isdigit()]
+            if not_ids:
+                self.logger.error(f"[HA] Not a guest id, not stopped on {node}: "
+                                  f"{[i[:32] for i in not_ids]}")
+                failed.extend(f"guest {i[:32]}" for i in not_ids)
+            vmids = [v for v in vmids or [] if str(v).isdigit()]
+            ctids = [c for c in ctids or [] if str(c).isdigit()]
+
             # Stop VMs
             if vmids:
                 for vmid in vmids:
                     self.logger.info(f"[HA] Stopping VM {vmid} on {node}...")
-                    stop_cmd = f"qm stop {vmid} --timeout 30 2>&1 || qm stop {vmid} --skiplock --timeout 30 2>&1"
+                    stop_cmd = self._ha_claimed(
+                        f"qm stop {vmid} --timeout 30 2>&1 || qm stop {vmid} --skiplock --timeout 30 2>&1",
+                        exact=False)
                     
                     success = False
                     if ssh_key:
@@ -5727,7 +6493,7 @@ class PegaProxManager:
             if ctids:
                 for ctid in ctids:
                     self.logger.info(f"[HA] Stopping CT {ctid} on {node}...")
-                    stop_cmd = f"pct stop {ctid} --timeout 30 2>&1"
+                    stop_cmd = self._ha_claimed(f"pct stop {ctid} --timeout 30 2>&1", exact=False)
                     
                     success = False
                     if ssh_key:
@@ -5753,81 +6519,275 @@ class PegaProxManager:
             return False
     
     # ═══════════════════════════════════════════════════════════════════════════
-    # SIMPLE SELF-FENCE AGENT - NS Jan 2026
-    # 
-    # Ultra-simple split-brain protection:
-    # - Each node pings the manager AND the other node
-    # - If BOTH unreachable → I'm isolated → stop my VMs
-    # - No shared storage needed! Works with LVM, iSCSI, anything.
+    # SELF-FENCE AGENT - NS Jan 2026, v2 MK Oct 2026 (#625)
+    #
+    # Split-brain protection on the node itself, no shared storage needed.
+    # v1 pinged one PegaProx address and never fenced while that answered, quorate
+    # or not. v2 lets corosync decide: a node that is not quorate for T_SF stops its
+    # VMs, whoever else it still reaches. Where quorum cannot settle it (two nodes,
+    # or quorum forced on failure) the node asks the PegaProx instances who leads.
+    #
+    # It has its own script and unit. Before, it shared pegaprox-agent.* with the
+    # node agent further down, and installing one replaced the other.
+    #
+    # A v1 agent that is on a node stays what it is. Only the install from the HA
+    # settings puts v2 there; nothing PegaProx does on its own replaces a v1 script.
     # ═══════════════════════════════════════════════════════════════════════════
-    
-    _SELF_FENCE_AGENT_SCRIPT = '''#!/bin/bash
-# PegaProx Self-Fence Agent
-# NS: split-brain prevention + auto-recovery of the PegaProx VM itself
 
-MANAGER_IP="__MANAGER_IP__"
-OTHER_NODES="__OTHER_NODES__"  # comma-separated list
-PEGAPROX_VMID="__PEGAPROX_VMID__"
-# MK 2026-06-03: 'quorum' (default for 3+ nodes or 2-node-with-qdevice)
-# uses corosync's vote to gate destructive actions. 'wait' (2-node WITHOUT
-# qdevice) skips fencing entirely because corosync loses quorum on every
-# single-node reboot and an aggressive fence would tear the cluster down
-# on every planned maintenance. Detected at install time from `pvecm status`.
+    FENCE_AGENT_PATH = '/usr/local/bin/pegaprox-fence-agent.sh'
+    FENCE_AGENT_UNIT = 'pegaprox-fence-agent.service'
+    NODE_AGENT_PATH = '/usr/local/bin/pegaprox-agent.sh'
+    NODE_AGENT_UNIT = 'pegaprox-agent.service'
+    # line 2 of every self-fence script, v1 included: what tells it from a node agent
+    # when both lived under the node agent's name
+    FENCE_AGENT_MARKER = '# PegaProx Self-Fence Agent'
+    FENCE_AGENT_VERSION = 2
+    # The two numbers below and the recovery worker's wait belong together, and
+    # _ha_fence_timing is the one place that puts them together: the script takes
+    # its fence delay from there, the worker the time it waits.
+    FENCE_AGENT_T_SF = 30        # seconds out of order before a node fences itself
+    FENCE_AGENT_MARGIN = 30      # what its stops may take after that (`qm stop --timeout 30`)
+    FENCE_AGENT_INTERVAL = 5
+
+    _SELF_FENCE_AGENT_SCRIPT = r'''#!/bin/bash
+# PegaProx Self-Fence Agent
+# Split-brain prevention on the node itself. v2: corosync quorum decides first.
+
+AGENT_VERSION=2
+# quorum   - 3 or more votes, or a qdevice: a node that is not quorate for T_SF
+#            fences itself, whoever else it still reaches
+# tiebreak - two nodes, or quorum gets forced on failure: quorum cannot settle it,
+#            so a node that lost its peers asks the PegaProx instances who leads
+# off      - no corosync cluster here: nothing to split from, never fences
+MODE="__MODE__"
+# 1 where the cluster has three or more votes: a node without quorum is then the
+# minority side whatever the mode, and a leader that answers does not change that.
+# 0 also where PegaProx forces quorum without a fence (unsafe two-node recovery):
+# the node that is left has no quorum until then, and the leader decides for it
+MINORITY_FENCES="__MINORITY_FENCES__"
+# MK 2026-06-03: 'wait' (2-node WITHOUT qdevice) logs and keeps the VMs running:
+# corosync loses quorum on every single-node reboot there. Detected at install
+# time from `pvecm status`.
 FENCE_STRATEGY="__FENCE_STRATEGY__"
-CHECK_INTERVAL=5
-FAIL_THRESHOLD=3
-FAIL_COUNT=0
-MGR_DOWN_COUNT=0
-MGR_RECOVERY_THRESHOLD=6  # 6 * 5s = 30s before trying restart
-RECOVERY_COOLDOWN=300      # 5 min between restart attempts
-RECOVERY_LOCKDIR="/tmp/.pegaprox-recovery.lock"
+# the votes of the whole cluster as they were at install time. corosync's own
+# "Expected votes" drops with `pvecm expected 1`, this does not.
+CLUSTER_VOTES=__CLUSTER_VOTES__
+MEMBERS="__MEMBERS__"           # space-separated base URLs of the PegaProx instances
+CLUSTER_ID="__CLUSTER_ID__"
+AGENT_TOKEN="__AGENT_TOKEN__"
+PEGAPROX_VMID="__PEGAPROX_VMID__"
+CHECK_INTERVAL=__CHECK_INTERVAL__
+T_SF_CS=__T_SF_CS__             # in 1/100 s, the unit of /proc/uptime
+RECOVERY_COOLDOWN=300           # 5 min between restart attempts
+RECOVERY_LOCKDIR="${TMPDIR:-/tmp}/.pegaprox-recovery.lock"
+LOG_FILE="/var/log/pegaprox-fence-agent.log"
+BAD_SINCE=""
+MGR_DOWN_SINCE=""
+HELD=0
+WHY=""
 
 log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a /var/log/pegaprox-agent.log
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE" 2>/dev/null
 }
 
-can_reach_manager() {
-    ping -c1 -W2 $MANAGER_IP >/dev/null 2>&1
+# uptime, not the wall clock: an NTP step must not fence a node
+now_cs() {
+    local s cs
+    IFS=' .' read -r s cs _ < /proc/uptime
+    NOW=$(( s * 100 + 10#$cs ))
 }
 
-can_reach_other_nodes() {
-    [ -z "$OTHER_NODES" ] && return 1
-    IFS=',' read -ra NODES <<< "$OTHER_NODES"
-    for node_ip in "${NODES[@]}"; do
-        if [ -n "$node_ip" ] && ping -c1 -W2 $node_ip >/dev/null 2>&1; then
-            return 0
-        fi
-    done
-    return 1
-}
-
-# MK 2026-06-03: quorum-aware gate. Before any destructive action we ask
-# corosync whether the cluster is currently quorate. If yes, we're not
-# isolated regardless of what ICMP says — corosync sees us as part of a
-# voting majority, and a destructive self-fence here would be a false
-# positive (typical trigger: a peer node rebooting briefly drops manager
-# pings while corosync stays quorate for the rest of us). Returns 0
-# when quorate, 1 otherwise (including pvecm absent / non-PVE host).
+# One look at corosync. Sets TOTAL_VOTES and EXPECTED_VOTES next to the answer.
 is_quorate() {
-    command -v pvecm >/dev/null 2>&1 || return 1
-    pvecm status 2>/dev/null | grep -qE "^Quorate:[[:space:]]+Yes"
+    local out
+    TOTAL_VOTES=0
+    EXPECTED_VOTES=0
+    if command -v corosync-quorumtool >/dev/null 2>&1; then
+        out=$(timeout 10 corosync-quorumtool -s 2>/dev/null)
+    elif command -v pvecm >/dev/null 2>&1; then
+        out=$(timeout 10 pvecm status 2>/dev/null)
+    else
+        return 1
+    fi
+    TOTAL_VOTES=$(echo "$out" | sed -n 's/^Total votes:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
+    EXPECTED_VOTES=$(echo "$out" | sed -n 's/^Expected votes:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
+    TOTAL_VOTES=${TOTAL_VOTES:-0}
+    EXPECTED_VOTES=${EXPECTED_VOTES:-0}
+    echo "$out" | grep -qE "^Quorate:[[:space:]]+Yes"
 }
 
+# Whether the members corosync still counts hold more than half of the cluster's
+# votes. "Quorate" alone does not say that: corosync's two_node option and
+# `pvecm expected 1` both leave a single node quorate. Asked of corosync, not of
+# the network: the peers' management addresses fall silent together with the way
+# to PegaProx when a management switch is down, while corosync on its own link
+# still counts every member.
+majority_present() {
+    local all=$CLUSTER_VOTES
+    [ "$EXPECTED_VOTES" -gt "$all" ] && all=$EXPECTED_VOTES
+    [ $((TOTAL_VOTES * 2)) -gt "$all" ]
+}
+
+# Quorate although corosync was told to expect fewer votes than the cluster has:
+# that is `pvecm expected`, which PegaProx runs on the node that is left when it
+# forces quorum. That node is the side that goes on, with or without a leader in
+# reach - a PegaProx restart must not stop its guests. corosync itself keeps the
+# quorum at a majority of the nodes that were there when it was lowered, so of
+# those only one side stays quorate. Its two_node option keeps its two expected
+# votes and is not this.
+quorum_forced() {
+    [ "$EXPECTED_VOTES" -gt 0 ] && [ "$EXPECTED_VOTES" -lt "$CLUSTER_VOTES" ]
+}
+
+# The key goes to perl in its environment. As an argument (openssl dgst -hmac) every
+# local user could read it from the process list.
+hmac() {
+    printf '%s' "$1" | AGENT_KEY="$AGENT_TOKEN" perl -MDigest::SHA=hmac_sha256_hex \
+        -e 'local $/; my $d = <STDIN>; print hmac_sha256_hex($d, $ENV{AGENT_KEY})' 2>/dev/null
+}
+
+# One PegaProx instance. It answers "leader <epoch> <mac>" while it leads; both the
+# question and the answer are keyed with AGENT_TOKEN over a fresh nonce, so the
+# certificate does not have to be trusted and an old answer cannot be replayed.
+ask_member() {
+    local url="$1" nonce sig ans word epoch mac want
+    [ -n "$AGENT_TOKEN" ] || return 1
+    nonce=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    sig=$(hmac "pegaprox-agent ask $CLUSTER_ID $nonce")
+    [ -n "$sig" ] || return 1
+    ans=$(curl -sk --max-time 2 "$url/api/ha/agent?cluster=$CLUSTER_ID&nonce=$nonce&sig=$sig" 2>/dev/null) || return 1
+    read -r word epoch mac _ <<< "$ans"
+    [ "$word" = "leader" ] || return 1
+    case "$epoch" in ''|*[!0-9]*) return 1 ;; esac
+    want=$(hmac "pegaprox-agent leader $CLUSTER_ID $nonce $epoch")
+    [ -n "$want" ] && [ "$mac" = "$want" ]
+}
+
+# every instance side by side, 2 s each
+leader_answers() {
+    [ -z "$MEMBERS" ] && return 1
+    local url pid pids="" ok=1
+    for url in $MEMBERS; do
+        ask_member "$url" &
+        pids="$pids $!"
+    done
+    for pid in $pids; do
+        wait "$pid" && ok=0
+    done
+    return $ok
+}
+
+# The status column and nothing else: a guest that is down and called
+# "long-running-jobs" is not a running guest. qm list prints VMID NAME STATUS
+# MEM(MB) BOOTDISK(GB) PID and lists a VM without a name as "VM <id>", two words,
+# so the status is counted from the right. pct list prints VMID Status Lock Name.
+running_vms() {
+    qm list 2>/dev/null | awk 'NF >= 6 && $1 ~ /^[0-9]+$/ && $(NF-3) == "running" {print $1}'
+}
+
+running_cts() {
+    pct list 2>/dev/null | awk '$1 ~ /^[0-9]+$/ && $2 == "running" {print $1}'
+}
+
+running_guests() {
+    [ -n "$(running_vms)" ] || [ -n "$(running_cts)" ]
+}
+
+# Stops every running guest and names them in one line. That line is all that is
+# kept of them: none is started again from here, see self_fence.
 stop_all_vms() {
+    local vms="" cts="" what=""
     log "STOPPING ALL VMs AND CONTAINERS!"
-    for vmid in $(qm list 2>/dev/null | grep running | awk '{print $1}'); do
+    for vmid in $(running_vms); do
         log "Stopping VM $vmid"
+        vms="$vms $vmid"
         qm stop $vmid --timeout 30 2>/dev/null &
     done
-    for ctid in $(pct list 2>/dev/null | grep running | awk '{print $1}'); do
+    for ctid in $(running_cts); do
         log "Stopping CT $ctid"
+        cts="$cts $ctid"
         pct stop $ctid --timeout 30 2>/dev/null &
     done
     wait
     log "All VMs/CTs stopped"
+    [ -n "$vms" ] && what="qm$vms"
+    [ -n "$cts" ] && what="${what:+$what, }pct$cts"
+    if [ -n "$what" ]; then
+        log "Stopped by this fence: $what - start them by hand once the node is in order again"
+    fi
 }
 
-# MK: try to bring back PegaProx when manager is down but cluster is healthy
+# 0 when this node is in order. WHY says what is wrong otherwise.
+check() {
+    WHY=""
+    case "$MODE" in
+        quorum)
+            is_quorate && return 0
+            WHY="not quorate"
+            return 1 ;;
+        tiebreak)
+            if is_quorate; then
+                if majority_present || quorum_forced; then
+                    HELD=0
+                    return 0
+                fi
+            elif [ "$MINORITY_FENCES" = "1" ]; then
+                HELD=0
+                WHY="not quorate"
+                return 1
+            fi
+            # quorum cannot settle it here: the side that still reaches the
+            # leader stays up
+            if leader_answers; then
+                [ $HELD -eq 0 ] && log "No majority of the cluster in sight ($TOTAL_VOTES of $CLUSTER_VOTES votes), but a PegaProx leader answers - staying up"
+                HELD=1
+                return 0
+            fi
+            HELD=0
+            WHY="no majority of the cluster in sight ($TOTAL_VOTES of $CLUSTER_VOTES votes), and no PegaProx leader answers"
+            return 1 ;;
+    esac
+    return 0
+}
+
+# What a fence stopped is not started again from here, however the node comes to
+# be in order again. The other nodes are back and PegaProx may have recovered the
+# guests there or be at it, or quorum was forced on a node that is still cut off,
+# whose /etc/pve is the copy from before the split. To corosync these look the same
+# as the one case where a start would be safe, and a guest whose config is moved
+# from under it runs twice. What was stopped is in the log; starting it is the
+# admin's call. The PegaProx VM is the one exception, as before: watch_pegaprox
+# starts it on a node in order while no leader answers.
+self_fence() {
+    local but=""
+    if [ "$FENCE_STRATEGY" = "wait" ]; then
+        log "ISOLATED ($WHY) but FENCE_STRATEGY=wait (2-node cluster, no qdevice)"
+        log "Keeping VMs running - add a qdevice to enable quorum-based fencing"
+        BAD_SINCE=""
+        return
+    fi
+    log "════════════════════════════════════════════════════════"
+    log "ISOLATED! Self-fencing to prevent split-brain..."
+    log "($WHY for $((T_SF_CS / 100))s)"
+    log "════════════════════════════════════════════════════════"
+    stop_all_vms
+
+    log "Waiting for recovery..."
+    until check; do
+        sleep "$CHECK_INTERVAL"
+        # nothing may come up on a fenced node
+        running_guests && stop_all_vms
+    done
+    log "In order again, resuming."
+    but=""
+    if [ -n "$PEGAPROX_VMID" ] && [ -n "$MEMBERS" ] && ! quorum_forced 2>/dev/null; then
+        but=" (but the PegaProx VM $PEGAPROX_VMID, while no PegaProx leader answers)"
+    fi
+    log "Nothing is started automatically$but: the guests this fence stopped stay down until they are started by hand"
+    BAD_SINCE=""
+}
+
+# MK: try to bring back PegaProx when it is down but the cluster is healthy
 try_restart_pegaprox_vm() {
     [ -z "$PEGAPROX_VMID" ] && return 1
 
@@ -5843,7 +6803,7 @@ try_restart_pegaprox_vm() {
     fi
 
     log "════════════════════════════════════════════════════════"
-    log "MANAGER DOWN - attempting PegaProx VM $PEGAPROX_VMID restart"
+    log "PEGAPROX DOWN - attempting PegaProx VM $PEGAPROX_VMID restart"
     log "════════════════════════════════════════════════════════"
 
     # check if we can see this VM at all
@@ -5859,201 +6819,438 @@ try_restart_pegaprox_vm() {
     if [ "$vm_status" != "running" ]; then
         qm unlock $PEGAPROX_VMID 2>/dev/null
         log "Starting VM $PEGAPROX_VMID..."
-        qm start $PEGAPROX_VMID 2>&1 | tee -a /var/log/pegaprox-agent.log
-
-        # give it time to boot
-        sleep 30
-        if can_reach_manager; then
-            log "PegaProx VM recovered successfully"
-        else
-            log "VM started but manager not yet reachable, might need more time"
-        fi
+        qm start $PEGAPROX_VMID 2>&1 | tee -a "$LOG_FILE" 2>/dev/null
+        # no waiting for it here: the loop has to keep looking at quorum, and it
+        # logs when PegaProx answers again
     else
-        log "VM already running - manager might still be booting"
+        log "VM already running - PegaProx might still be booting"
     fi
     return 0
 }
 
-log "PegaProx Self-Fence Agent starting"
-log "Manager: $MANAGER_IP | Other nodes: $OTHER_NODES"
+# only with a PegaProx VM configured, and only while the cluster is in order
+watch_pegaprox() {
+    [ -n "$PEGAPROX_VMID" ] && [ -n "$MEMBERS" ] || return 0
+    # not on a quorum somebody forced: this node may be the one that is cut off, and
+    # its /etc/pve the copy from before the split
+    if quorum_forced 2>/dev/null; then MGR_DOWN_SINCE=""; return 0; fi
+    if leader_answers; then
+        [ -n "$MGR_DOWN_SINCE" ] && log "PegaProx answers again"
+        MGR_DOWN_SINCE=""
+        return 0
+    fi
+    now_cs
+    if [ -z "$MGR_DOWN_SINCE" ]; then
+        MGR_DOWN_SINCE=$NOW
+        log "No PegaProx leader answers, the cluster is in order"
+    elif [ $((NOW - MGR_DOWN_SINCE)) -ge "$T_SF_CS" ]; then
+        try_restart_pegaprox_vm
+        MGR_DOWN_SINCE=""
+    fi
+}
+
+log "PegaProx Self-Fence Agent v$AGENT_VERSION starting (mode: $MODE, strategy: $FENCE_STRATEGY)"
+log "Cluster votes: $CLUSTER_VOTES | PegaProx: ${MEMBERS:-not asked}"
 log "PegaProx VMID: ${PEGAPROX_VMID:-not configured}"
-log "Thresholds: isolation=$FAIL_THRESHOLD, recovery=$MGR_RECOVERY_THRESHOLD"
+if [ -n "$MEMBERS" ] && [ -z "$(hmac probe)" ]; then
+    log "ERROR: cannot sign the leader question (perl with Digest::SHA is needed) - no PegaProx leader will be heard"
+fi
 
 while true; do
-    mgr_ok=0; nodes_ok=0
-    can_reach_manager && mgr_ok=1
-    can_reach_other_nodes && nodes_ok=1
-
-    if [ $mgr_ok -eq 1 ]; then
-        # everything fine
-        if [ $FAIL_COUNT -gt 0 ] || [ $MGR_DOWN_COUNT -gt 0 ]; then
-            log "Recovered (fail=$FAIL_COUNT mgr_down=$MGR_DOWN_COUNT)"
-        fi
-        FAIL_COUNT=0
-        MGR_DOWN_COUNT=0
-    elif [ $nodes_ok -eq 1 ]; then
-        # manager down but nodes reachable -> PegaProx probably crashed
-        ((MGR_DOWN_COUNT++))
-        FAIL_COUNT=0
-        log "Manager unreachable, other nodes OK ($MGR_DOWN_COUNT/$MGR_RECOVERY_THRESHOLD)"
-
-        if [ $MGR_DOWN_COUNT -ge $MGR_RECOVERY_THRESHOLD ]; then
-            try_restart_pegaprox_vm
-            MGR_DOWN_COUNT=0
-        fi
+    if check; then
+        [ -n "$BAD_SINCE" ] && log "In order again"
+        BAD_SINCE=""
+        [ $HELD -eq 0 ] && watch_pegaprox
     else
-        # nobody reachable -> isolated
-        ((FAIL_COUNT++))
-        MGR_DOWN_COUNT=0
-        log "WARNING: Cannot reach anyone! $FAIL_COUNT/$FAIL_THRESHOLD"
-
-        if [ $FAIL_COUNT -ge $FAIL_THRESHOLD ]; then
-            # MK 2026-06-03: quorum-aware gate. Before fencing, ask corosync
-            # whether the cluster considers us quorate. If yes, this is a
-            # transient ICMP blip (peer reboot / brief network glitch), not
-            # genuine isolation — fencing here would be a false positive
-            # that kills VMs unnecessarily. Reset FAIL_COUNT and keep going.
-            if is_quorate; then
-                log "FAIL_THRESHOLD reached but pvecm says Quorate: Yes — skipping fence (transient blip, not real isolation)"
-                FAIL_COUNT=0
-                sleep $CHECK_INTERVAL
-                continue
-            fi
-            # MK 2026-06-03: 2-node cluster WITHOUT qdevice can never be
-            # quorate during a peer reboot. The original ping-isolation
-            # behaviour would fence the surviving node on every planned
-            # maintenance and take down ALL VMs cluster-wide. FENCE_STRATEGY
-            # is detected at install time and baked in. 'wait' means we
-            # log + sit on our hands — admin must add a qdevice to enable
-            # safe automatic fencing, OR live with the no-auto-fence trade-off.
-            if [ "$FENCE_STRATEGY" = "wait" ]; then
-                log "ISOLATED but FENCE_STRATEGY=wait (2-node cluster, no qdevice)"
-                log "Keeping VMs running — add a qdevice to enable proper quorum-based fencing"
-                FAIL_COUNT=0
-                sleep $CHECK_INTERVAL
-                continue
-            fi
-            log "════════════════════════════════════════════════════════"
-            log "ISOLATED! Self-fencing to prevent split-brain..."
-            log "(pvecm not quorate AND manager/peers unreachable for ${FAIL_THRESHOLD} cycles)"
-            log "════════════════════════════════════════════════════════"
-            stop_all_vms
-
-            log "Waiting for network recovery..."
-            while ! can_reach_manager && ! can_reach_other_nodes; do
-                sleep 10
-            done
-            log "Network recovered, resuming."
-            FAIL_COUNT=0
-            MGR_DOWN_COUNT=0
+        now_cs
+        if [ -z "$BAD_SINCE" ]; then
+            BAD_SINCE=$NOW
+            log "WARNING: $WHY - fencing in $((T_SF_CS / 100))s unless that changes"
+        elif [ $((NOW - BAD_SINCE)) -ge "$T_SF_CS" ]; then
+            self_fence
         fi
     fi
 
-    sleep $CHECK_INTERVAL
+    sleep "$CHECK_INTERVAL"
 done
 '''
 
-    def _ha_install_self_fence_agent(self, node_name: str, node_ip: str) -> bool:
-        """install self-fence agent on a node via SSH"""
-        try:
-            # Get manager IP (this PegaProx server)
-            manager_ip = self._get_pegaprox_server_ip()
-            if not manager_ip:
-                self.logger.error(f"[HA] Cannot determine PegaProx server IP!")
-                return False
-            
-            # Get other node IPs
-            other_nodes = self._ha_get_other_node_ips(node_name)
-            other_nodes_str = ','.join(other_nodes)
-            
-            self.logger.info(f"[HA] Installing self-fence agent on {node_name}")
-            self.logger.info(f"[HA]   Manager IP: {manager_ip}")
-            self.logger.info(f"[HA]   Other nodes: {other_nodes_str}")
-            
-            # Prepare agent script
-            agent_script = self._SELF_FENCE_AGENT_SCRIPT
-            agent_script = agent_script.replace('__MANAGER_IP__', manager_ip)
-            agent_script = agent_script.replace('__OTHER_NODES__', other_nodes_str)
-            # sec (audit): substituted into a root-run agent script, so coerce rather than trust
-            # whatever landed in ha_config — a vmid is a number or nothing.
-            _pvmid = str(self.ha_config.get('pegaprox_vmid', '') or '')
-            agent_script = agent_script.replace('__PEGAPROX_VMID__', _pvmid if _pvmid.isdigit() else '')
-            # MK 2026-06-03: bake the fence-strategy decision in at install
-            # time. Default to 'quorum' if detection fails; 'wait' is only
-            # selected for confirmed 2-node-no-qdevice topology so admins
-            # of those clusters don't lose every VM on a planned reboot.
-            agent_script = agent_script.replace('__FENCE_STRATEGY__', self._ha_detect_fence_strategy())
-            
-            # SSH credentials - try multiple sources
-            ssh_user = getattr(self.config, 'ssh_user', None) or 'root'
-            ssh_key = getattr(self.config, 'ssh_key_path', None) or getattr(self.config, 'ssh_key', None)
-            ssh_password = getattr(self.config, 'ssh_password', None) or self.config.pass_  # Fallback to Proxmox password
-            
-            self.logger.debug(f"[HA] SSH credentials: user={ssh_user}, has_key={bool(ssh_key)}, has_password={bool(ssh_password)}")
-            
-            # Create agent script on node
-            import base64
-            script_b64 = base64.b64encode(agent_script.encode()).decode()
-            
-            install_cmd = f'''
-echo "{script_b64}" | base64 -d > /usr/local/bin/pegaprox-agent.sh
-chmod +x /usr/local/bin/pegaprox-agent.sh
-
-cat > /etc/systemd/system/pegaprox-agent.service << 'SERVICEEOF'
-[Unit]
+    _FENCE_AGENT_SERVICE = '''[Unit]
 Description=PegaProx Self-Fence Agent
-After=network.target pve-cluster.service
+After=network.target pve-cluster.service corosync.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/pegaprox-agent.sh
+ExecStart=/usr/local/bin/pegaprox-fence-agent.sh
 Restart=always
 RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
-SERVICEEOF
+'''
 
-systemctl daemon-reload
-systemctl enable pegaprox-agent.service
-systemctl restart pegaprox-agent.service
+    # host, port and the path ha.valid_https_url lets a member address have (an
+    # instance behind a reverse proxy under a sub-path)
+    _AGENT_URL_RE = re.compile(r'https?://(?:[A-Za-z0-9.-]{1,253}|\[[0-9A-Fa-f:.]{2,45}\])(?::\d{1,5})?'
+                               r'(?:/[A-Za-z0-9._~/-]*)?')
+    _AGENT_ID_RE = re.compile(r'[A-Za-z0-9_.-]{1,64}')
+
+    @classmethod
+    def _agent_url_ok(cls, url):
+        """Whether a member address can go into the agent script and the check
+        command. '__' is refused although a path may carry it: it is what the
+        script's placeholders are made of."""
+        return isinstance(url, str) and bool(cls._AGENT_URL_RE.fullmatch(url)) and '__' not in url
+
+    def _ha_agent_ssh(self, node_ip, cmd, timeout=30):
+        """One command on a node with the credentials the agent installer uses: the
+        configured key, then the password, then whatever ssh finds on its own. None
+        when none of them got through."""
+        ssh_user = getattr(self.config, 'ssh_user', None) or 'root'
+        ssh_key = getattr(self.config, 'ssh_key_path', None) or getattr(self.config, 'ssh_key', None)
+        ssh_password = getattr(self.config, 'ssh_password', None) or self.config.pass_
+        out = None
+        if ssh_key:
+            out = self._ssh_run_command_with_key_output(node_ip, ssh_user, cmd, ssh_key, timeout=timeout)
+        if out is None and ssh_password:
+            out = self._ssh_run_command_with_password_output(node_ip, ssh_user, cmd, ssh_password,
+                                                             timeout=timeout)
+        if out is None:
+            out = self._ssh_run_command_output(node_ip, ssh_user, cmd, timeout=timeout)
+        return out
+
+    def _ha_node_names(self):
+        """Node names as the API host lists them, None when it does not answer."""
+        url = f"https://{self.host}:{self.api_port}/api2/json/nodes"
+        resp = self._create_session().get(url, timeout=10)
+        if resp.status_code != 200:
+            return None
+        return [n.get('node') for n in resp.json().get('data', []) if n.get('node')]
+
+    def _ha_agent_members(self):
+        """Base URLs a node agent asks for the leader: this instance and every other
+        member of its group. Sorted, so each instance of a group renders the same
+        script. An address that cannot go into the script is left out and named in
+        the log: the nodes will not ask that instance."""
+        own = ha.own_url()
+        if not own:
+            # never handed out a pairing code: the address the cluster host sees us at
+            ip = self._get_pegaprox_server_ip()
+            if ip:
+                host = f'[{ip}]' if ':' in ip else ip
+                own = f'https://{host}:{_g.SERVER_BIND_PORT or 5000}'
+        urls = sorted({u.rstrip('/') for u in [own] + [m.get('url') or '' for m in ha.members()] if u})
+        said = self.__dict__.setdefault('_ha_agent_urls_refused', set())
+        for u in urls:
+            if not self._agent_url_ok(u) and u not in said:
+                said.add(u)        # the monitor asks every minute, the log hears it once
+                self.logger.error(f"[HA] {u[:200]!r} is no address a node agent can ask - the nodes will "
+                                  "not hear this PegaProx instance")
+        return [u for u in urls if self._agent_url_ok(u)]
+
+    def _ha_agent_token(self):
+        """The key the agents of this cluster and the instances share for the leader
+        question. Made once, stored with the HA settings, never shown.
+
+        It is stored before a script carries it. An agent whose key this instance
+        forgot at its next start would never hear a leader again, and a tiebreak
+        node without a leader fences itself. Raises ValueError when it cannot be
+        stored."""
+        token = self.ha_config.get('agent_token')
+        if not isinstance(token, str) or not re.fullmatch(r'[0-9a-f]{64}', token):
+            if not ha.is_active():
+                raise ValueError('a standby makes no agent token')
+            import secrets
+            token = secrets.token_hex(32)
+            try:
+                db = get_db()
+                row = db.get_cluster(self.id)
+                row['ha_settings'] = dict(row.get('ha_settings') or {}, agent_token=token)
+                db.save_cluster(self.id, row)
+                kept = db.get_cluster(self.id)['ha_settings'].get('agent_token') == token
+            except Exception as e:
+                self.logger.error(f"[HA] Could not store the agent token: {e}")
+                kept = False
+            if not kept:
+                raise ValueError('the agent token could not be stored')
+            # the copy save_config writes back over the row
+            stored = getattr(self.config, 'ha_settings', None)
+            if isinstance(stored, dict):
+                stored['agent_token'] = token
+            else:
+                self.config.ha_settings = dict(row['ha_settings'])
+            self.ha_config['agent_token'] = token
+        return token
+
+    def _ha_minority_fences(self):
+        """Whether a node without quorum stops its guests whatever a leader says, by the
+        last look at corosync (no SSH): three or more votes, no two_node, and not a
+        setup on unsafe_two_node_recovery."""
+        seen = self.ha_config.get('fence_strategy') or {}
+        votes = seen.get('expected_votes')
+        return bool(isinstance(votes, int) and not isinstance(votes, bool) and votes >= 3
+                    and not seen.get('two_node_flag') and not self._ha_unsafe_two_node())
+
+    def _ha_agent_plan(self, detect=True):
+        """How the self-fence agents of this cluster decide (#625, quorum first).
+
+        mode 'quorum': 3 or more votes or a qdevice, and nothing forces quorum - the
+        node fences itself when it is not quorate, and asks nobody. mode 'tiebreak':
+        two votes, or two_node_mode / force_quorum_on_failure - quorum cannot tell the
+        sides of a split apart there, so the instances are asked who leads. mode
+        'off': a node that is in no corosync cluster. Only tiebreak clusters, and
+        clusters with a PegaProx VM to restart, get the member list baked in.
+
+        detect=False goes by what the last look at corosync found, if there was one."""
+        seen = self.ha_config.get('fence_strategy') or {}
+        if detect or seen.get('detection_reason') != 'detected':
+            strategy = self._ha_detect_fence_strategy()
+            seen = self.ha_config.get('fence_strategy') or {}
+        else:
+            strategy = seen.get('strategy')
+        votes = seen.get('expected_votes')
+        forced = bool(self.ha_config.get('two_node_mode') or self.ha_config.get('force_quorum_on_failure'))
+        if votes is None:
+            # corosync was not read: go by the node count, as get_ha_status does
+            try:
+                names = self._ha_node_names()
+            except Exception:
+                names = None
+            votes = len(names) if names else None
+        if votes is not None and votes <= 1:
+            mode = 'off'
+        elif forced or votes is None or votes < 3 or seen.get('two_node_flag'):
+            mode = 'tiebreak'
+        else:
+            mode = 'quorum'
+        vmid = str(self.ha_config.get('pegaprox_vmid', '') or '')
+        vmid = vmid if vmid.isdigit() else ''
+        members = self._ha_agent_members() if (mode == 'tiebreak' or vmid) else []
+        # with three or more votes a majority can exist on the other side, so a node
+        # without quorum fences itself even where the leader is asked otherwise.
+        # corosync's two_node leaves both halves quorate and is no such cluster.
+        # Neither is a setup on unsafe_two_node_recovery: PegaProx forces quorum on
+        # the node that is left there, and that comes after the agent's fence delay.
+        # The node would stop its own guests, and the agent starts none of them
+        # again: an outage the agent before v2 did not cause. For a node without
+        # quorum the leader breaks the tie there, as it did before v2.
+        minority_fences = self._ha_minority_fences()
+        return {'mode': mode, 'strategy': strategy, 'members': members, 'vmid': vmid,
+                'expected_votes': votes, 'minority_fences': minority_fences}
+
+    def _ha_fence_timing(self, node=None):
+        """The agent's fence delay and the earliest start of a recovery, from one
+        place so they cannot drift apart (#625).
+
+        fence_delay: how long a node is out of order before its v2 agent stops its
+        guests; the script is rendered with it. earliest_recovery: seconds from the
+        monitor pass that first sees the node offline to the start of its recovery.
+        That pass is check one, so the node is declared failure_threshold - 1
+        intervals later, and then comes `wait`, which is what the recovery worker
+        sleeps.
+
+        On a node whose agent is not v2 (none, or the one of an older PegaProx) the
+        wait is recovery_delay as the admin set it, as before. Where v2 runs it is
+        never short of fence_delay + margin: a recovery that came first would start
+        guests elsewhere that the node is still about to stop. That holds for a
+        value that cannot be counted with too. A JSON true or false is a number to
+        time.sleep and to the monitor's comparison, and was handed on as it was:
+        the recovery of a v2 node then began after 0 to 30 s. node=None answers for
+        a node with the v2 agent."""
+        fence_delay, margin = self.FENCE_AGENT_T_SF, self.FENCE_AGENT_MARGIN
+        wait = self.ha_config.get('recovery_delay', 30)
+        threshold = getattr(self, 'ha_failure_threshold', 3)
+        interval = self._ha_interval()
+        v2 = node is None or (self.ha_config.get('fence_agent_versions') or {}).get(node) == self.FENCE_AGENT_VERSION
+        if v2:
+            # a threshold that is no number declares the node on the first pass
+            # that sees it offline, or never
+            declared = max(threshold - 1, 0) * interval if self._ha_countable(threshold) else 0
+            need = fence_delay + margin
+            wait = max(wait, need - declared) if self._ha_countable(wait) else need
+            return {'fence_delay': fence_delay, 'margin': margin, 'wait': wait,
+                    'earliest_recovery': declared + wait}
+        counted = all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (wait, threshold))
+        declared = max(threshold - 1, 0) * interval if counted else None
+        return {'fence_delay': fence_delay, 'margin': margin, 'wait': wait,
+                'earliest_recovery': declared + wait if counted else None}
+
+    @staticmethod
+    def _ha_countable(value) -> bool:
+        """Whether recovery_delay or failure_threshold is a number the recovery
+        timing can be worked out from: int or float, no bool, finite, not negative."""
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and value == value and value not in (float('inf'), float('-inf')) and value >= 0)
+
+    def _ha_interval(self) -> int:
+        """Seconds between two passes of the HA monitor. The loop sleeps this and
+        _ha_fence_timing counts with it: the loop slept a literal ten seconds, and
+        any other ha_check_interval would have moved the two apart."""
+        interval = getattr(self, 'ha_check_interval', 10)
+        return int(interval) if self._ha_countable(interval) and interval >= 1 else 10
+
+    def _ha_render_fence_agent(self, node_name, plan=None, t_sf=None, interval=None):
+        """The self-fence script, every placeholder filled. It carries nothing of the
+        node it goes to (it did carry the node's peers to ping): the same script for
+        every node of the cluster.
+
+        sec (audit): all of it lands in a root-run script, so each value is checked for
+        its shape here rather than trusted. Raises ValueError for one that has none."""
+        plan = plan or self._ha_agent_plan()
+        mode, strategy = plan.get('mode'), plan.get('strategy')
+        if mode not in ('quorum', 'tiebreak', 'off') or strategy not in ('quorum', 'wait'):
+            raise ValueError(f'no agent plan: {mode}/{strategy}')
+        members = [u for u in (plan.get('members') or []) if self._agent_url_ok(u)]
+        if mode == 'tiebreak' and not members:
+            raise ValueError('a tiebreak cluster needs the address of a PegaProx instance')
+        votes = plan.get('expected_votes')
+        votes = votes if isinstance(votes, int) and not isinstance(votes, bool) and 0 < votes < 1000 else 0
+        cluster_id = str(self.id)
+        if not self._AGENT_ID_RE.fullmatch(cluster_id):
+            raise ValueError('cluster id cannot go into the agent script')
+        vmid = str(plan.get('vmid') or '')
+        t_sf = self._ha_fence_timing()['fence_delay'] if t_sf is None else t_sf
+        interval = self.FENCE_AGENT_INTERVAL if interval is None else interval
+        fill = {
+            '__MODE__': mode,
+            '__MINORITY_FENCES__': '1' if plan.get('minority_fences') else '0',
+            '__FENCE_STRATEGY__': strategy,
+            '__CLUSTER_VOTES__': str(votes),
+            '__MEMBERS__': ' '.join(members),
+            '__CLUSTER_ID__': cluster_id,
+            '__AGENT_TOKEN__': self._ha_agent_token() if members else '',
+            '__PEGAPROX_VMID__': vmid if vmid.isdigit() else '',
+            '__CHECK_INTERVAL__': f'{float(interval):g}',
+            '__T_SF_CS__': str(int(round(float(t_sf) * 100))),
+        }
+        # one pass: a value that spells a placeholder is not filled in turn
+        return re.sub('|'.join(map(re.escape, fill)), lambda m: fill[m.group(0)],
+                      self._SELF_FENCE_AGENT_SCRIPT)
+
+    @classmethod
+    def _fence_agent_legacy_guard(cls, root=''):
+        """Shell test: the script under the node agent's name is a self-fence agent of
+        an older PegaProx. `root` is for the tests, a directory that stands in for /."""
+        return f"grep -qx {shlex.quote(cls.FENCE_AGENT_MARKER)} {shlex.quote(root + cls.NODE_AGENT_PATH)} 2>/dev/null"
+
+    @classmethod
+    def _fence_agent_leftovers_cmd(cls, root=''):
+        """Shell: remove the files a development build of the v2 agent kept under
+        /run (a list of the guests it had stopped, and what went with it). The agent
+        keeps nothing there, and nothing reads them."""
+        return f"rm -f {shlex.quote(root + '/run/pegaprox-fence-agent.stopped')}* 2>/dev/null"
+
+    @classmethod
+    def _fence_agent_install_cmd(cls, script_b64, unit_b64, root=''):
+        """Install the self-fence agent under its own names. A node agent on the node is
+        left alone; the script under the node agent's name goes only when it is the
+        self-fence agent an older PegaProx put there."""
+        script = shlex.quote(root + cls.FENCE_AGENT_PATH)
+        unit = shlex.quote(f'{root}/etc/systemd/system/{cls.FENCE_AGENT_UNIT}')
+        old_unit = shlex.quote(f'{root}/etc/systemd/system/{cls.NODE_AGENT_UNIT}')
+        old_script = shlex.quote(root + cls.NODE_AGENT_PATH)
+        return f'''
+umask 077
+{cls._fence_agent_leftovers_cmd(root)}
+echo "{script_b64}" | base64 -d > {script}.new &&
+chmod 700 {script}.new &&
+mv -f {script}.new {script} &&
+echo "{unit_b64}" | base64 -d > {unit} &&
+chmod 644 {unit} &&
+systemctl daemon-reload &&
+systemctl enable {cls.FENCE_AGENT_UNIT} &&
+systemctl restart {cls.FENCE_AGENT_UNIT} || exit 1
+if {cls._fence_agent_legacy_guard(root)}; then
+    systemctl stop {cls.NODE_AGENT_UNIT} 2>/dev/null || true
+    systemctl disable {cls.NODE_AGENT_UNIT} 2>/dev/null || true
+    rm -f {old_unit} {old_script}
+    systemctl daemon-reload
+    echo "LEGACY_AGENT_REMOVED"
+fi
 echo "AGENT_INSTALLED"
 '''
-            
-            # Execute installation - try different methods
-            result = None
-            
-            # 1. Try with SSH key if available
-            if result is None and ssh_key:
-                self.logger.info(f"[HA] Trying SSH key authentication to {node_ip}...")
-                result = self._ssh_run_command_with_key_output(node_ip, ssh_user, install_cmd, ssh_key)
-            
-            # 2. Try with sshpass (password) if available
-            if result is None and ssh_password:
-                # Check if sshpass is installed
-                import shutil
-                if shutil.which('sshpass'):
-                    self.logger.info(f"[HA] Trying SSH password authentication to {node_ip}...")
-                    result = self._ssh_run_command_with_password_output(node_ip, ssh_user, install_cmd, ssh_password)
-                else:
-                    self.logger.warning(f"[HA] sshpass not installed - cannot use password auth. Install with: apt install sshpass")
-            
-            # 3. Try with default SSH (requires pre-configured keys)
-            if result is None:
-                self.logger.info(f"[HA] Trying default SSH authentication to {node_ip}...")
-                result = self._ssh_run_command_output(node_ip, ssh_user, install_cmd)
-            
-            if result and 'AGENT_INSTALLED' in result:
-                self.logger.info(f"[HA] ✓ Self-fence agent installed on {node_name}")
-                return True
-            else:
-                self.logger.error(f"[HA] SSH to {node_ip} failed (key={bool(ssh_key)}, pass={bool(ssh_password)})")
+
+    @classmethod
+    def _fence_agent_uninstall_cmd(cls, root=''):
+        """Remove the self-fence agent: its own files, and the one an older PegaProx
+        left under the node agent's name. A node agent stays."""
+        script = shlex.quote(root + cls.FENCE_AGENT_PATH)
+        unit = shlex.quote(f'{root}/etc/systemd/system/{cls.FENCE_AGENT_UNIT}')
+        old_unit = shlex.quote(f'{root}/etc/systemd/system/{cls.NODE_AGENT_UNIT}')
+        old_script = shlex.quote(root + cls.NODE_AGENT_PATH)
+        return f'''
+systemctl stop {cls.FENCE_AGENT_UNIT} 2>/dev/null || true
+systemctl disable {cls.FENCE_AGENT_UNIT} 2>/dev/null || true
+rm -f {unit} {script}
+{cls._fence_agent_leftovers_cmd(root)}
+if {cls._fence_agent_legacy_guard(root)}; then
+    systemctl stop {cls.NODE_AGENT_UNIT} 2>/dev/null || true
+    systemctl disable {cls.NODE_AGENT_UNIT} 2>/dev/null || true
+    rm -f {old_unit} {old_script}
+fi
+systemctl daemon-reload
+echo "AGENT_UNINSTALLED"
+'''
+
+    @classmethod
+    def _fence_agent_ctl_cmd(cls, action, root=''):
+        """systemctl start or stop for the self-fence agent, the one an older PegaProx
+        left under the node agent's name included. A node agent is not touched."""
+        if action not in ('start', 'stop'):
+            raise ValueError(action)
+        return (f"systemctl {action} {cls.FENCE_AGENT_UNIT} 2>/dev/null || true; "
+                f"if {cls._fence_agent_legacy_guard(root)}; then "
+                f"systemctl {action} {cls.NODE_AGENT_UNIT} 2>/dev/null || true; fi")
+
+    @classmethod
+    def _node_agent_uninstall_cmd(cls, root=''):
+        """Remove the node agent (storage heartbeat, poison pill). The script under its
+        name stays when it is a self-fence agent: that one has its own uninstall."""
+        unit = shlex.quote(f'{root}/etc/systemd/system/{cls.NODE_AGENT_UNIT}')
+        script = shlex.quote(root + cls.NODE_AGENT_PATH)
+        return f'''
+if {cls._fence_agent_legacy_guard(root)}; then
+    echo "NODE_AGENT_ABSENT"
+else
+    systemctl stop {cls.NODE_AGENT_UNIT} 2>/dev/null || true
+    systemctl disable {cls.NODE_AGENT_UNIT} 2>/dev/null || true
+    rm -f {unit} {script}
+    systemctl daemon-reload
+    echo "NODE_AGENT_REMOVED"
+fi
+'''
+
+    def _ha_install_self_fence_agent(self, node_name: str, node_ip: str, plan=None) -> bool:
+        """install self-fence agent on a node via SSH"""
+        try:
+            try:
+                agent_script = self._ha_render_fence_agent(node_name, plan)
+            except ValueError as e:
+                self.logger.error(f"[HA] Cannot build the self-fence agent for {node_name}: {e}")
                 return False
-                
+
+            self.logger.info(f"[HA] Installing self-fence agent on {node_name}")
+
+            import base64
+            script_b64 = base64.b64encode(agent_script.encode()).decode()
+            unit_b64 = base64.b64encode(self._FENCE_AGENT_SERVICE.encode()).decode()
+            result = self._ha_agent_ssh(node_ip, self._fence_agent_install_cmd(script_b64, unit_b64))
+
+            if result and 'AGENT_INSTALLED' in result:
+                if 'LEGACY_AGENT_REMOVED' in result:
+                    self.logger.info(f"[HA] {node_name}: replaced the self-fence agent that ran as "
+                                     f"{self.NODE_AGENT_UNIT}")
+                self.logger.info(f"[HA] ✓ Self-fence agent installed on {node_name}")
+                versions = self.ha_config.setdefault('fence_agent_versions', {})
+                versions[node_name] = self.FENCE_AGENT_VERSION
+                return True
+            self.logger.error(f"[HA] SSH to {node_ip} failed, self-fence agent not installed on {node_name}")
+            return False
+
         except Exception as e:
             self.logger.error(f"[HA] Error installing self-fence agent on {node_name}: {e}")
             return False
-    
+
     def _get_pegaprox_server_ip(self) -> str:
         """Get the IP address of this PegaProx server that nodes can reach"""
         import socket
@@ -6077,195 +7274,427 @@ echo "AGENT_INSTALLED"
         except:
             return ''
     
-    def _ha_get_other_node_ips(self, exclude_node: str) -> list:
-        """Get IP addresses of all nodes except the specified one"""
-        other_ips = []
-        
-        try:
-            host = self.host
-            url = f"https://{host}:{self.api_port}/api2/json/nodes"
-            resp = self._create_session().get(url, timeout=10)
-            
-            if resp.status_code == 200:
-                nodes_data = resp.json().get('data', [])
-                self.logger.debug(f"[HA] Found {len(nodes_data)} nodes in cluster")
-                
-                for node in nodes_data:
-                    node_name = node.get('node', '')
-                    self.logger.debug(f"[HA] Checking node: {node_name} (exclude: {exclude_node})")
-                    
-                    # Case-insensitive comparison - NS Jan 2026
-                    if node_name and node_name.lower() != exclude_node.lower():
-                        # Use existing _ha_get_node_ip function
-                        node_ip = self._ha_get_node_ip(node_name)
-                        
-                        if node_ip:
-                            other_ips.append(node_ip)
-                            self.logger.info(f"[HA] Found other node: {node_name} -> {node_ip}")
-                        else:
-                            self.logger.warning(f"[HA] Could not find IP for node: {node_name}")
-                            
-        except Exception as e:
-            self.logger.error(f"[HA] Error getting other node IPs: {e}")
-        
-        return other_ips
-    
+    def _ha_node_ip_map(self):
+        """{node name: management IP or None} for every node, None when the API host
+        does not list them."""
+        names = self._ha_node_names()
+        if names is None:
+            return None
+        return {name: self._ha_get_node_ip(name) for name in names}
+
     def _ha_install_self_fence_on_all_nodes(self) -> dict:
         """install self-fence agent on all cluster nodes, returns {node: success} dict"""
         results = {}
-        
+
         try:
-            host = self.host
-            url = f"https://{host}:{self.api_port}/api2/json/nodes"
-            resp = self._create_session().get(url, timeout=10)
-            
-            if resp.status_code != 200:
+            ips = self._ha_node_ip_map()
+            if ips is None:
                 self.logger.error("[HA] Cannot get node list from cluster")
                 return results
-            
-            nodes = resp.json().get('data', [])
-            self.logger.info(f"[HA] Installing self-fence agent on {len(nodes)} nodes...")
-            
-            for node in nodes:
-                node_name = node.get('node', '')
-                if not node_name:
-                    continue
-                
-                # Get node IP
-                node_ip = self._ha_get_node_ip(node_name)
+
+            self.logger.info(f"[HA] Installing self-fence agent on {len(ips)} nodes...")
+            # corosync is read once for the cluster, not once per node
+            plan = self._ha_agent_plan()
+            self.logger.info(f"[HA]   Mode: {plan['mode']}, strategy: {plan['strategy']}, "
+                             f"PegaProx instances asked: {' '.join(plan['members']) or 'none'}")
+
+            for node_name, node_ip in ips.items():
                 if not node_ip:
                     self.logger.warning(f"[HA] Cannot determine IP for node {node_name}")
                     results[node_name] = False
                     continue
-                
-                # Install agent
-                success = self._ha_install_self_fence_agent(node_name, node_ip)
-                results[node_name] = success
-            
+
+                results[node_name] = self._ha_install_self_fence_agent(node_name, node_ip, plan)
+
             success_count = sum(1 for v in results.values() if v)
+            if success_count:
+                # the instances the nodes ask now: the monitor compares against it
+                self.ha_config['fence_agent_members'] = list(plan['members'])
             self.logger.info(f"[HA] Self-fence agent installation complete: {success_count}/{len(results)}")
-            
+
         except Exception as e:
             self.logger.error(f"[HA] Error installing self-fence agents: {e}")
-        
+
         return results
-    
-    def _ha_uninstall_self_fence_on_all_nodes(self) -> dict:
-        """uninstall self-fence agent from all cluster nodes, returns {node: success} dict"""
+
+    def _ha_on_all_nodes(self, what, per_node) -> dict:
+        """{node: per_node(name, ip)} over every node the API host lists; a node
+        without an IP counts as failed."""
         results = {}
-        
         try:
-            host = self.host
-            url = f"https://{host}:{self.api_port}/api2/json/nodes"
-            resp = self._create_session().get(url, timeout=10)
-            
-            if resp.status_code != 200:
+            ips = self._ha_node_ip_map()
+            if ips is None:
                 self.logger.error("[HA] Cannot get node list from cluster")
                 return results
-            
-            nodes = resp.json().get('data', [])
-            self.logger.info(f"[HA] Uninstalling self-fence agent from {len(nodes)} nodes...")
-            
-            for node in nodes:
-                node_name = node.get('node', '')
-                if not node_name:
-                    continue
-                
-                # Get node IP
-                node_ip = self._ha_get_node_ip(node_name)
+            self.logger.info(f"[HA] {what} on {len(ips)} nodes...")
+            for node_name, node_ip in ips.items():
                 if not node_ip:
                     self.logger.warning(f"[HA] Cannot determine IP for node {node_name}")
                     results[node_name] = False
                     continue
-                
-                # Uninstall agent
-                success = self._ha_uninstall_self_fence_agent(node_name, node_ip)
-                results[node_name] = success
-            
+                results[node_name] = per_node(node_name, node_ip)
             success_count = sum(1 for v in results.values() if v)
-            self.logger.info(f"[HA] Self-fence agent uninstallation complete: {success_count}/{len(results)}")
-            
+            self.logger.info(f"[HA] {what} complete: {success_count}/{len(results)}")
         except Exception as e:
-            self.logger.error(f"[HA] Error uninstalling self-fence agents: {e}")
-        
+            self.logger.error(f"[HA] Error, {what}: {e}")
         return results
-    
+
+    def _ha_uninstall_self_fence_on_all_nodes(self) -> dict:
+        """uninstall self-fence agent from all cluster nodes, returns {node: success} dict"""
+        return self._ha_on_all_nodes('Uninstalling self-fence agent', self._ha_uninstall_self_fence_agent)
+
     def _ha_uninstall_self_fence_agent(self, node_name: str, node_ip: str) -> bool:
-        """uninstall self-fence agent from a single node via SSH"""
+        """uninstall self-fence agent from a single node via SSH; a node agent stays"""
         try:
             self.logger.info(f"[HA] Uninstalling self-fence agent from {node_name}")
-            
-            # SSH credentials - try multiple sources (same as install)
-            ssh_user = getattr(self.config, 'ssh_user', None) or 'root'
-            ssh_key = getattr(self.config, 'ssh_key_path', None) or getattr(self.config, 'ssh_key', None)
-            ssh_password = getattr(self.config, 'ssh_password', None) or self.config.pass_
-            
-            uninstall_cmd = '''
-systemctl stop pegaprox-agent.service 2>/dev/null || true
-systemctl disable pegaprox-agent.service 2>/dev/null || true
-rm -f /etc/systemd/system/pegaprox-agent.service
-rm -f /usr/local/bin/pegaprox-agent.sh
-systemctl daemon-reload
-echo "AGENT_UNINSTALLED"
-'''
-            
-            # Execute uninstallation - try different methods
-            result = None
-            
-            if result is None and ssh_key:
-                result = self._ssh_run_command_with_key_output(node_ip, ssh_user, uninstall_cmd, ssh_key)
-            if result is None and ssh_password:
-                result = self._ssh_run_command_with_password_output(node_ip, ssh_user, uninstall_cmd, ssh_password)
-            if result is None:
-                result = self._ssh_run_command_output(node_ip, ssh_user, uninstall_cmd)
-            
+            result = self._ha_agent_ssh(node_ip, self._fence_agent_uninstall_cmd())
+
             if result and 'AGENT_UNINSTALLED' in result:
                 self.logger.info(f"[HA] ✓ Self-fence agent uninstalled from {node_name}")
+                (self.ha_config.get('fence_agent_versions') or {}).pop(node_name, None)
                 return True
-            else:
-                self.logger.error(f"[HA] ✗ Failed to uninstall agent from {node_name}: {result}")
-                return False
-                
+            self.logger.error(f"[HA] ✗ Failed to uninstall agent from {node_name}: {result}")
+            return False
+
         except Exception as e:
             self.logger.error(f"[HA] Error uninstalling self-fence agent from {node_name}: {e}")
             return False
-    
+
+    def _ha_uninstall_all_agents(self, node_name: str, node_ip: str) -> bool:
+        """Both agents off one node, for the HA teardown: True only when neither is
+        left. They have separate names now, so one uninstall no longer covers both."""
+        try:
+            result = self._ha_agent_ssh(node_ip, self._fence_agent_uninstall_cmd()
+                                        + self._node_agent_uninstall_cmd())
+            if result and 'AGENT_UNINSTALLED' in result and 'NODE_AGENT_REMOVED' in result:
+                self.logger.info(f"[HA] ✓ Agents removed from {node_name}")
+                (self.ha_config.get('fence_agent_versions') or {}).pop(node_name, None)
+                return True
+            self.logger.error(f"[HA] ✗ Failed to remove the agents from {node_name}: {result}")
+            return False
+        except Exception as e:
+            self.logger.error(f"[HA] Error removing the agents from {node_name}: {e}")
+            return False
+
+    def _ha_uninstall_agents_on_all_nodes(self) -> dict:
+        """Self-fence agent and node agent off every node, returns {node: success}."""
+        return self._ha_on_all_nodes('Removing the self-fence and node agents', self._ha_uninstall_all_agents)
+
     def _ha_stop_self_fence_agents(self):
         """Stop (but don't uninstall) self-fence agents on all nodes
-        
+
         Used when HA is disabled to prevent agents from running without manager
         """
+        self._ha_self_fence_agents_ctl('stop')
+
+    def _ha_self_fence_agents_ctl(self, action):
         try:
-            host = self.host
-            url = f"https://{host}:{self.api_port}/api2/json/nodes"
-            resp = self._create_session().get(url, timeout=10)
-            
-            if resp.status_code != 200:
+            ips = self._ha_node_ip_map()
+            if ips is None:
                 return
-            
-            for node in resp.json().get('data', []):
-                node_name = node.get('node', '')
-                node_ip = self._ha_get_node_ip(node_name) if node_name else None
-                
+            cmd = self._fence_agent_ctl_cmd(action)
+            for node_name, node_ip in ips.items():
                 if node_ip:
-                    ssh_user = getattr(self.config, 'ssh_user', None) or 'root'
-                    ssh_key = getattr(self.config, 'ssh_key_path', None) or getattr(self.config, 'ssh_key', None)
-                    ssh_password = getattr(self.config, 'ssh_password', None) or self.config.pass_
-                    
-                    stop_cmd = 'systemctl stop pegaprox-agent.service 2>/dev/null || true'
-                    
-                    result = None
-                    if ssh_key:
-                        result = self._ssh_run_command_with_key_output(node_ip, ssh_user, stop_cmd, ssh_key)
-                    if result is None and ssh_password:
-                        result = self._ssh_run_command_with_password_output(node_ip, ssh_user, stop_cmd, ssh_password)
-                    if result is None:
-                        self._ssh_run_command_output(node_ip, ssh_user, stop_cmd)
-                        
-                    self.logger.info(f"[HA] Stopped self-fence agent on {node_name}")
+                    self._ha_agent_ssh(node_ip, cmd)
+                    self.logger.info(f"[HA] Self-fence agent on {node_name}: {action}")
 
         except Exception as e:
-            self.logger.error(f"[HA] Error stopping self-fence agents: {e}")
+            self.logger.error(f"[HA] Error, self-fence agents {action}: {e}")
+
+    @classmethod
+    def _agent_check_cmd(cls, members=(), root=''):
+        """What one node runs for the install check: which agents it has, in which
+        version, whether they run, and which PegaProx instances it can reach."""
+        fence, node = shlex.quote(root + cls.FENCE_AGENT_PATH), shlex.quote(root + cls.NODE_AGENT_PATH)
+        lines = [
+            f"F={fence}; N={node}",
+            'v=0; mode=; sha=',
+            'if [ -f "$F" ]; then',
+            "  v=$(sed -n 's/^AGENT_VERSION=\\([0-9][0-9]*\\)$/\\1/p' \"$F\" | head -n1)",
+            # a v1 script that was moved to this name as it is: the marker, no version line
+            f'  [ -z "$v" ] && grep -qx {shlex.quote(cls.FENCE_AGENT_MARKER)} "$F" && v=1',
+            "  mode=$(sed -n 's/^MODE=\"\\([a-z]*\\)\"$/\\1/p' \"$F\" | head -n1)",
+            "  sha=$(sha256sum \"$F\" | cut -d' ' -f1)",
+            'fi',
+            'echo "FENCE_VERSION=${v:-0}"; echo "FENCE_MODE=$mode"; echo "FENCE_SHA=$sha"',
+            f'echo "FENCE_ACTIVE=$(systemctl is-active {cls.FENCE_AGENT_UNIT} 2>/dev/null)"',
+            # the script under the node agent's name: a v1 self-fence agent, a node agent, or nothing
+            f"if {cls._fence_agent_legacy_guard(root)}; then echo SHARED=fence; "
+            'elif [ -f "$N" ]; then echo SHARED=node; else echo SHARED=none; fi',
+            f'echo "SHARED_ACTIVE=$(systemctl is-active {cls.NODE_AGENT_UNIT} 2>/dev/null)"',
+        ]
+        for url in members:
+            if cls._agent_url_ok(url):
+                q = shlex.quote(url)
+                lines.append(f"echo \"MEMBER {url} $(curl -sk -o /dev/null -w '%{{http_code}}' "
+                             f"--max-time 3 {q}/api/ha/agent 2>/dev/null)\"")
+        lines.append('echo AGENT_CHECK_DONE')
+        return '\n'.join(lines) + '\n'
+
+    @classmethod
+    def _parse_agent_check(cls, out):
+        """The answer of _agent_check_cmd as a dict, None when the node did not finish it."""
+        if not out or 'AGENT_CHECK_DONE' not in out:
+            return None
+        raw, unreachable = {}, []
+        for line in out.splitlines():
+            if line.startswith('MEMBER '):
+                parts = line.split()
+                # the route answers a question without a shape with 400. Anything else
+                # did not come from it: no answer (000), a proxy, the IP allow list
+                if len(parts) < 3 or parts[2] != '400':
+                    unreachable.append(parts[1] if len(parts) > 1 else '')
+            elif '=' in line:
+                key, _, value = line.partition('=')
+                raw[key.strip()] = value.strip()
+        own = int(raw['FENCE_VERSION']) if raw.get('FENCE_VERSION', '').isdigit() else 0
+        legacy = raw.get('SHARED') == 'fence'
+        version = own or (1 if legacy else 0)
+        return {
+            # 0 none, 1 the agent of an older PegaProx: under the node agent's name, or
+            # moved to its own as it was
+            'fence_agent': {'version': version,
+                            'mode': raw.get('FENCE_MODE') or ('v1' if version == 1 else ''),
+                            'active': raw.get('FENCE_ACTIVE') == 'active'
+                                      or (legacy and not own and raw.get('SHARED_ACTIVE') == 'active'),
+                            'sha256': raw.get('FENCE_SHA', ''),
+                            'legacy_shared_name': legacy},
+            'node_agent': {'installed': raw.get('SHARED') == 'node',
+                           'active': raw.get('SHARED') == 'node' and raw.get('SHARED_ACTIVE') == 'active'},
+            'members_unreachable': unreachable,
+        }
+
+    def _ha_check_agents(self):
+        """The install check (#625): which agents every node runs and in which
+        version, read over SSH, 8 nodes at a time. In 'nodes' a node that did not
+        answer maps to None. Nodes whose self-fence agent asks the PegaProx instances
+        also try each of them once. None when the API host lists no nodes."""
+        ips = self._ha_node_ip_map()
+        if ips is None:
+            return None
+        plan = self._ha_agent_plan(detect=False)
+        cmd = self._agent_check_cmd(plan['members'])
+        names = [n for n, ip in ips.items() if ip]
+
+        def one(name):
+            try:
+                return self._parse_agent_check(self._ha_agent_ssh(ips[name], cmd))
+            except Exception as e:
+                self.logger.debug(f"[HA] agent check on {name}: {e}")
+                return None
+
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            found = dict(zip(names, pool.map(one, names)))
+        results = {n: found.get(n) for n in ips}
+        try:
+            want = hashlib.sha256(self._ha_render_fence_agent(None, plan).encode()).hexdigest()
+        except ValueError:
+            want = ''
+        # a node that did not answer keeps what was known of it, as in
+        # _ha_redeploy_fence_agents: forgotten, its recovery would no longer wait
+        # for the v2 agent it still runs
+        known = self.ha_config.get('fence_agent_versions')
+        versions = dict(known) if isinstance(known, dict) else {}
+        for name, info in results.items():
+            if not info:
+                continue
+            fa = info['fence_agent']
+            if fa['version']:
+                versions[name] = fa['version']
+            else:
+                versions.pop(name, None)
+            fa['current'] = bool(want) and fa['version'] == self.FENCE_AGENT_VERSION and fa['sha256'] == want
+            # an agent from before v2: it runs on as it is until it is installed again
+            fa['outdated'] = 0 < fa['version'] < self.FENCE_AGENT_VERSION
+        self.ha_config['fence_agent_versions'] = versions
+        return {'nodes': results, 'expected_version': self.FENCE_AGENT_VERSION,
+                'mode': plan['mode'], 'strategy': plan['strategy'], 'members': plan['members']}
+
+    FENCE_AGENT_OUTDATED = ('The self-fence agent on {nodes} is version 1: it pings one PegaProx address '
+                            'and does not go by the quorum of the cluster. It keeps running as it is. '
+                            'Install the self-fence agent again from the HA settings to replace it with '
+                            'version {version}.')
+    # saving the HA settings used to install on every node. It leaves a version 1
+    # agent alone now, so that one decides by what it was installed with
+    FENCE_AGENT_OUTDATED_SETTINGS = ('A change of the PegaProx VM ID or of the two-node settings does not '
+                                     'reach the version 1 agent on {nodes}: it keeps the settings it was '
+                                     'installed with until the self-fence agent is installed again from '
+                                     'the HA settings.')
+    FENCED_SURVIVOR_NOTE = ('Under the safety rules a node that loses quorum stops its own guests: when it is '
+                            'the last node left, PegaProx brings back the guests of the failed nodes after a '
+                            "verified fence, and the last node's own guests stay stopped until an admin "
+                            "starts them. The 'unsafe two-node recovery' switch keeps the old behaviour (the "
+                            'leader decides, the survivor keeps its guests) at the old risk.')
+
+    def _ha_fence_agent_status(self):
+        """What the HA status says about the self-fence agents: the version every
+        node was last seen with, which of them still run the agent of an older
+        PegaProx (the UI offers the install for those), and per node how long
+        after its failure a recovery starts at the earliest."""
+        seen = self.ha_config.get('fence_agent_versions')
+        versions = {n: v for n, v in (seen.items() if isinstance(seen, dict) else ())
+                    if isinstance(v, int) and not isinstance(v, bool)}
+        outdated = sorted(n for n, v in versions.items() if 0 < v < self.FENCE_AGENT_VERSION)
+        installed = [n for n in (self.ha_config.get('self_fence_nodes') or []) if isinstance(n, str)]
+        return {
+            'expected_version': self.FENCE_AGENT_VERSION,
+            'versions': versions,
+            'nodes': {n: {'version': v, 'outdated': n in outdated,
+                          'earliest_recovery': self._ha_fence_timing(n)['earliest_recovery']}
+                      for n, v in sorted(versions.items())},
+            'outdated': outdated,
+            'outdated_warning': (self.FENCE_AGENT_OUTDATED.format(nodes=', '.join(outdated),
+                                                                  version=self.FENCE_AGENT_VERSION)
+                                 if outdated else None),
+            'outdated_settings_warning': (self.FENCE_AGENT_OUTDATED_SETTINGS.format(nodes=', '.join(outdated))
+                                          if outdated else None),
+            # on the books and never looked at: the agent check tells
+            'unchecked': sorted(set(installed) - set(versions)),
+            # what a v2 agent waits before it stops the guests of its node
+            'fence_delay': self._ha_fence_timing()['fence_delay'],
+        }
+
+    def _ha_store_settings(self, **keys) -> bool:
+        """Put keys into the stored HA settings of this cluster: the row, and the
+        copy on the config that save_config writes back over it."""
+        if not ha.is_active():
+            return False
+        try:
+            db = get_db()
+            row = db.get_cluster(self.id)
+            row['ha_settings'] = dict(row.get('ha_settings') or {}, **keys)
+            db.save_cluster(self.id, row)
+        except Exception as e:
+            self.logger.error(f"[HA] Could not store the HA settings: {e}")
+            return False
+        stored = getattr(self.config, 'ha_settings', None)
+        if isinstance(stored, dict):
+            stored.update(keys)
+        else:
+            self.config.ha_settings = dict(row['ha_settings'])
+        return True
+
+    def _ha_redeploy_fence_agents(self, why, only=None, wait=False) -> dict:
+        """Bring the v2 self-fence agents up to the script this instance installs
+        now (#625, design 6.4). Returns {node: installed} for the nodes that needed
+        it. `only` names the one node to look at, for a node that is back; `wait`
+        waits for a pass that is running instead of leaving it to that one.
+
+        The script on a node goes stale. It names the PegaProx instances, and one
+        that was paired after the install, or that leads after a failover, is not in
+        it: a tiebreak node then asks instances that are gone, hears no leader and
+        fences itself, and a node with a PegaProx VM starts the old one again. The
+        install ran from two places only, the install route and a change of the
+        two-node settings. Now also when the HA monitor starts (every new leader
+        starts it), when the member list changed, and when a node is back.
+
+        Every node is asked for the version and the hash of its script, 8 at a
+        time, and what it answers is what the HA status reports. Only a node whose
+        agent is v2 already and whose script differs gets the new one. The agent of
+        an older PegaProx is left exactly as it is, under whichever name it runs:
+        it decides differently from v2, and replacing it is the admin's call,
+        through the install from the HA settings. A cluster without a v2 agent gets
+        the look and nothing else, no agent token and no look at corosync."""
+        if not self.ha_config.get('self_fence_installed') or not ha.is_active():
+            return {}
+        lock = self.__dict__.setdefault('_ha_redeploy_lock', threading.Lock())
+        # one pass at a time. A node that is back waits for the pass that is running:
+        # that one may have asked it while it was still down
+        if not lock.acquire(blocking=wait or only is not None):
+            return {}
+        try:
+            ips = self._ha_node_ip_map()
+            if ips is None:
+                return {}
+            cmd = self._agent_check_cmd()
+            names = [n for n, ip in ips.items() if ip and only in (None, n)]
+
+            def look(name):
+                try:
+                    return self._parse_agent_check(self._ha_agent_ssh(ips[name], cmd))
+                except Exception as e:
+                    self.logger.debug(f"[HA] agent check on {name}: {e}")
+                    return None
+
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                seen = {n: info['fence_agent'] for n, info in zip(names, pool.map(look, names)) if info}
+
+            known = self.ha_config.get('fence_agent_versions')
+            known = dict(known) if isinstance(known, dict) else {}
+            versions = dict(known)
+            for name, agent in seen.items():
+                if agent['version']:
+                    versions[name] = agent['version']
+                else:
+                    versions.pop(name, None)
+            self.ha_config['fence_agent_versions'] = versions
+            if versions != known:
+                self._ha_store_settings(fence_agent_versions=dict(versions))
+            old = sorted(n for n, agent in seen.items() if 0 < agent['version'] < self.FENCE_AGENT_VERSION)
+            said = self.__dict__.setdefault('_ha_old_agents_said', set())
+            if set(old) - said:
+                said.update(old)
+                self.logger.warning("[HA] " + self.FENCE_AGENT_OUTDATED.format(
+                    nodes=', '.join(old), version=self.FENCE_AGENT_VERSION))
+
+            results = {}
+            if self.FENCE_AGENT_VERSION in versions.values():
+                plan = self._ha_agent_plan(detect=only is None)
+                if only is None:
+                    # looked at for these instances; the monitor asks again when they change
+                    self.ha_config['fence_agent_members'] = list(plan['members'])
+                try:
+                    want = hashlib.sha256(self._ha_render_fence_agent(None, plan).encode()).hexdigest()
+                except ValueError as e:
+                    self.logger.error(f"[HA] The self-fence agents cannot be brought up to date: {e}")
+                    return {}
+                stale = [n for n, agent in seen.items()
+                         if agent['version'] == self.FENCE_AGENT_VERSION and agent['sha256'] != want]
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    results = dict(zip(stale, pool.map(
+                        lambda n: self._ha_install_self_fence_agent(n, ips[n], plan), stale)))
+            elif only is None:
+                # no v2 agent on this cluster: no script that has to follow the group
+                self.ha_config['fence_agent_members'] = []
+            if results:
+                failed = sorted(n for n, ok in results.items() if not ok)
+                self.logger.info(f"[HA] Self-fence agents brought up to date ({why}): "
+                                 f"{len(results) - len(failed)}/{len(results)} nodes")
+                if failed:
+                    self.logger.error(f"[HA] ✗ The self-fence agent on {', '.join(failed)} is not the "
+                                      "current one - install it again from the HA settings")
+                self._ha_store_settings(fence_agent_versions=dict(self.ha_config.get('fence_agent_versions') or {}))
+            return results
+        except Exception as e:
+            self.logger.error(f"[HA] Error bringing the self-fence agents up to date: {e}")
+            return {}
+        finally:
+            lock.release()
+
+    def _ha_redeploy_in_background(self, why, only=None):
+        if self.ha_config.get('self_fence_installed'):
+            threading.Thread(target=self._ha_redeploy_fence_agents, args=(why, only), daemon=True).start()
+
+    def _ha_agent_members_changed(self) -> bool:
+        """Whether the PegaProx instances the agents were given are still the ones of
+        the group. Asked on monitor passes, so nothing here goes to a node."""
+        if not self.ha_config.get('self_fence_installed'):
+            return False
+        deployed = self.ha_config.get('fence_agent_members')
+        if not isinstance(deployed, list):
+            # not looked at since this process started: the pass at monitor start
+            # did not get to the nodes
+            return True
+        # an empty list: the scripts name no instance, nothing to go stale
+        return bool(deployed) and self._ha_agent_members() != deployed
+
+    def _ha_bring_up_fence_agents(self):
+        """What the HA monitor does about the self-fence agents when it starts: start
+        them, then see what the nodes run and that the v2 ones run the script of now."""
+        self._ha_start_self_fence_agents()
+        self._ha_redeploy_fence_agents('the HA monitor started')
 
     def _ha_detect_fence_strategy(self) -> str:
         """Pick the agent fence-strategy by SSH-querying corosync's view.
@@ -6307,6 +7736,7 @@ echo "AGENT_UNINSTALLED"
 
             import re as _re
             cmd = "pvecm status 2>/dev/null"
+            listed = [n for n in resp.json().get('data', []) if n.get('node')]
             for node in resp.json().get('data', []):
                 node_name = node.get('node', '')
                 node_ip = self._ha_get_node_ip(node_name) if node_name else None
@@ -6329,8 +7759,18 @@ echo "AGENT_UNINSTALLED"
                 flags = flags_m.group(1) if flags_m else ''
                 has_qdevice = 'Qdevice' in flags
 
+                # MK Oct 2026 (#625) - "Expected votes" is what corosync runs with, and
+                # our own `pvecm expected 1` lowers it. An install while quorum was
+                # forced read a three-node cluster as one vote: agents that never
+                # fence, also after the cluster was whole again. Every listed node has
+                # a vote, and a qdevice one more.
+                decision['runtime_expected_votes'] = expected
+                expected = max(expected, len(listed) + (1 if has_qdevice else 0))
+
                 decision['expected_votes'] = expected
                 decision['has_qdevice'] = has_qdevice
+                # corosync's two_node option: either half of a split stays quorate
+                decision['two_node_flag'] = '2Node' in flags
 
                 if expected >= 3 or has_qdevice:
                     decision['strategy'] = 'quorum'
@@ -6396,6 +7836,23 @@ echo "AGENT_UNINSTALLED"
                 # above is the load-bearing surface.
                 pass
 
+    @staticmethod
+    def _heartbeat_cleanup_cmd(target):
+        """Shell: empty the .pegaprox directory `target`, all but the recovery locks.
+
+        MK Oct 2026 (#625) - this was rm -rf on the whole directory. The recovery lock
+        lives in it (recovery/<node>/), per node name and not per cluster, so the
+        teardown of one cluster took the lock of a recovery still running here or on
+        another instance. Lock directories go only once they are empty."""
+        t = shlex.quote(target)
+        return (
+            f"if [ -d {t} ]; then "
+            f"  find {t} -mindepth 1 -maxdepth 1 ! -name recovery -exec rm -rf {{}} + && "
+            f"  {{ find {t} -depth -mindepth 1 -type d -empty -delete 2>/dev/null; "
+            f"    rmdir {t} 2>/dev/null; echo HEARTBEAT_DIR_CLEANED; }}; "
+            f"else echo HEARTBEAT_DIR_ABSENT; fi"
+        )
+
     def _ha_cleanup_storage_heartbeat(self) -> dict:
         """Wipe the `.pegaprox` heartbeat directory on the shared storage path
         used by the node-agent's poison-pill mechanism.
@@ -6435,11 +7892,7 @@ echo "AGENT_UNINSTALLED"
                 result['error'] = 'safety-check: refusing to rm path that does not end in /.pegaprox'
                 return result
 
-            cleanup_cmd = (
-                f"if [ -d {shlex.quote(target)} ]; then "
-                f"  rm -rf {shlex.quote(target)} && echo HEARTBEAT_DIR_CLEANED; "
-                f"else echo HEARTBEAT_DIR_ABSENT; fi"
-            )
+            cleanup_cmd = self._heartbeat_cleanup_cmd(target)
 
             for node in resp.json().get('data', []):
                 node_name = node.get('node', '')
@@ -6473,38 +7926,8 @@ echo "AGENT_UNINSTALLED"
         
         Used when HA is enabled and agents were previously installed
         """
-        try:
-            host = self.host
-            url = f"https://{host}:{self.api_port}/api2/json/nodes"
-            resp = self._create_session().get(url, timeout=10)
-            
-            if resp.status_code != 200:
-                return
-            
-            for node in resp.json().get('data', []):
-                node_name = node.get('node', '')
-                node_ip = self._ha_get_node_ip(node_name) if node_name else None
-                
-                if node_ip:
-                    ssh_user = getattr(self.config, 'ssh_user', None) or 'root'
-                    ssh_key = getattr(self.config, 'ssh_key_path', None) or getattr(self.config, 'ssh_key', None)
-                    ssh_password = getattr(self.config, 'ssh_password', None) or self.config.pass_
-                    
-                    start_cmd = 'systemctl start pegaprox-agent.service 2>/dev/null || true'
-                    
-                    result = None
-                    if ssh_key:
-                        result = self._ssh_run_command_with_key_output(node_ip, ssh_user, start_cmd, ssh_key)
-                    if result is None and ssh_password:
-                        result = self._ssh_run_command_with_password_output(node_ip, ssh_user, start_cmd, ssh_password)
-                    if result is None:
-                        self._ssh_run_command_output(node_ip, ssh_user, start_cmd)
-                        
-                    self.logger.info(f"[HA] Started self-fence agent on {node_name}")
-                    
-        except Exception as e:
-            self.logger.error(f"[HA] Error starting self-fence agents: {e}")
-    
+        self._ha_self_fence_agents_ctl('start')
+
     def _ha_discover_shared_storages(self, force_refresh: bool = False) -> list:
         """Automatically discover all shared storages in the cluster
         
@@ -6781,6 +8204,71 @@ RestartSec=5
 WantedBy=multi-user.target
 '''
 
+    @classmethod
+    def _fence_agent_move_cmd(cls, root=''):
+        """Shell: move the self-fence agent an older PegaProx left under the node
+        agent's name to its own, as it is. The script is copied byte for byte and
+        compared before the old one goes; the unit is the old one with the new path
+        in it; enabled and running stay what they were. Prints LEGACY_AGENT_MOVED and
+        goes on, or puts back what it did, prints LEGACY_MOVE_FAILED and exits."""
+        old, new = shlex.quote(root + cls.NODE_AGENT_PATH), shlex.quote(root + cls.FENCE_AGENT_PATH)
+        old_unit = shlex.quote(f'{root}/etc/systemd/system/{cls.NODE_AGENT_UNIT}')
+        new_unit = shlex.quote(f'{root}/etc/systemd/system/{cls.FENCE_AGENT_UNIT}')
+        return f'''was_active=0; systemctl is-active {cls.NODE_AGENT_UNIT} >/dev/null 2>&1 && was_active=1
+was_enabled=0; systemctl is-enabled {cls.NODE_AGENT_UNIT} >/dev/null 2>&1 && was_enabled=1
+undo() {{
+    systemctl disable {cls.FENCE_AGENT_UNIT} >/dev/null 2>&1
+    systemctl stop {cls.FENCE_AGENT_UNIT} >/dev/null 2>&1
+    rm -f {new} {new}.new {new_unit}
+    systemctl daemon-reload
+    [ $was_active = 1 ] && systemctl start {cls.NODE_AGENT_UNIT}
+    echo "LEGACY_MOVE_FAILED"
+    exit 0
+}}
+cp -p {old} {new}.new && mv -f {new}.new {new} && cmp -s {old} {new} || undo
+if [ -f {old_unit} ]; then
+    sed 's#{cls.NODE_AGENT_PATH}#{cls.FENCE_AGENT_PATH}#g' {old_unit} > {new_unit} && chmod 644 {new_unit} \\
+        && systemctl daemon-reload || undo
+    if [ $was_enabled = 1 ]; then systemctl enable {cls.FENCE_AGENT_UNIT} >/dev/null 2>&1 || undo; fi
+    if [ $was_active = 1 ]; then
+        systemctl stop {cls.NODE_AGENT_UNIT}
+        systemctl start {cls.FENCE_AGENT_UNIT} || undo
+    fi
+    systemctl disable {cls.NODE_AGENT_UNIT} >/dev/null 2>&1
+fi
+rm -f {old_unit} {old}
+systemctl daemon-reload
+echo "LEGACY_AGENT_MOVED"
+'''
+
+    @classmethod
+    def _node_agent_install_cmd(cls, script_b64, service_b64, root=''):
+        """Install the node agent under pegaprox-agent.*. The self-fence agent has its
+        own names and is not touched.
+
+        Where the script under the node agent's name is the self-fence agent of an
+        older PegaProx, that one moves to its own name first, unchanged
+        (_fence_agent_move_cmd): the node agent used to be written over it. With a
+        self-fence agent under its own name already there nothing is written and the
+        answer is LEGACY_FENCE_AGENT; a move that failed answers LEGACY_MOVE_FAILED
+        and leaves the node as it was."""
+        script = shlex.quote(root + cls.NODE_AGENT_PATH)
+        unit = shlex.quote(f'{root}/etc/systemd/system/{cls.NODE_AGENT_UNIT}')
+        fence = shlex.quote(root + cls.FENCE_AGENT_PATH)
+        fence_unit = shlex.quote(f'{root}/etc/systemd/system/{cls.FENCE_AGENT_UNIT}')
+        return f'''
+if {cls._fence_agent_legacy_guard(root)}; then
+if [ -e {fence} ] || [ -e {fence_unit} ]; then echo "LEGACY_FENCE_AGENT"; exit 0; fi
+{cls._fence_agent_move_cmd(root)}fi
+echo "{script_b64}" | base64 -d > {script} &&
+chmod +x {script} &&
+echo "{service_b64}" | base64 -d > {unit} &&
+systemctl daemon-reload &&
+systemctl enable pegaprox-agent &&
+systemctl restart pegaprox-agent &&
+echo "AGENT_INSTALLED_OK"
+'''
+
     def _ha_install_node_agent(self, node: str) -> bool:
         """Auto-install the node agent on a Proxmox node via SSH
         
@@ -6816,30 +8304,42 @@ WantedBy=multi-user.target
             script_b64 = base64.b64encode(agent_script.encode()).decode()
             service_b64 = base64.b64encode(self._NODE_AGENT_SERVICE.encode()).decode()
             
-            install_cmd = f'''
-echo "{script_b64}" | base64 -d > /usr/local/bin/pegaprox-agent.sh && 
-chmod +x /usr/local/bin/pegaprox-agent.sh && 
-echo "{service_b64}" | base64 -d > /etc/systemd/system/pegaprox-agent.service && 
-systemctl daemon-reload && 
-systemctl enable pegaprox-agent && 
-systemctl restart pegaprox-agent && 
-echo "AGENT_INSTALLED_OK"
-'''
-            
-            success = False
-            if ssh_key:
-                output = self._ssh_run_command_with_key_output(node_ip, ssh_user, install_cmd, ssh_key)
-                success = output and 'AGENT_INSTALLED_OK' in output
-            
-            if not success:
-                output = self._ssh_run_command_output(node_ip, ssh_user, install_cmd)
-                success = output and 'AGENT_INSTALLED_OK' in output
-            
-            if not success and ssh_password:
-                output = self._ssh_run_command_with_password_output(node_ip, ssh_user, install_cmd, ssh_password)
-                success = output and 'AGENT_INSTALLED_OK' in output
-            
-            if success:
+            install_cmd = self._node_agent_install_cmd(script_b64, service_b64)
+
+            def answered(output):
+                return bool(output) and any(word in output for word in (
+                    'AGENT_INSTALLED_OK', 'LEGACY_FENCE_AGENT', 'LEGACY_MOVE_FAILED'))
+
+            def send():
+                """The install command over the first way in that works: its answer."""
+                output = None
+                if ssh_key:
+                    output = self._ssh_run_command_with_key_output(node_ip, ssh_user, install_cmd, ssh_key)
+                if not answered(output):
+                    output = self._ssh_run_command_output(node_ip, ssh_user, install_cmd)
+                if not answered(output) and ssh_password:
+                    output = self._ssh_run_command_with_password_output(node_ip, ssh_user, install_cmd, ssh_password)
+                return output or ''
+
+            # MK Oct 2026 (#625) - where the script under this name is the self-fence
+            # agent of an older PegaProx, the command moves it to its own name as it
+            # is before the node agent goes in. The node agent used to be written
+            # over it. Installing v2 in its place here was an upgrade nobody asked
+            # for: this install runs on its own when the monitor starts.
+            output = send()
+            if 'LEGACY_AGENT_MOVED' in output:
+                self.logger.warning(f"[HA] {node}: the self-fence agent of an older PegaProx ran as "
+                                    f"{self.NODE_AGENT_UNIT}. It runs as {self.FENCE_AGENT_UNIT} now, the "
+                                    "script unchanged")
+            if 'AGENT_INSTALLED_OK' not in output and ('LEGACY_MOVE_FAILED' in output
+                                                       or 'LEGACY_FENCE_AGENT' in output):
+                self.logger.error(f"[HA] ✗ {node}: the script under the node agent's name is the self-fence "
+                                  f"agent of an older PegaProx and could not be moved to {self.FENCE_AGENT_UNIT}. "
+                                  "It keeps running as it is and the node agent is not installed - install "
+                                  "the self-fence agent again from the HA settings")
+                return False
+
+            if 'AGENT_INSTALLED_OK' in output:
                 self.logger.info(f"[HA] ✓ Node agent installed successfully on {node}")
                 self.ha_config['node_agent_installed'][node] = True
                 return True
@@ -7620,20 +9120,22 @@ echo "AGENT_INSTALLED_OK"
             ssh_key = getattr(self.config, 'ssh_key', '')  # SSH private key from cluster config
             
             self.logger.info(f"[HA] Using cluster credentials (user: {ssh_user})")
+            # behind the cluster claim where that is on (#625)
+            force_cmd = self._ha_claimed('pvecm expected 1')
             
             # Method 1: Try SSH with configured key first (most secure)
             if ssh_key:
                 self.logger.info(f"[HA] Trying SSH with configured key...")
-                if self._ssh_run_command_with_key(node_ip, ssh_user, 'pvecm expected 1', ssh_key):
+                if self._ssh_run_command_with_key(node_ip, ssh_user, force_cmd, ssh_key):
                     return True
             
             # Method 2: Try passwordless SSH (if system keys are set up)
-            if self._ssh_run_command(node_ip, ssh_user, 'pvecm expected 1'):
+            if self._ssh_run_command(node_ip, ssh_user, force_cmd):
                 return True
             
             # Method 3: Try SSH with password (using sshpass - secure env var method)
             if ssh_password:
-                if self._ssh_run_command_with_password(node_ip, ssh_user, 'pvecm expected 1', ssh_password):
+                if self._ssh_run_command_with_password(node_ip, ssh_user, force_cmd, ssh_password):
                     return True
             
             self.logger.error(f"[HA] Could not force quorum via SSH")
@@ -7703,12 +9205,13 @@ echo "AGENT_INSTALLED_OK"
             ssh_key = getattr(self.config, 'ssh_key', '')  # SSH key from cluster config
             
             restore_cmd = f'pvecm expected {total_nodes}'
+            guarded_cmd = self._ha_claimed(restore_cmd)
             
             self.logger.info(f"[HA] Running '{restore_cmd}' on {target_node} ({node_ip})")
             
             # Method 1: Try SSH with configured key first (most secure)
             if ssh_key:
-                if self._ssh_run_command_with_key(node_ip, ssh_user, restore_cmd, ssh_key):
+                if self._ssh_run_command_with_key(node_ip, ssh_user, guarded_cmd, ssh_key):
                     self.logger.info(f"[HA] ✓ Quorum restored to {total_nodes} nodes")
                     broadcast_sse('ha_status', {
                         'event': 'quorum_restored',
@@ -7719,7 +9222,7 @@ echo "AGENT_INSTALLED_OK"
                     return
             
             # Method 2: Try passwordless SSH
-            if self._ssh_run_command(node_ip, ssh_user, restore_cmd):
+            if self._ssh_run_command(node_ip, ssh_user, guarded_cmd):
                 self.logger.info(f"[HA] ✓ Quorum restored to {total_nodes} nodes")
                 broadcast_sse('ha_status', {
                     'event': 'quorum_restored',
@@ -7731,7 +9234,7 @@ echo "AGENT_INSTALLED_OK"
             
             # Method 3: Try SSH with password
             if ssh_password:
-                if self._ssh_run_command_with_password(node_ip, ssh_user, restore_cmd, ssh_password):
+                if self._ssh_run_command_with_password(node_ip, ssh_user, guarded_cmd, ssh_password):
                     self.logger.info(f"[HA] ✓ Quorum restored to {total_nodes} nodes")
                     broadcast_sse('ha_status', {
                         'event': 'quorum_restored',
@@ -8297,7 +9800,7 @@ echo "AGENT_INSTALLED_OK"
             
             # Build the move command - use mv to atomically move the config
             # The /etc/pve filesystem (pmxcfs) is cluster-aware
-            move_cmd = f"mv {source_path} {target_path}"
+            move_cmd = self._ha_claimed(f"mv {source_path} {target_path}")
             
             # Try passwordless SSH first
             if self._ssh_run_command(target_ip, ssh_user, move_cmd):
@@ -8308,7 +9811,7 @@ echo "AGENT_INSTALLED_OK"
                 return True
             
             # Alternative: Try to copy instead of move (in case mv fails due to permissions)
-            copy_cmd = f"cp {source_path} {target_path} && rm {source_path}"
+            copy_cmd = self._ha_claimed(f"cp {source_path} {target_path} && rm {source_path}")
             
             if self._ssh_run_command(target_ip, ssh_user, copy_cmd):
                 return True
@@ -8394,6 +9897,28 @@ echo "AGENT_INSTALLED_OK"
                     'verify_network': self.ha_config.get('verify_network_before_recovery', True),
                     # 2-Node Mode
                     'two_node_mode': self.ha_config.get('two_node_mode', False),
+                    'force_quorum_on_failure': self.ha_config.get('force_quorum_on_failure', False),
+                    # for the banner: this setup still forces quorum without a fence
+                    # that was read back (#625)
+                    'unsafe_two_node_recovery': self._ha_unsafe_two_node(),
+                    'unsafe_two_node_warning': (
+                        "Unsafe two-node recovery is on: when a node fails, quorum is forced on "
+                        "the other one without proof that the failed node is off. In a network "
+                        "split both nodes can then run the same VM. Configure IPMI fencing for "
+                        "the nodes and switch this off."
+                        if self._ha_unsafe_two_node() else None
+                    ),
+                    # quorum would be forced, and only after a fence that is read back:
+                    # without one configured this cluster is not recovered automatically
+                    'verified_fence_required': self._ha_forces_quorum() and not self._ha_unsafe_two_node(),
+                    # what becomes of the guests of the node that is left, under the rules
+                    'fenced_survivor_note': (self.FENCED_SURVIVOR_NOTE
+                                             if self._ha_forces_quorum() and self._ha_minority_fences()
+                                             else None),
+                    'verified_fence_configured': self._ha_has_verifiable_fence(),
+                    # per node, set with `fencing` on PUT .../ha/config; the BMC
+                    # password is never in here
+                    'fencing': self._ha_fencing_status(),
                     # Storage-based Split-Brain Protection - NS Jan 2026
                     'storage_heartbeat_enabled': self.ha_config.get('storage_heartbeat_enabled', False),
                     'storage_heartbeat_path': self.ha_config.get('storage_heartbeat_path', ''),
@@ -8406,7 +9931,7 @@ echo "AGENT_INSTALLED_OK"
                     # strategy the agent was installed with so the UI can
                     # render a clear "this cluster is in wait-mode, add a
                     # qdevice" banner instead of admins having to grep
-                    # /var/log/pegaprox-agent.log on each node.
+                    # /var/log/pegaprox-fence-agent.log on each node.
                     'fence_strategy': self.ha_config.get('fence_strategy', {
                         'strategy': 'unknown',
                         'reason': 'agents not yet installed in this session',
@@ -8442,8 +9967,12 @@ echo "AGENT_INSTALLED_OK"
                 # Self-Fence Protection - NS Jan 2026
                 'self_fence_installed': self.ha_config.get('self_fence_installed', False),
                 'self_fence_nodes': self.ha_config.get('self_fence_nodes', []),
+                # which agent version each node was last seen with; below
+                # expected_version it still pings one PegaProx address (#625)
+                'fence_agent': self._ha_fence_agent_status(),
+                'cluster_claim': self._ha_claim_status(),
             }
-    
+
     def get_tasks(self, limit: int = 50, force: bool = False) -> List[Dict]:
         """get recent cluster tasks, newest first - MK
 

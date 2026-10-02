@@ -190,6 +190,9 @@ def add_cluster():
     cluster_id = str(uuid.uuid4())[:8]
     cluster_type = data.get('cluster_type', 'proxmox')
 
+    # the manager below is built from this body and started: no HA settings from it (#625)
+    data['ha_settings'] = _ha_settings_for_new_cluster()
+
     # Create config
     config = PegaProxConfig(data)
 
@@ -389,6 +392,16 @@ def reconfigure_cluster(cluster_id):
 
     cluster_type = data.get('cluster_type', getattr(cluster_managers[cluster_id], 'cluster_type', 'proxmox'))
 
+    # MK Oct 2026 (#625) - the dialog sends the connection, never the HA settings, and
+    # the new manager is built from this body alone: the agent token, the two-node
+    # settings and the cluster claim went with the old manager. They stay the cluster's.
+    old_mgr = cluster_managers[cluster_id]
+    if hasattr(old_mgr, 'ha_config'):
+        data['ha_settings'] = _ha_settings_of(old_mgr)
+    else:
+        kept = getattr(old_mgr.config, 'ha_settings', None)
+        data['ha_settings'] = dict(kept) if isinstance(kept, dict) else {}
+
     # Create new config + manager, test connection
     new_config = PegaProxConfig(data)
     if cluster_type == 'xcpng':
@@ -404,7 +417,6 @@ def reconfigure_cluster(cluster_id):
                             'error_code': getattr(new_mgr, 'connection_error_code', None)}), 400
 
     # Stop old manager, swap in new one
-    old_mgr = cluster_managers[cluster_id]
     try:
         old_mgr.stop()
     except Exception:
@@ -555,6 +567,64 @@ def repin_cluster_host_keys(cluster_id):
         return jsonify({'error': safe_error(e, 'Re-pin failed')}), 500
 
 
+def _retire_cluster_claim(mgr, every_node=False):
+    """Take our cluster claim off the cluster and switch the claim off, for HA disable,
+    for deleting the cluster and for the switch itself. What the response reports
+    about it; None where the claim was off, or the cluster is of a kind that has none.
+
+    A removal that raised is reported as one that failed. It answered None before,
+    which the responses show as "the claim was off": the file may still be in
+    /etc/pve/pegaprox then, and nothing said so."""
+    if not hasattr(mgr, '_ha_claim_retire'):
+        return None
+    try:
+        claim = mgr._ha_claim_retire(every_node=True) if every_node else mgr._ha_claim_retire()
+    except Exception as e:
+        logging.warning(f"[HA] cluster claim removal failed: {e}")
+        return _claim_removal_failed(mgr)
+    return claim if isinstance(claim, dict) else None
+
+
+def _claim_removal_failed(mgr):
+    """The report of _ha_claim_retire for a removal that did not get that far. The
+    switch goes off as it does there, and the command for the admin removes the file
+    only while it is ours."""
+    by_hand = None
+    try:
+        from pegaprox.core import ha
+        instance, epoch = ha.lock_holder()
+        by_hand = mgr._claim_by_hand(epoch, instance)
+    except Exception:
+        pass
+    try:
+        mgr.ha_config['claim_enabled'] = False
+        mgr.ha_config.pop('claim_state', None)
+    except Exception:
+        pass
+    warning = ("The cluster claim could not be removed (the removal ended with an error): "
+               "/etc/pve/pegaprox/claim may still be there. "
+               + (f"To remove it by hand, run on one node of the cluster, which has to be quorate for it: `{by_hand}`"
+                  if by_hand else
+                  "Look at the file on one node of the cluster and remove it when it names this PegaProx instance."))
+    return {'state': 'failed', 'removed': False, 'path': '/etc/pve/pegaprox/claim', 'instance': None,
+            'epoch': None, 'warning': warning, 'by_hand': by_hand}
+
+
+def _ensure_cluster_claim(mgr, takeover=False):
+    """_ha_claim_ensure for the claim route. A write that raised is the state 'failed',
+    as a write the node refused is: the switch stays where the admin put it, and the
+    next look at the claim tries again."""
+    try:
+        return mgr._ha_claim_ensure(takeover=takeover)
+    except Exception as e:
+        logging.warning(f"[HA] cluster claim write failed: {e}")
+        from datetime import datetime as _dt
+        result = {'state': 'failed', 'node': None, 'checked_at': _dt.now().isoformat(),
+                  'epoch': None, 'instance': None}
+        mgr.ha_config['claim_state'] = result
+        return result
+
+
 @bp.route('/api/clusters/<cluster_id>', methods=['DELETE'])
 @require_auth(perms=['cluster.delete'])
 def delete_cluster(cluster_id):
@@ -586,6 +656,11 @@ def delete_cluster(cluster_id):
                 logging.warning(f"Could not revoke API token {token_user}: HTTP {resp.status_code}")
         except Exception as e:
             logging.debug(f"Token revocation failed (non-critical): {e}")
+
+    # Our cluster claim leaves the cluster with it (#625): once the cluster is gone
+    # from PegaProx nobody could take the file out of /etc/pve/pegaprox any more.
+    # Before the host-key pins go, the removal is an SSH call.
+    claim = _retire_cluster_claim(mgr)
 
     # Clean up pinned SSH host keys for this cluster's hosts BEFORE stopping the
     # manager (so re-adding a node that was reinstalled meanwhile works via TOFU
@@ -670,9 +745,16 @@ def delete_cluster(cluster_id):
     except Exception as e:
         logging.error(f"Failed to delete cluster from database: {e}")
     
-    log_audit(request.session['user'], 'cluster.deleted', f"Deleted cluster: {cluster_name}")
-    
-    return jsonify({'message': 'Cluster deleted successfully'})
+    log_audit(request.session['user'], 'cluster.deleted', f"Deleted cluster: {cluster_name}"
+              + (f" (our cluster claim: {claim.get('state')})" if claim else ''))
+
+    result = {'message': 'Cluster deleted successfully'}
+    if claim:
+        # the cluster is gone from here either way; what is left on it has to be said
+        result['claim'] = claim
+        if claim.get('warning'):
+            result['warning'] = claim['warning']
+    return jsonify(result)
 
 
 @bp.route('/api/clusters/reorder', methods=['POST'])
@@ -1266,11 +1348,15 @@ def get_cluster_resources(cluster_id):
 # NS: Feb 2026 - SECURITY: explicit allowlist prevents mass assignment attacks
 # Password/key changes must go through dedicated endpoints with their own auth
 # MK: also keeps 'sort_order' out because that was causing issues with drag-and-drop
+# MK Oct 2026 (#625) - 'ha_settings' is out as well. It was taken as it came and stored
+# whole: cluster.config (an API token too) could switch the cluster claim and the unsafe
+# two-node recovery on past their own routes, and the same request dropped the agent
+# token and what the agent installs had recorded. The HA routes write those settings.
 ALLOWED_CONFIG_FIELDS = {
     'name', 'host', 'user', 'ssl_verification', 'migration_threshold', 'migration_tolerance',
     'check_interval', 'auto_migrate', 'balance_containers', 'balance_local_disks',
     'dry_run', 'enabled', 'ha_enabled', 'fallback_hosts', 'ssh_user', 'ssh_port',
-    'ha_settings', 'excluded_nodes',
+    'excluded_nodes',
     'predictive_balancing', 'predictive_threshold',
     'balance_cpu_weight', 'balance_mem_weight', 'balance_io_weight',
     'cpu_baseline',
@@ -2182,12 +2268,12 @@ def disable_ha(cluster_id):
     # recovery actions while we're tearing down the on-node agents.
     mgr.stop_ha_monitor()
 
-    # SSH-uninstall on every reachable node. The existing
-    # `_ha_uninstall_self_fence_on_all_nodes` removes both agent shapes
-    # because they share `pegaprox-agent.service` + the binary path.
+    # SSH-uninstall on every reachable node. MK Oct 2026 (#625) - the two agents have
+    # their own names now (pegaprox-fence-agent.* and pegaprox-agent.*), so this takes
+    # both off; the self-fence uninstall alone would leave the node agent running.
     uninstall_results = {}
     try:
-        uninstall_results = mgr._ha_uninstall_self_fence_on_all_nodes() or {}
+        uninstall_results = mgr._ha_uninstall_agents_on_all_nodes() or {}
     except Exception as e:
         logging.error(f"[HA disable] agent teardown failed: {e}")
 
@@ -2201,6 +2287,11 @@ def disable_ha(cluster_id):
     except Exception as e:
         logging.warning(f"[HA disable] storage heartbeat cleanup: {e}")
 
+    # MK Oct 2026 (#625) - the cluster claim goes with HA: our file out of
+    # /etc/pve/pegaprox, the switch off. It stayed on the cluster and in the
+    # settings before.
+    claim = _retire_cluster_claim(mgr)
+
     # Flip the flag + clear in-memory ha_config bookkeeping last so the
     # state we report back to the UI matches what's actually on disk.
     mgr.config.ha_enabled = False
@@ -2210,24 +2301,61 @@ def disable_ha(cluster_id):
     # bookkeeping. A node we believe has no agent, still running one, is a self-fence agent
     # acting on heartbeat state nobody is maintaining any more - it can reboot the node.
     # Keep the ones that did not come off; drop only what actually went.
-    if isinstance(mgr.ha_config.get('node_agent_installed'), dict):
-        _still_there = {n: True for n, ok in (uninstall_results or {}).items() if not ok}
-        if _still_there:
-            logging.warning(
-                "[HA disable] agent still installed on %s - keeping it in node_agent_installed "
-                "so the next enable does not assume a clean slate", sorted(_still_there))
-        mgr.ha_config['node_agent_installed'] = _still_there
+    # MK Oct 2026 (#625) - a node leaves the books only when its own teardown answered.
+    # When the cluster did not list its nodes nothing came off, and the empty result
+    # read as a clean slate: the agents kept running with nothing left to stop them.
+    nodes_gone = {n for n, ok in uninstall_results.items() if ok}
+    nodes_failed = sorted(n for n, ok in uninstall_results.items() if not ok)
+    had_node_agent = mgr.ha_config.get('node_agent_installed')
+    had_node_agent = {n for n, v in had_node_agent.items() if v} if isinstance(had_node_agent, dict) else set()
+    had_fence_agent = {n for n in (mgr.ha_config.get('self_fence_nodes') or []) if isinstance(n, str)}
+    had_any = bool(mgr.ha_config.get('self_fence_installed') or had_fence_agent or had_node_agent)
+    # on the books and not asked: the cluster did not list them, or listed nothing
+    nodes_unconfirmed = sorted((had_fence_agent | had_node_agent) - set(uninstall_results))
+    _still_there = {n: True for n in (had_node_agent - nodes_gone) | set(nodes_failed)}
+    if _still_there:
+        logging.warning(
+            "[HA disable] agent still installed on %s - keeping it in node_agent_installed "
+            "so the next enable does not assume a clean slate", sorted(_still_there))
+    mgr.ha_config['node_agent_installed'] = _still_there
+    # the self-fence agents went with it, except where the teardown failed or never ran
+    mgr.ha_config['self_fence_nodes'] = sorted((had_fence_agent - nodes_gone) | set(nodes_failed))
+    mgr.ha_config['self_fence_installed'] = bool(mgr.ha_config['self_fence_nodes']) or (
+        not uninstall_results and bool(mgr.ha_config.get('self_fence_installed')))
+    mgr.config.ha_settings = _ha_settings_of(mgr)
     save_config()
 
-    nodes_ok = sum(1 for v in uninstall_results.values() if v)
+    nodes_ok = len(nodes_gone)
     nodes_total = len(uninstall_results)
-    nodes_failed = sorted([n for n, ok in uninstall_results.items() if not ok])
+    by_hand = ("`systemctl disable --now pegaprox-fence-agent.service pegaprox-agent.service; "
+               "rm -f /usr/local/bin/pegaprox-fence-agent.sh /usr/local/bin/pegaprox-agent.sh "
+               "/etc/systemd/system/pegaprox-fence-agent.service "
+               "/etc/systemd/system/pegaprox-agent.service; systemctl daemon-reload`")
 
     user = getattr(request, 'session', {}).get('user', 'system')
     audit_detail = (f"HA disabled for cluster {mgr.config.name} — "
                     f"agents removed from {nodes_ok}/{nodes_total} nodes")
+    warnings = []
     if nodes_failed:
         audit_detail += f" (teardown FAILED on: {', '.join(nodes_failed)} — manual cleanup required)"
+        warnings.append(f"Could not tear down agents on {len(nodes_failed)} node(s): "
+                        f"{', '.join(nodes_failed)}. SSH to those nodes manually and run {by_hand}")
+    if not uninstall_results and had_any:
+        where = ', '.join(nodes_unconfirmed) or 'every node of the cluster'
+        audit_detail += (f" (the cluster did not list its nodes, NO agent was removed - "
+                         f"manual cleanup required on: {where})")
+        warnings.append(f"The cluster did not list its nodes, so no agent was stopped or removed. "
+                        f"The agents keep running, and can still stop the guests of a node, on: {where}. "
+                        f"Disable HA again once the cluster answers, or SSH to those nodes and run {by_hand}")
+    elif nodes_unconfirmed:
+        audit_detail += (f" (not listed by the cluster, agents may still run on: "
+                         f"{', '.join(nodes_unconfirmed)} - manual cleanup required)")
+        warnings.append(f"Not listed by the cluster, agents may still run on: "
+                        f"{', '.join(nodes_unconfirmed)}. SSH to those nodes and run {by_hand}")
+    if claim:
+        audit_detail += f" (cluster claim switched off, our claim: {claim.get('state')})"
+        if claim.get('warning'):
+            warnings.append(claim['warning'])
     log_audit(user, 'ha.disabled', audit_detail, cluster=mgr.config.name)
 
     return jsonify({
@@ -2235,15 +2363,12 @@ def disable_ha(cluster_id):
         'agents_uninstalled': nodes_ok,
         'agents_total': nodes_total,
         'agents_failed': nodes_failed,
+        'agents_unconfirmed': nodes_unconfirmed,
+        # what became of our claim in /etc/pve/pegaprox, null where the claim was off
+        'claim': claim,
         'storage_cleanup': storage_cleanup,
         'status': mgr.get_ha_status(),
-        'warning': (
-            f"Could not tear down agents on {len(nodes_failed)} node(s): "
-            f"{', '.join(nodes_failed)}. SSH to those nodes manually and run "
-            f"`systemctl disable --now pegaprox-agent.service && "
-            f"rm -f /usr/local/bin/pegaprox-agent.sh "
-            f"/etc/systemd/system/pegaprox-agent.service && systemctl daemon-reload`"
-        ) if nodes_failed else None,
+        'warning': ' '.join(warnings) or None,
     })
 
 
@@ -2262,7 +2387,43 @@ def update_ha_config(cluster_id):
     
     manager = cluster_managers[cluster_id]
     data = request.json or {}
-    
+
+    # MK Oct 2026 (#625) - forcing quorum without a fence that was read back. Setups
+    # from before the safety rules have it on and may switch it off; switching it on
+    # is a decision to run with the split-brain risk and has to be typed out. Asked
+    # before anything of this request is applied.
+    if (data.get('unsafe_two_node_recovery') is True
+            and manager.ha_config.get('unsafe_two_node_recovery') is not True
+            and data.get('confirm_unsafe_two_node') != UNSAFE_TWO_NODE_PHRASE):
+        return jsonify({'error': f'Type {UNSAFE_TWO_NODE_PHRASE} to confirm: with this on, quorum '
+                                 'is forced on the surviving node without proof that the failed '
+                                 'node is off, and both can run the same VM in a network split',
+                        'code': 'HA_UNSAFE_CONFIRM'}), 400
+    # the fence of each node (#625): checked as a whole before anything is applied
+    new_fencing = None
+    if 'fencing' in data:
+        if not hasattr(manager, '_fencing_from_request'):
+            return jsonify({'error': 'Node fencing exists on Proxmox clusters only'}), 400
+        try:
+            new_fencing = manager._fencing_from_request(data['fencing'])
+        except ValueError as e:
+            return jsonify({'error': f'fencing: {e}', 'code': 'HA_FENCING_INVALID'}), 400
+    # the two numbers the start of a recovery is worked out from (#625). They were
+    # stored as sent: a JSON true or false counts as 1 or 0 where the recovery
+    # waits, and took away the time a node's self-fence agent is given
+    for key in ('recovery_delay', 'failure_threshold'):
+        if key in data and not PegaProxManager._ha_countable(data[key]):
+            return jsonify({'error': f'{key} must be a number, zero or more',
+                            'code': 'HA_TIMING_INVALID'}), 400
+    def _agents_decide_by():
+        # what of the settings goes into the self-fence script: whether quorum gets
+        # forced, and whether without a fence (the leader then decides for a node
+        # that lost quorum)
+        cfg = manager.ha_config
+        return (bool(cfg.get('two_node_mode') or cfg.get('force_quorum_on_failure')),
+                cfg.get('unsafe_two_node_recovery') is True)
+    old_forces = _agents_decide_by()
+
     # Update HA config
     if 'quorum_enabled' in data:
         manager.ha_config['quorum_enabled'] = data['quorum_enabled']
@@ -2288,7 +2449,16 @@ def update_ha_config(cluster_id):
         manager.ha_config['two_node_mode'] = data['two_node_mode']
     if 'force_quorum_on_failure' in data:
         manager.ha_config['force_quorum_on_failure'] = data['force_quorum_on_failure']
-    
+    if 'unsafe_two_node_recovery' in data:
+        manager.ha_config['unsafe_two_node_recovery'] = data['unsafe_two_node_recovery'] is True
+    fencing_change = None
+    if new_fencing is not None:
+        old_fencing = manager.ha_config.get('fencing') or {}
+        fencing_change = ', '.join(
+            f"{n} ({(new_fencing.get(n) or {}).get('type') or 'removed'})"
+            for n in sorted(set(old_fencing) | set(new_fencing)) if old_fencing.get(n) != new_fencing.get(n))
+        manager.ha_config['fencing'] = new_fencing
+
     # Storage-based Split-Brain Protection - NS Jan 2026
     if 'storage_heartbeat_enabled' in data:
         manager.ha_config['storage_heartbeat_enabled'] = data['storage_heartbeat_enabled']
@@ -2345,43 +2515,27 @@ def update_ha_config(cluster_id):
     
     # Save to config
     # Store HA settings in cluster config for persistence
-    if not hasattr(manager.config, 'ha_settings'):
-        manager.config.ha_settings = {}
-    
-    manager.config.ha_settings = {
-        'quorum_enabled': manager.ha_config.get('quorum_enabled', True),
-        'quorum_hosts': manager.ha_config.get('quorum_hosts', []),
-        'quorum_gateway': manager.ha_config.get('quorum_gateway', ''),
-        'quorum_required_votes': manager.ha_config.get('quorum_required_votes', 2),
-        'self_fence_enabled': manager.ha_config.get('self_fence_enabled', True),
-        'watchdog_enabled': manager.ha_config.get('watchdog_enabled', False),
-        'verify_network': manager.ha_config.get('verify_network_before_recovery', True),
-        'recovery_delay': manager.ha_config.get('recovery_delay', 30),
-        'failure_threshold': manager.ha_failure_threshold,
-        # 2-Node Cluster Mode
-        'two_node_mode': manager.ha_config.get('two_node_mode', False),
-        'force_quorum_on_failure': manager.ha_config.get('force_quorum_on_failure', False),
-        # Storage-based Split-Brain Protection - NS Jan 2026
-        'storage_heartbeat_enabled': manager.ha_config.get('storage_heartbeat_enabled', False),
-        'storage_heartbeat_path': manager.ha_config.get('storage_heartbeat_path', ''),
-        'storage_heartbeat_timeout': manager.ha_config.get('storage_heartbeat_timeout', 30),
-        'poison_pill_enabled': manager.ha_config.get('poison_pill_enabled', True),
-        'strict_fencing': manager.ha_config.get('strict_fencing', False),
-        'pegaprox_vmid': manager.ha_config.get('pegaprox_vmid', ''),
-    }
+    manager.config.ha_settings = _ha_settings_of(manager)
     
     save_config()
 
-    # re-deploy self-fence agents if pegaprox_vmid changed
+    # re-deploy self-fence agents if pegaprox_vmid changed, or whether quorum gets
+    # forced: the agents decide by quorum alone or ask for the leader depending on it
     new_pegaprox_vmid = manager.ha_config.get('pegaprox_vmid', '')
-    if 'pegaprox_vmid' in data and str(old_pegaprox_vmid) != str(new_pegaprox_vmid) and manager.ha_config.get('self_fence_installed'):
+    vmid_changed = 'pegaprox_vmid' in data and str(old_pegaprox_vmid) != str(new_pegaprox_vmid)
+    forces_changed = old_forces != _agents_decide_by()
+    if (vmid_changed or forces_changed) and manager.ha_config.get('self_fence_installed'):
         def _reinstall():
             try:
-                manager.logger.info(f"[HA] pegaprox_vmid changed ({old_pegaprox_vmid} -> {new_pegaprox_vmid}), re-deploying agents")
-                results = manager._ha_install_self_fence_on_all_nodes()
+                manager.logger.info(f"[HA] pegaprox_vmid ({old_pegaprox_vmid} -> {new_pegaprox_vmid}) or the "
+                                    "two-node settings changed, re-deploying agents")
+                # MK Oct 2026 (#625) - the v2 agents only. This installed on every node,
+                # so saving a setting replaced the agent of an older PegaProx with v2.
+                # That one stays as it is, with the settings it was installed with,
+                # until the install from the HA settings; the status names the nodes.
+                results = manager._ha_redeploy_fence_agents('the HA settings changed', wait=True)
                 ok = sum(1 for v in results.values() if v)
                 manager.logger.info(f"[HA] agent redeploy: {ok}/{len(results)} nodes")
-                manager.ha_config['self_fence_nodes'] = [k for k, v in results.items() if v]
                 _save_ha_config_to_db(cluster_id, manager)
             except Exception as e:
                 manager.logger.error(f"[HA] agent redeploy failed: {e}")
@@ -2393,11 +2547,82 @@ def update_ha_config(cluster_id):
 
     user = getattr(request, 'session', {}).get('user', 'system')
     log_audit(user, 'ha.config_updated', f"HA configuration updated for cluster {manager.config.name}", cluster=manager.config.name)
+    if fencing_change:
+        # which node and which kind, never the BMC password
+        log_audit(user, 'ha.fencing_updated', f"Node fencing of cluster {manager.config.name} changed: "
+                                              f"{fencing_change}", cluster=manager.config.name)
 
     return jsonify({
         'message': 'HA-Konfiguration gespeichert',
         'status': manager.get_ha_status()
     })
+
+
+UNSAFE_TWO_NODE_PHRASE = 'UNSAFE'
+CLAIM_ON_PHRASE = 'WRITE CLAIM'
+CLAIM_RELEASE_PHRASE = 'RELEASE CLAIM'
+
+
+def _ha_settings_of(manager):
+    """A cluster's HA settings as they are stored, from the running manager.
+
+    MK Oct 2026 (#625) - the one place that lists them. The config route used to
+    rebuild the stored dict from its own form fields, which dropped what the agent
+    installs had recorded (self_fence_installed, self_fence_nodes,
+    node_agent_installed) at the next save; the install helper wrote the database
+    row only, so the next save_config put the older copy back over it. A stored key
+    that no route writes (node_ips, the timings) stays as it is."""
+    cfg = manager.ha_config
+    stored = getattr(manager.config, 'ha_settings', None)
+    return dict(stored if isinstance(stored, dict) else {}, **{
+        'quorum_enabled': cfg.get('quorum_enabled', True),
+        'quorum_hosts': cfg.get('quorum_hosts', []),
+        'quorum_gateway': cfg.get('quorum_gateway', ''),
+        'quorum_required_votes': cfg.get('quorum_required_votes', 2),
+        'self_fence_enabled': cfg.get('self_fence_enabled', True),
+        'watchdog_enabled': cfg.get('watchdog_enabled', False),
+        'verify_network': cfg.get('verify_network_before_recovery', True),
+        'recovery_delay': cfg.get('recovery_delay', 30),
+        'failure_threshold': manager.ha_failure_threshold,
+        # 2-Node Cluster Mode
+        'two_node_mode': cfg.get('two_node_mode', False),
+        'force_quorum_on_failure': cfg.get('force_quorum_on_failure', False),
+        'unsafe_two_node_recovery': cfg.get('unsafe_two_node_recovery') is True,
+        # Storage-based Split-Brain Protection - NS Jan 2026
+        'storage_heartbeat_enabled': cfg.get('storage_heartbeat_enabled', False),
+        'storage_heartbeat_path': cfg.get('storage_heartbeat_path', ''),
+        'storage_heartbeat_timeout': cfg.get('storage_heartbeat_timeout', 30),
+        'poison_pill_enabled': cfg.get('poison_pill_enabled', True),
+        'strict_fencing': cfg.get('strict_fencing', False),
+        'pegaprox_vmid': cfg.get('pegaprox_vmid', ''),
+        # what the installs recorded
+        'self_fence_installed': cfg.get('self_fence_installed', False),
+        'self_fence_nodes': cfg.get('self_fence_nodes', []),
+        'node_agent_installed': cfg.get('node_agent_installed', {}),
+        'fence_agent_versions': cfg.get('fence_agent_versions', {}),
+        'agent_token': cfg.get('agent_token', ''),
+        'claim_enabled': cfg.get('claim_enabled') is True,
+        # per node, BMC password included: the column is encrypted like the token above
+        'fencing': cfg.get('fencing') or {},
+    })
+
+
+# What only the HA routes put into the stored HA settings, each behind its own check:
+# the two switches, the agent token, what the installs recorded, the node fences. A
+# backup restore over a cluster that is there leaves them as they are.
+HA_SETTINGS_GUARDED = frozenset({
+    'claim_enabled', 'unsafe_two_node_recovery', 'agent_token', 'self_fence_installed',
+    'self_fence_nodes', 'node_agent_installed', 'fence_agent_versions', 'fencing',
+})
+
+
+def _ha_settings_for_new_cluster():
+    """The HA settings a cluster starts with when it is added: none from the request.
+    The HA config route checks what it takes (the heartbeat path goes into a script
+    that runs as root on the nodes), the body of the add route went in as it came.
+    unsafe_two_node_recovery is written out as off: a missing key would read as a
+    setup from before the safety rules (#625)."""
+    return {'unsafe_two_node_recovery': False}
 
 
 def _save_ha_config_to_db(cluster_id: str, manager):
@@ -2406,16 +2631,12 @@ def _save_ha_config_to_db(cluster_id: str, manager):
     NS: Called after self-fence install/uninstall so status survives restart
     """
     try:
+        # the copy on the manager too: save_config writes that one over the row
+        manager.config.ha_settings = _ha_settings_of(manager)
         db = get_db()
         cluster = db.get_cluster(cluster_id)
         if cluster:
-            # Update ha_settings with current ha_config
-            ha_settings = cluster.get('ha_settings', {})
-            ha_settings['self_fence_installed'] = manager.ha_config.get('self_fence_installed', False)
-            ha_settings['self_fence_nodes'] = manager.ha_config.get('self_fence_nodes', [])
-            ha_settings['node_agent_installed'] = manager.ha_config.get('node_agent_installed', {})
-            ha_settings['pegaprox_vmid'] = manager.ha_config.get('pegaprox_vmid', '')
-            cluster['ha_settings'] = ha_settings
+            cluster['ha_settings'] = dict(manager.config.ha_settings)
             db.save_cluster(cluster_id, cluster)
             logging.info(f"[HA] Persisted ha_config to database for {cluster_id}")
     except Exception as e:
@@ -2510,6 +2731,136 @@ def uninstall_self_fence_agent(cluster_id):
         'message': 'Self-fence agent uninstallation started',
         'status': 'uninstalling'
     })
+
+
+@bp.route('/api/clusters/<cluster_id>/ha/agent-check', methods=['POST'])
+@require_auth(perms=['ha.config'])
+def check_ha_agents(cluster_id):
+    """The install check: which agents every node of the cluster runs (#625).
+
+    Read over SSH from each node. For every node: the self-fence agent's version
+    (0 none, 1 the agent that pings one PegaProx address, 2 quorum first), its mode,
+    whether it runs and whether it is the script this instance would install now;
+    whether the node agent is there; and, where the agents ask the PegaProx instances
+    for the leader, the instances the node cannot reach. `outdated` names the nodes
+    below the current version, `unreachable` the ones that did not answer. An outdated
+    agent keeps running as it is: `outdated_warning` says so and that the install
+    from the HA settings replaces it."""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
+
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+
+    manager = cluster_managers[cluster_id]
+    if not hasattr(manager, '_ha_check_agents'):
+        return jsonify({'error': 'Node agents exist on Proxmox clusters only'}), 400
+    try:
+        report = manager._ha_check_agents()
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'The agent check failed')}), 502
+    if report is None:
+        return jsonify({'error': 'The cluster did not list its nodes'}), 502
+    # the versions found are what the HA status reports from now on
+    _save_ha_config_to_db(cluster_id, manager)
+
+    nodes = report['nodes']
+    report['unreachable'] = sorted(n for n, info in nodes.items() if info is None)
+    report['outdated'] = sorted(n for n, info in nodes.items()
+                                if info and 0 < info['fence_agent']['version'] < report['expected_version'])
+    report['outdated_warning'] = (PegaProxManager.FENCE_AGENT_OUTDATED.format(
+        nodes=', '.join(report['outdated']), version=report['expected_version'])
+        if report['outdated'] else None)
+    report['not_current'] = sorted(n for n, info in nodes.items()
+                                   if info and info['fence_agent']['version'] == report['expected_version']
+                                   and not info['fence_agent']['current'])
+    return jsonify(report)
+
+
+@bp.route('/api/clusters/<cluster_id>/ha/claim', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def set_cluster_claim(cluster_id):
+    """Switch the cluster claim of one cluster on or off, or release a foreign claim (#625).
+
+    The claim is off unless an admin switches it on. With it on, PegaProx writes
+    /etc/pve/pegaprox/claim into the cluster's file system; node recovery then runs
+    only while that file names this instance, and its SSH steps are refused at the
+    node otherwise. The HA status of the cluster carries the full warning text.
+
+    action "enable" wants confirm "WRITE CLAIM", "release" (write over the claim of
+    another instance) wants "RELEASE CLAIM", "disable" removes our claim again. All
+    three want user_password, like the instance HA routes; no API token."""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
+    from pegaprox.api.ha import _refuse_confined_admin, _refuse_without_reauth
+    denied = _refuse_confined_admin()
+    if denied:
+        return denied
+
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+
+    manager = cluster_managers[cluster_id]
+    if not hasattr(manager, '_ha_claim_ensure'):
+        return jsonify({'error': 'The cluster claim exists on Proxmox clusters only'}), 400
+    data = request.get_json(silent=True)
+    data = data if isinstance(data, dict) else {}
+    action = data.get('action')
+    if action not in ('enable', 'disable', 'release'):
+        return jsonify({'error': 'action must be enable, disable or release'}), 400
+    phrase = {'enable': CLAIM_ON_PHRASE, 'release': CLAIM_RELEASE_PHRASE}.get(action)
+    if phrase and data.get('confirm') != phrase:
+        return jsonify({'error': f'Type {phrase} to confirm', 'code': 'HA_CLAIM_CONFIRM',
+                        'warning': manager.CLAIM_WARNING}), 400
+    if action == 'release' and not manager._ha_claim_enabled():
+        return jsonify({'error': 'The cluster claim is off for this cluster'}), 409
+    if action != 'disable' and manager.ssh_blocked_reason():
+        return jsonify({'error': 'The cluster claim is written over SSH, which is not available '
+                                 'for this cluster'}), 409
+    denied = _refuse_without_reauth(f'the cluster claim of {manager.config.name} ({action})')
+    if denied:
+        return denied
+
+    user = getattr(request, 'session', {}).get('user', 'system')
+    name = manager.config.name
+    if action == 'disable':
+        # what became of the file, as HA disable and the delete report it: where it
+        # may still be there this said the state and nothing else, with the switch
+        # already off and no word on how to remove it
+        removed = _retire_cluster_claim(manager, every_node=True) or {'state': 'off'}
+        manager.ha_config['claim_enabled'] = False
+        _save_ha_config_to_db(cluster_id, manager)
+        log_audit(user, 'ha.claim_disabled', f"Cluster claim switched off for cluster {name} "
+                                             f"(our claim: {removed.get('state')})", cluster=name)
+        return jsonify({'claim': manager._ha_claim_status(), 'removed': removed.get('state'),
+                        'warning': removed.get('warning'), 'by_hand': removed.get('by_hand')})
+
+    if action == 'enable':
+        manager.ha_config['claim_enabled'] = True
+        _save_ha_config_to_db(cluster_id, manager)
+        result = _ensure_cluster_claim(manager)
+        log_audit(user, 'ha.claim_enabled', f"Cluster claim switched on for cluster {name}: PegaProx "
+                                            f"writes /etc/pve/pegaprox/claim there ({result.get('state')})",
+                  cluster=name)
+        return jsonify({'claim': manager._ha_claim_status()})
+
+    # release: whose claim it is goes into the audit trail before it is written over
+    before = _ensure_cluster_claim(manager)
+    if before.get('state') == 'ours':
+        return jsonify({'error': 'The claim is this instance\'s already',
+                        'claim': manager._ha_claim_status()}), 409
+    result = _ensure_cluster_claim(manager, takeover=True)
+    log_audit(user, 'ha.claim_released',
+              f"Cluster {name}: claim of instance {before.get('instance') or '?'} (epoch "
+              f"{before.get('epoch')}, {before.get('state')}) written over with ours "
+              f"({result.get('state')})", cluster=name)
+    return jsonify({'claim': manager._ha_claim_status()})
 
 
 @bp.route('/api/clusters/<cluster_id>/ha', methods=['PUT'])

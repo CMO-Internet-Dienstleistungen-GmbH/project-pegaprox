@@ -2218,6 +2218,42 @@ def _strip_secret_fields(d):
     return d
 
 
+def _strip_cluster_secrets(cluster):
+    """A cluster row for a backup without secrets.
+
+    MK Oct 2026 (#625) - the sweep above looks at the keys of the row. The HA settings
+    are a dict of their own inside it and went out as they were: they hold the token
+    the node agents sign their leader question with, and the BMC password of each
+    node's fence."""
+    _strip_secret_fields(cluster)
+    ha_settings = cluster.get('ha_settings') if isinstance(cluster, dict) else None
+    if isinstance(ha_settings, dict):
+        _strip_secret_fields(ha_settings)
+        fencing = ha_settings.get('fencing')
+        for fence in (fencing.values() if isinstance(fencing, dict) else ()):
+            _strip_secret_fields(fence)
+    return cluster
+
+
+def _keep_guarded_ha_settings(cluster, existing):
+    """A merge restore over a cluster that is there: what only the HA routes write
+    stays as the cluster has it (#625). The backup's value would switch the cluster
+    claim or the unsafe two-node recovery without their proof, and a backup without
+    secrets, or one from before the agents had a token, would take the token away:
+    every installed tiebreak agent is then answered 403."""
+    from pegaprox.api.clusters import HA_SETTINGS_GUARDED
+    held = existing.get('ha_settings') if isinstance(existing.get('ha_settings'), dict) else {}
+    # a backup without HA settings for the cluster changes none of them
+    sent = cluster.get('ha_settings') if isinstance(cluster.get('ha_settings'), dict) else held
+    merged ={k: v for k, v in sent.items() if k not in HA_SETTINGS_GUARDED}
+    merged.update({k: held[k] for k in HA_SETTINGS_GUARDED if k in held})
+    # a row without the key reads as a setup from before the safety rules as soon as it
+    # forces quorum: written out as what this row is right now
+    merged.setdefault('unsafe_two_node_recovery',
+                      bool(held.get('two_node_mode') or held.get('force_quorum_on_failure')))
+    cluster['ha_settings'] = merged
+
+
 @bp.route('/api/config/backup', methods=['POST'])
 
 @require_auth(roles=[ROLE_ADMIN])
@@ -2335,7 +2371,7 @@ def backup_config():
             # shape as well as by name so a newly added secret field can't slip through again.
             for cluster_id, cluster_data in clusters.items():
                 if isinstance(cluster_data, dict):
-                    _strip_secret_fields(cluster_data)
+                    _strip_cluster_secrets(cluster_data)
         backup_data['clusters'] = clusters
         
         # Users (optional)
@@ -2705,7 +2741,8 @@ def restore_config():
                                 cluster[_sk] = existing[_sk]
                         if not cluster.get('ssh_key_encrypted') and existing.get('ssh_key_encrypted'):
                             cluster['ssh_key_encrypted'] = existing['ssh_key_encrypted']
-                    
+                        _keep_guarded_ha_settings(cluster, existing)
+
                     if not dry_run:
                         database.save_cluster(cluster_id, cluster)
                     cluster_count += 1
