@@ -82,10 +82,14 @@ def test_a_replayed_call_is_refused(group, seed):
 
 
 @pytest.mark.parametrize('skew,status', [(-121, 401), (121, 401), (-100, 200), (100, 200)])
-def test_a_call_from_outside_the_window_is_refused(group, seed, skew, status):
+def test_a_call_from_outside_the_window_is_refused(group, seed, monkeypatch, skew, status):
     g = group
     _built(g, seed, 'bc')
-    headers = _sign_as(g, 'b', 'a', ts=int(time.time()) + skew)
+    # the clock stands still on a whole second: signed late in a second, 121 s ahead
+    # was 119.9 s ahead by the time it was checked, and the call went through
+    now = float(int(time.time()))
+    monkeypatch.setattr(g.ha, 'time', types.SimpleNamespace(time=lambda: now, monotonic=time.monotonic))
+    headers = _sign_as(g, 'b', 'a', ts=int(now) + skew)
     assert _send(g, 'a', headers).status_code == status
 
 
