@@ -2003,8 +2003,10 @@ def test_copies_go_only_when_an_admin_dismisses_them(env, db, seed, monkeypatch)
 # --- what is kept already is not kept again ---------------------------------------------------
 
 def _oidc_sign_in(name='jane', role='viewer'):
-    """Steps 5 and 6 of api/auth.py oidc_callback, as they run on any instance: the
-    sign-in provisions the users row, and the callback saves it once more."""
+    """Steps 5 and 6 of api/auth.py oidc_callback where the row is the instance's own to
+    write, and as they ran on a standby too until it took a sign-in in on the synced row
+    (tests/test_ha_standby_oidc.py): the sign-in provisions the users row, and the
+    callback saves it once more."""
     from datetime import datetime
     from pegaprox.utils.oidc import oidc_provision_user
     from pegaprox.utils.auth import save_single_user
@@ -2027,10 +2029,11 @@ def _one_tag_more(note):
 
 
 def test_an_account_made_again_after_every_sync_is_one_copy(env, db, seed):
-    """(#625 review) An OIDC sign-in on a standby provisions the users row there. The
-    next sync replaces it and keeps a copy, the user signs in again, the row is made
-    again with another created_at, and so on: one copy, one ERROR and one audit row per
-    sign-in and sync, and only an admin removes a copy. Fifty rounds are one copy now."""
+    """(#625 review) An OIDC sign-in on a standby provisioned the users row there, until
+    the callback stopped writing one on a standby. The next sync replaces such a row and
+    keeps a copy, the row is made again with another created_at, and so on: one copy,
+    one ERROR and one audit row per round, and only an admin removes a copy. Fifty
+    rounds are one copy now."""
     _leader(env)
     seed.user('alice')
     snap = _wire(ha.build_snapshot())

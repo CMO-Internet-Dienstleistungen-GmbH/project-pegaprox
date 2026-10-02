@@ -3,6 +3,7 @@
 PegaProx OIDC/OAuth2 Authentication - Layer 4
 """
 
+import copy
 import json
 import logging
 import time
@@ -838,16 +839,18 @@ def oidc_derive_username(user_info: dict, users: dict = None) -> str:
     return username
 
 
-def oidc_provision_user(user_info: dict, role_mapping: dict, auth_source: str = 'oidc') -> dict:
-    from pegaprox.utils.auth import load_users, save_users
-    """Create or update local user from OIDC authentication
-    
-    NS: JIT provisioning - same pattern as LDAP but for OIDC providers
-    MK: username derived from email or preferred_username
+def oidc_build_user_row(user_info: dict, role_mapping: dict, auth_source: str, users: dict):
+    """The row an OIDC sign-in would store for this user, without storing it.
+
+    `users` is the users table as loaded. Returns (username, row), or None where an
+    account of another identity source owns the name; the caller leaves it alone then.
+
+    MK Oct 2026 (#625) - split out of oidc_provision_user, as ldap_build_user_row was:
+    a standby asks what the identity provider says without writing it down, its users
+    table is the active's copy and the next sync puts that copy back.
     """
     # Derive username from OIDC claims
     email = user_info.get('email') or user_info.get('preferred_username', '')
-    users = load_users()
     username = oidc_derive_username(user_info, users)
 
     display_name = user_info.get('name') or user_info.get('given_name', '')
@@ -868,8 +871,9 @@ def oidc_provision_user(user_info: dict, role_mapping: dict, auth_source: str = 
                             f"account of that name exists and cannot be taken over by OIDC")
             return None  # Caller should handle None return
         
-        # Update existing OIDC user
-        user = users[username]
+        # Update existing OIDC user - on a copy, so the table the caller handed in
+        # stays what it was
+        user = copy.deepcopy(users[username])
         user['display_name'] = display_name
         user['email'] = email
         user['auth_source'] = auth_source
@@ -919,11 +923,9 @@ def oidc_provision_user(user_info: dict, role_mapping: dict, auth_source: str = 
                 if 'tenant_permissions' not in user:
                     user['tenant_permissions'] = {}
                 user['tenant_permissions'].update(role_mapping['tenant_permissions'])
-        
-        logging.info(f"[OIDC] Updated user '{username}' (role={user['role']}, source={auth_source})")
     else:
         # Create new user
-        users[username] = {
+        user = {
             'role': role_mapping.get('role', ROLE_VIEWER),
             'enabled': True,
             'display_name': display_name,
@@ -940,7 +942,26 @@ def oidc_provision_user(user_info: dict, role_mapping: dict, auth_source: str = 
             'last_oidc_sync': datetime.now().isoformat(),
             'created_at': datetime.now().isoformat()
         }
+    return username, user
+
+
+def oidc_provision_user(user_info: dict, role_mapping: dict, auth_source: str = 'oidc') -> dict:
+    from pegaprox.utils.auth import load_users, save_users
+    """Create or update local user from OIDC authentication
+    
+    NS: JIT provisioning - same pattern as LDAP but for OIDC providers
+    MK: username derived from email or preferred_username
+    """
+    users = load_users()
+    built = oidc_build_user_row(user_info, role_mapping, auth_source, users)
+    if built is None:
+        return None  # Caller should handle None return
+    username, user = built
+    if username in users:
+        logging.info(f"[OIDC] Updated user '{username}' (role={user['role']}, source={auth_source})")
+    else:
         logging.info(f"[OIDC] Provisioned new user '{username}' (role={role_mapping.get('role', ROLE_VIEWER)}, source={auth_source})")
+    users[username] = user
     
     save_users(users)
     return {**users[username], 'username': username}

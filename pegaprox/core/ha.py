@@ -4430,9 +4430,9 @@ def _capture_items(rows_kept, files_kept, journal, key):
     """One digest for every row, file and journal line a copy would hold, sorted, and one
     over all of them. A row counts without created_at and VOLATILE_COLUMNS, whatever the
     order of its columns: an account that is made here again after a sync replaced it
-    (an OIDC sign-in on a standby provisions one) is the same row every time. Keyed
-    with `key`, the key the copy is sealed under, so the meta file they go into says
-    nothing about the rows."""
+    (a sign-in under way while this instance steps down still provisions one) is the
+    same row every time. Keyed with `key`, the key the copy is sealed under, so the
+    meta file they go into says nothing about the rows."""
     sub = hashlib.sha256(b'pegaprox-ha-orphan-items:' + key).digest()
 
     def digest(*parts, size=8):

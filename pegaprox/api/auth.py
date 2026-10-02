@@ -36,7 +36,7 @@ from pegaprox.utils.oidc import (
     get_oidc_settings, get_oidc_endpoints, oidc_build_auth_url,
     oidc_exchange_code, oidc_decode_id_token, oidc_get_user_info,
     oidc_get_user_groups, oidc_get_user_groups_ex, oidc_map_groups_to_role, oidc_provision_user,
-    oidc_derive_username,
+    oidc_derive_username, oidc_build_user_row, OIDC_AUTH_SOURCES,
 )
 from pegaprox.utils.rbac import get_user_permissions, DEFAULT_TENANT_ID
 from pegaprox.api.helpers import load_server_settings, save_server_settings, get_login_settings, get_session_timeout, safe_error, effective_reverse_proxy
@@ -230,7 +230,42 @@ def oidc_callback():
     provider = config.get('provider', 'oidc')
     auth_source = 'entra' if provider == 'entra' else 'oidc'
     
-    user = oidc_provision_user(user_info, role_mapping, auth_source=auth_source)
+    from pegaprox.core import ha
+    on_standby = ha.is_standby()
+    if on_standby:
+        # MK Oct 2026 (#625) - a standby writes no users row here either, as for a
+        # directory login in auth_login: the next sync puts the active's copy back, and
+        # an account made here would be gone with it while its session stays. So the
+        # sign-in goes through only when the account is here already and the identity
+        # provider says what the synced row says. A serving member is a standby too.
+        users = load_users()
+        built = oidc_build_user_row(user_info, role_mapping, auth_source, users)
+        user = None  # another source owns the name: the answer below, as on the active
+        if built is not None:
+            username, would_be = built
+            row = users.get(username)
+            if not isinstance(row, dict):
+                logging.warning(f"[OIDC] '{username}' signs in on a standby that does not "
+                                f"hold the account yet - refused")
+                return jsonify({
+                    'error': 'Your account is not on this instance yet - sign in on the active '
+                             'instance once; it reaches this standby with the next sync.',
+                    'code': 'HA_STANDBY',
+                }), 409
+            if not row.get('enabled', True):
+                return jsonify({'error': 'Account is disabled'}), 403
+            if not _idp_agrees_with_synced_row(would_be, row):
+                logging.warning(f"[OIDC] '{username}' signs in on a standby with access at the "
+                                f"identity provider that differs from the synced account - refused")
+                return jsonify({
+                    'error': 'Your access changed at the identity provider - sign in on the active '
+                             'instance once; it reaches this standby with the next sync.',
+                    'code': 'HA_STANDBY',
+                }), 409
+            user = {**row, 'username': username}
+            logging.info(f"[OIDC] User '{username}' authenticated via {provider} from {client_ip} (standby, synced row)")
+    else:
+        user = oidc_provision_user(user_info, role_mapping, auth_source=auth_source)
     
     # NS: SECURITY - oidc_provision_user returns None if local account would be overwritten
     if not user:
@@ -252,8 +287,10 @@ def oidc_callback():
     # Management however often it signed in — misleading when reviewing dormant accounts.
     # Placed after create_session and after the disabled-account gate above, so a rejected
     # attempt is not recorded as a login.
-    user['last_login'] = datetime.now().isoformat()
-    save_single_user(username, user)
+    # #625: not on a standby, where no login writes the synced row
+    if not on_standby:
+        user['last_login'] = datetime.now().isoformat()
+        save_single_user(username, user)
 
     log_audit(username, 'auth.oidc.login', f"OIDC login via {provider} from {client_ip}")
     
@@ -570,7 +607,12 @@ def _directory_agrees_with_synced_row(ldap_result, row):
     would_be = ldap_build_user_row(ldap_result, row)
     if would_be is None:
         return False
+    return _same_access(would_be, row)
 
+
+def _same_access(would_be, row):
+    """Role, tenant, extra permissions (as a set) and per-tenant overrides: what a
+    sign-in rewrites and a check reads."""
     def _perms(u):
         return sorted(set(u.get('permissions') or []))
 
@@ -578,6 +620,18 @@ def _directory_agrees_with_synced_row(ldap_result, row):
             and would_be.get('tenant_id') == row.get('tenant_id')
             and _perms(would_be) == _perms(row)
             and (would_be.get('tenant_permissions') or {}) == (row.get('tenant_permissions') or {}))
+
+
+def _idp_agrees_with_synced_row(would_be, row):
+    """#625 - the same question for an OIDC / Entra sign-in, and the same four answers
+    to compare. `would_be` is the row oidc_build_user_row says the sign-in would store;
+    display name, mail and the oidc_* bookkeeping change nothing a check reads here
+    either. A missing row or one another identity source owns is never a match.
+    MK Oct 2026
+    """
+    if not isinstance(row, dict) or row.get('auth_source', 'local') not in OIDC_AUTH_SOURCES:
+        return False
+    return isinstance(would_be, dict) and _same_access(would_be, row)
 
 
 def _ha_banner():
