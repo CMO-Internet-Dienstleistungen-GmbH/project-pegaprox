@@ -30,6 +30,8 @@ ACTIVE_URL = 'https://active.example:5000'
 STANDBY_URL = 'https://standby.example:5000'
 # what _admin's account signs in with; pairing, join, promote and unpair want it again
 ADMIN_PW = 'Adm1n-at-the-keyboard!'
+# the name of a copy of changes that were not carried over; none is kept under it
+ORPHAN = '1-4-20261001T100158Z-0123456789ab'
 
 ADMIN_ROUTES = [
     ('get', '/api/ha/status', None),
@@ -43,6 +45,8 @@ ADMIN_ROUTES = [
     ('post', '/api/ha/apply-config', None),
     ('post', f'/api/ha/members/{B_ID}/remove', {'confirm': 'REMOVE', 'user_password': ADMIN_PW}),
     ('put', f'/api/ha/members/{B_ID}/serve', {'serve': True}),
+    ('post', f'/api/ha/orphans/{ORPHAN}/download', {'user_password': ADMIN_PW}),
+    ('post', f'/api/ha/orphans/{ORPHAN}/dismiss', {'confirm': True}),
 ]
 PEER_ROUTES = [
     ('POST', '/api/ha/peer/pair'),
@@ -260,7 +264,7 @@ def test_the_route_lists_are_every_ha_route(api):
         if rule.rule.startswith('/api/ha/'):
             for m in rule.methods - {'HEAD', 'OPTIONS'}:
                 # the list names one member for the route that takes any
-                served.add((m, rule.rule.replace('<instance_id>', B_ID)))
+                served.add((m, rule.rule.replace('<instance_id>', B_ID).replace('<name>', ORPHAN)))
     assert served == listed
 
 
@@ -333,6 +337,8 @@ def test_an_admin_reaches_every_route(ha_env, seed):
         '/api/ha/apply-config': 409,  # not a standby
         f'/api/ha/members/{B_ID}/remove': 409,  # not active
         f'/api/ha/members/{B_ID}/serve': 409,   # not the leader
+        f'/api/ha/orphans/{ORPHAN}/download': 404,  # no such copy
+        f'/api/ha/orphans/{ORPHAN}/dismiss': 404,
     }
     for method, path, body in ADMIN_ROUTES:
         r = _send(c, method, path, body)
@@ -1268,7 +1274,7 @@ def test_the_spec_says_what_the_peer_routes_take(api):
         else:
             assert op['security'] == [{'haPeer': []}], path
     for method, path, _b in ADMIN_ROUTES:
-        op = paths[path.replace(B_ID, '{instance_id}')][method]
+        op = paths[path.replace(B_ID, '{instance_id}').replace(ORPHAN, '{name}')][method]
         assert op['x-pegaprox-roles'] == ['admin'], path
 
 

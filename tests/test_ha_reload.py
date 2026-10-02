@@ -509,7 +509,9 @@ def test_a_note_carries_the_etag_and_a_member_that_holds_it_pulls_nothing(grp, s
     with g.at('a'):
         assert admin.post('/api/push/inbox/clear', json={}).status_code == 200
     assert _fire(g, ha.NUDGE_DELAY) == 1
-    assert _note_bodies(g, sent) == [('a', 'b', {'etag': held}), ('a', 'c', {'etag': held})]
+    # next to the etag, where the leader's configuration is at (tests/test_ha_orphans.py)
+    assert [(frm, to, body['etag']) for frm, to, body in _note_bodies(g, sent)] == [
+        ('a', 'b', held), ('a', 'c', held)]
     assert len(walks) == 1 and g.pulls == [] and _snapshots(g, before) == []
 
     # counterproof: a write that changes what they hold

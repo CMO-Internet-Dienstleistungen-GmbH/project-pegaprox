@@ -71,6 +71,11 @@ What travels:
     key pins, the login background, the plugins' config.json files and the member
     list. Instance-local tables and settings stay put.
 
+Nothing a member holds goes with the DELETE of a sync unseen (#625, stage 2): the
+active counts its configuration (cv), every snapshot names the history its data went
+through, and a member that holds anything outside of it keeps a copy in
+config/ha_orphans first. See "config version" further down.
+
 A state file from before the groups holds a single peer. It reads as a group of two
 (_from_pair_format), and both sides keep talking without pairing again.
 
@@ -80,6 +85,7 @@ It is never part of a snapshot.
 MK Sep 2026
 """
 import base64
+import collections
 import errno
 import gzip
 import hashlib
@@ -97,7 +103,7 @@ import threading
 import time
 import urllib.parse
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from pegaprox.constants import CONFIG_DIR, BRANDING_DIR, PLUGINS_DIR
 
@@ -135,6 +141,9 @@ PEER_KEYED_HEADER = 'X-PegaProx-Peer-Keyed'
 # the sha256 of the body, as signed: a receiver can check who sent a large call before
 # it reads the body (signed_before_body), and the body against it afterwards
 PEER_BODY_HEADER = 'X-PegaProx-Peer-Body'
+# with the pull of a snapshot: the config version the member holds, [epoch, seq, segment,
+# leader] as JSON (note_config_etag)
+PEER_CV_HEADER = 'X-PegaProx-Peer-Cv'
 # how far a signed call's time may be off, either way
 SIGNATURE_WINDOW = 120
 _NONCES_PER_SENDER = 4096
@@ -158,6 +167,8 @@ ACTIVE_LIMIT_ERROR = (f'A group has at most {ACTIVE_LIMIT} active instances, the
 PULL_TIMEOUT = 60
 PULL_TIMEOUT_FLOOR = 20
 PULL_TIMEOUT_UNREACHABLE = 10
+# how long a promotion waits for a sync that is under way, as pull_before_promote does
+PROMOTE_PULL_WAIT = 20
 
 # A write a standby forwards: the peer route that takes it on the active, and the key
 # the active marks the call it runs for the standby with in the WSGI environ (the
@@ -264,6 +275,8 @@ LOCAL_TABLES = (
     'status_uptime', 'cloud_init_deployments', 'dr_drills', 'dr_drill_checks',
     'snapshot_runs', 'drift_events', 'auto_install_runs', 'push_inbox',
     'balance_recommendations', 'logs', 'logs_fts',
+    # who wrote what on the active, and the change counter behind cv_tick
+    'ha_change_journal', 'ha_cv_dirty',
 )
 
 # server_settings keys that describe this host, not the deployment
@@ -278,12 +291,15 @@ LOCAL_SETTING_PREFIXES = ('acme_',)
 # Columns every login, token use or push delivery writes. They still travel in
 # the body, but leaving them out of the etag keeps a busy active from forcing a
 # full transfer on nearly every poll.
+# A standby writes some of them itself: a passkey sign-in there counts sign_count up,
+# a plugin it loads notes its own error. Out of the etag, they are also no change of
+# its own that the next sync would have to keep a copy of (_why_not_carried).
 VOLATILE_COLUMNS = {
     'users': ('last_login', 'last_ldap_sync', 'last_oidc_sync'),
     'api_tokens': ('last_used_at', 'last_used_ip'),
-    'webauthn_credentials': ('last_used_at', 'last_used_ip'),
+    'webauthn_credentials': ('last_used_at', 'last_used_ip', 'sign_count'),
     'push_subscriptions': ('last_used_at', 'failures'),
-    'plugin_state': ('loaded_at',),
+    'plugin_state': ('loaded_at', 'error'),
     'siem_targets': ('last_status', 'last_ok_at', 'last_error_at', 'last_error',
                      'sent_count', 'error_count'),
 }
@@ -316,6 +332,12 @@ _URL_CHARS_RE = re.compile(r'[A-Za-z0-9.\-_~:/\[\]]+')
 _URL_PATH_RE = re.compile(r'/[A-Za-z0-9._~\-/]*')
 _URL_PORT_RE = re.compile(r':[0-9]{1,5}')
 _ID_RE = re.compile(r'[0-9a-f]{32}')
+_SEGMENT_RE = re.compile(r'[0-9a-f]{16}')
+_MARK_RE = re.compile(r'[0-9a-f]{8}')
+_SEQ_MAX = 2 ** 53
+# <epoch>-<seq>-<UTC time>-<digest of what it holds>
+_ORPHAN_NAME_RE = re.compile(r'[0-9]{1,10}-[0-9]{1,16}-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}')
+_TRIGGER_NAME_RE = re.compile(r'ha_cv_[a-z0-9_]{1,80}')
 _SECRET_HASH_RE = re.compile(r'[0-9a-f]{64}')
 _FP_RE = re.compile(r'[0-9A-F]{2}(:[0-9A-F]{2}){31}')
 # an Ed25519 public key or signature, base64 of the raw bytes
@@ -348,12 +370,61 @@ NUDGE_DELAY = 2
 NUDGE_SPACING = 10
 NUDGE_TIMEOUT = 5
 
+# The config version (#625, stage 2). A history names the last LINEAGE_KEEP segments
+# the data went through; a member further back than that keeps a copy at its next sync.
+CV_ZERO = (0, 0)
+LINEAGE_KEEP = 64
+# Every step of the cv gets a random mark, and a snapshot carries the marks of the last
+# STEPS_KEEP steps: a member that holds one of them under another mark holds content the
+# leader never handed out under that number (its state went back to an earlier one).
+STEPS_KEEP = 128
+# What a member held and a snapshot did not carry over. A copy goes only when an admin
+# dismisses it; past ORPHANS_ALERT_BYTES, or that share of the free space, the instance
+# says so and still deletes nothing.
+ORPHANS_DIR = os.path.join(CONFIG_DIR, 'ha_orphans')
+ORPHANS_ALERT_BYTES = 200 * 1024 * 1024
+ORPHANS_ALERT_SHARE = 0.10
+# A copy on disk: the gzip'd JSON sealed with AES-256-GCM, after a magic and the
+# fingerprint of the key it is sealed under. With SQLCipher that is a key derived from
+# the master key of the key store (ORPHAN_MAGIC_MASTER): the field key lies in the
+# config directory, next to the copies, and the master key need not. On plain SQLite,
+# where the rows are readable in the database file anyway, it is the field key
+# (ORPHAN_MAGIC). The meta file next to a copy stays readable and holds nothing of the
+# rows (_ORPHAN_META_KEYS).
+ORPHAN_SUFFIX = '.json.gz.enc'
+ORPHAN_MAGIC = b'PGXHAO1\n'
+ORPHAN_MAGIC_MASTER = b'PGXHAO2\n'
+ORPHAN_KEY_INFO = b'pegaprox-ha-orphans'
+# A copy names every row, file and journal line it holds in its meta file, as a keyed
+# digest, so the same rows are not kept a second time. Past this many it names none:
+# the status reads the meta files with every poll.
+ORPHAN_ITEMS_MAX = 512
+# how long dismissing a copy waits for a sync that is under way
+DISMISS_WAIT = 10
+# The change journal: one line per write request on the active, in the database
+# JOURNAL_DELAY seconds after the first one that waits, JOURNAL_KEEP lines at most.
+JOURNAL_KEEP = 20000
+JOURNAL_PENDING_MAX = 2000
+JOURNAL_DELAY = 1
+# The tick of an automatic leader (cv_tick), every CV_TICK seconds. Measured on a
+# generated 10k-VM dataset (42.7k rows in 46 shared tables, SQLCipher): one etag walk
+# takes 0.40 s, 0.10 s of it the SELECTs alone, so a tick that always walks would cost
+# 13% of a core for nothing. Triggers on the shared tables count the changes into
+# ha_cv_dirty instead (2-10 us a changed row, 10 us to read), and the tick walks only
+# when the count or a file moved. The triggers are looked over whenever the schema
+# changed, and every TRIGGER_CHECK seconds anyway; nothing but the tick relies on them.
+CV_TICK = 3
+TRIGGER_PREFIX = 'ha_cv_'
+TRIGGER_CHECK = 60
+
 _lock = threading.RLock()
 _state = None
 _loop_started = False
 # the stored etag is dropped once per process start: an upgrade or a restored
 # database changes what we hold without the active knowing
 _etag_checked = False
+# and the first sync of a process reads the rows here whatever the change mark says
+_mark_checked = False
 
 
 def _fresh_run():
@@ -387,6 +458,17 @@ _last_watch = {'at': None, 'unreachable': frozenset()}
 # forwarded write) got no answer at all; the next answer clears it. Forwarding waits
 # for that answer instead of holding every write until it times out
 _silent_source = {'id': None}
+# journal lines that wait for the database; last_id is the highest id written there,
+# filled_to the highest one that has its cv
+_journal_lock = threading.Lock()
+_journal = {'pending': [], 'dropped': 0, 'last_id': None, 'filled_to': 0, 'due': False}
+# cv_tick: the change count and file marks it last walked at, and when it last looked
+# over the triggers (monotonic), and SQLite's schema version at that look
+_tick = {'seen': None, 'checked': None, 'schema': None}
+# how many copies ORPHANS_DIR holds (None until counted), and whether it was said that
+# they are past the limit; not_kept is the copy that could not be written, as it was
+# last audited
+_orphans = {'count': None, 'over_said': False, 'not_kept': None}
 
 
 class HaError(Exception):
@@ -412,6 +494,10 @@ class PeerRefused(HaError):
 
 class RemoveUnconfirmed(HaError):
     """remove_member: the member was not seen as a standby under the current epoch."""
+
+
+class SyncRunning(HaError):
+    """A sync holds the pull lock for longer than the caller waits for it."""
 
 
 class ActiveLimit(HaError):
@@ -2294,11 +2380,13 @@ def join(code, own_url, own_fingerprint):
             # standby first, key second: if the key write fails we are a passive
             # standby whose sync refuses a key mismatch, not a standalone that acts
             # on a foreign key. Both under the lock, so accept_pairing cannot seal
-            # the adopted key to anybody in between.
+            # the adopted key to anybody in between. joined: the first snapshot replaces
+            # this instance's configuration, as the admin confirmed it would
             _commit_locked(dict(st, role=ROLE_STANDBY, epoch=new_epoch, pairing=None, sync={},
                                 signing_key=my_key, member_secret=None, members=ms,
                                 tombstones=_bounded_tombstones(tombs), removed=None,
-                                source=info['instance_id'], serve_assigned=False))
+                                source=info['instance_id'], serve_assigned=False,
+                                cv={'joined': True}, change_gap=None))
             try:
                 _install_field_key(field_key)
             except Exception as e:
@@ -2372,7 +2460,7 @@ def unpair():
         # (one at the ceiling would otherwise refuse every promotion there as well)
         new.update(members={}, source=None, member_secret=None, signing_key=None, pairing=None,
                    sync={}, tombstones={}, removed=None, role=ROLE_STANDALONE, epoch=0,
-                   serve_assigned=False)
+                   serve_assigned=False, cv=None, change_gap=None)
         _commit_locked(new)
     # now, not at the next boot: the route restarts only a former standby
     _note_member_in_db('')
@@ -2405,6 +2493,8 @@ def _mark_removed(by, their_epoch):
         return None
     logging.warning(f"[HA] member {by} says this instance was removed from the group (epoch "
                     f"{their_epoch}) - passive until it is unpaired")
+    if was == ROLE_ACTIVE:
+        flush_journal()
     _audit('ha.removed', f"removed from the group, as member {by} says (epoch {their_epoch}); "
                          f"this instance was {was} and stays passive until it is unpaired")
     return was
@@ -2512,7 +2602,7 @@ def refresh_member(member_id, timeout=5):
     if not rec:
         return
     try:
-        their_role, their_epoch, mark, serving_seen = _ask(rec, _signer(), timeout)
+        their_role, their_epoch, mark, serving_seen = _ask(rec, _signer(), timeout)[:4]
     except Exception as e:
         logging.info(f"[HA] member {rec.get('url') or member_id} did not answer the check: {e}")
         return
@@ -2640,7 +2730,25 @@ def take_tombstones(sender_id, entries):
 
 def promote():
     """Standby to active under a new epoch, one above every epoch this instance has
-    seen in the group. The caller restarts the process."""
+    seen in the group. The caller restarts the process. What a member was known to
+    hold and this instance does not is noted as change_gap, audited and shown.
+
+    A sync that is under way finishes first, for up to PROMOTE_PULL_WAIT seconds: the
+    promotion comes after it or before it, never in the middle. One that is still out
+    by then (its source does not answer) no longer applies: apply_snapshot looks at
+    the role again before it replaces anything."""
+    waited = _pull_lock.acquire(timeout=PROMOTE_PULL_WAIT)
+    try:
+        new_epoch, gap = _promote()
+    finally:
+        if waited:
+            _pull_lock.release()
+    if gap:
+        _say_change_gap(gap)
+    return new_epoch
+
+
+def _promote():
     with _lock:
         st = _load()
         if st.get('broken'):
@@ -2660,14 +2768,19 @@ def promote():
             # no member could read it: the old active would never step down to us
             raise HaError('The group has reached the highest epoch there is - unpair every '
                           'instance and pair them again')
+        gap = _gap_at_promotion(st)
+        cvr = _cv_record(st)
+        if cvr is not None and cvr.get('joined'):
+            # never synced: what it holds is its own, with no history behind it
+            cvr = None
         # whoever was active may not be once it hears about us
         ms = {mid: dict(rec, role_seen=None) if rec.get('role_seen') == ROLE_ACTIVE else dict(rec)
               for mid, rec in ms.items()}
         # the members keep the serve flags the old leader gave them; ours is no flag
         # any more, the leader is active anyway
         _commit_locked(dict(st, epoch=new_epoch, role=ROLE_ACTIVE, members=ms, source=None,
-                            serve_assigned=False))
-        return new_epoch
+                            serve_assigned=False, cv=cvr, change_gap=gap))
+    return new_epoch, gap
 
 
 def _wins_tie(one, other):
@@ -2694,6 +2807,8 @@ def step_down(new_epoch, by_peer_id):
         _commit_locked(dict(st, role=ROLE_STANDBY, epoch=new_epoch, sync={}, members=ms,
                             source=by_peer_id))
     logging.warning(f"[HA] stepped down: member {by_peer_id} is active with epoch {new_epoch}")
+    # who wrote what while this instance led, before the restart takes what still waits
+    flush_journal()
     return True
 
 
@@ -2712,6 +2827,7 @@ def step_aside(new_epoch, reason):
         _commit_locked(dict(st, role=ROLE_STANDBY, epoch=max(mine, new_epoch),
                             source=None, sync={'last_error': f'Stepped aside: {reason}'[:300]}))
     logging.warning(f"[HA] stepped aside to a passive standby: {reason}")
+    flush_journal()
     return True
 
 
@@ -2901,14 +3017,88 @@ def _hash_value(h, v):
         h.update(v)
 
 
-def _row_digest(values, masked):
+def _default_values(dflt):
+    """What a row reads in a column nobody set, from the default as PRAGMA table_info
+    gives it: None when the column declares none (the row reads NULL), else the values
+    that stand for it, as text and as a number."""
+    if not isinstance(dflt, str) or dflt.strip().upper() == 'NULL':
+        return None
+    lit = dflt.strip()
+    if len(lit) >= 2 and lit[0] == lit[-1] == "'":
+        lit = lit[1:-1].replace("''", "'")
+    out = [lit]
+    for number in (int, float):
+        try:
+            out.append(number(lit))
+            break
+        except ValueError:
+            pass
+    return frozenset(out)
+
+
+def _row_plan(name, cols, coldefs):
+    """How a row of `name` is hashed: (index, tag, default values) of every column
+    outside VOLATILE_COLUMNS, in the order of the names."""
+    masked = VOLATILE_COLUMNS.get(name, ())
+    plan = []
+    for i, c in enumerate(cols):
+        if c in masked:
+            continue
+        tag = c.lower().encode('utf-8', 'surrogatepass')
+        plan.append((tag, i, b'c%d:' % len(tag) + tag, _default_values((coldefs.get(c) or ['', None])[1])))
+    return [p[1:] for p in sorted(plan)]
+
+
+def _row_digest(values, plan):
+    """One row as (column name, value) pairs. A column that holds what nobody set (its
+    default, NULL where it declares none) is left out, so a row hashes the same before
+    and after ALTER TABLE ADD COLUMN, and in whatever order the columns come."""
     h = hashlib.sha256()
-    for i, v in enumerate(values):
-        if i in masked:
-            h.update(b'm;')
-        else:
-            _hash_value(h, v)
+    for i, tag, unset in plan:
+        v = values[i]
+        if v is None:
+            if unset is None:
+                continue
+        elif unset is not None and v in unset:
+            continue
+        h.update(tag)
+        _hash_value(h, v)
     return h.digest()
+
+
+class _Digests:
+    """The two hashes a walk feeds. etag takes all a snapshot carries, the definition of
+    every table included: a member pulls again when the active got a column. data takes
+    the rows and the files alone and skips a table without rows, so it stays what it was
+    through a step that changes no row (the column an upgrade adds, a table the code
+    makes on first use): it says whether anything was changed here (_why_not_carried)."""
+
+    def __init__(self):
+        self.etag = hashlib.sha256(b'pegaprox-ha-snapshot')
+        self.data = hashlib.sha256(b'pegaprox-ha-data')
+
+    def update(self, raw):
+        self.etag.update(raw)
+        self.data.update(raw)
+
+    def table(self, name, sql, cols, rows):
+        rows = b''.join(sorted(rows))
+        h = self.etag
+        h.update(b'T')
+        _hash_value(h, name)
+        _hash_value(h, sql)
+        _hash_value(h, '\x00'.join(cols))
+        h.update(b'%d;' % (len(rows) // 32))
+        h.update(rows)
+        if rows:
+            h = self.data
+            h.update(b'T')
+            _hash_value(h, name)
+            h.update(b'%d;' % (len(rows) // 32))
+            h.update(rows)
+
+    def done(self):
+        return self.etag.hexdigest()[:32], self.data.hexdigest()[:32]
 
 
 def _reseal_legacy(db, value, label, stuck):
@@ -3011,6 +3201,8 @@ def _plugin_configs():
 
 
 def _walk_files(h, body):
+    """The file half of _walk_snapshot, into the hashes `h` (_Digests): each file as the
+    digest of its content."""
     files = {}
     try:
         with open(KNOWN_HOSTS_FILE, 'rb') as fh:
@@ -3020,7 +3212,7 @@ def _walk_files(h, body):
         pass
     else:
         h.update(b'F:ssh_known_hosts;')
-        _hash_value(h, raw)
+        _hash_value(h, hashlib.sha256(raw).digest())
         if body:
             files['ssh_known_hosts'] = text
 
@@ -3044,7 +3236,7 @@ def _walk_files(h, body):
         total += size
         h.update(b'F:branding;')
         _hash_value(h, fn)
-        _hash_value(h, data)
+        _hash_value(h, hashlib.sha256(data).digest())
         if body:
             branding[fn] = base64.b64encode(data).decode()
     if body:
@@ -3054,7 +3246,7 @@ def _walk_files(h, body):
     for pid, raw, text in _plugin_configs():
         h.update(b'F:plugin_config;')
         _hash_value(h, pid)
-        _hash_value(h, raw)
+        _hash_value(h, hashlib.sha256(raw).digest())
         if body:
             configs[pid] = text
     if body:
@@ -3062,49 +3254,53 @@ def _walk_files(h, body):
     return files
 
 
-def _walk_snapshot(body):
-    """The etag of what a snapshot carries and, with body=True, its tables and files.
-
-    Each row is hashed on its own with VOLATILE_COLUMNS masked, and the row digests
-    are sorted, so neither a login nor an INSERT OR REPLACE that moves a row changes
-    the etag. It is taken from the values as stored: a resealed legacy value is
-    randomized and would change it on every build.
-    """
+def _walk_tables(body):
+    """The table half of _walk_snapshot: (the hashes so far, tables, stuck). On the
+    connection of whoever calls, so inside a transaction it sees what that one wrote."""
     from pegaprox.core.db import get_db
     db = get_db()
     cur = db.conn.cursor()
     present = _existing_tables(cur)
-    h = hashlib.sha256(b'pegaprox-ha-snapshot')
+    h = _Digests()
     tables, stuck = {}, []
     for name in SYNC_TABLES:
         if name not in present:
             continue
+        cur.execute(f'PRAGMA table_info("{name}")')
+        coldefs = {r[1]: [r[2] or '', r[4]] for r in cur.fetchall()}
         cur.execute(f'SELECT * FROM "{name}"')
         cols = [d[0] for d in cur.description]
-        masked = {i for i, c in enumerate(cols) if c in VOLATILE_COLUMNS.get(name, ())}
+        plan = _row_plan(name, cols, coldefs)
         convert = _row_converter(db, name, cols, stuck) if body else None
         digests, rows = [], []
         for r in cur:
             vals = tuple(r)
             if name == 'server_settings' and _is_local_setting(str(vals[0])):
                 continue
-            digests.append(_row_digest(vals, masked))
+            digests.append(_row_digest(vals, plan))
             if body:
                 rows.append([_enc(v) for v in (convert(vals) if convert else vals)])
-        h.update(b'T')
-        _hash_value(h, name)
-        _hash_value(h, present[name] or '')
-        _hash_value(h, '\x00'.join(cols))
-        h.update(b'%d;' % len(digests))
-        for d in sorted(digests):
-            h.update(d)
+        h.table(name, present[name] or '', cols, digests)
         if body:
-            cur.execute(f'PRAGMA table_info("{name}")')
-            coldefs = {r[1]: [r[2] or '', r[4]] for r in cur.fetchall()}
             tables[name] = {'sql': present[name], 'columns': cols, 'rows': rows,
                             'coldefs': coldefs}
+    return h, tables, stuck
+
+
+def _walk_snapshot(body):
+    """(etag, tables, files, stuck, data): the etag of what a snapshot carries, with
+    body=True its tables and files, and the digest of the rows and files alone (see
+    _Digests).
+
+    Each row is hashed on its own with VOLATILE_COLUMNS left out, and the row digests
+    are sorted, so neither a login nor an INSERT OR REPLACE that moves a row changes
+    either one. They are taken from the values as stored: a resealed legacy value is
+    randomized and would change them on every build.
+    """
+    h, tables, stuck = _walk_tables(body)
     files = _walk_files(h, body)
-    return h.hexdigest()[:32], tables, files, sorted(set(stuck))
+    etag, data = h.done()
+    return etag, tables, files, sorted(set(stuck)), data
 
 
 def warn_stuck(stuck):
@@ -3151,28 +3347,43 @@ def _group_etag(etag, meta):
     return h.hexdigest()[:32]
 
 
-def build_snapshot(meta=None, stuck=None):
+def build_snapshot(meta=None, stuck=None, raw=None):
     """Everything a standby needs, as a JSON-ready dict.
 
     From the threadpool, pass `meta` from snapshot_meta() and a `stuck` list to
     collect the legacy values that could not be resealed; the caller logs them on
-    the hub. Called without them it does both itself."""
+    the hub. Called without them it does both itself, and puts the config version on
+    the snapshot (stamp_snapshot). From the threadpool that is the caller's part too,
+    back on the hub: `raw`, a list, gets the etag of the tables and files for it, and
+    the digest of the rows and files alone."""
+    own = meta is None
     meta = meta or snapshot_meta()
-    etag, tables, files, found = _walk_snapshot(body=True)
+    upto = journal_mark() if own else None
+    etag, tables, files, found, data = _walk_snapshot(body=True)
     if stuck is None:
         warn_stuck(found)
     else:
         stuck.extend(found)
-    return dict(tables=tables, files=files, format=SNAPSHOT_FORMAT, generated_at=_now(),
+    if raw is not None:
+        raw.extend((etag, data))
+    snap = dict(tables=tables, files=files, format=SNAPSHOT_FORMAT, generated_at=_now(),
                 etag=_group_etag(etag, meta), **meta)
+    if own:
+        stamp_snapshot(snap, etag, upto, data)
+    return snap
 
 
-def snapshot_etag(meta=None):
+def snapshot_etag(meta=None, raw=None):
     """The etag build_snapshot(meta) would put on a snapshot now, without building the
     body: a poll that ends in 304 reads and hashes, nothing more. From the threadpool,
-    pass `meta` from snapshot_meta()."""
+    pass `meta` from snapshot_meta(); `raw`, a list, gets the etag of the tables and
+    files alone and the digest of their rows, for the config version (note_config_etag,
+    on the hub)."""
     meta = meta or snapshot_meta()
-    return _group_etag(_walk_snapshot(body=False)[0], meta)
+    walked = _walk_snapshot(body=False)
+    if raw is not None:
+        raw.extend((walked[0], walked[4]))
+    return _group_etag(walked[0], meta)
 
 
 def snapshot_bytes(snap):
@@ -3183,9 +3394,14 @@ def apply_snapshot(snap):
     """Replace every SYNC table with the snapshot's rows, in one transaction.
 
     Refuses a snapshot that is not from the member we pull from, not from an active
-    instance, from an older epoch, or sealed under a different field key. Takes the
-    member list and the epoch that come with it. Returns a summary.
+    instance, from an older epoch, sealed under a different field key, or older than
+    the one held from the same leader (_refuse_older). What is here and the snapshot
+    does not carry over is kept in ORPHANS_DIR first; when it cannot be kept, nothing
+    is applied. Nor when this instance is no longer a standby of that member by the
+    time the look at what is here is over. Takes the member list and the epoch that
+    come with it. Returns a summary; captured names the copy, None when none was needed.
     """
+    global _mark_checked
     p = peer() if is_standby() else None
     if not p:
         raise HaError('Not paired')
@@ -3202,17 +3418,56 @@ def apply_snapshot(snap):
         raise HaError('The paired instance runs an older epoch than this one')
     if snap.get('key_fp') != key_fingerprint():
         raise HaError('The field key changed on the active instance (key rotation?) - pair again')
+    lineage = _clean_hist(snap.get('hist'))
+    if lineage and (lineage[-1][3] != p['instance_id'] or lineage[-1][0] != their_epoch):
+        # a history that does not end with its sender under this epoch names nothing
+        lineage = None
+    st = _load()
+    _refuse_older(st, lineage)
 
     from pegaprox.core.db import get_db
     db = get_db()
     conn = db.conn
     cur = conn.cursor()
     tables = snap.get('tables') or {}
-    summary = {'tables': 0, 'rows': 0, 'skipped_columns': {}, 'created': []}
+    summary = {'tables': 0, 'rows': 0, 'skipped_columns': {}, 'created': [], 'captured': None}
+    first, _mark_checked = not _mark_checked, True
+    kept, held, mark = [], None, None
     try:
         if conn.in_transaction:
             conn.commit()
+        # What says whether somebody wrote here while we look: the count of the triggers
+        # on the shared tables, where the last sync left them complete and the schema
+        # has not moved since. Anywhere else SQLite's own count, which moves with every
+        # commit, a log line or a metric included.
+        seen = _change_mark()
+        counted = _triggers_whole(_cv_record(st), seen)
+        version = None if counted else _data_version(conn)
+        # before anything is wiped; raises when a copy is needed and cannot be written
+        kept.append(_keep_not_carried(st, snap, lineage, their_epoch, mark=None if first else seen))
         cur.execute('BEGIN IMMEDIATE')
+        # The look gave the hub away, for seconds on a large configuration: a promotion
+        # with force, a removal or another member to follow may have come in between,
+        # and this snapshot is no longer ours to take. Nothing yields from here to the
+        # commit.
+        again = peer() if is_standby() else None
+        if not again or again['instance_id'] != p['instance_id'] or their_epoch < epoch():
+            raise HaError('This instance changed its role or the member it follows while '
+                          'the sync was under way - not applied')
+        # somebody wrote here while we looked (a request that was on its way when this
+        # instance stepped down)
+        wrote = (_change_mark() != seen) if counted else (_data_version(conn) != version)
+        # or the copy the look ended at is gone. dismiss_orphan waits for the pull lock,
+        # and still an apply that runs without it must not wipe rows that a copy held
+        # only while it looked
+        gone = bool(kept[0]) and not orphan_path(kept[0]['name'])
+        if gone:
+            kept.pop()
+        if wrote or gone:
+            # once more, now that nobody else can
+            kept.append(_keep_not_carried(st, snap, lineage, their_epoch, inline=True))
+        # the rows of the sync are no change made here: no trigger counts them
+        _drop_change_triggers(cur, tables)
         cur.execute('PRAGMA defer_foreign_keys = ON')
         before = _sign_in_rows(cur)
         present = _existing_tables(cur)
@@ -3265,22 +3520,51 @@ def apply_snapshot(snap):
             stmt = f'INSERT OR REPLACE INTO "{name}" ({collist}) VALUES ({placeholders})'
             n = 0
             for row in t.get('rows') or []:
-                values = [_dec(row[i]) for i in idx]
+                # only a blob comes as a dict, and a call for every value adds up
+                values = [_dec(v) if type(v) is dict else v for v in (row[i] for i in idx)]
                 if name == 'server_settings' and _is_local_setting(str(values[cols.index('key')])):
                     continue
                 cur.execute(stmt, values)
                 n += 1
             summary['tables'] += 1
             summary['rows'] += n
+        if 'ha_change_journal' in present:
+            # every line in there is settled by now: its change is in this snapshot, or
+            # in the copy just kept
+            cur.execute('DELETE FROM ha_change_journal')
+        try:
+            # The triggers again, and what they count to before the commit lets the next
+            # writer in: whatever is written here later moves it, and is a change of our
+            # own. The hash of what the sync left is worked out after the commit, off
+            # the hub (_hash_applied).
+            _make_change_triggers(cur)
+            mark = _change_mark()
+        except Exception as e:
+            mark = None
+            logging.warning(f"[HA] could not count the changes made here from this sync on: {e}")
+        if mark is None:
+            try:
+                # without the count, the hash itself has to be taken in here
+                held = _walk_tables(body=False)[0]
+            except Exception as e:
+                logging.warning(f"[HA] could not hash the tables of the sync: {e}")
         conn.commit()
-    except Exception:
+    except Exception as e:
         try:
             conn.rollback()
         except Exception:
             pass
+        # a copy that was written stays, whatever became of the apply
+        _say_kept(kept, snap, their_epoch)
+        if isinstance(e, CaptureFailed):
+            _say_not_kept(e, snap)
         raise
 
     # the rows are in; nothing below raises, so a caller that got here can count them
+    with _journal_lock:
+        _journal['pending'] = []
+    _orphans['not_kept'] = None
+    summary['captured'] = _say_kept(kept, snap, their_epoch, wiped=True)
     after = _sign_in_rows(conn.cursor())
     if before is not None and after is not None:
         _end_sessions(sorted(u for u, row in before.items() if after.get(u) != row))
@@ -3289,7 +3573,11 @@ def apply_snapshot(snap):
     if problem:
         summary['file_errors'].append(problem)
     summary['tombstones_owed'] = _tombstones_owed(snap)
+    rec = _note_applied(snap, lineage, their_epoch, held, mark)
     _after_apply()
+    if rec and rec.get('mark'):
+        # last: it gives the hub away once more, and everything else is in place
+        _hash_applied(rec)
     return summary
 
 
@@ -3542,6 +3830,1479 @@ def _after_apply():
             getattr(importlib.import_module(mod), fn)()
         except Exception as e:
             logging.debug(f"[HA] {mod}.{fn} after sync: {e}")
+
+
+# --- config version and changes not carried over ---------------------------------
+#
+# MK Oct 2026 (#625) - a sync replaces every shared table on a member, and whatever the
+# member held that the snapshot did not carry went with the DELETE: what a former
+# active took after its last hand-out, what a standby held of an active that was
+# replaced by force. Now the data says where it comes from. The active steps its
+# config version (cv) whenever what it hands out changed, and every instance keeps
+# the cv of what it holds next to the digest its own rows and files had at that
+# moment (data_at_cv; etag_at_cv is the etag of the same walk, which the definition of
+# the tables is part of). A member whose rows still have that digest, and whose cv is
+# part of the history a snapshot names, holds nothing the snapshot lacks. Any other
+# member compares row by row and keeps what differs in ORPHANS_DIR before the wipe:
+# sealed (_copy_key), audited, listed in the status, gone only when an admin dismisses
+# it. A copy that cannot be written refuses the snapshot. In every mode.
+#
+# A member also keeps the triggers of the tick (ha_cv_dirty) between two syncs, and the
+# count they stood at when the last one committed (mark). While that count, the schema
+# and the files are what they were, nothing was changed here and nothing is read or
+# hashed before the wipe; the hashes are for when it moved.
+#
+# cv = (epoch, seq). An entry is [epoch, seq, segment id, leader id]: every instance
+# that leads writes a segment of its own, so two actives under one epoch (two
+# promotions at once) or a leader whose state file came back from a backup never give
+# one cv two contents. hist is the last cv of each segment the data went through,
+# oldest first; its last entry is the cv of the data here. A cv and the base it started
+# from alone are not enough: a member two leaders behind sits below the base of a
+# history it was never part of.
+#
+# A leader whose state went back (the config directory from a backup, a VM snapshot)
+# counts on in the segment it had, and one number then names two contents. Two things
+# catch that. A member says what it holds with every pull (PEER_CV_HEADER): more of
+# the segment than the leader knows of, and the leader goes on in a new one. And every
+# step has a random mark (steps): a member that holds a step under another mark than
+# the snapshot names for it compares row by row.
+#
+# The cv steps when a snapshot, a poll or a note to the members finds the tables
+# changed, so the cv on a snapshot always stands for its content. The leader of an
+# automatic group also ticks (cv_tick), for the changes nobody pulls or notes.
+
+class CaptureFailed(HaError):
+    """What this instance holds and a snapshot does not carry could not be kept."""
+
+    def __init__(self, why, cause):
+        super().__init__('This instance holds changes the snapshot does not carry, and could '
+                         f'not keep a copy of them ({type(cause).__name__}) - not applied. Free '
+                         'up space in the config directory')
+        self.why, self.cause = why, cause
+
+
+def _cv_record(st):
+    rec = st.get('cv')
+    return rec if isinstance(rec, dict) else None
+
+
+def _clean_hist(value):
+    """A history as the state file or a snapshot carries it, None when it is none: up to
+    LINEAGE_KEEP entries [epoch, seq, segment id, leader id], the epochs in order and no
+    segment twice."""
+    if not isinstance(value, list) or not value or len(value) > LINEAGE_KEEP:
+        return None
+    out, segments = [], set()
+    for entry in value:
+        if not isinstance(entry, list) or len(entry) != 4:
+            return None
+        ep, seq, seg, by = entry
+        if (_epoch_value(ep) is None or isinstance(seq, bool) or not isinstance(seq, int)
+                or not 0 <= seq < _SEQ_MAX
+                or not isinstance(seg, str) or not _SEGMENT_RE.fullmatch(seg) or seg in segments
+                or not isinstance(by, str) or not _ID_RE.fullmatch(by)
+                or (out and ep < out[-1][0])):
+            return None
+        segments.add(seg)
+        out.append([ep, seq, seg, by])
+    return out
+
+
+def _hist_of(rec):
+    return (_clean_hist(rec.get('hist')) or []) if rec else []
+
+
+def _clean_steps(value):
+    """The marks of the last steps as the state file or a snapshot carries them, up to
+    STEPS_KEEP entries [segment id, seq, mark]; [] for anything else."""
+    if not isinstance(value, list) or len(value) > STEPS_KEEP:
+        return []
+    out = []
+    for entry in value:
+        if not isinstance(entry, list) or len(entry) != 3:
+            return []
+        seg, seq, mark = entry
+        if (not isinstance(seg, str) or not _SEGMENT_RE.fullmatch(seg) or isinstance(seq, bool)
+                or not isinstance(seq, int) or not 0 <= seq < _SEQ_MAX
+                or not isinstance(mark, str) or not _MARK_RE.fullmatch(mark)):
+            return []
+        out.append([seg, seq, mark])
+    return out
+
+
+def _step_mark(steps, entry):
+    """The mark `steps` has for the cv `entry`, None when they do not reach that far."""
+    return next((mark for seg, seq, mark in steps if seg == entry[2] and seq == entry[1]), None)
+
+
+def _one_cv(value):
+    """One entry as another member reports it, None for anything else."""
+    got = _clean_hist([value]) if isinstance(value, list) else None
+    return got[0] if got else None
+
+
+def config_version(st=None):
+    """(epoch, seq) of the configuration this instance holds, CV_ZERO before it has one."""
+    hist = _hist_of(_cv_record(st or _load()))
+    return (hist[-1][0], hist[-1][1]) if hist else CV_ZERO
+
+
+def cv_entry(st=None):
+    """[epoch, seq, segment id, leader id] of the configuration here, None before it has one."""
+    hist = _hist_of(_cv_record(st or _load()))
+    return list(hist[-1]) if hist else None
+
+
+def held_cv(value):
+    """PEER_CV_HEADER as a member sent it with its pull: the entry, None for anything
+    that is none."""
+    if not isinstance(value, str) or not 0 < len(value) <= 256:
+        return None
+    try:
+        return _one_cv(json.loads(value))
+    except ValueError:
+        return None
+
+
+def _covered(entry, hist):
+    """Whether the history `hist` went through the cv `entry`: it has that segment, and
+    left it no earlier."""
+    return any(h[0] == entry[0] and h[2] == entry[2] and h[1] >= entry[1] for h in hist)
+
+
+def _newer_cv(old, new):
+    """Whether the entry `new` a member reported replaces `old`, the one noted before.
+    Within a segment only a higher one does: an answer that took long must not put the
+    note back. Another segment is that member on another history."""
+    old = _one_cv(old)
+    return old is None or old[2] != new[2] or new[1] > old[1]
+
+
+def _in_pool(fn):
+    """fn() in gevent's threadpool, so the hub serves on while it reads and hashes;
+    inline without a hub. fn takes no gevent lock and logs nothing."""
+    try:
+        from gevent import get_hub
+        pool = get_hub().threadpool
+    except Exception:
+        return fn()
+    return pool.apply(fn)
+
+
+def _ahead_in(segment, st, held=None):
+    """The highest seq a member says it holds of `segment`, -1 when none holds any:
+    what the watch noted of each (cv_seen), and `held`, the entry the member that pulls
+    right now sent along."""
+    best = -1
+    for seen in [rec.get('cv_seen') for rec in (st.get('members') or {}).values()] + [held]:
+        seen = _one_cv(seen)
+        if seen and seen[2] == segment:
+            best = max(best, seen[1])
+    return best
+
+
+def note_config_etag(raw, upto=None, data=None, held=None):
+    """The active, after it worked out `raw`, the etag of its shared tables and files as
+    _walk_snapshot returns it: one step of cv when that changed since the last step, in
+    a segment of its own (begun here when it leads from data it did not hand out
+    itself). `data` is the digest of the rows and files of the same walk, kept next to
+    it. Journal lines up to the id `upto`, written before that walk began, get the cv.
+    `held` is the entry the member this is worked out for says it holds (held_cv).
+    Returns the record, None anywhere but on an active with members. Raises HaError
+    when the step cannot be saved: no snapshot may leave under a cv that stands for
+    other content."""
+    with _lock:
+        st = _load()
+        if st['role'] != ROLE_ACTIVE or not st.get('members') or not raw:
+            return None
+        old = _cv_record(st)
+        rec = {k: v for k, v in (old or {}).items() if k not in ('joined', 'from')}
+        hist = _hist_of(old)
+        me, ep = st['instance_id'], int(st.get('epoch') or 0)
+        last = hist[-1] if hist else None
+        changed, segments = rec.get('etag_at_cv') != raw, len(hist)
+        if last is None or last[0] != ep or last[3] != me:
+            # we lead from what we hold. Under the same epoch (another active was
+            # promoted at the same time) the count goes on, so (epoch, seq) never goes
+            # back
+            rec['base_cv'] = [last[0], last[1]] if last else list(CV_ZERO)
+            hist.append([ep, last[1] if last and last[0] == ep else 0, secrets.token_hex(8), me])
+        elif _ahead_in(last[2], st, held) > last[1]:
+            # a member holds more of our segment than we know of: this state file went
+            # back (a restored backup). From here on it is a segment of its own, above
+            # all of that, so the member keeps a copy instead of taking what we hand out
+            # for the continuation of what it has
+            rec['base_cv'] = [last[0], last[1]]
+            hist.append([ep, _ahead_in(last[2], st, held), secrets.token_hex(8), me])
+            changed = True
+        if changed:
+            hist[-1][1] += 1
+            rec.update(etag_at_cv=raw, data_at_cv=data, at=_now())
+            # what a sync left here as a member (_note_applied) is not what is here now
+            rec.pop('mark', None)
+        if changed or len(hist) > segments:
+            # the mark of this step: a member that holds the same number under another
+            # one holds other content (_why_not_carried)
+            steps = _clean_steps(rec.get('steps'))
+            steps.append([hist[-1][2], hist[-1][1], secrets.token_hex(4)])
+            rec['steps'] = steps[-STEPS_KEEP:]
+        rec['hist'] = hist[-LINEAGE_KEEP:]
+        if rec != old:
+            try:
+                _commit_locked(dict(st, cv=rec))
+            except Exception as e:
+                raise HaError(f'The config version could not be saved: {e}')
+        entry = list(rec['hist'][-1])
+    if upto:
+        _fill_journal(entry, upto)
+    return rec
+
+
+def stamp_snapshot(snap, raw, upto=None, data=None, held=None):
+    """The config version on a snapshot whose tables and files have the etag `raw`: cv,
+    base_cv, the history it carries (hist), when its cv stepped (cv_at) and the marks
+    of its last steps (steps). Anywhere but on an active with members the snapshot
+    stays without. `data` and `held` as for note_config_etag, and it raises HaError
+    like that one."""
+    rec = note_config_etag(raw, upto, data, held)
+    hist = _hist_of(rec)
+    if hist:
+        snap.update(cv=hist[-1][:2], hist=hist, base_cv=rec.get('base_cv') or list(CV_ZERO),
+                    cv_at=rec.get('at'), steps=_clean_steps(rec.get('steps')))
+    return snap
+
+
+def _refuse_older(st, lineage):
+    """The order guard: a member never applies a snapshot older than the one it holds
+    from the same leader. Pulls go one at a time (_pull_lock), and still a retry or an
+    answer that took long can hand in an older snapshot after a newer one, which would
+    put the member back below what it told the group it holds."""
+    mine = _hist_of(_cv_record(st))
+    if not mine or not lineage:
+        return
+    m, t = mine[-1], lineage[-1]
+    if t[0] == m[0] and t[2] == m[2] and t[1] < m[1]:
+        raise HaError(f'The snapshot is older than the configuration this instance holds '
+                      f'({t[0]}.{t[1]} against {m[0]}.{m[1]}) - not applied')
+
+
+def _rows_not_sent(snap):
+    """The shared tables that hold rows here and that `snap` does not carry at all: its
+    sender runs a release that does not share them, and the sync empties them all the
+    same. Only reads, on the caller's connection."""
+    sent = snap.get('tables') if isinstance(snap.get('tables'), dict) else {}
+    from pegaprox.core.db import get_db
+    cur = get_db().conn.cursor()
+    present = _existing_tables(cur)
+    out = []
+    for name in SYNC_TABLES:
+        if sent.get(name) or name not in present:
+            continue
+        if name == 'server_settings':
+            rows = [k for (k,) in cur.execute('SELECT key FROM server_settings').fetchall()
+                    if not _is_local_setting(str(k))]
+        else:
+            rows = cur.execute(f'SELECT 1 FROM "{name}" LIMIT 1').fetchall()
+        if rows:
+            out.append(name)
+    return out
+
+
+def _why_not_carried(st, snap, lineage, their_epoch, data_here, mark=None):
+    """'' when `snap` is known to carry everything this instance holds, else why that
+    cannot be shown. data_here() gives the digest of the rows and files now; it is
+    asked only when the histories fit, and not at all when `mark` (_change_mark, as
+    it is now) is still the one the last sync left: nothing was written here since."""
+    rec = _cv_record(st)
+    sender = snap.get('instance_id')
+    if rec is not None and rec.get('joined'):
+        # the first snapshot after the join replaces what the admin agreed to replace
+        return ''
+    missing = _rows_not_sent(snap)
+    if missing:
+        # a history says what the sender was handed, not what its release hands on
+        return f"the snapshot carries no {', '.join(missing)}, and there are rows of it here"
+    if rec is None:
+        sync = st.get('sync') or {}
+        if sync.get('last_ok_at') and sync.get('source_epoch') == int(st.get('epoch') or 0) == their_epoch:
+            # synced by a release before the config version and pulling on under the
+            # same epoch: what is here came from that active
+            return ''
+        return 'this instance has no record of where its configuration came from'
+    mine = _hist_of(rec)
+    if mine and lineage is not None:
+        e, s, _seg, by = mine[-1]
+        if not _covered(mine[-1], lineage):
+            return (f'the configuration here is at {e}.{s} (led by {by[:8]}), which the '
+                    'snapshot does not carry')
+        here = _step_mark(_clean_steps(rec.get('steps')), mine[-1])
+        there = _step_mark(_clean_steps(snap.get('steps')), mine[-1])
+        if here and there and here != there:
+            # the same number, made twice: the sender went back to an earlier state
+            # and counted on from there
+            return (f'the snapshot names {e}.{s}, the config version held here, for '
+                    'other content')
+    elif rec.get('from') != [sender, their_epoch]:
+        # one side cannot name its history (a release before it): only the next pull
+        # from the very instance and epoch the data here came from continues it
+        return 'neither side can show that the snapshot carries what is here'
+    if mark is not None and rec.get('mark') == mark:
+        return ''
+    if not rec.get('data_at_cv') or data_here() != rec['data_at_cv']:
+        return 'the configuration here changed after it was last synced or handed out'
+    return ''
+
+
+def _is_default(value, coldef):
+    """Whether `value` is what a row has in a column nobody set: NULL, or the declared
+    default (coldef as the walk reads it, [type, default as SQL text])."""
+    if value is None:
+        return True
+    dflt = coldef[1] if isinstance(coldef, (list, tuple)) and len(coldef) > 1 else None
+    try:
+        return value in (_default_values(dflt) or ())
+    except TypeError:
+        # a blob as the walk encodes it
+        return False
+
+
+def _row_keys(name, cols, rows, other_cols, coldefs=None):
+    """One text per row of `name` that is equal for two rows a sync would not tell
+    apart: the columns both sides have, by name, VOLATILE_COLUMNS left out. With
+    `coldefs` (the rows here) a column only this side has counts where a row holds more
+    than its default in it, which the snapshot cannot carry; a column only the snapshot
+    has takes nothing from here. None for a row that takes no part (one of the
+    instance's own settings, or one that is no row)."""
+    masked = {c.lower() for c in VOLATILE_COLUMNS.get(name, ())}
+    other = {c.lower() for c in other_cols if isinstance(c, str)}
+    shared, own = [], []
+    for i, c in enumerate(cols):
+        if isinstance(c, str) and c.lower() not in masked:
+            (shared if c.lower() in other else own).append((c.lower(), i))
+    shared.sort()
+    key_at = next((i for c, i in shared + own if c == 'key'), None) if name == 'server_settings' else None
+    out = []
+    for row in rows:
+        if not isinstance(row, list) or len(row) != len(cols):
+            out.append(None)
+            continue
+        if key_at is not None and _is_local_setting(str(row[key_at])):
+            out.append(None)
+            continue
+        key = [[c, row[i]] for c, i in shared]
+        if coldefs is not None:
+            extra = [[c, row[i]] for c, i in own if not _is_default(row[i], coldefs.get(cols[i]))]
+            if extra:
+                key.append(['\x00only-here', extra])
+        out.append(json.dumps(key, default=str, separators=(',', ':')))
+    return out
+
+
+def _lines(text):
+    return {line.strip() for line in text.splitlines() if line.strip()}
+
+
+def _differences(tables, files, snap):
+    """What applying `snap` would take away or change here: (rows, files, counts). rows
+    holds, per table, the rows here that the snapshot does not carry, as the walk read
+    them (sealed values stay sealed); files the files it would overwrite with other
+    content, as they are here; counts per table how many rows are only here and how
+    many only in the snapshot, and under 'files' the names. All empty when the snapshot
+    holds exactly what is here."""
+    theirs = snap.get('tables') if isinstance(snap.get('tables'), dict) else {}
+    rows_kept, counts = {}, {}
+    for name in SYNC_TABLES:
+        a = tables.get(name) or {}
+        b = theirs.get(name) if isinstance(theirs.get(name), dict) else {}
+        acols, arows = a.get('columns') or [], a.get('rows') or []
+        bcols = b.get('columns') if isinstance(b.get('columns'), list) else []
+        brows = b.get('rows') if isinstance(b.get('rows'), list) else []
+        if not arows and not brows:
+            continue
+        there = collections.Counter(k for k in _row_keys(name, bcols, brows, acols) if k is not None)
+        mine = []
+        for row, key in zip(arows, _row_keys(name, acols, arows, bcols, a.get('coldefs') or {})):
+            if key is None:
+                continue
+            if there.get(key, 0) > 0:
+                there[key] -= 1
+            else:
+                mine.append(row)
+        only_there = sum(there.values())
+        if mine or only_there:
+            counts[name] = {'only_here': len(mine), 'only_there': only_there}
+        if mine:
+            rows_kept[name] = {'columns': acols, 'rows': mine}
+    sent = snap.get('files') if isinstance(snap.get('files'), dict) else {}
+    files_kept, names = {}, []
+    kh = sent.get('ssh_known_hosts')
+    if isinstance(kh, str) and _lines(kh) != _lines(files.get('ssh_known_hosts') or ''):
+        files_kept['ssh_known_hosts'] = files.get('ssh_known_hosts') or ''
+        names.append('ssh_known_hosts')
+    # only what _apply_files would write: a well-formed name, a plugin that is here
+    held = files.get('branding') or {}
+    for fn, data in sorted(sent['branding'].items()) if isinstance(sent.get('branding'), dict) else ():
+        if (isinstance(fn, str) and re.match(r'^[A-Za-z0-9_.\-]{1,64}$', fn) and not fn.startswith('.')
+                and held.get(fn) != data):
+            names.append(f'branding/{fn}')
+            if fn in held:
+                files_kept.setdefault('branding', {})[fn] = held[fn]
+    held = files.get('plugin_config') or {}
+    for pid, text in sorted(sent['plugin_config'].items()) if isinstance(sent.get('plugin_config'), dict) else ():
+        if (isinstance(pid, str) and _PLUGIN_ID_RE.fullmatch(pid) and held.get(pid) != text
+                and os.path.isdir(os.path.join(PLUGINS_DIR, pid))):
+            names.append(f'plugins/{pid}/config.json')
+            if pid in held:
+                files_kept.setdefault('plugin_config', {})[pid] = held[pid]
+    if names:
+        counts['files'] = names
+    return rows_kept, files_kept, counts
+
+
+def _orphan_meta(name):
+    try:
+        with open(os.path.join(ORPHANS_DIR, name + '.meta.json'), 'rb') as fh:
+            data = json.loads(fh.read(1024 * 1024))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+# What the meta file of a copy holds, in the clear next to the sealed copy: where and
+# why it was kept, the keys it is under, counts and digests. No row, no file content
+# and no journal line.
+_ORPHAN_META_KEYS = ('kind', 'format', 'captured_at', 'instance_id', 'role', 'reason', 'key_fp',
+                     'seal', 'seal_fp', 'cv', 'hist', 'replaced_by')
+# what a copy begins with, by the kind of key it is sealed under
+_ORPHAN_MAGICS = {'field': ORPHAN_MAGIC, 'master': ORPHAN_MAGIC_MASTER}
+
+
+def _field_key():
+    """The field key, for the copies of an instance on plain SQLite. Raises HaError
+    without one: a copy never goes to disk in the clear."""
+    from pegaprox.core.db import get_db
+    key = get_db().aes_key
+    if not isinstance(key, bytes) or len(key) != 32:
+        raise HaError('This instance has no field key to seal a copy under')
+    return key
+
+
+def _master_key():
+    """The master key of the key store where the database is SQLCipher, None on plain
+    SQLite. It is the key this process opened its database with: the key store holds it
+    in memory from the first connection on, so nothing is read from disk here. Raises
+    HaError when it cannot be had."""
+    from pegaprox.core import dbcrypto
+    if not dbcrypto.is_encrypted():
+        return None
+    try:
+        from pegaprox.core.keystore import load_master_key
+        key = load_master_key().key_raw
+    except Exception as e:
+        # the reason may name a path, never the key; the type is enough here
+        raise HaError(f'The master key of this instance could not be loaded ({type(e).__name__})')
+    if not isinstance(key, bytes) or len(key) != 32:
+        raise HaError('This instance has no master key to seal a copy under')
+    return key
+
+
+def _copy_key():
+    """(key, kind) for the copies kept from now on: what they are sealed under, and what
+    their items are keyed with. With SQLCipher a key derived from the master key
+    ('master'), which exists in memory only; on plain SQLite the field key ('field').
+    Raises HaError without one."""
+    master = _master_key()
+    if master is None:
+        return _field_key(), 'field'
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=None,
+                info=ORPHAN_KEY_INFO).derive(master), 'master'
+
+
+def _copy_key_now():
+    """(kind, fingerprint) of the key the copies are sealed under now, (None, None)
+    when this instance has none. Never raises."""
+    try:
+        key, kind = _copy_key()
+    except Exception:
+        return None, None
+    return kind, key_fingerprint(key)
+
+
+def _copy_head(key, kind):
+    """What a copy sealed under `key` begins with: the magic of its kind and the
+    fingerprint of the key."""
+    return _ORPHAN_MAGICS[kind] + key_fingerprint(key).encode()
+
+
+def _seal_copy(name, data, key, kind='field'):
+    """`data`, the gzip'd JSON of the copy `name`, as it goes to disk: the head
+    (_copy_head), a nonce and the AES-256-GCM ciphertext. The head and the name are
+    bound in, so a file put under another name does not open."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    head = _copy_head(key, kind)
+    nonce = os.urandom(12)
+    return head + nonce + AESGCM(key).encrypt(nonce, data, head + name.encode())
+
+
+def _older_key(fp):
+    """The field key with the fingerprint `fp` that this instance held before, from the
+    file a rotation or a join left next to the key file. None when it is gone."""
+    fn = _older_keys().get(fp)
+    if not fn:
+        return None
+    try:
+        with open(os.path.join(os.path.dirname(AES_KEY_FILE) or '.', fn), 'rb') as fh:
+            key = fh.read(64)
+    except OSError:
+        return None
+    # still that key: the file was listed a moment ago, by what it held then
+    return key if key_fingerprint(key) == fp else None
+
+
+def _key_of_copy(kind, fp):
+    """The key that opens a copy whose head names the fingerprint `fp` of a key of
+    `kind`. Raises HaError that says why this instance does not have it."""
+    if kind == 'master':
+        if _master_key() is None:
+            raise HaError(f'This copy is sealed under a master key (fingerprint {fp}), and this '
+                          'instance runs without an encrypted database - it cannot be opened on '
+                          'this instance')
+        key = _copy_key()[0]
+        if key_fingerprint(key) != fp:
+            raise HaError(f'This copy is sealed under another master key (fingerprint {fp}) than '
+                          'the one this instance runs with: the key store changed, or the copy '
+                          'came here from another host - it cannot be opened on this instance')
+        return key
+    # the field key: of an instance on plain SQLite, or from before its database was
+    # encrypted
+    try:
+        key = _field_key()
+    except HaError:
+        key = None
+    if key is None or key_fingerprint(key) != fp:
+        key = _older_key(fp)
+    if key is None:
+        raise HaError(f'This copy is sealed under an earlier field key (fingerprint {fp}), from '
+                      'before a key rotation or a join, and the backup of that key is no longer '
+                      'next to the key file - it cannot be opened on this instance')
+    return key
+
+
+def open_orphan(name):
+    """The copy `name` as the gzip'd JSON it was sealed from, None when there is none.
+    A copy sealed under a field key from before a rotation or a join opens with the
+    file that still holds that key. Raises HaError that says why when it does not open:
+    the key it names is not one this instance has, or the file was changed."""
+    path = orphan_path(name)
+    if not path:
+        return None
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    try:
+        with open(path, 'rb') as fh:
+            raw = fh.read()
+    except OSError as e:
+        raise HaError(f'The copy could not be read ({type(e).__name__})')
+    cut = len(ORPHAN_MAGIC) + 16
+    head, nonce, sealed = raw[:cut], raw[cut:cut + 12], raw[cut + 12:]
+    kind = next((k for k, magic in _ORPHAN_MAGICS.items() if raw.startswith(magic)), None)
+    fp = head[len(ORPHAN_MAGIC):].decode('ascii', 'replace')
+    if kind is None or len(sealed) < 16 or not re.fullmatch('[0-9a-f]{16}', fp):
+        raise HaError('This file is not a copy as this instance seals them - it was changed '
+                      'or cut short')
+    key = _key_of_copy(kind, fp)
+    try:
+        return AESGCM(key).decrypt(nonce, sealed, head + name.encode())
+    except InvalidTag:
+        raise HaError('This copy does not open under the key it names - the file was '
+                      'changed or damaged')
+
+
+def _capture_items(rows_kept, files_kept, journal, key):
+    """One digest for every row, file and journal line a copy would hold, sorted, and one
+    over all of them. A row counts without created_at and VOLATILE_COLUMNS, whatever the
+    order of its columns: an account that is made here again after a sync replaced it
+    (an OIDC sign-in on a standby provisions one) is the same row every time. Keyed
+    with `key`, the key the copy is sealed under, so the meta file they go into says
+    nothing about the rows."""
+    sub = hashlib.sha256(b'pegaprox-ha-orphan-items:' + key).digest()
+
+    def digest(*parts, size=8):
+        text = json.dumps(parts, default=str, separators=(',', ':'))
+        return hashlib.blake2b(text.encode('utf-8', 'surrogatepass'), digest_size=size,
+                               key=sub).hexdigest()
+    items = set()
+    for name, t in rows_kept.items():
+        masked = {c.lower() for c in VOLATILE_COLUMNS.get(name, ())} | {'created_at'}
+        cols = sorted((c.lower(), i) for i, c in enumerate(t['columns']) if c.lower() not in masked)
+        for row in t['rows']:
+            items.add(digest('row', name, [[c, row[i]] for c, i in cols]))
+    for kind, held in files_kept.items():
+        for fn, content in sorted(held.items()) if isinstance(held, dict) else (('', held),):
+            items.add(digest('file', kind, fn, content))
+    for line in journal:
+        items.add(digest('journal', [line.get(k) for k in ('at', 'user', 'method', 'path', 'via', 'cv')]))
+    items = sorted(items)
+    return items, digest('copy', items, size=6)
+
+
+def _copy_whole(name, size, meta, key, kind):
+    """Whether the sealed file of the copy `name` opens under `key`, the key in use:
+    `size`, its length, is the one its meta file names, it begins as a copy sealed now
+    does (_copy_head), and its seal holds under its own name. Not one that was cut
+    short, damaged or put under another name, nor one under a key from before."""
+    if not meta or isinstance(meta.get('bytes'), bool) or meta.get('bytes') != size:
+        return False
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    head = _copy_head(key, kind)
+    try:
+        with open(os.path.join(ORPHANS_DIR, name + ORPHAN_SUFFIX), 'rb') as fh:
+            raw = fh.read()
+    except OSError:
+        return False
+    cut = len(head)
+    if not raw.startswith(head) or len(raw) < cut + 12 + 16:
+        return False
+    try:
+        AESGCM(key).decrypt(raw[cut:cut + 12], raw[cut + 12:], head + name.encode())
+    except InvalidTag:
+        return False
+    return True
+
+
+def _kept_already(tag, items, key, kind):
+    """The copy that holds what a new one would: the one with the tag `tag` (the very
+    same rows, files and journal lines), else, when every one of `items` is in a copy
+    that is still here, the copy that holds most of them. None when something would be
+    kept for the first time. Only a copy that opens under the key in use counts
+    (_copy_whole, `head` as a copy sealed now begins): what no admin can get back out
+    stands for no row."""
+    files = _orphan_files()
+    for name, size in files:
+        if name.endswith('-' + tag) and _copy_whole(name, size, _orphan_meta(name), key, kind):
+            return name
+    if not items or len(items) > ORPHAN_ITEMS_MAX:
+        return None
+    want, found, best = set(items), set(), (0, None)
+    for name, size in files:
+        meta = _orphan_meta(name) or {}
+        held = meta.get('items')
+        if not isinstance(held, list):
+            continue
+        held = want.intersection(i for i in held if isinstance(i, str))
+        if not held or not _copy_whole(name, size, meta, key, kind):
+            continue
+        found |= held
+        if len(held) > best[0]:
+            best = (len(held), name)
+    return best[1] if found == want else None
+
+
+def _write_capture(head, snap, journal, key):
+    """What is here and `snap` does not carry, with `head` and the journal lines, sealed
+    under `key` (_copy_key, of the kind head['seal'] names) into ORPHANS_DIR. Returns
+    (name, new, counts): (None, False, {}) when there is nothing to keep, because the
+    snapshot holds exactly what is here or only has more (no row and no file here would
+    go, and no journal line says somebody wrote here); new is False when copies that
+    are still here hold all of it already (_kept_already: an apply that failed after it
+    kept them and is tried again, an account that is made here again after every sync),
+    and name is that copy.
+
+    Runs in the threadpool, or inline inside the apply's transaction: no state lock, no
+    logging, no commit."""
+    tables, files = _walk_snapshot(body=True)[1:3]
+    rows_kept, files_kept, counts = _differences(tables, files, snap)
+    if not counts or not (rows_kept or files_kept or journal):
+        return None, False, {}
+    items, tag = _capture_items(rows_kept, files_kept, journal, key)
+    os.makedirs(ORPHANS_DIR, mode=0o700, exist_ok=True)
+    os.chmod(ORPHANS_DIR, 0o700)
+    again = _kept_already(tag, items, key, head['seal'])
+    if again:
+        return again, False, counts
+    cv = head['cv'] or list(CV_ZERO)
+    at = datetime.now(timezone.utc)
+    while True:
+        name = f"{cv[0]}-{cv[1]}-{at.strftime('%Y%m%dT%H%M%SZ')}-{tag}"
+        base = os.path.join(ORPHANS_DIR, name)
+        if not os.path.lexists(base + ORPHAN_SUFFIX) and not os.path.lexists(base + '.meta.json'):
+            break
+        # the same rows under the same cv within one second, in a copy that no longer
+        # counts (cut short, damaged): it stays as it is until an admin dismisses it
+        at += timedelta(seconds=1)
+    data = _seal_copy(name, gzip.compress(
+        json.dumps(dict(head, name=name, differences=counts, journal=journal, tables=rows_kept,
+                        files=files_kept), default=str).encode(), compresslevel=6), key, head['seal'])
+    meta = dict({k: head.get(k) for k in _ORPHAN_META_KEYS}, name=name, differences=counts,
+                journal_rows=len(journal), bytes=len(data), repeats=0, last_at=None,
+                items=items if len(items) <= ORPHAN_ITEMS_MAX else None)
+    try:
+        _write_private(base + ORPHAN_SUFFIX, data)
+        _write_private(base + '.meta.json', json.dumps(meta, default=str).encode())
+    except Exception:
+        for path in (base + ORPHAN_SUFFIX, base + '.meta.json', base + ORPHAN_SUFFIX + '.ha-tmp',
+                     base + '.meta.json.ha-tmp'):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        raise
+    return name, True, counts
+
+
+def _keep_not_carried(st, snap, lineage, their_epoch, inline=False, mark=None):
+    """apply_snapshot, before the DELETE: a copy of what is here and the snapshot does
+    not carry over. Returns {name, new, why, differences}, None when it carries
+    everything. Raises CaptureFailed when the copy could not be written. `inline` reads
+    on the caller's connection, inside its transaction, instead of in the threadpool.
+    `mark` as for _why_not_carried. Neither logs nor audits: _say_kept does, once the
+    transaction is over."""
+    run = (lambda fn: fn()) if inline else _in_pool
+    why = _why_not_carried(st, snap, lineage, their_epoch,
+                           lambda: run(lambda: _walk_snapshot(body=False)[4]), mark)
+    if not why:
+        return None
+    mine = _hist_of(_cv_record(st))
+    try:
+        # taken here, on the hub: the worker gets the key, not the way to it
+        key, kind = _copy_key()
+        from pegaprox.core.db import get_db
+        head = {
+            'kind': 'pegaprox-ha-orphans', 'format': 1, 'captured_at': _now(),
+            'instance_id': st['instance_id'], 'role': st['role'], 'reason': why,
+            # two keys: the sealed values in the copy stay as they are in the database,
+            # under the field key of this moment (key_fp); the copy as a whole is
+            # sealed under `key` (seal, seal_fp)
+            'key_fp': key_fingerprint() if get_db().aes_key else None,
+            'seal': kind, 'seal_fp': key_fingerprint(key),
+            'cv': mine[-1] if mine else None, 'hist': mine,
+            'replaced_by': {'instance_id': snap.get('instance_id'), 'epoch': their_epoch,
+                            'cv': lineage[-1] if lineage else None},
+        }
+        journal = _journal_not_in(lineage)
+        name, new, counts = run(lambda: _write_capture(head, snap, journal, key))
+    except Exception as e:
+        raise CaptureFailed(why, e)
+    if name is None:
+        return None
+    return {'name': name, 'new': new, 'why': why, 'differences': counts}
+
+
+def _note_repeat(name):
+    """A sync took away once more what the copy `name` holds already: counted in its meta
+    file, with the time. No second copy, no audit row: an account that is made here
+    again after every sync would add one of each per sign-in."""
+    meta = _orphan_meta(name)
+    if meta is None:
+        return
+    repeats = meta.get('repeats')
+    meta.update(repeats=(repeats if isinstance(repeats, int) and repeats > 0 else 0) + 1,
+                last_at=_now())
+    _write_private(os.path.join(ORPHANS_DIR, name + '.meta.json'),
+                   json.dumps(meta, default=str).encode())
+
+
+def _say_kept(kept, snap, their_epoch, wiped=False):
+    """Log and audit the copies an apply kept, each new one once. `wiped` says the apply
+    went through: what an older copy holds already and went again is counted on that
+    copy (_note_repeat). Returns the name of the last one, None when there was none.
+    Never raises."""
+    name, sender, said = None, snap.get('instance_id'), set()
+    for item in kept:
+        if not item:
+            continue
+        name = item['name']
+        if name in said:
+            continue
+        said.add(name)
+        try:
+            if not item['new']:
+                if wiped:
+                    _note_repeat(name)
+                    logging.info(f"[HA] the snapshot from {sender} does not carry changes "
+                                 f"that are kept already, in {name}: {item['why']}")
+                continue
+            _orphans['count'] = None
+            _fsync_dir(os.path.join(ORPHANS_DIR, name))
+            logging.error(f"[HA] changes not carried over by the snapshot from {sender}: "
+                          f"{item['why']} - kept in {os.path.join(ORPHANS_DIR, name)}{ORPHAN_SUFFIX}")
+            _audit('ha.changes_not_carried_over',
+                   f"kept as {name}: the snapshot from {sender} (epoch {their_epoch}) does not "
+                   f"carry them, {item['why']}; {json.dumps(item['differences'])}"[:1000])
+            _check_orphan_space()
+        except Exception as e:
+            logging.warning(f"[HA] kept {name}, and could not say so: {e}")
+    return name
+
+
+def _say_not_kept(error, snap):
+    """Logged on every try. Audited once per sender, reason and kind of error, and again
+    only after a sync went through: the loop tries again every interval, for as long as
+    the disk stays full, and each audit row goes onto that disk."""
+    sender = snap.get('instance_id')
+    logging.error(f"[HA] the snapshot from {sender} does not carry what this instance holds "
+                  f"({error.why}), and no copy of it could be kept - not applied: {error.cause}")
+    what = (sender, error.why, type(error.cause).__name__)
+    if _orphans.get('not_kept') == what:
+        return
+    _orphans['not_kept'] = what
+    _audit('ha.changes_not_kept', f'snapshot from {sender} refused, no copy could be kept '
+                                  f'({type(error.cause).__name__}): {error.why}'[:500])
+
+
+def _data_version(conn):
+    """SQLite's count of commits other connections made to the database, as this
+    connection sees it. It moves when anybody else wrote, never for a write of our own."""
+    return conn.execute('PRAGMA data_version').fetchone()[0]
+
+
+def _change_mark():
+    """What moves when somebody writes to a shared table or file here, and stays for
+    anything else: [the count of the triggers, SQLite's schema version, a digest of
+    _files_mark]. None while the count cannot be read (no sync made the triggers yet)."""
+    try:
+        n = _dirty_count()
+        if n is None:
+            return None
+        return [n, _schema_version(), hashlib.sha256(repr(_files_mark()).encode()).hexdigest()[:16]]
+    except Exception:
+        return None
+
+
+def _triggers_whole(rec, mark):
+    """Whether the count in `mark` saw every change since the sync that wrote the record
+    `rec`: that sync left a trigger on every shared table, and the schema has not moved
+    since. A table or column made later has no trigger yet, and one that was rebuilt
+    lost its own."""
+    held = rec.get('mark') if rec else None
+    return bool(mark) and isinstance(held, list) and len(held) == 3 and held[1] == mark[1]
+
+
+def _note_applied(snap, lineage, their_epoch, held, mark=None):
+    """The record once a snapshot is in: its history and the marks of its steps, who it
+    came from, and what says whether anything was changed here since. That is `mark`,
+    the count of the triggers and the schema version as the apply's transaction left
+    them (_change_mark), with the files as they are now; _hash_applied adds the etag and
+    the digest of the rows. Without a count those two come from `held`, the tables as
+    hashed inside the transaction. Returns the record, None when it was not written.
+    Never raises: without it the next sync compares row by row, and keeps a copy it
+    would not have needed."""
+    try:
+        etag = data = None
+        if held is not None:
+            _walk_files(held, False)
+            etag, data = held.done()
+        at = snap.get('cv_at') if lineage and isinstance(snap.get('cv_at'), str) else None
+        rec = {'hist': lineage or [], 'etag_at_cv': etag, 'data_at_cv': data,
+               'from': [snap.get('instance_id'), their_epoch], 'at': at[:40] if at else None,
+               'steps': _clean_steps(snap.get('steps')) if lineage else []}
+        now = _change_mark() if mark else None
+        if now:
+            # the files went in after the commit
+            rec['mark'] = mark[:2] + now[2:]
+        with _lock:
+            st = _load()
+            if st['role'] == ROLE_STANDBY:
+                _commit_locked(dict(st, cv=rec))
+                return rec
+    except Exception as e:
+        logging.warning(f"[HA] could not note the config version of the sync: {e}")
+    return None
+
+
+def _hash_applied(rec):
+    """etag_at_cv and data_at_cv for the record `rec` a sync just wrote: what the tables
+    and files hash to with the snapshot in. Walked in the threadpool after the commit,
+    where it stalled the hub for 0.4 s at 10k VMs inside the transaction. The hashes
+    stand for what the sync left only when the mark of the record still holds after the
+    walk (the count never goes back); a write since the commit leaves the record
+    without them, and the next sync compares row by row. Returns True when they were
+    noted. Never raises."""
+    def look():
+        walked = _walk_snapshot(body=False)
+        return walked[0], walked[4], _change_mark()
+    try:
+        etag, data, after = _in_pool(look)
+        if after != rec['mark']:
+            return False
+        with _lock:
+            st = _load()
+            if st['role'] != ROLE_STANDBY or _cv_record(st) != rec:
+                return False
+            _commit_locked(dict(st, cv=dict(rec, etag_at_cv=etag, data_at_cv=data)))
+        return True
+    except Exception as e:
+        logging.warning(f"[HA] could not hash what the sync left here: {e}")
+        return False
+
+
+def _orphan_files():
+    """(name, bytes) of every copy kept here, newest first."""
+    try:
+        names = os.listdir(ORPHANS_DIR)
+    except OSError:
+        return []
+    out = []
+    for fn in names:
+        name = fn[:-len(ORPHAN_SUFFIX)] if fn.endswith(ORPHAN_SUFFIX) else ''
+        if not _ORPHAN_NAME_RE.fullmatch(name):
+            continue
+        try:
+            out.append((name, os.path.getsize(os.path.join(ORPHANS_DIR, fn))))
+        except OSError:
+            continue
+    # the third part of the name is the time
+    out.sort(key=lambda nb: (nb[0].split('-')[2], nb[0]), reverse=True)
+    return out
+
+
+def orphan_count():
+    """How many copies wait for an admin to look at them. Counted once and after every
+    change, the banner asks with each page."""
+    if _orphans['count'] is None:
+        _orphans['count'] = len(_orphan_files())
+    return _orphans['count']
+
+
+def _older_keys():
+    """{fingerprint: file name} of the field keys this instance held before the one it
+    uses now: what a key rotation (.backup.) and a join (.pre-ha.) leave next to the
+    key file."""
+    folder, base = os.path.dirname(AES_KEY_FILE) or '.', os.path.basename(AES_KEY_FILE)
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return {}
+    out = {}
+    for fn in names:
+        if not fn.startswith((base + '.backup.', base + '.pre-ha.')):
+            continue
+        try:
+            with open(os.path.join(folder, fn), 'rb') as fh:
+                key = fh.read(64)
+        except OSError:
+            continue
+        if len(key) == 32:
+            out.setdefault(key_fingerprint(key), fn)
+    return out
+
+
+def orphan_captures(limit=50):
+    """The copies of what this instance held and a snapshot did not carry over, newest
+    first, `limit` at most: name, size and what the meta file next to each says. A copy
+    names two keys.
+
+    seal is the key the copy itself is sealed under: under says which kind ('master', a
+    key derived from the master key of the key store, as with SQLCipher; 'field', the
+    field key, as on plain SQLite), fp its fingerprint, current whether this instance
+    seals under that very key now, backup the file that still holds a field key from
+    before a rotation or a join, and opens whether this instance has the key at all. A
+    copy under another master key (the key store changed, the copy came from another
+    host) has current and opens False: it does not open here.
+
+    key is the field key the sealed values inside the copy are under, as they were in
+    the database: its fingerprint (fp), whether that is the field key in use (current)
+    and, once the key was rotated or replaced by a join, the file next to the key file
+    that still holds it (backup, None when there is none: those values no longer
+    decrypt).
+
+    Either is None for a copy that does not name that key. repeats and last_at say how
+    often, and when last, a sync took the same rows away again without a second copy."""
+    files = _orphan_files()[:limit]
+    if not files:
+        return []
+    out, older = [], []
+    kind_now, seal_now = _copy_key_now()
+    field_now = key_fingerprint()
+
+    def backup(fp):
+        if not older:
+            older.append(_older_keys())
+        return older[0].get(fp)
+    for name, size in files:
+        meta = _orphan_meta(name) or {}
+        key, fp = None, meta.get('key_fp')
+        if isinstance(fp, str) and fp:
+            key = {'fp': fp, 'current': fp == field_now,
+                   'backup': None if fp == field_now else backup(fp)}
+        # a copy from before the two keys had names is sealed under its field key
+        under, sfp = meta.get('seal') or 'field', meta.get('seal_fp') or fp
+        seal = None
+        if isinstance(sfp, str) and sfp and under == 'master':
+            mine = (kind_now, seal_now) == ('master', sfp)
+            seal = {'under': 'master', 'fp': sfp, 'current': mine, 'backup': None, 'opens': mine}
+        elif isinstance(sfp, str) and sfp and under == 'field':
+            held = sfp == field_now
+            kept = None if held else backup(sfp)
+            seal = {'under': 'field', 'fp': sfp, 'current': held and kind_now == 'field',
+                    'backup': kept, 'opens': held or bool(kept)}
+        repeats = meta.get('repeats')
+        out.append({'name': name, 'bytes': size, 'captured_at': meta.get('captured_at'),
+                    'reason': meta.get('reason'), 'cv': meta.get('cv'),
+                    'replaced_by': meta.get('replaced_by'), 'differences': meta.get('differences'),
+                    'journal_rows': meta.get('journal_rows'), 'key': key, 'seal': seal,
+                    'repeats': repeats if isinstance(repeats, int) else 0,
+                    'last_at': meta.get('last_at')})
+    return out
+
+
+def orphan_path(name):
+    """The file of the copy `name`, None for anything that is not one."""
+    if not isinstance(name, str) or not _ORPHAN_NAME_RE.fullmatch(name):
+        return None
+    path = os.path.join(ORPHANS_DIR, name + ORPHAN_SUFFIX)
+    return path if os.path.isfile(path) else None
+
+
+def dismiss_orphan(name, by):
+    """An admin has looked at the copy `name`: it goes, the only way one ever does.
+    Returns True when it was there.
+
+    Before a sync or after it, never inside one: between its look at what is here and
+    its wipe, a sync counts on the copies it found (_kept_already). So this waits for
+    the pull lock, DISMISS_WAIT seconds at most, and raises SyncRunning when a sync
+    holds it for longer (its source does not answer, or the configuration is large).
+    Nothing else is held while it waits, and only the files go under the lock."""
+    if not orphan_path(name):
+        return False
+    if not _pull_lock.acquire(timeout=DISMISS_WAIT):
+        raise SyncRunning('A sync is running right now - the copy is still here, try again '
+                          'in a moment')
+    try:
+        path = orphan_path(name)
+        if not path:
+            return False
+        for p in (path, os.path.join(ORPHANS_DIR, name + '.meta.json')):
+            try:
+                os.unlink(p)
+            except FileNotFoundError:
+                pass
+        _fsync_dir(path)
+        _orphans['count'] = None
+    finally:
+        _pull_lock.release()
+    _audit('ha.changes_dismissed', f'{by} dismissed {name}, a copy of changes not carried over')
+    _check_orphan_space()
+    return True
+
+
+def _orphans_over(total):
+    try:
+        vfs = os.statvfs(ORPHANS_DIR if os.path.isdir(ORPHANS_DIR) else os.path.dirname(ORPHANS_DIR))
+        free = vfs.f_bavail * vfs.f_frsize
+    except (OSError, ValueError):
+        free = None
+    return total > ORPHANS_ALERT_BYTES or (free is not None and total > ORPHANS_ALERT_SHARE * free)
+
+
+def orphans_summary():
+    """The copies for the status. seal says what a copy kept now is sealed under (under,
+    fp as on an item), None when this instance has no key for one: held against the
+    seal of a copy that does not open here, it tells which instance does open it."""
+    files = _orphan_files()
+    total = sum(size for _name, size in files)
+    under, fp = _copy_key_now()
+    return {'count': len(files), 'bytes': total, 'over_limit': _orphans_over(total),
+            'seal': {'under': under, 'fp': fp} if under else None,
+            'items': orphan_captures()}
+
+
+def _check_orphan_space():
+    """Said once each time the copies pass ORPHANS_ALERT_BYTES or ORPHANS_ALERT_SHARE of
+    the free space. Nothing is deleted for it."""
+    files = _orphan_files()
+    total = sum(size for _name, size in files)
+    over = _orphans_over(total)
+    if over and not _orphans['over_said']:
+        logging.error(f"[HA] {len(files)} copies of changes not carried over take "
+                      f"{total // 1024} KiB in {ORPHANS_DIR} - review and dismiss them")
+        _audit('ha.orphans_space', f'{len(files)} copies of changes not carried over take '
+                                   f'{total} bytes - review and dismiss them')
+    _orphans['over_said'] = over
+
+
+# The change journal, a LOCAL table: who wrote what on the active, and the cv that
+# first carried it. It goes into the copy a member keeps of what a snapshot did not
+# carry over, so the rows in there have a name and a request next to them.
+
+def note_write(user, method, path, via=''):
+    """The active, after a write request went through (app.py, next to nudge_members):
+    one line of the change journal. It waits in memory and goes into the database
+    JOURNAL_DELAY seconds later with the lines that came meanwhile, so no write pays a
+    commit for it; a process killed in between loses those lines, never the rows they
+    are about. Returns True when it took the line. Never raises."""
+    try:
+        st = _load()
+        if st['role'] != ROLE_ACTIVE or not st.get('members'):
+            return False
+        line = (_now(), str(user or '')[:128], str(method or '')[:8], str(path or '')[:512],
+                str(via or '')[:256])
+        with _journal_lock:
+            pending = _journal['pending']
+            if len(pending) >= JOURNAL_PENDING_MAX:
+                # the database has not taken them for a while: the oldest go, counted
+                del pending[0]
+                _journal['dropped'] += 1
+            pending.append(line)
+            due, _journal['due'] = _journal['due'], True
+        if not due:
+            try:
+                _journal_later()
+            except Exception:
+                # the next note to the members flushes as well
+                with _journal_lock:
+                    _journal['due'] = False
+        return True
+    except Exception:
+        return False
+
+
+def _journal_later():
+    _later(JOURNAL_DELAY, _journal_run, 'ha-journal')
+
+
+def _journal_run():
+    with _journal_lock:
+        _journal['due'] = False
+    flush_journal()
+
+
+def _journal_table(cur):
+    cur.execute('CREATE TABLE IF NOT EXISTS ha_change_journal (id INTEGER PRIMARY KEY AUTOINCREMENT, '
+                'at TEXT NOT NULL, user TEXT, method TEXT, path TEXT, via TEXT, cv TEXT)')
+
+
+def journal_mark():
+    """The id of the last journal line in the database: lines up to it were written
+    before a walk that starts now, so their changes are in it. Read from the table once
+    per process, for the lines a restart left without a cv."""
+    with _journal_lock:
+        last = _journal['last_id']
+    if last is None:
+        try:
+            from pegaprox.core.db import get_db
+            last = get_db().conn.execute('SELECT MAX(id) FROM ha_change_journal').fetchone()[0] or 0
+        except Exception:
+            last = 0
+        with _journal_lock:
+            if _journal['last_id'] is None:
+                _journal['last_id'] = last
+            last = _journal['last_id']
+    return last
+
+
+def flush_journal():
+    """The journal lines that wait, into the database in one transaction; the last
+    JOURNAL_KEEP stay. Returns how many went in. Never raises: lines that could not be
+    written wait for the next flush."""
+    with _journal_lock:
+        lines, _journal['pending'] = _journal['pending'], []
+        dropped, _journal['dropped'] = _journal['dropped'], 0
+    if dropped:
+        logging.warning(f"[HA] {dropped} line(s) of the change journal were dropped")
+    if not lines:
+        return 0
+    conn = None
+    try:
+        from pegaprox.core.db import get_db
+        conn = get_db().conn
+        cur = conn.cursor()
+        _journal_table(cur)
+        cur.executemany('INSERT INTO ha_change_journal (at, user, method, path, via) '
+                        'VALUES (?, ?, ?, ?, ?)', lines)
+        last = cur.execute('SELECT MAX(id) FROM ha_change_journal').fetchone()[0] or 0
+        cur.execute('DELETE FROM ha_change_journal WHERE id <= ?', (last - JOURNAL_KEEP,))
+        conn.commit()
+    except Exception as e:
+        try:
+            if conn is not None:
+                conn.rollback()
+        except Exception:
+            pass
+        with _journal_lock:
+            _journal['pending'][:0] = lines
+            del _journal['pending'][:-JOURNAL_PENDING_MAX]
+        logging.warning(f"[HA] could not write the change journal: {e}")
+        return 0
+    with _journal_lock:
+        _journal['last_id'] = max(_journal['last_id'] or 0, last)
+    return len(lines)
+
+
+def _fill_journal(entry, upto):
+    """The cv `entry` on the journal lines up to the id `upto` that have none yet.
+    Never raises."""
+    with _journal_lock:
+        if upto <= _journal['filled_to']:
+            return
+    conn = None
+    try:
+        from pegaprox.core.db import get_db
+        conn = get_db().conn
+        conn.execute('UPDATE ha_change_journal SET cv = ? WHERE cv IS NULL AND id <= ?',
+                     (json.dumps(entry), upto))
+        conn.commit()
+    except Exception as e:
+        try:
+            if conn is not None:
+                conn.rollback()
+        except Exception:
+            pass
+        logging.warning(f"[HA] could not note the config version in the change journal: {e}")
+        return
+    with _journal_lock:
+        _journal['filled_to'] = max(_journal['filled_to'], upto)
+
+
+def _journal_not_in(lineage):
+    """The journal lines whose change the history `lineage` does not carry, or that have
+    no cv yet, oldest first, the ones still waiting in memory at the end. Only reads:
+    it runs inside the apply's transaction as well."""
+    try:
+        from pegaprox.core.db import get_db
+        rows = get_db().conn.execute('SELECT id, at, user, method, path, via, cv FROM '
+                                     'ha_change_journal ORDER BY id').fetchall()
+    except Exception:
+        # no journal was ever written here
+        rows = []
+    out = []
+    for r in rows:
+        try:
+            cv = _one_cv(json.loads(r[6])) if r[6] else None
+        except ValueError:
+            cv = None
+        if cv is None or not lineage or not _covered(cv, lineage):
+            out.append({'id': r[0], 'at': r[1], 'user': r[2], 'method': r[3], 'path': r[4],
+                        'via': r[5], 'cv': cv})
+    with _journal_lock:
+        waiting = list(_journal['pending'])
+    out.extend({'id': None, 'at': at, 'user': user, 'method': method, 'path': path, 'via': via,
+                'cv': None} for at, user, method, path, via in waiting)
+    return out
+
+
+# The tick. Triggers on the shared tables count every change into ha_cv_dirty, an UPDATE
+# only when a column outside VOLATILE_COLUMNS took another value; the tick reads the
+# count and walks only when it moved, or when a file the snapshot carries did.
+
+def _change_triggers(cur):
+    """{trigger name: statement} for every shared table there is."""
+    bump = 'BEGIN UPDATE ha_cv_dirty SET n = n + 1 WHERE id = 1; END'
+    out = {}
+    present = _existing_tables(cur)
+    for name in SYNC_TABLES:
+        if name not in present:
+            continue
+        cur.execute(f'PRAGMA table_info("{name}")')
+        masked = {c.lower() for c in VOLATILE_COLUMNS.get(name, ())}
+        # every column, whatever its name: the count is what says a member is in step
+        watched = ['"' + r[1].replace('"', '""') + '"' for r in cur.fetchall()
+                   if r[1].lower() not in masked]
+        when = ' OR '.join(f'NEW.{c} IS NOT OLD.{c}' for c in watched) or '0'
+        for kind, event, cond in (('i', 'INSERT', ''), ('d', 'DELETE', ''),
+                                  ('u', 'UPDATE', f' WHEN {when}')):
+            trig = f'{TRIGGER_PREFIX}{name}_{kind}'
+            out[trig] = f'CREATE TRIGGER "{trig}" AFTER {event} ON "{name}"{cond} {bump}'
+    return out
+
+
+def _make_change_triggers(cur):
+    """The counter and its triggers, on the cursor of whoever calls and inside its
+    transaction: made where they are missing, made again where a rebuilt table or a new
+    column left one stale, dropped from a table that is no longer shared. Returns how
+    many it made."""
+    cur.execute('CREATE TABLE IF NOT EXISTS ha_cv_dirty (id INTEGER PRIMARY KEY '
+                'CHECK (id = 1), n INTEGER NOT NULL DEFAULT 0)')
+    cur.execute('INSERT OR IGNORE INTO ha_cv_dirty (id, n) VALUES (1, 0)')
+    want = _change_triggers(cur)
+    cur.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger'")
+    have = {n: s for n, s in cur.fetchall() if _TRIGGER_NAME_RE.fullmatch(str(n))}
+    made = 0
+    for trig in sorted(set(have) - set(want)):
+        cur.execute(f'DROP TRIGGER IF EXISTS "{trig}"')
+    for trig, sql in want.items():
+        if have.get(trig) == sql:
+            continue
+        if trig in have:
+            cur.execute(f'DROP TRIGGER IF EXISTS "{trig}"')
+        cur.execute(sql)
+        made += 1
+    return made
+
+
+def ensure_change_triggers():
+    """The tick's counter and its triggers, looked over in a transaction of its own
+    (_make_change_triggers). Returns how many it made."""
+    from pegaprox.core.db import get_db
+    conn = get_db().conn
+    try:
+        made = _make_change_triggers(conn.cursor())
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return made
+
+
+def _drop_change_triggers(cur, sent):
+    """Inside the apply's transaction, before the rows of the sync go in: the triggers
+    would fire for every row it deletes and inserts (0.4 s more on a full apply at 10k
+    VMs), and count what is no change made here. The apply makes them again once the
+    rows are in: on a member they say whether anything was written between two syncs
+    (_change_mark). A table that holds no row here and gets none from `sent`, the
+    tables of the snapshot, keeps its own: nothing fires there, and a trigger takes
+    0.3 ms to drop and make again."""
+    cur.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+    have = {str(r[0]) for r in cur.fetchall() if _TRIGGER_NAME_RE.fullmatch(str(r[0]))}
+    if not have:
+        return
+    present, gone = _existing_tables(cur), []
+    for name in SYNC_TABLES:
+        own = [trig for trig in (f'{TRIGGER_PREFIX}{name}_{kind}' for kind in 'idu') if trig in have]
+        if not own or name not in present:
+            continue
+        t = sent.get(name)
+        if ((isinstance(t, dict) and t.get('rows'))
+                or cur.execute(f'SELECT 1 FROM "{name}" LIMIT 1').fetchone()):
+            gone += own
+    for trig in gone:
+        cur.execute(f'DROP TRIGGER IF EXISTS "{trig}"')
+    if gone:
+        _tick.update(seen=None, checked=None, schema=None)
+
+
+def _dirty_count():
+    from pegaprox.core.db import get_db
+    row = get_db().conn.execute('SELECT n FROM ha_cv_dirty WHERE id = 1').fetchone()
+    return int(row[0]) if row else None
+
+
+def _schema_version():
+    """SQLite's count of changes to the schema: it moves with every table, column or
+    trigger made or dropped, by whichever connection."""
+    from pegaprox.core.db import get_db
+    return get_db().conn.execute('PRAGMA schema_version').fetchone()[0]
+
+
+def _files_mark():
+    """Size and time of every file a snapshot carries: no trigger sees those."""
+    paths = [KNOWN_HOSTS_FILE]
+    for folder, leaf in ((BRANDING_DIR, None), (PLUGINS_DIR, 'config.json')):
+        try:
+            names = sorted(os.listdir(folder))
+        except OSError:
+            continue
+        paths += [os.path.join(folder, fn, leaf) if leaf else os.path.join(folder, fn) for fn in names]
+    out = []
+    for path in paths:
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        out.append((path, st.st_size, st.st_mtime_ns))
+    return tuple(out)
+
+
+def cv_tick(force=False):
+    """The leader of an automatic group, every CV_TICK seconds: one step of cv when the
+    shared tables or files changed since its last walk, and a note to the members, so a
+    change the automation makes goes out within seconds as well. It walks only when the
+    count of the triggers or a file moved, once after it made a trigger, and every time
+    while the count cannot be read. Returns 'idle' (not an active with members),
+    'clean', 'same' or 'stepped'.
+
+    The lease loop calls it once automatic mode is in (S3). A manual group goes without:
+    there the cv steps when a snapshot, a poll or a note to the members goes out."""
+    st = _load()
+    if st['role'] != ROLE_ACTIVE or not st.get('members'):
+        return 'idle'
+    seen, made = None, 0
+    try:
+        now = time.monotonic()
+        if (force or _tick['checked'] is None or now - _tick['checked'] >= TRIGGER_CHECK
+                or _schema_version() != _tick['schema']):
+            # A table or a column the code makes on first use (api_tokens, pegaprox_kv,
+            # custom_scripts.deleted_at) has no trigger until this look, and what was
+            # written there before it was not counted. The schema version says so at
+            # the next tick; a trigger made here is one walk whatever the count says.
+            made = ensure_change_triggers()
+            _tick.update(checked=now, schema=_schema_version())
+        n = _dirty_count()
+        seen = (n, _files_mark()) if n is not None else None
+    except Exception as e:
+        logging.warning(f"[HA] cannot read the change count of the config version, walking "
+                        f"on every tick: {e}")
+    if not force and not made and seen is not None and seen == _tick['seen']:
+        return 'clean'
+    flush_journal()
+    before = cv_entry()
+    from pegaprox.api.ha import current_etag
+    current_etag()
+    _tick['seen'] = seen
+    if cv_entry() == before:
+        return 'same'
+    nudge_members()
+    return 'stepped'
+
+
+# The change gap: what an instance that takes the lead knows it does not have.
+
+def note_leader_cv(member_id, cv, at=None):
+    """A standby, when the member it pulls from says which cv it is at (with its note
+    about a change): kept on that member's record, for the change gap should this
+    instance take the lead before it has pulled that far. Returns True when it was
+    news. Never raises."""
+    try:
+        entry, rec = _one_cv(cv), member(member_id)
+        if entry is None or rec is None or not _newer_cv(rec.get('cv_seen'), entry):
+            return False
+        _note_members({member_id: {'cv_seen': entry,
+                                   'cv_seen_at': at[:40] if isinstance(at, str) else None}})
+        return True
+    except Exception as e:
+        logging.warning(f"[HA] could not note the config version of member {member_id}: {e}")
+        return False
+
+
+def change_gap(mine, heard, heard_at=None):
+    """`heard`, the newest cv another member reported, against `mine`, the history held
+    here. None when that much is here, or nothing usable was heard. from and count are
+    None when the changes sit on another line of history and cannot be counted."""
+    seen = _one_cv(heard)
+    if seen is None or _covered(seen, mine):
+        return None
+    match = next((h for h in mine if h[0] == seen[0] and h[2] == seen[2]), None)
+    return {'epoch': seen[0], 'from': match[1] + 1 if match else None, 'to': seen[1],
+            'count': seen[1] - match[1] if match else None, 'by': seen[3],
+            'until': heard_at[:40] if isinstance(heard_at, str) else None}
+
+
+def _gap_at_promotion(st):
+    """promote(): the change gap against the newest cv any member reported (cv_seen on
+    its record, from the watch and from the active's notes). None for none."""
+    best = None
+    for mid, rec in sorted((st.get('members') or {}).items()):
+        seen = _one_cv(rec.get('cv_seen'))
+        if seen and (best is None or seen[:2] > best[0][:2]):
+            best = (seen, rec.get('cv_seen_at'), mid)
+    if best is None:
+        return None
+    gap = change_gap(_hist_of(_cv_record(st)), best[0], best[1])
+    if gap:
+        gap.update(member=best[2], noted_at=_now())
+    return gap
+
+
+def _say_change_gap(gap):
+    what = (f"changes {gap['epoch']}.{gap['from']} to {gap['epoch']}.{gap['to']}" if gap.get('count')
+            else f"changes up to {gap['epoch']}.{gap['to']}")
+    until = f" until {gap['until']}" if gap.get('until') else ''
+    text = f"{what}, made on {gap['by'][:8]}{until}, are not on this instance"
+    logging.warning(f"[HA] took the lead without them: {text}")
+    _audit('ha.change_gap', text)
 
 
 # --- talking to the other members ----------------------------------------------
@@ -3904,12 +5665,18 @@ def _nudge_run():
     try:
         if role() != ROLE_ACTIVE:
             return
+        # the journal lines of the writes this note is about, before the walk that
+        # steps the cv for them
+        flush_journal()
         body = None
         try:
             # once for all of them, off the hub like the etag of a poll: a write that
             # changed nothing they hold (a VM started, a test mail) costs no member a pull
             from pegaprox.api.ha import current_etag
             body = {'etag': current_etag()}
+            # and where the configuration is at, for a member that takes the lead before
+            # it has pulled that far (change_gap)
+            body.update(peer_cv())
         except Exception as e:
             # without one every member pulls, as from a release before the etag
             logging.warning(f"[HA] could not work out the etag for the note to the members: {e}")
@@ -4012,8 +5779,14 @@ def _pull_detail(timeout):
         # columns, a restored database may hold other rows, and the active's etag
         # knows about neither
         etag = None if first else (_load().get('sync') or {}).get('etag')
-        resp = call_member(src, 'GET', '/api/ha/peer/snapshot',
-                           headers={'If-None-Match': etag} if etag else None, timeout=timeout)
+        headers = {'If-None-Match': etag} if etag else {}
+        held = cv_entry()
+        if held:
+            # what this instance holds: an active whose state went back learns it from
+            # the pull itself, before it hands out a number that is taken
+            headers[PEER_CV_HEADER] = json.dumps(held, separators=(',', ':'))
+        resp = call_member(src, 'GET', '/api/ha/peer/snapshot', headers=headers or None,
+                           timeout=timeout)
         answered = True
         _note_source_heard(sid, True)
         if resp.status_code == 304:
@@ -4157,9 +5930,10 @@ def _take_follow_hint(src, resp, timeout):
 
 
 def _ask(rec, signer, timeout):
-    """(role, epoch, group mark, serving) as the member `rec` reports them, serving False
-    from a release that does not say. Raises PeerRefused when it turns us away (401,
-    410), HaError when it does not answer usably."""
+    """(role, epoch, group mark, serving, cv) as the member `rec` reports them, serving
+    False and cv (None, None) from a release that does not say; cv is (the entry of the
+    configuration it holds, when that last stepped). Raises PeerRefused when it turns us
+    away (401, 410), HaError when it does not answer usably."""
     resp = call_member(rec, 'GET', '/api/ha/peer/status', timeout=timeout, signer=signer)
     if resp.status_code in (401, 410):
         try:
@@ -4186,7 +5960,10 @@ def _ask(rec, signer, timeout):
         their_role = None
     if their_epoch is None:
         raise HaError('The member sent an epoch this version does not read')
-    return their_role, their_epoch, data.get('group'), data.get('serving') is True
+    cv = _one_cv(data.get('cv'))
+    at = data.get('cv_at') if cv and isinstance(data.get('cv_at'), str) else None
+    return (their_role, their_epoch, data.get('group'), data.get('serving') is True,
+            (cv, at[:40] if at else None))
 
 
 def _ask_members(timeout, refused=None):
@@ -4216,6 +5993,10 @@ def _ask_members(timeout, refused=None):
         answers[mid] = value[:2]
         notes[mid] = {'last_contact': now, 'role_seen': value[0], 'epoch_seen': value[1],
                       'serving_seen': value[3], 'last_error': ''}
+        if value[4][0] is not None and _newer_cv(rec.get('cv_seen'), value[4][0]):
+            # what it holds: for the change gap at a promotion, and for an active to
+            # see its own segment held further than it knows (note_config_etag)
+            notes[mid].update(cv_seen=value[4][0], cv_seen_at=value[4][1])
         if value[2] == GROUP_MARK:
             notes[mid]['group_seen'] = True
     _last_watch.update(at=time.monotonic(), unreachable=frozenset(unreachable))
@@ -4496,16 +6277,45 @@ def public_status():
         'standby_count': standby_count(),
         'sync': dict(st.get('sync') or {}, etag=None, restart_pending=_restart_pending(),
                      reload_pending=_reload_pending(), last_reload=_run['last_reload']),
+        'config_version': _cv_status(st),
+        # what a member was known to hold when this instance took the lead without it
+        'change_gap': st.get('change_gap') if isinstance(st.get('change_gap'), dict) else None,
+        # what was here and a snapshot did not carry over, until an admin dismisses it
+        'orphans': orphans_summary(),
     }
 
 
-def banner():
-    """What every logged-in user sees about this instance, nothing more."""
+def _cv_status(st):
+    rec = _cv_record(st) or {}
+    hist = _hist_of(rec)
+    last = hist[-1] if hist else None
+    return {'cv': last[:2] if last else list(CV_ZERO), 'segment': last[2] if last else None,
+            'by': last[3] if last else None, 'base_cv': rec.get('base_cv'), 'at': rec.get('at'),
+            'etag_known': bool(rec.get('etag_at_cv')), 'joined': bool(rec.get('joined'))}
+
+
+def peer_cv():
+    """What this instance tells a member about the configuration it holds: cv, the
+    entry, and cv_at, when it last stepped. {} before it has one."""
     st = _load()
-    if st['role'] != ROLE_STANDBY:
-        return {'role': st['role']}
-    p = peer() or {}
-    # removed: the group took it out, and it stays passive until an admin unpairs it
-    return {'role': st['role'], 'peer_url': p.get('url') or '',
-            'last_sync_at': (st.get('sync') or {}).get('last_ok_at') or '',
-            'removed': bool(st.get('removed'))}
+    entry = cv_entry(st)
+    if entry is None:
+        return {}
+    return {'cv': entry, 'cv_at': (_cv_record(st) or {}).get('at')}
+
+
+def banner():
+    """What every logged-in user sees about this instance, nothing more. orphans, only
+    when there are any: how many copies of changes that were not carried over wait
+    here; the UI shows that to admins."""
+    st = _load()
+    out = {'role': st['role']}
+    if st['role'] == ROLE_STANDBY:
+        p = peer() or {}
+        # removed: the group took it out, and it stays passive until an admin unpairs it
+        out.update(peer_url=p.get('url') or '',
+                   last_sync_at=(st.get('sync') or {}).get('last_ok_at') or '',
+                   removed=bool(st.get('removed')))
+    if orphan_count():
+        out['orphans'] = orphan_count()
+    return out

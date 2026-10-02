@@ -13,6 +13,7 @@ The invariant test at the bottom is the point: it fails for the NEXT encrypted
 column somebody adds without extending the rotation. MK
 """
 import json
+import os
 
 import pytest
 
@@ -75,6 +76,37 @@ def test_rotation_reports_no_errors(seeded):
     res = seeded.rotate_encryption_key()
 
     assert res.get('errors') == [], res['errors']
+
+
+def test_two_rotations_within_one_second_keep_the_backup_of_each(seeded, monkeypatch):
+    """The backup of the old key is named by the second and was opened with 'wb'. A
+    second rotation within that second wrote over the backup of the first, and the key
+    from before it existed nowhere: whatever was still sealed under it (a config backup
+    taken earlier, a copy the HA sync kept, #625) had no key left. MK Oct 2026"""
+    class Frozen(dbmod.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 10, 2, 10, 0, 0, tzinfo=tz)
+    monkeypatch.setattr(dbmod, 'datetime', Frozen)
+    keys, backups = [seeded.aes_key], []
+    for _ in range(3):
+        res = seeded.rotate_encryption_key()
+        assert res.get('success') is True, res
+        keys.append(seeded.aes_key)
+        backups.append(res['key_backup'])
+
+    first = os.path.join(dbmod.CONFIG_DIR, '.pegaprox_aes256.key.backup.20261002_100000')
+    assert backups == [first, first + '.1', first + '.2']
+    for path, key in zip(backups, keys):
+        with open(path, 'rb') as fh:
+            assert fh.read() == key
+        assert os.stat(path).st_mode & 0o777 == 0o600
+    assert len(set(keys)) == 4
+    # the key file holds the last one, and the data went along every time
+    with open(os.path.join(dbmod.CONFIG_DIR, '.pegaprox_aes256.key'), 'rb') as fh:
+        assert fh.read() == keys[-1]
+    assert seeded.get_cluster('c1')['pass'] == 'clusterpw'
+    assert len(seeded.get_key_info()['backups']) == 3
 
 
 def _encrypted_columns(db):

@@ -30,6 +30,7 @@ MK Sep 2026
 """
 import base64
 import binascii
+import contextlib
 import contextvars
 import hmac
 import io
@@ -469,7 +470,16 @@ def ha_status():
     whether a standby hands its writes to the active right now. serve_assigned says the
     leader made this standby active, serving that it serves users right now, actives
     and active_limit how many instances do and may; serve on a member is the leader's
-    word, serving_seen what the member said."""
+    word, serving_seen what the member said. config_version is the cv of the
+    configuration here, change_gap what a member was known to hold when this instance
+    took the lead without it, and orphans the copies of what a sync did not carry over
+    (count, bytes, over_limit, seal, items). An item names two keys. seal is the key the
+    copy itself is sealed under: under ('master', derived from the master key of the key
+    store, or 'field', the field key on plain SQLite), fp, current, backup and opens,
+    whether this instance can open it; a copy under another master key has opens false.
+    key is the field key the sealed values inside it are under: fp, current, and backup,
+    the key file that still holds it once the key was rotated. seal next to items is
+    what this instance seals a copy under now (under, fp)."""
     denied = _refuse_confined_admin()
     if denied:
         return denied
@@ -576,6 +586,7 @@ def promote_standby():
     comes first, so the new active starts from the configuration and the member list
     of now; if that sync fails the promotion is refused (409 HA_PROMOTE_SYNC), unless
     force is true. An instance that does not answer at all is the failover this is for.
+    A sync that is under way finishes first either way, for up to 20 seconds.
     Every member hears about the new epoch before the restart, if it answers within a
     few seconds: the instance that was active steps down, the other standbys follow
     this one from their next look at the group. A member that does not answer does the
@@ -904,6 +915,70 @@ def apply_config():
     return jsonify({'success': True, 'restarting': restarting, 'reloaded': reloaded})
 
 
+# What this instance held and a sync did not carry over (ha.ORPHANS_DIR). The list is
+# part of the status; these two hand one out and let go of one. They work on a standby
+# as well: that is where the copies are.
+
+@bp.route('/api/ha/orphans/<name>/download', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def download_orphan(name):
+    """One copy of changes that were not carried over, as gzip'd JSON: the rows this
+    instance held and the snapshot did not carry (sealed values stay sealed), the files
+    it replaced, and the journal lines of who wrote them. On disk the copy is sealed
+    (under a key derived from the master key, on plain SQLite under the field key) and
+    is opened here, after user_password: account rows are in there, as in the config
+    backup. 404 for a name that is no copy, 409 with the reason for one that does not
+    open: sealed under another master key than this instance runs with (the key store
+    changed, or the copy came from another host), under a field key from before a
+    rotation whose backup is gone, or a file that was changed."""
+    denied = _refuse_confined_admin()
+    if denied:
+        return denied
+    if not ha.orphan_path(name):
+        return jsonify({'error': 'There is no such copy'}), 404
+    denied = _refuse_without_reauth('downloading changes that were not carried over')
+    if denied:
+        return denied
+    try:
+        data = ha.open_orphan(name)
+    except ha.HaError as e:
+        return jsonify({'error': str(e)}), 409
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Could not read the copy')}), 500
+    if data is None:
+        return jsonify({'error': 'There is no such copy'}), 404
+    log_audit(_user(), 'ha.changes_downloaded', f'{name}, a copy of changes not carried over')
+    return Response(data, status=200, mimetype='application/gzip', headers={
+        'Content-Disposition': f'attachment; filename="pegaprox-ha-{name}.json.gz"',
+        'Cache-Control': 'no-store'})
+
+
+@bp.route('/api/ha/orphans/<name>/dismiss', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def dismiss_orphan(name):
+    """An admin has looked at a copy of changes that were not carried over, and it can
+    go: nothing else ever deletes one. Wants confirm: true. 404 for a name that is no
+    copy. A copy goes before a sync or after it, never while one looks at what the
+    copies hold: this waits a few seconds for a sync that is under way, and answers 409
+    HA_SYNC_RUNNING when that one takes longer; the copy is still there then."""
+    denied = _refuse_confined_admin()
+    if denied:
+        return denied
+    if _body().get('confirm') is not True:
+        return jsonify({'error': 'Dismissing deletes the copy for good - confirm it to go ahead'}), 400
+    try:
+        gone = ha.dismiss_orphan(name, _user())
+    except ha.SyncRunning as e:
+        resp = jsonify({'code': 'HA_SYNC_RUNNING', 'error': str(e)})
+        resp.headers['Retry-After'] = '10'
+        return resp, 409
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Could not dismiss the copy')}), 500
+    if not gone:
+        return jsonify({'error': 'There is no such copy'}), 404
+    return jsonify({'success': True, 'orphans': ha.orphans_summary()})
+
+
 # --- peer ------------------------------------------------------------------------
 
 # where request_peer keeps its verdict: on the request itself. flask.g belongs to the
@@ -1042,12 +1117,14 @@ def peer_pair():
 def peer_status():
     """Role and epoch, for the watch loop of every other member. group says this
     release takes calls from every member, not only from one peer; serving that this
-    standby serves users, which the others show."""
+    standby serves users, which the others show. cv is the configuration it holds
+    ([epoch, seq, segment, leader]) and cv_at when that last stepped: what the leader
+    is at, and how far each member has pulled."""
     _p, refused = _peer_or_refuse()
     if refused:
         return refused
-    return jsonify({'instance_id': ha.instance_id(), 'role': ha.role(), 'epoch': ha.epoch(),
-                    'group': ha.GROUP_MARK, 'serving': ha.serving()})
+    return jsonify(dict({'instance_id': ha.instance_id(), 'role': ha.role(), 'epoch': ha.epoch(),
+                         'group': ha.GROUP_MARK, 'serving': ha.serving()}, **ha.peer_cv()))
 
 
 def _if_none_match():
@@ -1067,35 +1144,65 @@ def _if_none_match():
 _SNAPSHOT_SEM = None
 
 
-def _build_and_pack(meta):
+def _build(meta):
     # runs in the threadpool: no state lock and no logging in here, both are gevent
     # locks a native thread cannot hand back to a waiting greenlet
-    stuck = []
-    snap = ha.build_snapshot(meta, stuck=stuck)
-    return snap, ha.snapshot_bytes(snap), stuck
+    stuck, raw = [], []
+    snap = ha.build_snapshot(meta, stuck=stuck, raw=raw)
+    return snap, raw, stuck
 
 
-def _off_hub(fn):
-    """Hashing and packing every shared table is CPU work. In gevent's threadpool the
-    hub keeps serving the UI and the consoles meanwhile; one snapshot at a time."""
+def _one_at_a_time():
+    """Hashing and packing every shared table is CPU work, done in gevent's threadpool
+    (_pool) while the hub keeps serving the UI and the consoles. One snapshot at a
+    time, and the config version steps in the order of the walks it comes from."""
     global _SNAPSHOT_SEM
     try:
-        from gevent import get_hub
         from gevent.lock import BoundedSemaphore
     except Exception:
-        return fn()
+        return contextlib.nullcontext()
     if _SNAPSHOT_SEM is None:
         _SNAPSHOT_SEM = BoundedSemaphore(1)
-    with _SNAPSHOT_SEM:
-        return get_hub().threadpool.apply(fn)
+    return _SNAPSHOT_SEM
 
 
-def current_etag(meta=None):
-    """The etag a poll of the snapshot gets now, without the body: for the poll, and
-    for the note the active sends its members after a change (ha.nudge_members).
-    `meta` read on the hub, from ha.snapshot_meta(); the worker never touches the state."""
+def _pool(fn):
+    try:
+        from gevent import get_hub
+    except Exception:
+        return fn()
+    return get_hub().threadpool.apply(fn)
+
+
+def current_etag(meta=None, held=None):
+    """The etag a poll of the snapshot gets now, without the body: for the poll, for the
+    note the active sends its members after a change (ha.nudge_members) and for the tick
+    of an automatic leader (ha.cv_tick). Back on the hub the config version steps when
+    the tables and files changed since it last did. `meta` read on the hub, from
+    ha.snapshot_meta(); the worker never touches the state. `held` is the config
+    version the member that polls says it holds."""
     meta = meta or ha.snapshot_meta()
-    return _off_hub(lambda: ha.snapshot_etag(meta))
+    raw = []
+    with _one_at_a_time():
+        upto = ha.journal_mark()
+        etag = _pool(lambda: ha.snapshot_etag(meta, raw=raw))
+        try:
+            ha.note_config_etag(raw[0], upto, data=raw[1], held=held)
+        except ha.HaError as e:
+            # the snapshot itself is refused until the step can be saved (_snapshot_body)
+            logging.warning(f"[HA] {e}")
+    return etag
+
+
+def _snapshot_body(meta, held=None):
+    """(snapshot, its gzip'd body, stuck): built in the threadpool, its config version
+    put on it on the hub, packed in the threadpool. Raises ha.HaError when the cv
+    cannot be saved."""
+    with _one_at_a_time():
+        upto = ha.journal_mark()
+        snap, raw, stuck = _pool(lambda: _build(meta))
+        ha.stamp_snapshot(snap, raw[0], upto, data=raw[1], held=held)
+        return snap, _pool(lambda: ha.snapshot_bytes(snap)), stuck
 
 
 @bp.route('/api/ha/peer/snapshot', methods=['GET'])
@@ -1106,7 +1213,12 @@ def peer_snapshot():
     active one: a standby must never serve a snapshot another standby could take. A
     standby names the active it follows in follow {instance_id, url, fingerprint,
     public_key, epoch}, for a member that missed it; that member checks it with the
-    active itself before it follows."""
+    active itself before it follows.
+
+    The member sends the config version it holds in X-PegaProx-Peer-Cv, [epoch, seq,
+    segment, leader] as JSON. When that is more of this instance's own segment than it
+    knows of (its state went back to an earlier one), the snapshot goes out under a
+    segment of its own, and the member keeps a copy of what it holds."""
     _p, refused = _peer_or_refuse()
     if refused:
         return refused
@@ -1120,12 +1232,13 @@ def peer_snapshot():
     try:
         # read on the hub, member list included: the worker never touches the state
         meta = ha.snapshot_meta()
+        held = ha.held_cv(request.headers.get(ha.PEER_CV_HEADER))
         # the etag alone first: most polls end in a 304 and never build the body
-        etag = current_etag(meta)
+        etag = current_etag(meta, held)
         headers = {'ETag': f'"{etag}"', 'Cache-Control': 'no-store'}
         if etag in _if_none_match():
             return Response(status=304, headers=headers)
-        snap, body, stuck = _off_hub(lambda: _build_and_pack(meta))
+        snap, body, stuck = _snapshot_body(meta, held)
         ha.warn_stuck(stuck)
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Could not build the snapshot')}), 500
@@ -1229,12 +1342,17 @@ def peer_changed():
     like any other, from that member; from any other member nothing happens. etag is
     the configuration the active holds now: a standby whose last sync was that one has
     nothing to pull. A note without it (an active of an earlier release) is a pull.
-    pull says whether it was taken."""
+    cv and cv_at say where the active's configuration is at; the standby keeps them for
+    the day it takes the lead before it has pulled that far. pull says whether the note
+    was taken."""
     p, refused = _peer_or_refuse()
     if refused:
         return refused
-    taken = (ha.is_standby() and p['instance_id'] == ha.source_id()
-             and not ha.holds_etag(_peer_body().get('etag')))
+    data = _peer_body()
+    ours = ha.is_standby() and p['instance_id'] == ha.source_id()
+    if ours:
+        ha.note_leader_cv(p['instance_id'], data.get('cv'), data.get('cv_at'))
+    taken = ours and not ha.holds_etag(data.get('etag'))
     if taken:
         # runs in the background, and asks that come in meanwhile make one more pull
         ha.pull_soon()

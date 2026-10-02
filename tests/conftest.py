@@ -129,6 +129,18 @@ def _ha_state_out_of_the_checkout(tmp_path, monkeypatch):
     monkeypatch.setattr(ha, 'KNOWN_HOSTS_FILE', str(ha_dir / '.ssh_known_hosts'))
     monkeypatch.setattr(ha, 'BRANDING_DIR', str(ha_dir / 'branding'))
     monkeypatch.setattr(ha, 'PLUGINS_DIR', str(ha_dir / 'plugins'))
+    # what a sync did not carry over is kept there; the change journal waits in memory,
+    # and so does what the tick last saw
+    monkeypatch.setattr(ha, 'ORPHANS_DIR', str(ha_dir / 'ha_orphans'))
+    monkeypatch.setattr(ha, '_journal', {'pending': [], 'dropped': 0, 'last_id': None,
+                                         'filled_to': 0, 'due': False})
+    # its timer is a second one next to the note's, which the group tests count
+    monkeypatch.setattr(ha, '_journal_later', lambda: None)
+    monkeypatch.setattr(ha, '_tick', {'seen': None, 'checked': None, 'schema': None})
+    # a process that has synced before: its first sync would read the rows whatever the
+    # change mark says, and which test runs first in a worker must not matter
+    monkeypatch.setattr(ha, '_mark_checked', True)
+    monkeypatch.setattr(ha, '_orphans', {'count': None, 'over_said': False, 'not_kept': None})
     # an applied snapshot reloads the IP allow list from that test's database into
     # module globals; without this a later test in the run meets someone else's list
     import pegaprox.api.settings as settings_api

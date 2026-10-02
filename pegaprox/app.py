@@ -572,6 +572,12 @@ def create_app():
                         and not (rule == _PLUGIN_PROXY_RULE and (request.view_args or {}).get(
                             'subpath') in _PLUGIN_CONSOLE_PATHS)):
                     from pegaprox.core import ha
+                    # who wrote what, for the copy a member keeps should a sync not carry
+                    # it over (ha.note_write)
+                    mark = request.environ.get(ha.FORWARD_ENVIRON)
+                    ha.note_write((getattr(request, 'session', None) or {}).get('user', ''),
+                                  request.method, path,
+                                  mark.get('via') if isinstance(mark, dict) else '')
                     ha.nudge_members()
         except Exception as e:
             logging.debug(f"[HA] no note to the members after {request.path}: {e}")

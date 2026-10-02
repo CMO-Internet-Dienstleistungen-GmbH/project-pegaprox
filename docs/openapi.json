@@ -43283,7 +43283,7 @@
           }
         },
         "summary": "Role, epoch, members and last sync of this instance.",
-        "description": "members lists every other instance of the group, is_source marks the one a\nstandby pulls from; peer is that one (or the first member) for older readers.\nsuggested_url and own_fingerprint are what a pairing code made here would carry,\nso the UI can prefill the form. forward_writes is this instance's switch, forwarding\nwhether a standby hands its writes to the active right now. serve_assigned says the\nleader made this standby active, serving that it serves users right now, actives\nand active_limit how many instances do and may; serve on a member is the leader's\nword, serving_seen what the member said.",
+        "description": "members lists every other instance of the group, is_source marks the one a\nstandby pulls from; peer is that one (or the first member) for older readers.\nsuggested_url and own_fingerprint are what a pairing code made here would carry,\nso the UI can prefill the form. forward_writes is this instance's switch, forwarding\nwhether a standby hands its writes to the active right now. serve_assigned says the\nleader made this standby active, serving that it serves users right now, actives\nand active_limit how many instances do and may; serve on a member is the leader's\nword, serving_seen what the member said. config_version is the cv of the\nconfiguration here, change_gap what a member was known to hold when this instance\ntook the lead without it, and orphans the copies of what a sync did not carry over\n(count, bytes, over_limit, seal, items). An item names two keys. seal is the key the\ncopy itself is sealed under: under ('master', derived from the master key of the key\nstore, or 'field', the field key on plain SQLite), fp, current, backup and opens,\nwhether this instance can open it; a copy under another master key has opens false.\nkey is the field key the sealed values inside it are under: fp, current, and backup,\nthe key file that still holds it once the key was rotated. seal next to items is\nwhat this instance seals a copy under now (under, fp).",
         "x-pegaprox-auth": "decorator",
         "security": [
           {
@@ -43456,7 +43456,7 @@
           }
         },
         "summary": "Make this standby the active instance under a new epoch, then restart.",
-        "description": "Wants user_password. When the instance it follows still answers, one sync from it\ncomes first, so the new active starts from the configuration and the member list\nof now; if that sync fails the promotion is refused (409 HA_PROMOTE_SYNC), unless\nforce is true. An instance that does not answer at all is the failover this is for.\nEvery member hears about the new epoch before the restart, if it answers within a\nfew seconds: the instance that was active steps down, the other standbys follow\nthis one from their next look at the group. A member that does not answer does the\nsame as soon as it sees this instance.",
+        "description": "Wants user_password. When the instance it follows still answers, one sync from it\ncomes first, so the new active starts from the configuration and the member list\nof now; if that sync fails the promotion is refused (409 HA_PROMOTE_SYNC), unless\nforce is true. An instance that does not answer at all is the failover this is for.\nA sync that is under way finishes first either way, for up to 20 seconds.\nEvery member hears about the new epoch before the restart, if it answers within a\nfew seconds: the instance that was active steps down, the other standbys follow\nthis one from their next look at the group. A member that does not answer does the\nsame as soon as it sees this instance.",
         "requestBody": {
           "required": false,
           "content": {
@@ -43731,6 +43731,116 @@
         ]
       }
     },
+    "/api/ha/orphans/{name}/download": {
+      "post": {
+        "operationId": "ha.download_orphan_post",
+        "tags": [
+          "ha"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "One copy of changes that were not carried over, as gzip'd JSON: the rows this instance held and the snapshot did not carry (sealed values stay sealed), the files it replaced, and the journal lines of who wrote them. On disk the copy is sealed (under a key derived from the master key, on plain SQLite under the field key) and is opened here, after user_password: account rows are in there, as in the config backup. 404 for a name that is no copy, 409 with the reason for one that does not open: sealed under another master key than this instance runs with (the key store changed, or the copy came from another host), under a field key from before a rotation whose backup is gone, or a file that was changed.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-roles": [
+          "admin"
+        ]
+      }
+    },
+    "/api/ha/orphans/{name}/dismiss": {
+      "post": {
+        "operationId": "ha.dismiss_orphan_post",
+        "tags": [
+          "ha"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "An admin has looked at a copy of changes that were not carried over, and it can go: nothing else ever deletes one. Wants confirm: true. 404 for a name that is no copy. A copy goes before a sync or after it, never while one looks at what the copies hold: this waits a few seconds for a sync that is under way, and answers 409 HA_SYNC_RUNNING when that one takes longer; the copy is still there then.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-roles": [
+          "admin"
+        ]
+      }
+    },
     "/api/ha/peer/pair": {
       "post": {
         "operationId": "ha.peer_pair_post",
@@ -43784,7 +43894,7 @@
             "description": "HA_REMOVED: the caller was removed from the group"
           }
         },
-        "summary": "Role and epoch, for the watch loop of every other member. group says this release takes calls from every member, not only from one peer; serving that this standby serves users, which the others show.",
+        "summary": "Role and epoch, for the watch loop of every other member. group says this release takes calls from every member, not only from one peer; serving that this standby serves users, which the others show. cv is the configuration it holds ([epoch, seq, segment, leader]) and cv_at when that last stepped: what the leader is at, and how far each member has pulled.",
         "x-pegaprox-auth": "inline",
         "security": [
           {
@@ -43814,7 +43924,7 @@
           }
         },
         "summary": "The shared configuration as gzip-compressed JSON, for the standby.",
-        "description": "304 when If-None-Match carries the current etag. 409 unless this instance is the\nactive one: a standby must never serve a snapshot another standby could take. A\nstandby names the active it follows in follow {instance_id, url, fingerprint,\npublic_key, epoch}, for a member that missed it; that member checks it with the\nactive itself before it follows.",
+        "description": "304 when If-None-Match carries the current etag. 409 unless this instance is the\nactive one: a standby must never serve a snapshot another standby could take. A\nstandby names the active it follows in follow {instance_id, url, fingerprint,\npublic_key, epoch}, for a member that missed it; that member checks it with the\nactive itself before it follows.\n\nThe member sends the config version it holds in X-PegaProx-Peer-Cv, [epoch, seq,\nsegment, leader] as JSON. When that is more of this instance's own segment than it\nknows of (its state went back to an earlier one), the snapshot goes out under a\nsegment of its own, and the member keeps a copy of what it holds.",
         "x-pegaprox-auth": "inline",
         "security": [
           {
@@ -44001,7 +44111,7 @@
             "description": "HA_REMOVED: the caller was removed from the group"
           }
         },
-        "summary": "The active changed its configuration (ha.nudge_members): pull now instead of at the next poll. Taken from the member this standby pulls from, and the pull is one like any other, from that member; from any other member nothing happens. etag is the configuration the active holds now: a standby whose last sync was that one has nothing to pull. A note without it (an active of an earlier release) is a pull. pull says whether it was taken.",
+        "summary": "The active changed its configuration (ha.nudge_members): pull now instead of at the next poll. Taken from the member this standby pulls from, and the pull is one like any other, from that member; from any other member nothing happens. etag is the configuration the active holds now: a standby whose last sync was that one has nothing to pull. A note without it (an active of an earlier release) is a pull. cv and cv_at say where the active's configuration is at; the standby keeps them for the day it takes the lead before it has pulled that far. pull says whether the note was taken.",
         "requestBody": {
           "required": false,
           "content": {

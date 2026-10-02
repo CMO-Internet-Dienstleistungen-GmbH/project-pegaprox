@@ -4645,9 +4645,21 @@ class PegaProxDB:
             # after the next restart, with no way back. Write the key first, fsync it, and roll
             # the transaction back if anything about the file step fails; the rows are still
             # readable with the old key in that case.
-            backup_file = aes_key_file + f'.backup.{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+            # MK Oct 2026 (#625) - the name goes by the second and the file was opened with
+            # 'wb': a second rotation within that second wrote over the backup of the
+            # first, and the key from before it was gone. A name that is taken gets a
+            # counter, as ha._install_field_key does for .pre-ha.
+            backup_base = aes_key_file + f'.backup.{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+            backup_file, _taken = backup_base, 0
             try:
-                with open(backup_file, 'wb') as f:
+                while True:
+                    try:
+                        _fd = os.open(backup_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                        break
+                    except FileExistsError:
+                        _taken += 1
+                        backup_file = f'{backup_base}.{_taken}'
+                with os.fdopen(_fd, 'wb') as f:
                     f.write(old_key)
                     f.flush()
                     os.fsync(f.fileno())
