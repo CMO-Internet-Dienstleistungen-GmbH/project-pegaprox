@@ -21,6 +21,55 @@ import shutil
 
 import pytest
 
+
+def _poll(done):
+    import gevent
+    while not done():
+        gevent.sleep(0.02)
+    return True
+
+
+class _PolledFlag:
+    """What xdist's worker queue waits on, without a wake-up across threads."""
+
+    def __init__(self):
+        self._set = False
+
+    def set(self):
+        self._set = True
+
+    def clear(self):
+        self._set = False
+
+    def wait(self, timeout=None):
+        return _poll(lambda: self._set)
+
+
+def pytest_configure(config):
+    # Under pytest-xdist the worker's main thread waits on execnet's receiver, and that
+    # receiver is a real thread: it was started before the patch above. What the two
+    # share is locked and signalled with gevent's primitives from then on, and a
+    # release from the other thread now and then never wakes the worker - it sits there
+    # for good, or the idle hub ends the wait with LoopExit. So the three waits of the
+    # main thread poll instead: for the next test, for the shutdown, and for the
+    # receiver to end. The queue's lock is a real one, held for a few instructions.
+    if not hasattr(config, 'workerinput'):
+        return
+    import _thread
+    for plugin in config.pluginmanager.get_plugins():
+        queue = getattr(plugin, 'torun', None)
+        if queue is None or not hasattr(queue, '_has_items_event'):
+            continue
+        queue._lock = _thread.RLock()
+        queue._has_items_event = _PolledFlag()
+        gateway = plugin.channel.gateway
+        ready = getattr(gateway._execpool, '_primary_thread_task_ready', None)
+        if ready is not None:
+            ready.wait = lambda timeout=None, ev=ready: _poll(ev.is_set)
+        receivers = gateway._receivepool
+        receivers.waitall = lambda timeout=None, pool=receivers: _poll(lambda: not pool.active_count())
+
+
 DEFAULT_TENANT = 'default'
 
 
