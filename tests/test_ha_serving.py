@@ -1236,8 +1236,8 @@ def test_a_leader_view_is_never_the_standbys_own_rows(fwd, seed, recorded, monke
 
 
 def test_a_leader_view_answers_here_while_nothing_is_forwarded(fwd, seed, recorded):
-    """No attempt, no refusal: forwarding switched off, the leader known to be gone, or an
-    API token. The route answers as it did before."""
+    """No attempt, no refusal: forwarding switched off, or an API token. The route
+    answers as it did before."""
     from pegaprox.utils.auth import create_api_token
     g = fwd
     admin = _built(g, seed, 'b')
@@ -1249,10 +1249,25 @@ def test_a_leader_view_answers_here_while_nothing_is_forwarded(fwd, seed, record
         assert g.api.anon().get(LEADER_VIEWS[rule], headers=token).get_json() == {'on': 'standby'}
         ha.set_forward_writes(False)
         assert admin.get(LEADER_VIEWS[rule]).get_json() == {'on': 'standby'}
-        ha.set_forward_writes(True)
+    assert _forward_calls(g) == []
+
+
+def test_a_leader_view_says_so_while_the_leader_is_known_to_be_away(fwd, seed, recorded):
+    """Forwarding is on and the leader is known to be away: no attempt, and the view
+    says the leader keeps it rather than showing this instance's own rows. The
+    progress of a job still answers from here."""
+    g = fwd
+    admin = _built(g, seed, 'b')
+    rule = '/api/clusters/<cluster_id>/drift/events'
+    recorded.swap(rule, 'GET')
+    recorded.swap('/api/vmware/migrations', 'GET')
+    g.calls.clear()
+    with g.at('b') as ha:
         ha._note_source_heard(IDS['a'], False)
-        assert ha.forwarding() is False
-        assert admin.get(LEADER_VIEWS[rule]).get_json() == {'on': 'standby'}
+        assert ha.forwarding() is False and ha.forward_writes() is True
+        r = admin.get(LEADER_VIEWS[rule])
+        assert r.status_code == 503 and r.get_json()['code'] == 'HA_ACTIVE_UNREACHABLE', r.data
+        assert admin.get('/api/vmware/migrations').get_json() == {'on': 'standby'}
     assert _forward_calls(g) == []
 
 

@@ -258,7 +258,8 @@ def forward_to_active(read=False):
     there, with a short timeout. When it does not come back whole: None for the progress
     of a job, and the route answers from this instance; None for a plugin as well, which
     app.py refuses; 503 HA_ACTIVE_UNREACHABLE for a view of ha.LEADER_ONLY_READS, whose
-    rows here are not the active's.
+    rows here are not the active's - also without an attempt while the leader is known
+    to be away.
 
     The active runs the request as the signed-in user, checked against its own
     accounts, and its status, body and content headers come back as they are. 413
@@ -280,6 +281,10 @@ def forward_to_active(read=False):
     if not session:
         return None
     if not ha.forwarding():
+        if read and ha.forward_writes() and not ha.leader_reachable():
+            # the leader is known to be away: no attempt, but a view only it fills says
+            # so instead of showing this instance's own rows
+            return _no_leader_read()
         return None
     if not _forward_per_user.allow(session['user']):
         resp = jsonify({'error': 'Too many changes through this standby at once - slow down, or '
