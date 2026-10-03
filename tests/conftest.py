@@ -167,6 +167,16 @@ def _ha_state_out_of_the_checkout(tmp_path, monkeypatch):
     monkeypatch.setattr(ha, '_later', lambda delay, fn, name: None)
     monkeypatch.setattr(ha, '_nudge', {'due': False, 'last': None})
     monkeypatch.setattr(ha, '_run', ha._fresh_run())
+    # Automatic failover: what runs a lease lives as long as the process, one per
+    # instance id. Nothing of it runs on its own in a test - no loop, no watchdog, no
+    # call in the background: the calls a node wants sent stay in its queue, and a test
+    # that wants them delivers them by hand (tests/test_ha_auto.py).
+    monkeypatch.setattr(ha, '_rts', {})
+    monkeypatch.setattr(ha, 'lease_start', lambda: False)
+    monkeypatch.setattr(ha, '_lease_dispatch', lambda rt: None)
+    monkeypatch.setattr(ha, '_lease_spawn', lambda fn, name: None)
+    # the zone of the machine the suite runs on would go into every group a test forms
+    monkeypatch.setattr(ha, '_local_zone', {'name': ''})
     ha.reset_for_tests()
     yield
     ha.reset_for_tests()

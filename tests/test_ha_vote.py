@@ -716,11 +716,55 @@ def test_a_pending_member_acks_only_the_member_that_asked():
     g = genesis(mode=hv.MODE_MANUAL)
     pending = hv.make_cfg(g, 1, 'a', body(mode=hv.MODE_PENDING), KEYS['a'][1])
     box = settled(Box('c', g, voted_for=None))
-    assert box.renew('a', 1, chain=[g, pending], switch=True)['ok']
+    ans = box.renew('a', 1, chain=[g, pending], switch=True)
+    # the ack names the config it is for, by digest
+    assert ans['ok'] and ans['cfg_digest'] == hv.cfg_digest(pending)
     assert box.node.view.mode == hv.MODE_PENDING and box.node.promise_to is None
     assert box.renew('b', 1, switch=True)['reason'] == 'MODE_MANUAL'
     assert box.vote('b', 2)['reason'] == 'MODE_MANUAL'
     assert box.node.promote_manual(5) == 'HA_AUTO_MODE'
+
+
+def test_a_switch_round_is_no_renewal_to_a_member_in_automatic_mode():
+    """Whoever sends it is not switching the group this member is in. Taken for a
+    renewal, it would hand the sender this voter's term, its vote and its promise."""
+    box = settled(Box('c', genesis()))
+    assert box.renew('a', 1)['ok']
+    held, saves = dict(box.store.state), len(box.store.saves)
+
+    for epoch in (1, 5):
+        ans = box.renew('b', epoch, switch=True)
+        assert ans['ok'] is False and ans['reason'] == 'MODE_AUTO'
+        assert ans['cfg_digest'] == hv.cfg_digest(box.node.view.cfg)
+    assert box.store.state == held and len(box.store.saves) == saves
+    assert box.node.promise_to == 'a' and box.node.leader_seen == 'a'
+
+
+def test_a_renewal_comes_from_a_data_voter_of_the_config_held():
+    """Only a data voter can have won a term: a member without a vote, the witness and
+    an instance the config does not name renew nothing, at any epoch."""
+    b = body('abcd', 'w', d={'voter': False})
+    box = settled(Box('c', hv.make_cfg(None, 1, 'a', b, KEYS['a'][1])))
+    for frm in 'dwe':
+        ans = box.renew(frm, 2)
+        assert ans['ok'] is False and ans['reason'] == 'NOT_VOTER', frm
+    assert box.store.state['epoch'] == 1 and box.node.promise_to is None and not box.store.saves
+    assert box.renew('b', 2)['ok']
+
+
+def test_a_voter_renews_one_leader_per_term():
+    box = settled(Box('c', genesis()))
+    assert box.renew('a', 1)['ok']
+    ans = box.renew('b', 1)
+    assert ans['ok'] is False and ans['reason'] == 'PROMISED' and ans['holder'] == 'a'
+    assert box.store.state['voted_for'] == 'a' and box.node.promise_to == 'a'
+    # a higher term is another term, and written down as ever
+    assert box.renew('b', 2)['ok'] and box.store.state['voted_for'] == 'b'
+    # and a promise that came with a vote is no renewal: the winner of a split election
+    # renews with the voter of the loser (D4)
+    other = settled(Box('c', genesis(), voted_for=None, epoch=1))
+    other.now += T.P
+    assert other.vote('b', 2)['granted'] and other.renew('a', 2)['ok']
 
 
 def test_the_witness_takes_the_floor():
@@ -749,6 +793,81 @@ def _leader(**kw):
 
 def _ok(to, b):
     return {'ok': True, 'epoch': b['epoch'], 'cfg_id': (1, 1), 'gen': 1, 'cv': (1, 5)}
+
+
+def _holds(box, **extra):
+    """An answer from a member that holds the config the leader holds now: id and digest."""
+    view = box.node.view
+    return lambda to, b: dict(_ok(to, b), cfg_id=view.id, cfg_digest=hv.cfg_digest(view.cfg), **extra)
+
+
+def test_a_leader_that_hears_another_data_voter_renew_in_its_term_leaves():
+    """One leader per term. Two of them refusing each other as equals would both keep
+    their lease for good."""
+    box = _leader()
+    box.answer_all('renew', _ok)
+    assert box.node.is_active()
+    ans = box.renew('b', 1)
+    assert ans['reason'] == 'GONE' and box.restarts == ['renewal at epoch 1']
+    assert box.store.state['role'] == hv.ROLE_STANDBY and not box.node.is_active()
+
+
+def test_a_leader_keeps_its_term_against_a_switch_round_and_a_member_without_a_vote():
+    b = body('abcd', d={'voter': False})
+    led = {'epoch': 1, 'cv': (1, 5), 'take_after': {'boot_id': 'boot-1', 'at': 0.0}}
+    box = Box('a', hv.make_cfg(None, 1, 'a', b, KEYS['a'][1]), role=hv.ROLE_LEADER, led=led)
+    box.answer_all('renew', _ok)
+    ans = box.renew('b', 1, switch=True)
+    assert ans['reason'] == 'MODE_AUTO' and ans['cfg_digest'] == hv.cfg_digest(box.node.view.cfg)
+    assert box.renew('d', 1)['reason'] == 'NOT_VOTER'
+    assert box.renew('b', 0)['reason'] == 'OLD_EPOCH'
+    assert box.node.is_active() and not box.restarts
+    assert box.store.state['role'] == hv.ROLE_LEADER
+
+
+def _switching(monkeypatch):
+    monkeypatch.setattr(hv, 'AUTO_MODE_SHIPPED', True)
+    box = Box('a', genesis(mode=hv.MODE_MANUAL), role=hv.ROLE_ACTIVE, voted_for=None)
+    assert box.node.switch_on() == ''
+    box.later(0)
+    return box, hv.cfg_digest(box.node.view.cfg)
+
+
+def test_the_switch_counts_a_member_only_on_its_ack_of_the_pending_config(monkeypatch):
+    """Not on a refusal, whatever config id stands in it, and not on an ack of another
+    config: where two chains meet, the ids of one say nothing about the other."""
+    box, digest = _switching(monkeypatch)
+    pending = box.node.view.id
+
+    box.answer_all('renew', lambda to, b: {'ok': False, 'reason': 'OLD_EPOCH', 'epoch': 1,
+                                           'cfg_id': (9, 9), 'gen': 3, 'cfg_digest': digest})
+    box.later(T.R + 0.1)
+    assert box.node.view.mode == hv.MODE_PENDING and box.node.switch is not None
+    box.answer_all('renew', lambda to, b: {'ok': True, 'epoch': 1, 'cfg_id': pending, 'gen': 3})
+    box.later(T.R + 0.1)
+    box.answer_all('renew', lambda to, b: {'ok': True, 'epoch': 1, 'cfg_id': pending, 'gen': 3,
+                                           'cfg_digest': 'f' * 64})
+    box.later(T.R + 0.1)
+    assert box.node.view.mode == hv.MODE_PENDING and box.store.state['role'] == hv.ROLE_ACTIVE
+
+    box.answer_all('renew', lambda to, b: {'ok': True, 'epoch': 1, 'cfg_id': pending, 'gen': 3,
+                                           'cfg_digest': digest})
+    box.later(T.R + 0.1)
+    assert box.node.view.mode == hv.MODE_AUTO and box.store.state['role'] == hv.ROLE_LEADER
+
+
+def test_a_switch_taken_back_ends_once_every_member_holds_the_manual_config(monkeypatch):
+    box, _digest = _switching(monkeypatch)
+    assert box.node.switch_cancel() == ''
+    box.later(0.1)
+    assert box.node.view.mode == hv.MODE_MANUAL and box.node.switch['cancelled']
+    back = hv.cfg_digest(box.node.view.cfg)
+    box.later(0.1)
+    # a member in manual mode refuses the round, and holds the config all the same
+    box.answer_all('renew', lambda to, b: {'ok': False, 'reason': 'MODE_MANUAL', 'epoch': 1,
+                                           'cfg_id': box.node.view.id, 'cfg_digest': back})
+    box.later(T.R + 0.1)
+    assert box.node.switch is None
 
 
 def test_the_lease_counts_from_the_send_of_the_round():
@@ -840,7 +959,7 @@ def test_after_boot_the_next_round_comes_inside_the_lease():
     c2 = hv.make_cfg(g, 1, 'a', body(lease_s=118), KEYS['a'][1])
     led = {'epoch': 1, 'cv': (1, 5), 'take_after': {'boot_id': 'boot-1', 'at': 0.0}}
     box = Box('a', c2, chain=[g], role=hv.ROLE_LEADER, led=led)
-    box.answer_all('renew', lambda to, b: dict(_ok(to, b), cfg_id=(1, 2)))
+    box.answer_all('renew', _holds(box))
     assert box.node._is_committed() and box.node.is_active()
     assert box.node.next_round_at < box.node.lease_until
 
@@ -915,12 +1034,12 @@ def test_while_a_longer_lease_is_not_committed_the_shorter_one_counts():
     t1 = box.now
     # the answers of this round commit the change; the round still counts by the 20 it
     # asked for, a voter on the old config promised no more
-    box.answer_all('renew', lambda to, b: dict(_ok(to, b), cfg_id=(1, 2)))
+    box.answer_all('renew', _holds(box))
     assert box.node.lease_until == pytest.approx(t1 + hv.Timings(20).per_round)
     box.later(T.R + 0.01)
     t2 = box.now
     assert all(b['lease_s'] == 30 for _, k, b, _ in box.sent if k == 'renew')
-    box.answer_all('renew', lambda to, b: dict(_ok(to, b), cfg_id=(1, 2)))
+    box.answer_all('renew', _holds(box))
     assert box.node.lease_until == pytest.approx(t2 + hv.Timings(30).per_round)
 
 
@@ -1051,10 +1170,101 @@ def test_switching_off_reached_a_majority():
     box.later(0.1)
     box.node.switch_off()
     box.later(0.01)
-    box.answer_all('renew', lambda to, b: dict(_ok(to, b), ok=False, reason='MODE_MANUAL', cfg_id=(1, 2)))
+    box.answer_all('renew', _holds(box, ok=False, reason='MODE_MANUAL'))
     assert box.store.state['role'] == hv.ROLE_ACTIVE and not box.node.lease_mode()
     box.now += 10 * T.L
     assert box.node.is_active()
+
+
+def test_a_commit_counts_who_holds_the_config_by_its_digest():
+    """A leader whose state went back makes a config under an id its members passed
+    already: their answers name that id, and they hold another config under it."""
+    led = {'epoch': 1, 'cv': (1, 5), 'take_after': {'boot_id': 'boot-1', 'at': 0.0}}
+    box = Box('a', genesis(data='abcde'), role=hv.ROLE_LEADER, led=led)
+    box.answer_all('renew', _ok)
+    box.later(0.1)
+    assert box.node.switch_off() == ''
+    box.later(0.01)
+    assert box.node.view.id == (1, 2)
+    other = 'f' * 64
+    box.answer_all('renew', lambda to, b: dict(_ok(to, b), cfg_id=(1, 2), cfg_digest=other))
+    assert not box.node._is_committed() and box.store.state['role'] == hv.ROLE_LEADER
+    box.later(T.R)
+    box.answer_all('renew', _holds(box, ok=False, reason='MODE_MANUAL'))
+    assert box.node._is_committed() and box.store.state['role'] == hv.ROLE_ACTIVE
+
+
+def test_a_leader_that_hears_of_a_config_of_its_term_it_does_not_hold_leaves():
+    box = _leader()
+    box.answer_all('renew', _ok)
+    assert box.node.is_active()
+    box.later(T.R)
+    box.answer_all('renew', lambda to, b: dict(_ok(to, b), cfg_id=(1, 2) if to == 'c' else (1, 1)))
+    assert box.store.state['role'] == hv.ROLE_STANDBY and box.restarts
+    assert 'voter config [1, 2], newer than the [1, 1] held here' in box.restarts[0]
+
+
+def test_a_newer_config_of_an_older_term_is_one_the_leader_before_left_behind():
+    """It never reached a majority (the new leader won with votes that hold its own
+    config or older), and the new leader's first config goes past it."""
+    led = {'epoch': 2, 'cv': (1, 5), 'take_after': {'boot_id': 'boot-1', 'at': 0.0}}
+    box = Box('a', genesis(), role=hv.ROLE_LEADER, led=led, epoch=2, voted_for='a')
+    box.answer_all('renew', lambda to, b: dict(_ok(to, b), cfg_id=(1, 2) if to == 'c' else (1, 1)))
+    assert box.node.is_active() and box.store.state['role'] == hv.ROLE_LEADER
+    box.later(0.01)
+    assert box.node.view.id == (2, 2)
+
+
+def test_a_leader_that_boots_into_a_term_its_members_moved_past_stays_a_standby():
+    led = {'epoch': 1, 'cv': (1, 5), 'take_after': {'boot_id': 'boot-1', 'at': 0.0}}
+    box = Box('a', genesis(), role=hv.ROLE_LEADER, led=led)
+    box.answer_all('renew', lambda to, b: dict(_ok(to, b), cfg_id=(1, 3)))
+    assert box.store.state['role'] == hv.ROLE_STANDBY and not box.node.acting_process()
+    assert not box.restarts and 'boot_standby' in box.names()
+
+
+def test_a_leader_that_leaves_before_its_switch_back_went_through_drops_it():
+    box = _leader()
+    box.answer_all('renew', _ok)
+    box.later(0.1)
+    assert box.node.switch_off() == ''
+    box.later(0.01)
+    assert box.node.view.mode == hv.MODE_MANUAL
+    box.now += T.per_round
+    box.node.tick()
+    st = box.store.state
+    assert st['role'] == hv.ROLE_STANDBY and st['cfg']['body']['mode'] == hv.MODE_AUTO
+    assert hv.pair(st['cfg']['id']) == (1, 1) and 'switch_off_dropped' in box.names()
+    # one that went through stays: a majority holds it
+    box = _leader()
+    box.answer_all('renew', _ok)
+    box.later(0.1)
+    box.node.switch_off()
+    box.later(0.01)
+    box.store.fail = True
+    box.answer_all('renew', _holds(box, ok=False, reason='MODE_MANUAL'))
+    assert box.node._is_committed() and box.store.state['role'] == hv.ROLE_LEADER
+    box.store.fail = False
+    box.node.step_down('test')
+    assert box.store.state['cfg']['body']['mode'] == hv.MODE_MANUAL
+
+
+def test_a_manual_active_that_takes_an_automatic_config_from_a_vote_request_is_a_standby():
+    g = genesis(mode=hv.MODE_MANUAL)
+    auto_cfg = hv.make_cfg(g, 1, 'a', body(), KEYS['a'][1])
+    box = settled(Box('a', g, role=hv.ROLE_ACTIVE, voted_for=None))
+    # a pre-vote takes nothing
+    assert box.vote('b', 2, pre=True, cfg_id=(1, 2), chain=[auto_cfg])['granted']
+    assert box.store.state['role'] == hv.ROLE_ACTIVE and not box.restarts
+    ans = box.vote('b', 2, cfg_id=(1, 2), chain=[auto_cfg])
+    assert ans['granted'] and box.store.state['role'] == hv.ROLE_STANDBY
+    assert box.store.state['voted_for'] == 'b' and box.store.state['cfg'] == auto_cfg
+    assert box.restarts and ('step_down', {'why': box.restarts[0], 'by_hand': True}) in box.events
+    # refused, it leaves all the same
+    box = Box('a', g, role=hv.ROLE_ACTIVE, voted_for=None)
+    ans = box.vote('b', 2, cfg_id=(1, 2), chain=[auto_cfg])
+    assert ans['reason'] == 'HOLD_AFTER_START' and box.store.state['role'] == hv.ROLE_STANDBY
+    assert box.restarts
 
 
 def test_an_ack_from_a_voter_the_config_dropped_does_not_count():
@@ -1204,7 +1414,7 @@ def test_the_new_leader_commits_its_own_config_before_any_change():
     # the change waits for the no-op to reach a majority of the config before it
     box.later(0.01)
     assert box.node.view.id == (2, 2)
-    box.answer_all('renew', lambda to, b: dict(_ok(to, b), cfg_id=(2, 2)))
+    box.answer_all('renew', _holds(box))
     box.later(0.01)
     assert box.node.view.id == (2, 3)
 

@@ -208,7 +208,9 @@ def check_schedules():
             continue
         try:
             schedules = load_schedules()
-            now = datetime.now()
+            # the group's zone when this instance is in one, so a failover does not
+            # shift a schedule; datetime.now() on an instance of its own (#625)
+            now = ha.schedule_now()
             current_time = now.strftime('%H:%M')
             current_day = now.strftime('%A').lower()
             current_date = now.strftime('%Y-%m-%d')
@@ -1129,7 +1131,7 @@ def delete_update_schedule(cluster_id):
 def calculate_next_update_run(day: str, time_str: str) -> str:
     """Calculate the next scheduled run time"""
     try:
-        now = datetime.now()
+        now = ha.schedule_now()
         hour, minute = map(int, time_str.split(':'))
         
         day_map = {
@@ -1162,7 +1164,7 @@ def check_scheduled_updates():
     """Check if any scheduled updates should run - called by scheduler"""
     try:
         schedules = load_all_update_schedules()
-        now = datetime.now()
+        now = ha.schedule_now()
         
         for cluster_id, schedule in schedules.items():
             if not schedule.get('enabled'):

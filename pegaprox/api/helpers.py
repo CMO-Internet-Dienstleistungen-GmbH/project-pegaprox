@@ -249,6 +249,11 @@ def save_server_settings(settings):
     SQLite migration
     """
     try:
+        from pegaprox.core.ha import STAMPS_ZONE_SETTING
+        # MK Oct 2026 (#625) - the zone the schedule stamps are in is written with the
+        # stamps only. A caller read every setting before a change of the group zone, and
+        # writing that value back would make the next look move stamps that are in place
+        settings = {k: v for k, v in settings.items() if k != STAMPS_ZONE_SETTING}
         db = get_db()
         db.save_server_settings(settings)
         return True

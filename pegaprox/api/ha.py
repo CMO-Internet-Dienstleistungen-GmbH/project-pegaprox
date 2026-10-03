@@ -23,6 +23,12 @@ travel as the body of a signed peer call, and the active runs the request as tha
 by its own accounts (peer_forward). The consoles are not among them: a standby that
 serves users opens them itself, any other refuses them, see app.py.
 
+Automatic failover (#625 stage 2) adds the switch between the two modes on the admin
+side, and on the peer side the vote and the renewal of the lease (ha.lease_request).
+In an automatic group the leader takes writes, hands out snapshots and takes members
+only while it holds the lease (503 HA_NO_LEASE otherwise). The server refuses the
+switch until ha_vote.AUTO_MODE_SHIPPED is on.
+
 The state machine behind all of it is pegaprox/core/ha.py; nothing here decides a
 role on its own.
 
@@ -44,7 +50,7 @@ import time
 from flask import Blueprint, current_app, jsonify, request, Response
 from werkzeug.exceptions import RequestEntityTooLarge
 
-from pegaprox.core import ha
+from pegaprox.core import ha, ha_vote
 from pegaprox.models.permissions import ROLE_ADMIN
 from pegaprox.utils.auth import require_auth, build_authz_user
 from pegaprox.utils.audit import log_audit, get_client_ip
@@ -235,6 +241,50 @@ def by_api_token():
     return request.headers.get('Authorization', '').startswith('Bearer pgx_')
 
 
+def no_lease_refusal(known=True):
+    """503 HA_NO_LEASE where the leader of an automatic group takes no change right now:
+    its lease ran out, or it is still taking over (Retry-After says for how long).
+    None everywhere else, a manual group and an instance of its own included. A caller
+    nobody has checked (`known` false) hears that changes are paused and nothing else:
+    not whether the group has a leader, not how long a takeover still runs."""
+    refusal = ha.no_lease()
+    if refusal is None:
+        return None
+    if not known:
+        refusal = {'error': ha.NO_LEASE_ANON_ERROR, 'retry_after': None}
+    resp = jsonify({'code': 'HA_NO_LEASE', 'error': refusal['error']})
+    resp.headers['Retry-After'] = str(refusal['retry_after'] or 10)
+    return resp, 503
+
+
+def write_gate_refusal():
+    """What the write gate in app.py answers on an instance that is no standby and may
+    not act right now. Never None: the gate asked ha.is_active() and heard no, and
+    whatever the state says a moment later (the lease loop may have stepped the
+    instance down in between), this write is not taken. The gate runs before any
+    route has looked at the caller, so only a signed-in browser session, or a write a
+    member handed over, hears who leads and for how long not."""
+    known = request.environ.get(ha.FORWARD_ENVIRON) is not None
+    if not known:
+        from pegaprox.utils.auth import validate_session
+        known = bool(validate_session(request.headers.get('X-Session-ID')
+                                      or request.cookies.get('session_id')))
+    refused = no_lease_refusal(known)
+    if refused is None:
+        resp = jsonify({'code': 'HA_NO_LEASE',
+                        'error': ha.NO_LEASE_ERROR if known else ha.NO_LEASE_ANON_ERROR})
+        resp.headers['Retry-After'] = '10'
+        refused = (resp, 503)
+    return refused
+
+
+def _auto_mode_refusal(error=ha.AUTO_MODE_ERROR):
+    """409 HA_AUTO_MODE for what only a manual group does, None in a manual group."""
+    if ha.mode() == ha_vote.MODE_MANUAL:
+        return None
+    return jsonify({'code': 'HA_AUTO_MODE', 'error': error}), 409
+
+
 def standby_console_refusal():
     """The answer a console route gives where it opens none, None where it opens: on a
     standby that does not serve users, and on one that does for an API token, which
@@ -357,6 +407,11 @@ def _forward(session):
         logging.warning(f"[HA] the active instance refused a forwarded {what} "
                         f"(HTTP {resp.status_code})")
         return None
+    elif resp.status_code == 503 and _answer_code(resp) == 'HA_NO_LEASE':
+        # an automatic group between two leaders: its words, and when to try again
+        out = jsonify(resp.json())
+        out.headers['Retry-After'] = ha._answer_header(resp, 'Retry-After') or '10'
+        return out, 503
     elif resp.status_code == 403 and _answer_code(resp) == 'HA_FORWARD_USER':
         # the account is not there, or disabled, on the active: its words
         return jsonify(resp.json()), 403
@@ -484,7 +539,11 @@ def ha_status():
     whether this instance can open it; a copy under another master key has opens false.
     key is the field key the sealed values inside it are under: fp, current, and backup,
     the key file that still holds it once the key was rotated. seal next to items is
-    what this instance seals a copy under now (under, fp)."""
+    what this instance seals a copy under now (under, fp). auto, once this release
+    offers automatic failover: the mode, the lease and the findings, and pending while
+    a switch to automatic failover is pending on this instance (by and by_url, the
+    instance that started it, own, since and text), which is why it is not promoted by
+    hand until the switch is through or taken back there."""
     denied = _refuse_confined_admin()
     if denied:
         return denied
@@ -513,9 +572,15 @@ def create_pairing_code():
     waiting = ha.group_waiting()
     if waiting:
         return jsonify({'error': ha._group_waiting_error(waiting)}), 409
+    if ha.mode() == ha_vote.MODE_PENDING:
+        return jsonify({'code': 'HA_AUTO_MODE', 'error': ha.AUTO_PENDING_ERROR}), 409
     denied = _refuse_without_reauth('a pairing code')
     if denied:
         return denied
+    # an automatic group takes a member only on the instance that holds its lease, and
+    # only once a majority said so again just now
+    if ha.lease_in_force() and not ha.confirm_lease():
+        return no_lease_refusal() or (jsonify({'code': 'HA_NO_LEASE', 'error': ha.NO_LEASE_ERROR}), 503)
     try:
         code, expires = ha.create_pairing_code(url, _own_fingerprint())
     except ha.HaError as e:
@@ -595,7 +660,11 @@ def promote_standby():
     Every member hears about the new epoch before the restart, if it answers within a
     few seconds: the instance that was active steps down, the other standbys follow
     this one from their next look at the group. A member that does not answer does the
-    same as soon as it sees this instance."""
+    same as soon as it sees this instance. 409 HA_AUTO_MODE in a group that fails
+    over automatically or is switching to it: as this instance holds it, as the
+    instance it follows said with the pairing or its last snapshot, or as a member
+    that answers says right now. While a switch is pending here, the error names the
+    instance that started it and since when (auto.pending of the status)."""
     denied = _refuse_confined_admin()
     if denied:
         return denied
@@ -604,6 +673,11 @@ def promote_standby():
         return jsonify({'error': 'Type PROMOTE to confirm'}), 400
     if not ha.is_standby():
         return jsonify({'error': 'Only a standby can be promoted'}), 409
+    refused = _auto_mode_refusal(ha.promote_refusal())
+    if refused:
+        # the group elects its leader, also while the switch to that is pending (the
+        # answer then says who started the switch, and since when)
+        return refused
     denied = _refuse_without_reauth('promoting this standby')
     if denied:
         return denied
@@ -621,23 +695,32 @@ def promote_standby():
     old_active = ha.source_id()
     try:
         new_epoch = ha.promote()
+    except ha.AutoMode as e:
+        # this instance holds no voter config, and a member says the group elects
+        return jsonify({'code': 'HA_AUTO_MODE', 'error': str(e)}), 409
     except ha.HaError as e:
         return jsonify({'error': str(e)}), 409
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Promotion failed')}), 500
     # a reachable old active steps down now, not after our restart and its next watch:
     # until then both would act on the same clusters
+    said = {}
     told = ha.tell_members('POST', '/api/ha/peer/step-down', json_body={'epoch': new_epoch},
-                           timeout=5)
+                           timeout=5, answers=said)
     for mid, err in told.items():
         if err:
             logging.warning(f"[HA] could not tell member {mid} about the promotion: {err}")
     reached = old_active in told and told[old_active] is None
+    # its answer says whether it did: an active that refuses (the leader of an automatic
+    # group leaves by its lease, not on a member's word) is still active
+    theirs = said.get(old_active) or {}
+    refused = reached and theirs.get('stepped_down') is False and theirs.get('role') == ha.ROLE_ACTIVE
     others = [mid for mid in told if mid != old_active]
     detail = (f", {sum(1 for mid in others if told[mid] is None)} of {len(others)} other "
               f"member(s) told" if others else '')
+    how = 'refused to step down' if refused else 'told to step down' if reached else 'not reached'
     log_audit(_user(), 'ha.promoted', f"promoted to active with epoch {new_epoch}, "
-                                      f"old active {'told to step down' if reached else 'not reached'}"
+                                      f"old active {how}"
                                       f"{detail}{', without the sync first (force)' if force else ''}")
     ha.restart_process('promoted to active')
     return jsonify({'success': True, 'epoch': new_epoch, 'restarting': True})
@@ -652,7 +735,8 @@ def unpair_peer():
     everybody else. It becomes standalone and restarts, because from then on it acts on
     the configuration it holds. An active leaves the group entirely: every member drops
     it and it becomes standalone; the standbys keep each other and wait for one of them
-    to be promoted."""
+    to be promoted. 409 HA_AUTO_MODE in a group that fails over automatically, where
+    automatic failover is switched off first (ha.unpair_refusal)."""
     denied = _refuse_confined_admin()
     if denied:
         return denied
@@ -664,6 +748,10 @@ def unpair_peer():
     # one was promoted) must still get out; only a standalone has nothing to undo
     if not group and ha.role() == ha.ROLE_STANDALONE:
         return jsonify({'error': 'This instance is not paired'}), 409
+    why = ha.unpair_refusal()
+    if why:
+        # before any member is told: nobody leaves an automatic group by hand
+        return jsonify({'code': 'HA_AUTO_MODE', 'error': why}), 409
     denied = _refuse_without_reauth('unpairing')
     if denied:
         return denied
@@ -674,6 +762,8 @@ def unpair_peer():
             logging.warning(f"[HA] could not tell member {mid} about the unpairing: {err}")
     try:
         was = ha.unpair()
+    except ha.AutoMode as e:
+        return jsonify({'code': 'HA_AUTO_MODE', 'error': str(e)}), 409
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Unpairing failed')}), 500
     restarting = was == ha.ROLE_STANDBY
@@ -713,6 +803,9 @@ def remove_member(instance_id):
         return jsonify({'error': 'Type REMOVE to confirm'}), 400
     if ha.role() != ha.ROLE_ACTIVE:
         return jsonify({'error': 'Only the active instance removes members'}), 409
+    refused = _auto_mode_refusal(ha.AUTO_REMOVE_ERROR)
+    if refused:
+        return refused
     if not ha.member(instance_id):
         return jsonify({'error': 'That instance is not a member of this group'}), 404
     shut_down = data.get('shut_down') is True
@@ -780,6 +873,9 @@ def set_member_serve(instance_id):
     if ha.role() != ha.ROLE_ACTIVE:
         return jsonify({'code': 'HA_STANDBY',
                         'error': 'Which instances are active is set on the leader'}), 409
+    refused = no_lease_refusal()
+    if refused:
+        return refused
     if not ha.member(instance_id):
         return jsonify({'error': 'That instance is not a member of this group'}), 404
     try:
@@ -798,6 +894,166 @@ def set_member_serve(instance_id):
         # the HA routes tell nobody by themselves (app.py): the member list changed
         ha.nudge_members()
     return jsonify({'success': True, 'serve': serve, 'actives': actives})
+
+
+@bp.route('/api/ha/members/<instance_id>/readmit', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def readmit_member(instance_id):
+    """Take a quarantined voter back, on the leader of an automatic group. Wants
+    user_password.
+
+    A voter that reports an older state than it reported before (a restored backup, a
+    reverted VM snapshot) is quarantined by the leader: it may have forgotten a vote,
+    so its votes and acks stop counting, and it still counts in the majority to reach.
+    Once an admin has looked at it, this lets it count again, in force when a majority
+    holds the change. 409 in a manual group and for a member that is not quarantined,
+    503 HA_NO_LEASE on an instance that does not hold the lease."""
+    denied = _refuse_confined_admin()
+    if denied:
+        return denied
+    if not ha.lease_in_force():
+        return jsonify({'error': 'This group is in manual mode - nobody is quarantined'}), 409
+    denied = _refuse_without_reauth('re-admitting a member')
+    if denied:
+        return denied
+    try:
+        ha.readmit_member(instance_id)
+    except ha.NoLease as e:
+        return no_lease_refusal() or (jsonify({'code': 'HA_NO_LEASE', 'error': str(e)}), 503)
+    except ha.HaError as e:
+        return jsonify({'error': str(e)}), 409
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Could not re-admit the member')}), 500
+    rec = ha.member(instance_id) or {}
+    log_audit(_user(), 'ha.member_readmitted',
+              f"{rec.get('url') or instance_id} re-admitted: its votes count again once a "
+              f"majority holds the change")
+    return jsonify({'success': True})
+
+
+@bp.route('/api/ha/mode', methods=['PUT'])
+@require_auth(roles=[ROLE_ADMIN])
+def set_mode():
+    """Switch the group between manual and automatic failover, on the leader. Wants
+    user_password.
+
+    mode: auto starts the switch. It needs at least three votes (data members or the
+    witness), every member answering on this release within the last two minutes,
+    clocks within 5 s, a time zone for the group (one that has none takes the zone of
+    this instance; where that cannot be told, it is set first) and no member that says
+    the group is automatic already while this instance holds no voter config of that;
+    what stands in the way comes back as 409 HA_AUTO_REFUSED with
+    findings [{code, level, text, member}]. A warning (an even number of votes) wants
+    its code in accept, else 409 HA_AUTO_CONFIRM with the same list. The voter config
+    then goes to every member as pending, and automatic mode is in force once all of
+    them hold it (waiting names them); one that does not take it within ten minutes
+    takes the group back to manual mode. lease_s is the lease length, 15 to 120 s,
+    20 unless given; sent again in automatic mode it changes it.
+
+    mode: manual switches it off, in force once a majority holds the change, or takes a
+    pending switch back. The answer's mode is the group's: auto, with result off, while
+    the change waits for that majority (the leader still holds its lease then, and one
+    that loses it first drops the change); manual once it is through. 409 while it
+    waits, HA_AUTO_NOT_SHIPPED while this release does not offer automatic failover,
+    503 HA_NO_LEASE on an instance that does not hold the lease, 500 when the change
+    could not be written (nothing changed)."""
+    denied = _refuse_confined_admin()
+    if denied:
+        return denied
+    data = _body()
+    want = data.get('mode')
+    if want not in (ha_vote.MODE_AUTO, ha_vote.MODE_MANUAL):
+        return jsonify({'error': 'mode is auto or manual'}), 400
+    lease_s = data.get('lease_s', ha_vote.LEASE_DEFAULT)
+    if isinstance(lease_s, bool) or not isinstance(lease_s, int) \
+            or not ha_vote.LEASE_MIN <= lease_s <= ha_vote.LEASE_MAX:
+        return jsonify({'error': ha.LEASE_RANGE_ERROR}), 400
+    accept = data.get('accept') if isinstance(data.get('accept'), list) else []
+    accept = [code for code in accept if isinstance(code, str)][:32]
+    if want == ha_vote.MODE_AUTO and not ha_vote.AUTO_MODE_SHIPPED:
+        return jsonify({'code': 'HA_AUTO_NOT_SHIPPED', 'error': ha_vote.NOT_SHIPPED_ERROR}), 409
+    if ha.role() != ha.ROLE_ACTIVE:
+        return jsonify({'code': 'HA_STANDBY',
+                        'error': 'Automatic failover is switched on the leader of a group'}), 409
+    now = ha.mode()
+    if want == ha_vote.MODE_MANUAL and now == ha_vote.MODE_MANUAL:
+        return jsonify({'error': 'This group is in manual mode'}), 409
+    denied = _refuse_without_reauth('switching automatic failover')
+    if denied:
+        return denied
+    try:
+        if want == ha_vote.MODE_MANUAL:
+            done = ha.switch_auto_off()
+            log_audit(_user(), 'ha.mode_changed',
+                      'automatic failover switched off, in force once a majority of the members '
+                      'holds the change' if done == 'off'
+                      else 'the pending switch to automatic failover taken back')
+            return jsonify({'success': True, 'mode': ha.mode(), 'result': done})
+        if now == ha_vote.MODE_AUTO:
+            changed = ha.set_lease_seconds(lease_s)
+            if changed:
+                log_audit(_user(), 'ha.mode_changed', f'lease length set to {lease_s} s')
+            return jsonify({'success': True, 'mode': now, 'lease_s': lease_s, 'changed': changed})
+        waiting = ha.switch_auto_on(lease_s, accept)
+    except ha.AutoRefused as e:
+        return jsonify({'code': 'HA_AUTO_CONFIRM' if e.confirm else 'HA_AUTO_REFUSED',
+                        'error': str(e), 'findings': e.findings}), 409
+    except ha.NoLease as e:
+        return no_lease_refusal() or (jsonify({'code': 'HA_NO_LEASE', 'error': str(e)}), 503)
+    except ha.StateNotWritten as e:
+        return jsonify({'error': str(e)}), 500
+    except ha.HaError as e:
+        return jsonify({'error': str(e)}), 409
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Could not switch the mode')}), 500
+    log_audit(_user(), 'ha.mode_changed',
+              f"switch to automatic failover started (lease {lease_s} s, waiting for "
+              f"{len(waiting)} member(s){', accepted: ' + ', '.join(accept) if accept else ''})")
+    return jsonify({'success': True, 'mode': ha.mode(), 'lease_s': lease_s, 'waiting': waiting})
+
+
+@bp.route('/api/ha/timezone', methods=['PUT'])
+@require_auth(roles=[ROLE_ADMIN])
+def set_timezone():
+    """The time zone the group's schedules are evaluated in, on the leader.
+
+    Members may run in different zones. Scheduled actions, scheduled tasks, snapshot
+    policies and scheduled updates fire by the wall time of this zone on whichever
+    member leads, so a failover does not shift them. timezone is an IANA name
+    (Europe/Vienna). A group formed on this release starts with the zone of the
+    instance that formed it; one formed before has none until it is set here, and each
+    instance goes by its own zone until then. The members take it with their next
+    sync, which they are asked for right away. The last-run stamps of the schedules
+    move to the new zone first; 500 when they could not be moved or the zone not be
+    saved, and the zone stays as it was then. 400 for a name this instance does not
+    know, or when it has no time zone data at all. No password: it decides when a
+    schedule fires, not which instance acts."""
+    denied = _refuse_confined_admin()
+    if denied:
+        return denied
+    name = _str(_body().get('timezone'), 100)
+    if not name:
+        return jsonify({'error': 'timezone is the name of a time zone, like Europe/Vienna'}), 400
+    if ha.role() != ha.ROLE_ACTIVE:
+        return jsonify({'code': 'HA_STANDBY',
+                        'error': "The group's time zone is set on the leader of a group"}), 409
+    before = ha.group_timezone()
+    try:
+        changed = ha.set_group_timezone(name)
+    except ha.NoLease:
+        return no_lease_refusal() or (jsonify({'code': 'HA_NO_LEASE', 'error': ha.NO_LEASE_ERROR}), 503)
+    except ha.StateNotWritten as e:
+        return jsonify({'error': str(e)}), 500
+    except ha.HaError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Could not save the time zone')}), 500
+    if changed:
+        log_audit(_user(), 'ha.timezone_changed',
+                  f"schedules are evaluated in {name} from now on (was {before or 'the zone of each instance'})")
+        # the HA routes tell nobody by themselves (app.py)
+        ha.nudge_members()
+    return jsonify({'success': True, 'timezone': name, 'changed': changed})
 
 
 @bp.route('/api/ha/settings', methods=['PUT'])
@@ -1071,8 +1327,8 @@ def _peer_body_limit():
     app makes on a Content-Length; its cap is set here, on the active, and only for a
     call whose headers are signed by a member we hold a key of, over the digest of the
     body to come. Everything else is a few bytes."""
-    if (request.method == 'POST' and request.path == ha.FORWARD_PATH and ha.is_active()
-            and signed_member_call()):
+    if (request.method == 'POST' and request.path == ha.FORWARD_PATH
+            and ha.role() == ha.ROLE_ACTIVE and signed_member_call()):
         return _MAX_FORWARD_ENVELOPE
     return _MAX_PEER_BODY
 
@@ -1139,13 +1395,25 @@ def peer_pair():
     No session and no peer header: the pairing code in the body authenticates the
     call and is spent by it. The standby sends its Ed25519 public key (public_key).
     The field key, our own public key, the member list and the removed members go
-    back sealed with a key derived from that code."""
+    back sealed with a key derived from that code, and the group's mode when it is
+    not manual. The code is looked at first: a wrong one gets 403 on every instance,
+    whatever the group does. With the right one, 503 HA_NO_LEASE in an automatic group
+    on an instance a majority did not just confirm, and 403 for an instance that holds
+    a vote there and would lose it by pairing again."""
     ip = get_client_ip()
     if not _pair_attempts.allow(ip):
         resp = jsonify({'error': 'Too many pairing attempts - wait a few minutes'})
         resp.headers['Retry-After'] = '300'
         return resp, 429
     data = _body()
+    if not ha.pairing_code_ok(_str(data.get('code'))):
+        # first, and the same on every instance: whoever holds no code learns nothing
+        # about the group from this route, and costs its leader no round
+        logging.warning(f"[HA] pairing attempt from {ip} refused: {ha.PAIRING_CODE_ERROR}")
+        return jsonify({'error': ha.PAIRING_CODE_ERROR}), 403
+    if ha.lease_in_force() and not ha.confirm_lease():
+        # an automatic group: only the instance a majority just confirmed takes a member
+        return no_lease_refusal() or (jsonify({'code': 'HA_NO_LEASE', 'error': ha.NO_LEASE_ERROR}), 503)
     # not cut here: core refuses an over-long address instead of pairing a shortened one
     standby_url = _str(data.get('url'), 4096)
     try:
@@ -1173,8 +1441,11 @@ def peer_status():
     _p, refused = _peer_or_refuse()
     if refused:
         return refused
-    return jsonify(dict({'instance_id': ha.instance_id(), 'role': ha.role(), 'epoch': ha.epoch(),
-                         'group': ha.GROUP_MARK, 'serving': ha.serving()}, **ha.peer_cv()))
+    out = dict({'instance_id': ha.instance_id(), 'role': ha.role(), 'epoch': ha.epoch(),
+                'group': ha.GROUP_MARK, 'serving': ha.serving()}, **ha.peer_cv())
+    if ha_vote.AUTO_MODE_SHIPPED:
+        out.update(ha.peer_lease_status())
+    return jsonify(out)
 
 
 def _if_none_match():
@@ -1272,7 +1543,9 @@ def peer_snapshot():
     _p, refused = _peer_or_refuse()
     if refused:
         return refused
-    if ha.role() != ha.ROLE_ACTIVE:
+    if ha.role() != ha.ROLE_ACTIVE or not ha.holds_lease():
+        # in an automatic group only the instance that holds the lease hands out the
+        # configuration: what a leader without one holds may be behind
         body = {'error': 'This instance is not active'}
         hint = ha.follow_hint()
         if hint:
@@ -1302,14 +1575,19 @@ def peer_snapshot():
 @bp.route('/api/ha/peer/step-down', methods=['POST'])
 def peer_step_down():
     """A member is active under a newer epoch, or under ours with the higher instance
-    id. We become its standby and restart; anything else changes nothing."""
+    id. We become its standby and restart; anything else changes nothing.
+    holds_lease: true is the leader of an automatic group, which holds its lease at
+    that epoch: an active made by hand next to it steps down at an epoch as high as
+    ours too, whatever the instance ids say (a majority renews that leader)."""
     p, refused = _peer_or_refuse()
     if refused:
         return refused
-    new_epoch = _peer_body().get('epoch')
+    data = _peer_body()
+    new_epoch = data.get('epoch')
     if ha._epoch_value(new_epoch, low=1) is None:
         return jsonify({'error': 'epoch must be a positive whole number'}), 400
-    changed = ha.step_down(new_epoch, p['instance_id'])
+    holds = data.get('holds_lease') is True and ha_vote.AUTO_MODE_SHIPPED
+    changed = ha.step_down(new_epoch, p['instance_id'], holds_lease=holds)
     if changed:
         log_audit('system', 'ha.stepped_down',
                   f"peer {p.get('url') or p['instance_id']} is active with epoch {new_epoch}",
@@ -1409,6 +1687,95 @@ def peer_changed():
     return jsonify({'success': True, 'pull': taken})
 
 
+# --- automatic failover, between the members -------------------------------------------
+
+def _lease_call(p, kind):
+    if not p.get('keyed'):
+        # a member that still goes by its old secret signs nothing, and a vote rests
+        # on who asked for it
+        return jsonify({'code': 'HA_LEASE_UNSIGNED',
+                        'error': 'Only a member that signs its calls votes or renews'}), 401
+    return jsonify(ha.lease_request(p['instance_id'], kind, _peer_body()))
+
+
+@bp.route('/api/ha/peer/vote', methods=['POST'])
+def peer_vote():
+    """A member asks for this instance's vote, or (pre: true) whether it would get it.
+
+    The body is {epoch, candidate, pre, why, cv, cfg_id, lease_s} and, when this voter
+    may lack them, the voter configs it is missing (chain). The answer is always 200
+    with {granted, ok, reason, epoch, cv, cfg_id, gen}: a real vote is on disk before
+    it is granted, a pre-vote changes nothing. reason says why not: MODE_MANUAL (this
+    group, or this member, is not in automatic mode; cfg_id [0, 0] and gen 0 from a
+    member that holds no voter config at all), NOT_SHIPPED (this release does
+    not offer it), NOT_CANDIDATE, TERM, PROMISED (a leader holds this voter's promise),
+    HOLD_AFTER_START (this process started less than a lease ago), OLD_CFG, STALE
+    (this voter holds a newer configuration, named in fresher), LEADER, GONE.
+    These calls have a replay cache of their own, apart from the other peer calls."""
+    p, refused = _peer_or_refuse()
+    if refused:
+        return refused
+    return _lease_call(p, 'vote')
+
+
+@bp.route('/api/ha/peer/renew', methods=['POST'])
+def peer_renew():
+    """The leader of an automatic group renews its lease with this member.
+
+    The body is {epoch, leader, lease_s, cv, wall, floor_cv}, the voter configs this
+    member lacks (chain), leader_cv and leader_cv_at (where the leader's configuration
+    is at), hold_s for a planned restart, and switch: true while a switch to automatic
+    mode is pending. The answer is always 200 with {ok, reason, epoch, cv, cfg_id,
+    gen}. A member that takes it promises the leader its vote for the length of the
+    lease and pulls from it from then on; a higher epoch than its own is on disk
+    before the answer. reason says why not: MODE_MANUAL (with cfg_id [0, 0] and gen 0
+    from a member that holds no voter config at all), NOT_SHIPPED, OLD_EPOCH, NOT_VOTER
+    (the sender is no data voter of the config held here), PROMISED (holder: the
+    leader this voter renewed in this very term), MODE_AUTO (a switch round to a
+    member that is in automatic mode already), CFG_GAP or BAD_CFG (the voter configs
+    do not follow the ones held here), GONE. The answer to a switch round names the
+    config held here by its digest (cfg_digest). A switch round with taken_back: true
+    comes from a member that started a switch and took it back as it stopped leading:
+    a member that holds its pending config takes the manual one, every other answers
+    NOT_PENDING and takes nothing."""
+    p, refused = _peer_or_refuse()
+    if refused:
+        return refused
+    return _lease_call(p, 'renew')
+
+
+@bp.route('/api/ha/peer/fingerprint', methods=['POST'])
+def peer_fingerprint():
+    """A member says which certificate pin reaches it from now on: fingerprint, the
+    SHA-256 fingerprint of its certificate, or '' for one a CA signed.
+
+    Its self-signed certificate was made anew, or it changed between a self-signed and
+    a CA certificate; the pin held here would refuse every call to it. Taken only from
+    the member itself, on its signature under the key held here. changed says whether
+    the pin held here is another one now. Part of automatic failover, whose members
+    announce it: 409 HA_AUTO_NOT_SHIPPED while this release does not offer that, and
+    the pin stays the one taken at pairing."""
+    p, refused = _peer_or_refuse()
+    if refused:
+        return refused
+    if not p.get('keyed'):
+        return jsonify({'code': 'HA_LEASE_UNSIGNED',
+                        'error': 'Only a member that signs its calls announces a pin'}), 401
+    if not ha_vote.AUTO_MODE_SHIPPED:
+        return jsonify({'code': 'HA_AUTO_NOT_SHIPPED', 'error': ha_vote.NOT_SHIPPED_ERROR}), 409
+    try:
+        changed = ha.take_fingerprint(p['instance_id'], _peer_body().get('fingerprint'))
+    except ha.HaError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Could not save the pin')}), 500
+    if changed:
+        log_audit('system', 'ha.fingerprint_changed',
+                  f"member {p.get('url') or p['instance_id']} announced a new certificate pin",
+                  ip_address=get_client_ip())
+    return jsonify({'success': True, 'changed': changed})
+
+
 # --- forwarded writes, the active's half ---------------------------------------------
 
 @bp.route('/api/ha/peer/forward', methods=['POST'])
@@ -1419,7 +1786,9 @@ def peer_forward():
     client_ip}, the browser's request as the standby took it, and the peer signature
     covers it like the body of every peer call: neither the request nor the user can
     change on the way. Only on the active (409 anywhere else, which also stops a write
-    that would travel on), only from a member that signs its calls, only a write under
+    that would travel on; 503 HA_NO_LEASE on a leader without its lease, said to a
+    member before the body is read), only from a member that signs its calls, only a
+    write under
     /api/ and never under /api/ha/ - or a GET of ha.FORWARDED_READS, the progress of a
     job or a view only our tables hold, or of a plugin route that opens no console -
     and only for an account that exists and is enabled here. sign_in is the
@@ -1430,6 +1799,13 @@ def peer_forward():
     request: role, tenant and permissions are ours, whatever the standby thinks of
     them. Its audit lines name the standby and carry the client address the standby
     saw. The answer is {status, headers, body_b64}."""
+    if ha.role() == ha.ROLE_ACTIVE and signed_member_call():
+        # a leader without its lease, asked by a member (its signature over the headers
+        # is good): said before the body is read, however large that is, and no nonce
+        # is spent on it
+        refused = no_lease_refusal()
+        if refused:
+            return refused
     p, refused = _peer_or_refuse()
     if refused:
         return refused
@@ -1439,6 +1815,9 @@ def peer_forward():
                         'error': 'Only a member that signs its calls can hand over a change'}), 401
     if ha.role() != ha.ROLE_ACTIVE:
         return jsonify({'code': 'HA_STANDBY', 'error': 'This instance is not active'}), 409
+    refused = no_lease_refusal()
+    if refused:
+        return refused
     call, bad = _forward_envelope(_peer_body())
     if bad:
         return jsonify({'code': 'HA_FORWARD_INVALID', 'error': bad}), 400

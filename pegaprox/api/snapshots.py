@@ -219,7 +219,9 @@ def _is_due(policy, now=None):
     """Check whether the policy should fire right now. Idempotent: also reads
     last_run_at to avoid double-fires when the scheduler wakes during the
     same minute."""
-    now = now or datetime.now()
+    # the group's zone when this instance is in one, so a failover does not shift a
+    # schedule; datetime.now() on an instance of its own (#625)
+    now = now or ha.schedule_now()
     last_run = policy['last_run_at']
     last_dt = None
     if last_run:
@@ -364,7 +366,7 @@ def _execute_policy(policy_id, force=False):
     if policy['schedule'] == 'once':
         try:
             c.execute("UPDATE snapshot_policies SET last_run_at=? WHERE id=?",
-                      (datetime.now().isoformat(), policy_id))
+                      (ha.schedule_now().isoformat(), policy_id))
             db.conn.commit()
         except Exception:
             pass
@@ -514,8 +516,10 @@ def _execute_policy(policy_id, force=False):
                  WHERE id=?''',
               (status, finished_at, '\n'.join(log_lines), summary,
                created, failed, pruned_total, run_id))
+    # last_run_at is what _is_due counts from, on the same clock as its `now`
     c.execute('''UPDATE snapshot_policies SET last_run_at=?, last_run_status=? WHERE id=?''',
-              (finished_at, status, policy['id']))
+              (ha.schedule_now().isoformat() if ha.group_timezone() else finished_at,
+               status, policy['id']))
     db.conn.commit()
 
     try:

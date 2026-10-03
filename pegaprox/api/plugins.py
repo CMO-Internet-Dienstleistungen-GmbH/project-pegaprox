@@ -309,6 +309,18 @@ def follow_synced_state():
 
 
 def start_plugin_backgrounds():
+    # MK Oct 2026 (#625) - automatic failover: a plugin's background task asks nobody,
+    # so it starts only where this instance may act. In the leader's process that may
+    # not act yet (the takeover wait) it starts once it may; on a leader on disk whose
+    # process is not the acting one (no lease state to run) it does not start at all.
+    # In a manual group nothing changes: main() calls this on no standby
+    from pegaprox.core import ha
+    if not ha.is_active():
+        if ha.acting_process():
+            ha.when_active(start_plugin_backgrounds, 'plugin-backgrounds')
+        else:
+            logging.warning("[PLUGINS] background tasks not started: this instance may not act")
+        return
     # snapshot under lock to avoid "dictionary changed size during iteration"
     with _plugin_lock:
         plugins_snapshot = list(_loaded_plugins.items())

@@ -47,6 +47,10 @@ ADMIN_ROUTES = [
     ('put', f'/api/ha/members/{B_ID}/serve', {'serve': True}),
     ('post', f'/api/ha/orphans/{ORPHAN}/download', {'user_password': ADMIN_PW}),
     ('post', f'/api/ha/orphans/{ORPHAN}/dismiss', {'confirm': True}),
+    # automatic failover and the group's time zone (tests/test_ha_lease_routes.py)
+    ('put', '/api/ha/mode', {'mode': 'auto', 'user_password': ADMIN_PW}),
+    ('post', f'/api/ha/members/{B_ID}/readmit', {'user_password': ADMIN_PW}),
+    ('put', '/api/ha/timezone', {'timezone': 'Europe/Vienna'}),
 ]
 PEER_ROUTES = [
     ('POST', '/api/ha/peer/pair'),
@@ -58,6 +62,9 @@ PEER_ROUTES = [
     ('POST', '/api/ha/peer/tombstones'),
     ('POST', '/api/ha/peer/forward'),
     ('POST', '/api/ha/peer/changed'),
+    ('POST', '/api/ha/peer/vote'),
+    ('POST', '/api/ha/peer/renew'),
+    ('POST', '/api/ha/peer/fingerprint'),
 ]
 # what the self-fence agent of a node asks; no session, keyed with the cluster's agent
 # token (tests/test_ha_agent_script.py)
@@ -344,6 +351,9 @@ def test_an_admin_reaches_every_route(ha_env, seed):
         f'/api/ha/members/{B_ID}/serve': 409,   # not the leader
         f'/api/ha/orphans/{ORPHAN}/download': 404,  # no such copy
         f'/api/ha/orphans/{ORPHAN}/dismiss': 404,
+        '/api/ha/mode': 409,                        # not offered by this release yet
+        f'/api/ha/members/{B_ID}/readmit': 409,     # a manual group quarantines nobody
+        '/api/ha/timezone': 409,                    # not the leader of a group
     }
     for method, path, body in ADMIN_ROUTES:
         r = _send(c, method, path, body)

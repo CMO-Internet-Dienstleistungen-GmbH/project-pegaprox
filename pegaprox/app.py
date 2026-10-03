@@ -513,9 +513,21 @@ def create_app():
         if (request.method, rule) in _STANDBY_LOCAL_WRITES:
             return None
         from pegaprox.core import ha
-        if not ha.is_standby():
-            return None
         view_args = request.view_args or {}
+        if not ha.is_standby():
+            if ha.is_active():
+                return None
+            # MK Oct 2026 (#625) - automatic failover: this instance leads and holds no
+            # lease right now (it ran out, or the takeover wait is on). A change taken now
+            # might be one the next leader never sees. The consoles stay: they are the
+            # user's, on the instance the browser is on.
+            if (request.method, rule) in _STANDBY_CONSOLES or (
+                    plugin_call and view_args.get('subpath') in _PLUGIN_CONSOLE_PATHS):
+                return None
+            # never None: is_active() said no, and a second look at the state may find a
+            # standby by now, which would wave the write through
+            from pegaprox.api.ha import write_gate_refusal
+            return write_gate_refusal()
         if plugin_call and view_args.get('subpath') in _PLUGIN_CONSOLE_PATHS:
             # never forwarded: the browser connects to the instance that opened it. Where
             # consoles open, only for a plugin the leader runs as well - one switched off
@@ -1252,6 +1264,9 @@ def main(debug_mode=False):
     # An unreachable peer changes nothing: every acting loop started below checks
     # ha.is_active() on each tick, so it stops the moment the ha loop steps us down.
     # The markers go first: a member whose state file is gone comes up passive.
+    # In an automatic group the same call asks for the lease instead (ha.lease_boot): a
+    # leader on disk renews with its majority here or goes on as a standby, and what
+    # starts once below goes by ha.acting_process().
     _ha_markers = ha.check_markers_at_boot()
     if _ha_markers == 'missing':
         print("HA state file missing on a group member - staying passive until it is restored or unpaired")

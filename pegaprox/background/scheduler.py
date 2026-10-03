@@ -138,7 +138,9 @@ def run_scheduled_tasks():
     Supported actions: start, stop, restart, snapshot, backup
     """
     config = load_scheduled_tasks()
-    current_time = datetime.now()
+    # the group's zone when this instance is in one, so a failover does not shift a
+    # schedule; datetime.now() on an instance of its own (#625)
+    current_time = ha.schedule_now()
     
     for task in config.get('tasks', []):
         if not task.get('enabled', True):

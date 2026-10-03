@@ -4390,7 +4390,13 @@ class PegaProxManager:
         # managers do start with the live view (#625 v2) and call this from start()
         # when the synced row says ha_enabled, so this is the lock on that door.
         if not ha.is_active():
-            self.logger.info("HA monitor not started - this PegaProx instance is a standby")
+            if ha.acting_process():
+                # automatic failover: this process leads and may not act yet (the
+                # takeover wait). The monitor starts once it may; before S3 it never
+                # started on a new leader at all
+                ha.when_active(self.start_ha_monitor, 'ha-monitor-start')
+            else:
+                self.logger.info("HA monitor not started - this PegaProx instance is a standby")
             return
         # start HA thread
         if self.ha_thread and self.ha_thread.is_alive():
@@ -4525,6 +4531,11 @@ class PegaProxManager:
         while self.ha_enabled and not self.stop_event.is_set():
             # stepped down to standby (#625): nothing more from here, the restart follows
             if not ha.is_active():
+                if ha.acting_process():
+                    # automatic failover: still the leader's process, the lease is just
+                    # not there this moment. It waits; a lease that is lost ends it
+                    time.sleep(1)
+                    continue
                 self.logger.warning("[HA] HA monitor ends - this PegaProx instance is a standby now")
                 break
             try:

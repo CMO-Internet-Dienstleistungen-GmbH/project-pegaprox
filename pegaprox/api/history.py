@@ -11,6 +11,7 @@ from pegaprox.constants import *
 from pegaprox.globals import *
 from pegaprox.models.permissions import *
 from pegaprox.core.db import get_db
+from pegaprox.core import ha
 
 from pegaprox.utils.auth import require_auth
 from pegaprox.utils.audit import log_audit
@@ -120,7 +121,8 @@ def run_scheduled_task_now(task_id):
     for task in config['tasks']:
         if task['id'] == task_id:
             execute_scheduled_task(task)
-            task['last_run'] = datetime.now().isoformat()
+            # the scheduler compares this stamp with the group's clock, not the host's (#625)
+            task['last_run'] = ha.schedule_now().isoformat()
             save_scheduled_tasks(config)
             return jsonify({'success': True, 'message': f"Task '{task['name']}' executed"})
     

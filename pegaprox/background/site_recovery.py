@@ -1154,7 +1154,12 @@ def start_heartbeat():
     # before the heartbeat starts so the UI doesn't keep showing aborted runs
     # as active.
     try:
-        recover_orphan_runs()
+        if ha.acting_process() and not ha.is_active():
+            # MK Oct 2026 (#625) - automatic failover: this process leads and may not
+            # act yet (the takeover wait). The reset writes plan rows, so it waits
+            ha.when_active(recover_orphan_runs, 'sr-orphan-cleanup')
+        else:
+            recover_orphan_runs()
     except Exception as e:
         logger.error(f"[SR] orphan-cleanup wrapper crashed: {e}")
     gevent.spawn(heartbeat_loop)

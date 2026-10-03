@@ -30,12 +30,25 @@ The rules, in the words of the design:
     leader that shortens the lease cuts its own lease to the new length at once
   * a leader that hands its term on writes that down before it lets go, and comes back
     from a crash as a standby
+  * a renewal is taken from a data voter of the voter config held, and from one leader
+    per term: a second member that renews in a term gets nothing from a voter whose
+    promise to the first still runs, and a leader that hears one leaves
+  * a round of a switch between the modes carries a config and never a lease. A member
+    in automatic mode refuses it, and the switch counts a member only on its ack of
+    the pending config, named by digest: where two chains meet in one group, the ids
+    of one say nothing about the other
+  * a config is committed once a majority holds it by digest, as every answer names
+    it. A leader that hears of a config of its own term it does not hold leaves (its
+    state went back), and one that leaves before its switch back to manual mode was
+    committed drops that config: the group stays automatic
+  * a manual active that takes an automatic config from a vote request is a standby
+    from that write on
 
 This module is the protocol and nothing else. It imports neither Flask, the database
 nor requests: a Node reads the time from the clock it is handed, sends through the
 transport it is handed and writes its state through the store it is handed. ha.py
-will drive it; tests/test_ha_vote_sim.py drives it in a simulator with a clock per
-member, directed cuts, pauses and restarts. Nothing calls it yet, and
+drives it (its section "automatic failover"); tests/test_ha_vote_sim.py drives it in a
+simulator with a clock per member, directed cuts, pauses and restarts.
 AUTO_MODE_SHIPPED keeps automatic mode off until the confirm sites, the cluster claim
 and the transfer routes are in.
 
@@ -585,6 +598,8 @@ class Node:
         self.allow = None
         self.heard_at = None
         self.leader_seen = None
+        # (epoch, member) of the renewal this voter last took: one leader per term
+        self._renewed = None
         self.max_leader_cv = None
         self.max_leader_wall = None
         self.epoch_seen = self.st['epoch']
@@ -596,6 +611,9 @@ class Node:
         self._waiters = []
         self._cfg_seen = {}
         self._cfg_seen_at = {}
+        # member -> (digest of the config it said it holds, start of that round): what
+        # a commit counts, never the id alone
+        self._held = {}
         self._cv_seen = {}
         self._acked_at = {}
         self._gens = {}
@@ -605,6 +623,9 @@ class Node:
         self.floor = self.st['floor_cv'] or ZERO
         self.transfer = None
         self.switch = None
+        # member -> (digest of the config it holds, whether it acked), from the answers
+        # to switch rounds only
+        self._switch_said = {}
         self._booting = None
         self._jump_at = -_INF
         self._watch_last = None
@@ -672,6 +693,7 @@ class Node:
 
     def _set_view(self):
         self.view = CfgView(self._chain[-1])
+        self._digest = cfg_digest(self._chain[-1])
         self._prev_view = CfgView(self._chain[-2]) if len(self._chain) > 1 else None
         self.t = Timings(self.view.lease_s, self.keep_w_take)
         # never goes down in a process, even when a branch drops a config from the chain
@@ -770,10 +792,25 @@ class Node:
         self._acting = False
         self.lease_until = min(self.lease_until, now)
         self._fail_waiters()
-        self._save(role=ROLE_STANDBY, campaign_after={'boot_id': self.boot_id, 'started': self.started,
-                                                      'at': now + self.t.lost_lease_backoff})
+        dropped = self._switch_off_dropped()
+        if self._save(chain=dropped, role=ROLE_STANDBY,
+                      campaign_after={'boot_id': self.boot_id, 'started': self.started,
+                                      'at': now + self.t.lost_lease_backoff}) and dropped:
+            self._event('switch_off_dropped', epoch=self.st['epoch'])
         self._event('boot_standby', why=why)
         self._arm_timer(now)
+
+    def _switch_off_dropped(self):
+        """The chain a leader leaves its lead with, None when it keeps the one it holds.
+        A switch back to manual mode that it made and never saw a majority take is not
+        the group's mode (4.13): kept, it would make this instance one that is promoted
+        by hand next to the leader the others elect. Where a majority took it all the
+        same, its voters hand it back with their answer to the next vote."""
+        v = self.view
+        if (self.st['role'] == ROLE_LEADER and v.mode == MODE_MANUAL and v.cfg.get('by') == self.me
+                and len(self._chain) > 1 and not self._is_committed()):
+            return self._chain[:-1]
+        return None
 
     # --- the host's entry points ---
 
@@ -857,14 +894,19 @@ class Node:
                 self.epoch_seen = e
         r = self._rounds.get(tag)
         if r is None or r.done:
-            # late: an answer with a higher epoch still ends a leadership (4.7)
+            # late: an answer with a higher epoch still ends a leadership (4.7), and so
+            # does one that names a config of our term we do not hold
             if ans is not None and self.st['role'] == ROLE_LEADER and self.lease_mode():
                 e = ans.get('epoch')
-                if _is_epoch(e) and e > self.st['led']['epoch']:
+                led = self.st['led']['epoch']
+                why = f'epoch {e} seen' if _is_epoch(e) and e > led else ''
+                if not why and (r is None or r.kind != 'switch'):
+                    why = self._ahead_of_me(ans, led)
+                if why:
                     if self._booting is not None:
-                        self._boot_failed(now, f'epoch {e} seen at boot')
+                        self._boot_failed(now, f'{why} at boot')
                     else:
-                        self._step_down(now, f'epoch {e} seen')
+                        self._step_down(now, why)
             return
         if r.kind in ('renew', 'boot', 'release', 'switch'):
             self._renew_answer(r, frm, ans, now)
@@ -881,7 +923,8 @@ class Node:
 
     def _base(self):
         st = self.st
-        return {'epoch': st['epoch'], 'cv': st['cv'], 'cfg_id': self.view.id, 'gen': st['gen']}
+        return {'epoch': st['epoch'], 'cv': st['cv'], 'cfg_id': self.view.id, 'gen': st['gen'],
+                'cfg_digest': self._digest}
 
     def _no(self, reason, **extra):
         ans = self._base()
@@ -984,10 +1027,19 @@ class Node:
         except CfgRefused as e:
             return self._no(e.code)
         view = CfgView(chain[-1]) if chain else self.view
+        # a manual active that learns from a vote request that its group fails over
+        # automatically is a standby from that write on, whatever it answers (4.10): an
+        # active with an automatic config and no lead would neither act nor follow
+        leaves = (not pre and chain is not None and self.st['role'] == ROLE_ACTIVE
+                  and view.mode == MODE_AUTO)
         reason = self._vote_rules(frm, T, pre, why, body, view, now)
         if reason:
             if chain and not pre:
-                self._save(chain=chain)
+                if leaves:
+                    if self._save(chain=chain, role=ROLE_STANDBY):
+                        self._left_by_hand(frm)
+                else:
+                    self._save(chain=chain)
             return self._vote_no(reason, body)
         if pre:
             return dict(self._base(), ok=True, granted=True, reason='')
@@ -995,7 +1047,8 @@ class Node:
         # it; a failed write is no vote. A leader handing its term on promises nothing
         until = now + 1.1 * max(self._asked_lease(body), view.lease_s)
         promised = -_INF if self.st['role'] == ROLE_LEADER else until
-        if not self._save(chain=chain, epoch=T, voted_for=frm, promised=promised):
+        changes = {'role': ROLE_STANDBY} if leaves else {}
+        if not self._save(chain=chain, epoch=T, voted_for=frm, promised=promised, **changes):
             return self._no('WRITE_FAILED')
         by_allowance = self._allowance(frm, T, now)
         self.allow = None
@@ -1011,8 +1064,18 @@ class Node:
         if self._campaign is not None:
             self._end_campaign()
         self._arm_timer(now)
-        return dict(self._base(), ok=True, granted=True, reason='',
-                    max_leader_cv=self.max_leader_cv)
+        ans = dict(self._base(), ok=True, granted=True, reason='', max_leader_cv=self.max_leader_cv)
+        if leaves:
+            self._left_by_hand(frm)
+        return ans
+
+    def _left_by_hand(self, frm):
+        # what this process started as an active must not outlive the role
+        why = f'member {frm} asks for votes: the group fails over automatically'
+        self._acting = False
+        self._fail_waiters()
+        self._event('step_down', why=why, by_hand=True)
+        self._exit(why)
 
     @staticmethod
     def _asked_lease(body):
@@ -1036,9 +1099,21 @@ class Node:
             return self._no('BAD_REQUEST')
         st = self.st
         role = st['role']
+        # a round of a switch between the modes (4.13): it carries a config, never a lease.
+        # Its answer names the config held here by digest, which is what the sender
+        # counts; an id alone says nothing where two chains meet
+        switch = body.get('switch') is True
         if role == ROLE_LEADER and self.lease_mode():
-            if T <= st['led']['epoch']:
+            led = st['led']['epoch']
+            if T < led:
                 return self._no('OLD_EPOCH')
+            if T == led:
+                if switch:
+                    return self._no('MODE_AUTO', cfg_digest=self._digest)
+                if frm not in self.view.data:
+                    return self._no('NOT_VOTER')
+                # a term has one leader. Another data voter that renews in ours means
+                # the group has two: this one leaves, and the voters elect again
             if self._booting is None:
                 self._step_down(now, f'renewal at epoch {T}')
                 return self._no('GONE')
@@ -1059,10 +1134,24 @@ class Node:
         if view.mode != MODE_AUTO:
             if chain and not self._save(chain=chain):
                 return self._no('WRITE_FAILED')
+            said = {'cfg_digest': self._digest} if switch else {}
             if view.mode == MODE_PENDING and view.cfg.get('by') == frm:
                 # an ack of the switch, nothing more: no promise, no vote
-                return dict(self._base(), ok=True)
-            return self._no('MODE_MANUAL')
+                return dict(self._base(), ok=True, **said)
+            return self._no('MODE_MANUAL', **said)
+        if switch:
+            # this member is in automatic mode already: whoever switches is not switching
+            # the group it is in. Nothing is taken from the call, no config, no term
+            return self._no('MODE_AUTO', cfg_digest=self._digest)
+        if frm not in view.data:
+            # only a data voter of the config held here can have won a term
+            return self._no('NOT_VOTER')
+        if (T == st['epoch'] and self._renewed is not None and self._renewed[0] == T
+                and self._renewed[1] != frm and self.promise_to == self._renewed[1]
+                and self._promise_live(now)):
+            # the promise this voter holds is to the leader whose renewal it took in this
+            # very term. A second member renewing in it gets nothing
+            return self._no('PROMISED', holder=self.promise_to)
         changes = {}
         if T > st['epoch']:
             changes['epoch'] = T
@@ -1097,6 +1186,7 @@ class Node:
             self.max_leader_wall = body.get('wall')
         self.heard_at = now
         self.leader_seen = frm
+        self._renewed = (T, frm)
         if self._campaign is not None and self._campaign.epoch <= T + 1:
             self._end_campaign()
         self._arm_timer(now)
@@ -1379,6 +1469,17 @@ class Node:
         self._event('round', tag=r.tag, kind=kind, epoch=led_epoch)
         return r
 
+    def _ahead_of_me(self, ans, epoch):
+        """Why this leader is not the one its members follow, '' when it is: an answer
+        names a voter config of the term it leads that it does not hold. Only the leader
+        of a term makes configs of it, so its state file went back (a backup put back,
+        a VM snapshot reverted), or a second chain exists. Whatever it would make from
+        here has an id its members passed already."""
+        cid = pair(ans.get('cfg_id'))
+        if cid is not None and cid > self.view.id and cid[0] >= epoch:
+            return f'a member holds voter config {list(cid)}, newer than the {list(self.view.id)} held here'
+        return ''
+
     def _renew_answer(self, r, frm, ans, now):
         r.answered.add(frm)
         if ans is not None:
@@ -1387,9 +1488,18 @@ class Node:
                 if self._booting is not None:
                     return self._boot_failed(now, f'epoch {e} seen at boot')
                 return self._step_down(now, f'epoch {e} seen')
+            why = self._ahead_of_me(ans, r.epoch) if r.kind != 'switch' else ''
+            if why:
+                if self._booting is not None:
+                    return self._boot_failed(now, why)
+                return self._step_down(now, why)
             cid = pair(ans.get('cfg_id'))
             if cid is not None:
                 self._saw_cfg(frm, cid, r.t0)
+            digest = ans.get('cfg_digest')
+            if isinstance(digest, str) and r.t0 >= self._held.get(frm, ('', -_INF))[1]:
+                # answers cross: one to an older round never replaces what a newer said
+                self._held[frm] = (digest, r.t0)
             cv = pair(ans.get('cv'))
             if cv is not None:
                 self._cv_seen[frm] = cv
@@ -1402,6 +1512,10 @@ class Node:
                 self._acked_at[frm] = r.t0
                 if cv is not None and frm in self.view.data:
                     r.cvs[frm] = cv
+            if r.kind == 'switch':
+                digest = ans.get('cfg_digest')
+                if isinstance(digest, str):
+                    self._switch_said[frm] = (digest, ans.get('ok') is True)
         if r.kind == 'switch':
             if r.answered >= r.targets:
                 self._finish(r, now)
@@ -1539,28 +1653,34 @@ class Node:
             if s not in quarantined and s in v.counting:
                 return self._new_cfg(now, dict(body, quarantined=quarantined + [s]), 'quarantine')
         if self._changes:
-            change = self._changes.pop(0)
+            # off the queue once it is written: a write that failed is tried again
+            change = self._changes[0]
             new = change(body)
             if new is None or body_error(new):
+                self._changes.pop(0)
                 return self._event('change_refused', why=body_error(new) if new else 'no change')
             nxt = {'id': [0, 0], 'body': new}
             if not majorities_intersect(v.cfg, nxt):
                 # one voter in or out per change, or two majorities in a row may miss
                 # each other (I8)
+                self._changes.pop(0)
                 return self._event('change_refused', why='more than one voter at once')
-            return self._new_cfg(now, new, 'change')
+            if self._new_cfg(now, new, 'change'):
+                self._changes.pop(0)
 
     def _new_cfg(self, now, body, why):
+        """Make the next config and write it; False when it is not on disk."""
         prev = self._chain[-1]
         cfg = make_cfg(prev, self.st['led']['epoch'], self.me, body, self.sign)
         if not self._save(chain=self._chain + [cfg]):
-            return
+            return False
         if body['lease_s'] < prev['body']['lease_s']:
             # a shorter lease cuts what this leader holds at once: from here on no lease
             # rests on the old length, even once that config has left every chain
             self.lease_until = min(self.lease_until, now + self._per_round(body['lease_s']))
         self._event('cfg', cfg=cfg, prev=prev, why=why)
         self.next_round_at = min(self.next_round_at, now)
+        return True
 
     def change_cfg(self, change):
         """Queue a change of the voter config: change(body) -> the new body. One at a time,
@@ -1571,22 +1691,40 @@ class Node:
         self.next_round_at = min(self.next_round_at, self.clock())
         return ''
 
+    def readmit(self, voter):
+        """The admin looked at a quarantined voter and takes it back (4.5). What this
+        leader held against it goes with the change, or the next pass would quarantine
+        it again: the generations it saw before, and the suspicion itself."""
+        if self.st['role'] != ROLE_LEADER:
+            return 'NOT_LEADER'
+        if voter not in (self.view.cfg['body'].get('quarantined') or ()):
+            return 'NOT_QUARANTINED'
+        if voter in self._suspects:
+            self._suspects.remove(voter)
+        self._gens.pop(voter, None)
+        return self.change_cfg(lambda body: dict(
+            body, quarantined=[q for q in body.get('quarantined') or () if q != voter]))
+
     def _commit_check(self, now):
         v = self.view
-        if self._is_committed():
-            return
-        prev = self._prev_view
-        if prev is None:
+        if not self._is_committed():
+            prev = self._prev_view
+            if prev is None:
+                self._committed = v.id
+                return
+            # who holds this very config, by its digest: an id says nothing where this
+            # leader's state went back and it made a config under an id its members
+            # passed already
+            holders = {self.me} | {i for i, (digest, _t0) in self._held.items() if digest == self._digest}
+            if len(holders & prev.counting) < prev.m:
+                return
             self._committed = v.id
-            return
-        holders = {self.me} | {i for i, cid in self._cfg_seen.items() if cid >= v.id}
-        if len(holders & prev.counting) < prev.m:
-            return
-        self._committed = v.id
-        self._event('cfg_committed', cfg=v.cfg)
+            self._event('cfg_committed', cfg=v.cfg)
         if v.mode == MODE_MANUAL and self.st['role'] == ROLE_LEADER:
-            # switched off: the role decides again (4.13)
-            self._save(role=ROLE_ACTIVE)
+            # switched off: the role decides again (4.13). A write that fails is tried
+            # again with the next answer, and until it is on disk the lease decides
+            if not self._save(role=ROLE_ACTIVE):
+                return
             self._fail_waiters()
             self._event('manual', epoch=self.st['epoch'])
 
@@ -1649,8 +1787,11 @@ class Node:
         self.lease_until = min(self.lease_until, now)
         self._acting = False
         self._fail_waiters()
-        self._save(role=ROLE_STANDBY, campaign_after={'boot_id': self.boot_id, 'started': self.started,
-                                                      'at': now + self.t.lost_lease_backoff})
+        dropped = self._switch_off_dropped()
+        if self._save(chain=dropped, role=ROLE_STANDBY,
+                      campaign_after={'boot_id': self.boot_id, 'started': self.started,
+                                      'at': now + self.t.lost_lease_backoff}) and dropped:
+            self._event('switch_off_dropped', epoch=self.st['epoch'])
         self._event('step_down', why=why)
         self._exit(why)
 
@@ -1751,14 +1892,35 @@ class Node:
         if not self._save(chain=self._chain + [cfg]):
             return 'WRITE_FAILED'
         self.switch = {'id': pair(cfg['id']), 'until': now + SWITCH_TIMEOUT, 'next': now}
+        self._switch_said = {}
         self._event('switch_pending', cfg=cfg)
+        return ''
+
+    def switch_cancel(self):
+        """Take a pending switch back before every member acked it: the one that runs, or
+        one a restart of this instance left behind (the config on disk is pending, made
+        here, and nothing drives it any more). The members get the manual config again."""
+        now = self.clock()
+        v = self.view
+        if (self.dead or self.st['role'] != ROLE_ACTIVE or v.mode != MODE_PENDING
+                or v.cfg.get('by') != self.me):
+            return 'NOT_PENDING'
+        if self.switch is None:
+            self.switch = {'id': v.id, 'until': now, 'next': now}
+        elif not self.switch.get('cancelled'):
+            self.switch['until'] = now
         return ''
 
     def _switch_tick(self, now):
         s = self.switch
         v = self.view
         E = self.st['epoch']
-        holders = {self.me} | {i for i, cid in self._cfg_seen.items() if cid >= s['id']}
+        # who holds the config this switch is about: by its digest, from an answer to a
+        # round of this switch. The pending one counts only where it was acked - a
+        # refusal holds nothing, whatever config id stands in it
+        cancelled = bool(s.get('cancelled'))
+        holders = {self.me} | {i for i, (digest, ok) in self._switch_said.items()
+                               if digest == self._digest and (ok or cancelled)}
         if s.get('cancelled'):
             # hand the manual config back to whoever took the pending one, then stop
             if holders >= v.members or now >= s['until']:
@@ -1803,7 +1965,8 @@ class Node:
             return 'NOT_LEADER'
         if not self._is_committed():
             return 'BUSY'
-        self._new_cfg(now, dict(v.cfg['body'], mode=MODE_MANUAL), 'switch off')
+        if not self._new_cfg(now, dict(v.cfg['body'], mode=MODE_MANUAL), 'switch off'):
+            return 'WRITE_FAILED'
         return ''
 
     def manual_promote_refusal(self):
