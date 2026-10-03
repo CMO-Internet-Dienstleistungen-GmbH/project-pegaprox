@@ -3566,6 +3566,47 @@ def get_update_status(cluster_id, node_name):
     return jsonify(status if status else {'is_updating': False})
 
 
+# MK Oct 2026 (#625) - what a confined caller does not get of a maintenance, as from
+# updates/status: the guests in it
+_GUEST_FIELDS = ('failed_vms', 'pending_vms', 'current_vm')
+
+
+@bp.route('/api/clusters/<cluster_id>/node-progress', methods=['GET'])
+@require_auth(perms=['cluster.view'])
+def get_node_progress(cluster_id):
+    """The maintenance and the update of every node that has one
+
+    {nodes: {name: {maintenance_mode, maintenance_task, maintenance_acknowledged,
+    is_updating, update_task}}}, the fields /metrics puts on a node. Both run in the
+    process of the instance that started them: a member that forwards reads this on
+    the leader and lays it over the /metrics it reads itself."""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    mgr = cluster_managers[cluster_id]
+    # an ESXi cluster keeps a set here, and runs neither
+    in_maintenance = getattr(mgr, 'nodes_in_maintenance', None)
+    updating = getattr(mgr, 'nodes_updating', None)
+    nodes = {}
+    for name, task in (list(in_maintenance.items()) if isinstance(in_maintenance, dict) else []):
+        nodes[name] = {'maintenance_mode': True, 'maintenance_task': task.to_dict(),
+                       'maintenance_acknowledged': bool(task.acknowledged),
+                       'is_updating': False, 'update_task': None}
+    for name, task in (list(updating.items()) if isinstance(updating, dict) else []):
+        entry = nodes.setdefault(name, {'maintenance_mode': False, 'maintenance_task': None,
+                                        'maintenance_acknowledged': False})
+        entry.update(is_updating=True, update_task=task.to_dict())
+    if any(e['maintenance_task'] for e in nodes.values()) and caller_is_scoped(
+            build_authz_user(request.session.get('user', ''), request.session), cluster_id):
+        for e in nodes.values():
+            if e['maintenance_task']:
+                e['maintenance_task'] = {k: v for k, v in e['maintenance_task'].items()
+                                         if k not in _GUEST_FIELDS}
+    return jsonify({'nodes': nodes})
+
+
 @bp.route('/api/clusters/<cluster_id>/nodes/<node_name>/update', methods=['DELETE'])
 @require_auth(perms=['node.update'])
 def clear_update_status_api(cluster_id, node_name):

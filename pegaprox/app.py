@@ -488,6 +488,7 @@ def create_app():
     # runs but its console where consoles open. Its GETs are read on the active while
     # this standby forwards, its writes go there like any other.
     from pegaprox.core.ha import (FORWARDED_READS as _ha_forwarded_reads,
+                                  FORWARD_ENVIRON as _FORWARD_ENVIRON,
                                   PLUGIN_PROXY_RULE as _PLUGIN_PROXY_RULE,
                                   PLUGIN_CONSOLE_PATHS as _PLUGIN_CONSOLE_PATHS)
 
@@ -496,9 +497,10 @@ def create_app():
         rule = request.url_rule.rule if request.url_rule is not None else None
         if request.method == 'GET' and rule in _ha_forwarded_reads:
             # the progress of a job the active runs, or a view only its tables hold: from
-            # there while this standby hands its writes on, else our own (empty) copy
+            # there while this standby hands its writes on, else our own (empty) copy.
+            # The task lists only for an XCP-ng pool (ha.XCPNG_TASK_READS)
             from pegaprox.core import ha
-            if ha.is_standby():
+            if ha.is_standby() and ha.forwards_read(rule, request.view_args):
                 from pegaprox.api.ha import forward_to_active
                 return forward_to_active(read=True)
             return None
@@ -553,6 +555,26 @@ def create_app():
             'code': 'HA_STANDBY',
         }), 409
 
+    # A read can change shared configuration as well: a plugin serves every method from
+    # one function, and the leader runs the reads its members hand over. Around those
+    # the leader takes the change count of the shared tables and files (ha.read_mark),
+    # and one that moved it tells the members like a write (below). Counted, not guessed
+    # from the route: most of them change nothing.
+    _READ_MARK = 'pegaprox.ha_read_mark'
+
+    @app.before_request
+    def count_around_a_read():
+        if request.method != 'GET':
+            return None
+        rule = request.url_rule.rule if request.url_rule is not None else None
+        if rule != _PLUGIN_PROXY_RULE and request.environ.get(_FORWARD_ENVIRON) is None:
+            return None
+        from pegaprox.core import ha
+        mark = ha.read_mark()
+        if mark is not None:
+            request.environ[_READ_MARK] = mark
+        return None
+
     # The active tells its members after a write, so the change shows there in seconds
     # and not at their next poll (ha.nudge_members, one call for a burst). A forwarded
     # write runs through here on the active as well. Not for the HA routes, not for the
@@ -571,17 +593,31 @@ def create_app():
                         and (request.method, rule) not in _STANDBY_CONSOLES
                         and not (rule == _PLUGIN_PROXY_RULE and (request.view_args or {}).get(
                             'subpath') in _PLUGIN_CONSOLE_PATHS)):
-                    from pegaprox.core import ha
-                    # who wrote what, for the copy a member keeps should a sync not carry
-                    # it over (ha.note_write)
-                    mark = request.environ.get(ha.FORWARD_ENVIRON)
-                    ha.note_write((getattr(request, 'session', None) or {}).get('user', ''),
-                                  request.method, path,
-                                  mark.get('via') if isinstance(mark, dict) else '')
-                    ha.nudge_members()
+                    _note_and_nudge()
+            elif _READ_MARK in request.environ:
+                # the count says something changed while it ran: the members pull either
+                # way, but only a read that went through for a signed-in user is the
+                # journal's "who wrote it" - another connection may have made the change
+                from pegaprox.core import ha
+                if ha.read_mark() != request.environ[_READ_MARK]:
+                    # a forwarded read runs for the signed-in user its member vouched for
+                    signed_in = (bool((getattr(request, 'session', None) or {}).get('user'))
+                                 or request.environ.get(ha.FORWARD_ENVIRON) is not None)
+                    _note_and_nudge(journal=signed_in and 200 <= response.status_code < 300)
         except Exception as e:
             logging.debug(f"[HA] no note to the members after {request.path}: {e}")
         return response
+
+    def _note_and_nudge(journal=True):
+        from pegaprox.core import ha
+        # who wrote what, for the copy a member keeps should a sync not carry it over
+        # (ha.note_write)
+        if journal:
+            mark = request.environ.get(ha.FORWARD_ENVIRON)
+            ha.note_write((getattr(request, 'session', None) or {}).get('user', ''),
+                          request.method, request.path,
+                          mark.get('via') if isinstance(mark, dict) else '')
+        ha.nudge_members()
 
     # Load enabled plugins
     from pegaprox.api.plugins import load_enabled_plugins

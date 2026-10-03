@@ -206,12 +206,24 @@ LEADER_ONLY_READS = frozenset((
     '/api/migration-history',
     '/api/clusters/<cluster_id>/vms/<int:vmid>/migration-history',
 ))
-FORWARDED_READS = LEADER_ONLY_READS | frozenset((
+# The task lists of an XCP-ng pool. PegaProx follows the XAPI tasks it started itself, in
+# the process that started them (core/xcpng.py _active_tasks), so a member lists none of
+# what its users start through the leader. A Proxmox cluster keeps a task log of its own
+# that every instance reads there: these go to the leader for an XCP-ng pool only
+# (forwards_read).
+XCPNG_TASK_READS = frozenset((
+    '/api/clusters/<cluster_id>/tasks',
+    '/api/clusters/<cluster_id>/nodes/<node>/tasks',
+    '/api/clusters/<cluster_id>/nodes/<node>/tasks/<path:upid>/log',
+))
+FORWARDED_READS = LEADER_ONLY_READS | XCPNG_TASK_READS | frozenset((
     '/api/vmware/migrations',
     '/api/vmware/migrations/<mid>',
     '/api/xhm/migrations',
     '/api/xhm/migrations/<mid>',
     '/api/clusters/<cluster_id>/updates/status',
+    # what the node list shows of both, for every node at once (api/vms.py)
+    '/api/clusters/<cluster_id>/node-progress',
     '/api/clusters/<cluster_id>/nodes/<node_name>/update',
     '/api/clusters/<cluster_id>/nodes/<node_name>/maintenance',
     '/api/clusters/<cluster_id>/datastores/<storage_name>/download-status/<task_id>',
@@ -1039,6 +1051,20 @@ def forwarding():
     """True when a write this standby refuses goes to the active right now: forwarding
     is on and the leader is reachable. False on every other instance."""
     return leader_reachable() and forward_writes()
+
+
+def forwards_read(rule, view_args=None):
+    """Whether a standby reads `rule`, a GET as app.url_map writes it, on the leader while
+    it forwards: every rule of FORWARDED_READS, those of XCPNG_TASK_READS for an XCP-ng
+    pool only. The leader takes each of them whatever the cluster (api/ha.py
+    _forwarded_read)."""
+    if rule not in FORWARDED_READS:
+        return False
+    if rule not in XCPNG_TASK_READS:
+        return True
+    from pegaprox.globals import cluster_managers
+    mgr = cluster_managers.get((view_args or {}).get('cluster_id'))
+    return getattr(mgr, 'cluster_type', None) == 'xcpng'
 
 
 # --- serving users ---------------------------------------------------------------
@@ -4681,6 +4707,40 @@ def _change_mark():
             return None
         return [n, _schema_version(), hashlib.sha256(repr(_files_mark()).encode()).hexdigest()[:16]]
     except Exception:
+        return None
+
+
+# read_mark: when it last looked the triggers over (monotonic), and the schema then
+_read_look = {'checked': None, 'schema': None}
+_read_look_lock = threading.Lock()
+
+
+def read_mark():
+    """The leader, before and after a read that may change shared configuration (app.py:
+    a plugin's GET, and every read a member hands over): _change_mark, which moves with
+    every change to a shared table or file here. A read that moved it is told to the
+    members like a write. None on any other instance, and while it cannot be counted.
+
+    The leader of a manual group runs no cv_tick, so the triggers are looked over here:
+    when the count cannot be read, when the schema moved since the last look, and every
+    TRIGGER_CHECK seconds anyway. Never raises."""
+    try:
+        st = _load()
+        if st['role'] != ROLE_ACTIVE or not st.get('members'):
+            return None
+        last = _read_look['checked']
+        mark = None
+        if (last is not None and time.monotonic() - last < TRIGGER_CHECK
+                and _read_look['schema'] == _schema_version()):
+            mark = _change_mark()
+        if mark is None:
+            with _read_look_lock:
+                ensure_change_triggers()
+                _read_look.update(checked=time.monotonic(), schema=_schema_version())
+            mark = _change_mark()
+        return mark
+    except Exception as e:
+        logging.debug(f"[HA] no change count around a read: {e}")
         return None
 
 

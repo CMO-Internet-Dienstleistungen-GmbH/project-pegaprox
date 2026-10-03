@@ -9440,6 +9440,52 @@
         ]
       }
     },
+    "/api/clusters/{cluster_id}/node-progress": {
+      "get": {
+        "operationId": "vms.get_node_progress_get",
+        "tags": [
+          "vms"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "The maintenance and the update of every node that has one",
+        "description": "{nodes: {name: {maintenance_mode, maintenance_task, maintenance_acknowledged,\nis_updating, update_task}}}, the fields /metrics puts on a node. Both run in the\nprocess of the instance that started them: a member that forwards reads this on\nthe leader and lays it over the /metrics it reads itself.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "cluster.view"
+        ]
+      }
+    },
     "/api/clusters/{cluster_id}/vms/{node}/{vm_type}/{vmid}/{action}": {
       "post": {
         "operationId": "vms.vm_action_api_post",

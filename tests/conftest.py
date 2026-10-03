@@ -137,6 +137,7 @@ def _ha_state_out_of_the_checkout(tmp_path, monkeypatch):
     # its timer is a second one next to the note's, which the group tests count
     monkeypatch.setattr(ha, '_journal_later', lambda: None)
     monkeypatch.setattr(ha, '_tick', {'seen': None, 'checked': None, 'schema': None})
+    monkeypatch.setattr(ha, '_read_look', {'checked': None, 'schema': None})
     # a process that has synced before: its first sync would read the rows whatever the
     # change mark says, and which test runs first in a worker must not matter
     monkeypatch.setattr(ha, '_mark_checked', True)
