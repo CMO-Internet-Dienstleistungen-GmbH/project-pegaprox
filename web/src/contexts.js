@@ -554,6 +554,27 @@
             return !!body && body.code === 'HA_ACTIVE_UNREACHABLE';
         }
 
+        // LW Oct 2026 (#625) - the maintenance and update of the nodes as the leader runs them,
+        // over the node figures this instance reads itself. progress is the leader's
+        // /node-progress answer for clusterId ({cluster, nodes}); a node it names takes
+        // all five fields from it, the others keep their own. Same object when nothing
+        // changes, so nothing renders again for it.
+        const HA_NODE_JOB_FIELDS = ['maintenance_mode', 'maintenance_task', 'maintenance_acknowledged', 'is_updating', 'update_task'];
+        function haWithLeaderProgress(metrics, progress, clusterId) {
+            const nodes = progress && progress.cluster === clusterId ? progress.nodes : null;
+            if (!metrics || !nodes || typeof nodes !== 'object') return metrics;
+            let out = metrics;
+            Object.keys(nodes).forEach(name => {
+                const here = metrics[name], there = nodes[name];
+                if (!here || typeof here !== 'object' || !there || typeof there !== 'object') return;
+                if (out === metrics) out = { ...metrics };
+                const job = {};
+                HA_NODE_JOB_FIELDS.forEach(k => { job[k] = there[k] ?? (k.endsWith('_task') ? null : false); });
+                out[name] = { ...here, ...job };
+            });
+            return out;
+        }
+
         // #625 - this view on the active instance, for what a standby never runs itself.
         // peer_url is the active as this standby reaches it (a path behind a proxy stays);
         // search is '' for its start page or a console window's '?console=...'. Only an

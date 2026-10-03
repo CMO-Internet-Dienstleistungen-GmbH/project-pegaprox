@@ -8139,7 +8139,13 @@
             const [selectedGroup, setSelectedGroup] = useState(null); // LW: Feb 2026 - folder overlay
             const [showGroupSettings, setShowGroupSettings] = useState(null); // group settings modal
             const [selectedCluster, setSelectedCluster] = useState(null);
-            const [clusterMetrics, setClusterMetrics] = useState({});
+            // LW Oct 2026 (#625) - on a member that forwards, the maintenance and update of
+            // its nodes are the leader's: they run in its process, and the leader's
+            // /node-progress is laid over what this instance reads itself (haWithLeaderProgress)
+            const [ownClusterMetrics, setClusterMetrics] = useState({});
+            const [leaderNodeProgress, setLeaderNodeProgress] = useState(null);
+            const clusterMetrics = useMemo(() => haWithLeaderProgress(ownClusterMetrics, leaderNodeProgress, selectedCluster?.id),
+                [ownClusterMetrics, leaderNodeProgress, selectedCluster?.id]);
             const [allClusterMetrics, setAllClusterMetrics] = useState({}); // LW: metrics cache for overview page
             const [topGuests, setTopGuests] = useState([]); // top vms for overview table
             const [allClusterGuests, setAllClusterGuests] = useState({}); // NS: Mar 2026 - per-cluster guests for topology
@@ -12665,6 +12671,27 @@
                     };
                 }
             }, [selectedCluster?.id]);
+
+            // LW Oct 2026 (#625) - the leader's node progress (see ownClusterMetrics), every 5 s
+            // like the task list, while this member forwards. When the leader does not answer
+            // the read comes from here and adds nothing
+            useEffect(() => {
+                setLeaderNodeProgress(null);
+                const clusterId = selectedCluster?.id;
+                if (!clusterId || !haStandby || haReadOnly) return;
+                let gone = false;
+                const poll = async () => {
+                    const r = await authFetch(`${API_URL}/clusters/${clusterId}/node-progress`, { timeout: POLL_TIMEOUT_MS });
+                    if (gone || !r || !r.ok) return;
+                    const data = await r.json().catch(() => null);
+                    if (!gone && data && data.nodes && typeof data.nodes === 'object') {
+                        setLeaderNodeProgress({ cluster: clusterId, nodes: data.nodes });
+                    }
+                };
+                poll();
+                const timer = setInterval(poll, 5000);
+                return () => { gone = true; clearInterval(timer); };
+            }, [selectedCluster?.id, haStandby, haReadOnly]);
 
             const fetchClusters = async () => {
                 try {

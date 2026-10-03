@@ -3722,9 +3722,12 @@ def test_the_forms_that_save_as_you_type_are_locked_on_a_standby():
         assert re.search(r'const \{[^}]*\bhaStandby\b[^}]*\} = useAuth\(\);', body), component
         view = body[body.index('\n            return (\n'):]
         start = view.index('<fieldset disabled={haStandby}')
-        end = view.index('</fieldset>', start)
+        # the locked parts: the Force Password Reset between two of them is a write of its
+        # own, which a forwarding standby hands on (tests/test_ha_leftovers_ui.py)
+        spans = [(m.start(), view.index('</fieldset>', m.start()))
+                 for m in re.finditer(re.escape('<fieldset disabled={haStandby}'), view)]
         calls = [m.start() for m in re.finditer(re.escape(save), view)]
-        assert calls and all(start < c < end for c in calls), component
+        assert calls and all(any(s < c < e for s, e in spans) for c in calls), component
         # the note right before the locked part
         assert '{haStandby && <HaSettingsOnActive />}' in view[start - 120:start], component
     # the lockouts and the backup export stay: they are this instance's own and go through

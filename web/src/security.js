@@ -6,7 +6,7 @@
         // LW: The locked IPs table was AI-generated (Claude), I just styled it - Oct 2025
         function SecuritySettingsSection({ addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, isAdmin, haStandby } = useAuth();
+            const { getAuthHeaders, isAdmin, haStandby, haReadOnly } = useAuth();
             const { isCorporate } = useLayout();
             const [settings, setSettings] = useState({
                 login_max_attempts: 5,
@@ -387,11 +387,13 @@
                             </label>
                         </div>
                     </div>
+                    </fieldset>
 
                     {/* LW: Password Expiry Settings - Dec 2025
                         NS: Good feature request from IT-Sec team. They wanted this for compliance.
                         MK: Admins exempt because otherwise you could lock yourself out lol */}
                     <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-4">
+                        <fieldset disabled={haStandby} className="min-w-0">
                         <div className="flex items-center justify-between mb-4">
                             <h4 className="font-medium text-white flex items-center gap-2">
                                 <Icons.Clock />
@@ -490,23 +492,28 @@
                                         💡 {t('passwordExpiryHint') || 'Users receive email reminders at 14, 7, 3, and 1 day(s) before expiry. A warning banner is shown in the UI. SMTP must be configured for emails.'}
                                     </p>
                                 </div>
-                                
-                                {/* LW: Emergency reset button - NS wanted this after a security scare */}
-                                <div className="pt-4 border-t border-proxmox-border">
-                                    <div className="flex items-center justify-between">
-                                        <div>
-                                            <h5 className="text-sm font-medium text-white">{t('forcePasswordReset') || 'Force Password Reset'}</h5>
-                                            <p className="text-xs text-gray-500 mt-1">{t('forcePasswordResetDesc') || 'Expire all user passwords immediately. Use after security incidents.'}</p>
-                                        </div>
-                                        <button
-                                            onClick={() => setShowResetConfirm(true)}
-                                            className="px-4 py-2 bg-red-500/20 text-red-400 hover:bg-red-500/30 rounded-lg text-sm font-medium transition-colors"
-                                        >
-                                            {t('resetAllPasswords') || 'Reset All'}
-                                        </button>
-                                    </div>
-                                </div>
                             </div>
+                        )}
+                        </fieldset>
+
+                        {/* LW: Emergency reset button - NS wanted this after a security scare.
+                            A write of its own, not a setting: a standby hands it to the leader
+                            while it forwards (#625), like every other change */}
+                        {settings.password_expiry_enabled && (
+                            <fieldset disabled={haReadOnly} className="min-w-0 mt-4 pt-4 border-t border-proxmox-border">
+                                <div className="flex items-center justify-between">
+                                    <div>
+                                        <h5 className="text-sm font-medium text-white">{t('forcePasswordReset') || 'Force Password Reset'}</h5>
+                                        <p className="text-xs text-gray-500 mt-1">{t('forcePasswordResetDesc') || 'Expire all user passwords immediately. Use after security incidents.'}</p>
+                                    </div>
+                                    <button
+                                        onClick={() => setShowResetConfirm(true)}
+                                        className="px-4 py-2 bg-red-500/20 text-red-400 hover:bg-red-500/30 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
+                                    >
+                                        {t('resetAllPasswords') || 'Reset All'}
+                                    </button>
+                                </div>
+                            </fieldset>
                         )}
                     </div>
                     
@@ -568,6 +575,7 @@
                         </div>
                     )}
 
+                    <fieldset disabled={haStandby} className="space-y-6 min-w-0">
                     {/* NS: Feb 2026 - Force 2FA Settings */}
                     <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-4">
                         <div className="flex items-center justify-between mb-4">
