@@ -2388,12 +2388,21 @@ def update_ha_config(cluster_id):
     manager = cluster_managers[cluster_id]
     data = request.json or {}
 
+    def _agents_decide_by():
+        # what of the settings goes into the self-fence script: whether quorum gets
+        # forced, and whether without a fence (the leader then decides for a node
+        # that lost quorum)
+        cfg = manager.ha_config
+        return (bool(cfg.get('two_node_mode') or cfg.get('force_quorum_on_failure')),
+                cfg.get('unsafe_two_node_recovery') is True)
+    old_forces = _agents_decide_by()
+
     # MK Oct 2026 (#625) - forcing quorum without a fence that was read back. Setups
     # from before the safety rules have it on and may switch it off; switching it on
     # is a decision to run with the split-brain risk and has to be typed out. Asked
-    # before anything of this request is applied.
-    if (data.get('unsafe_two_node_recovery') is True
-            and manager.ha_config.get('unsafe_two_node_recovery') is not True
+    # before anything of this request is applied. Stored on where nothing forces
+    # quorum it is off (the status says so), and is switched on like any off switch.
+    if (data.get('unsafe_two_node_recovery') is True and not all(old_forces)
             and data.get('confirm_unsafe_two_node') != UNSAFE_TWO_NODE_PHRASE):
         return jsonify({'error': f'Type {UNSAFE_TWO_NODE_PHRASE} to confirm: with this on, quorum '
                                  'is forced on the surviving node without proof that the failed '
@@ -2415,14 +2424,6 @@ def update_ha_config(cluster_id):
         if key in data and not PegaProxManager._ha_countable(data[key]):
             return jsonify({'error': f'{key} must be a number, zero or more',
                             'code': 'HA_TIMING_INVALID'}), 400
-    def _agents_decide_by():
-        # what of the settings goes into the self-fence script: whether quorum gets
-        # forced, and whether without a fence (the leader then decides for a node
-        # that lost quorum)
-        cfg = manager.ha_config
-        return (bool(cfg.get('two_node_mode') or cfg.get('force_quorum_on_failure')),
-                cfg.get('unsafe_two_node_recovery') is True)
-    old_forces = _agents_decide_by()
 
     # Update HA config
     if 'quorum_enabled' in data:
@@ -2451,6 +2452,14 @@ def update_ha_config(cluster_id):
         manager.ha_config['force_quorum_on_failure'] = data['force_quorum_on_failure']
     if 'unsafe_two_node_recovery' in data:
         manager.ha_config['unsafe_two_node_recovery'] = data['unsafe_two_node_recovery'] is True
+    # The switch only counts where quorum gets forced, and the status reports it as off
+    # everywhere else. Kept on underneath, it came back without a word with the next
+    # save of 2-node mode. A cluster this request leaves without forced quorum drops it,
+    # and one it starts forcing quorum on is a new setup under the safety rules: unsafe
+    # only when this request switches it on, with the phrase asked for above.
+    forces = _agents_decide_by()[0]
+    if not forces or (not old_forces[0] and data.get('unsafe_two_node_recovery') is not True):
+        manager.ha_config['unsafe_two_node_recovery'] = False
     fencing_change = None
     if new_fencing is not None:
         old_fencing = manager.ha_config.get('fencing') or {}

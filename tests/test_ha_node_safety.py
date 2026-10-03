@@ -542,6 +542,69 @@ def test_switching_it_on_has_to_be_typed_out(cluster):
     assert cluster.client.put(URL, json={'unsafe_two_node_recovery': True}).status_code == 200
 
 
+@pytest.mark.parametrize('setup,off', [
+    ({'force_quorum_on_failure': True}, {'force_quorum_on_failure': False}),
+    ({'two_node_mode': True, 'force_quorum_on_failure': True}, {'two_node_mode': False, 'force_quorum_on_failure': False}),
+], ids=['force-quorum', 'the-form'])
+def test_the_switch_does_not_come_back_with_forced_quorum(cluster, setup, off):
+    """It only counts where quorum gets forced, and the status reports it as off everywhere
+    else. Stored on underneath, the next save of 2-node mode made a setup from before the
+    rules unsafe again without the phrase, and the UI had shown it as off all along."""
+    cluster.mgr._apply_ha_settings(setup)                  # from before the rules: derived on
+    assert cluster.mgr._ha_unsafe_two_node() is True
+
+    r = cluster.client.put(URL, json=off)
+
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert cluster.mgr.ha_config['unsafe_two_node_recovery'] is False
+    assert _stored(cluster)['unsafe_two_node_recovery'] is False
+
+    # forcing quorum again is a new setup under the rules
+    r = cluster.client.put(URL, json={'two_node_mode': True, 'force_quorum_on_failure': True})
+
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert _stored(cluster)['unsafe_two_node_recovery'] is False
+    sbp = _sbp(cluster)
+    assert sbp['unsafe_two_node_recovery'] is False and sbp['verified_fence_required'] is True
+    cluster.mgr._apply_ha_settings(_stored(cluster))       # and so after a restart
+    assert cluster.mgr._ha_unsafe_two_node() is False
+    # going unsafe takes the phrase
+    r = cluster.client.put(URL, json={'unsafe_two_node_recovery': True})
+    assert r.status_code == 400 and r.get_json()['code'] == 'HA_UNSAFE_CONFIRM'
+    r = cluster.client.put(URL, json={'unsafe_two_node_recovery': True, 'confirm_unsafe_two_node': 'UNSAFE'})
+    assert r.status_code == 200 and _sbp(cluster)['unsafe_two_node_recovery'] is True
+
+
+def test_a_switch_stored_on_without_forced_quorum_is_off(cluster):
+    """A row written before the switch went with forced quorum: on, while nothing forces
+    quorum. The status shows it as off, and so it is to the route: forcing quorum leaves it
+    off, and switching it on wants the phrase like any switch that is off."""
+    cluster.mgr._apply_ha_settings({'two_node_mode': False, 'unsafe_two_node_recovery': True})
+    assert cluster.mgr.ha_config['unsafe_two_node_recovery'] is True and _sbp(cluster)['unsafe_two_node_recovery'] is False
+
+    r = cluster.client.put(URL, json={'two_node_mode': True, 'unsafe_two_node_recovery': True})
+    assert r.status_code == 400 and r.get_json()['code'] == 'HA_UNSAFE_CONFIRM'
+    assert cluster.mgr.ha_config['two_node_mode'] is False             # nothing of it applied
+
+    r = cluster.client.put(URL, json={'two_node_mode': True})
+    assert r.status_code == 200
+    assert _stored(cluster)['unsafe_two_node_recovery'] is False and cluster.mgr._ha_unsafe_two_node() is False
+    assert _sbp(cluster)['verified_fence_required'] is True
+
+
+def test_a_save_that_keeps_quorum_forced_keeps_the_switch(cluster):
+    """The counterproof: a setup from before the rules that still forces quorum keeps the old
+    way through a save of another setting, and an unsafe setup through a fence."""
+    cluster.mgr._apply_ha_settings({'two_node_mode': True})
+
+    assert cluster.client.put(URL, json={'recovery_delay': 40}).status_code == 200
+    assert _stored(cluster)['unsafe_two_node_recovery'] is True and cluster.mgr._ha_unsafe_two_node() is True
+
+    r = cluster.client.put(URL, json={'fencing': {'pve2': dict(IPMI)}})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert _sbp(cluster)['unsafe_two_node_recovery'] is True
+
+
 @pytest.mark.parametrize('sent', [
     {'recovery_delay': False}, {'recovery_delay': True}, {'failure_threshold': True}, {'failure_threshold': False},
     {'recovery_delay': '30'}, {'failure_threshold': '3'}, {'recovery_delay': None}, {'failure_threshold': [3]},
