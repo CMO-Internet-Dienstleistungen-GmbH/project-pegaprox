@@ -277,6 +277,9 @@ def test_a_merge_restore_leaves_what_the_cluster_holds(claimed, sent):
     ({}, False),                                     # the cluster forces nothing: a new setup, the rules
     ({'two_node_mode': True}, True),                 # a setup from before the rules stays one
     ({'two_node_mode': True, 'unsafe_two_node_recovery': False}, False),
+    # a flag kept from an earlier setup on a cluster that forces nothing now: the backup's
+    # 2-node mode makes a new setup, not an unsafe one
+    ({'unsafe_two_node_recovery': True}, False),
 ])
 def test_a_merge_restore_switches_neither_the_claim_nor_unsafe_recovery_on(claimed, held, expected):
     claimed.db.save_cluster('c1', dict(ROW, ha_settings=dict(held)))

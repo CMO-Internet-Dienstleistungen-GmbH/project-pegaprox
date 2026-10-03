@@ -2249,8 +2249,12 @@ def _keep_guarded_ha_settings(cluster, existing):
     merged.update({k: held[k] for k in HA_SETTINGS_GUARDED if k in held})
     # a row without the key reads as a setup from before the safety rules as soon as it
     # forces quorum: written out as what this row is right now
-    merged.setdefault('unsafe_two_node_recovery',
-                      bool(held.get('two_node_mode') or held.get('force_quorum_on_failure')))
+    forced_now = bool(held.get('two_node_mode') or held.get('force_quorum_on_failure'))
+    merged.setdefault('unsafe_two_node_recovery', forced_now)
+    if not forced_now and (merged.get('two_node_mode') or merged.get('force_quorum_on_failure')):
+        # the backup turns forced quorum on where the cluster has none: a new setup under
+        # the safety rules, whatever flag the row kept from an earlier one
+        merged['unsafe_two_node_recovery'] = False
     cluster['ha_settings'] = merged
 
 
