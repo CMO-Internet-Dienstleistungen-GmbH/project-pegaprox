@@ -43615,7 +43615,7 @@
           }
         },
         "summary": "Make this standby the active instance under a new epoch, then restart.",
-        "description": "Wants user_password. When the instance it follows still answers, one sync from it\ncomes first, so the new active starts from the configuration and the member list\nof now; if that sync fails the promotion is refused (409 HA_PROMOTE_SYNC), unless\nforce is true. An instance that does not answer at all is the failover this is for.\nA sync that is under way finishes first either way, for up to 20 seconds.\nEvery member hears about the new epoch before the restart, if it answers within a\nfew seconds: the instance that was active steps down, the other standbys follow\nthis one from their next look at the group. A member that does not answer does the\nsame as soon as it sees this instance. 409 HA_AUTO_MODE in a group that fails\nover automatically or is switching to it: as this instance holds it, as the\ninstance it follows said with the pairing or its last snapshot, or as a member\nthat answers says right now. While a switch is pending here, the error names the\ninstance that started it and since when (auto.pending of the status).",
+        "description": "Wants user_password. When the instance it follows still answers, one sync from it\ncomes first, so the new active starts from the configuration and the member list\nof now; if that sync fails the promotion is refused (409 HA_PROMOTE_SYNC), unless\nforce is true. An instance that does not answer at all is the failover this is for.\nA sync that is under way finishes first either way, for up to 20 seconds.\nEvery member hears about the new epoch before the restart, if it answers within a\nfew seconds: the instance that was active steps down, the other standbys follow\nthis one from their next look at the group. A member that does not answer does the\nsame as soon as it sees this instance. 409 HA_AUTO_MODE in a group that fails\nover automatically or is switching to it: as this instance holds it, as the\ninstance it follows said with the pairing or its last snapshot, or as a member or\nthe witness that answers says right now. While a switch is pending here, the error\nnames the instance that started it and since when (auto.pending of the status).",
         "requestBody": {
           "required": false,
           "content": {
@@ -44148,6 +44148,98 @@
         ]
       }
     },
+    "/api/ha/witness/pairing-code": {
+      "post": {
+        "operationId": "ha.create_witness_code_post",
+        "tags": [
+          "ha"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "A one-time code for the witness of this group, on the leader. Wants user_password.",
+        "description": "url is this instance as the witness reaches it, site where the witness runs (a label,\nfor the split checks). On the witness host the admin runs `pegaprox-witness join\n<code> --url https://<witness>:5005` (in the Docker image: the command `witness join\n...`), which the answer spells out in commands. The code is good for 15 minutes and\none pairing; a new one replaces an open one. One witness per group: 409 while it has\none, and 409 HA_AUTO_NOT_SHIPPED while this release does not offer automatic failover,\nwhich is what a witness votes in. In an automatic group only the instance a majority\njust confirmed makes one (503 HA_NO_LEASE).",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-roles": [
+          "admin"
+        ]
+      }
+    },
+    "/api/ha/witness/remove": {
+      "post": {
+        "operationId": "ha.remove_witness_post",
+        "tags": [
+          "ha"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Take the witness out of the group, on the leader. Wants confirm: REMOVE and user_password.",
+        "description": "In an automatic group the voter config follows, as a change a majority has to hold;\n409 HA_AUTO_MODE where the group would be left with fewer than three votes (switch\nautomatic failover off first), 503 HA_NO_LEASE on an instance that does not hold the\nlease. The witness is told right away if it answers (told), and the members drop it\nwith their next sync.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-roles": [
+          "admin"
+        ]
+      }
+    },
     "/api/ha/agent": {
       "get": {
         "operationId": "ha.agent_leader_check_get",
@@ -44558,6 +44650,79 @@
         },
         "summary": "A member says which certificate pin reaches it from now on: fingerprint, the SHA-256 fingerprint of its certificate, or '' for one a CA signed.",
         "description": "Its self-signed certificate was made anew, or it changed between a self-signed and\na CA certificate; the pin held here would refuse every call to it. Taken only from\nthe member itself, on its signature under the key held here. changed says whether\nthe pin held here is another one now. Part of automatic failover, whose members\nannounce it: 409 HA_AUTO_NOT_SHIPPED while this release does not offer that, and\nthe pin stays the one taken at pairing.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "inline",
+        "security": [
+          {
+            "haPeer": []
+          }
+        ]
+      }
+    },
+    "/api/ha/peer/pair-witness": {
+      "post": {
+        "operationId": "ha.peer_pair_witness_post",
+        "tags": [
+          "ha"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "403": {
+            "description": "Wrong, expired or spent pairing code"
+          }
+        },
+        "summary": "The witness's half of its pairing (`pegaprox-witness join`).",
+        "description": "No session and no peer header: the witness code in the body authenticates the call\nand is spent by it. The witness sends instance_id, url, fingerprint and its Ed25519\npublic_key. Its record goes into the group, and back goes, sealed with a key derived\nfrom the code, this instance's public key, the voter config with the configs before\nit, the epoch, the mode and, in an automatic group, the floor - no field key and no\nsnapshot. A wrong code is 403 on every instance; with the right one, 503 HA_NO_LEASE\nin an automatic group on an instance a majority did not just confirm, 403 for\nanything else that is refused.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "inline",
+        "security": []
+      }
+    },
+    "/api/ha/peer/witness-leave": {
+      "post": {
+        "operationId": "ha.peer_witness_leave_post",
+        "tags": [
+          "ha"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not the paired instance"
+          },
+          "410": {
+            "description": "HA_REMOVED: the caller was removed from the group"
+          }
+        },
+        "summary": "The witness leaves the group (`pegaprox-witness leave`), signed with its key.",
+        "description": "Taken on the leader, which takes it out as the remove route does: 409 HA_AUTO_MODE\nwhere an automatic group would be left with fewer than three votes, 503 HA_NO_LEASE\nwithout the lease. 409 with follow {instance_id, url, fingerprint, public_key, epoch}\non a standby that knows the leader, for the witness to ask there. 401 HA_CLOCK for a\ngood signature whose time is off, 401 for anybody else.",
         "requestBody": {
           "required": false,
           "content": {

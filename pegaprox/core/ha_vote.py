@@ -380,6 +380,20 @@ def chain_after(chain, known):
     return [c for c in chain if pair(c['id']) > known]
 
 
+def takes_switch_back(body, held_mode):
+    """Whether a voter that holds a config in `held_mode` takes anything from the renewal
+    `body`. A round marked taken_back hands out the manual config that took a pending
+    switch back; its sender need not lead, so only a voter that holds a pending config
+    takes it, and only where the newest config it carries is a manual one."""
+    if body.get('taken_back') is not True:
+        return True
+    seg = body.get('chain') if isinstance(body.get('chain'), list) else []
+    top = max((c for c in seg if isinstance(c, dict) and pair(c.get('id'))),
+              key=lambda c: pair(c['id']), default=None)
+    return (held_mode == MODE_PENDING and top is not None
+            and (top.get('body') or {}).get('mode') == MODE_MANUAL)
+
+
 def longest_lease(chain):
     """The longest lease_s in a chain. A promise made under any config of it, and a lease
     counted on one, may still run after the config moved on to a shorter one."""

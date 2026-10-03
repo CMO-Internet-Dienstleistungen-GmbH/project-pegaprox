@@ -98,7 +98,6 @@ import gzip
 import hashlib
 import hmac
 import importlib
-import ipaddress
 import json
 import logging
 import os
@@ -109,12 +108,11 @@ import stat
 import sys
 import threading
 import time
-import urllib.parse
 import uuid
 from datetime import datetime, timedelta, timezone
 
 from pegaprox.constants import CONFIG_DIR, BRANDING_DIR, PLUGINS_DIR, PEGAPROX_VERSION
-from pegaprox.core import ha_vote
+from pegaprox.core import ha_vote, ha_wire
 
 ROLE_STANDALONE = 'standalone'
 ROLE_ACTIVE = 'active'
@@ -135,32 +133,32 @@ MEMBER_SETTING = 'ha_member_of'
 EXIT_RESTART = 75
 
 SNAPSHOT_FORMAT = 1
-CODE_PREFIX = 'pgxha1_'
+CODE_PREFIX = ha_wire.CODE_PREFIX
 PAIRING_TTL = 15 * 60
 DEFAULT_INTERVAL = 30
 # the sender's instance id; '<id>:<secret>' from a member paired before the keys
-PEER_HEADER = 'X-PegaProx-Peer'
-PEER_TS_HEADER = 'X-PegaProx-Peer-Ts'
-PEER_NONCE_HEADER = 'X-PegaProx-Peer-Nonce'
-PEER_SIG_HEADER = 'X-PegaProx-Peer-Sig'
+PEER_HEADER = ha_wire.PEER_HEADER
+PEER_TS_HEADER = ha_wire.PEER_TS_HEADER
+PEER_NONCE_HEADER = ha_wire.PEER_NONCE_HEADER
+PEER_SIG_HEADER = ha_wire.PEER_SIG_HEADER
 # our public key, along with a call that still carries the old secret
 PEER_KEY_HEADER = 'X-PegaProx-Peer-Key'
 # the answer to it: the receiver holds the key this call was signed with
 PEER_KEYED_HEADER = 'X-PegaProx-Peer-Keyed'
 # the sha256 of the body, as signed: a receiver can check who sent a large call before
 # it reads the body (signed_before_body), and the body against it afterwards
-PEER_BODY_HEADER = 'X-PegaProx-Peer-Body'
+PEER_BODY_HEADER = ha_wire.PEER_BODY_HEADER
 # with the pull of a snapshot: the config version the member holds, [epoch, seq, segment,
 # leader] as JSON (note_config_etag)
 PEER_CV_HEADER = 'X-PegaProx-Peer-Cv'
 # how far a signed call's time may be off, either way
-SIGNATURE_WINDOW = 120
-_NONCES_PER_SENDER = 4096
+SIGNATURE_WINDOW = ha_wire.SIGNATURE_WINDOW
+_NONCES_PER_SENDER = ha_wire.NONCES_PER_SENDER
 # /peer/status and the snapshot say they come from this release: members, keys, tombstones
-GROUP_MARK = 1
+GROUP_MARK = ha_wire.GROUP_MARK
 # /peer/status says so once this release speaks the lease protocol of automatic failover.
 # A mark of its own: a release before it compares GROUP_MARK for equality
-LEASE_MARK = 2
+LEASE_MARK = ha_wire.LEASE_MARK
 # the highest epoch any member reads, holds or hands on. A promotion that would go past
 # it is refused: an epoch nobody can read would leave two actives that never settle
 EPOCH_MAX = 2 ** 31 - 1
@@ -355,11 +353,6 @@ _PLUGIN_ID_RE = re.compile(r'^[a-z0-9][a-z0-9_-]{0,63}$')
 _TABLE_NAME_RE = re.compile(r'^[a-z_][a-z0-9_]*$')
 _COLUMN_NAME_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]{0,63}')
 
-_MAX_URL_LEN = 512
-_DNS_LABEL_RE = re.compile(r'(?!-)[a-z0-9-]{1,63}(?<!-)')
-_URL_CHARS_RE = re.compile(r'[A-Za-z0-9.\-_~:/\[\]]+')
-_URL_PATH_RE = re.compile(r'/[A-Za-z0-9._~\-/]*')
-_URL_PORT_RE = re.compile(r':[0-9]{1,5}')
 _ID_RE = re.compile(r'[0-9a-f]{32}')
 _SEGMENT_RE = re.compile(r'[0-9a-f]{16}')
 _MARK_RE = re.compile(r'[0-9a-f]{8}')
@@ -477,10 +470,11 @@ _pull_lock = threading.Lock()
 # one reload at a time, whoever asks: its timer, a pull, the admin's "apply now"
 _reload_lock = threading.Lock()
 # the nonces of signed calls taken within the window, per (receiver, sender). Memory
-# only, so a call signed before this process started is not taken at all
+# only, so a call signed before this process started is not taken at all. The start is
+# lease time: see _process_started
 _nonce_lock = threading.Lock()
 _seen_nonces = {}
-_PROCESS_STARTED = int(time.time())
+_PROCESS_STARTED = ha_vote.ha_clock()
 # what the last look at the group could not reach, for the pull of the same pass
 _last_watch = {'at': None, 'unreachable': frozenset()}
 # the member this standby pulls from, when the last try to reach it (watch, pull or a
@@ -1810,50 +1804,26 @@ def _hash_secret(value):
     return hashlib.sha256(('pegaprox-ha:' + (value or '')).encode()).hexdigest()
 
 
+# The key pairs, the signature over a peer call and the sealed pairing answer are in
+# ha_wire.py, which the witness uses as well (MK Oct 2026, #625)
+
 def _new_signing_key():
     """A fresh Ed25519 private key, as the state file keeps it."""
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-    raw = Ed25519PrivateKey.generate().private_bytes(
-        serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
-    return base64.b64encode(raw).decode()
+    return ha_wire.new_signing_key()
 
 
 def _private_key(value):
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-    return Ed25519PrivateKey.from_private_bytes(base64.b64decode(value))
+    return ha_wire.private_key(value)
 
 
 def _public_of(private):
-    from cryptography.hazmat.primitives import serialization
-    return base64.b64encode(private.public_key().public_bytes(
-        serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode()
-
-
-# The y coordinates of the eight Ed25519 points of small order (libsodium keeps the
-# same list). OpenSSL takes them as public keys, and under the identity point one
-# fixed signature holds for every message: such a key would be an identity anybody
-# can sign as.
-_ED25519_P = 2 ** 255 - 19
-_ORDER_8_Y = 2707385501144840649318225287225658788936804267575313519463743609750303402022
-_SMALL_ORDER_Y = frozenset((0, 1, _ED25519_P - 1, _ORDER_8_Y, _ED25519_P - _ORDER_8_Y))
+    return ha_wire.public_of(private)
 
 
 def _public_key(value):
     """The Ed25519 public key in `value` (base64 of the raw 32 bytes), None for anything
     else, a point of small order included."""
-    if not isinstance(value, str) or not _PUBLIC_KEY_RE.fullmatch(value):
-        return None
-    raw = base64.b64decode(value)
-    # the sign bit of x left out, and y taken mod p: the encodings above p are the
-    # same points
-    if (int.from_bytes(raw, 'little') & ((1 << 255) - 1)) % _ED25519_P in _SMALL_ORDER_Y:
-        return None
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-    try:
-        return Ed25519PublicKey.from_public_bytes(raw)
-    except Exception:
-        return None
+    return ha_wire.public_key(value)
 
 
 def peer_key_fingerprint(public_key):
@@ -1874,26 +1844,19 @@ def own_public_key():
 
 def _wire_body(json_body):
     """The bytes a peer call carries, the same ones its signature covers."""
-    if json_body is None:
-        return b''
-    return json.dumps(json_body, separators=(',', ':'), sort_keys=True).encode()
+    return ha_wire.wire_body(json_body)
 
 
 def _body_digest(body):
-    return hashlib.sha256(body or b'').hexdigest()
+    return ha_wire.body_digest(body)
 
 
 def _to_sign(method, path, body, ts, nonce, receiver, sender, digest=None):
-    return '\n'.join(('pegaprox-ha-peer-1', method.upper(), path,
-                      digest if digest is not None else _body_digest(body), ts, nonce,
-                      receiver, sender)).encode()
+    return ha_wire.to_sign(method, path, body, ts, nonce, receiver, sender, digest)
 
 
 def _signed_headers(private, sender, receiver, method, path, body):
-    ts, nonce, digest = str(int(time.time())), secrets.token_urlsafe(18), _body_digest(body)
-    sig = private.sign(_to_sign(method, path, body, ts, nonce, receiver, sender, digest))
-    return {PEER_HEADER: sender, PEER_TS_HEADER: ts, PEER_NONCE_HEADER: nonce,
-            PEER_SIG_HEADER: base64.b64encode(sig).decode(), PEER_BODY_HEADER: digest}
+    return ha_wire.signed_headers(private, sender, receiver, method, path, body, time.time())
 
 
 class _Signer:
@@ -1961,19 +1924,20 @@ def _fresh_nonce(receiver, sender, nonce, ts, lease=False):
     once the signature is good, so nobody else can fill a member's share. The votes and
     renewals of automatic failover (`lease`) have a share of their own: a member that
     forwards many writes must not use up what its renewals need, nor the other way."""
-    now = time.time()
     with _nonce_lock:
         seen = _seen_nonces.setdefault((receiver, sender, 'lease') if lease else (receiver, sender), {})
-        for n in [n for n, until in seen.items() if until < now]:
-            del seen[n]
-        if nonce in seen:
-            return False
-        if len(seen) >= _NONCES_PER_SENDER:
-            logging.warning(f"[HA] member {sender} sent more signed calls than the replay "
-                            "cache holds - refusing until they age out")
-            return False
-        seen[nonce] = ts + SIGNATURE_WINDOW + 1
-        return True
+        said = ha_wire.take_nonce(seen, nonce, ts, time.time(), _NONCES_PER_SENDER)
+    if said == 'full':
+        logging.warning(f"[HA] member {sender} sent more signed calls than the replay "
+                        "cache holds - refusing until they age out")
+    return said == 'ok'
+
+
+def _process_started():
+    """When this process started, by the wall clock as it reads now. Worked out from the
+    lease clock, which never steps: a wall clock that was ahead at the start and that NTP
+    set back since would otherwise refuse every member's call for as long as it was off."""
+    return int(time.time() - (ha_vote.ha_clock() - _PROCESS_STARTED))
 
 
 def _signature_check(headers, method, path, body, sender, public_key, receiver):
@@ -1982,30 +1946,23 @@ def _signature_check(headers, method, path, body, sender, public_key, receiver):
     before. 'skewed' for a good signature from outside the window: the member's clock
     is off, or the call is an old one. A call signed before this process started is
     one of those too, since the nonces seen until then are gone. '' for anything else."""
-    ts, nonce, sig = (headers.get(PEER_TS_HEADER), headers.get(PEER_NONCE_HEADER),
-                      headers.get(PEER_SIG_HEADER))
-    if not all(isinstance(v, str) for v in (ts, nonce, sig)):
-        return ''
-    if not (_TS_RE.fullmatch(ts) and _NONCE_RE.fullmatch(nonce) and _SIGNATURE_RE.fullmatch(sig)):
-        return ''
-    key = _public_key(public_key)
-    if key is None:
-        return ''
-    from cryptography.exceptions import InvalidSignature
-    try:
-        key.verify(base64.b64decode(sig), _to_sign(method, path, body, ts, nonce, receiver, sender))
-    except (InvalidSignature, ValueError):
-        return ''
-    if abs(time.time() - int(ts)) > SIGNATURE_WINDOW:
-        logging.warning(f"[HA] a signed call from member {sender} is {int(time.time()) - int(ts)}s "
+    now = time.time()
+    said = ha_wire.signature_verdict(headers, method, path, body, sender, public_key, receiver,
+                                     now, _process_started())
+    if said == 'window':
+        ts = int(headers.get(PEER_TS_HEADER))
+        logging.warning(f"[HA] a signed call from member {sender} is {int(now) - ts}s "
                         "off our clock - are the clocks of the members in sync?")
         return 'skewed'
-    if int(ts) < _PROCESS_STARTED:
+    if said == 'early':
         # whether we took it before the restart is not known any more: a member whose
         # clock is behind hears HA_CLOCK for that long, a replay nothing better
         logging.info(f"[HA] a signed call from member {sender} is older than this process")
         return 'skewed'
-    return 'ok' if _fresh_nonce(receiver, sender, nonce, int(ts),
+    if said != 'ok':
+        return ''
+    return 'ok' if _fresh_nonce(receiver, sender, headers.get(PEER_NONCE_HEADER),
+                                int(headers.get(PEER_TS_HEADER)),
                                 lease=path in (VOTE_PATH, RENEW_PATH)) else ''
 
 
@@ -2029,7 +1986,7 @@ def signed_before_body(headers, method, path):
                 and _ID_RE.fullmatch(claimed) and _TS_RE.fullmatch(ts)
                 and _NONCE_RE.fullmatch(nonce) and _SIGNATURE_RE.fullmatch(sig)):
             return False
-        if abs(time.time() - int(ts)) > SIGNATURE_WINDOW or int(ts) < _PROCESS_STARTED:
+        if abs(time.time() - int(ts)) > SIGNATURE_WINDOW or int(ts) < _process_started():
             return False
         st = _load()
         rec = (st.get('members') or {}).get(claimed) or {}
@@ -2142,40 +2099,19 @@ def key_fingerprint(key=None):
 
 
 def _seal_key(code_secret, salt):
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-    return HKDF(algorithm=hashes.SHA256(), length=32, salt=salt,
-                info=b'pegaprox-ha-pairing').derive(code_secret.encode())
+    return ha_wire.seal_key(code_secret, salt)
 
 
 def _seal(code_secret, payload, aad):
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    salt, nonce = os.urandom(16), os.urandom(12)
-    ct = AESGCM(_seal_key(code_secret, salt)).encrypt(
-        nonce, json.dumps(payload).encode(), aad.encode())
-    return base64.b64encode(salt + nonce + ct).decode()
+    return ha_wire.seal(code_secret, payload, aad)
 
 
 def _unseal(code_secret, blob, aad):
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    raw = base64.b64decode(blob)
-    salt, nonce, ct = raw[:16], raw[16:28], raw[28:]
-    return json.loads(AESGCM(_seal_key(code_secret, salt)).decrypt(nonce, ct, aad.encode()))
+    return ha_wire.unseal(code_secret, blob, aad)
 
 
 def _valid_host(host):
-    if len(host) > 253:
-        return False
-    labels = host.split('.')
-    if not all(_DNS_LABEL_RE.fullmatch(label) for label in labels):
-        return False
-    if all(label.isdigit() for label in labels):
-        # all digits is an IPv4 address or nothing
-        try:
-            ipaddress.IPv4Address(host)
-        except ValueError:
-            return False
-    return True
+    return ha_wire.valid_host(host)
 
 
 def valid_https_url(url):
@@ -2186,72 +2122,18 @@ def valid_https_url(url):
     IPv4 address or a bracketed IPv6 address. No user info, query, fragment,
     percent escapes, whitespace or control characters. Too long is refused, not cut.
     """
-    if not isinstance(url, str):
-        return ''
-    url = url.strip()
-    if not url or len(url) > _MAX_URL_LEN or not url.startswith('https://'):
-        return ''
-    url = url.rstrip('/')
-    if not _URL_CHARS_RE.fullmatch(url):
-        return ''
-    try:
-        parts = urllib.parse.urlsplit(url)
-    except ValueError:
-        return ''
-    if parts.scheme != 'https' or parts.query or parts.fragment or '@' in parts.netloc:
-        return ''
-    netloc = parts.netloc
-    if netloc.startswith('['):
-        host, bracket, port = netloc[1:].partition(']')
-        if not bracket:
-            return ''
-        try:
-            ipaddress.IPv6Address(host)
-        except ValueError:
-            return ''
-        host = f'[{host.lower()}]'
-    else:
-        host, colon, port = netloc.partition(':')
-        port = colon + port
-        host = host.lower()
-        if not _valid_host(host):
-            return ''
-    if port:
-        if not _URL_PORT_RE.fullmatch(port) or not 0 < int(port[1:]) < 65536:
-            return ''
-        port = f':{int(port[1:])}'
-    if parts.path and not _URL_PATH_RE.fullmatch(parts.path):
-        return ''
-    return f'https://{host}{port}{parts.path}'
+    return ha_wire.valid_https_url(url)
 
 
 def encode_code(url, fingerprint, secret, active_id):
-    body = json.dumps({'u': url, 'f': fingerprint or '', 'c': secret, 'i': active_id},
-                      separators=(',', ':')).encode()
-    return CODE_PREFIX + base64.urlsafe_b64encode(body).decode().rstrip('=')
+    return ha_wire.encode_code(CODE_PREFIX, url, fingerprint, secret, active_id)
 
 
 def decode_code(code):
-    code = (code or '').strip()
-    if not code.startswith(CODE_PREFIX):
-        raise HaError('This is not a PegaProx pairing code')
-    raw = code[len(CODE_PREFIX):]
     try:
-        body = json.loads(base64.urlsafe_b64decode(raw + '=' * (-len(raw) % 4)))
-    except Exception:
-        raise HaError('The pairing code is damaged - copy it again')
-    if not isinstance(body, dict) or not all(isinstance(body.get(k) or '', str) for k in 'ufci'):
-        raise HaError('The pairing code is damaged - copy it again')
-    url = valid_https_url(body.get('u') or '')
-    if not url:
-        raise HaError('The pairing code does not carry a usable https:// address')
-    fp = (body.get('f') or '').strip().upper()
-    if fp and not re.match(r'^[0-9A-F]{2}(:[0-9A-F]{2}){31}$', fp):
-        raise HaError('The pairing code carries a malformed certificate fingerprint')
-    secret, active_id = body.get('c') or '', body.get('i') or ''
-    if len(secret) < 32 or not re.match(r'^[0-9a-f]{32}$', active_id):
-        raise HaError('The pairing code is incomplete')
-    return {'url': url, 'fingerprint': fp, 'secret': secret, 'instance_id': active_id}
+        return ha_wire.decode_code(CODE_PREFIX, code)
+    except ha_wire.WireError as e:
+        raise HaError(str(e))
 
 
 def create_pairing_code(own_url, fingerprint):
@@ -2707,7 +2589,7 @@ def _mark_removed(by, their_epoch):
             was = st['role']
             # out of the group, so out of its votes as well
             kept = {k: v for k, v in st.items()
-                    if k not in ('lease', 'leader', 'witness', 'group_mode')}
+                    if k not in ('lease', 'leader', 'witness', 'witness_pairing', 'group_mode')}
             _commit_locked(dict(kept, role=ROLE_STANDBY, members={}, source=None, sync={}, pairing=None,
                                 epoch=max(int(st.get('epoch') or 0), their_epoch),
                                 removed={'epoch': their_epoch, 'at': _now(), 'by': by},
@@ -2984,7 +2866,8 @@ def promote():
     if said is not None:
         # this instance holds no voter config that says so (it was restored from an
         # older state, or no renewal of the leader ever reached it): the members do
-        raise AutoMode(f"Member {said.get('url') or said['instance_id'][:8]} says this group "
+        who = 'The witness' if said.get('kind') == ha_vote.KIND_WITNESS else 'Member'
+        raise AutoMode(f"{who} {said.get('url') or said['instance_id'][:8]} says this group "
                        'fails over automatically: its members elect the leader, and none is '
                        'promoted by hand')
     waited = _pull_lock.acquire(timeout=PROMOTE_PULL_WAIT)
@@ -3592,11 +3475,11 @@ def snapshot_meta():
         meta['members'] = _member_list(st)
         meta['tombstones'] = _tombstone_list(st)
         # what the group has besides its members, only once it has it: the zone its
-        # schedules run in, and the witness of an automatic group
+        # schedules run in. The witness always, None when there is none: a member drops
+        # the one it holds once the leader removed it
         if st.get('timezone'):
             meta['timezone'] = st['timezone']
-        if _witness(st):
-            meta['witness'] = _witness(st)
+        meta['witness'] = _witness(st)
         # and its mode, for a member that holds no voter config (yet): it must not take
         # the group for a manual one
         if _mode_said(st) != ha_vote.MODE_MANUAL:
@@ -3973,6 +3856,9 @@ def _adopt_group(snap):
             witness = _clean_witness(snap.get('witness'))
             if witness and witness['instance_id'] != st['instance_id']:
                 new['witness'] = witness
+            elif 'witness' in snap and snap['witness'] is None:
+                # a leader that says it has none (an older one sends no key at all)
+                new.pop('witness', None)
             # the group's mode as the instance we follow says it. Kept where the voter
             # config held here does not say the same: none here and an automatic group
             # (nobody is promoted by hand then), or an automatic one here and a group
@@ -6796,7 +6682,7 @@ _LEASE_KEYS = ('voted_for', 'gen', 'cfg', 'cfg_chain', 'floor_cv', 'led', 'relea
 _WITNESS_KEYS = ('instance_id', 'url', 'fingerprint', 'public_key', 'site')
 # what a group decided, in the state file of each of its instances: gone when the
 # instance is on its own again, and never taken into the next group
-_GROUP_KEYS = ('lease', 'leader', 'witness', 'timezone', 'group_mode')
+_GROUP_KEYS = ('lease', 'leader', 'witness', 'witness_pairing', 'timezone', 'group_mode')
 # a vote round and a renewal both have two seconds (ha_vote.Timings)
 LEASE_CALL_TIMEOUT = 2
 # how long a status answer counts for the checks before the switch
@@ -7034,13 +6920,22 @@ def _members_say_auto(timeout=5):
     holds the lease always counts. Where the manual voter config held here is known to
     be the group's (_manual_known), a member with an older config missed the switch
     back, and one without any only repeats what it was told at its last pull: those
-    count for nothing."""
+    count for nothing.
+
+    The witness is asked as well and answers like a member (its record comes back with
+    kind 'witness'): of two data members and a witness it is the only voter besides
+    the leader. It never holds a lease itself, so a promise it keeps counts as the
+    lease of the one it names."""
     if not ha_vote.AUTO_MODE_SHIPPED:
         return None
     st = _load()
     recs = members()
     if st['role'] != ROLE_STANDBY or not recs:
         return None
+    witness = _witness(st)
+    if witness and witness.get('url'):
+        # signed only, as _ask_witness: the witness takes no old secret
+        recs.append(dict(witness, key_acked=True, kind=ha_vote.KIND_WITNESS))
     lease = _lease(st)
     mine = ha_vote.pair(lease['cfg']['id']) if lease is not None else None
     try:
@@ -7056,6 +6951,8 @@ def _members_say_auto(timeout=5):
         if not seen or seen.get('mode') == ha_vote.MODE_MANUAL:
             continue
         if seen.get('holds') is True:
+            return rec
+        if rec.get('kind') == ha_vote.KIND_WITNESS and seen.get('holder'):
             return rec
         theirs = seen.get('cfg_id')
         if known and (theirs is None or theirs < mine):
@@ -7401,6 +7298,7 @@ class _LeaseRuntime:
         self.born = time.monotonic()
         self.lag_max = 0.0
         self.boot_lag_max = 0.0
+        self.witness_asked = None       # (node gen, what) the voter config was asked to name
 
 
 def _rt():
@@ -7545,14 +7443,7 @@ class _LeaseHooks:
 
 
 def _cfg_signed(public_key, message, sig):
-    key = _public_key(public_key)
-    if key is None or not isinstance(sig, str) or not _SIGNATURE_RE.fullmatch(sig):
-        return False
-    try:
-        key.verify(base64.b64decode(sig), message)
-        return True
-    except Exception:
-        return False
+    return ha_wire.cfg_signed(public_key, message, sig)
 
 
 def _lease_node(rt=None):
@@ -7813,6 +7704,11 @@ def _lease_answer(rt, item, ans):
             return
         if kind == 'renew' and isinstance(ans, dict) and ans.get('ok') is True:
             rt.acked[to] = ha_clock()
+        seen = rt.seen.get(to) if isinstance(ans, dict) and 'write_failed' in ans else None
+        if seen is not None:
+            # the witness says with every answer whether it can write its state: a
+            # renewal it acks needs no write, the vote at the next failover does
+            seen['write_failed'] = ans['write_failed'] is True
         node.on_answer(to, tag, ans)
 
 
@@ -7983,9 +7879,9 @@ def lease_request(sender, kind, body):
         # nobody else: its sender need not lead, so no chain starts from its word here
         # and no term ends on it. Such a member takes it by its chain, whoever sends
         # it - one that ends in a manual config and hangs off a config held here, each
-        # link signed by a voter of the one before (ha_vote.newer_chain)
-        stray = body.get('taken_back') is True and not (
-            node is not None and node.view.mode == ha_vote.MODE_PENDING and _ends_manual(body))
+        # link signed by a voter of the one before (ha_vote.newer_chain). The witness
+        # goes by the same rule (ha_vote.takes_switch_back)
+        stray = not ha_vote.takes_switch_back(body, node.view.mode if node is not None else None)
         if node is None and kind == 'renew' and not stray and _lease(_load()) is None:
             node = _lease_adopt(rt, sender, body)
         if stray:
@@ -8012,14 +7908,6 @@ def lease_request(sender, kind, body):
     if rt.node is not None and not rt.loop:
         lease_start()
     return ans
-
-
-def _ends_manual(body):
-    """Whether the newest config of the chain a call carries is a manual one."""
-    seg = body.get('chain') if isinstance(body.get('chain'), list) else []
-    top = max((c for c in seg if isinstance(c, dict) and ha_vote.pair(c.get('id'))),
-              key=lambda c: ha_vote.pair(c['id']), default=None)
-    return top is not None and (top.get('body') or {}).get('mode') == ha_vote.MODE_MANUAL
 
 
 def _look_soon(rt):
@@ -8329,7 +8217,8 @@ def _ask_witness():
     if not witness or not witness.get('url'):
         return
     try:
-        _note_lease_seen(witness['instance_id'], _ask(witness, _signer(), 5)[5])
+        # signed only: the witness takes no old secret, and should never see one
+        _note_lease_seen(witness['instance_id'], _ask(dict(witness, key_acked=True), _signer(), 5)[5])
     except Exception as e:
         logging.info(f"[HA] the witness did not answer: {_error_text(e)}")
 
@@ -8449,6 +8338,19 @@ def _finding(code, level, text, member_id=None):
     return {'code': code, 'level': level, 'text': text, 'member': member_id}
 
 
+def _one_vote_less(n):
+    """What a voter that gives no vote costs a group of `n` votes, said as a sentence."""
+    left = n - 1
+    spare = left - ha_vote.majority(n)
+    if spare < 0:
+        then = 'no leader can be elected until it can'
+    elif spare == 0:
+        then = 'one more failure may stop automation'
+    else:
+        then = f'the group survives the loss of {spare} more'
+    return f'The group has one vote less, {left} of its {n}: {then}.'
+
+
 def _founds_chain(st):
     """Whether a switch started on this instance would found a chain of voter configs:
     it holds none, or one it is no data voter of (it joined later and was promoted)."""
@@ -8506,14 +8408,18 @@ def auto_findings(st=None, lease_s=ha_vote.LEASE_DEFAULT):
     targets = [dict(rec, instance_id=mid) for mid, rec in sorted((st.get('members') or {}).items())]
     if _witness(st):
         targets.append(_witness(st))
+    wid = (_witness(st) or {}).get('instance_id')
     for rec in targets:
         mid = rec['instance_id']
         label = rec.get('url') or mid[:8]
+        if mid == wid:
+            label = f'the witness {label}'
+        start = len(out)
         seen = rt.seen.get(mid)
         if running and mid not in named:
-            out.append(_finding('NOT_IN_CONFIG', 'warn', f'{label} is a member, and the voter '
-                                'config does not name it (yet): it neither votes nor is it '
-                                'counted.', mid))
+            out.append(_finding('NOT_IN_CONFIG', 'warn', f'{label} is ' + (
+                'paired' if mid == wid else 'a member') + ', and the voter config does not name '
+                'it (yet): it neither votes nor is it counted.', mid))
         elif running and named[mid].get('public_key') != rec.get('public_key'):
             out.append(_finding('KEY_MISMATCH', 'warn', f'The voter config names {label} with '
                                 'another key than the one it paired with: it was paired again, '
@@ -8564,16 +8470,25 @@ def auto_findings(st=None, lease_s=ha_vote.LEASE_DEFAULT):
                 out.append(_finding('NO_DIR_SYNC', 'warn', f'The file system {label} keeps its '
                                     'state on cannot sync a directory: a vote it gives may not '
                                     'survive a power cut.', mid))
-            if seen.get('write_failed'):
+            if seen.get('write_failed') and mid == wid:
+                # it acks the renewals that need no write all the same, and would first
+                # say no at the vote that decides a failover
+                out.append(_finding('STATE_NOT_WRITTEN', 'warn', f'{label} cannot write its state '
+                                    'file: it gives no vote and takes no renewal that needs a '
+                                    'write until it can. ' + _one_vote_less(n) + ' Check the '
+                                    'disk of the witness host.', mid))
+            elif seen.get('write_failed'):
                 out.append(_finding('STATE_NOT_WRITTEN', 'warn', f'{label} could not write its HA '
                                     'state file the last time it tried: it gives no vote and '
-                                    'takes no renewal that needs a write until it can. Check its '
-                                    'disk.', mid))
+                                    'takes no renewal that needs a write until it can. '
+                                    + _one_vote_less(n) + ' Check its disk.', mid))
             if running and rec.get('role_seen') == ROLE_ACTIVE and not seen.get('holds'):
                 out.append(_finding('ACTIVE_WITHOUT_LEASE', 'warn', f'{label} answers as an '
                                     'active and holds no lease: an instance made active by hand '
                                     'acts next to the leader the group elects. The leader tells '
                                     'it to step down.', mid))
+        for f in out[start:]:
+            f['text'] = f['text'][:1].upper() + f['text'][1:]
     if running:
         # a voter that left by hand, or was never a member of this instance's list: its
         # vote stands in the config and never answers
@@ -8587,6 +8502,13 @@ def auto_findings(st=None, lease_s=ha_vote.LEASE_DEFAULT):
     for mid in body.get('quarantined') or ():
         out.append(_finding('QUARANTINED', 'warn', f'{_label(mid)} came back with an older state. '
                             'Check it, then re-admit it.', mid))
+    w = body.get('witness') or {}
+    shared = w.get('site') and sorted({r.get('site') for r in body.get('voters') or ()
+                                       if r.get('voter') and r.get('site') == w['site']})
+    if shared:
+        out.append(_finding('WITNESS_SAME_SITE', 'warn', f"The witness shares site {w['site']} with "
+                            'data members: losing that site may stop automation. It belongs at a '
+                            'third site.', w.get('id')))
     if n >= ha_vote.MIN_VOTERS and n % 2 == 0:
         lost = n - ha_vote.majority(n)
         out.append(_finding('EVEN_VOTERS', 'warn',
@@ -8761,12 +8683,15 @@ def _switch_taken_back(st, automatic=False):
     try:
         rt = _rts.get(me)
         # however long ago: an answer that is out of date costs a config of its own
-        # that this instance keeps, never a promotion by hand next to a leader
-        said = list(rt.seen.values()) if rt is not None else ()
+        # that this instance keeps, never a promotion by hand next to a leader. The
+        # witness holds no lease; a promise it keeps is the lease of the one it names
+        said = list(rt.seen.items()) if rt is not None else ()
         pending = ha_vote.pair(lease['cfg']['id'])
+        wid = (_witness(st) or {}).get('instance_id')
         if automatic or any(seen.get('holds') is True or (
+                mid == wid and seen.get('holder') and seen.get('mode') != ha_vote.MODE_MANUAL) or (
                 seen.get('mode') == ha_vote.MODE_AUTO
-                and (seen.get('cfg_id') is None or seen['cfg_id'] >= pending)) for seen in said):
+                and (seen.get('cfg_id') is None or seen['cfg_id'] >= pending)) for mid, seen in said):
             return None
         private = _signer().private
         if private is None:
@@ -9118,9 +9043,11 @@ def lease_status():
                      'quarantined': witness['instance_id'] in quarantined, 'skew': seen.get('skew'),
                      'release': seen.get('release'), 'mode': seen.get('mode'),
                      'zone': seen.get('zone'), 'holds': False,
-                     'reach': None,
+                     'reach': None, 'url': witness['url'],
+                     'last_heard': (witness_view(st) or {}).get('last_heard'),
                      'seen_ago': round(now - seen['at'], 1) if 'at' in seen else None})
     out['members'] = rows
+    out['witness'] = witness_view(st)
     return out
 
 
@@ -9263,8 +9190,297 @@ def _lease_housekeeping():
     for mid in [m for m in rt.seen if m not in known]:
         rt.seen.pop(mid, None)
     for step in (announce_fingerprint, measure_reach, _ask_witness, lease_start,
-                 lambda: _say_downgraded(rt), _switch_back_again):
+                 lambda: _say_downgraded(rt), _switch_back_again, _witness_into_config):
         try:
             step()
         except Exception as e:
             logging.warning(f"[HA] lease housekeeping: {e}")
+
+
+# --- the witness -------------------------------------------------------------------
+#
+# MK Oct 2026 (#625) - the third vote of a group with two data members, a process of its
+# own (pegaprox/witness.py) that holds no configuration of the deployment. The leader
+# pairs it with a code of its own prefix: the same sealed exchange a member pairs with,
+# minus what a vote does not need - no field key, no snapshot, no member list. Its record
+# lives under 'witness', never in 'members' (MAX_MEMBERS counts data members), and
+# travels to the members with the snapshot meta. In an automatic group the voter config
+# follows the record, one change at a time (_witness_into_config).
+
+WITNESS_LEADER_ERROR = 'A witness is added and removed on the leader of a group'
+WITNESS_EXISTS_ERROR = 'This group has a witness already - remove it first'
+WITNESS_NONE_ERROR = 'This group has no witness'
+AUTO_WITNESS_REMOVE_ERROR = (f'Without the witness this group would have fewer than '
+                             f'{ha_vote.MIN_VOTERS} votes, too few for automatic failover. Switch '
+                             'automatic failover off first, or add a data member')
+WITNESS_PAIR_PATH = '/api/ha/peer/pair-witness'
+WITNESS_LEAVE_PATH = '/api/ha/peer/witness-leave'
+WITNESS_UNPAIRED_PATH = '/api/ha/peer/unpaired'
+SWITCHING_OFF_ERROR = ('Automatic failover is being switched off: it is off once a majority of '
+                       'the members holds the change')
+
+
+def _switching_off(st):
+    """A leader whose switch back to manual mode has not reached a majority yet: its
+    lease is in force, and the voter config takes no other change until then (as
+    set_lease_seconds says)."""
+    lease = _lease(st)
+    return _lease_mode(st) and lease is not None and lease['cfg']['body'].get('mode') == ha_vote.MODE_MANUAL
+
+
+def witness():
+    """The record of the group's witness, None when it has none."""
+    return _witness(_load())
+
+
+def witness_refusal(st=None):
+    """Why this instance pairs no witness right now, '' when it does: only the leader of
+    a group, in a release that offers automatic failover, and one witness at most."""
+    st = st or _load()
+    if not ha_vote.AUTO_MODE_SHIPPED:
+        return ha_vote.NOT_SHIPPED_ERROR
+    if st.get('broken') or st['role'] != ROLE_ACTIVE or not st.get('members'):
+        return WITNESS_LEADER_ERROR
+    why = _pairing_refusal(st)
+    if why:
+        return why
+    if _switching_off(st):
+        return SWITCHING_OFF_ERROR
+    if _witness(st):
+        return WITNESS_EXISTS_ERROR
+    return ''
+
+
+def _witness_unheard():
+    """The first member whose last answer to this process did not speak the lease
+    protocol, None when every one did: no witness before the whole group runs a release
+    that knows it (10)."""
+    rt = _rt()
+    for rec in members():
+        if (rt.seen.get(rec['instance_id']) or {}).get('mark') != LEASE_MARK:
+            return rec
+    return None
+
+
+def create_witness_code(own_url, fingerprint, site=''):
+    """Leader: a one-time code for `pegaprox-witness join`, good for PAIRING_TTL. A new
+    one replaces an open one. `site` is where the witness runs, for the split checks.
+    Returns (code, expires_at)."""
+    if not isinstance(site, str) or len(site.strip()) > ha_vote.SITE_MAX:
+        raise HaError(f'The site is a label of up to {ha_vote.SITE_MAX} characters')
+    if ha_vote.AUTO_MODE_SHIPPED and role() == ROLE_ACTIVE:
+        try:
+            # what every member says right now, not what the watch heard a while ago
+            _ask_members(5)
+        except Exception as e:
+            logging.warning(f"[HA] could not ask the members before pairing a witness: {e}")
+    with _lock:
+        st = _load()
+        why = witness_refusal(st)
+        if why:
+            raise HaError(why)
+        waiting = _witness_unheard()
+        if waiting:
+            raise HaError(f"{waiting.get('url') or waiting['instance_id'][:8]} has not answered on a "
+                          "release with automatic failover yet - update it and let it answer once "
+                          "before adding a witness")
+        secret = secrets.token_urlsafe(32)
+        expires = int(time.time()) + PAIRING_TTL
+        _commit_locked(dict(st, witness_pairing={'code_hash': _hash_secret(secret), 'expires': expires,
+                                                 'site': site.strip()},
+                            own_url=own_url, own_fingerprint=fingerprint or ''))
+    return ha_wire.encode_code(ha_wire.WITNESS_CODE_PREFIX, own_url, fingerprint, secret,
+                               st['instance_id']), expires
+
+
+def witness_code_ok(code_secret):
+    """Whether `code_secret` is the open witness code of this instance. Nothing is spent."""
+    pairing = _load().get('witness_pairing') or {}
+    return bool(isinstance(code_secret, str) and isinstance(pairing, dict) and pairing.get('code_hash')
+                and int(pairing.get('expires') or 0) >= int(time.time())
+                and hmac.compare_digest(_hash_secret(code_secret), pairing['code_hash']))
+
+
+def accept_witness(code_secret, witness_id, url, fingerprint, public_key):
+    """The leader's half of `pegaprox-witness join`. Returns the answer for the witness:
+    the leader's id and epoch, and sealed with the code the leader's public key, the
+    voter config with the configs before it, the epoch, the mode and the floor. No field
+    key and no snapshot: accept_pairing always seals the field key, so the witness has
+    a function of its own.
+
+    In a manual group the record goes into the voter config right away (the first
+    config founds the chain the members take at the switch); in an automatic group
+    that is a change of the config the lease holder makes once the one before reached
+    a majority, and the witness learns it with the next renewal."""
+    with _lock:
+        st = _load()
+        if not witness_code_ok(code_secret):
+            raise HaError(PAIRING_CODE_ERROR)
+        why = witness_refusal(st)
+        if why:
+            raise HaError(why)
+        ms = st.get('members') or {}
+        if (not isinstance(witness_id, str) or not _ID_RE.fullmatch(witness_id)
+                or witness_id == st['instance_id'] or witness_id in ms
+                or witness_id in (st.get('tombstones') or {})):
+            raise HaError('The witness did not identify itself')
+        if (not _public_key(public_key) or public_key == own_public_key()
+                or any(rec.get('public_key') == public_key for rec in ms.values())):
+            raise HaError('The witness did not send a usable public key - update it to this release')
+        url = valid_https_url(url) if isinstance(url, str) else ''
+        if not url:
+            raise HaError('The witness address must be https://host[:port][/path]')
+        fp = fingerprint.strip().upper() if isinstance(fingerprint, str) else ''
+        if fp and not _FP_RE.fullmatch(fp):
+            raise HaError('The witness sent a malformed certificate fingerprint')
+        site = (st.get('witness_pairing') or {}).get('site') or ''
+        rec = {'instance_id': witness_id, 'url': url, 'fingerprint': fp, 'public_key': public_key,
+               'site': site if isinstance(site, str) and len(site) <= ha_vote.SITE_MAX else ''}
+        new = {k: v for k, v in st.items() if k != 'witness_pairing'}
+        new['witness'] = rec
+        automatic = _lease_mode(st)
+        if automatic:
+            _commit_locked(new)
+        else:
+            held = _lease(st)
+            _lease_found(new, held['cfg']['body']['lease_s'] if held else ha_vote.LEASE_DEFAULT)
+            if _witness(_load()) != rec:
+                # the voter config said so already: the record goes in on its own
+                _commit_locked(dict(new, lease=_load().get('lease')))
+        st = _load()
+        lease = _lease(st)
+        if lease is None:
+            raise HaError('The voter config could not be made')
+        payload = {'public_key': own_public_key(), 'epoch': int(st.get('epoch') or 0),
+                   'chain': list(lease.get('cfg_chain') or []) + [lease['cfg']],
+                   'mode': _mode_said(st)}
+        node = _lease_live(st) if automatic else None
+        if node is not None:
+            payload['floor_cv'] = list(node.floor)
+        out = {'instance_id': st['instance_id'], 'epoch': int(st.get('epoch') or 0),
+               'sealed': _seal(code_secret, payload, aad=witness_id)}
+    if automatic:
+        _witness_into_config()
+    return out
+
+
+def remove_witness():
+    """Leader: take the witness out of the group. Returns its record, for the caller to
+    tell it. Refused in an automatic group where that would leave fewer than three
+    votes, and on a leader that does not hold the lease; there the voter config follows
+    with the next change (_witness_into_config)."""
+    with _lock:
+        st = _load()
+        if st['role'] != ROLE_ACTIVE:
+            raise HaError(WITNESS_LEADER_ERROR)
+        rec = _witness(st)
+        if rec is None:
+            raise HaError(WITNESS_NONE_ERROR)
+        if mode(st) == ha_vote.MODE_PENDING:
+            raise AutoMode(AUTO_PENDING_ERROR)
+        if _switching_off(st):
+            raise HaError(SWITCHING_OFF_ERROR)
+        automatic = _lease_mode(st)
+        if automatic:
+            lease = _lease(st)
+            left = [v for v in ha_vote.voter_ids(lease['cfg']['body']) if v != rec['instance_id']]
+            if len(left) < ha_vote.MIN_VOTERS:
+                raise AutoMode(AUTO_WITNESS_REMOVE_ERROR)
+            if not is_active():
+                raise NoLease(NO_LEASE_ERROR)
+        _commit_locked({k: v for k, v in st.items() if k not in ('witness', 'witness_pairing')})
+    if automatic:
+        _witness_into_config()
+    return rec
+
+
+def _witness_into_config():
+    """Leader of an automatic group: the voter config names the witness this instance
+    holds a record of, and no other. Asked once per node, as a change of the config;
+    the node makes it once the change before reached a majority. Never below three
+    votes: a config that names a witness without a record keeps it, and the findings
+    say so. Returns 'add', 'remove' or ''."""
+    st = _load()
+    if st['role'] != ROLE_ACTIVE or not _lease_mode(st):
+        return ''
+    rt = _rt()
+    with rt.lock:
+        node = _lease_live(st)
+        if (node is None or not node.is_active() or node.transfer is not None
+                or node.view.mode != ha_vote.MODE_AUTO):
+            # and nothing while a switch back to manual mode is under way
+            return ''
+        rec = _witness(st)
+        want = ({'id': rec['instance_id'], 'public_key': rec['public_key'], 'site': rec['site']}
+                if rec else None)
+        held = node.view.cfg['body'].get('witness') or None
+        if held == want:
+            return ''
+        if want is None and node.view.n - 1 < ha_vote.MIN_VOTERS:
+            return ''
+        asked = (rt.gen, json.dumps(want, sort_keys=True))
+        if rt.witness_asked == asked:
+            return ''
+        rt.witness_asked = asked
+        node.change_cfg(lambda body: dict(body, witness=want))
+    rt.wake.set()
+    return 'add' if want else 'remove'
+
+
+def witness_verdict(headers, method, path, body):
+    """Who sent a call that names the witness as its sender: ('witness', record) for a
+    good signature under the key held for it, ('skewed', record) for one from outside
+    the window, (None, None) for anything else."""
+    rec = witness()
+    raw = headers.get(PEER_HEADER) if headers is not None else None
+    if rec is None or raw != rec['instance_id']:
+        return None, None
+    check = _signature_check(headers, method, path, body, raw, rec['public_key'], instance_id())
+    if check == 'ok':
+        return 'witness', rec
+    if check == 'skewed':
+        return 'skewed', rec
+    return None, None
+
+
+def call_witness(rec, method, path, json_body=None, timeout=10):
+    """One signed call to the witness `rec`: our key only, never an old secret."""
+    if not rec or not rec.get('url'):
+        raise HaError('No address known for the witness')
+    return _peer_call(method, rec['url'], rec.get('fingerprint') or '', path, json_body=json_body,
+                      auth=_auth_for(_signer(), rec['instance_id']), timeout=timeout)
+
+
+def witness_view(st=None):
+    """The witness on the status page: its record without the key, a short digest of
+    the key, when it was last heard (a status answer, or a renewal it acked: seconds
+    ago) and its clock against ours. None when the group has none."""
+    st = st or _load()
+    rec = _witness(st)
+    if rec is None:
+        return None
+    rt = _rts.get(st['instance_id'])
+    heard, skew, unwritten = None, None, False
+    if rt is not None:
+        seen = rt.seen.get(rec['instance_id']) or {}
+        if 'at' in seen:
+            heard = time.monotonic() - seen['at']
+            skew = seen.get('skew')
+        unwritten = seen.get('write_failed') is True
+        if rec['instance_id'] in rt.acked:
+            acked = ha_clock() - rt.acked[rec['instance_id']]
+            heard = acked if heard is None else min(heard, acked)
+    return {'instance_id': rec['instance_id'], 'kind': ha_vote.KIND_WITNESS, 'url': rec['url'],
+            'fingerprint': rec['fingerprint'], 'site': rec['site'],
+            'key_fingerprint': peer_key_fingerprint(rec['public_key']),
+            'last_heard': round(max(0.0, heard), 1) if heard is not None else None, 'skew': skew,
+            # it cannot write its state, and gives no vote until it can (auto_findings)
+            'write_failed': unwritten}
+
+
+def check_not_a_witness_dir(path=None):
+    """main(): a PegaProx instance never runs on the state directory of a witness."""
+    folder = path or os.path.dirname(os.path.abspath(LOCK_FILE))
+    if os.path.exists(os.path.join(folder, ha_wire.WITNESS_STATE_NAME)):
+        raise HaError(f'{folder} is the state directory of a PegaProx witness - run PegaProx on a '
+                      'config directory of its own')

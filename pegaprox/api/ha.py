@@ -662,9 +662,9 @@ def promote_standby():
     this one from their next look at the group. A member that does not answer does the
     same as soon as it sees this instance. 409 HA_AUTO_MODE in a group that fails
     over automatically or is switching to it: as this instance holds it, as the
-    instance it follows said with the pairing or its last snapshot, or as a member
-    that answers says right now. While a switch is pending here, the error names the
-    instance that started it and since when (auto.pending of the status)."""
+    instance it follows said with the pairing or its last snapshot, or as a member or
+    the witness that answers says right now. While a switch is pending here, the error
+    names the instance that started it and since when (auto.pending of the status)."""
     denied = _refuse_confined_admin()
     if denied:
         return denied
@@ -1240,6 +1240,106 @@ def dismiss_orphan(name):
     return jsonify({'success': True, 'orphans': ha.orphans_summary()})
 
 
+# --- the witness ------------------------------------------------------------------
+#
+# MK Oct 2026 (#625) - the third vote of a group, a process of its own that holds no
+# configuration (pegaprox/witness.py). It is paired and removed here, on the leader.
+
+@bp.route('/api/ha/witness/pairing-code', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def create_witness_code():
+    """A one-time code for the witness of this group, on the leader. Wants user_password.
+
+    url is this instance as the witness reaches it, site where the witness runs (a label,
+    for the split checks). On the witness host the admin runs `pegaprox-witness join
+    <code> --url https://<witness>:5005` (in the Docker image: the command `witness join
+    ...`), which the answer spells out in commands. The code is good for 15 minutes and
+    one pairing; a new one replaces an open one. One witness per group: 409 while it has
+    one, and 409 HA_AUTO_NOT_SHIPPED while this release does not offer automatic failover,
+    which is what a witness votes in. In an automatic group only the instance a majority
+    just confirmed makes one (503 HA_NO_LEASE)."""
+    denied = _refuse_confined_admin()
+    if denied:
+        return denied
+    data = _body()
+    url = _https_url(data.get('url'))
+    if not url:
+        return jsonify({'error': 'Enter the https:// address the witness will use to reach this instance'}), 400
+    site = data.get('site', '')
+    if not isinstance(site, str) or len(site.strip()) > ha_vote.SITE_MAX:
+        return jsonify({'error': f'site is a label of up to {ha_vote.SITE_MAX} characters'}), 400
+    if not ha_vote.AUTO_MODE_SHIPPED:
+        return jsonify({'code': 'HA_AUTO_NOT_SHIPPED', 'error': ha_vote.NOT_SHIPPED_ERROR}), 409
+    why = ha.witness_refusal()
+    if why:
+        return jsonify({'error': why}), 409
+    denied = _refuse_without_reauth('a witness pairing code')
+    if denied:
+        return denied
+    if ha.lease_in_force() and not ha.confirm_lease():
+        return no_lease_refusal() or (jsonify({'code': 'HA_NO_LEASE', 'error': ha.NO_LEASE_ERROR}), 503)
+    try:
+        code, expires = ha.create_witness_code(url, _own_fingerprint(), site)
+    except ha.HaError as e:
+        return jsonify({'error': str(e)}), 409
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Could not create a witness code')}), 500
+    log_audit(_user(), 'ha.witness_code_created', f'witness code for {url}, valid for 15 minutes')
+    return jsonify({'code': code, 'expires_at': expires, 'commands': {
+        'package': f'pegaprox-witness join {code} --url https://<witness host>:5005',
+        'docker': f'docker run --rm -v pegaprox-witness:/app/witness ghcr.io/pegaprox/pegaprox '
+                  f'witness join {code} --url https://<witness host>:5005'}})
+
+
+@bp.route('/api/ha/witness/remove', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def remove_witness():
+    """Take the witness out of the group, on the leader. Wants confirm: REMOVE and
+    user_password.
+
+    In an automatic group the voter config follows, as a change a majority has to hold;
+    409 HA_AUTO_MODE where the group would be left with fewer than three votes (switch
+    automatic failover off first), 503 HA_NO_LEASE on an instance that does not hold the
+    lease. The witness is told right away if it answers (told), and the members drop it
+    with their next sync."""
+    denied = _refuse_confined_admin()
+    if denied:
+        return denied
+    if _body().get('confirm') != 'REMOVE':
+        return jsonify({'error': 'Type REMOVE to confirm'}), 400
+    if ha.role() != ha.ROLE_ACTIVE:
+        return jsonify({'error': ha.WITNESS_LEADER_ERROR}), 409
+    if ha.witness() is None:
+        return jsonify({'error': ha.WITNESS_NONE_ERROR}), 404
+    denied = _refuse_without_reauth('removing the witness')
+    if denied:
+        return denied
+    if ha.lease_in_force() and not ha.confirm_lease():
+        return no_lease_refusal() or (jsonify({'code': 'HA_NO_LEASE', 'error': ha.NO_LEASE_ERROR}), 503)
+    try:
+        rec = ha.remove_witness()
+    except ha.AutoMode as e:
+        return jsonify({'code': 'HA_AUTO_MODE', 'error': str(e)}), 409
+    except ha.NoLease as e:
+        return no_lease_refusal() or (jsonify({'code': 'HA_NO_LEASE', 'error': str(e)}), 503)
+    except ha.HaError as e:
+        return jsonify({'error': str(e)}), 409
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Removing the witness failed')}), 500
+    told = False
+    try:
+        resp = ha.call_witness(rec, 'POST', ha.WITNESS_UNPAIRED_PATH,
+                               json_body={'removed': True, 'epoch': ha.epoch()})
+        told = resp.status_code == 200 and (resp.json() or {}).get('left_group') is True
+    except Exception as e:
+        logging.warning(f"[HA] could not tell the witness {rec.get('url')} it was removed: {e}")
+    log_audit(_user(), 'ha.witness_removed',
+              f"removed the witness {rec.get('url') or rec['instance_id']} ({'told' if told else 'not told'})")
+    # the HA routes tell nobody by themselves (app.py): the record goes with the next sync
+    ha.nudge_members()
+    return jsonify({'success': True, 'told': told})
+
+
 # --- node agents -----------------------------------------------------------------
 
 _AGENT_CLUSTER = re.compile(r'[A-Za-z0-9_.-]{1,64}')
@@ -1774,6 +1874,95 @@ def peer_fingerprint():
                   f"member {p.get('url') or p['instance_id']} announced a new certificate pin",
                   ip_address=get_client_ip())
     return jsonify({'success': True, 'changed': changed})
+
+
+# --- the witness, between it and the leader ------------------------------------------
+
+@bp.route('/api/ha/peer/pair-witness', methods=['POST'])
+def peer_pair_witness():
+    """The witness's half of its pairing (`pegaprox-witness join`).
+
+    No session and no peer header: the witness code in the body authenticates the call
+    and is spent by it. The witness sends instance_id, url, fingerprint and its Ed25519
+    public_key. Its record goes into the group, and back goes, sealed with a key derived
+    from the code, this instance's public key, the voter config with the configs before
+    it, the epoch, the mode and, in an automatic group, the floor - no field key and no
+    snapshot. A wrong code is 403 on every instance; with the right one, 503 HA_NO_LEASE
+    in an automatic group on an instance a majority did not just confirm, 403 for
+    anything else that is refused."""
+    ip = get_client_ip()
+    if not _pair_attempts.allow(ip):
+        resp = jsonify({'error': 'Too many pairing attempts - wait a few minutes'})
+        resp.headers['Retry-After'] = '300'
+        return resp, 429
+    data = _body()
+    if not ha.witness_code_ok(_str(data.get('code'))):
+        logging.warning(f"[HA] witness pairing attempt from {ip} refused: {ha.PAIRING_CODE_ERROR}")
+        return jsonify({'error': ha.PAIRING_CODE_ERROR}), 403
+    if ha.lease_in_force() and not ha.confirm_lease():
+        return no_lease_refusal() or (jsonify({'code': 'HA_NO_LEASE', 'error': ha.NO_LEASE_ERROR}), 503)
+    url = _str(data.get('url'), 4096)
+    try:
+        out = ha.accept_witness(_str(data.get('code')), _str(data.get('instance_id'), 64), url,
+                                _str(data.get('fingerprint'), 128), _str(data.get('public_key'), 128))
+    except ha.HaError as e:
+        logging.warning(f"[HA] witness pairing attempt from {ip} refused: {e}")
+        return jsonify({'error': str(e)}), 403
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Pairing the witness failed')}), 500
+    log_audit('system', 'ha.witness_paired', f"witness {url} paired, epoch {out['epoch']}", ip_address=ip)
+    ha.nudge_members()
+    return jsonify(out)
+
+
+@bp.route('/api/ha/peer/witness-leave', methods=['POST'])
+def peer_witness_leave():
+    """The witness leaves the group (`pegaprox-witness leave`), signed with its key.
+
+    Taken on the leader, which takes it out as the remove route does: 409 HA_AUTO_MODE
+    where an automatic group would be left with fewer than three votes, 503 HA_NO_LEASE
+    without the lease. 409 with follow {instance_id, url, fingerprint, public_key, epoch}
+    on a standby that knows the leader, for the witness to ask there. 401 HA_CLOCK for a
+    good signature whose time is off, 401 for anybody else."""
+    try:
+        request.max_content_length = _MAX_PEER_BODY
+        body = request.get_data(cache=True)
+    except Exception:
+        body = None
+    kind, rec = (None, None) if body is None or request.query_string else \
+        ha.witness_verdict(request.headers, request.method, request.path, body)
+    if kind == 'skewed':
+        return jsonify({'code': 'HA_CLOCK',
+                        'error': f'The clocks of the two instances are more than '
+                                 f'{ha.SIGNATURE_WINDOW} seconds apart - set both by NTP'}), 401
+    if kind != 'witness':
+        ip = get_client_ip()
+        if not _peer_failures.allow(ip):
+            resp = jsonify({'error': 'Too many failed peer calls'})
+            resp.headers['Retry-After'] = '300'
+            return resp, 429
+        logging.warning(f"[HA] refused a witness call from {ip} to {request.path}")
+        return jsonify({'error': 'Not the witness of this group', 'instance_id': ha.instance_id()}), 401
+    if ha.role() != ha.ROLE_ACTIVE:
+        out = {'error': 'This instance does not lead the group'}
+        hint = ha.follow_hint()
+        if hint:
+            out['follow'] = hint
+        return jsonify(out), 409
+    if ha.lease_in_force() and not ha.confirm_lease():
+        return no_lease_refusal() or (jsonify({'code': 'HA_NO_LEASE', 'error': ha.NO_LEASE_ERROR}), 503)
+    try:
+        ha.remove_witness()
+    except ha.AutoMode as e:
+        return jsonify({'code': 'HA_AUTO_MODE', 'error': str(e)}), 409
+    except ha.NoLease as e:
+        return no_lease_refusal() or (jsonify({'code': 'HA_NO_LEASE', 'error': str(e)}), 503)
+    except ha.HaError as e:
+        return jsonify({'error': str(e)}), 409
+    log_audit('system', 'ha.witness_left', f"the witness {rec.get('url') or rec['instance_id']} left "
+                                           'the group', ip_address=get_client_ip())
+    ha.nudge_members()
+    return jsonify({'success': True})
 
 
 # --- forwarded writes, the active's half ---------------------------------------------

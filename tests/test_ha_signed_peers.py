@@ -266,11 +266,27 @@ def test_a_call_from_before_a_restart_is_not_taken_after_it(group, seed, monkeyp
     assert _send(g, 'a', headers).status_code == 401
     # a restarts
     ha.forget_seen_nonces()
-    monkeypatch.setattr(ha, '_PROCESS_STARTED', int(time.time()))
+    monkeypatch.setattr(ha, '_PROCESS_STARTED', ha.ha_vote.ha_clock())
     r = _send(g, 'a', headers)
     assert r.status_code == 401 and r.get_json()['code'] == 'HA_CLOCK'
     # what b signs from now on is taken
     assert _asks(g, 'b', 'a') == 200 and _watch(g, 'b') == 'ok'
+
+
+def test_the_start_of_the_process_follows_the_wall_clock(group, seed, monkeypatch):
+    """The start is kept in lease time and read in the wall clock of the moment: an
+    instance whose clock was ahead when it started, and that NTP set back since, takes
+    its members' calls again instead of answering HA_CLOCK for as long as it was off. A
+    call signed before the start is still not taken."""
+    g = group
+    _built(g, seed, 'bc')
+    ha = g.ha
+    # started 30 seconds ago, whatever the wall clock said then
+    monkeypatch.setattr(ha, '_PROCESS_STARTED', ha.ha_vote.ha_clock() - 30)
+    assert _send(g, 'a', _sign_as(g, 'b', 'a')).status_code == 200
+    assert _send(g, 'a', _sign_as(g, 'b', 'a', ts=int(time.time()) - 10)).status_code == 200
+    r = _send(g, 'a', _sign_as(g, 'b', 'a', ts=int(time.time()) - 60))
+    assert r.status_code == 401 and r.get_json()['code'] == 'HA_CLOCK'
 
 
 def test_the_body_is_read_whatever_the_content_type_says(group, seed):

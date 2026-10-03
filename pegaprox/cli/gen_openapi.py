@@ -38,7 +38,9 @@ _INLINE_AUTH = ('_require_session', 'validate_session(', 'validate_api_token(',
                 # token; it has no session and never will, but it is not public.
                 '_profile_for_token', '_run_for_callback_token',
                 # #625 - the other PegaProx instance of a standby pair
-                '_peer_or_refuse', 'accept_pairing')
+                '_peer_or_refuse', 'accept_pairing',
+                # and its witness: the code at pairing, its signature after
+                'accept_witness', 'witness_verdict')
 
 # ...and those two take that token only, so advertising apiToken/sessionId on them
 # sends an integrator straight into a 403.
@@ -46,8 +48,8 @@ _INSTALL_TOKEN_AUTH = ('_profile_for_token', '_run_for_callback_token')
 
 # Same for the standby pair: the peer header and nothing else. The pairing route
 # is authenticated by the one-time code in its body, which no scheme describes.
-_HA_PEER_AUTH = ('_peer_or_refuse',)
-_HA_PAIRING_AUTH = ('accept_pairing',)
+_HA_PEER_AUTH = ('_peer_or_refuse', 'witness_verdict')
+_HA_PAIRING_AUTH = ('accept_pairing', 'accept_witness')
 
 _CONVERTER_TYPES = {
     'int': ('integer', None),

@@ -156,7 +156,8 @@ def _ha_state_out_of_the_checkout(tmp_path, monkeypatch):
     monkeypatch.setattr(auto_install, 'self_signed_fingerprint', lambda: '')
     # A signed call from before the process started is refused (the nonces seen until
     # then are gone). The test process started whenever the run did, so every test
-    # counts as a process that has run for longer than the signature window.
+    # counts as a process that has run for longer than the signature window (lease
+    # time 0 is the boot of the host).
     monkeypatch.setattr(ha, '_PROCESS_STARTED', 0)
     # a standby's note that its active did not answer lives as long as the process
     monkeypatch.setattr(ha, '_silent_source', {'id': None})

@@ -44,7 +44,8 @@ COPY --chown=pegaprox:pegaprox requirements.txt .
 COPY --chown=pegaprox:pegaprox update.sh .
 
 # Create runtime directories
-RUN mkdir -p /app/config /app/logs /app/backups \
+# /app/witness: the state of the witness, for the command `witness` (#625)
+RUN mkdir -p /app/config /app/logs /app/backups /app/witness \
     && chown -R pegaprox:pegaprox /app
 
 # Persistent volumes for config and logs
@@ -54,6 +55,8 @@ VOLUME ["/app/config", "/app/logs"]
 USER pegaprox
 
 EXPOSE 5000 5001 5002
+# the witness, when the container runs the command `witness`
+EXPOSE 5005
 
 # MK May 2026 — start_period bumped from 15s to 120s and retries from 3 to 5
 # to give the one-time plain→SQLCipher DB migration room to finish on first

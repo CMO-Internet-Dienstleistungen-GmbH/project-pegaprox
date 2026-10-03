@@ -1170,6 +1170,8 @@ def main(debug_mode=False):
     # to the service, say - shares the database and the HA state and acts next to it.
     from pegaprox.core import ha
     try:
+        # and never on the state directory of a witness (pegaprox/witness.py)
+        ha.check_not_a_witness_dir()
         ha.lock_config_dir()
     except ha.HaError as e:
         print(f"\n[FATAL] {e}\n")

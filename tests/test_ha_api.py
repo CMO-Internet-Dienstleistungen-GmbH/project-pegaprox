@@ -51,6 +51,9 @@ ADMIN_ROUTES = [
     ('put', '/api/ha/mode', {'mode': 'auto', 'user_password': ADMIN_PW}),
     ('post', f'/api/ha/members/{B_ID}/readmit', {'user_password': ADMIN_PW}),
     ('put', '/api/ha/timezone', {'timezone': 'Europe/Vienna'}),
+    # the witness (tests/test_ha_witness.py)
+    ('post', '/api/ha/witness/pairing-code', {'url': ACTIVE_URL, 'user_password': ADMIN_PW}),
+    ('post', '/api/ha/witness/remove', {'confirm': 'REMOVE', 'user_password': ADMIN_PW}),
 ]
 PEER_ROUTES = [
     ('POST', '/api/ha/peer/pair'),
@@ -65,6 +68,8 @@ PEER_ROUTES = [
     ('POST', '/api/ha/peer/vote'),
     ('POST', '/api/ha/peer/renew'),
     ('POST', '/api/ha/peer/fingerprint'),
+    ('POST', '/api/ha/peer/pair-witness'),
+    ('POST', '/api/ha/peer/witness-leave'),
 ]
 # what the self-fence agent of a node asks; no session, keyed with the cluster's agent
 # token (tests/test_ha_agent_script.py)
@@ -354,6 +359,8 @@ def test_an_admin_reaches_every_route(ha_env, seed):
         '/api/ha/mode': 409,                        # not offered by this release yet
         f'/api/ha/members/{B_ID}/readmit': 409,     # a manual group quarantines nobody
         '/api/ha/timezone': 409,                    # not the leader of a group
+        '/api/ha/witness/pairing-code': 409,        # not offered by this release yet
+        '/api/ha/witness/remove': 409,              # not the leader of a group
     }
     for method, path, body in ADMIN_ROUTES:
         r = _send(c, method, path, body)
@@ -380,8 +387,8 @@ def test_peer_routes_want_the_peer_header(ha_env):
              f'{A_ID}:{PEER_SECRET}', f'{B_ID}:{PEER_SECRET}x',
              f'{B_ID}:{ha._hash_secret(PEER_SECRET)}']
     for method, path in PEER_ROUTES:
-        if path == '/api/ha/peer/pair':
-            continue                               # the code authenticates that one
+        if path in ('/api/ha/peer/pair', '/api/ha/peer/pair-witness'):
+            continue                               # the code authenticates those
         ha_api._peer_failures.reset()
         for header in wrong:
             r = _peer(api, method, path, header, json={'epoch': 99})
@@ -1284,7 +1291,7 @@ def test_the_spec_says_what_the_peer_routes_take(api):
     for method, path in PEER_ROUTES:
         op = paths[path][method.lower()]
         assert op['x-pegaprox-auth'] == 'inline', path
-        if path == '/api/ha/peer/pair':
+        if path in ('/api/ha/peer/pair', '/api/ha/peer/pair-witness'):
             assert op['security'] == [], 'the code in the body is the credential'
         else:
             assert op['security'] == [{'haPeer': []}], path

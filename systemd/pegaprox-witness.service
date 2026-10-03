@@ -1,0 +1,37 @@
+[Unit]
+Description=PegaProx witness - the third vote of an automatic group
+After=network-online.target
+Wants=network-online.target
+# MK Oct 2026 (#625): not enabled by the package. Pair it first
+# (pegaprox-witness join <code> --url https://<this host>:5005), then
+# systemctl enable --now pegaprox-witness. It never runs next to a PegaProx
+# instance on the same host: the vote of a site would count twice.
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=pegaprox-witness
+Group=pegaprox-witness
+StateDirectory=pegaprox-witness
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/pegaprox-witness
+# Firewall the witness port so that only the networks of the members reach it.
+# Where you cannot, name those networks with --allow (before `run`) or here:
+#Environment=PEGAPROX_WITNESS_ALLOW=192.0.2.0/24,2001:db8:1::/48
+ExecStart=/usr/bin/pegaprox/pegaprox-wrapper witness run
+
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pegaprox-witness
+
+[Install]
+WantedBy=multi-user.target
