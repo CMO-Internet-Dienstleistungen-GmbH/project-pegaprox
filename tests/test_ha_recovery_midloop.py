@@ -410,7 +410,7 @@ def _run(monkeypatch, out, agent='none', reboot=False, horizon=400, setup=None, 
     m._ha_update_fallback_hosts = lambda: None
     m.get_node_status = lambda: {'pve1': {'score': 5}, 'pve3': {'score': 50}, 'pve2': {'score': 60}}
     m._ssh_run_command = pve.ssh
-    m._ssh_run_command_with_password = lambda host, user, command, password: pve.ssh(host, user, command)
+    m._ssh_run_command_with_password = lambda host, user, command, password, **kw: pve.ssh(host, user, command)
 
     # every recovery the monitor starts is a thread on the clock
     workers = []

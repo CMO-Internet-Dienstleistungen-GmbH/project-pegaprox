@@ -269,7 +269,10 @@ class VMwareManager:
                 sslContext=ssl_context,
                 disableSslCertValidation=(not self.ssl_verify)
             )
-            
+            # every *_Task and guest operation asks the guard of an automatic group (#625)
+            from pegaprox.core import ha_transport
+            ha_transport.guard_soap(self._si)
+
             self._soap_content = self._si.RetrieveContent()
             self._connection_type = 'soap'
             self.connected = True
@@ -412,13 +415,14 @@ class VMwareManager:
     def api_post(self, path: str, data: dict = None) -> dict:
         """POST request to vSphere REST API"""
         try:
-            import requests
             try:
                 url = self._build_validated_url(path)
             except ValueError as ve:
                 return {'error': f'invalid path: {ve}'}
-            resp = requests.post(
-                url,
+            # asked at the exit and once its connection is up in an automatic group (#625)
+            from pegaprox.core import ha_transport
+            resp = ha_transport.http(
+                'POST', url,
                 headers={**self._headers(), 'Content-Type': 'application/json'},
                 json=data,
                 verify=self.ssl_verify,
@@ -426,9 +430,10 @@ class VMwareManager:
             )
             if resp.status_code == 401:
                 if self.connect():
-                    resp = requests.post(url,
-                                        headers={**self._headers(), 'Content-Type': 'application/json'},
-                                        json=data, verify=self.ssl_verify, timeout=60)
+                    # the same call once more: checked again, the lease may be gone by now
+                    resp = ha_transport.http('POST', url, again=True,
+                                             headers={**self._headers(), 'Content-Type': 'application/json'},
+                                             json=data, verify=self.ssl_verify, timeout=60)
             if resp.status_code in (200, 201, 204):
                 try:
                     return {'data': resp.json()}
@@ -441,13 +446,13 @@ class VMwareManager:
     def api_delete(self, path: str) -> dict:
         """DELETE request to vSphere REST API"""
         try:
-            import requests
             try:
                 url = self._build_validated_url(path)
             except ValueError as ve:
                 return {'error': f'invalid path: {ve}'}
-            resp = requests.delete(
-                url,
+            from pegaprox.core import ha_transport
+            resp = ha_transport.http(
+                'DELETE', url,
                 headers=self._headers(),
                 verify=self.ssl_verify,
                 timeout=30
@@ -1135,10 +1140,11 @@ class VMwareManager:
         result = self.api_post(f'/api/vcenter/vm/{vm_id}', spec)
         # REST PATCH for notes
         if 'notes' in config and 'error' not in result:
-            import requests
+            from pegaprox.core import ha_transport
             try:
-                resp = requests.patch(
-                    f"{self._base_url}/api/vcenter/vm/{vm_id}",
+                url = f"{self._base_url}/api/vcenter/vm/{vm_id}"
+                resp = ha_transport.http(
+                    'PATCH', url,
                     headers={**self._headers(), 'Content-Type': 'application/json'},
                     json={'annotation': config['notes']},
                     verify=self.ssl_verify, timeout=30

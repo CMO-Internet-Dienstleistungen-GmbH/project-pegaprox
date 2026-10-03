@@ -55,6 +55,8 @@ from pegaprox.utils.ssh import get_ssh_connection_stats, _ssh_track_connection
 from pegaprox.utils.concurrent import GEVENT_PATCHED
 from pegaprox.core.db import get_db
 from pegaprox.core import ha  # PegaProx's own warm standby (#625), not PVE HA
+from pegaprox.core import ha_transport, ha_vote
+from pegaprox.core.ha_transport import node_cmd
 from pegaprox.utils.ssh import read_capped as _read_capped
 
 # Lazy paramiko import
@@ -111,6 +113,24 @@ _TASK_USER_NEGCACHE = {}
 _TASK_USER_NEGCACHE_MAX = 5000
 _TASK_USER_NEGCACHE_TTL = 120.0
 
+
+# a guest a recovery moved while its node was online, and did not start (design 5.6)
+HELD_NOTE = ("moved while {node} was online and not started on purpose - {node} may still run "
+             "it without a config there: check {node} before you start it by hand")
+
+
+def _interrupted_text(rec):
+    """What a node recovery an automatic leader left half done says in the log and the
+    audit (#625, design 5.6)."""
+    return (f"the recovery of {rec['node']} by instance {rec['instance_id'][:8]} (epoch "
+            f"{rec['epoch']}) stopped half way"
+            + (f"; guests moved and not started: {', '.join(map(str, rec['moved']))}"
+               if rec['moved'] else '')
+            + (f"; steps begun and not finished: {', '.join(rec['open'])}" if rec['open'] else '')
+            + (f"; {HELD_NOTE.format(node=rec['node'])}: {', '.join(map(str, rec['held']))}"
+               if rec.get('held') else ''))
+
+
 def run_concurrent(tasks: list, timeout: float = 30.0, pool=None) -> list:
     # MK 2026-05-31 — paired bugfix with utils/concurrent.py: gevent.pool.Pool's
     # __bool__ is len(), so `if GEVENT_POOL and ...` was always-False on entry.
@@ -123,6 +143,9 @@ def run_concurrent(tasks: list, timeout: float = 30.0, pool=None) -> list:
     # Coverage is unchanged; this only bounds how much of the machine it holds at once.
     if not tasks:
         return []
+    if ha.guard_on():
+        # each task may send what the caller may (#625)
+        tasks = [ha.carry(task) for task in tasks]
     _pool = pool if pool is not None else GEVENT_POOL
     if _pool is not None and GEVENT_AVAILABLE:
         try:
@@ -746,6 +769,8 @@ class PegaProxManager:
                 kwargs['timeout'] = 15  # 15 s is plenty for any PVE API call
             return _original_request(method, url, **kwargs)
         session.request = _request_with_default_timeout
+        # an automatic leader that lost its lease sends no change from here (#625)
+        ha_transport.guard_session(session)
 
         self._session_cache = session
         self._session_auth_key = auth_key
@@ -1230,6 +1255,8 @@ class PegaProxManager:
                         session.verify = False
                     if not self._ssl_verify:
                         session.mount('https://', _NoHostnameCheckAdapter())  # MK: #88
+                    # the login passes in every role, the token it may mint needs the lease
+                    ha_transport.guard_session(session)
 
                     if self._using_api_token:
                         # API Token auth - no ticket needed!
@@ -2616,6 +2643,8 @@ class PegaProxManager:
                         except Exception:
                             pass
 
+                    if not ha.confirm_step(f'the anti-affinity move of {vid}'):
+                        return migrations
                     ok = self.migrate_vm(vm_res, target)
                     if ok:
                         migrations += 1
@@ -3525,7 +3554,9 @@ class PegaProxManager:
             if self._try_native_ha_maintenance(node_name, task):
                 self.logger.info(f"[MAINT] HA flag set for {node_name}, now evacuating VMs ourselves")
             # always run our own evacuation
-            t = threading.Thread(target=self._evacuate_node, args=(node_name, task))
+            # a user job: in an automatic group each migration asks for the lease (#625)
+            t = threading.Thread(target=ha.as_job(self._evacuate_node, f'evacuation of {node_name}'),
+                                 args=(node_name, task))
             t.daemon = True
             t.start()
 
@@ -4440,6 +4471,9 @@ class PegaProxManager:
         self.ha_thread = threading.Thread(target=self._ha_monitor_loop, daemon=True)
         self.ha_thread.start()
         self.logger.info("[HA] High Availability monitor started (checking every 10s)")  # 10s hardcoded for now
+        # a new leader of an automatic group says what its predecessor left half done (5.6)
+        if ha.lease_in_force():
+            self._ha_say_interrupted()
         
         # ═══════════════════════════════════════════════════════════════
         # AUTOMATIC SPLIT-BRAIN PROTECTION SETUP - NS Jan 2026
@@ -4465,7 +4499,9 @@ class PegaProxManager:
                     success = sum(1 for v in results.values() if v)
                     self.logger.info(f"[HA] ✓ Node agents: {success}/{len(results)} installed")
                 
-                threading.Thread(target=auto_install, daemon=True).start()
+                # agent housekeeping over many nodes: each SSH step asks for the lease at
+                # its exit in an automatic group (#625)
+                threading.Thread(target=ha.as_job(auto_install, 'node agent install'), daemon=True).start()
             else:
                 self.logger.warning("[HA] ⚠️ No shared storage found - SSH-only protection mode")
                 self.logger.warning("[HA] ⚠️ Add shared storage (NFS/CephFS) for full dual-network protection")
@@ -4482,7 +4518,8 @@ class PegaProxManager:
         # and bring the script of the v2 ones up to date: this may be a new leader (#625)
         if self.ha_config.get('self_fence_installed'):
             self.logger.info("[HA] 🛡️ Restarting self-fence agents on nodes...")
-            threading.Thread(target=self._ha_bring_up_fence_agents, daemon=True).start()
+            threading.Thread(target=ha.as_job(self._ha_bring_up_fence_agents, 'self-fence agents'),
+                             daemon=True).start()
 
         # the switch goes into the stored settings with the next save, so it is this
         # setup's from now on and not worked out again (#625)
@@ -4495,7 +4532,7 @@ class PegaProxManager:
                                 "IPMI fencing and switch it off in the HA settings.")
         # the cluster claim, where an admin switched it on
         if self._ha_claim_enabled():
-            threading.Thread(target=self._ha_claim_ensure, daemon=True).start()
+            threading.Thread(target=ha.as_job(self._ha_claim_ensure, 'the cluster claim'), daemon=True).start()
 
     def stop_ha_monitor(self):
         # MK Sep 2026 (#625) - self_fence_installed comes from the synced clusters row, so
@@ -4516,7 +4553,8 @@ class PegaProxManager:
         if self.ha_config.get('self_fence_installed'):
             if ha.is_active() and started_here:
                 self.logger.info("[HA] Stopping self-fence agents on nodes...")
-                threading.Thread(target=self._ha_stop_self_fence_agents, daemon=True).start()
+                threading.Thread(target=ha.as_job(self._ha_stop_self_fence_agents, 'self-fence agents'),
+                                 daemon=True).start()
             else:
                 self.logger.info("[HA] Self-fence agents left running - the HA monitor did not "
                                  "run on this PegaProx instance")
@@ -4608,6 +4646,9 @@ class PegaProxManager:
                     if node_status == 'online':
                         # Node is healthy
                         self.ha_node_status[node_name]['last_seen'] = current_time
+                        # last_seen is also set when a node is first tracked, online or
+                        # not; this one only by a pass that saw it online (#625, 5.6)
+                        self.ha_node_status[node_name]['online_at'] = current_time
                         self.ha_node_status[node_name]['consecutive_failures'] = 0
                         
                         if prev_status == 'offline':
@@ -4720,6 +4761,9 @@ class PegaProxManager:
         looked = {'last_seen': seen_online}
         locked = False
         must_fence = []
+        # automatic failover: each step is written down before and after, so a leader
+        # that takes over says what this one left half done (design 5.6)
+        run = None
         try:
             # ============================================
             # STEP 0: Try to acquire recovery lock (if storage configured)
@@ -4738,7 +4782,10 @@ class PegaProxManager:
                         self.logger.warning(f"[HA] Another instance is already recovering {failed_node}")
                     return
                 locked = True
-            
+            run = ha.recovery_begin(self.id, failed_node)
+            # _ha_start_vm_on_node writes its steps under the same run
+            self.__dict__.setdefault('_ha_recovery_runs', {})[failed_node] = run
+
             # ============================================
             # SPLIT-BRAIN PREVENTION STEP 1: Wait period
             # ============================================
@@ -4851,16 +4898,21 @@ class PegaProxManager:
                     self.logger.critical(f"[HA] ═══════════════════════════════════════════════════════")
                     
                     vms_stopped = False
-                    
+
                     # Try SSH method first
                     if ssh_check['reachable']:
+                        # the same goal as a newer leader's: no lease time asked for (5.4)
+                        if not ha.confirm_step(f'stopping the guests on {failed_node}', ha.NEED_SAME_GOAL):
+                            return
+                        ha.recovery_step(run, self.id, failed_node, 'stop_vms')
                         vms_stopped = self._ha_ssh_stop_vms_on_node(
-                            failed_node, 
+                            failed_node,
                             vmids=running_vms,
                             ctids=running_cts,
                             reachable_ips=ssh_check.get('reachable_ips', [])
                         )
-                    
+                        ha.recovery_step(run, self.id, failed_node, 'stop_vms', done=True)
+
                     # If SSH didn't work, use poison pill via storage
                     if not vms_stopped and (self.ha_config.get('dual_network_mode') or self.ha_config.get('storage_heartbeat_enabled')):
                         # the SSH stop above can take a while; a step-down that came in
@@ -4869,11 +4921,17 @@ class PegaProxManager:
                             self.logger.warning(f"[HA] Recovery of {failed_node} dropped - this PegaProx instance stepped down")
                             return
                         self.logger.info(f"[HA] SSH stop failed, using POISON PILL via storage...")
+                        if not ha.confirm_step(f'the poison pill for {failed_node}', ha.NEED_SAME_GOAL):
+                            return
+                        ha.recovery_step(run, self.id, failed_node, 'poison_pill')
                         if self._ha_write_poison_pill(failed_node, "Recovery initiated - stop all VMs"):
+                            ha.recovery_step(run, self.id, failed_node, 'poison_pill', done=True)
                             # Wait for the node agent to see the poison and stop VMs
                             self.logger.info(f"[HA] Waiting 30s for node agent to stop VMs...")
                             time.sleep(30)
-                            
+                            if not ha.confirm_step(f'recovery of {failed_node} after the poison pill'):
+                                return
+
                             # Check if VMs stopped
                             heartbeat = self._ha_check_node_agent_heartbeat(failed_node)
                             if not heartbeat.get('running_vms') and not heartbeat.get('running_cts'):
@@ -4897,6 +4955,8 @@ class PegaProxManager:
                     # Wait a moment for VMs to fully stop
                     self.logger.info(f"[HA] Waiting 10s for VMs to fully stop...")
                     time.sleep(10)
+                    if not ha.confirm_step(f'recovery of {failed_node} after its guests stopped'):
+                        return
                 else:
                     self.logger.info(f"[HA] No running VMs on {failed_node} - safe to proceed")
             else:
@@ -4948,10 +5008,15 @@ class PegaProxManager:
             if not ha.is_active():
                 self.logger.warning(f"[HA] Recovery of {failed_node} dropped - this PegaProx instance stepped down")
                 return
+            # the power-off of the failed node is the same goal for any leader (5.4)
+            if not ha.confirm_step(f'fencing {failed_node}', ha.NEED_SAME_GOAL):
+                return
+            ha.recovery_step(run, self.id, failed_node, 'fence')
             # quorum will be forced: not before every node outside is off, read back
             if must_fence and not self._ha_fence_outside(failed_node, must_fence):
                 return
             fenced = self._ha_fence_verified(failed_node) or self._ha_fence_node(failed_node)
+            ha.recovery_step(run, self.id, failed_node, 'fence', done=True)
             if fenced:
                 self.logger.info(f"[HA] ✓ Hardware fencing successful for {failed_node}")
             
@@ -5117,6 +5182,15 @@ class PegaProxManager:
             # a fence that was read back covers this recovery only
             for node in must_fence or ():
                 self.__dict__.get('_ha_verified_fences', {}).pop(node, None)
+            self.__dict__.get('_ha_recovery_runs', {}).pop(failed_node, None)
+            # a guest moved and not started stays in the journal and is said now, a run cut
+            # short by the lease stays as it is for the next leader (design 5.6)
+            try:
+                left = ha.recovery_end(run, self._ha_guests_now)
+                if left:
+                    self._ha_refuse('ha.recovery_interrupted', _interrupted_text(left))
+            except Exception as e:
+                self.logger.warning(f"[HA] Could not close the recovery journal of {failed_node}: {e}")
 
             # Keep recovery flag for a while to prevent duplicate recovery
             time.sleep(60)  # 60s cooldown, maybe make this configurable?
@@ -5142,6 +5216,23 @@ class PegaProxManager:
             self.logger.warning(f"[HA] Could not list the nodes to look at {node}: {e}")
         with self.ha_lock:
             return (self.ha_node_status.get(node) or {}).get('status') == 'online'
+
+    def _ha_seen_since(self, node, since) -> bool:
+        """Whether a failed node may have been back since the config of one of its guests
+        moved: a pass of the monitor here saw it online after `since` (a time from the
+        recovery journal, written by whichever leader moved it: the skew automatic mode
+        allows is taken off), or the API host lists it online now. The rule the worker
+        holds a moved guest by, for the guests a former leader left (#625, design 5.6).
+        True when `since` cannot be read."""
+        try:
+            moved = datetime.fromisoformat(since).astimezone() - timedelta(seconds=ha_vote.SKEW_LIMIT)
+        except (TypeError, ValueError):
+            return True
+        with self.ha_lock:
+            seen = (self.ha_node_status.get(node) or {}).get('online_at')
+        if isinstance(seen, datetime) and seen.astimezone() >= moved:
+            return True
+        return self._ha_node_listed_online(node)
 
     NODE_BACK_RESTARTS = 3     # watches started over in one look before the node is taken as back
 
@@ -5597,13 +5688,18 @@ class PegaProxManager:
         the start. looked is the recovery worker's, for _ha_node_back.
         """
         host = self.host
-        
+        # automatic failover: the journal run of this recovery, None anywhere else (5.6)
+        run = self.__dict__.get('_ha_recovery_runs', {}).get(original_node)
+
+        def step(name, done=False):
+            ha.recovery_step(run, self.id, original_node, name, vmid=vmid, done=done)
+
         try:
             # Force quorum first (for 2-node clusters)
             # Without quorum, pmxcfs is read-only - we can't do anything!
             two_node_mode = self.ha_config.get('two_node_mode', False)
             force_quorum = self.ha_config.get('force_quorum_on_failure', False)
-            
+
             if (two_node_mode or force_quorum) and not self._ha_may_force_quorum(original_node):
                 # not without a fence of the other node that was read back. On a
                 # quorate cluster nothing needs forcing anyway.
@@ -5612,6 +5708,8 @@ class PegaProxManager:
             elif two_node_mode or force_quorum:
                 self.logger.info(f"[HA] Forcing quorum on {target_node} (2-node mode)")
 
+                if not ha.confirm_step(f'forcing quorum on {target_node}'):
+                    return False
                 if self._ha_try_force_quorum(target_node):
                     self.logger.info(f"[HA] ✓ Quorum forced successfully")
                     time.sleep(3)  # Give corosync/pmxcfs time to update
@@ -5622,6 +5720,8 @@ class PegaProxManager:
             
             # Try to fence the dead node (if fencing is configured)
             self.logger.info(f"[HA] Attempting to fence {original_node}")
+            if not ha.confirm_step(f'fencing {original_node} again', ha.NEED_SAME_GOAL):
+                return False
             fenced = self._ha_fence_node(original_node)
             if not fenced:
                 self.logger.warning(f"[HA] ⚠ Could not fence node {original_node}")
@@ -5643,8 +5743,12 @@ class PegaProxManager:
             
             # Clear any locks on the VM
             self.logger.info(f"[HA] Clearing locks on VM {vmid}")
+            if not ha.confirm_step(f'clearing the lock of {vmid}'):
+                return False
+            step('clear_lock')
             if not self._ha_clear_vm_lock(vmid, vm_type, target_node, original_node):
                 self.logger.warning(f"[HA] ⚠ Failed to clear lock on {vm_type}/{vmid} - continuing anyway")
+            step('clear_lock', done=True)
             
             # right before the config leaves the node: forcing quorum, the fence and the
             # reads above can take a while, and the node may be back by now (#625)
@@ -5655,8 +5759,18 @@ class PegaProxManager:
             # Move VM config to target node
             # The config must be in /etc/pve/nodes/<target>/qemu-server/<vmid>.conf
             self.logger.info(f"[HA] Moving VM {vmid} config from {original_node} to {target_node}")
+            # written down and sent to the members before the round that lets it go (5.6).
+            # The hold goes first, so the same send-on carries it: held until the look after
+            # the move clears it, a leader gone anywhere from the move to that look leaves
+            # the guest held, not startable
+            if looked is not None:
+                step('hold')
+            step('move_config')
+            if not ha.confirm_step(f'moving the config of {vmid}'):
+                return False
             config_moved = self._ha_move_vm_config(vmid, vm_type, original_node, target_node)
             if config_moved:
+                step('move_config', done=True)
                 self.logger.info(f"[HA] ✓ VM {vmid} config moved to {target_node}")
                 time.sleep(2)  # Give pmxcfs time to sync
                 # Looked at once more right before the start: the mv over SSH can hang
@@ -5673,26 +5787,44 @@ class PegaProxManager:
                         looked['last_seen'] = seen
                         self.logger.warning(f"[HA] {vm_type}/{vmid} was moved to {target_node} and is not "
                                             f"started: {original_node} was online while its config moved")
+                        # not started on purpose: the journal lists it apart, and the start
+                        # of the moved guests leaves it out (design 5.6)
+                        step('hold', done=True)
                         return 'moved'
-            elif self._ha_node_back(original_node, looked, vmid) is True or not ha.is_active():
-                # the attempts of the move can take long; it did not go through, and
-                # the guest stays with its node
-                self.logger.warning(f"[HA] {vm_type}/{vmid} is left on {original_node}, its config did not move")
-                return None
+                    ha.recovery_clear(run, 'hold', vmid)
             else:
-                self.logger.warning(f"[HA] Could not move config - will try to start anyway")
-            
+                if looked is not None:
+                    # nothing moved, nothing to hold
+                    ha.recovery_clear(run, 'hold', vmid)
+                if self._ha_node_back(original_node, looked, vmid) is True or not ha.is_active():
+                    # the attempts of the move can take long; it did not go through, and
+                    # the guest stays with its node
+                    self.logger.warning(f"[HA] {vm_type}/{vmid} is left on {original_node}, its config did not move")
+                    return None
+                if not ha.lease_in_force():
+                    self.logger.warning(f"[HA] Could not move config - will try to start anyway")
+            if ha.lease_in_force() and not self._ha_vm_is_on(vmid, vm_type, target_node,
+                                                             tries=3 if config_moved else 1):
+                # automatic failover: the config location is the token PVE checks, a guest
+                # whose config is not on the target is not started from here (design 5.2)
+                self.logger.error(f"[HA] ✗ {vm_type}/{vmid} is not on {target_node} - not starting it")
+                return False
+
             # Start the VM on target node
             self.logger.info(f"[HA] Starting VM {vmid} on {target_node}")
-            
+
             if vm_type == 'qemu':
                 start_url = f"https://{host}:{self.api_port}/api2/json/nodes/{target_node}/qemu/{vmid}/status/start"
             else:
                 start_url = f"https://{host}:{self.api_port}/api2/json/nodes/{target_node}/lxc/{vmid}/status/start"
-            
+
+            step('start')
+            if not ha.confirm_step(f'starting {vmid} on {target_node}'):
+                return False
             start_response = self._create_session().post(start_url, timeout=15)
-            
+
             if start_response.status_code == 200:
+                step('start', done=True)
                 self.logger.info(f"[HA] ✓ VM {vmid} started successfully on {target_node}")
                 return True
             
@@ -5718,8 +5850,11 @@ class PegaProxManager:
                     and self.config.user.lower().startswith('root@')
                     and not getattr(self, '_using_api_token', False)):
                 self.logger.info(f"[HA] VM {vmid} has lock, trying with skiplock=1")
+                if not ha.confirm_step(f'starting {vmid} on {target_node} with skiplock'):
+                    return False
                 start_response = self._create_session().post(start_url, data={'skiplock': 1}, timeout=15)
                 if start_response.status_code == 200:
+                    step('start', done=True)
                     self.logger.info(f"[HA] ✓ VM {vmid} started with skiplock")
                     return True
 
@@ -5729,6 +5864,146 @@ class PegaProxManager:
             self.logger.error(f"[HA] Error starting VM {vmid} on {target_node}: {e}")
             return False
     
+    def _ha_vm_is_on(self, vmid, vm_type, node, tries=1) -> bool:
+        """Whether the config of the guest sits in `node`'s directory: its status there
+        answers. One read per try, 2 s apart (pmxcfs may take a moment after a move); not
+        /cluster/resources, which lists every guest of the cluster for each one asked."""
+        kind = 'lxc' if vm_type == 'lxc' else 'qemu'
+        url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/{kind}/{int(vmid)}/status/current"
+        for attempt in range(max(1, tries)):
+            if attempt:
+                time.sleep(2)
+            try:
+                if self._create_session().get(url, timeout=10).status_code == 200:
+                    return True
+            except Exception as e:
+                self.logger.warning(f"[HA] Could not look up where {vmid} is: {e}")
+        return False
+
+    def ha_interrupted_recoveries(self):
+        """Node recoveries a leader of an automatic group left half done on this cluster
+        (design 5.6): one entry per run, with `moved` the guests whose config left the
+        failed node and that do not run now, `held` those a recovery moved while the
+        node was online and did not start on purpose (`held_note` says why), and
+        `guests_open` those with a step begun that the guests cannot place. Read against
+        the guests as the cluster lists them: one that runs, or whose config sits on the
+        failed node again, is the monitor's or the admin's and drops out; one with a step
+        begun that sits stopped on another node was moved (the leader was gone before it
+        wrote so). A run with nothing left is forgotten - never on a list that came back
+        empty. A moved guest whose failed node is listed online now, or was seen online
+        by a pass since the move, is held as the worker holds it (_ha_seen_since). Empty
+        anywhere else."""
+        runs = ha.recovery_leftovers(self.id)
+        if not runs:
+            return []
+        try:
+            resources = self.get_vm_resources() or []
+        except Exception:
+            resources = []
+        where = {r.get('vmid'): r for r in resources if isinstance(r, dict)}
+        leads = ha.is_active()
+        looks = {}
+        out = []
+        for rec in runs:
+            rec['held_note'] = HELD_NOTE.format(node=rec['node'])
+            if not where:
+                self._ha_hold_if_back(rec, looks)
+                out.append(rec)
+                continue
+
+            def settled(vmid, node=rec['node']):
+                vm = where.get(vmid)
+                return vm is not None and (vm.get('status') == 'running' or vm.get('node') == node)
+            named = set(rec['moved']) | set(rec['guests_open']) | set(rec['held'])
+            moved = [v for v in rec['moved'] if not settled(v)]
+            unplaced = []
+            for v in rec['guests_open']:
+                if settled(v) or v in moved:
+                    continue
+                if v in where:
+                    moved.append(v)
+                else:
+                    unplaced.append(v)
+            rec['moved'], rec['guests_open'] = sorted(moved), unplaced
+            rec['held'] = [v for v in rec['held'] if not settled(v)]
+            self._ha_hold_if_back(rec, looks)
+            if not (rec['moved'] or rec['guests_open'] or rec['held']):
+                # the journal is the leader's to change; a member's copy follows it
+                if leads:
+                    ha.recovery_forget([rec['run']])
+                continue
+            if leads:
+                # a guest that runs, or sits on its node again, is done with
+                ha.recovery_drop_guests(rec['run'], [v for v in named if settled(v)])
+            out.append(rec)
+        return out
+
+    def _ha_hold_if_back(self, rec, looks=None):
+        """The moved guests of an interrupted run go under held, not started from here,
+        when its failed node may have been back since their config moved (the worker's
+        rule, _ha_seen_since). `looks` keeps one look per node for a listing."""
+        if not rec['moved']:
+            return
+        key = (rec['node'], rec.get('moved_at') or rec.get('at'))
+        looks = {} if looks is None else looks
+        if key not in looks:
+            looks[key] = self._ha_seen_since(*key)
+        if looks[key]:
+            rec['held'] = sorted(set(rec['held']) | set(rec['moved']))
+            rec['moved'] = []
+
+    def _ha_say_interrupted(self):
+        """Log and audit the recoveries a former leader left half done. A run that left
+        nothing for the guests is not said: the listing forgets it once the guests can
+        be read, and a step on the failed node is done again by the monitor. Never raises."""
+        try:
+            for rec in self.ha_interrupted_recoveries():
+                if rec['moved'] or rec.get('guests_open') or rec.get('held'):
+                    self._ha_refuse('ha.recovery_interrupted', _interrupted_text(rec))
+        except Exception as e:
+            self.logger.warning(f"[HA] Could not read the recovery journal: {e}")
+
+    def ha_start_moved_vms(self, runs=None, listed=None):
+        """Start the guests interrupted recoveries moved and did not start, from an admin:
+        the one way on from there, nothing resumes on its own. Starting is safe to
+        repeat: PVE refuses a guest that runs, and one whose config is elsewhere is not
+        found where it is asked for. A held guest is not started (see
+        ha_interrupted_recoveries), and neither is a moved one whose failed node is listed
+        online by now: it goes under held in `listed`. A run is forgotten once each of its
+        moved guests started and nothing else is left in it; else the rows of the guests
+        that started go. `listed` is what ha_interrupted_recoveries returned, read here
+        when not given. Returns {vmid: True/False}."""
+        started = {}
+        done = []
+        try:
+            where = {r.get('vmid'): r for r in self.get_vm_resources() or []}
+        except Exception:
+            where = {}
+        for rec in self.ha_interrupted_recoveries() if listed is None else listed:
+            if runs is not None and rec['run'] not in runs:
+                continue
+            # looked at again right before the starts: the listing may be a while old
+            self._ha_hold_if_back(rec)
+            for vmid in rec['moved']:
+                vm = where.get(vmid)
+                if not vm or not ha.confirm_step(f'starting the moved guest {vmid}'):
+                    started[vmid] = False
+                    continue
+                kind = 'lxc' if vm.get('type') == 'lxc' else 'qemu'
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{vm.get('node')}/{kind}/{vmid}/status/start"
+                try:
+                    started[vmid] = self._create_session().post(url, timeout=15).status_code == 200
+                except Exception as e:
+                    self.logger.error(f"[HA] Could not start {vmid}: {e}")
+                    started[vmid] = False
+            # never on a guest list that came back empty: nothing could be told then
+            if where and not rec['guests_open'] and not rec['held'] and all(started.get(v) for v in rec['moved']):
+                done.append(rec['run'])
+            else:
+                ha.recovery_drop_guests(rec['run'], [v for v in rec['moved'] if started.get(v)])
+        ha.recovery_forget(done)
+        return started
+
     # ═══════════════════════════════════════════════════════════════════════════
     # NODE-HA SAFETY RULES AND THE CLUSTER CLAIM - MK Oct 2026 (#625)
     #
@@ -6018,10 +6293,10 @@ class PegaProxManager:
         env = {**os.environ, 'IPMITOOL_PASSWORD': password, 'IPMI_PASSWORD': password}
         try:
             # the answer to "off" is not the proof, the status after it is
-            subprocess.run(base + ['power', 'off'], capture_output=True, timeout=30, env=env)
+            node_cmd(base + ['power', 'off'], capture_output=True, timeout=30, env=env, host=str(host))
             for _ in range(self.FENCE_VERIFY_READS):
-                status = subprocess.run(base + ['power', 'status'], capture_output=True, text=True,
-                                        timeout=15, env=env)
+                status = node_cmd(base + ['power', 'status'], capture_output=True, text=True,
+                                  timeout=15, env=env, host=str(host), read=True)
                 if status.returncode == 0 and re.search(r'power is off', status.stdout or '', re.I):
                     self.__dict__.setdefault('_ha_verified_fences', {})[node] = time.monotonic()
                     self.logger.info(f"[HA] ✓ {node} is powered off (read back from its BMC)")
@@ -6583,15 +6858,16 @@ if ours; then rm -f "$F" && { rmdir "$D" 2>/dev/null; echo "CLAIM_REMOVED"; } ||
                 self.logger.info(f"[HA] Fencing node {node} via IPMI at {ipmi_host}")
                 
                 # Power off via ipmitool
-                result = subprocess.run(
-                    ['ipmitool', '-I', 'lanplus', '-H', ipmi_host, 
+                result = node_cmd(
+                    ['ipmitool', '-I', 'lanplus', '-H', ipmi_host,
                      '-U', ipmi_user, '-E', 'power', 'off'],
                     capture_output=True, timeout=30,
                     # NS: pass the IPMI password via the environment (-E reads
                     # IPMITOOL_PASSWORD; older ipmitool builds use IPMI_PASSWORD) instead
                     # of -P on the argv, which is visible in `ps` to any local user during
                     # a fence.
-                    env={**os.environ, 'IPMITOOL_PASSWORD': ipmi_pass, 'IPMI_PASSWORD': ipmi_pass}
+                    env={**os.environ, 'IPMITOOL_PASSWORD': ipmi_pass, 'IPMI_PASSWORD': ipmi_pass},
+                    host=str(ipmi_host)
                 )
                 
                 if result.returncode == 0:
@@ -6610,11 +6886,11 @@ if ours; then rm -f "$F" && { rmdir "$D" 2>/dev/null; echo "CLAIM_REMOVED"; } ||
                 self.logger.info(f"[HA] Fencing node {node} via SSH shutdown")
 
                 _hkc, _kh = cli_hostkey_opts()
-                result = subprocess.run(
+                result = node_cmd(
                     ['ssh', '-o', 'ConnectTimeout=5', '-o', f'StrictHostKeyChecking={_hkc}',
                      '-o', f'UserKnownHostsFile={_kh}',
                      f'{ssh_user}@{ssh_host}', 'poweroff'],
-                    capture_output=True, timeout=15
+                    capture_output=True, timeout=15, host=str(ssh_host)
                 )
                 
                 # SSH might fail if node is really dead, that's OK
@@ -6704,12 +6980,14 @@ if ours; then rm -f "$F" && { rmdir "$D" 2>/dev/null; echo "CLAIM_REMOVED"; } ||
                 """Try all SSH auth methods for one IP, return (ip, output) or None."""
                 self.logger.info(f"[HA] Trying SSH to {node} via {ip}...")
                 output = None
-                if ssh_key:
-                    output = self._ssh_run_command_with_key_output(ip, ssh_user, check_cmd, ssh_key)
-                if output is None:
-                    output = self._ssh_run_command_output(ip, ssh_user, check_cmd)
-                if output is None and ssh_password:
-                    output = self._ssh_run_command_with_password_output(ip, ssh_user, check_cmd, ssh_password)
+                # qm list and pct list: a look, no step (#625)
+                with ha.reading():
+                    if ssh_key:
+                        output = self._ssh_run_command_with_key_output(ip, ssh_user, check_cmd, ssh_key)
+                    if output is None:
+                        output = self._ssh_run_command_output(ip, ssh_user, check_cmd)
+                    if output is None and ssh_password:
+                        output = self._ssh_run_command_with_password_output(ip, ssh_user, check_cmd, ssh_password)
                 return (ip, output) if output is not None else None
 
             # Run SSH checks in parallel using gevent pool
@@ -6793,13 +7071,14 @@ if ours; then rm -f "$F" && { rmdir "$D" 2>/dev/null; echo "CLAIM_REMOVED"; } ||
             # Find a working IP
             working_ip = None
             for ip in all_ips:
-                # Quick connectivity test
-                test_output = self._ssh_run_command_output(ip, ssh_user, "echo OK")
-                if test_output is None and ssh_key:
-                    test_output = self._ssh_run_command_with_key_output(ip, ssh_user, "echo OK", ssh_key)
-                if test_output is None and ssh_password:
-                    test_output = self._ssh_run_command_with_password_output(ip, ssh_user, "echo OK", ssh_password)
-                
+                # Quick connectivity test (a look, no round of its own in an automatic group, #625)
+                with ha.reading():
+                    test_output = self._ssh_run_command_output(ip, ssh_user, "echo OK")
+                    if test_output is None and ssh_key:
+                        test_output = self._ssh_run_command_with_key_output(ip, ssh_user, "echo OK", ssh_key)
+                    if test_output is None and ssh_password:
+                        test_output = self._ssh_run_command_with_password_output(ip, ssh_user, "echo OK", ssh_password)
+
                 if test_output is not None:
                     working_ip = ip
                     self.logger.info(f"[HA] Using IP {ip} for VM stop commands")
@@ -7838,7 +8117,9 @@ fi
 
         def one(name):
             try:
-                return self._parse_agent_check(self._ha_agent_ssh(ips[name], cmd))
+                # a look at the agents; on a pool thread no request context says so (#625)
+                with ha.reading():
+                    return self._parse_agent_check(self._ha_agent_ssh(ips[name], cmd))
             except Exception as e:
                 self.logger.debug(f"[HA] agent check on {name}: {e}")
                 return None
@@ -7972,7 +8253,8 @@ fi
 
             def look(name):
                 try:
-                    return self._parse_agent_check(self._ha_agent_ssh(ips[name], cmd))
+                    with ha.reading():
+                        return self._parse_agent_check(self._ha_agent_ssh(ips[name], cmd))
                 except Exception as e:
                     self.logger.debug(f"[HA] agent check on {name}: {e}")
                     return None
@@ -8014,7 +8296,7 @@ fi
                          if agent['version'] == self.FENCE_AGENT_VERSION and agent['sha256'] != want]
                 with ThreadPoolExecutor(max_workers=8) as pool:
                     results = dict(zip(stale, pool.map(
-                        lambda n: self._ha_install_self_fence_agent(n, ips[n], plan), stale)))
+                        ha.carry(lambda n: self._ha_install_self_fence_agent(n, ips[n], plan)), stale)))
             elif only is None:
                 # no v2 agent on this cluster: no script that has to follow the group
                 self.ha_config['fence_agent_members'] = []
@@ -8035,7 +8317,8 @@ fi
 
     def _ha_redeploy_in_background(self, why, only=None):
         if self.ha_config.get('self_fence_installed'):
-            threading.Thread(target=self._ha_redeploy_fence_agents, args=(why, only), daemon=True).start()
+            threading.Thread(target=ha.as_job(self._ha_redeploy_fence_agents, 'self-fence agents'),
+                             args=(why, only), daemon=True).start()
 
     def _ha_agent_members_changed(self) -> bool:
         """Whether the PegaProx instances the agents were given are still the ones of
@@ -8104,12 +8387,14 @@ fi
                     continue
 
                 out = None
-                if ssh_key:
-                    out = self._ssh_run_command_with_key_output(node_ip, ssh_user, cmd, ssh_key)
-                if out is None and ssh_password:
-                    out = self._ssh_run_command_with_password_output(node_ip, ssh_user, cmd, ssh_password)
-                if out is None:
-                    out = self._ssh_run_command_output(node_ip, ssh_user, cmd)
+                # pvecm status: a look at corosync, no step (#625)
+                with ha.reading():
+                    if ssh_key:
+                        out = self._ssh_run_command_with_key_output(node_ip, ssh_user, cmd, ssh_key)
+                    if out is None and ssh_password:
+                        out = self._ssh_run_command_with_password_output(node_ip, ssh_user, cmd, ssh_password)
+                    if out is None:
+                        out = self._ssh_run_command_output(node_ip, ssh_user, cmd)
                 if not out or 'Expected votes' not in out:
                     continue
 
@@ -8851,11 +9136,11 @@ echo "AGENT_INSTALLED_OK"
         try:
             ct = self.ha_config.get('ssh_connect_timeout', 10)
             _hkc, _kh = cli_hostkey_opts()
-            result = subprocess.run(
+            result = node_cmd(
                 ['ssh', '-o', f'ConnectTimeout={ct}', '-o', f'StrictHostKeyChecking={_hkc}',
                  '-o', f'UserKnownHostsFile={_kh}',
                  '-o', 'BatchMode=yes', f'{user}@{host}', command],
-                capture_output=True, text=True, timeout=timeout
+                capture_output=True, text=True, timeout=timeout, host=host
             )
             if result.returncode == 0:
                 return result.stdout
@@ -8912,11 +9197,11 @@ echo "AGENT_INSTALLED_OK"
             ct = self.ha_config.get('ssh_connect_timeout', 10)
             try:
                 _hkc, _kh = cli_hostkey_opts()
-                result = subprocess.run(
+                result = node_cmd(
                     ['ssh', '-o', f'ConnectTimeout={ct}', '-o', f'StrictHostKeyChecking={_hkc}',
                      '-o', f'UserKnownHostsFile={_kh}',
                      '-i', key_file, f'{user}@{host}', command],
-                    capture_output=True, text=True, timeout=timeout
+                    capture_output=True, text=True, timeout=timeout, host=host
                 )
                 if result.returncode == 0:
                     return result.stdout
@@ -8962,11 +9247,11 @@ echo "AGENT_INSTALLED_OK"
             
             ct = self.ha_config.get('ssh_connect_timeout', 10)
             _hkc, _kh = cli_hostkey_opts()
-            result = subprocess.run(
+            result = node_cmd(
                 ['sshpass', '-e', 'ssh', '-o', f'ConnectTimeout={ct}', '-o', f'StrictHostKeyChecking={_hkc}',
                  '-o', f'UserKnownHostsFile={_kh}',
                  f'{user}@{host}', command],
-                capture_output=True, text=True, timeout=timeout, env=env
+                capture_output=True, text=True, timeout=timeout, env=env, host=host
             )
             if result.returncode == 0:
                 return result.stdout
@@ -9130,6 +9415,8 @@ echo "AGENT_INSTALLED_OK"
             target_real = os.path.realpath(poison_file)
             if os.path.commonpath([base_real, target_real]) != base_real:
                 raise Exception('poison pill path escaped base directory')
+            # a file on shared storage the node's agent acts on: an exit like any other (#625)
+            ha.guard(f'poison pill for {target_node}')
             with open(target_real, 'w') as f:
                 import json
                 json.dump(poison_data, f)
@@ -9492,16 +9779,17 @@ echo "AGENT_INSTALLED_OK"
             # Method 1: Try SSH with configured key first (most secure)
             if ssh_key:
                 self.logger.info(f"[HA] Trying SSH with configured key...")
-                if self._ssh_run_command_with_key(node_ip, ssh_user, force_cmd, ssh_key):
+                if self._ssh_run_command_with_key(node_ip, ssh_user, force_cmd, ssh_key, need=ha.NEED_STEP):
                     return True
             
             # Method 2: Try passwordless SSH (if system keys are set up)
-            if self._ssh_run_command(node_ip, ssh_user, force_cmd):
+            if self._ssh_run_command(node_ip, ssh_user, force_cmd, need=ha.NEED_STEP):
                 return True
             
             # Method 3: Try SSH with password (using sshpass - secure env var method)
             if ssh_password:
-                if self._ssh_run_command_with_password(node_ip, ssh_user, force_cmd, ssh_password):
+                if self._ssh_run_command_with_password(node_ip, ssh_user, force_cmd, ssh_password,
+                                                       need=ha.NEED_STEP):
                     return True
             
             self.logger.error(f"[HA] Could not force quorum via SSH")
@@ -9572,12 +9860,14 @@ echo "AGENT_INSTALLED_OK"
             
             restore_cmd = f'pvecm expected {total_nodes}'
             guarded_cmd = self._ha_claimed(restore_cmd)
-            
+
             self.logger.info(f"[HA] Running '{restore_cmd}' on {target_node} ({node_ip})")
-            
+            if not ha.confirm_step(f"'{restore_cmd}' on {target_node}"):
+                return
+
             # Method 1: Try SSH with configured key first (most secure)
             if ssh_key:
-                if self._ssh_run_command_with_key(node_ip, ssh_user, guarded_cmd, ssh_key):
+                if self._ssh_run_command_with_key(node_ip, ssh_user, guarded_cmd, ssh_key, need=ha.NEED_STEP):
                     self.logger.info(f"[HA] ✓ Quorum restored to {total_nodes} nodes")
                     broadcast_sse('ha_status', {
                         'event': 'quorum_restored',
@@ -9588,7 +9878,7 @@ echo "AGENT_INSTALLED_OK"
                     return
             
             # Method 2: Try passwordless SSH
-            if self._ssh_run_command(node_ip, ssh_user, guarded_cmd):
+            if self._ssh_run_command(node_ip, ssh_user, guarded_cmd, need=ha.NEED_STEP):
                 self.logger.info(f"[HA] ✓ Quorum restored to {total_nodes} nodes")
                 broadcast_sse('ha_status', {
                     'event': 'quorum_restored',
@@ -9600,7 +9890,8 @@ echo "AGENT_INSTALLED_OK"
             
             # Method 3: Try SSH with password
             if ssh_password:
-                if self._ssh_run_command_with_password(node_ip, ssh_user, guarded_cmd, ssh_password):
+                if self._ssh_run_command_with_password(node_ip, ssh_user, guarded_cmd, ssh_password,
+                                                       need=ha.NEED_STEP):
                     self.logger.info(f"[HA] ✓ Quorum restored to {total_nodes} nodes")
                     broadcast_sse('ha_status', {
                         'event': 'quorum_restored',
@@ -9920,7 +10211,8 @@ echo "AGENT_INSTALLED_OK"
         
         return disks
     
-    def _ssh_run_command(self, host: str, user: str, command: str, key_file: str = None) -> bool:
+    def _ssh_run_command(self, host: str, user: str, command: str, key_file: str = None,
+                         need: float = None) -> bool:
         """Run SSH command on remote host - HA PRIORITY (no rate limiting)
 
         NS: Jan 2026 - HA operations bypass the semaphore because:
@@ -9956,8 +10248,8 @@ echo "AGENT_INSTALLED_OK"
             
             self.logger.info(f"[HA] Running: ssh {user}@{host} '{command}'")
             
-            result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=30)
-            
+            result = node_cmd(ssh_cmd, capture_output=True, text=True, timeout=30, host=host, need=need)
+
             if result.returncode == 0:
                 self.logger.info(f"[HA] ✓ Command successful: {result.stdout.strip()}")
                 return True
@@ -9973,7 +10265,8 @@ echo "AGENT_INSTALLED_OK"
         finally:
             _ssh_track_connection('ha', -1)
     
-    def _ssh_run_command_with_key(self, host: str, user: str, command: str, key_content: str) -> bool:
+    def _ssh_run_command_with_key(self, host: str, user: str, command: str, key_content: str,
+                                  need: float = None) -> bool:
         """Run SSH command using a private key from cluster config
 
         MK: Security fix - writes key to temp file with strict permissions,
@@ -10016,7 +10309,7 @@ echo "AGENT_INSTALLED_OK"
             self.logger.info(f"[HA] Trying SSH with configured key...")
             
             # Run SSH with the key file
-            result = self._ssh_run_command(host, user, command, key_file=key_path)
+            result = self._ssh_run_command(host, user, command, key_file=key_path, need=need)
             
             return result
             
@@ -10036,7 +10329,8 @@ echo "AGENT_INSTALLED_OK"
                 except:
                     pass
     
-    def _ssh_run_command_with_password(self, host: str, user: str, command: str, password: str) -> bool:
+    def _ssh_run_command_with_password(self, host: str, user: str, command: str, password: str,
+                                       need: float = None) -> bool:
         """Run SSH command with password using sshpass - HA PRIORITY (no rate limiting)
 
         MK: Security fix - use SSHPASS environment variable instead of
@@ -10067,7 +10361,7 @@ echo "AGENT_INSTALLED_OK"
             if which_result.returncode != 0:
                 self.logger.warning(f"[HA] sshpass not installed, trying without password...")
                 _ssh_track_connection('ha', -1)  # Will be tracked by _ssh_run_command
-                return self._ssh_run_command(host, user, command)
+                return self._ssh_run_command(host, user, command, need=need)
             
             ct = self.ha_config.get('ssh_connect_timeout', 10)
             _hkc, _kh = cli_hostkey_opts()
@@ -10083,7 +10377,8 @@ echo "AGENT_INSTALLED_OK"
             
             self.logger.info(f"[HA] Running: sshpass ssh {user}@{host} '{command}'")
             
-            result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=30, env=env)
+            result = node_cmd(ssh_cmd, capture_output=True, text=True, timeout=30, env=env, host=host,
+                              need=need)
             
             if result.returncode == 0:
                 self.logger.info(f"[HA] ✓ Command successful: {result.stdout.strip()}")
@@ -10168,21 +10463,24 @@ echo "AGENT_INSTALLED_OK"
             # The /etc/pve filesystem (pmxcfs) is cluster-aware
             move_cmd = self._ha_claimed(f"mv {source_path} {target_path}")
             
-            # Try passwordless SSH first
-            if self._ssh_run_command(target_ip, ssh_user, move_cmd):
+            # Try passwordless SSH first (a change inside /etc/pve: it wants the lease time of
+            # a step left, whatever confirmed before it, #625)
+            if self._ssh_run_command(target_ip, ssh_user, move_cmd, need=ha.NEED_STEP):
                 return True
             
             # Try with password
-            if ssh_password and self._ssh_run_command_with_password(target_ip, ssh_user, move_cmd, ssh_password):
+            if ssh_password and self._ssh_run_command_with_password(target_ip, ssh_user, move_cmd, ssh_password,
+                                                                    need=ha.NEED_STEP):
                 return True
             
             # Alternative: Try to copy instead of move (in case mv fails due to permissions)
             copy_cmd = self._ha_claimed(f"cp {source_path} {target_path} && rm {source_path}")
             
-            if self._ssh_run_command(target_ip, ssh_user, copy_cmd):
+            if self._ssh_run_command(target_ip, ssh_user, copy_cmd, need=ha.NEED_STEP):
                 return True
             
-            if ssh_password and self._ssh_run_command_with_password(target_ip, ssh_user, copy_cmd, ssh_password):
+            if ssh_password and self._ssh_run_command_with_password(target_ip, ssh_user, copy_cmd, ssh_password,
+                                                                    need=ha.NEED_STEP):
                 return True
             
             self.logger.error(f"[HA] ✗ Could not move VM config - SSH access required")
@@ -10234,7 +10532,7 @@ echo "AGENT_INSTALLED_OK"
             else:
                 health_status = 'critical'
             
-            return {
+            status = {
                 'enabled': self.ha_enabled,
                 'check_interval': self.ha_check_interval,
                 'failure_threshold': self.ha_failure_threshold,
@@ -10338,6 +10636,10 @@ echo "AGENT_INSTALLED_OK"
                 'fence_agent': self._ha_fence_agent_status(),
                 'cluster_claim': self._ha_claim_status(),
             }
+            if ha.lease_in_force():
+                # automatic failover: recoveries a former leader left half done (5.6)
+                status['interrupted_recoveries'] = self.ha_interrupted_recoveries()
+            return status
 
     def get_tasks(self, limit: int = 50, force: bool = False) -> List[Dict]:
         """get recent cluster tasks, newest first - MK
@@ -11304,10 +11606,10 @@ echo "AGENT_INSTALLED_OK"
                 ssh.connect(**connect_kwargs)
                 persist_host_keys(ssh)
                 self.logger.info(f"SSH connected to {host}" + (f" (attempt {attempt})" if attempt > 1 else ""))
-                
+
                 # SUCCESS - release semaphore immediately, connection is established
                 # This allows new connections while this session runs
-                return ssh
+                return ha_transport.guard_client(ssh, host)
                 
             except paramiko.ssh_exception.AuthenticationException as e:
                 self.logger.error(f"SSH auth failed for {username}@{host}: {e}")
@@ -11429,22 +11731,24 @@ echo "AGENT_INSTALLED_OK"
         self.logger.info(f"[SYNC] Starting update for node: {node_name} (reboot: {reboot}, force: {force})")
         
         # Start update in background - use gevent if available for paramiko compatibility
+        # (a user job: in an automatic group each of its commands asks for the lease, #625)
+        perform = ha.as_job(self._perform_node_update, f'update of {node_name}')
         if GEVENT_PATCHED:
             try:
                 import gevent
-                gevent.spawn(self._perform_node_update, node_name, task)
+                gevent.spawn(perform, node_name, task)
                 self.logger.info(f"[SYNC] Update spawned with gevent greenlet")
             except Exception as e:
                 self.logger.warning(f"Gevent spawn failed, falling back to thread: {e}")
                 update_thread = threading.Thread(
-                    target=self._perform_node_update,
+                    target=perform,
                     args=(node_name, task)
                 )
                 update_thread.daemon = True
                 update_thread.start()
         else:
             update_thread = threading.Thread(
-                target=self._perform_node_update,
+                target=perform,
                 args=(node_name, task)
             )
             update_thread.daemon = True
@@ -11589,6 +11893,8 @@ echo "AGENT_INSTALLED_OK"
                             
                             # Get transport and open channel with PTY for sudo support
                             transport = ssh.get_transport()
+                            # past exec_command, so asked here (#625)
+                            ha_transport.guard_ssh(node_ip, 'shutdown')
                             channel = transport.open_session()
                             channel.get_pty()
                             channel.settimeout(10)
@@ -11630,6 +11936,9 @@ echo "AGENT_INSTALLED_OK"
                             task.add_output(f"Skipping reboot for node: {node_name}")
                             task.reboot_issued = False   # #715 — no reboot: RU must NOT wait for offline
 
+                    except ha.GuardRefused:
+                        # nothing was sent: no reboot to wait for (#625)
+                        raise
                     except Exception as e:
                         self.logger.info(f"Reboot command sent (connection closed as expected): {e}")
                         task.add_output("Reboot command sent / Reboot-Befehl gesendet")
@@ -13400,9 +13709,10 @@ echo "AGENT_INSTALLED_OK"
         # Get LV usage data via SSH
         # NS: use separator so empty columns don't break the parsing, was causing
         # false "snapshot lost" status when data_percent was blank on some LVM versions
-        exit_code, stdout, stderr = self._node_ssh_exec(
-            node, f'lvs --noheadings --nosuffix --units g --separator "|" -o lv_name,lv_size,data_percent,snap_percent {shlex.quote(vg_name)}'
-        )
+        with ha.reading():
+            exit_code, stdout, stderr = self._node_ssh_exec(
+                node, f'lvs --noheadings --nosuffix --units g --separator "|" -o lv_name,lv_size,data_percent,snap_percent {shlex.quote(vg_name)}'
+            )
         if exit_code != 0:
             return snapshots
 
@@ -13429,9 +13739,10 @@ echo "AGENT_INSTALLED_OK"
 
         # Also get VG free space for auto-extend
         vg_free_gb = 0.0
-        exit_code2, stdout2, _ = self._node_ssh_exec(
-            node, f'vgs --noheadings --nosuffix --units g -o vg_free {shlex.quote(vg_name)}'
-        )
+        with ha.reading():
+            exit_code2, stdout2, _ = self._node_ssh_exec(
+                node, f'vgs --noheadings --nosuffix --units g -o vg_free {shlex.quote(vg_name)}'
+            )
         if exit_code2 == 0 and stdout2.strip():
             try:
                 vg_free_gb = float(stdout2.strip())
@@ -13453,7 +13764,7 @@ echo "AGENT_INSTALLED_OK"
                     # Auto-extend at 90-99%
                     if 90 <= data_pct < 100:
                         extend_size = max(1.0, disk['snap_alloc_gb'] * 0.5)
-                        if vg_free_gb > extend_size + 1:
+                        if vg_free_gb > extend_size + 1 and ha.confirm_step(f'lvextend of {snap_lv}'):
                             ext_code, _, _ = self._node_ssh_exec(
                                 node, f"lvextend -L +{extend_size:.0f}G /dev/{shlex.quote(vg_name)}/{shlex.quote(snap_lv)}"
                             )
@@ -13919,6 +14230,7 @@ echo "AGENT_INSTALLED_OK"
             else:
                 s.verify = False
                 s.mount('https://', _NoHostnameCheckAdapter(**_pool_kw))
+            ha_transport.guard_session(s)
             # self.host is already IPv6-bracketed by the property — use it directly.
             login_url = f"https://{self.host}:{self.api_port}/api2/json/access/ticket"
             resp = s.post(login_url, data={'username': usr, 'password': pwd}, timeout=10)
@@ -16938,7 +17250,8 @@ echo "AGENT_INSTALLED_OK"
             return {'error': f'no SSH-reachable IP for node {node}'}
         user = getattr(self.config, 'ssh_user', None) or 'root'
 
-        raw = self._ssh_run_command_output(ip, user, 'sensors -j 2>/dev/null', timeout=8)
+        with ha.reading():
+            raw = self._ssh_run_command_output(ip, user, 'sensors -j 2>/dev/null', timeout=8)
         data = None
         if raw and raw.strip():
             import json as _json
@@ -16955,7 +17268,8 @@ echo "AGENT_INSTALLED_OK"
             # all (empty output) or emit broken JSON, even when the plain `sensors` command
             # is perfectly fine. Parse the human-readable output instead — it works wherever
             # `sensors` itself does.
-            text = self._ssh_run_command_output(ip, user, 'sensors 2>/dev/null', timeout=8)
+            with ha.reading():
+                text = self._ssh_run_command_output(ip, user, 'sensors 2>/dev/null', timeout=8)
             if not text or not text.strip():
                 return {'error': 'sensors command unavailable or empty (lm-sensors not installed?)'}
             out = self._parse_sensors_text(text)
@@ -17733,7 +18047,10 @@ echo "AGENT_INSTALLED_OK"
                     
                     if max_migrations > 1:
                         self.logger.info(f"[{migration_round + 1}/{max_migrations}] Migrating {vm_name} (VMID {vmid}): {source_node} → {target_node}")
-                    
+
+                    # an automatic leader that lost its lease starts no migration (#625)
+                    if not ha.confirm_step(f'balancing {vm_name} ({vmid})'):
+                        break
                     success = self.migrate_vm(vm, target_node)
                     
                     if success:
@@ -17773,6 +18090,8 @@ echo "AGENT_INSTALLED_OK"
                             vm = self.find_migration_candidate(nname, tgt, exclude_vmids=already_migrated_vmids)
                             if vm:
                                 self.logger.info(f"[PREDICTIVE] Migrating {vm.get('name', '')} (VMID {vm.get('vmid')}): {nname} → {tgt}")
+                                if not ha.confirm_step(f"balancing {vm.get('vmid')} ahead of a trend"):
+                                    break
                                 if self.migrate_vm(vm, tgt):
                                     migrations_done += 1
                                     self._vm_migration_cooldown[vm.get('vmid')] = time.time()

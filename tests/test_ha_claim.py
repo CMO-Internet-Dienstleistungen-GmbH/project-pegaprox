@@ -424,8 +424,8 @@ def _step_mgr(pve, **ha_config):
         m.steps.append(cmd)
         return code == 0
     m._ssh_run_command = run
-    m._ssh_run_command_with_password = lambda host, user, cmd, password: run(host, user, cmd)
-    m._ssh_run_command_with_key = lambda host, user, cmd, key: run(host, user, cmd)
+    m._ssh_run_command_with_password = lambda host, user, cmd, password, **kw: run(host, user, cmd)
+    m._ssh_run_command_with_key = lambda host, user, cmd, key, **kw: run(host, user, cmd)
     m._ssh_run_command_output = lambda host, user, cmd, **kw: 'OK'
     m._ha_get_node_ip = lambda node: '10.9.0.1'
     m._ha_get_all_node_ips = lambda node: ['10.9.0.2']

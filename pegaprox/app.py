@@ -4,7 +4,10 @@ PegaProx Flask App Factory - Layer 8
 Creates and configures the Flask application.
 """
 
+import io
+import json
 import os
+import re
 import sys
 import time
 import errno
@@ -23,6 +26,7 @@ from flask_cors import CORS
 from flask_sock import Sock
 from flask_compress import Compress
 from pathlib import Path
+from werkzeug.datastructures import EnvironHeaders
 
 from pegaprox.constants import (
     PEGAPROX_VERSION, PEGAPROX_BUILD,
@@ -631,11 +635,200 @@ def create_app():
                           mark.get('via') if isinstance(mark, dict) else '')
         ha.nudge_members()
 
+    # the lease calls of automatic failover, answered before Flask where Flask would
+    # answer them with 200 anyway (_LeaseFastPath). It takes the hooks as they are now,
+    # before any plugin is loaded: one that hooks into requests turns it off
+    app.wsgi_app = _LeaseFastPath(app, app.wsgi_app, _default_max)
+
     # Load enabled plugins
     from pegaprox.api.plugins import load_enabled_plugins
     load_enabled_plugins(app)
 
     return app
+
+
+# --- the lease calls of automatic failover, before Flask -------------------------------------
+#
+# MK Oct 2026 (#625) - a leader in automatic mode renews its lease before every write, so
+# a member answers renewals many times a second. Through Flask one cost a member about
+# 1.0 ms of CPU (2 ms with TLS and pywsgi), more than three times the answer itself: a
+# request context and the URL map, the CSRF, rate-limit and IP hooks, the signature
+# checked twice (once before the body for the rate limit), the after-request headers.
+# Here it is 0.37 ms (1.05 ms with TLS and pywsgi).
+# _LeaseFastPath answers POST /api/ha/peer/renew and /api/ha/peer/vote in the WSGI layer
+# instead, and only a call the Flask path would answer with 200 as well: a member we hold
+# a key of signed it, the IP lists let its address through (settings.ip_lists_pass, the
+# function check_ip_whitelist goes by), its body is within both caps, its headers are what
+# the CSRF and content-type checks take, and nothing asks a hook to act (compression, a
+# CORS setup, a hook nobody here looked at). Anything else goes down the Flask path
+# untouched and is refused there as before. The one thing done before that is known is
+# the signature check; it spends the nonce, so its verdict goes along (api/ha.py
+# request_peer) and a call is judged once whichever way it takes.
+
+_LEASE_ROUTES = {'/api/ha/peer/renew': 'renew', '/api/ha/peer/vote': 'vote'}
+_LENGTH_RE = re.compile(r'[0-9]{1,9}')
+# the hooks the fast path stands in for, by name: what each does for these two routes is
+# done above or cannot apply (refuse_writes_on_standby lets /api/ha/ through,
+# count_around_a_read and tell_the_members_about_a_write look at other methods and paths)
+_STOOD_IN_FOR = {
+    'before': ('validate_request', 'check_ip_whitelist', 'refuse_writes_on_standby',
+               'count_around_a_read'),
+    'after': ('after_request', 'add_security_headers', 'tell_the_members_about_a_write',
+              '_say_we_hold_the_key'),
+}
+
+
+def _request_hooks(app):
+    """The functions Flask runs around a request of the 'ha' blueprint, in order."""
+    out = []
+    for table in (app.before_request_funcs, app.after_request_funcs, app.teardown_request_funcs,
+                  app.url_value_preprocessors):
+        for key in (None, 'ha'):
+            out.append(tuple(table.get(key, ())))
+    return tuple(out)
+
+
+def _hooks_known(app):
+    def names(table):
+        return sorted(getattr(f, '__name__', '') for key in (None, 'ha') for f in table.get(key, ()))
+    befores, afters = names(app.before_request_funcs), names(app.after_request_funcs)
+    return (befores == sorted(_STOOD_IN_FOR['before'])
+            and afters == sorted(_STOOD_IN_FOR['after'])
+            and not any(app.teardown_request_funcs.get(k) for k in (None, 'ha'))
+            and not any(app.url_value_preprocessors.get(k) for k in (None, 'ha')))
+
+
+class _LeaseFastPath:
+    """The WSGI app in front of Flask: a renewal or a vote the Flask path would answer
+    with 200 is answered here, everything else goes to `wsgi_app` as it came."""
+
+    def __init__(self, app, wsgi_app, max_size):
+        self.app, self.wsgi_app, self.max_size = app, wsgi_app, max_size
+        self.hooks = _request_hooks(app)
+        # a CORS setup puts headers on these answers too (flask-cors sends them without
+        # an Origin): Flask's to make
+        self.on = _hooks_known(app) and not g._cors_origins_env
+        self.answered = 0
+        self._after_made = {}
+
+    def __call__(self, environ, start_response):
+        kind = _LEASE_ROUTES.get(environ.get('PATH_INFO'))
+        if (kind is not None and self.on and environ.get('REQUEST_METHOD') == 'POST'
+                and _request_hooks(self.app) == self.hooks):
+            resp = self._answer(environ, kind)
+            if resp is not None:
+                self.answered += 1
+                return resp(environ, start_response)
+        return self.wsgi_app(environ, start_response)
+
+    def _answer(self, environ, kind):
+        """The answer to a call that passes every check of the Flask path, None for any
+        other (the Flask path judges it; a body read here is handed on with it)."""
+        from pegaprox.core import ha, ha_wire
+        import pegaprox.api.ha as ha_api
+        from pegaprox.api.settings import ip_lists_pass
+        from pegaprox.utils.audit import client_ip_from, _is_trusted_proxy
+        get = environ.get
+        length = get('CONTENT_LENGTH') or ''
+        # the size, content-type and CSRF checks of validate_request, met the one way a
+        # member's call meets them: JSON, X-Requested-With and neither Origin nor Referer
+        if (get('QUERY_STRING') or get('SCRIPT_NAME') or get('HTTP_TRANSFER_ENCODING')
+                or get('HTTP_UPGRADE') or get('HTTP_ORIGIN') or get('HTTP_REFERER')
+                or get('HTTP_X_REQUESTED_WITH') != 'XMLHttpRequest'
+                or 'application/json' not in (get('CONTENT_TYPE') or '')
+                or (get('HTTP_ACCEPT_ENCODING') or 'identity').strip().lower() != 'identity'
+                or not _LENGTH_RE.fullmatch(length)
+                or not 0 < int(length) <= min(self.max_size, ha_api._MAX_PEER_BODY)):
+            return None
+        claimed = (get('HTTP_X_PEGAPROX_PEER') or '').partition(':')[0]
+        digest = get('HTTP_X_PEGAPROX_PEER_BODY')
+        rec = (ha._load().get('members') or {}).get(claimed)
+        # a member we hold a key of: a paired instance, and no key recorded on the way
+        if not rec or not rec.get('public_key') or not digest:
+            return None
+        path = environ['PATH_INFO']
+        ip = client_ip_from(get('REMOTE_ADDR'),
+                            lambda name: get('HTTP_' + name.upper().replace('-', '_')))
+        # the lists let a member's signed call through here, or refuse it whatever it is
+        if not ip_lists_pass(ip, path, lambda: True)[0]:
+            return None
+        n = int(length)
+        try:
+            body = environ['wsgi.input'].read(n)
+        except (OSError, ValueError):
+            # the caller went away: Flask finds the body short, as it would have
+            body = b''
+        environ['wsgi.input'] = io.BytesIO(body)
+        # the digest the headers name is the one the rate limit's look before the body
+        # checks the signature over (signed_member_call): the same call passes both
+        if len(body) != n or digest != ha_wire.body_digest(body):
+            return None
+        verdict = ha.peer_verdict(EnvironHeaders(environ), 'POST', path, body)
+        if verdict[0] != 'member' or not verdict[1].get('keyed'):
+            environ[ha_api._PEER_VERDICT] = verdict
+            return None
+        https = get('wsgi.url_scheme') in ('https', 'wss') or (
+            _is_trusted_proxy(get('REMOTE_ADDR')) and get('HTTP_X_FORWARDED_PROTO') == 'https')
+        try:
+            try:
+                data = json.loads(body)
+            except ValueError:
+                data = None
+            # api/ha.py _lease_call, as the route runs it, and jsonify's bytes
+            out = self._json(ha.lease_request(verdict[1]['instance_id'], kind,
+                                              data if isinstance(data, dict) else {}))
+        except Exception:
+            propagate = self.app.config['PROPAGATE_EXCEPTIONS']
+            if propagate is None:
+                propagate = self.app.testing or self.app.debug
+            if propagate:
+                raise
+            self.app.logger.error(f'Exception on {path} [POST]', exc_info=True)
+            from werkzeug.exceptions import InternalServerError
+            resp = InternalServerError().get_response()
+            for k, v in self._after(path, https):
+                resp.headers[k] = v
+            return resp
+        # the headers of the answer as Flask's would come out (a header set through a
+        # werkzeug Response cost more than the rest of the answer): its own two, then what
+        # the after-request hooks put on in the order Flask runs them
+        headers = [('Content-Type', self.app.json.mimetype), ('Content-Length', str(len(out)))]
+        headers += self._after(path, https)
+
+        def respond(environ, start_response):
+            start_response('200 OK', headers)
+            return [out]
+        return respond
+
+    def _json(self, obj):
+        """The bytes jsonify() makes of `obj` (flask.json.provider DefaultJSONProvider)."""
+        provider = self.app.json
+        if (provider.compact is None and self.app.debug) or provider.compact is False:
+            text = provider.dumps(obj, indent=2)
+        else:
+            text = provider.dumps(obj, separators=(',', ':'))
+        return f'{text}\n'.encode()
+
+    def _after(self, path, https):
+        """What the after-request hooks add: the blueprint's mark that we hold the key,
+        the app's security headers, flask-compress' Vary. The same for every call to a
+        path, so made once, by the app's own add_security_headers on an empty answer
+        (`https` stands for request.is_secure and a trusted proxy's X-Forwarded-Proto)."""
+        key = (path, https)
+        held = self._after_made.get(key)
+        if held is None:
+            from pegaprox.core import ha
+            hook = next(f for f in self.app.after_request_funcs[None]
+                        if f.__name__ == 'add_security_headers')
+            blank = self.app.response_class()
+            blank.headers.clear()
+            scheme = 'https' if https else 'http'
+            with self.app.test_request_context(path, method='POST', base_url=f'{scheme}://localhost',
+                                               environ_base={'REMOTE_ADDR': '192.0.2.1'}):
+                sec = list(hook(blank).headers.items())
+            held = self._after_made[key] = ([(ha.PEER_KEYED_HEADER, '1')] + sec
+                                            + [('Vary', 'Accept-Encoding')])
+        return held
 
 
 # MK Sep 2026 - the sweep this used to carry ran whenever the map passed 1024 entries
@@ -1831,6 +2024,20 @@ class _IdleTimeoutMixin:
             t.close()
 
 
+def _no_delay(sock):
+    """TCP_NODELAY on an accepted connection.
+
+    MK Oct 2026 (#625) - pywsgi sends the head of a response and its body in two writes.
+    With Nagle on, the body waits for the client to ack the head, and a client with
+    nothing to send acks 40 ms late: every answer on a kept-alive connection took 40 ms
+    more than the network did (a renewal of the HA leader on a LAN: 43 ms instead of 1.5).
+    """
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except (OSError, AttributeError):
+        pass
+
+
 def _should_bypass_gevent_upgrade(app, environ):
     """Is this request one that flask-sock will handshake itself?
 
@@ -2036,6 +2243,7 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
                     client_socket.settimeout(_HANDSHAKE_TIMEOUT)
                 except Exception:
                     pass
+            _no_delay(client_socket)
             try:
                 return super().wrap_socket_and_handle(client_socket, address)
             except (socket.timeout, OSError) as e:

@@ -15,6 +15,7 @@ import shlex
 from datetime import datetime
 
 from pegaprox.globals import cluster_managers, _xhm_migrations
+from pegaprox.core import ha_transport
 from pegaprox.utils.ssh import _ssh_exec, _pve_node_exec
 from pegaprox.utils.realtime import broadcast_sse
 from pegaprox.utils.audit import log_audit
@@ -1054,7 +1055,6 @@ def _run_pve_to_xcpng(task):
     so we SSH in and dd/qemu-img convert the disk to raw, then stream
     to XCP-ng's import_raw_vdi endpoint.
     """
-    import requests as _req
     import os
 
     try:
@@ -1292,9 +1292,11 @@ def _run_pve_to_xcpng(task):
                 body = _StreamBody(stdout_stream, total,
                                    lambda n: task.update_progress(disk_key, n, total))
 
-                resp = _req.put(import_url, data=body, verify=ssl_verify,
-                                headers={'Content-Type': 'application/octet-stream'},
-                                timeout=7200)
+                # an upload into the pool: the guard of an automatic group asks first and
+                # once its connection is up (#625)
+                resp = ha_transport.http('PUT', import_url, data=body, verify=ssl_verify,
+                                         headers={'Content-Type': 'application/octet-stream'},
+                                         timeout=7200)
                 copied = body._read
 
                 # read stderr in case dd had warnings
@@ -1577,7 +1579,7 @@ def _connect_ssh(host, user, password, key_path=None, port=22):
             persist_host_keys(client)
             try: client.get_transport().set_keepalive(30)  # #546: keep the channel alive through long disk transfers
             except Exception: pass
-            return client
+            return ha_transport.guard_client(client, host)
         except Exception as e:
             logger.debug(f"[SSH] key auth failed for {user}@{host}: {e}")
 
@@ -1595,7 +1597,7 @@ def _connect_ssh(host, user, password, key_path=None, port=22):
             client._transport = transport
             try: transport.set_keepalive(30)  # #546: keep the channel alive through long disk transfers
             except Exception: pass
-            return client
+            return ha_transport.guard_client(client, host)
         transport.close()
     except Exception as e:
         logger.debug(f"[SSH] keyboard-interactive failed for {user}@{host}: {e}")
@@ -1612,7 +1614,7 @@ def _connect_ssh(host, user, password, key_path=None, port=22):
     persist_host_keys(client2)
     try: client2.get_transport().set_keepalive(30)  # #546: keep the channel alive through long disk transfers
     except Exception: pass
-    return client2
+    return ha_transport.guard_client(client2, host)
 
 
 def _ssh_cleanup(ssh, path):
@@ -2168,7 +2170,6 @@ def _run_esxi_to_xcpng(task):
     Uses PegaProx server as relay since ESXi can't do qemu-img and XCP-ng
     can't mount ESXi datastores directly.
     """
-    import requests as _req
     import subprocess
 
     try:
@@ -2337,9 +2338,9 @@ def _run_esxi_to_xcpng(task):
                 with open(tmp_raw, 'rb') as f:
                     body = _StreamBody(f, cap,
                                        lambda n: task.update_progress(disk_key, n, cap))
-                    resp = _req.put(import_url, data=body, verify=ssl_verify,
-                                    headers={'Content-Type': 'application/octet-stream'},
-                                    timeout=7200)
+                    resp = ha_transport.http('PUT', import_url, data=body, verify=ssl_verify,
+                                             headers={'Content-Type': 'application/octet-stream'},
+                                             timeout=7200)
                 os.remove(tmp_raw)
                 try:
                     os.rmdir(task.scratch)      # only when the last disk is done

@@ -20,6 +20,7 @@ from pegaprox.constants import LOG_DIR
 from pegaprox import globals as _g
 from pegaprox.core.db import get_db
 from pegaprox.core import ha
+from pegaprox.core import ha_transport
 from pegaprox.utils.realtime import broadcast_sse
 from pegaprox.utils.ssh import read_capped as _read_capped
 
@@ -220,7 +221,8 @@ class XcpngManager:
                 return False
             try:
                 url = self._get_xapi_url()
-                session = XenAPI.Session(url, ignore_ssl=not self.config.ssl_verification)
+                session = ha_transport.guard_xapi(
+                    XenAPI.Session(url, ignore_ssl=not self.config.ssl_verification))
                 session.xenapi.login_with_password(
                     self.config.user, self.config.pass_,
                     '1.0', 'PegaProx'
@@ -2610,7 +2612,6 @@ class XcpngManager:
             sr_type = api.SR.get_type(sr_ref)
 
             # for ISO SRs, we use HTTP PUT to the host
-            import requests as _req
             session_ref = api.xenapi._session
             host_url = f"https://{self.host}"
 
@@ -2632,8 +2633,8 @@ class XcpngManager:
                 # HTTP PUT to import endpoint — URL built via defensive helper
                 url = _build_xapi_import_vdi_url(host_url, session_ref, vdi_uuid, "raw")
                 _ssl_verify = getattr(self.config, 'ssl_verification', False)
-                resp = _req.put(url, data=file_stream, verify=_ssl_verify,
-                               headers={'Content-Type': 'application/octet-stream'})
+                resp = ha_transport.http('PUT', url, data=file_stream, verify=_ssl_verify,
+                                         headers={'Content-Type': 'application/octet-stream'})
                 if resp.status_code in (200, 204):
                     self.logger.info(f"Uploaded {filename} to {storage}")
                     return {'success': True, 'message': f'{filename} uploaded'}
@@ -3192,7 +3193,7 @@ class XcpngManager:
                                    password=self.config.pass_, timeout=15,
                                    allow_agent=False, look_for_keys=False)
                 persist_host_keys(client)
-                return client
+                return ha_transport.guard_client(client, host)
             except Exception as e:
                 if attempt == retries - 1:
                     self.logger.error(f"SSH to {host} failed: {e}")
@@ -3594,8 +3595,9 @@ class XcpngManager:
         with self.update_lock:
             self.nodes_updating[node_name] = task
 
-        t = threading.Thread(target=self._perform_node_update, daemon=True,
-                             args=(node_name, task))
+        # a user job: in an automatic group each command asks for the lease (#625)
+        t = threading.Thread(target=ha.as_job(self._perform_node_update, f'update of {node_name}'),
+                             daemon=True, args=(node_name, task))
         t.start()
         return task
 
@@ -4434,8 +4436,8 @@ echo DONE""",
             # below, so the source's setting is the one that is actually meaningful.
             # MK Sep 2026 - was pinned to ignore_ssl=True, which quietly ignored an
             # operator who had turned verification ON for this cluster.
-            remote_session = XenAPI.Session(target_endpoint,
-                                            ignore_ssl=not self.config.ssl_verification)
+            remote_session = ha_transport.guard_xapi(XenAPI.Session(
+                target_endpoint, ignore_ssl=not self.config.ssl_verification))
             remote_session.xenapi.login_with_password(
                 self.config.user, self.config.pass_, '1.0', 'PegaProx')
 
@@ -5030,6 +5032,9 @@ echo DONE""",
             if not target:
                 break
 
+            # an automatic leader that lost its lease starts no migration (#625)
+            if not ha.confirm_step(f"balancing VM {candidate['vmid']}"):
+                break
             ok = self._do_balance_migrate(candidate, target)
             if ok:
                 migrated += 1

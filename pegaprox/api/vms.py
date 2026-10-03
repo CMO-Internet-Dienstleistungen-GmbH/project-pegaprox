@@ -7,7 +7,7 @@ import json
 import time
 import logging
 from pegaprox.utils.sanitization import sanitize_log_message as _sl  # CWE-117 tainted-log sanitiser
-from pegaprox.utils.ssh_security import apply_host_key_policy, persist_host_keys  # TOFU SSH host-key verification
+from pegaprox.utils.ssh_security import apply_host_key_policy, persist_host_keys, secure_ssh_client  # TOFU SSH host-key verification
 import threading
 import uuid
 import hashlib
@@ -43,7 +43,7 @@ from pegaprox.utils.realtime import broadcast_sse, broadcast_action, push_immedi
 from pegaprox.core.config import save_config
 from pegaprox.api.helpers import get_connected_manager, check_cluster_access, register_task_user, safe_error, parse_pve_error, scope_vm_rows, require_unconfined, caller_is_scoped
 from pegaprox.api.ha import standby_console_refusal, STANDBY_CONSOLE_ERROR
-from pegaprox.core import ha
+from pegaprox.core import ha, ha_transport
 from pegaprox.utils.ssh import get_paramiko
 from pegaprox.utils.sanitization import sanitize_int, validate_snapshot_name
 from urllib.parse import urlencode, quote as url_quote
@@ -2850,8 +2850,7 @@ def join_node_to_cluster(cluster_id):
             return jsonify({'success': False, 'error': 'Could not get cluster fingerprint. Check server logs for details.'}), 500
         
         # Connect to new node via SSH
-        ssh = paramiko.SSHClient()
-        apply_host_key_policy(ssh, paramiko)
+        ssh = secure_ssh_client(paramiko)
         ssh.connect(node_ip, port=ssh_port, username=username, password=password, timeout=30)
         persist_host_keys(ssh)
         
@@ -2902,8 +2901,7 @@ def join_node_to_cluster(cluster_id):
             # Reconnect SSH after pve-cluster restart
             ssh.close()
             time.sleep(2)
-            ssh = paramiko.SSHClient()
-            apply_host_key_policy(ssh, paramiko)
+            ssh = secure_ssh_client(paramiko)
             ssh.connect(node_ip, port=ssh_port, username=username, password=password, timeout=30)
             persist_host_keys(ssh)
         
@@ -3166,9 +3164,8 @@ def remove_node_from_cluster(cluster_id, node_name):
         removed_node_ip = mgr._get_node_ip(node_name) if hasattr(mgr, '_get_node_ip') else None
         logging.info(f"[RemoveNode] Pre-resolved IP for {node_name}: {removed_node_ip}")
         
-        # Connect to an online node via SSH
-        ssh = paramiko.SSHClient()
-        apply_host_key_policy(ssh, paramiko)
+        # Connect to an online node via SSH (its commands ask the transport guard, #625)
+        ssh = secure_ssh_client(paramiko)
         
         # Try SSH key first, then password
         connected = False
@@ -3226,8 +3223,7 @@ def remove_node_from_cluster(cluster_id, node_name):
         if removed_node_ip:
             try:
                 logging.info(f"[RemoveNode] Cleaning up cluster config on removed node {node_name} ({removed_node_ip})")
-                ssh_cleanup = paramiko.SSHClient()
-                apply_host_key_policy(ssh_cleanup, paramiko)
+                ssh_cleanup = secure_ssh_client(paramiko)
                 
                 # Try to connect to the removed node
                 cleanup_connected = False
@@ -3452,8 +3448,10 @@ def node_action_api(cluster_id, node_name, action):
             uid = _read_capped(stdout).strip()
             is_root = (uid == '0')
             
-            # Always use PTY for reliable execution
+            # Always use PTY for reliable execution. The channel of a transport is no
+            # exec of the guarded client: the shutdown asks the guard itself (#625)
             transport = ssh.get_transport()
+            ha_transport.guard_ssh(node_ip, 'shutdown')
             channel = transport.open_session()
             channel.get_pty()
             channel.settimeout(10)
@@ -8236,7 +8234,9 @@ def run_cross_cluster_replication(job_id):
     is_local = job_dict.get('source_cluster') == job_dict.get('target_cluster')
     handler = _execute_local_replication if is_local else _execute_replication
     try:
-        threading.Thread(target=_tracked_run, args=(handler, job_dict), daemon=True).start()
+        # a user job: in an automatic group each step asks for the lease (#625)
+        threading.Thread(target=ha.as_job(_tracked_run, f"replication job {job_dict.get('id')}"),
+                         args=(handler, job_dict), daemon=True).start()
     except Exception as e:
         _release_job(job_id)
         return jsonify({'error': f'Failed to start replication: {e}'}), 500
@@ -11327,7 +11327,8 @@ def cross_cluster_migrate_api():
                 target_manager.delete_api_token(token_name)
                 logging.info(f"[TOKEN-CLEANUP] Deleted migration token: {token_name}")
             
-            cleanup_thread = threading.Thread(target=cleanup_token_when_done, daemon=True)
+            cleanup_thread = threading.Thread(target=ha.as_job(cleanup_token_when_done, 'token cleanup'),
+                                              daemon=True)
             cleanup_thread.start()
             
             response = {

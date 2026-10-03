@@ -15,6 +15,7 @@ import gevent.monkey
 gevent.monkey.patch_all()
 
 import os
+import threading
 import types
 import tempfile
 import shutil
@@ -46,6 +47,9 @@ class _PolledFlag:
 
 
 def pytest_configure(config):
+    config.addinivalue_line(
+        'markers', 'guard_refusals: the test makes the transport guard refuse a write that '
+        'carries no confirmed lease on purpose (#625; anywhere else that fails the test)')
     # Under pytest-xdist the worker's main thread waits on execnet's receiver, and that
     # receiver is a real thread: it was started before the patch above. What the two
     # share is locked and signalled with gevent's primitives from then on, and a
@@ -115,8 +119,16 @@ def db():
         _reset_rbac_caches()
 
 
+def unconfirmed_writes():
+    """The writes the transport guard refused in this test for want of a confirmed lease
+    in a background context (#625, design 5.3), however the code around them took it."""
+    from pegaprox.core import ha
+    return sorted(action for action, why in ha._guard_said
+                  if why in (ha.GUARD_NO_TOKEN, ha.GUARD_RAN_OUT))
+
+
 @pytest.fixture(autouse=True)
-def _ha_state_out_of_the_checkout(tmp_path, monkeypatch):
+def _ha_state_out_of_the_checkout(tmp_path, monkeypatch, request):
     """A checkout whose config/ha_state.json says standby would turn every write in
     the suite into a 409, and a snapshot applied in a test would write the checkout's
     known_hosts, branding and plugin configs. Every test gets its own throwaway set;
@@ -178,9 +190,23 @@ def _ha_state_out_of_the_checkout(tmp_path, monkeypatch):
     monkeypatch.setattr(ha, '_lease_spawn', lambda fn, name: None)
     # the zone of the machine the suite runs on would go into every group a test forms
     monkeypatch.setattr(ha, '_local_zone', {'name': ''})
+    # what the transport guard holds per thread (a confirmed lease, a read, a job) and
+    # what it said, from a test before: the tests share their greenlet (S4)
+    monkeypatch.setattr(ha, '_guard_tls', threading.local())
+    monkeypatch.setattr(ha, '_guard_said', set())
+    monkeypatch.setattr(ha, '_recovery_live', set())
+    monkeypatch.setattr(ha, '_missed_said', {})
     ha.reset_for_tests()
     yield
+    # in a test, a background write without a confirmed lease is a failure even where
+    # a broad except swallowed the refusal (design 5.3)
+    unconfirmed = unconfirmed_writes()
     ha.reset_for_tests()
+    if unconfirmed and request.node.get_closest_marker('guard_refusals') is None:
+        pytest.fail('the transport guard refused writes that no step confirmed: '
+                    f'{unconfirmed[:5]} - confirm the step before it (ha.confirm_step), run '
+                    'the job through ha.as_job or carry the token into the fan-out (ha.carry); '
+                    'mark the test guard_refusals where the refusal is what it tests')
 
 
 def _reset_api_rate_window():

@@ -300,6 +300,8 @@ class _Session:
         self.calls += 1
         if self.fail:
             import requests
+            if self.fail == 'read':
+                raise requests.exceptions.ReadTimeout('took it, said nothing')
             raise requests.exceptions.ConnectTimeout('down')
         return types.SimpleNamespace(status_code=200, url=url)
 
@@ -349,11 +351,24 @@ def test_a_new_pin_gets_a_new_session(sessions):
     assert first.closed and not second.closed and second.fingerprint == other
 
 
-def test_a_kept_session_that_failed_is_dropped(sessions):
+def test_a_kept_session_stays_across_a_call_that_never_got_out(sessions):
+    """Refused or timed out while connecting: nothing of the call sits in the session, and
+    a member that is down must not cost a new session per call (#625 stage 2, a confirm
+    round before every write)."""
     sessions.failing.add(FP)
-    with pytest.raises(ha.PeerUnreachable):
+    for _ in range(3):
+        with pytest.raises(ha.PeerUnreachable):
+            _call(keep_alive=True)
+    only, = sessions.made
+    only.fail = False
+    _call(keep_alive=True)
+    assert len(sessions.made) == 1 and not only.closed and only.calls == 4
+
+
+def test_a_kept_session_that_failed_after_the_call_got_out_is_dropped(sessions):
+    ha._kept_session(URL, FP).fail = 'read'
+    with pytest.raises(ha.PeerNoAnswer):
         _call(keep_alive=True)
-    sessions.failing.clear()
     _call(keep_alive=True)
 
     broken, fresh = sessions.made

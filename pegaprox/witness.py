@@ -418,6 +418,9 @@ class Witness:
         self.call = call or https_call
         self.lock = threading.RLock()
         self.nonces = {}
+        # sender -> its streams of lease calls, (sender, 'calls') -> those of its other
+        # calls (ha_wire.take_stream)
+        self.streams = {}
         self.skews = {}
         self.events = []
         self.said = set()
@@ -561,11 +564,8 @@ class Witness:
             self._note_skew(sender, headers)
             return 401, {'code': 'HA_CLOCK', 'error': f'The clocks of the two instances are more '
                          f'than {ha_wire.SIGNATURE_WINDOW} seconds apart - set both by NTP'}
-        if verdict == 'ok':
-            ts = int(headers[ha_wire.PEER_TS_HEADER])
-            bucket = self.nonces.setdefault((sender, kind in ('vote', 'renew')), {})
-            if ha_wire.take_nonce(bucket, headers[ha_wire.PEER_NONCE_HEADER], ts, self.wall()) != 'ok':
-                verdict = ''
+        if verdict == 'ok' and self._spend(sender, kind, headers) != 'ok':
+            verdict = ''
         if verdict != 'ok':
             if not self.failures.allow(remote or '-'):
                 return 429, {'error': 'Too many failed peer calls'}
@@ -614,8 +614,25 @@ class Witness:
                 return 'open'
             if verdict != 'ok':
                 return ''
-            seen = self.nonces.get((sender, kind in ('vote', 'renew'))) or {}
-            return '' if headers.get(ha_wire.PEER_NONCE_HEADER) in seen else 'member'
+            return '' if self._spend(sender, kind, headers, spend=False) == 'seen' else 'member'
+
+    def _spend(self, sender, kind, headers, spend=True):
+        """The nonce of a call with a good signature: 'ok' the first time, 'seen' or 'full'
+        (ha_wire.take_nonce). A member numbers its calls (stream nonces, one stream for
+        the votes and renewals and one for the rest, ha_wire.take_stream): a confirm round
+        before every write of the leader never fills a share here. The lease calls and
+        the others are kept apart, as random nonces are. With spend=False nothing is
+        taken."""
+        nonce = headers[ha_wire.PEER_NONCE_HEADER]
+        ts = int(headers[ha_wire.PEER_TS_HEADER])
+        lease = kind in ('vote', 'renew')
+        if ha_wire.is_stream_nonce(nonce):
+            key = sender if lease else (sender, 'calls')
+            streams = self.streams.setdefault(key, {}) if spend else dict(self.streams.get(key) or {})
+            return ha_wire.take_stream(streams, nonce, ts, self.wall(), spend)
+        if not spend:
+            return 'seen' if nonce in (self.nonces.get((sender, lease)) or {}) else 'ok'
+        return ha_wire.take_nonce(self.nonces.setdefault((sender, lease), {}), nonce, ts, self.wall())
 
     def _key_of(self, sender, kind, data, node):
         """The public key `sender` signs with, as the voter config held here names it, or
@@ -693,6 +710,7 @@ class Witness:
         self.write(keep)
         self.node = None
         self.nonces.clear()
+        self.streams.clear()
         self.said.add('left')
         self.events.append(('left', {'why': why}))
 
@@ -772,6 +790,7 @@ class Witness:
         self.write(st)
         self.node = None
         self.nonces.clear()
+        self.streams.clear()
         return info['instance_id']
 
     @staticmethod
@@ -832,10 +851,13 @@ class Witness:
             raise WitnessError('No leader to tell')
         private = ha_wire.private_key(signing_key)
         target = dict(paired)
-        for _ in range(2):
+        # numbered like every signed call of a member (ha._signed_headers)
+        stream = ha_wire.new_stream()
+        for seq in (1, 2):
             body = ha_wire.wire_body({'epoch': self.st.get('epoch') or 0})
             headers = ha_wire.signed_headers(private, self.instance_id(), target['instance_id'],
-                                             'POST', LEAVE_PATH, body, self.wall())
+                                             'POST', LEAVE_PATH, body, self.wall(),
+                                             nonce=ha_wire.stream_nonce(stream, seq))
             status, data = self.call('POST', target['url'], target.get('fingerprint') or '',
                                      LEAVE_PATH, body, headers)
             if status == 200:

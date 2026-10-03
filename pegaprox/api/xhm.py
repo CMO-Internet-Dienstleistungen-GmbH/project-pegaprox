@@ -219,7 +219,9 @@ def xhm_start():
     runner = _runners.get(direction)
     if not runner:
         return jsonify({'error': f'No runner for direction {direction}'}), 400
-    t = threading.Thread(target=runner, args=(task,), daemon=True)
+    # a user job: in an automatic group each call it sends asks for the lease (#625)
+    from pegaprox.core import ha
+    t = threading.Thread(target=ha.as_job(runner, 'cross-hypervisor migration'), args=(task,), daemon=True)
     t.start()
 
     user = request.session.get('user', 'admin') if hasattr(request, 'session') else 'admin'

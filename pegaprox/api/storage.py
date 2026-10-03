@@ -1433,7 +1433,10 @@ def run_auto_storage_balance():
                                         'storage': target_storage,
                                         'delete': 1
                                     }
-                                    
+
+                                    # it deletes the source: not from a leader that lost its lease (#625)
+                                    if not ha.confirm_step(f'moving {key} of {vmid} to {target_storage}'):
+                                        break
                                     move_response = manager._create_session().post(move_url, data=move_data, timeout=10)
                                     
                                     if move_response.status_code == 200:
@@ -1897,9 +1900,9 @@ def rescan_storage(cluster_id, storage_id):
                             node_host = host if node == nodes[0] else f"{node}.{host.split('.', 1)[1] if '.' in host else host}"
                             
                             # Try to connect via SSH
-                            from pegaprox.utils.ssh_security import apply_host_key_policy, persist_host_keys
-                            ssh = paramiko.SSHClient()
-                            apply_host_key_policy(ssh, paramiko)
+                            # its commands ask the transport guard of an automatic group (#625)
+                            from pegaprox.utils.ssh_security import secure_ssh_client, persist_host_keys
+                            ssh = secure_ssh_client(paramiko)
 
                             connect_kwargs = {
                                 'hostname': node_host,
@@ -2863,7 +2866,9 @@ def iso_sync_trigger(cluster_id):
         results = mgr.sync_content_to_nodes(source, storage, filename, content_type, targets)
         logging.info(f"[SYNC] {filename}: {sum(1 for r in results if r.get('success'))} ok, {sum(1 for r in results if not r.get('success'))} failed")
 
-    threading.Thread(target=_do_sync, daemon=True, name=f'iso-sync-{filename}').start()
+    # a user job: in an automatic group each copy asks for the lease (#625)
+    threading.Thread(target=ha.as_job(_do_sync, f'ISO sync of {filename}'), daemon=True,
+                     name=f'iso-sync-{filename}').start()
     return jsonify({'success': True, 'message': f'Sync started for {filename}'})
 
 
@@ -2898,7 +2903,7 @@ def iso_sync_all(cluster_id):
             synced += sum(1 for r in results if r.get('success'))
         logging.info(f"[SYNC] Sync-all done: {synced} files distributed")
 
-    threading.Thread(target=_do_sync_all, daemon=True, name='iso-sync-all').start()
+    threading.Thread(target=ha.as_job(_do_sync_all, 'ISO sync'), daemon=True, name='iso-sync-all').start()
     return jsonify({'success': True, 'message': 'Full sync started'})
 
 

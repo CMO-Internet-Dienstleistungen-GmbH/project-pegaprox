@@ -106,6 +106,9 @@ class PBSManager:
             self._session.mount('https://', _PinnedFingerprintAdapter(_pin))
             logging.info(f"[PBS] {self.name}: pinning the server certificate to its "
                          f"configured fingerprint")
+        # an automatic leader that lost its lease changes nothing on the PBS (#625)
+        from pegaprox.core import ha_transport
+        ha_transport.guard_session(self._session)
         self._ticket = None
         self._csrf_token = None
         self._using_api_token = bool(self.api_token_id and self.api_token_secret)
@@ -359,7 +362,8 @@ class PBSManager:
                                    pkey=key, timeout=15, banner_timeout=15, auth_timeout=15,
                                    allow_agent=False, look_for_keys=False)
                     persist_host_keys(client)
-                    return client, None
+                    from pegaprox.core import ha_transport
+                    return ha_transport.guard_client(client, self.host), None
             except Exception as e:
                 logging.warning(f"[PBS:{self.name}] SSH key auth failed: {e}")
 
@@ -370,7 +374,8 @@ class PBSManager:
                                password=self.password, timeout=15, banner_timeout=15, auth_timeout=15,
                                allow_agent=False, look_for_keys=False)
                 persist_host_keys(client)
-                return client, None
+                from pegaprox.core import ha_transport
+                return ha_transport.guard_client(client, self.host), None
             except Exception as e:
                 return None, f"SSH auth failed for {ssh_user}@{self.host}: {e}"
 
@@ -389,14 +394,17 @@ class PBSManager:
             task = UpdateTask(self.name, reboot)
             self._update_task = task
 
+        # a user job: in an automatic group each command asks for the lease (#625)
+        from pegaprox.core import ha
+        perform = ha.as_job(self._perform_update, f'update of PBS {self.name}')
         if GEVENT_PATCHED:
             try:
                 import gevent
-                gevent.spawn(self._perform_update, task)
+                gevent.spawn(perform, task)
                 return task
             except Exception:
                 pass
-        t = _th.Thread(target=self._perform_update, args=(task,), daemon=True)
+        t = _th.Thread(target=perform, args=(task,), daemon=True)
         t.start()
         return task
 
@@ -470,6 +478,8 @@ class PBSManager:
                 task.phase = 'reboot'
                 task.status = 'rebooting'
                 task.add_output("Rebooting PBS...")
+                from pegaprox.core import ha_transport
+                ha_transport.guard_ssh(self.host, 'shutdown')
                 try:
                     transport = ssh.get_transport()
                     channel = transport.open_session()

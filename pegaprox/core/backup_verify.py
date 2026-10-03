@@ -305,7 +305,10 @@ def start_verification(pve_mgr, params):
                     _active_verifications.pop(task_id, None)
             threading.Thread(target=_cleanup, daemon=True).start()
 
-    thread = threading.Thread(target=run, daemon=True, name=f"verify-{task_id}")
+    # a user job: in an automatic group each call it sends asks for the lease (#625)
+    from pegaprox.core import ha
+    thread = threading.Thread(target=ha.as_job(run, f'backup verification {task_id}'), daemon=True,
+                              name=f"verify-{task_id}")
     thread.start()
 
     return task_id

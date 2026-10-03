@@ -608,8 +608,10 @@ def deploy(cluster_id):
     except Exception as e:
         return jsonify({'error': f'db insert failed: {e}'}), 500
 
+    # a user job: in an automatic group each call it sends asks for the lease (#625)
+    from pegaprox.core import ha
     t = threading.Thread(
-        target=_run_deploy,
+        target=ha.as_job(_run_deploy, f'template deploy {dep_id}'),
         args=(dep_id, cluster_id, node, template_id, storage, vmid, name),
         daemon=True, name=f"ci-deploy-{dep_id}"
     )

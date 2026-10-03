@@ -329,29 +329,53 @@ def test_a_voter_config_from_anybody_but_the_followed_instance_is_not_taken(auto
 
 def test_votes_and_renewals_have_a_replay_cache_of_their_own(auto, seed, monkeypatch):
     """A member that forwards many writes must not use up what its renewals need, and a
-    burst of confirm rounds must not shut out its sync."""
+    burst of confirm rounds must not shut out its sync. The lease calls a member sends
+    are numbered (stream nonces): however many come, none fills a share, and each is
+    taken once. A lease call with a random nonce goes to a share of its own."""
+    from pegaprox.core import ha_wire
     auto.form(seed)
     ha, g = auto.ha, auto.g
     monkeypatch.setattr(ha, '_NONCES_PER_SENDER', 6)
     ha.forget_seen_nonces()
     status = '/api/ha/peer/status'
+    raw = ha._wire_body(_vote(auto, 'b', 'a', 2, pre=True))
 
-    def ask(path, method='GET'):
-        raw = b'' if method == 'GET' else ha._wire_body(_vote(auto, 'b', 'a', 2, pre=True))
+    def ask(path, method='GET', headers=None):
+        body = b'' if method == 'GET' else raw
         _fresh()
-        return _send(g, 'a', g.signed('b', 'a', method, path, raw), method, path, raw).status_code
+        h = headers or g.signed('b', 'a', method, path, body)
+        return _send(g, 'a', h, method, path, body).status_code
 
-    # the share of the other calls is used up ...
-    assert [ask(status) for _ in range(6)] == [200] * 6 and ask(status) == 401
-    # ... and a vote still gets through, six of them
-    assert [ask(VOTE, 'POST') for _ in range(6)] == [200] * 6 and ask(VOTE, 'POST') == 401
-    assert ask(RENEW, 'POST') == 401
+    def random_nonce(path, method='POST'):
+        with g.at('b'):
+            key = ha._signer().private
+        return ha_wire.signed_headers(key, IDS['b'], IDS['a'], method, path, raw if method == 'POST' else b'',
+                                      time.time())
+
+    # the share of the other calls is used up by random nonces (a member on the release
+    # before) ...
+    assert [ask(status, headers=random_nonce(status, 'GET')) for _ in range(6)] == [200] * 6
+    assert ask(status, headers=random_nonce(status, 'GET')) == 401
+    # ... while the other calls of this release are numbered and still get through
+    assert [ask(status) for _ in range(20)] == [200] * 20
+    # ... and votes and renewals still get through, many more than a share holds
+    signed = [g.signed('b', 'a', 'POST', VOTE, raw) for _ in range(40)]
+    assert all(ha_wire.is_stream_nonce(h[ha.PEER_NONCE_HEADER]) for h in signed)
+    assert [ask(VOTE, 'POST', h) for h in signed] == [200] * 40
+    assert ask(RENEW, 'POST') == 200
+    # each one once, and in any order
+    assert ask(VOTE, 'POST', signed[7]) == 401 and ask(VOTE, 'POST', signed[39]) == 401
+    assert not [k for k in ha._seen_nonces if k == (IDS['a'], IDS['b'], 'lease')]
+    # a random nonce on a lease route: the share of its own, which fills
+    assert [ask(VOTE, 'POST', random_nonce(VOTE)) for _ in range(6)] == [200] * 6
+    assert ask(VOTE, 'POST', random_nonce(VOTE)) == 401
+    assert ask(RENEW, 'POST') == 200
     keys = [k for k in ha._seen_nonces if k[:2] == (IDS['a'], IDS['b'])]
     assert sorted(len(k) for k in keys) == [2, 3] and all(len(ha._seen_nonces[k]) == 6 for k in keys)
 
     ha.forget_seen_nonces()
     # the other way round
-    assert [ask(RENEW, 'POST') for _ in range(6)] == [200] * 6 and ask(VOTE, 'POST') == 401
+    assert [ask(VOTE, 'POST', random_nonce(VOTE)) for _ in range(6)] == [200] * 6
     assert ask(status) == 200
 
 

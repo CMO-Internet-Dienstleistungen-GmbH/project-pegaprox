@@ -1365,6 +1365,9 @@ def _msdn_scan_once():
                 if to_fix:
                     recreated = [cid for cid in to_fix if live[cid].get('status') == 'missing']
                     for cid in to_fix:
+                        # before it applies: not from a leader that lost its lease (#625)
+                        if not ha.confirm_step(f"reconciling vnet {rec.get('name')} on {cid}"):
+                            break
                         try:
                             _reconcile_on_cluster(cid, defn)
                         except Exception as e:

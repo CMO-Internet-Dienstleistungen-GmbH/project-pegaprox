@@ -309,7 +309,8 @@ def _migrate_vm_cross_cluster(src_mgr, tgt_mgr, vmid, vm_type, storage_map, net_
                 pass
 
         import gevent
-        gevent.spawn(_delayed_cleanup)
+        # an hour later: the delete asks for the lease at its exit then (#625)
+        gevent.spawn(ha.as_job(_delayed_cleanup, f'token cleanup for {vmid}'))
 
         if not result.get('success'):
             return False, result.get('error', 'Migration failed')
@@ -574,7 +575,10 @@ def execute_failover(plan_id, failover_type='planned', authorized_vmids=None):
             vm_type = vm.get('vm_type', 'qemu')
             vm_name = vm.get('vm_name', f'VM {vmid}')
 
-            if failover_type == 'emergency':
+            # before each guest's stop, start or migration (design 5.2, #625)
+            if not ha.confirm_step(f'site recovery of {_sl(vm_name)} ({vmid})'):
+                ok, err = False, 'not started: this instance does not hold the lease of its group'
+            elif failover_type == 'emergency':
                 # source is down - start replicated VM on target
                 logger.info(f"[SR] Emergency: starting {_sl(vm_name)} ({vmid}) on target")
                 _broadcast_progress(plan_id, f"Starting {_sl(vm_name)} on target...", int(completed / total_vms * 100))

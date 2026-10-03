@@ -236,9 +236,17 @@ def get_client_ip():
     """
     if not has_request_context():
         return 'system'
+    return client_ip_from(request.remote_addr, request.headers.get)
+
+
+def client_ip_from(remote_addr, header):
+    """get_client_ip() for a request read straight from its WSGI environ: `remote_addr`
+    the peer address, `header(name)` the value of a request header or None. MK Oct 2026
+    (#625) - the HA lease routes answer before Flask (app._LeaseFastPath) and go by the
+    same address the IP lists see."""
     # trust proxy headers from loopback + configured trusted proxies
-    if _is_trusted_proxy(request.remote_addr):
-        xff = request.headers.get('X-Forwarded-For')
+    if _is_trusted_proxy(remote_addr):
+        xff = header('X-Forwarded-For')
         if xff:
             # sec (audit): the LEFTMOST entry is whatever the client sent — a proxy APPENDS the
             # peer it saw, so `X-Forwarded-For: 1.2.3.4` from the client arrives as
@@ -253,11 +261,11 @@ def get_client_ip():
                 if not _is_trusted_proxy(_cand):
                     return _canonical_ip(_cand)
             # every hop is one of our own proxies — the peer is as close as we get
-            return _canonical_ip(request.remote_addr)
-        xri = request.headers.get('X-Real-IP')
+            return _canonical_ip(remote_addr)
+        xri = header('X-Real-IP')
         if xri:
             return _canonical_ip(xri.strip())
-    return _canonical_ip(request.remote_addr)
+    return _canonical_ip(remote_addr)
 
 # Global users store (loaded at startup)
 users_db = {}

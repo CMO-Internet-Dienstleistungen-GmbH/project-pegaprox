@@ -93,7 +93,13 @@ _SMALL_ORDER_Y = frozenset((0, 1, _ED25519_P - 1, _ORDER_8_Y, _ED25519_P - _ORDE
 def public_key(value):
     """The Ed25519 public key in `value` (base64 of the raw 32 bytes), None for anything
     else, a point of small order included."""
-    if not isinstance(value, str) or not PUBLIC_KEY_RE.fullmatch(value):
+    if not isinstance(value, str):
+        return None
+    # every signed call is checked against a key of a member: each one is read once
+    held = _keys_read.get(value)
+    if held is not None:
+        return held
+    if not PUBLIC_KEY_RE.fullmatch(value):
         return None
     raw = base64.b64decode(value)
     # the sign bit of x left out, and y taken mod p: the encodings above p are the
@@ -102,9 +108,16 @@ def public_key(value):
         return None
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
     try:
-        return Ed25519PublicKey.from_public_bytes(raw)
+        key = Ed25519PublicKey.from_public_bytes(raw)
     except Exception:
         return None
+    if len(_keys_read) >= 64:
+        _keys_read.clear()
+    _keys_read[value] = key
+    return key
+
+
+_keys_read = {}
 
 
 def cfg_signed(public_b64, message, sig):
@@ -139,8 +152,11 @@ def to_sign(method, path, body, ts, nonce, receiver, sender, digest=None):
                       receiver, sender)).encode()
 
 
-def signed_headers(private, sender, receiver, method, path, body, now):
-    ts, nonce, digest = str(int(now)), secrets.token_urlsafe(18), body_digest(body)
+def signed_headers(private, sender, receiver, method, path, body, now, nonce=None):
+    """The peer headers of one call. `nonce` is a stream nonce (stream_nonce) for the
+    calls of automatic failover, a random one when left out."""
+    ts, digest = str(int(now)), body_digest(body)
+    nonce = nonce or secrets.token_urlsafe(18)
     sig = private.sign(to_sign(method, path, body, ts, nonce, receiver, sender, digest))
     return {PEER_HEADER: sender, PEER_TS_HEADER: ts, PEER_NONCE_HEADER: nonce,
             PEER_SIG_HEADER: base64.b64encode(sig).decode(), PEER_BODY_HEADER: digest}
@@ -186,6 +202,75 @@ def take_nonce(seen, nonce, ts, now, cap=NONCES_PER_SENDER):
     if len(seen) >= cap:
         return 'full'
     seen[nonce] = ts + SIGNATURE_WINDOW + 1
+    return 'ok'
+
+
+# --- stream nonces: the votes and renewals of automatic failover ---------------------------
+#
+# MK Oct 2026 (#625) - a leader sends a confirm round before each write, many a second. A
+# replay cache of random nonces that has to hold every one of them for the signature
+# window would need 121 entries per round a second and sender. Instead each process
+# that sends lease calls draws a random stream id once and numbers its calls to each
+# receiver 1, 2, 3, ... The receiver keeps per sender and stream the highest number it
+# took and which of the STREAM_WINDOW below it it took (a bitmap), for as long as the
+# newest call it took from that stream is inside the signature window. A number is taken
+# once: above the highest it moves the window, inside it needs its bit clear, below it is
+# refused. A sender that restarts draws a new stream; a receiver that restarts refuses
+# whatever was signed before its start (signature_verdict 'early'), as it does for random
+# nonces; calls that overtake each other on the way are taken as long as they are less
+# than STREAM_WINDOW apart. A stream left alone ages out once its newest call is outside
+# the signature window, and so is every call of it ever taken.
+
+STREAM_NONCE_RE = re.compile(r'ls1-([0-9a-f]{32})-([1-9][0-9]{0,17})')
+STREAM_WINDOW = 4096
+# streams one sender may have live at a receiver: one per start of its process within the
+# signature window. A sender that restarts this often is refused until the oldest ages out
+STREAMS_PER_SENDER = 64
+
+
+def new_stream():
+    return secrets.token_hex(16)
+
+
+def stream_nonce(stream, seq):
+    return f'ls1-{stream}-{seq}'
+
+
+def is_stream_nonce(nonce):
+    return isinstance(nonce, str) and STREAM_NONCE_RE.fullmatch(nonce) is not None
+
+
+def take_stream(streams, nonce, ts, now, spend=True):
+    """Spend the stream nonce `nonce` in `streams` ({stream: [highest, bitmap, newest ts]},
+    one per sender): 'ok' the first time, 'seen' for a number taken before or one too far
+    below the highest, 'full' when the sender holds STREAMS_PER_SENDER live streams
+    already. With spend=False only says what spending would say. The caller holds its
+    lock around it and checked the signature and its window first."""
+    m = STREAM_NONCE_RE.fullmatch(nonce)
+    stream, seq = m.group(1), int(m.group(2))
+    rec = streams.get(stream)
+    if rec is None:
+        for s in [s for s, r in streams.items() if r[2] + SIGNATURE_WINDOW + 1 < now]:
+            del streams[s]
+        if len(streams) >= STREAMS_PER_SENDER:
+            return 'full'
+        if spend:
+            streams[stream] = [seq, 1, ts]
+        return 'ok'
+    high, bits, newest = rec
+    if seq > high:
+        if spend:
+            shift = seq - high
+            bits = ((bits << shift) | 1) if shift < STREAM_WINDOW else 1
+            rec[0], rec[1] = seq, bits & ((1 << STREAM_WINDOW) - 1)
+    else:
+        back = high - seq
+        if back >= STREAM_WINDOW or (bits >> back) & 1:
+            return 'seen'
+        if spend:
+            rec[1] = bits | (1 << back)
+    if spend and ts > newest:
+        rec[2] = ts
     return 'ok'
 
 

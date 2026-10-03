@@ -177,6 +177,11 @@ def _ssh_exec(host, user, password, cmd, timeout=30, use_controlmaster=False,
     import socket as _socket
     last_err = ''
     errors = []
+    # one exit, both ways out below (#625): asked before anything connects, and again
+    # right before the command goes out either way
+    from pegaprox.core import ha_transport
+    from pegaprox.core.ha import GuardRefused
+    ha_transport.guard_ssh(host, cmd)
 
     def _make_sock():
         """Pre-create socket with explicit connect_timeout — paramiko.Transport
@@ -331,8 +336,9 @@ def _ssh_exec(host, user, password, cmd, timeout=30, use_controlmaster=False,
         # MK: Mar 2026 - persist host keys (TOFU model) — reject-on-change next time
         persist_host_keys(client)
 
-        # Execute command
+        # Execute command (the connects above may have taken a while: checked again, #625)
         try:
+            ha_transport.guard_ssh(host, cmd, again=True)
             stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
             out = read_capped(stdout)
             err = read_capped(stderr)
@@ -342,14 +348,17 @@ def _ssh_exec(host, user, password, cmd, timeout=30, use_controlmaster=False,
         except Exception as e:
             try: client.close()
             except: pass
+            if isinstance(e, GuardRefused):
+                raise
             raise Exception(f'Paramiko exec failed: {e}')
-    
+
+    except GuardRefused:
+        raise
     except Exception as paramiko_err:
         last_err = str(paramiko_err)
     
     # Fallback: sshpass + ssh subprocess (handles keyboard-interactive via PreferredAuthentications)
     try:
-        import subprocess
         from pegaprox.utils.ssh_security import cli_hostkey_opts
         env = os.environ.copy()
         env['SSHPASS'] = password
@@ -375,14 +384,18 @@ def _ssh_exec(host, user, password, cmd, timeout=30, use_controlmaster=False,
                 # any import / setup error → fall through, ssh just runs without sharing
                 pass
         ssh_args.extend([f'{user}@{host}', cmd])
-        result = subprocess.run(
-            ssh_args,
-            capture_output=True, text=True, timeout=timeout, env=env
+        # long after the guard was asked at the top: checked again, bounded and in a
+        # process group of its own in an automatic group (#625)
+        result = ha_transport.node_cmd(
+            ssh_args, capture_output=True, text=True, timeout=timeout, env=env,
+            host=host, again=True
         )
         if result.returncode == 0:
             return result.returncode, result.stdout, result.stderr
         # sshpass also failed
         return result.returncode, result.stdout, result.stderr or last_err
+    except GuardRefused:
+        raise
     except Exception as sub_err:
         return 1, '', f'All SSH methods failed: {last_err}; subprocess: {sub_err}'
 

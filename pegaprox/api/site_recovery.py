@@ -36,7 +36,9 @@ def _safe_spawn_failover(func, plan_id, *args):
                            (datetime.utcnow().isoformat(), plan_id))
             except Exception:
                 pass
-    gevent.spawn(_wrapper)
+    # in an automatic group what goes out between the confirms of the run asks at its exit (#625)
+    from pegaprox.core import ha
+    gevent.spawn(ha.as_job(_wrapper, f'site recovery plan {plan_id}'))
 
 
 

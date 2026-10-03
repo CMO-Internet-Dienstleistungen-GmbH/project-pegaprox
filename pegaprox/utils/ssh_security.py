@@ -148,9 +148,12 @@ def apply_host_key_policy(client, paramiko):
 
 
 def secure_ssh_client(paramiko):
-    """Return a fresh ``paramiko.SSHClient`` with known_hosts loaded + policy set."""
+    """Return a fresh ``paramiko.SSHClient`` with known_hosts loaded + policy set.
+
+    Its commands ask the transport guard of an automatic group (#625)."""
     client = paramiko.SSHClient()
-    return apply_host_key_policy(client, paramiko)
+    from pegaprox.core import ha_transport
+    return ha_transport.guard_client(apply_host_key_policy(client, paramiko))
 
 
 def persist_host_keys(client):

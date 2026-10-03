@@ -1310,16 +1310,18 @@ def test_confirm_needs_a_round_that_started_after_it():
     box = _leader()
     box.answer_all('renew', _ok)
     box.later(T.R)
-    # a round is out; the step is asked for right after it left
+    first = [s for s in box.sent if s[1] == 'renew']
+    box.sent.clear()
+    # a round is out; the step is asked for right after it left, and gets one of its own
+    # at once - there is no spacing between rounds
     box.now += 0.05
     seen = []
     box.node.confirm(5, seen.append)
-    assert not seen
-    box.answer_all('renew', _ok)
+    own = [s for s in box.sent if s[1] == 'renew']
+    assert not seen and own and all(s[2]['epoch'] == 1 for s in own)
+    for to, _, b, tag in first:
+        box.node.on_answer(to, tag, _ok(to, b))
     assert seen == [], 'answered by a round that started before the step was asked for'
-    box.later(T.confirm_spacing)
-    rounds = [s for s in box.sent if s[1] == 'renew']
-    assert rounds and all(s[2]['epoch'] == 1 for s in rounds)
     box.answer_all('renew', _ok)
     assert seen == [True]
     # a round that misses its majority fails the confirm

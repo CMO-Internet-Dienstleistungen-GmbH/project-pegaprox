@@ -18,6 +18,7 @@ from pegaprox.constants import *
 from pegaprox.globals import *
 from pegaprox.models.permissions import *
 from pegaprox.core.db import get_db, ENCRYPTION_AVAILABLE
+from pegaprox.core import ha
 
 import requests
 from pegaprox.utils.auth import require_auth, load_users, save_users, validate_session, TOTP_AVAILABLE, ARGON2_AVAILABLE, _check_default_password_in_use, verify_password, needs_password_rehash
@@ -2983,6 +2984,36 @@ try:
 except:
     pass  # Settings might not exist yet
 
+def _peer_may_pass(client_ip, path):
+    # MK Sep 2026 (#625) - the list is synced, so a standby enforces the active's
+    # copy, and nobody lists the active's own address on the active: its watch and
+    # unpair calls to the standby would bounce here. The peer calls carry their own
+    # credential, a signature over the whole call, so a member gets through (and a
+    # removed one too, to hear 410 from the route). A wrong one counts against the
+    # same failure budget as on the peer routes, so the list does not turn into a
+    # free place to try credentials. The pairing call has no peer credential yet
+    # and stays behind the list.
+    # A blacklist entry is an explicit no and stays one, peer or not.
+    return (path.startswith('/api/ha/peer/') and path != '/api/ha/peer/pair'
+            and not _ip_blacklisted(client_ip))
+
+
+def ip_lists_pass(client_ip, path, peer):
+    """(passes, reason): whether the allow and block lists let a request to `path` from
+    `client_ip` through. `peer()` says whether the call is a member's signed call, asked
+    only where the lists refuse the address and a member may still pass (_peer_may_pass).
+    check_ip_whitelist goes by it, and so do the HA lease routes that answer before
+    Flask (app._LeaseFastPath, #625)."""
+    if not _ip_whitelist_enabled:
+        return True, 'Whitelist disabled'
+    allowed, reason = check_ip_allowed(client_ip)
+    if allowed:
+        return True, reason
+    if _peer_may_pass(client_ip, path) and peer():
+        return True, 'signed call of a member'
+    return False, reason
+
+
 @bp.before_app_request
 def check_ip_whitelist():
     """Check IP whitelist before processing request"""
@@ -2996,26 +3027,18 @@ def check_ip_whitelist():
     # Skip if whitelist not enabled
     if not _ip_whitelist_enabled:
         return None
-    
+
     client_ip = get_client_ip()
-    allowed, reason = check_ip_allowed(client_ip)
-    
+    path = request.path
+
+    def peer():
+        from pegaprox.api.ha import request_peer
+        return bool(request_peer()[0])
+    allowed, reason = ip_lists_pass(client_ip, path, peer)
+
     if not allowed:
-        # MK Sep 2026 (#625) - the list is synced, so a standby enforces the active's
-        # copy, and nobody lists the active's own address on the active: its watch and
-        # unpair calls to the standby would bounce here. The peer calls carry their own
-        # credential, a signature over the whole call, so a member gets through (and a
-        # removed one too, to hear 410 from the route). A wrong one counts against the
-        # same failure budget as on the peer routes, so the list does not turn into a
-        # free place to try credentials. The pairing call has no peer credential yet
-        # and stays behind the list.
-        # A blacklist entry is an explicit no and stays one, peer or not.
-        path = request.path
-        if (path.startswith('/api/ha/peer/') and path != '/api/ha/peer/pair'
-                and not _ip_blacklisted(client_ip)):
-            from pegaprox.api.ha import request_peer, _peer_failures
-            if request_peer()[0]:
-                return None
+        if _peer_may_pass(client_ip, path):
+            from pegaprox.api.ha import _peer_failures
             _peer_failures.allow(client_ip)
         logging.warning(f"IP blocked: {client_ip} - {reason}")
         return jsonify({
@@ -4664,6 +4687,9 @@ def start_rolling_update(cluster_id):
                         _log(f"  → Ceph (if present): noout + norebalance will be set on {node_name} to prevent rebalancing")
                         logging.info(f"[RollingUpdate] Enabling maintenance mode on {node_name}")
                     
+                    # before each node's evacuation and its update (design 5.2, #625)
+                    if not ha.confirm_step(f'rolling update of {node_name}'):
+                        raise Exception('this instance does not hold the lease of its group')
                     maintenance_task = mgr.enter_maintenance_mode(
                         node_name,
                         skip_evacuation=skip_evacuation,
@@ -4754,8 +4780,10 @@ def start_rolling_update(cluster_id):
                     mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Installing updates on {node_name}")
                     logging.info(f"[RollingUpdate] Installing updates on {node_name}")
                     
+                    if not ha.confirm_step(f'update of {node_name}'):
+                        raise Exception('this instance does not hold the lease of its group')
                     update_task = mgr.start_node_update(node_name, reboot=include_reboot)
-                    
+
                     if not update_task:
                         logging.error(f"[RollingUpdate] start_node_update returned None for {node_name}")
                         raise Exception(f"Update failed: Could not start update task")
@@ -5039,7 +5067,9 @@ def start_rolling_update(cluster_id):
                              channel_ids=notify_channels)
     
     import threading
-    update_thread = threading.Thread(target=run_rolling_update, daemon=True)
+    # a user job: what goes out between the confirms asks at its exit (#625)
+    update_thread = threading.Thread(target=ha.as_job(run_rolling_update, f'rolling update of {cluster_id}'),
+                                     daemon=True)
     update_thread.start()
     
     return jsonify({

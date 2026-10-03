@@ -2675,8 +2675,10 @@ def _ssh_esxi_exec(esxi_host, esxi_user, esxi_pass, cmd, timeout=30):
         pass  # graceful fallback
     full.extend([f'{esxi_user}@{esxi_host}', cmd])
     try:
-        r = subprocess.run(full, capture_output=True, timeout=timeout, text=True,
-                           env={**os.environ, 'SSHPASS': esxi_pass or ''})
+        # the transport guard of an automatic group, and the bound of a node command (#625)
+        from pegaprox.core.ha_transport import node_cmd
+        r = node_cmd(full, capture_output=True, timeout=timeout, text=True,
+                     env={**os.environ, 'SSHPASS': esxi_pass or ''}, host=esxi_host)
         return r.returncode, r.stdout, r.stderr
     except Exception as e:
         return 1, '', str(e)
@@ -6299,6 +6301,14 @@ def _monitor_disk_write(pve_mgr, node, vol_path, disk_size, task, disk_key, stop
       monitor itself is still alive.
     """
     import time as _time
+    from pegaprox.core import ha
+
+    def probe(cmd):
+        # stat, lvs and a cat of the dd log only read. This thread carries neither the
+        # import job's mark nor a token, so in an automatic group they say so (#625)
+        with ha.reading():
+            return _pve_node_exec(pve_mgr, node, cmd, timeout=8)
+
     # Detect block-device target once
     is_block_dev = bool(vol_path) and vol_path.startswith('/dev/')
 
@@ -6321,8 +6331,7 @@ def _monitor_disk_write(pve_mgr, node, vol_path, disk_size, task, disk_key, stop
                 # /dev/pve/vm-100-disk-0 → ['', 'dev', 'pve', 'vm-100-disk-0']
                 if len(parts) >= 4 and parts[1] == 'dev':
                     vg, lv = parts[2], parts[3]
-                    rc, out, _ = _pve_node_exec(pve_mgr, node,
-                        f"lvs --noheadings -o data_percent {vg}/{lv} 2>/dev/null", timeout=8)
+                    rc, out, _ = probe(f"lvs --noheadings -o data_percent {vg}/{lv} 2>/dev/null")
                     s = str(out or '').strip()
                     if rc == 0 and s and s != '':
                         try:
@@ -6338,16 +6347,15 @@ def _monitor_disk_write(pve_mgr, node, vol_path, disk_size, task, disk_key, stop
                 # into one of these three logs on the node.
                 if written < 0:
                     _idx = disk_key.replace('disk', '') or '0'
-                    rc2, out2, _ = _pve_node_exec(pve_mgr, node,
+                    rc2, out2, _ = probe(
                         f"cat /tmp/v2p-{task.id}-sshdd-{_idx}.log /tmp/v2p-{task.id}-dl-{_idx}.log "
                         f"/tmp/v2p-{task.id}-dd3-{_idx}.log 2>/dev/null | tr '\\r' '\\n' "
-                        f"| grep -oE '[0-9]+ bytes' | tail -1", timeout=8)
+                        f"| grep -oE '[0-9]+ bytes' | tail -1")
                     m = re.search(r'(\d+)', str(out2 or ''))
                     if m:
                         written = int(m.group(1))
             else:
-                rc, out, _ = _pve_node_exec(pve_mgr, node,
-                    f"stat -c '%s' '{vol_path}' 2>/dev/null || echo 0", timeout=8)
+                rc, out, _ = probe(f"stat -c '%s' '{vol_path}' 2>/dev/null || echo 0")
                 if rc == 0 and str(out or '').strip().isdigit():
                     written = int(out.strip())
         except Exception:

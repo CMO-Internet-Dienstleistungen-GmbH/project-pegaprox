@@ -101,6 +101,20 @@ SITE_MAX = 64
 SKEW_LIMIT = 5
 # a step of the wall clock against the lease clock that forces a confirm round
 CLOCK_JUMP = 2
+# Confirm rounds (4.5) start the moment a caller has no round out that started after it,
+# up to this many out at once; past that, callers share the next one, which starts as
+# one of them comes back
+CONFIRM_IN_FLIGHT = 4
+# what the voters are protected by whatever the callers do: confirm rounds per second.
+# A data member answering through the real app (pywsgi, TLS, the lease fast path in
+# app.py) spends about 1.05 ms of CPU per renewal under load (MK Oct 2026, #625: 1.0-1.15
+# ms measured with 50 writers on LAN, 2 ms through Flask before): 450 a second is about
+# half a core of it, with what it spends idle
+CONFIRM_RATE_MAX = 450
+# unanswered calls one voter may hold from confirm rounds. A confirm round passes a voter
+# that holds this many (a slow or a dead one) and asks the others; the renewal every R
+# goes to everyone
+CONFIRM_PER_VOTER = 16
 SWITCH_TIMEOUT = 600
 TRANSFER_CATCHUP = 10
 CATCHUP_TIMEOUT = 10
@@ -135,7 +149,7 @@ class Timings:
 
     __slots__ = ('L', 'R', 'renew_timeout', 'P', 'D', 'per_round', 'T_vote', 'G', 'W_take',
                  'hold_after_start', 'won_hold', 'boot_wait', 'boot_retry', 'confirm_timeout',
-                 'confirm_spacing', 'need', 'lost_lease_backoff')
+                 'need', 'lost_lease_backoff')
 
     def __init__(self, lease_s=LEASE_DEFAULT, keep_w_take=True):
         L = float(lease_s)
@@ -159,7 +173,6 @@ class Timings:
         # another one
         self.boot_retry = min(self.R, 1.0)
         self.confirm_timeout = 2.0
-        self.confirm_spacing = 0.1
         self.need = 5.0
         self.lost_lease_backoff = 2 * L
 
@@ -512,11 +525,14 @@ def _normalized(st):
 
 class _Round:
     __slots__ = ('tag', 'kind', 't0', 'deadline', 'epoch', 'targets', 'answered', 'acks',
-                 'refusals', 'cvs', 'gens', 'majority', 'done', 'why', 'catchup_done', 'lease_s')
+                 'refusals', 'cvs', 'gens', 'majority', 'done', 'why', 'catchup_done', 'lease_s',
+                 'passed')
 
     def __init__(self, tag, kind, t0, deadline, epoch):
         self.tag, self.kind, self.t0, self.deadline, self.epoch = tag, kind, t0, deadline, epoch
         self.targets = frozenset()
+        # the voters a confirm round did not ask (Node._confirm_plan)
+        self.passed = frozenset()
         self.answered = set()
         self.acks = set()
         self.refusals = []
@@ -622,7 +638,16 @@ class Node:
         self._tag = 0
         self.next_round_at = _INF
         self._last_round_t0 = -_INF
+        # [decided at, need, cb, mark] per confirm still waiting for its round. mark is the
+        # tag of the last round started before it: only a later one serves it, whatever
+        # the clock read (a held clock reads the same before and after a pause)
         self._waiters = []
+        # confirm rounds that may start before CONFIRM_RATE_MAX holds them back
+        self._bucket = float(CONFIRM_IN_FLIGHT)
+        self._bucket_at = now
+        # voters a renewal did not reach (refused, closed, no answer in time): confirm
+        # rounds pass them as owing until a round that asks everyone reaches them again
+        self._unreached = set()
         self._cfg_seen = {}
         self._cfg_seen_at = {}
         # member -> (digest of the config it said it holds, start of that round): what
@@ -864,18 +889,15 @@ class Node:
                     times.append(self.lease_until)
                 if self._acting and not self._acting_said and self.acting_from > now:
                     times.append(self.acting_from)
-                if self._round_wanted():
-                    times.append(self._last_round_t0 + self.t.confirm_spacing)
+                at = self._confirm_due(now)
+                if at is not None:
+                    times.append(at)
         elif self.switch is not None:
             times.append(min(self.switch['next'], self.switch['until']))
         elif role == ROLE_STANDBY and self._campaign is None and self._timer_candidate():
             times.append(self.election_at)
         times = [t for t in times if t < _INF]
         return max(now, min(times)) if times else None
-
-    def _round_wanted(self):
-        # a confirm asked after the last round started needs a round of its own
-        return any(w[0] > self._last_round_t0 for w in self._waiters)
 
     def on_request(self, frm, kind, body):
         if self.dead:
@@ -900,6 +922,9 @@ class Node:
         if self.dead:
             return
         now = self.clock()
+        # a step of the clock since the last tick is seen before this answer serves any
+        # confirm: the rounds out started before it
+        self._watch_clock(now)
         if ans is not None and not isinstance(ans, dict):
             ans = None
         if ans is not None:
@@ -1458,12 +1483,13 @@ class Node:
     def _is_committed(self):
         return self._committed is not None and self._committed >= self.view.id
 
-    def _start_round(self, now, kind='renew', extra=None):
+    def _start_round(self, now, kind='renew', extra=None, skip=frozenset()):
         led_epoch = self.st['led']['epoch']
         v = self.view
         deadline = now + (self.t.boot_wait if kind == 'boot' else self.t.renew_timeout)
         r = self._new_round('renew' if kind == 'won' else kind, now, deadline, led_epoch,
-                            v.members - {self.me})
+                            v.members - {self.me} - skip)
+        r.passed = frozenset(skip)
         if self.me in v.counting:
             r.acks.add(self.me)
         r.lease_s = lease_s = self._lease_s()
@@ -1478,7 +1504,9 @@ class Node:
                 body = dict(base, chain=chain_after(self._chain, known))
             self.send(to, 'renew', body, r.tag)
         if kind in ('renew', 'boot', 'won'):
-            self.next_round_at = now + self._timings(lease_s).R
+            if not skip:
+                # a round that passed a voter is no renewal of that voter's promise
+                self.next_round_at = now + self._timings(lease_s).R
             self._last_round_t0 = now
         self._event('round', tag=r.tag, kind=kind, epoch=led_epoch)
         return r
@@ -1496,6 +1524,11 @@ class Node:
 
     def _renew_answer(self, r, frm, ans, now):
         r.answered.add(frm)
+        if ans is None:
+            if r.kind in ('renew', 'boot'):
+                self._unreached.add(frm)
+        else:
+            self._unreached.discard(frm)
         if ans is not None:
             e = ans.get('epoch')
             if r.kind != 'switch' and _is_epoch(e) and e > r.epoch:
@@ -1523,7 +1556,8 @@ class Node:
                 r.gens[frm] = gen
             if ans.get('ok') and frm in self.view.counting:
                 r.acks.add(frm)
-                self._acked_at[frm] = r.t0
+                # rounds overlap and come back in any order
+                self._acked_at[frm] = max(r.t0, self._acked_at.get(frm, -_INF))
                 if cv is not None and frm in self.view.data:
                     r.cvs[frm] = cv
             if r.kind == 'switch':
@@ -1546,6 +1580,8 @@ class Node:
                 self._majority(r, now)
         if r.answered >= r.targets and not r.done:
             self._finish(r, now)
+        # a round back, or a voter that answered: whoever waits for one may get it now
+        self._confirm_round(now)
 
     def _majority(self, r, now):
         r.majority = True
@@ -1582,6 +1618,13 @@ class Node:
             if len(hist) > 8:
                 del hist[0]
         if r.kind in ('renew', 'boot') and not r.majority:
+            # the voters asked made no majority after all: the ones it passed because
+            # their last call failed are asked again, by one more round for whoever
+            # waits now, before the waiters are told no
+            again = bool(r.passed & self._unreached)
+            self._unreached.clear()
+            if again:
+                self._confirm_round(now)
             self._resolve_waiters(r, now, False)
 
     def _gen_check(self, frm, gen, r):
@@ -1642,8 +1685,7 @@ class Node:
                 return
         if now >= self.lease_until:
             return self._lose(now, 'lease ran out')
-        if self._round_wanted() and now >= self._last_round_t0 + self.t.confirm_spacing:
-            self.next_round_at = min(self.next_round_at, now)
+        self._confirm_round(now)
         if now >= self.next_round_at:
             self._start_round(now)
         if self._acting and not self._acting_said and self.acting_from <= now:
@@ -1747,25 +1789,86 @@ class Node:
     def confirm(self, need, cb):
         """cb(ok) once a majority round that started after this call came back with at
         least `need` seconds of lease left, cb(False) when it does not. Manual mode and a
-        standalone instance confirm at once."""
+        standalone instance confirm at once.
+
+        There is no spacing between rounds. A call that no round out can serve (none
+        started after it) starts one at once, while fewer than CONFIRM_IN_FLIGHT are out;
+        else it waits with the others for the next, which starts as one comes back. A
+        round serves every call made up to its start, whichever order rounds come back
+        in. CONFIRM_RATE_MAX caps the rounds a second whatever the callers do."""
         if self.dead:
             return cb(False)
         if not self.lease_mode():
             return cb(self.is_active())
+        now = self.clock()
+        self._watch_clock(now)
         if not self.is_active():
             return cb(False)
-        now = self.clock()
-        self._waiters.append([max(now, self._jump_at), need, cb])
-        if now >= self._last_round_t0 + self.t.confirm_spacing:
-            self._start_round(now)
-        else:
-            self.next_round_at = min(self.next_round_at, self._last_round_t0 + self.t.confirm_spacing)
+        self._waiters.append([max(now, self._jump_at), need, cb, self._tag])
+        self._confirm_round(now)
+
+    def _flying(self):
+        """The renewal rounds out that may still serve a confirm: no majority yet, not done."""
+        return [r for r in self._rounds.values()
+                if r.kind in ('renew', 'boot') and not r.majority and not r.done]
+
+    def _owed(self):
+        """voter -> calls of the leader's rounds it has not answered yet."""
+        owed = {}
+        for r in self._rounds.values():
+            if r.kind in ('renew', 'boot', 'release') and not r.done:
+                for to in r.targets - r.answered:
+                    owed[to] = owed.get(to, 0) + 1
+        return owed
+
+    def _confirm_plan(self, now):
+        """(when the next confirm round may start, the voters it passes), None when no
+        round is wanted (each confirm waiting has a round out that started after it) or
+        none can start before a round out comes back: as many are out as may be, or the
+        voters it could ask hold too many calls of ours to make a majority. A voter whose
+        last call failed counts as owing too (_unreached), while the others can make the
+        majority without it: a member that refuses or drops connections costs no confirm
+        round a call, the renewal every R still goes to it."""
+        if not self._waiters or self.dead or self._booting is not None:
+            return None
+        if self.st['role'] != ROLE_LEADER or (self.transfer is not None and self.transfer['phase'] != 'catchup'):
+            return None
+        flying = self._flying()
+        newest = max((r.tag for r in flying), default=0)
+        if all(w[3] < newest for w in self._waiters) or len(flying) >= CONFIRM_IN_FLIGHT:
+            return None
+        skip = frozenset(i for i, n in self._owed().items() if n >= CONFIRM_PER_VOTER)
+        if len(self.view.counting - skip - self._unreached) >= self.view.m:
+            skip |= self._unreached & self.view.members
+        elif len(self.view.counting - skip) < self.view.m:
+            return None
+        self._bucket = min(float(CONFIRM_IN_FLIGHT),
+                           self._bucket + max(0.0, now - self._bucket_at) * CONFIRM_RATE_MAX)
+        self._bucket_at = now
+        at = now if self._bucket >= 1 else now + (1 - self._bucket) / CONFIRM_RATE_MAX
+        return at, skip
+
+    def _confirm_due(self, now):
+        plan = self._confirm_plan(now)
+        return plan[0] if plan is not None else None
+
+    def _confirm_round(self, now):
+        plan = self._confirm_plan(now)
+        if plan is None or plan[0] > now:
+            return
+        self._bucket -= 1
+        self._start_round(now, skip=plan[1])
 
     def _resolve_waiters(self, r, now, ok):
+        if not self._waiters:
+            return
+        # a round serves every confirm made before it started. One that failed fails only
+        # those no other round out can serve any more
+        newest = 0 if ok else max((x.tag for x in self._flying() if x is not r), default=0)
         keep = []
         done = []
         for w in self._waiters:
-            if r.t0 >= w[0]:
+            if r.tag > w[3] >= newest:
                 done.append(w)
             else:
                 keep.append(w)
@@ -1779,6 +1882,12 @@ class Node:
         for w in waiters:
             w[2](False)
 
+    def watch_clock(self):
+        """The look at the clock a tick or an answer takes, for a caller about to act on
+        what an earlier round said (the transport guard): a step seen here voids it."""
+        if not self.dead:
+            self._watch_clock(self.clock())
+
     def _watch_clock(self, now):
         # a step of the wall clock against the lease clock does not drop the lease (an NTP
         # step would cost a failover), it forces a fresh round before any step goes out
@@ -1788,8 +1897,10 @@ class Node:
             return
         if self.st['role'] == ROLE_LEADER and self.lease_mode():
             self._jump_at = now
+            # no round out from before the step serves anyone
             for w in self._waiters:
                 w[0] = max(w[0], now)
+                w[3] = self._tag
             self.next_round_at = now
             self._event('clock_jump', by=d - last)
 

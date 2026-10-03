@@ -1083,7 +1083,7 @@ def _by_pegaprox(m, world):
     m.ha_config['fence_agent_versions'] = {'pve1': 2}
     m._ha_get_node_ip = lambda node: '10.9.0.1'
     m._ssh_run_command = lambda host, user, cmd, *a, **kw: world.sh(cmd) == 0
-    m._ssh_run_command_with_password = lambda host, user, cmd, password: world.sh(cmd) == 0
+    m._ssh_run_command_with_password = lambda host, user, cmd, password, **kw: world.sh(cmd) == 0
     return m._ha_try_force_quorum('pve1')
 
 
@@ -2126,7 +2126,7 @@ def test_a_pvecm_that_fails_is_a_force_that_failed(node):
     (node.world.dir / 'refuses').write_text('')
     m = _forcing(fence_agent_versions={'pve1': 2})
     m._ssh_run_command = lambda host, user, cmd, *a, **kw: node.world.sh(cmd) == 0
-    m._ssh_run_command_with_password = lambda host, user, cmd, password: node.world.sh(cmd) == 0
+    m._ssh_run_command_with_password = lambda host, user, cmd, password, **kw: node.world.sh(cmd) == 0
 
     assert m._ha_try_force_quorum('pve1') is False
 

@@ -13,6 +13,7 @@ from pegaprox.globals import *
 from pegaprox.models.permissions import *
 from pegaprox.models.tasks import PegaProxConfig
 from pegaprox.core.db import get_db
+from pegaprox.core import ha
 
 from pegaprox.utils.auth import require_auth, load_users, build_authz_user
 from pegaprox.utils.audit import log_audit
@@ -2501,7 +2502,8 @@ def update_ha_config(cluster_id):
                 except Exception as e:
                     manager.logger.error(f"[HA] ✗ Agent installation failed: {e}")
             
-            threading.Thread(target=install_agents, daemon=True).start()
+            # user jobs over every node: each SSH step asks for the lease in an automatic group (#625)
+            threading.Thread(target=ha.as_job(install_agents, 'node agent install'), daemon=True).start()
     
     if 'storage_heartbeat_timeout' in data:
         manager.ha_config['storage_heartbeat_timeout'] = data['storage_heartbeat_timeout']
@@ -2552,7 +2554,7 @@ def update_ha_config(cluster_id):
         # one at top of file is enough. Local re-import made `threading` a local
         # for the whole function and broke the earlier ref in the storage-heartbeat
         # branch with UnboundLocalError before save_config could even run.
-        threading.Thread(target=_reinstall, daemon=True).start()
+        threading.Thread(target=ha.as_job(_reinstall, 'self-fence agents'), daemon=True).start()
 
     user = getattr(request, 'session', {}).get('user', 'system')
     log_audit(user, 'ha.config_updated', f"HA configuration updated for cluster {manager.config.name}", cluster=manager.config.name)
@@ -2686,7 +2688,7 @@ def install_self_fence_agent(cluster_id):
         except Exception as e:
             manager.logger.error(f"[HA] ✗ Self-fence installation failed: {e}")
     
-    threading.Thread(target=do_install, daemon=True).start()
+    threading.Thread(target=ha.as_job(do_install, 'self-fence agents'), daemon=True).start()
     
     user = getattr(request, 'session', {}).get('user', 'system')
     log_audit(user, 'ha.self_fence_install', f"Self-fence agent installation started for cluster {manager.config.name}", cluster=manager.config.name)
@@ -2731,7 +2733,7 @@ def uninstall_self_fence_agent(cluster_id):
         except Exception as e:
             manager.logger.error(f"[HA] ✗ Self-fence uninstallation failed: {e}")
     
-    threading.Thread(target=do_uninstall, daemon=True).start()
+    threading.Thread(target=ha.as_job(do_uninstall, 'self-fence agents'), daemon=True).start()
     
     user = getattr(request, 'session', {}).get('user', 'system')
     log_audit(user, 'ha.self_fence_uninstall', f"Self-fence agent uninstallation started for cluster {manager.config.name}", cluster=manager.config.name)
@@ -2787,6 +2789,86 @@ def check_ha_agents(cluster_id):
                                    if info and info['fence_agent']['version'] == report['expected_version']
                                    and not info['fence_agent']['current'])
     return jsonify(report)
+
+
+def _recovery_runs_asked():
+    """The run ids of an interrupted-recoveries body, None when it is not a list of them."""
+    data = request.get_json(silent=True)
+    runs = data.get('runs') if isinstance(data, dict) else None
+    if (not isinstance(runs, list) or not runs or len(runs) > ha.RECOVERY_KEEP
+            or not all(isinstance(r, str) and 0 < len(r) <= 64 for r in runs)):
+        return None
+    return list(dict.fromkeys(runs))
+
+
+@bp.route('/api/clusters/<cluster_id>/ha/interrupted-recoveries/start', methods=['POST'])
+@require_auth(perms=['ha.config'])
+def start_interrupted_recoveries(cluster_id):
+    """Start the guests that node recoveries an automatic leader left half done moved and
+    did not start (#625, design 5.6) - the one way on from there, nothing resumes them on
+    its own. Body {runs: [run id]}, the runs of interrupted_recoveries in the HA status.
+
+    A guest held on purpose (moved while its node was online) is not started: `held`
+    names it with the reason. A run is forgotten once each of its moved guests started
+    and nothing else is left in it; `unknown` are runs this cluster does not list."""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
+
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    manager = cluster_managers[cluster_id]
+    if not hasattr(manager, 'ha_start_moved_vms'):
+        return jsonify({'error': 'Node recoveries exist on Proxmox clusters only'}), 400
+    runs = _recovery_runs_asked()
+    if runs is None:
+        return jsonify({'error': 'runs must be a list of run ids'}), 400
+
+    asked = [r for r in manager.ha_interrupted_recoveries() if r['run'] in runs]
+    started = manager.ha_start_moved_vms(runs=[r['run'] for r in asked], listed=asked)
+    held = [{'vmid': v, 'run': r['run'], 'node': r['node'], 'note': r['held_note']}
+            for r in asked for v in r['held']]
+    ok_ids = sorted(v for v, went in started.items() if went)
+    failed = sorted(v for v, went in started.items() if not went)
+    user = getattr(request, 'session', {}).get('user', 'system')
+    name = manager.config.name
+    log_audit(user, 'ha.interrupted_recoveries_started',
+              f"Cluster {name}: moved guests of interrupted recoveries started: "
+              f"{', '.join(map(str, ok_ids)) or 'none'}; not started: {', '.join(map(str, failed)) or 'none'}; "
+              f"held: {', '.join(str(h['vmid']) for h in held) or 'none'}", cluster=name)
+    return jsonify({'started': ok_ids, 'failed': failed, 'held': held,
+                    'unknown': sorted(set(runs) - {r['run'] for r in asked})})
+
+
+@bp.route('/api/clusters/<cluster_id>/ha/interrupted-recoveries/dismiss', methods=['POST'])
+@require_auth(perms=['ha.config'])
+def dismiss_interrupted_recoveries(cluster_id):
+    """An admin dealt with what these interrupted recoveries left (#625, design 5.6): they
+    are not listed or said any more. Body {runs: [run id]}; runs of this cluster only,
+    nothing on the cluster changes."""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
+
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    runs = _recovery_runs_asked()
+    if runs is None:
+        return jsonify({'error': 'runs must be a list of run ids'}), 400
+
+    known = {r['run'] for r in ha.recovery_leftovers(cluster_id)}
+    gone = [r for r in runs if r in known]
+    ha.recovery_forget(gone)
+    if gone:
+        user = getattr(request, 'session', {}).get('user', 'system')
+        name = cluster_managers[cluster_id].config.name
+        log_audit(user, 'ha.interrupted_recoveries_dismissed',
+                  f"Cluster {name}: interrupted recoveries dismissed: {', '.join(gone)}", cluster=name)
+    return jsonify({'dismissed': gone, 'unknown': sorted(set(runs) - known)})
 
 
 @bp.route('/api/clusters/<cluster_id>/ha/claim', methods=['POST'])

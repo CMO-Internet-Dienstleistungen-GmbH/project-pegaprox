@@ -93,7 +93,9 @@ MK Sep 2026
 """
 import base64
 import collections
+import contextlib
 import errno
+import functools
 import gzip
 import hashlib
 import hmac
@@ -295,6 +297,8 @@ SYNC_TABLES = (
     'siem_targets', 'push_subscriptions', 'plugin_state', 'status_incidents',
     'custom_cloud_templates', 'power_rates', 'cost_rates', 'auto_install_profiles',
     'pegaprox_kv',
+    # node recoveries an automatic leader left half done (5.6); made on its first write
+    'ha_recovery_journal',
 )
 LOCAL_TABLES = (
     'sessions', 'audit_log', 'task_users', 'migration_history', 'metrics_history',
@@ -474,6 +478,12 @@ _reload_lock = threading.Lock()
 # lease time: see _process_started
 _nonce_lock = threading.Lock()
 _seen_nonces = {}
+# the signed calls of this release carry stream nonces instead (ha_wire.take_stream):
+# what this process took per (receiver, sender, share), and the streams it numbers its
+# own calls in, per receiver - one for the votes and renewals, one for every other call
+_seen_streams = {}
+_lease_stream = {'id': ha_wire.new_stream(), 'seq': {}}
+_call_stream = {'id': ha_wire.new_stream(), 'seq': {}}
 _PROCESS_STARTED = ha_vote.ha_clock()
 # what the last look at the group could not reach, for the pull of the same pass
 _last_watch = {'at': None, 'unreachable': frozenset()}
@@ -1855,8 +1865,22 @@ def _to_sign(method, path, body, ts, nonce, receiver, sender, digest=None):
     return ha_wire.to_sign(method, path, body, ts, nonce, receiver, sender, digest)
 
 
+def _stream_nonce(stream, receiver):
+    """The next nonce of `stream` (_lease_stream, _call_stream) towards `receiver`."""
+    with _nonce_lock:
+        seq = stream['seq'].get(receiver, 0) + 1
+        stream['seq'][receiver] = seq
+    return ha_wire.stream_nonce(stream['id'], seq)
+
+
 def _signed_headers(private, sender, receiver, method, path, body):
-    return ha_wire.signed_headers(private, sender, receiver, method, path, body, time.time())
+    # numbered, not random (_fresh_nonce): a vote or a renewal may come many times a
+    # second, and so may the writes a serving member forwards. Each has a stream of its
+    # own, and the receiver a share of its own for each: forwarded writes never use up
+    # what the renewals need
+    stream = _lease_stream if path in (VOTE_PATH, RENEW_PATH) else _call_stream
+    return ha_wire.signed_headers(private, sender, receiver, method, path, body, time.time(),
+                                  _stream_nonce(stream, receiver))
 
 
 class _Signer:
@@ -1866,6 +1890,10 @@ class _Signer:
     def __init__(self, instance_id, private=None, secret=None):
         self.instance_id, self.private, self.secret = instance_id, private, secret
         self.public_key = _public_of(private) if private is not None else ''
+
+
+# the last _Signer made, by (instance id, key, secret) it was made from
+_signer_made = {}
 
 
 def _signer():
@@ -1884,6 +1912,11 @@ def _signer():
         value, secret = st.get('signing_key'), st.get('member_secret') or None
         if not value and not secret:
             raise HaError('Not paired')
+        made = (st['instance_id'], value, secret)
+        held = _signer_made.get('signer')
+        if held is not None and held[0] == made:
+            # read again for every lease call: the key is parsed once
+            return held[1]
         private = None
         if value:
             try:
@@ -1891,7 +1924,10 @@ def _signer():
             except Exception as e:
                 if not secret:
                     raise HaError(f'The key pair in the HA state file cannot be read ({type(e).__name__})')
-        return _Signer(st['instance_id'], private, secret)
+        signer = _Signer(st['instance_id'], private, secret)
+        if private is not None or not value:
+            _signer_made['signer'] = (made, signer)
+        return signer
 
 
 def _auth_for(signer, receiver, legacy=False):
@@ -1917,16 +1953,25 @@ def forget_seen_nonces():
     """For tests: start the replay cache over."""
     with _nonce_lock:
         _seen_nonces.clear()
+        _seen_streams.clear()
 
 
 def _fresh_nonce(receiver, sender, nonce, ts, lease=False):
     """True the first time `nonce` comes from `sender` within the window. Only called
     once the signature is good, so nobody else can fill a member's share. The votes and
     renewals of automatic failover (`lease`) have a share of their own: a member that
-    forwards many writes must not use up what its renewals need, nor the other way."""
+    forwards many writes must not use up what its renewals need, nor the other way. This
+    release numbers every signed call (a stream nonce), so neither a confirm round before
+    every write nor a member forwarding writes fills a share. A random nonce, from a
+    member on a release before (a group updates one member at a time), goes to the
+    random share of its kind as before."""
     with _nonce_lock:
-        seen = _seen_nonces.setdefault((receiver, sender, 'lease') if lease else (receiver, sender), {})
-        said = ha_wire.take_nonce(seen, nonce, ts, time.time(), _NONCES_PER_SENDER)
+        if ha_wire.is_stream_nonce(nonce):
+            said = ha_wire.take_stream(_seen_streams.setdefault((receiver, sender, bool(lease)), {}),
+                                       nonce, ts, time.time())
+        else:
+            seen = _seen_nonces.setdefault((receiver, sender, 'lease') if lease else (receiver, sender), {})
+            said = ha_wire.take_nonce(seen, nonce, ts, time.time(), _NONCES_PER_SENDER)
     if said == 'full':
         logging.warning(f"[HA] member {sender} sent more signed calls than the replay "
                         "cache holds - refusing until they age out")
@@ -4168,16 +4213,34 @@ def _one_cv(value):
     return got[0] if got else None
 
 
+def _last_cv(st):
+    """The newest entry of the history held, None before there is one. Asked with every
+    lease call: a history is checked once (a write puts a new list in, none is changed
+    in place)."""
+    rec = _cv_record(st)
+    hist = rec.get('hist') if rec else None
+    seen = _hist_checked[0]
+    if seen is not None and seen[0] is hist:
+        return seen[1]
+    clean = _clean_hist(hist) if hist is not None else None
+    last = tuple(clean[-1]) if clean else None
+    _hist_checked[0] = (hist, last)
+    return last
+
+
+_hist_checked = [None]
+
+
 def config_version(st=None):
     """(epoch, seq) of the configuration this instance holds, CV_ZERO before it has one."""
-    hist = _hist_of(_cv_record(st or _load()))
-    return (hist[-1][0], hist[-1][1]) if hist else CV_ZERO
+    last = _last_cv(st or _load())
+    return (last[0], last[1]) if last else CV_ZERO
 
 
 def cv_entry(st=None):
     """[epoch, seq, segment id, leader id] of the configuration here, None before it has one."""
-    hist = _hist_of(_cv_record(st or _load()))
-    return list(hist[-1]) if hist else None
+    last = _last_cv(st or _load())
+    return list(last) if last else None
 
 
 def held_cv(value):
@@ -5596,13 +5659,288 @@ def _kept_session(base_url, fingerprint):
         if held:
             gone.append(held[1])
         sess = _new_session(fingerprint)
+        _lean_session(sess, key, fingerprint)
         _kept_sessions[key] = (fingerprint, sess)
         # a member that moved leaves its old address behind
         while len(_kept_sessions) > _MAX_KEPT_SESSIONS:
             gone.append(_kept_sessions.pop(next(iter(_kept_sessions)))[1])
     for old in gone:
-        old.close()
+        _close_kept(old)
     return sess
+
+
+# MK Oct 2026 (#625) - an automatic leader renews before every write, so a lease call has
+# to be cheap. Through requests one cost this kind of host about 1.4 ms of CPU (the
+# environment read for proxies and a CA bundle, settings, cookies and hooks merged, every
+# header checked, the answer's headers parsed by the email module), more than the round
+# trip on a LAN. A kept session therefore carries a link of its own (_LeaseLink):
+# kept-alive TLS connections, pinned to the member's fingerprint as the session's adapter
+# pins them or checked against the CA bundle requests would use, one write per call and
+# a small parser for the answer. The environment is read once, when the session is made;
+# where a proxy applies, or the pin is not a SHA-256 one, the calls take the session as
+# before. The link keeps as many connections as a member can have calls out from the
+# confirm rounds, so none of them waits for a TLS handshake.
+_KEPT_POOL = ha_vote.CONFIRM_PER_VOTER + 4
+_KEPT_ANSWER_MAX = 4 * 1024 * 1024
+_KEPT_HEAD_MAX = 64 * 1024
+_PIN_HEX_RE = re.compile(r'[0-9a-f]{64}')
+_STATUS_RE = re.compile(r'[1-5][0-9]{2}')
+_LENGTH_RE = re.compile(r'[0-9]{1,9}')
+_CHUNK_RE = re.compile(rb'[0-9a-fA-F]{1,8}')
+_HEAD_BREAK_RE = re.compile(r'[\r\n\x00]')
+
+
+class _KeptAnswer:
+    """What _peer_call hands back for a call that went over a link: the part of a
+    requests.Response its callers read."""
+
+    def __init__(self, status, content, headers):
+        self.status_code, self.content, self.headers = status, content, headers
+
+    def json(self):
+        return json.loads(self.content)
+
+
+class _AnswerHeaders(dict):
+    """The headers of an answer over a link, by lower-case name; get() takes any case."""
+
+    def get(self, name, default=None):
+        return dict.get(self, name.lower(), default)
+
+
+class _LeaseLink:
+    """Kept-alive TLS connections to one member, for the calls of its kept session."""
+
+    def __init__(self, url, ctx, pin):
+        from urllib.parse import urlsplit
+        parts = urlsplit(url)
+        self.host, self.port, self.netloc = parts.hostname, parts.port or 443, parts.netloc
+        self.prefix = parts.path.rstrip('/')
+        self.ctx, self.pin = ctx, pin
+        self.idle = []
+        self.lock = threading.Lock()
+        self.closed = False
+
+    def _connect(self, timeout):
+        import socket
+        import ssl
+        raw = socket.create_connection((self.host, self.port), timeout=timeout)
+        try:
+            raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock = self.ctx.wrap_socket(raw, server_hostname=self.host)
+        except Exception:
+            raw.close()
+            raise
+        if self.pin and not hmac.compare_digest(
+                hashlib.sha256(sock.getpeercert(binary_form=True) or b'').hexdigest(), self.pin):
+            sock.close()
+            raise ssl.SSLError('the certificate does not match the pinned fingerprint')
+        return sock
+
+    def _take(self):
+        import select
+        while True:
+            with self.lock:
+                if not self.idle:
+                    return None
+                sock = self.idle.pop()
+            try:
+                # one the member closed while it sat here reads as readable (EOF)
+                stale = bool(select.select([sock], [], [], 0)[0])
+            except (OSError, ValueError):
+                stale = True
+            if not stale:
+                return sock
+            sock.close()
+
+    def _give(self, sock):
+        with self.lock:
+            if not self.closed and len(self.idle) < _KEPT_POOL:
+                self.idle.append(sock)
+                return
+        sock.close()
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+            idle, self.idle = self.idle, []
+        for sock in idle:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def post(self, method, target, body, headers, timeout):
+        """(status, headers, body) of one call. Raises PeerUnreachable while the call is
+        not out yet, PeerNoAnswer once it is."""
+        import ssl
+        lines = [f'{method} {target} HTTP/1.1', f'Host: {self.netloc}', f'Content-Length: {len(body)}']
+        lines += [f'{k}: {v}' for k, v in headers.items()]
+        if _HEAD_BREAK_RE.search(''.join(lines)):
+            raise HaError('A peer call header carries a line break')
+        data = ('\r\n'.join(lines) + '\r\n\r\n').encode('latin-1') + body
+        deadline = time.monotonic() + timeout
+        sock, sent = self._take(), False
+        try:
+            if sock is None:
+                sock = self._connect(timeout)
+            sock.settimeout(max(0.001, deadline - time.monotonic()))
+            sock.sendall(data)
+            sent = True
+            status, hdrs, content, keep = self._answer(sock, deadline)
+        except Exception as e:
+            if sock is not None:
+                sock.close()
+            if sent:
+                raise PeerNoAnswer(f'The peer took the call but sent no answer: {type(e).__name__}')
+            if isinstance(e, ssl.SSLError):
+                raise PeerUnreachable(
+                    f'The peer certificate does not match the pinned fingerprint ({type(e).__name__})'
+                    if self.pin else 'The peer certificate is not trusted by a CA, and no fingerprint '
+                    f'is pinned for it ({type(e).__name__})')
+            raise PeerUnreachable(f'Cannot reach the peer: {type(e).__name__}')
+        if keep:
+            self._give(sock)
+        else:
+            sock.close()
+        return status, hdrs, content
+
+    @staticmethod
+    def _recv(sock, deadline, eof_ok=False):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError('no answer in time')
+        sock.settimeout(left)
+        chunk = sock.recv(65536)
+        if not chunk and not eof_ok:
+            raise ConnectionError('closed before the answer was complete')
+        return chunk
+
+    def _answer(self, sock, deadline):
+        buf = b''
+        while b'\r\n\r\n' not in buf:
+            if len(buf) > _KEPT_HEAD_MAX:
+                raise ValueError('answer head too long')
+            buf += self._recv(sock, deadline)
+        top, _, rest = buf.partition(b'\r\n\r\n')
+        lines = top.decode('latin-1').split('\r\n')
+        parts = lines[0].split(' ', 2)
+        if len(parts) < 2 or parts[0] not in ('HTTP/1.1', 'HTTP/1.0') or not _STATUS_RE.fullmatch(parts[1]):
+            raise ValueError('not an HTTP answer')
+        status = int(parts[1])
+        if status < 200:
+            # this link sends no Expect, so an honest member never answers with an interim
+            # head; the final one would be left on the socket for the next call to read
+            raise ValueError('interim answer')
+        hdrs = _AnswerHeaders()
+        for line in lines[1:]:
+            k, sep, v = line.partition(':')
+            if not sep:
+                raise ValueError('broken header line')
+            hdrs[k.strip().lower()] = v.strip()
+        keep = parts[0] == 'HTTP/1.1' and hdrs.get('connection', '').lower() != 'close'
+        coding = hdrs.get('transfer-encoding', '').lower()
+        if status in (204, 304):
+            content = b''
+        elif coding:
+            if coding != 'chunked':
+                raise ValueError('unknown transfer encoding')
+            content, rest = self._chunks(sock, rest, deadline)
+        elif 'content-length' in hdrs:
+            if not _LENGTH_RE.fullmatch(hdrs['content-length']):
+                raise ValueError('broken content length')
+            n = int(hdrs['content-length'])
+            if n > _KEPT_ANSWER_MAX:
+                raise ValueError('answer too large')
+            while len(rest) < n:
+                rest += self._recv(sock, deadline)
+            content, rest = rest[:n], rest[n:]
+        else:
+            # no length: the answer ends where the member closes
+            keep = False
+            while True:
+                chunk = self._recv(sock, deadline, eof_ok=True)
+                if not chunk:
+                    break
+                rest += chunk
+                if len(rest) > _KEPT_ANSWER_MAX:
+                    raise ValueError('answer too large')
+            content, rest = rest, b''
+        # bytes after the answer: whatever comes next on this connection cannot be matched
+        return status, hdrs, content, keep and not rest
+
+    def _chunks(self, sock, rest, deadline):
+        out = bytearray()
+        while True:
+            while b'\r\n' not in rest:
+                if len(rest) > _KEPT_HEAD_MAX:
+                    raise ValueError('chunk head too long')
+                rest += self._recv(sock, deadline)
+            line, _, rest = rest.partition(b'\r\n')
+            size_text = line.split(b';')[0].strip()
+            if not _CHUNK_RE.fullmatch(size_text):
+                raise ValueError('broken chunk size')
+            size = int(size_text, 16)
+            if size == 0:
+                while True:
+                    while b'\r\n' not in rest:
+                        if len(rest) > _KEPT_HEAD_MAX:
+                            raise ValueError('trailer too long')
+                        rest += self._recv(sock, deadline)
+                    line, _, rest = rest.partition(b'\r\n')
+                    if not line:
+                        return bytes(out), rest
+            if len(out) + size > _KEPT_ANSWER_MAX:
+                raise ValueError('answer too large')
+            while len(rest) < size + 2:
+                rest += self._recv(sock, deadline)
+            if rest[size:size + 2] != b'\r\n':
+                raise ValueError('broken chunk')
+            out += rest[:size]
+            rest = rest[size + 2:]
+
+
+def _lean_session(sess, url, fingerprint):
+    """Give a kept session its link (_LeaseLink), where it can have one."""
+    import requests
+    import ssl
+    if not isinstance(sess, requests.Session):
+        return
+    pin = (fingerprint or '').replace(':', '').lower()
+    if pin and not _PIN_HEX_RE.fullmatch(pin):
+        return
+    env = sess.merge_environment_settings(url, {}, None, not pin, None)
+    if env.get('proxies'):
+        return
+    if pin:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    else:
+        verify = env.get('verify')
+        if not isinstance(verify, str):
+            from requests.utils import DEFAULT_CA_BUNDLE_PATH
+            verify = DEFAULT_CA_BUNDLE_PATH
+        ctx = (ssl.create_default_context(capath=verify) if os.path.isdir(verify)
+               else ssl.create_default_context(cafile=verify))
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    sess.pegaprox_lean = _LeaseLink(url, ctx, pin)
+
+
+def _kept_send(sess, method, path, body, headers, timeout):
+    """The call over the kept session's link, None where it takes the session."""
+    link = getattr(sess, 'pegaprox_lean', None)
+    if link is None:
+        return None
+    status, hdrs, content = link.post(method, link.prefix + path, body or b'', headers, timeout)
+    return _KeptAnswer(status, content, hdrs)
+
+
+def _close_kept(sess):
+    link = getattr(sess, 'pegaprox_lean', None)
+    if link is not None:
+        link.close()
+    sess.close()
 
 
 def drop_kept_session(base_url, sess=None):
@@ -5612,7 +5950,36 @@ def drop_kept_session(base_url, sess=None):
         if not held or (sess is not None and held[1] is not sess):
             return
         del _kept_sessions[base_url.rstrip('/')]
-    held[1].close()
+    _close_kept(held[1])
+
+
+# the address check of the kept calls, by url: (ok, why, lease time of the check). A name
+# is looked up by the check, and a lease call comes before every write of the leader; a
+# connection that is up stays with the address it was opened to whatever the check says
+_PEER_URL_RECHECK = 30
+_peer_urls = {}
+
+
+def _peer_url_ok(url, kept):
+    from pegaprox.utils.url_security import is_safe_outbound_url
+    now = ha_clock()
+    held = _peer_urls.get(url) if kept else None
+    if held is not None and 0 <= now - held[2] < _PEER_URL_RECHECK:
+        return held[:2]
+    ok, why = is_safe_outbound_url(url, allowed_schemes=('https',), allow_private=True)
+    if kept:
+        if len(_peer_urls) > 64:
+            _peer_urls.clear()
+        _peer_urls[url] = (ok, why, now)
+    return ok, why
+
+
+def _quiet_insecure_warning():
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:
+        pass
 
 
 def _peer_call(method, base_url, fingerprint, path, json_body=None, auth=None,
@@ -5622,9 +5989,8 @@ def _peer_call(method, base_url, fingerprint, path, json_body=None, auth=None,
     bytes sent here. `keep_alive` sends it on the member's kept session (F9) instead
     of one of its own."""
     import requests
-    from pegaprox.utils.url_security import is_safe_outbound_url
     url = base_url.rstrip('/') + path
-    ok, why = is_safe_outbound_url(url, allowed_schemes=('https',), allow_private=True)
+    ok, why = _peer_url_ok(url, keep_alive)
     if not ok:
         raise HaError(f'The peer address is not allowed: {why}')
     body = _wire_body(json_body)
@@ -5637,12 +6003,11 @@ def _peer_call(method, base_url, fingerprint, path, json_body=None, auth=None,
         h.update(headers)
     sess = _kept_session(base_url, fingerprint) if keep_alive else _new_session(fingerprint)
     verify = not fingerprint
-    answered = False
-    try:
-        import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    except Exception:
-        pass
+    # answered: the session gave an answer back. unreached: the call never got out, and
+    # nothing of it is left in the session (the link closed the socket that failed, the
+    # pool dropped a connection that did not come up): the kept session stays, so a
+    # member that refuses or drops connections costs no new session per call
+    answered = unreached = False
     data = body or None
     if body and path == FORWARD_PATH:
         # The envelope of an upload is larger than what the receiving app takes with a
@@ -5650,11 +6015,22 @@ def _peer_call(method, base_url, fingerprint, path, json_body=None, auth=None,
         # Sent in chunks, it meets the cap the forward route sets for itself instead.
         data = (body[i:i + _FORWARD_CHUNK] for i in range(0, len(body), _FORWARD_CHUNK))
     try:
-        resp = sess.request(method, url, data=data, headers=h, verify=verify,
-                            timeout=timeout, allow_redirects=False)
+        # a kept session sends over its link where it has one (_lean_session)
+        resp = _kept_send(sess, method, path, body, h, timeout) if keep_alive and data is body \
+            and body else None
+        if resp is None:
+            _quiet_insecure_warning()
+            resp = sess.request(method, url, data=data, headers=h, verify=verify,
+                                timeout=timeout, allow_redirects=False)
         answered = True
         return resp
+    except PeerUnreachable as e:
+        # from the link (_LeaseLink.post), which closed the socket that failed. One it
+        # took and did not answer (PeerNoAnswer) drops the session below
+        unreached = not isinstance(e, PeerNoAnswer)
+        raise
     except requests.exceptions.SSLError as e:
+        unreached = True
         if fingerprint:
             raise PeerUnreachable(f'The peer certificate does not match the pinned fingerprint ({type(e).__name__})')
         raise PeerUnreachable('The peer certificate is not trusted by a CA, and no fingerprint is '
@@ -5668,14 +6044,17 @@ def _peer_call(method, base_url, fingerprint, path, json_body=None, auth=None,
         if (not isinstance(e, requests.exceptions.ConnectTimeout) and e.args
                 and isinstance(e.args[0], ProtocolError)):
             raise PeerNoAnswer(f'The peer took the call but sent no answer: {type(e).__name__}')
+        unreached = True
         raise PeerUnreachable(f'Cannot reach the peer: {type(e).__name__}')
     except requests.exceptions.RequestException as e:
+        unreached = True
         raise PeerUnreachable(f'Cannot reach the peer: {type(e).__name__}')
     finally:
         if not keep_alive:
             sess.close()
-        elif not answered:
-            # whatever broke may still sit in its pool: the next call starts afresh
+        elif not answered and not unreached:
+            # a call that got out and broke may leave what broke in the pool: the next
+            # call starts afresh
             drop_kept_session(base_url, sess)
 
 
@@ -6744,11 +7123,19 @@ def _lease(st):
     if not isinstance(rec, dict):
         return None
     cfg = rec.get('cfg')
-    if (not isinstance(cfg, dict) or ha_vote.pair(cfg.get('id')) is None
-            or ha_vote.body_error(cfg.get('body'))
-            or not isinstance(rec.get('cfg_chain') or [], list)):
-        return None
-    return rec
+    # asked on every lease call: the check of the very same block is kept (a write
+    # puts new objects in, nothing changes a block in place)
+    seen = _lease_checked[0]
+    if seen is not None and seen[0] is rec and seen[1] is cfg and seen[2] is rec.get('cfg_chain'):
+        return seen[3]
+    ok = not (not isinstance(cfg, dict) or ha_vote.pair(cfg.get('id')) is None
+              or ha_vote.body_error(cfg.get('body'))
+              or not isinstance(rec.get('cfg_chain') or [], list))
+    _lease_checked[0] = (rec, cfg, rec.get('cfg_chain'), rec if ok else None)
+    return rec if ok else None
+
+
+_lease_checked = [None]
 
 
 def mode(st=None):
@@ -7105,6 +7492,14 @@ def schedule_now():
     return datetime.now(_zone(name)).replace(tzinfo=None)
 
 
+def schedule_at(ts):
+    """schedule_now() as it read at the wall time `ts` (seconds since the epoch)."""
+    name = group_timezone()
+    if not name:
+        return datetime.fromtimestamp(ts)
+    return datetime.fromtimestamp(ts, _zone(name)).replace(tzinfo=None)
+
+
 def _rezoned(stamp, old, new):
     """The wall time `stamp` (without a zone, as the schedules write it) of the zone
     `old`, as the same moment reads in `new`; None is the zone this process runs in.
@@ -7276,15 +7671,22 @@ class _LeaseRuntime:
         self.lock = threading.RLock()
         self.node = None
         self.gen = 0                    # counts the nodes built; an answer to an older one is dropped
+        self.jumps = 0                  # clock jumps the loop saw: a token from before one is void
         self.stale = False              # role, epoch or lease state moved past the node
         self.saving = False             # the node itself is writing the state
         self.outbox = collections.deque()
         self.events = collections.deque()
         self.wake = threading.Event()
+        # lease time of the loop's next pass while it waits for it (None while a pass
+        # runs), and when the node wants its next tick, said by whoever just called it:
+        # the loop is woken only for a tick earlier than the one it waits for
+        self.wake_at = None
+        self.due = None
         self.halt = threading.Event()
         self.stop = False
         self.loop = False               # the lease loop runs
         self.acting = False             # this process leads and a majority renewed its lease
+        self.came_up = False            # it leads since its start (the boot check), not by the switch
         self.boot_check = False         # lease_boot runs: nothing has started for a role yet
         self.armed = False              # the watchdog counts from the loop's first majority round
         self.exit_at = None             # lease time at which the way out was asked for
@@ -7422,9 +7824,16 @@ class _LeaseHooks:
             if rt.loop:
                 rt.armed = True
             return
+        if name == 'clock_jump':
+            # a token from before the step of the clock is void (design 4.2): the next
+            # call waits for a round that started after it
+            rt.jumps += 1
         if name == 'booted' or (name == 'elected' and info.get('why') == 'switch'):
             # at once: acting_process() goes by it
             rt.acting = True
+            # a leader that came up by a start has a gap behind it (5.7), one that took
+            # the lead by the switch has none
+            rt.came_up = name == 'booted'
         elif name in ('boot_standby', 'step_down', 'manual'):
             # no lease is in force here any more, so the watchdog has none to watch: the
             # last lease_until of a leader that went back to manual mode stays where it
@@ -7635,19 +8044,46 @@ def _lease_dispatch(rt):
         except IndexError:
             return
         try:
-            _in_background(lambda item=item: _lease_deliver(rt, item), 'ha-lease-call')
+            _lease_call_spawn(lambda item=item: _lease_deliver(rt, item))
         except Exception as e:
             logging.warning(f"[HA] could not send a lease call: {e}")
+
+
+def _lease_call_spawn(fn):
+    """Run one lease call in the background. Under gevent a greenlet of its own: a
+    threading.Thread costs about as much to start as the call takes to sign (MK Oct 2026,
+    #625: a confirm round before every write)."""
+    if _threads_are_greenlets():
+        from gevent import spawn
+        spawn(fn)
+    else:
+        _in_background(fn, 'ha-lease-call')
+
+
+def _threads_are_greenlets():
+    if _gevent_threads[0] is None:
+        try:
+            from gevent import monkey
+            _gevent_threads[0] = bool(monkey.is_module_patched('threading'))
+        except ImportError:
+            _gevent_threads[0] = False
+    return _gevent_threads[0]
+
+
+_gevent_threads = [None]
 
 
 def _lease_after(rt, wake=True):
     """After every call into the node, outside its lock: say what it reported, take the
     way out it asked for, send what it wants sent, and let the loop work out its next
     pass."""
+    due, rt.due = rt.due, None
     _lease_events(rt)
     _lease_dispatch(rt)
     if wake:
-        rt.wake.set()
+        at = rt.wake_at
+        if due is None or at is None or due < at:
+            rt.wake.set()
 
 
 def _lease_target(member_id):
@@ -7710,6 +8146,7 @@ def _lease_answer(rt, item, ans):
             # renewal it acks needs no write, the vote at the next failover does
             seen['write_failed'] = ans['write_failed'] is True
         node.on_answer(to, tag, ans)
+        rt.due = node.next_wake()
 
 
 def _lease_deliver(rt, item):
@@ -7900,6 +8337,7 @@ def lease_request(sender, kind, body):
                     ans = node.on_request(sender, kind, body)
             took = (kind == 'renew' and ans.get('ok') is True
                     and node.view.mode == ha_vote.MODE_AUTO)
+            rt.due = node.next_wake()
     if took:
         _lease_heard(sender, body)
     elif kind == 'renew' and body.get('switch') is not True:
@@ -7957,7 +8395,9 @@ def _lease_loop(rt):
             logging.error(f"[HA] lease loop: {e}")
         wait = LEASE_IDLE if wait is None else min(max(wait, 0.005), LEASE_IDLE)
         asked = time.monotonic()
+        rt.wake_at = ha_clock() + wait
         woken = rt.wake.wait(wait)
+        rt.wake_at = None
         rt.wake.clear()
         if not woken:
             # how late the hub let this greenlet run: a stall as long as the lease
@@ -8043,6 +8483,7 @@ def _lease_pump(rt, done, deadline):
                                LEASE_CALL_TIMEOUT + 1)
             for item, (ans, err) in zip(calls, results):
                 _lease_answer(rt, item, ans if err is None else None)
+            rt.due = None
         _lease_events(rt)
         if done() or time.monotonic() >= deadline:
             return
@@ -8945,26 +9386,40 @@ def _lease_wait(done, seconds):
 def confirm_lease(need=ha_vote.Timings().need):
     """True once a majority renewed this leader's lease in a round that started after
     this call, with at least `need` seconds of it left. In manual mode and on an
-    instance of its own it is the role, at once. Rounds are shared: at most one every
-    100 ms, for every caller that waits."""
+    instance of its own it is the role, at once. A caller that no round out can serve
+    starts one at once; past ha_vote.CONFIRM_IN_FLIGHT rounds out, callers share the
+    next one (ha_vote.Node.confirm). A write costs about one round trip to the fastest
+    majority.
+
+    A yes leaves a token in this thread (or greenlet) for the transport guard: one call
+    goes out on it while `need` seconds of that lease are left, the next one asks for a
+    round of its own (guard). A no leaves none: this thread is in no confirmed step any
+    more. In manual mode there is none, the guard asks for none there."""
     st = _load()
     if not _lease_mode(st):
         return st['role'] != ROLE_STANDBY
     rt = _rt()
     done, said = threading.Event(), []
-
-    def answer(ok):
-        said.append(bool(ok))
-        done.set()
     with rt.lock:
         node = _lease_node(rt)
         if node is None:
+            _guard_tls.token = None
             return False
+        gen = rt.gen
+
+        def answer(ok):
+            # where the lease and the clock checks stand as the round comes back is what
+            # the token goes by
+            said.append((bool(ok), node.lease_until, rt.jumps))
+            done.set()
         node.confirm(need, answer)
         limit = node.t.confirm_timeout + node.t.renew_timeout + 1
+        rt.due = node.next_wake()
     _lease_after(rt)
     _lease_wait(done, limit)
-    return bool(said and said[0])
+    ok = bool(said and said[0][0])
+    _guard_tls.token = _Token(rt.instance, gen, said[0][2], said[0][1], float(need)) if ok else None
+    return ok
 
 
 def no_lease():
@@ -9484,3 +9939,587 @@ def check_not_a_witness_dir(path=None):
     if os.path.exists(os.path.join(folder, ha_wire.WITNESS_STATE_NAME)):
         raise HaError(f'{folder} is the state directory of a PegaProx witness - run PegaProx on a '
                       'config directory of its own')
+
+
+# --- the transport guard (design 5.3) ------------------------------------------------
+#
+# MK Oct 2026 (#625) - the gates above decide whether a loop starts a step. What the
+# step sends to a cluster, a node or a BMC leaves this process through a short list of
+# exits (ha_transport.py; the whole list is in tests/test_ha_exits.py), and each of
+# them asks guard() right before the call goes out.
+#
+# Anywhere but in an automatic group guard() returns at once and nothing is asked that
+# was not asked before. In an automatic group a call that changes something goes out
+# only from the lease holder while it may act, and only after a majority renewed the
+# lease in a round that started after the call was asked for: a local clock cannot see
+# a pause that held it, the voters can. confirm_lease() leaves a token for one call in
+# the thread or greenlet that asked; the step's first call goes out on it, every further
+# call (the next guest a recovery stops, the next command of a user job, the next write
+# of a request) asks for a round of its own, shared with whoever waits for one at the
+# time. A call that is sent once more, or whose connection came up late, is checked
+# again on its token. A background thread that never confirmed is refused: a step
+# without its confirm is a bug, not a call to make. Reads pass everywhere, so do the
+# console proxies, the logins and, in a GET, the SSH commands that read for it.
+
+NEED_SAME_GOAL = 0.0                     # stopping the failed node and its guests (5.4)
+NEED_STEP = ha_vote.Timings().need       # every other step that changes a cluster
+
+GUARD_NO_LEASE = 'this instance does not hold the lease of its group'
+GUARD_NO_TOKEN = 'no step in this thread confirmed the lease first'
+GUARD_RAN_OUT = 'the lease confirmed for this step ran out'
+GUARD_UNCONFIRMED = 'no majority confirmed the lease for this call'
+
+
+class GuardRefused(NoLease):
+    """A call that would change something outside this process, refused at its exit in
+    an automatic group. Says which call and why."""
+
+    def __init__(self, action, why):
+        super().__init__(f'{action} refused: {why}')
+        self.action, self.why = action, why
+
+
+class _Token:
+    """What a confirmed round leaves in the thread that asked: whose node and which build
+    of it, how many clock jumps its loop had seen, where the lease stood as the round came
+    back, the need of the step, and whether a call went out on it already."""
+
+    __slots__ = ('instance', 'gen', 'jumps', 'until', 'need', 'used')
+
+    def __init__(self, instance, gen, jumps, until, need):
+        self.instance, self.gen, self.jumps = instance, gen, jumps
+        self.until, self.need, self.used = until, need, False
+
+
+# per thread, a greenlet under gevent: token (a _Token), reading (depth of reading()
+# blocks), job (what as_job runs) and request (the method of the request a fan-out
+# started from)
+_guard_tls = threading.local()
+_guard_said = set()
+_READ_METHODS = frozenset(('GET', 'HEAD'))
+
+
+def guard_on():
+    """Whether the exits ask anything here at all: only while the lease is in force."""
+    return _lease_mode(_load())
+
+
+def _request_method():
+    """The method of the request to this instance that this thread serves, '' when none."""
+    said = getattr(_guard_tls, 'request', '')
+    if said:
+        return said
+    try:
+        from flask import has_request_context, request
+        return request.method if has_request_context() else ''
+    except Exception:
+        return ''
+
+
+def _in_request():
+    return bool(_request_method())
+
+
+def _token_fits(st, tok, need=None):
+    """`tok` is from the node of this instance as it runs now, no clock jump came since,
+    and it leaves the need of the step that asked for it, or `need` where the exit asks
+    for more."""
+    rt = _rts.get(st['instance_id'])
+    return (tok is not None and rt is not None and tok.instance == st['instance_id']
+            and tok.gen == rt.gen and tok.jumps == rt.jumps
+            and ha_clock() <= tok.until - max(tok.need, need or 0.0))
+
+
+def _clock_look(rt):
+    """The node's look at the clock, under its lock, as a tick takes it (ha_vote
+    Node.watch_clock). A step it finds counts in rt.jumps at once; the loop is woken for
+    the round the step asks for."""
+    jumps = rt.jumps
+    with rt.lock:
+        node = rt.node
+        if node is not None:
+            node.watch_clock()
+    if rt.jumps != jumps:
+        _lease_after(rt)
+
+
+def _guard_refuse(action, why):
+    if (action, why) not in _guard_said:
+        # each exit once: a loop that keeps trying must not fill the log
+        if len(_guard_said) > 512:
+            _guard_said.clear()
+        _guard_said.add((action, why))
+        logging.error(f"[HA] {action} refused at the transport: {why}")
+    raise GuardRefused(action, why)
+
+
+def guard(action, kind=None, need=None, again=False):
+    """Right before a call that changes something leaves for a cluster, a node or a BMC.
+    `action` names it (method and path, or the command). kind 'console' and 'login'
+    pass in every role, 'cheap' needs the lease and no round (a spare PVE API token does
+    no harm), 'ssh' passes in a GET as a read. `need` is lease time the call itself
+    wants left, on top of what the step that confirmed asked for (5.4). `again` for the
+    same call once more (a new login, a fallback, the connection now up): the token it
+    went out on is checked, no new round while that still fits. Raises GuardRefused in
+    an automatic group, never anywhere else."""
+    st = _load()
+    if not _lease_mode(st) or kind in ('console', 'login') or getattr(_guard_tls, 'reading', 0):
+        return
+    if kind == 'ssh' and _request_method() in _READ_METHODS:
+        # a GET answered here, on the leader or a member that serves users: the command
+        # is how the read gets to the node, and an SSH command cannot say so itself
+        return
+    node = _lease_live(st)
+    if node is None or not node.is_active():
+        _guard_refuse(action, GUARD_NO_LEASE)
+    if kind == 'cheap':
+        return
+    tok = getattr(_guard_tls, 'token', None)
+    rt = _rts.get(st['instance_id'])
+    if tok is not None and rt is not None:
+        # the node sees a step of its clock only when it looks: a pause that held the
+        # lease clock moved the wall clock alone, and the token from before it is void
+        # (rt.jumps) once the node looked
+        _clock_look(rt)
+    if _token_fits(st, tok, need) and (again or not tok.used):
+        tok.used = True
+        return
+    # a round of its own, where this thread may ask for one: in a step that confirmed
+    # (each further command of it), in a user job, in a request to this instance
+    step = tok is not None and rt is not None and tok.instance == st['instance_id'] and tok.gen == rt.gen
+    asks = bool(getattr(_guard_tls, 'job', None)) or _in_request()
+    if step or asks:
+        want = max(need or 0.0, tok.need if step else 0.0, NEED_STEP if asks else 0.0)
+        if confirm_lease(want):
+            fresh = getattr(_guard_tls, 'token', None)
+            if _token_fits(st, fresh, need):
+                fresh.used = True
+                return
+        _guard_refuse(action, GUARD_UNCONFIRMED)
+    _guard_refuse(action, GUARD_RAN_OUT if tok is not None else GUARD_NO_TOKEN)
+
+
+@contextlib.contextmanager
+def reading():
+    """Around calls that change nothing but leave through an exit that cannot tell a read
+    from a write (an SSH command, POST /nodes/<n>/execute): the guard lets them pass in
+    this thread. Keep it tight, a write inside it goes out unasked."""
+    _guard_tls.reading = getattr(_guard_tls, 'reading', 0) + 1
+    try:
+        yield
+    finally:
+        _guard_tls.reading -= 1
+
+
+_CARRIED = (('request', ''), ('token', None), ('reading', 0), ('job', None))
+
+
+def carry(fn):
+    """fn as it runs in another thread or greenlet, with what this one may send: its
+    token, its reads, the request it serves and the job it runs. A fan-out carries it,
+    or the calls of a confirmed step it spreads out go out unconfirmed and are refused.
+    Once fn is done the worker has what it had before, so nothing fn confirmed serves
+    its next task. fn itself where the lease is not in force."""
+    if not guard_on():
+        return fn
+    ctx = [_request_method()] + [getattr(_guard_tls, k, d) for k, d in _CARRIED[1:]]
+
+    @functools.wraps(fn)
+    def run(*args, **kwargs):
+        saved = [getattr(_guard_tls, k, d) for k, d in _CARRIED]
+        for (k, _d), v in zip(_CARRIED, ctx):
+            setattr(_guard_tls, k, v)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            for (k, _d), v in zip(_CARRIED, saved):
+                setattr(_guard_tls, k, v)
+    return run
+
+
+def as_job(fn, what):
+    """A user job that runs on in a thread of its own after the request that started it
+    returned (an evacuation, a node update, a migration, a deploy). In an automatic group
+    each call it sends asks for a round of its own at the exit, as a step of an automation
+    confirms before it starts. fn itself where the lease is not in force (a job started
+    before a switch to automatic failover carries no mark, and its writes after the
+    switch are refused at the exit)."""
+    if not guard_on():
+        return fn
+
+    @functools.wraps(fn)
+    def run(*args, **kwargs):
+        saved = (getattr(_guard_tls, 'job', None), getattr(_guard_tls, 'token', None))
+        _guard_tls.job, _guard_tls.token = what, None
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            # what the job confirmed is gone with it: the thread may run something else next
+            _guard_tls.job, _guard_tls.token = saved
+    return run
+
+
+def confirm_step(what, need=NEED_STEP):
+    """confirm_lease() before a step of an automation that cannot be taken back (5.2),
+    and a log line when the answer is no: a leader that lost its lease starts no new
+    step. In manual mode and on an instance of its own it is the role, at once."""
+    if confirm_lease(need):
+        return True
+    if guard_on():
+        logging.warning(f"[HA] {what}: not started - the lease of this instance could not be confirmed")
+    return False
+
+
+# --- interrupted recoveries (design 5.6) ---------------------------------------------
+#
+# A node recovery the leader started and did not finish (the lease went, the process
+# ended) is written down step by step in ha_recovery_journal, a shared table: the next
+# leader pulls it with the configuration and says what is left. Guests whose config was
+# moved off the failed node and did not start are listed; nothing resumes them by itself
+# (an admin starts them, PegaProxManager.ha_start_moved_vms). A guest the worker moved
+# while the failed node was online and did not start on purpose (step 'hold') is listed
+# apart and never started from here: the node may still run it without a config.
+# Written in an automatic group only, where another instance takes over; nothing
+# changes anywhere else.
+
+RECOVERY_KEEP = 256
+_recovery_live = set()
+_recovery_lock = threading.Lock()
+
+
+def _recovery_table(cur):
+    cur.execute('CREATE TABLE IF NOT EXISTS ha_recovery_journal (id TEXT PRIMARY KEY, run TEXT NOT NULL, '
+                'cluster_id TEXT NOT NULL, node TEXT NOT NULL, epoch INTEGER NOT NULL, '
+                'instance_id TEXT NOT NULL, step TEXT NOT NULL, vmid INTEGER, done INTEGER NOT NULL '
+                'DEFAULT 0, at TEXT)')
+
+
+def _recovery_write(sql, args):
+    try:
+        from pegaprox.core.db import get_db
+        conn = get_db().conn
+        with _recovery_lock:
+            cur = conn.cursor()
+            _recovery_table(cur)
+            cur.execute(sql, args)
+            conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"[HA] could not write the recovery journal: {e}")
+        return False
+
+
+def recovery_begin(cluster_id, node):
+    """A node recovery starts: the id of its run, None where nothing is written down."""
+    st = _load()
+    if not _lease_mode(st):
+        return None
+    run = f"{int(st.get('epoch') or 0)}.{st['instance_id'][:12]}.{secrets.token_hex(4)}"
+    with _recovery_lock:
+        _recovery_live.add(run)
+    recovery_step(run, cluster_id, node, 'begin', done=True)
+    return run
+
+
+# The step that takes a guest's config off the failed node. Its 'begun' row (and the hold
+# written just before it) goes to the members at once (_send_on), before the step's confirm
+# round: a leader gone right after leaves the next leader a journal that names the guest.
+# The round carries the new cv to the voters, and a voter that holds less pulls right away
+# (_lease_heard). One send-on per guest: each is a walk of the shared tables (about 0.4 s at
+# 10k guests) in the recovery's own time. A lost 'start' row costs nothing - the guest runs
+# and drops out, or sits stopped on the target with its move listed.
+_SENT_AT_ONCE = frozenset(('move_config',))
+
+
+def _recovery_key(run, step, vmid):
+    return f"{run}/{step}" + (f"/{vmid}" if vmid is not None else '')
+
+
+def recovery_step(run, cluster_id, node, step, vmid=None, done=False):
+    """Before (done False) and after (done True) a step of the run."""
+    if run is None:
+        return
+    st = _load()
+    _recovery_write('INSERT OR REPLACE INTO ha_recovery_journal (id, run, cluster_id, node, epoch, '
+                    'instance_id, step, vmid, done, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    (_recovery_key(run, step, vmid), run, str(cluster_id), str(node),
+                     int(st.get('epoch') or 0), st['instance_id'], step,
+                     None if vmid is None else int(vmid), 1 if done else 0, _now()))
+    if not done and step in _SENT_AT_ONCE:
+        _send_on('the recovery journal')
+
+
+def recovery_clear(run, step, vmid=None):
+    """Take back the row of a step that turned out not to be needed (a hold the look
+    after the move did not confirm)."""
+    if run is not None:
+        _recovery_write('DELETE FROM ha_recovery_journal WHERE id = ?', (_recovery_key(run, step, vmid),))
+
+
+def recovery_drop_guests(run, vmids):
+    """The rows of guests that started: nothing is left to say about them, whatever else
+    keeps their run."""
+    vmids = sorted({int(v) for v in vmids or ()})
+    if run is not None and vmids:
+        _recovery_write(f"DELETE FROM ha_recovery_journal WHERE run = ? AND vmid IN "
+                        f"({', '.join('?' * len(vmids))})", (str(run), *vmids))
+
+
+def _steps_begun(rec, vmid):
+    return {s.rsplit(' ', 1)[0] for s in rec['open'] if s.rsplit(' ', 1)[-1] == str(vmid)}
+
+
+def recovery_end(run, locate=None):
+    """The worker is done with the run. A run that left a guest moved and not started,
+    or a step on a guest begun and not finished, stays in the journal and is listed as
+    interrupted from now on, here as well, until the guest started
+    (PegaProxManager.ha_start_moved_vms) or the next leader took the run over: its
+    record is returned for the worker to report. A step begun on a guest is kept only
+    where the guest's config may have left the failed node - its start began, or its
+    move did and `locate()` (the guests as the cluster lists them now, {vmid: entry},
+    None when unread) does not show it there; one whose config still sits there is
+    the monitor's again. A guest held on purpose ('hold') keeps the run listed and was
+    reported by the worker already. Any other run is forgotten - a step on the failed
+    node that did not finish is done again by the next pass of the monitor, the guests'
+    configs still sit there. A run cut short by the lease stays as it is, for the next
+    leader. The rows of the guests that started go either way. None where nothing is
+    kept to report."""
+    if run is None:
+        return None
+    with _recovery_lock:
+        _recovery_live.discard(run)
+    if not is_active():
+        return None
+    _recovery_write('DELETE FROM ha_recovery_journal WHERE run = ? AND vmid IN (SELECT vmid FROM '
+                    'ha_recovery_journal WHERE run = ? AND step = ? AND done = 1)', (run, run, 'start'))
+    left = recovery_leftovers(run=run)
+    rec = left[0] if left else None
+    if rec and rec['guests_open']:
+        where, keep = False, []
+        for vmid in rec['guests_open']:
+            begun = _steps_begun(rec, vmid)
+            if 'start' not in begun and 'move_config' in begun:
+                if where is False:
+                    try:
+                        where = locate() if locate else None
+                    except Exception:
+                        where = None
+                if where is not None and (where.get(vmid) or {}).get('node') == rec['node']:
+                    continue
+            elif 'start' not in begun:
+                # nothing began that takes the config away
+                continue
+            keep.append(vmid)
+        for vmid in set(rec['guests_open']) - set(keep):
+            _recovery_write('DELETE FROM ha_recovery_journal WHERE run = ? AND vmid = ?', (run, int(vmid)))
+            rec['open'] = [s for s in rec['open'] if s.rsplit(' ', 1)[-1] != str(vmid)]
+        rec['guests_open'] = keep
+    if rec and (rec['moved'] or rec['guests_open'] or rec['held']):
+        return rec if rec['moved'] or rec['guests_open'] else None
+    _recovery_write('DELETE FROM ha_recovery_journal WHERE run = ?', (run,))
+    return None
+
+
+def recovery_forget(runs):
+    """An admin dealt with what these runs left."""
+    for run in runs or ():
+        _recovery_write('DELETE FROM ha_recovery_journal WHERE run = ?', (str(run),))
+
+
+_recovery_said = {}
+
+
+def recovery_leftovers(cluster_id=None, run=None):
+    """The recovery runs that stopped half way, none of this process's live ones, or
+    the one run `run`: [{run, cluster_id, node, epoch, instance_id, at, moved_at, open:
+    [step], guests_open: [vmid], moved: [vmid], held: [vmid]}], oldest first. moved names
+    the guests whose config left the failed node and that no step started, guests_open
+    those with a step begun and not finished, held those moved while the failed node was
+    online and not started on purpose, or whose look at the node never finished (a
+    'hold' begun); whether they run now is the cluster's to say. moved_at is when the
+    first config of the run began to move (None before any did). The newest
+    RECOVERY_KEEP runs of the cluster, each with all its rows; more than that kept is
+    said once per count."""
+    try:
+        from pegaprox.core.db import get_db
+        cur = get_db().conn.cursor()
+        if 'ha_recovery_journal' not in _existing_tables(cur):
+            return []
+        cols = 'SELECT run, cluster_id, node, epoch, instance_id, step, vmid, done, at FROM ha_recovery_journal'
+        with _recovery_lock:
+            live = sorted(_recovery_live)
+        if run is not None:
+            cur.execute(cols + ' WHERE run = ? ORDER BY at, id', (str(run),))
+            rows = cur.fetchall()
+        else:
+            where, args = [], []
+            if cluster_id is not None:
+                where.append('cluster_id = ?')
+                args.append(str(cluster_id))
+            if live:
+                where.append(f"run NOT IN ({', '.join('?' * len(live))})")
+                args += live
+            cond = (' WHERE ' + ' AND '.join(where)) if where else ''
+            # whole runs, the newest first: a kept run of a large node, or another
+            # cluster's, never pushes a later one out of what is read
+            cur.execute(f'SELECT run FROM ha_recovery_journal{cond} GROUP BY run '
+                        'ORDER BY MAX(at) DESC, run DESC LIMIT ?', (*args, RECOVERY_KEEP + 1))
+            picked = [r[0] for r in cur.fetchall()]
+            if len(picked) > RECOVERY_KEEP:
+                cur.execute(f'SELECT COUNT(DISTINCT run) FROM ha_recovery_journal{cond}', args)
+                _say_runs_kept(cluster_id, cur.fetchone()[0])
+                picked = picked[:RECOVERY_KEEP]
+            rows = []
+            if picked:
+                cur.execute(cols + f" WHERE run IN ({', '.join('?' * len(picked))}) ORDER BY at, id", picked)
+                rows = cur.fetchall()
+    except Exception as e:
+        logging.warning(f"[HA] could not read the recovery journal: {e}")
+        return []
+    runs = {}
+    for rid, cid, node, epoch, iid, step, vmid, done, at in rows:
+        if rid in live:
+            continue
+        rec = runs.setdefault(rid, {'run': rid, 'cluster_id': cid, 'node': node, 'epoch': epoch,
+                                    'instance_id': iid, 'at': at, 'moved_at': None, 'open': [],
+                                    'guests_open': [], 'moved': set(), 'started': set(), 'held': set()})
+        if step == 'move_config' and rec['moved_at'] is None:
+            rec['moved_at'] = at
+        if step == 'hold' and vmid is not None:
+            # begun counts as well: the leader was gone before its look at the node said
+            rec['held'].add(vmid)
+        elif not done:
+            rec['open'].append(step if vmid is None else f'{step} {vmid}')
+            if vmid is not None and vmid not in rec['guests_open']:
+                rec['guests_open'].append(vmid)
+        elif step == 'move_config' and vmid is not None:
+            rec['moved'].add(vmid)
+        elif step == 'start' and vmid is not None:
+            rec['started'].add(vmid)
+    out = []
+    for rec in runs.values():
+        held = rec.pop('held')
+        rec['moved'] = sorted(rec.pop('moved') - rec.pop('started') - held)
+        rec['guests_open'] = [v for v in rec['guests_open'] if v not in held]
+        rec['held'] = sorted(held)
+        out.append(rec)
+    return out
+
+
+def _say_runs_kept(cluster_id, total):
+    where = f'cluster {cluster_id}' if cluster_id is not None else 'all clusters'
+    if _recovery_said.get(where) == total:
+        return
+    _recovery_said[where] = total
+    text = (f"{total} interrupted node recoveries are kept for {where}: the oldest "
+            f"{total - RECOVERY_KEEP} are not listed until newer ones are started or dismissed")
+    logging.warning(f"[HA] {text}")
+    _audit('ha.recovery_journal_full', text)
+
+
+# --- schedules across a change of leader (design 5.7) --------------------------------
+
+_missed_said = {}
+
+
+def _largest_skew():
+    rt = _rts.get(_load()['instance_id'])
+    now = time.monotonic()
+    skews = [abs(s['skew']) for s in (list(rt.seen.values()) if rt else ())
+             if type(s.get('skew')) in (int, float) and now - s.get('at', -1e9) <= LEASE_SEEN_FRESH]
+    # nothing measured yet: the most automatic mode allows
+    return max(skews) if skews else float(ha_vote.SKEW_LIMIT)
+
+
+def _acting_wall(node):
+    """acting_from of `node` as a wall time."""
+    return _wall() - (ha_clock() - node.acting_from)
+
+
+def schedule_held():
+    """True while the minute that runs now began before this leader may fire schedules:
+    before it acts, plus the largest clock skew to a member (5 s while none was
+    measured), so a minute the former leader may have fired is not fired again. A leader
+    that took the lead in its own process (the switch) had no former leader, and its own
+    last runs are here: nothing held. False anywhere but in an automatic group."""
+    st = _load()
+    if not _lease_mode(st):
+        return False
+    node = _lease_live(st)
+    if node is None or not node.is_active():
+        return True
+    rt = _rts.get(st['instance_id'])
+    if rt is None or not rt.came_up:
+        return False
+    wall = _wall()
+    return wall - (wall % 60) < _acting_wall(node) + _largest_skew()
+
+
+def schedule_fire_first():
+    """At most once (5.7): in an automatic group a schedule writes its last run before it
+    acts (a one-time schedule switches itself off with it), and schedule_fired() sends
+    that to the members, so a leader that takes over in between does not fire it again.
+    Anywhere else the order stays as it was."""
+    return guard_on()
+
+
+def schedule_fired():
+    """The last run of a schedule is written: in an automatic group the members get it now,
+    before the schedule acts, not with the next etag tick."""
+    _send_on('the last run of a schedule')
+
+
+def _send_on(what):
+    """In an automatic group: the cv steps for what was just written and the members hear
+    of it now (cv_tick, which tells them), not with the next etag tick."""
+    if not guard_on():
+        return
+    try:
+        cv_tick()
+    except Exception as e:
+        logging.warning(f"[HA] could not send {what} on at once: {e}")
+
+
+def missed_schedule_window(kind):
+    """Once per acting process of a leader that came up by a restart (a takeover, or a
+    restart of its own) and per kind of schedule: (from, to) as wall times, the stretch
+    in which no leader fired schedules, from before the last renewal its process could
+    have heard to the end of what schedule_held() skips. None otherwise, and anywhere
+    but in an automatic group."""
+    st = _load()
+    if not _lease_mode(st):
+        return None
+    node = _lease_live(st)
+    if node is None or not node.is_active():
+        return None
+    t = node.t
+    rt = _rts.get(st['instance_id'])
+    if rt is None or not rt.came_up:
+        # it took the lead in this process (the switch to automatic mode): no gap
+        return None
+    mark = (st['instance_id'], rt.gen, node.acting_from)
+    if _missed_said.get(kind) == mark:
+        return None
+    _missed_said[kind] = mark
+    # the vote round it won, from take_after on this boot; W_take covers the restart
+    # after it, so it lies no further back than that from the start of this process (a
+    # take_after from long ago is a restart of a leader that kept the lease)
+    take = ((st.get('lease') or {}).get('led') or {}).get('take_after') or {}
+    won = node.started - t.W_take
+    if take.get('boot_id') == node.boot_id and type(take.get('at')) in (int, float):
+        won = min(max(take['at'] - t.W_take, won), node.started)
+    # its timer fired at most P + L/4 (+ L/2 at a lower reach) after the last renewal it
+    # heard, and the vote took T_vote
+    heard = _wall() - (ha_clock() - won) - (t.P + t.L / 4 + t.L / 2 + t.T_vote)
+    return heard, _acting_wall(node) + _largest_skew()
+
+
+def missed_schedules(kind, names, window):
+    """Say and audit which schedules of `kind` fell in `window` and did not run."""
+    if not names:
+        return
+    a, b = (datetime.fromtimestamp(x).strftime('%Y-%m-%d %H:%M:%S') for x in window)
+    text = (f"{len(names)} {kind} fell due between {a} and {b} while the group changed its "
+            f"leader and did not run: {', '.join(sorted(names)[:20])}")
+    logging.warning(f"[HA] {text}")
+    _audit('ha.schedules_missed', text)

@@ -1220,6 +1220,10 @@ def lease_from_an_older_round(seed):
     sim.start('a', rates={i: 1.0 for i in sim.order}, skew=0.0)
     settle(sim)
     a, ma = sim.node('a'), sim.members['a']
+    # a voter not up yet at a's boot round is passed by confirm rounds until a renewal
+    # reaches it (ha_vote Node._unreached): one every R, and then all are asked
+    sim.run(sim.now + hv.Timings(120).R + 1)
+    assert not a._unreached
 
     def only(x):
         for o in 'bcdw':

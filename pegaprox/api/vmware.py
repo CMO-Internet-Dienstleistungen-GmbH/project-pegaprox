@@ -1226,7 +1226,10 @@ def start_vmware_migration(vmware_id, vm_id):
     with _migration_lock_v2p:
         _vmware_migrations[mid] = task
     
-    thread = threading.Thread(target=_run_v2p_migration, args=(task,), daemon=True)
+    # a user job: in an automatic group each call it sends asks for the lease (#625)
+    from pegaprox.core import ha
+    thread = threading.Thread(target=ha.as_job(_run_v2p_migration, 'ESXi migration'), args=(task,),
+                              daemon=True)
     thread.start()
     
     log_audit(request.session.get('user', 'admin'), 'vmware.migration.started',

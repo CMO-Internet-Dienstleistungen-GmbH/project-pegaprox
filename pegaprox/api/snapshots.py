@@ -333,7 +333,9 @@ def _prune(mgr, node, vmid, vm_type, policy):
         if cutoff and snap_t >= cutoff:
             keep_set.add(name)
             continue
-        # delete this snapshot
+        # delete this snapshot: not from a leader that lost its lease (#625)
+        if not ha.confirm_step(f'pruning {name} of {vmid}'):
+            break
         try:
             if hasattr(mgr, 'delete_snapshot'):
                 mgr.delete_snapshot(node, vmid, vm_type, name)
@@ -464,6 +466,9 @@ def _execute_policy(policy_id, force=False):
             continue
         snap = _snap_name(policy['id'])
         create_ok = False
+        if not ha.confirm_step(f"snapshot policy {policy['name']} on {vmid}"):
+            log_lines.append(f"  ✗ {vm_type}/{vmid}@{node}: not taken - this instance does not hold the lease")
+            break
         try:
             res = mgr.create_snapshot(node, vmid, vm_type, snap, f"PegaProx policy {policy['name']}", policy['include_ram'])
             if res.get('success'):

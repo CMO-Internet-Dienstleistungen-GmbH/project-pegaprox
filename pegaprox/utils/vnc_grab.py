@@ -230,7 +230,11 @@ def screendump_to_png(pve_mgr, node, vmid, max_width=480, timeout=20):
     cmd = (f"echo screendump {remote} | qm monitor {vmid} >/dev/null 2>&1; "
            f"gzip -c {remote} 2>/dev/null | base64 | tr -d '\\n'; "
            f"rm -f {remote}")
-    rc, out, err = _pve_node_exec(pve_mgr, node, cmd, timeout=timeout)
+    # a picture of the console, as a console proxy hands one out: the guard of an
+    # automatic group lets it through on every member (#625)
+    from pegaprox.core import ha
+    with ha.reading():
+        rc, out, err = _pve_node_exec(pve_mgr, node, cmd, timeout=timeout)
     b64 = (out or '').strip()
     if not b64:
         raise IOError(f"screendump produced no data (rc={rc}, err={str(err)[:120]})")

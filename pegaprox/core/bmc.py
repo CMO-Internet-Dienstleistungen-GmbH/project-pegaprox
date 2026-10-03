@@ -509,14 +509,18 @@ def read_node_bmc_inband(mgr, node, timeout=15):
 
         raw = None
         ssh_key = getattr(mgr.config, 'ssh_key', '') or ''
-        if ssh_key:
-            raw = mgr._ssh_run_command_with_key_output(ip, user, INBAND_PROBE_CMD, ssh_key, timeout=timeout)
-        if not _has_output(raw):
-            raw = mgr._ssh_run_command_output(ip, user, INBAND_PROBE_CMD, timeout=timeout)
-        if not _has_output(raw):
-            ssh_pass = getattr(mgr.config, 'pass_', '') or ''
-            if ssh_pass:
-                raw = mgr._ssh_run_command_with_password_output(ip, user, INBAND_PROBE_CMD, ssh_pass, timeout=timeout)
+        # the probe only reads, so the transport guard of an automatic leader lets it
+        # through without a confirmed step (#625)
+        from pegaprox.core import ha
+        with ha.reading():
+            if ssh_key:
+                raw = mgr._ssh_run_command_with_key_output(ip, user, INBAND_PROBE_CMD, ssh_key, timeout=timeout)
+            if not _has_output(raw):
+                raw = mgr._ssh_run_command_output(ip, user, INBAND_PROBE_CMD, timeout=timeout)
+            if not _has_output(raw):
+                ssh_pass = getattr(mgr.config, 'pass_', '') or ''
+                if ssh_pass:
+                    raw = mgr._ssh_run_command_with_password_output(ip, user, INBAND_PROBE_CMD, ssh_pass, timeout=timeout)
         if not _has_output(raw):
             return {'available': False, 'reason': 'no response from node (SSH unavailable or auth failed?)'}
         return parse_inband(raw)
