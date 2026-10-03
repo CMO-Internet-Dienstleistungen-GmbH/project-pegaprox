@@ -5326,7 +5326,7 @@ class PegaProxManager:
             # storage heartbeat - safest for 2-node clusters
             # NS: spent forever getting this to work right
             'storage_heartbeat_enabled': saved_ha.get('storage_heartbeat_enabled', False),
-            'storage_heartbeat_path': saved_ha.get('storage_heartbeat_path', ''),
+            'storage_heartbeat_path': self._heartbeat_path_or_none(saved_ha.get('storage_heartbeat_path', '')),
             'storage_heartbeat_interval': saved_ha.get('storage_heartbeat_interval', 5),
             'storage_heartbeat_timeout': saved_ha.get('storage_heartbeat_timeout', 30),
             'poison_pill_enabled': saved_ha.get('poison_pill_enabled', True),
@@ -7163,6 +7163,11 @@ class PegaProxManager:
     # with the key) and set through PUT .../ha/config.
 
     FENCE_TYPES = ('ipmi', 'ssh', 'proxmox')
+    # The storage heartbeat path goes into the node agent as STORAGE_PATH="<path>", in a
+    # script that runs as root on every node: a plain absolute path and nothing else,
+    # wherever it came from (the HA settings route, the storages of the cluster, a
+    # restored or synced configuration).
+    HEARTBEAT_PATH_RE = re.compile(r'/[A-Za-z0-9._@/+-]{0,255}')
     _FENCE_NODE_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9.-]{0,62}')
     _FENCE_HOST_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9.:-]{0,252}')
     _FENCE_USER_RE = re.compile(r'[A-Za-z0-9_][A-Za-z0-9._@-]{0,63}')
@@ -9757,6 +9762,10 @@ fi
                     self.logger.debug(f"[HA] Found shared BLOCK storage (not usable for heartbeats): {storage_name} ({storage_type})")
                     continue
                 
+                if mount_path and not self.HEARTBEAT_PATH_RE.fullmatch(str(mount_path)):
+                    self.logger.warning(f"[HA] Shared storage {storage_name!r} has a path that is not a plain "
+                                        f"absolute path - not used for heartbeats")
+                    mount_path = None
                 if mount_path:
                     storages.append({
                         'name': storage_name,
@@ -10025,6 +10034,15 @@ systemctl restart pegaprox-agent &&
 echo "AGENT_INSTALLED_OK"
 '''
 
+    @classmethod
+    def _heartbeat_path_or_none(cls, path):
+        """The stored heartbeat path when it has the shape the node agent takes, else ''."""
+        if isinstance(path, str) and cls.HEARTBEAT_PATH_RE.fullmatch(path):
+            return path
+        if path:
+            logging.warning("[HA] the stored storage heartbeat path is not a plain absolute path - ignored")
+        return ''
+
     def _ha_install_node_agent(self, node: str) -> bool:
         """Auto-install the node agent on a Proxmox node via SSH
         
@@ -10034,6 +10052,10 @@ echo "AGENT_INSTALLED_OK"
         storage_path = self.ha_config.get('storage_heartbeat_path')
         if not storage_path:
             self.logger.error(f"[HA] Cannot install agent: storage_heartbeat_path not configured!")
+            return False
+        if not isinstance(storage_path, str) or not self.HEARTBEAT_PATH_RE.fullmatch(storage_path):
+            self.logger.error("[HA] Cannot install agent: the storage heartbeat path is not a plain "
+                              "absolute path - set it again in the HA settings")
             return False
         
         try:

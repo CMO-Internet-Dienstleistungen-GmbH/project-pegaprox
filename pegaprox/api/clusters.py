@@ -2865,7 +2865,7 @@ def update_ha_config(cluster_id):
         # value breaks out of the assignment. Config is not code — constrain it to a plain
         # absolute path before it can reach the splice in manager._NODE_AGENT_SCRIPT.
         _shp = str(data['storage_heartbeat_path'] or '')
-        if _shp and not re.fullmatch(r'/[A-Za-z0-9._@/+-]{0,255}', _shp):
+        if _shp and not PegaProxManager.HEARTBEAT_PATH_RE.fullmatch(_shp):
             return jsonify({'error': 'storage_heartbeat_path must be an absolute path '
                                      '(letters, digits and . _ @ + - / only)'}), 400
         manager.ha_config['storage_heartbeat_path'] = _shp
