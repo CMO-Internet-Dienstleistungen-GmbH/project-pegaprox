@@ -9791,11 +9791,15 @@
             
             // NS: Toggle favorite
             const toggleFavorite = async (type, clusterId, vmid = null, vmType = null, nodeName = null) => {
+                // LW Oct 2026 - a container row of the search says 'ct', its star is a VM favorite
+                // (lxc). The server keeps at most so many per kind and only what this user may see,
+                // and a refusal says why instead of leaving the star as it was without a word.
+                if (type === 'ct') type = 'vm';
                 const currentFavs = favorites[type + 's'] || [];
                 let isFavorite = false;
                 
                 if (type === 'vm') {
-                    isFavorite = currentFavs.some(f => f.cluster_id === clusterId && f.vmid === vmid);
+                    isFavorite = currentFavs.some(f => f.cluster_id === clusterId && String(f.vmid) === String(vmid));
                 } else if (type === 'node') {
                     isFavorite = currentFavs.some(f => f.cluster_id === clusterId && f.node === nodeName);
                 } else if (type === 'cluster') {
@@ -9808,7 +9812,7 @@
                     const body = { action, type, cluster_id: clusterId };
                     if (vmid) body.vmid = vmid;
                     if (vmType) body.vm_type = vmType;
-                    if (nodeName) body.node = nodeName;
+                    if (nodeName && type === 'node') body.node = nodeName;
                     
                     const response = await authFetch(`${API_URL}/user/favorites`, {
                         method: 'POST',
@@ -9819,6 +9823,8 @@
                     if (response && response.ok) {
                         const data = await response.json();
                         setFavorites(data.favorites);
+                    } else if (response) {
+                        addToast(await PegaProxApiErrors.message(response, t('actionFailed')), 'error');
                     }
                 } catch (err) {
                     console.error('Toggle favorite error:', err);
@@ -9827,8 +9833,8 @@
             
             // NS: Check if item is favorite
             const isFavorite = (type, clusterId, vmid = null, nodeName = null) => {
-                if (type === 'vm') {
-                    return (favorites.vms || []).some(f => f.cluster_id === clusterId && f.vmid === vmid);
+                if (type === 'vm' || type === 'ct') {
+                    return (favorites.vms || []).some(f => f.cluster_id === clusterId && String(f.vmid) === String(vmid));
                 } else if (type === 'node') {
                     return (favorites.nodes || []).some(f => f.cluster_id === clusterId && f.node === nodeName);
                 } else if (type === 'cluster') {
