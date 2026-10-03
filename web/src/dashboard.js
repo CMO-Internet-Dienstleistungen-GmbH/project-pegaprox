@@ -739,7 +739,7 @@
                                 <span className={`font-medium ${expired ? 'text-red-400' : 'text-yellow-400'}`}>
                                     {expired 
                                         ? (t('passwordExpired') || 'Ihr Passwort ist abgelaufen!')
-                                        : (t('passwordExpiresIn') || `Ihr Passwort läuft in ${days_until_expiry} Tagen ab`).replace('{days}', days_until_expiry)
+                                        : (t('passwordExpiresIn') || `Ihr Passwort läuft in ${days_until_expiry} Tagen ab`).replace('{days}', () => days_until_expiry)
                                     }
                                 </span>
                                 <span className="text-gray-400 ml-2 text-sm">
@@ -802,7 +802,7 @@
             const text = t(leaderDown ? 'pgHaBannerLeaderDown'
                     : serving ? 'pgHaBannerServing'
                     : ha.forwarding === true ? 'pgHaBannerForwarding' : 'pgHaBannerStandby')
-                .replace('{url}', ha.peer_url || '-')
+                .replace('{url}', () => ha.peer_url || '-')
                 .replace('{time}', ha.last_sync_at ? haRelTime(ha.last_sync_at, language) : t('pgHaNotYet'));
             // yellow on a standby, blue on a serving member, red while its leader is away
             const tone = leaderDown ? 'red' : serving ? 'blue' : 'yellow';
@@ -854,6 +854,46 @@
                    button: 'bg-red-600 hover:bg-red-700',
                    cloud: ['rgba(248,113,113,0.14)', 'rgba(248,113,113,0.42)', 'var(--cloud-error, #f87171)'] },
         };
+
+        // LW Oct 2026 (#625) - copies of what a sync replaced here wait until an admin looks at
+        // them, in every role. The banner object counts them; only admins see this line, and
+        // its button opens the HA tab where the list is.
+        function HaCopiesBanner({ onOpenHa, cloud = false }) {
+            const { t } = useTranslation();
+            const { ha, isAdmin } = useAuth();
+            const n = typeof ha?.orphans === 'number' ? ha.orphans : 0;
+            if (!isAdmin || n < 1) return null;
+
+            const text = n === 1 ? t('haCopiesBannerOne') : t('haCopiesBanner').replace('{n}', n);
+            const tone = HA_BANNER_TONE.yellow;
+            const button = onOpenHa && (
+                <button onClick={onOpenHa}
+                    className={cloud ? 'cloud-btn cloud-btn-sm' : `px-3 py-1 rounded-lg text-xs font-medium text-white whitespace-nowrap ${tone.button}`}
+                    style={cloud ? { whiteSpace: 'nowrap' } : undefined}>
+                    {t('pgHaTab')}
+                </button>
+            );
+            if (cloud) {
+                return (
+                    <div data-ha-copies-banner="cloud" data-ha-copies-count={n} role="status"
+                        style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 16px', fontSize: 13,
+                                 background: tone.cloud[0], borderBottom: `1px solid ${tone.cloud[1]}`, color: tone.cloud[2] }}>
+                        <span style={{ display: 'inline-flex', flexShrink: 0 }}><Icons.Archive /></span>
+                        <span style={{ flex: '1 1 auto', minWidth: 0 }}>{text}</span>
+                        {button}
+                    </div>
+                );
+            }
+            return (
+                <div data-ha-copies-banner="classic" data-ha-copies-count={n} role="status" className={`px-4 py-2 border-b ${tone.box}`}>
+                    <div className="flex items-center gap-3 text-sm">
+                        <span className={`flex-shrink-0 ${tone.icon}`}><Icons.Archive /></span>
+                        <span className={`flex-1 min-w-0 ${tone.text}`}>{text}</span>
+                        {button}
+                    </div>
+                </div>
+            );
+        }
 
         // Cluster Sidebar Item Component - NS Jan 2026
         function ClusterSidebarItem({ cluster, idx, selectedCluster, setSelectedCluster, nodeAlerts, clusterGroups, isAdmin, handleDeleteCluster, setShowAssignGroup, setRenamingCluster, setRenameValue, setReconfigureCluster, t, getAuthHeaders, fetchClusters, addToast, isCorporate, expandedSidebarClusters, toggleSidebarCluster, onContextMenu, hwHealth }) {
@@ -8115,6 +8155,766 @@
             return true;
         }
 
+        // ═══════════════════════════════════════════════
+        // Node HA in the HA settings of a cluster (#625)
+        // LW Oct 2026 - which self-fence agent each node runs, the safety rules of a node
+        // recovery, the fence of each node and the cluster claim. Each part renders from what
+        // the HA status carries and stays away when its key is missing, so the settings of a
+        // server that sends none of it look the way they did.
+        // ═══════════════════════════════════════════════
+
+        const HA_NODE_FENCE_TYPES = ['ipmi', 'ssh', 'proxmox'];
+        const HA_NODE_UNSAFE_WORD = 'UNSAFE';
+        const HA_NODE_CLAIM_WORD = { enable: 'WRITE CLAIM', release: 'RELEASE CLAIM' };
+        // another instance's claim, or a file that is no claim: what a release writes over
+        const HA_NODE_CLAIM_FOREIGN = ['higher', 'same', 'unreadable'];
+        const HA_NODE_CLAIM_LABEL = {
+            off: 'haNodeClaimOff', ours: 'haNodeClaimOurs', foreign: 'haNodeClaimForeign',
+            unreadable: 'haNodeClaimUnreadable', pending: 'haNodeClaimPending', standby: 'haNodeClaimStandby',
+            unknown: 'haNodeClaimUnknown',
+        };
+        const HA_NODE_CLAIM_MEANS = {
+            ours: 'haNodeClaimMeansOurs', higher: 'haNodeClaimMeansHigher', same: 'haNodeClaimMeansSame',
+            unreadable: 'haNodeClaimMeansUnreadable', busy: 'haNodeClaimMeansBusy', readonly: 'haNodeClaimMeansReadonly',
+            failed: 'haNodeClaimMeansFailed', unreachable: 'haNodeClaimMeansUnreachable', standby: 'haNodeClaimMeansStandby',
+            unknown: 'haNodeClaimMeansUnknown',
+        };
+        const HA_NODE_CLAIM_TONE = {
+            off: 'bg-gray-500/20 text-gray-300 border-gray-500/30',
+            ours: 'bg-green-500/20 text-green-300 border-green-500/30',
+            foreign: 'bg-red-500/20 text-red-300 border-red-500/30',
+            unreadable: 'bg-red-500/20 text-red-300 border-red-500/30',
+            pending: 'bg-yellow-500/20 text-yellow-300 border-yellow-500/40',
+            standby: 'bg-gray-500/20 text-gray-300 border-gray-500/30',
+            unknown: 'bg-gray-500/20 text-gray-300 border-gray-500/30',
+        };
+
+        // Whether any of the parts below renders for this status, by the check each of them
+        // starts with. The modal is only made wider for their tables: with a status from
+        // before them it keeps the width it had.
+        function haNodePartsShown(status) {
+            const sbp = status?.split_brain_prevention || {};
+            const isObj = (v) => !!v && typeof v === 'object';
+            return typeof sbp.unsafe_two_node_recovery === 'boolean' || !!sbp.fenced_survivor_note
+                || (sbp.verified_fence_required === true && sbp.verified_fence_configured === false)
+                || isObj(status?.fence_agent) || isObj(sbp.fencing) || isObj(status?.cluster_claim);
+        }
+
+        function haNodeClaimKind(state) {
+            if (state === 'ours' || state === 'off' || state === 'standby' || state === 'unreadable') return state;
+            if (state === 'higher' || state === 'same') return 'foreign';
+            if (['busy', 'readonly', 'failed', 'unreachable'].includes(state)) return 'pending';
+            return 'unknown';
+        }
+
+        // POST/PUT to an HA route of a cluster: the server's own words on a refusal, with its
+        // code. authFetch hands back null for a request that got no answer at all.
+        async function haNodeSend(authFetch, url, method, body, fallback) {
+            const r = await authFetch(url, {
+                method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {})
+            });
+            if (!r) return { ok: false, code: '', error: fallback, data: null };
+            const data = await r.json().catch(() => null);
+            if (!r.ok) {
+                const said = typeof data?.error === 'string' ? data.error.trim() : '';
+                return { ok: false, code: data?.code || '', error: said || fallback, data };
+            }
+            return { ok: true, code: '', error: '', data: data || {} };
+        }
+
+        function HaNodeCommand({ value, t }) {
+            return (
+                <div className="flex items-start gap-2" data-ha-node-command>
+                    <code className="flex-1 min-w-0 px-3 py-2 bg-black/40 rounded text-xs text-gray-200 break-all font-mono select-all">{value}</code>
+                    <span className="shrink-0 inline-flex">
+                        <CopyButton value={value} size="md" title={t('copy')}
+                            className="w-8 h-8 border border-proxmox-border hover:border-gray-500" />
+                    </span>
+                </div>
+            );
+        }
+
+        // The server puts what to run by hand between backticks. Each of those gets a line of
+        // its own with a copy button, the rest stays prose. Unpaired backticks stay text.
+        function HaNodeText({ text, t, className }) {
+            const parts = String(text || '').split('`');
+            if (parts.length % 2 === 0) return <div className={className}>{text}</div>;
+            return (
+                <div className={`space-y-2 ${className || ''}`}>
+                    {parts.map((part, i) => !part.trim() ? null
+                        : i % 2 ? <HaNodeCommand key={i} value={part.trim()} t={t} />
+                        : <p key={i}>{part.trim()}</p>)}
+                </div>
+            );
+        }
+
+        // On top of the settings: a cluster that recovers the old way, at the old risk, and
+        // one that is not recovered at all until a fence is set
+        function HaNodeWarnings({ status, t }) {
+            const sbp = status?.split_brain_prevention || {};
+            const unsafe = sbp.unsafe_two_node_recovery === true;
+            const noFence = sbp.verified_fence_required === true && sbp.verified_fence_configured === false;
+            if (!unsafe && !noFence) return null;
+            return (
+                <div className="space-y-3 mb-4">
+                    {unsafe && (
+                        <div role="alert" data-ha-node-unsafe className="p-4 rounded-xl border bg-red-500/10 border-red-500/50">
+                            <div className="flex items-start gap-3">
+                                <span className="mt-0.5 flex-shrink-0 text-red-400"><Icons.AlertTriangle /></span>
+                                <div className="min-w-0 space-y-1">
+                                    <h4 className="font-medium text-red-300">{t('haNodeUnsafeTitle')}</h4>
+                                    <p className="text-sm text-red-200">{sbp.unsafe_two_node_warning || t('haNodeUnsafeRisk')}</p>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                    {noFence && (
+                        <div role="alert" data-ha-node-no-fence className="p-4 rounded-xl border bg-yellow-500/10 border-yellow-500/40">
+                            <div className="flex items-start gap-3">
+                                <span className="mt-0.5 flex-shrink-0 text-yellow-400"><Icons.AlertTriangle /></span>
+                                <div className="min-w-0 space-y-1">
+                                    <h4 className="font-medium text-yellow-300">{t('haNodeNoFenceTitle')}</h4>
+                                    <p className="text-sm text-yellow-200">{t('haNodeNoFenceText')}</p>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // Which self-fence agent each node runs, from the status, and what the agent check
+        // read on the nodes once it ran. An agent of an earlier PegaProx keeps running as it
+        // is: the install above replaces it.
+        function HaNodeAgents({ t, clusterId, status, check, onCheck, authFetch, onReload, locked }) {
+            const [checking, setChecking] = useState(false);
+            const [error, setError] = useState('');
+            const fa = status?.fence_agent;
+            if (!fa || typeof fa !== 'object') return null;
+
+            const expected = fa.expected_version || 2;
+            const known = fa.nodes && typeof fa.nodes === 'object' ? fa.nodes : {};
+            const unchecked = Array.isArray(fa.unchecked) ? fa.unchecked : [];
+            const found = check && check.nodes && typeof check.nodes === 'object' ? check.nodes : null;
+            const names = Array.from(new Set([
+                ...Object.keys(status.nodes || {}), ...Object.keys(known), ...unchecked,
+                ...(Array.isArray(status.self_fence_nodes) ? status.self_fence_nodes : []),
+                ...Object.keys(found || {}),
+            ])).sort();
+            // the agents ask the PegaProx instances only where quorum cannot decide
+            const asks = Array.isArray(check?.members) && check.members.length > 0;
+            const outdatedText = fa.outdated_warning || check?.outdated_warning;
+
+            const runCheck = async () => {
+                setChecking(true);
+                setError('');
+                const res = await haNodeSend(authFetch, `${API_URL}/clusters/${clusterId}/ha/agent-check`, 'POST', {},
+                                             t('haNodeCheckFailed'));
+                setChecking(false);
+                if (!res.ok) { setError(res.error); return; }
+                onCheck(res.data);
+                // what it found is what the status reports from now on
+                onReload();
+            };
+
+            // the check's answer where there is one, else what the status knows
+            const agentOf = (name) => {
+                const seen = found ? found[name] : undefined;
+                const version = seen && seen.fence_agent ? seen.fence_agent.version : known[name]?.version;
+                if (typeof version !== 'number') return { kind: unchecked.includes(name) ? 'unchecked' : 'none' };
+                if (version <= 0) return { kind: 'none' };
+                return { kind: version < expected ? 'earlier' : 'current', version };
+            };
+            const label = (agent) => agent.kind === 'current' ? t('haNodeAgentCurrent').replace('{version}', agent.version)
+                : agent.kind === 'earlier' ? t('haNodeAgentEarlier').replace('{version}', agent.version)
+                : agent.kind === 'unchecked' ? t('haNodeAgentUnchecked') : t('haNodeAgentNone');
+            const yesNo = (v) => v ? <span className="text-green-300">{t('yes')}</span> : <span className="text-yellow-300">{t('no')}</span>;
+            const cell = 'py-2 pr-4';
+            const silent = Array.isArray(check?.unreachable) ? check.unreachable : [];
+            const notCurrent = Array.isArray(check?.not_current) ? check.not_current : [];
+
+            return (
+                <div className="mt-3 p-3 bg-proxmox-dark border border-proxmox-border rounded-lg space-y-3" data-ha-node-agents>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                        <h5 className="text-sm font-medium text-white">{t('haNodeAgentsTitle')}</h5>
+                        <button type="button" onClick={runCheck} disabled={checking || locked}
+                            className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white hover:border-gray-500 disabled:opacity-50 disabled:cursor-not-allowed">
+                            <span className={`inline-flex ${checking ? 'animate-spin' : ''}`}><Icons.RefreshCw className="w-3 h-3" /></span>
+                            {checking ? t('haNodeChecking') : t('haNodeCheckAgents')}
+                        </button>
+                    </div>
+                    {names.length > 0 && (
+                        <div className="overflow-x-auto">
+                            <table className="w-full text-sm">
+                                <thead>
+                                    <tr className="text-left text-xs text-gray-500 border-b border-proxmox-border">
+                                        <th className={`${cell} font-medium`}>{t('node')}</th>
+                                        <th className={`${cell} font-medium`}>{t('haNodeColAgent')}</th>
+                                        <th className={`${cell} font-medium whitespace-nowrap`} title={t('haNodeColRecoveryHint')}>{t('haNodeColRecovery')}</th>
+                                        {found && (<>
+                                            <th className={`${cell} font-medium`}>{t('haNodeColRuns')}</th>
+                                            <th className={`${cell} font-medium`}>{t('haNodeColMode')}</th>
+                                            <th className={`${cell} font-medium whitespace-nowrap`}>{t('haNodeColCurrent')}</th>
+                                            <th className="py-2 font-medium whitespace-nowrap">{t('haNodeColInstances')}</th>
+                                        </>)}
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {names.map(name => {
+                                        const agent = agentOf(name);
+                                        const seen = found ? found[name] : undefined;
+                                        const recovery = known[name]?.earliest_recovery;
+                                        const away = Array.isArray(seen?.members_unreachable) ? seen.members_unreachable : [];
+                                        return (
+                                            <React.Fragment key={name}>
+                                                <tr data-ha-node-agent={name} data-ha-node-agent-kind={agent.kind}
+                                                    className={away.length ? '' : 'border-b border-proxmox-border'}>
+                                                    <td className={`${cell} font-mono text-xs text-gray-200 whitespace-nowrap`}>{name}</td>
+                                                    <td className={`${cell} text-gray-200`}>
+                                                        <span className="whitespace-nowrap">{label(agent)}</span>
+                                                        {agent.kind === 'earlier' && (
+                                                            <span data-ha-node-outdated title={t('haNodeOutdatedHint')}
+                                                                className="ml-2 px-1.5 py-0.5 rounded-full border text-[11px] bg-yellow-500/20 text-yellow-300 border-yellow-500/40">
+                                                                {t('haNodeOutdated')}
+                                                            </span>
+                                                        )}
+                                                    </td>
+                                                    <td className={`${cell} text-gray-200 whitespace-nowrap`}>
+                                                        {typeof recovery === 'number' ? t('haNodeSeconds').replace('{n}', recovery) : '-'}
+                                                    </td>
+                                                    {found && (seen === null ? (
+                                                        <td colSpan={4} className="py-2 text-xs text-red-300" data-ha-node-silent>{t('haNodeNoAnswer')}</td>
+                                                    ) : seen ? (<>
+                                                        <td className={cell}>{yesNo(seen.fence_agent?.active)}</td>
+                                                        <td className={`${cell} font-mono text-xs text-gray-300`}>{seen.fence_agent?.mode || '-'}</td>
+                                                        <td className={cell}>{seen.fence_agent?.version ? yesNo(seen.fence_agent.current) : '-'}</td>
+                                                        <td className="py-2 text-xs whitespace-nowrap" data-ha-node-unreachable={away.length}>
+                                                            {away.length > 0
+                                                                ? <span className="text-red-300">{t('haNodeOutOfReach').replace('{n}', away.length).replace('{total}', check.members.length)}</span>
+                                                                : asks ? <span className="text-green-300">{t('haNodeAllReachable')}</span>
+                                                                : <span className="text-gray-500" title={t('haNodeAsksNobody')}>-</span>}
+                                                        </td>
+                                                    </>) : (
+                                                        <td colSpan={4} className="py-2 text-gray-500">-</td>
+                                                    ))}
+                                                </tr>
+                                                {/* the addresses on a line of their own, a column would squeeze them */}
+                                                {away.length > 0 && (
+                                                    <tr className="border-b border-proxmox-border" data-ha-node-cannot-reach={name}>
+                                                        <td colSpan={7} className="pb-2 text-xs text-red-300">
+                                                            {t('haNodeCannotReach')} <span className="font-mono break-all">{away.join(', ')}</span>
+                                                        </td>
+                                                    </tr>
+                                                )}
+                                            </React.Fragment>
+                                        );
+                                    })}
+                                </tbody>
+                            </table>
+                        </div>
+                    )}
+                    {typeof fa.fence_delay === 'number' && (
+                        <p className="text-xs text-gray-400" data-ha-node-fence-delay>
+                            {t('haNodeFenceDelay').replace('{n}', fa.fence_delay).replace('{version}', () => expected)}
+                        </p>
+                    )}
+                    {unchecked.length > 0 && !found && (
+                        <p className="text-xs text-gray-400">{t('haNodeUncheckedHint')}</p>
+                    )}
+                    {(outdatedText || fa.outdated_settings_warning) && (
+                        <div className="rounded-lg p-3 text-sm border bg-yellow-500/10 border-yellow-500/40 text-yellow-200 space-y-2" data-ha-node-outdated-warning>
+                            {outdatedText && <p>{outdatedText}</p>}
+                            {fa.outdated_settings_warning && <p>{fa.outdated_settings_warning}</p>}
+                        </div>
+                    )}
+                    {silent.length > 0 && (
+                        <p className="text-xs text-red-300">{t('haNodeCheckSilent').replace('{nodes}', () => silent.join(', '))}</p>
+                    )}
+                    {notCurrent.length > 0 && (
+                        <p className="text-xs text-yellow-300">{t('haNodeCheckNotCurrent').replace('{nodes}', () => notCurrent.join(', '))}</p>
+                    )}
+                    {error && <p role="alert" className="text-sm text-red-300" data-ha-node-check-error>{error}</p>}
+                </div>
+            );
+        }
+
+        // The switch for unsafe two-node recovery: off at any time, on only with the word
+        // typed out. And what the rules do to the guests of the node that is left.
+        function HaNodeSafety({ t, clusterId, status, authFetch, addToast, onStatus, locked }) {
+            const [asking, setAsking] = useState(false);
+            const [typed, setTyped] = useState('');
+            const [busy, setBusy] = useState(false);
+            const [error, setError] = useState('');
+            const sbp = status?.split_brain_prevention || {};
+            const known = typeof sbp.unsafe_two_node_recovery === 'boolean';
+            if (!known && !sbp.fenced_survivor_note) return null;
+            const unsafe = sbp.unsafe_two_node_recovery === true;
+            // the switch only means something where quorum gets forced
+            const forces = !!(sbp.two_node_mode || sbp.force_quorum_on_failure);
+
+            const save = async (on) => {
+                setBusy(true);
+                setError('');
+                const body = on ? { unsafe_two_node_recovery: true, confirm_unsafe_two_node: typed }
+                    : { unsafe_two_node_recovery: false };
+                const res = await haNodeSend(authFetch, `${API_URL}/clusters/${clusterId}/ha/config`, 'PUT', body, t('operationFailed'));
+                setBusy(false);
+                if (!res.ok) { setError(res.error); return; }
+                setAsking(false);
+                setTyped('');
+                if (res.data.status) onStatus(res.data.status);
+                addToast(t(on ? 'haNodeUnsafeSavedOn' : 'haNodeUnsafeSavedOff'), on ? 'warning' : 'success');
+            };
+            const toggle = () => {
+                setError('');
+                if (unsafe) { save(false); return; }
+                setTyped('');
+                setAsking(a => !a);
+            };
+
+            return (
+                <div className="p-4 bg-proxmox-dark border border-proxmox-border rounded-xl mb-4 space-y-3" data-ha-node-safety>
+                    <h4 className="font-medium text-white flex items-center gap-2">
+                        <Icons.Shield className="w-4 h-4 text-proxmox-orange" />
+                        {t('haNodeSafetyTitle')}
+                    </h4>
+                    {known && (
+                        <div className="flex items-start justify-between gap-4">
+                            <div className="min-w-0">
+                                <label className="block text-sm font-medium text-white" htmlFor="ha-node-unsafe">{t('haNodeUnsafeSwitch')}</label>
+                                <p className="text-xs text-gray-500 mt-1">{t('haNodeUnsafeHint')}</p>
+                                {!unsafe && !forces && <p className="text-xs text-gray-400 mt-1" data-ha-node-unsafe-idle>{t('haNodeUnsafeNeedsForce')}</p>}
+                            </div>
+                            <button id="ha-node-unsafe" type="button" role="switch" aria-checked={unsafe}
+                                onClick={toggle} disabled={busy || locked || (!unsafe && !forces)}
+                                className={`toggle-switch flex-shrink-0 disabled:opacity-50 disabled:cursor-not-allowed ${unsafe ? 'active' : ''}`} />
+                        </div>
+                    )}
+                    {asking && !unsafe && (
+                        <div className="rounded-lg p-3 space-y-3 border bg-red-500/10 border-red-500/30" data-ha-node-unsafe-confirm>
+                            <p className="text-sm text-red-300">{t('haNodeUnsafeRisk')}</p>
+                            <div>
+                                <label className="block text-xs text-gray-400 mb-1" htmlFor="ha-node-unsafe-typed">
+                                    {t('pgHaTypeToConfirm').replace('{word}', HA_NODE_UNSAFE_WORD)}
+                                </label>
+                                <input id="ha-node-unsafe-typed" value={typed} onChange={e => setTyped(e.target.value)} autoComplete="off"
+                                    className="w-full max-w-xs bg-proxmox-darker border border-proxmox-border rounded-lg px-3 py-2 text-white text-sm font-mono" />
+                            </div>
+                            <div className="flex flex-wrap justify-end gap-2">
+                                <button type="button" onClick={() => { setAsking(false); setTyped(''); setError(''); }}
+                                    className="px-3 py-1.5 text-sm bg-proxmox-dark hover:bg-proxmox-hover border border-proxmox-border rounded-lg">
+                                    {t('cancel')}
+                                </button>
+                                <button type="button" onClick={() => save(true)} disabled={typed !== HA_NODE_UNSAFE_WORD || busy || locked}
+                                    className="px-3 py-1.5 text-sm font-medium bg-red-600 hover:bg-red-700 text-white rounded-lg disabled:opacity-50 disabled:cursor-not-allowed">
+                                    {t('haNodeUnsafeTurnOn')}
+                                </button>
+                            </div>
+                        </div>
+                    )}
+                    {error && <p role="alert" className="text-sm text-red-300" style={{ overflowWrap: 'anywhere' }} data-ha-node-unsafe-error>{error}</p>}
+                    {sbp.fenced_survivor_note && (
+                        <div className="flex items-start gap-2 rounded-lg p-3 text-sm border bg-blue-500/10 border-blue-500/30 text-blue-200" data-ha-node-survivor>
+                            <span className="mt-0.5 flex-shrink-0 text-blue-400"><Icons.Info /></span>
+                            <span>{sbp.fenced_survivor_note}</span>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // How PegaProx powers a failed node off: one row per node. The BMC password is never
+        // sent back by the server, so its field only writes; left empty, the stored one stays.
+        function HaNodeFencing({ t, clusterId, status, nodeNames, authFetch, addToast, onStatus, locked }) {
+            const [draft, setDraft] = useState({});           // node -> {type, host, user, password}, what was touched
+            const [busy, setBusy] = useState(false);
+            const [rowError, setRowError] = useState(null);   // {node, error} the server refused
+            const [error, setError] = useState('');
+            const sbp = status?.split_brain_prevention || {};
+            const stored = sbp.fencing;
+            if (!stored || typeof stored !== 'object') return null;
+
+            const types = Array.isArray(sbp.fence_types) && sbp.fence_types.length ? sbp.fence_types : HA_NODE_FENCE_TYPES;
+            const names = Array.from(new Set([
+                ...(nodeNames || []), ...Object.keys(status.nodes || {}), ...Object.keys(stored),
+            ])).sort();
+            const saved = (node) => {
+                const f = stored[node] || {};
+                return { type: f.type || '', host: f.host || '', user: f.user || '', password: '' };
+            };
+            const rowOf = (node) => draft[node] || saved(node);
+            const edit = (node, key, value) => {
+                setDraft(d => ({ ...d, [node]: { ...(d[node] || saved(node)), [key]: value } }));
+                setRowError(e => e && e.node === node ? null : e);
+            };
+            const changed = names.filter(node => {
+                const row = draft[node];
+                if (!row) return false;
+                const was = saved(node);
+                return row.type !== was.type || row.host.trim() !== was.host || row.user.trim() !== was.user || row.password !== '';
+            });
+
+            const save = async () => {
+                setBusy(true);
+                setRowError(null);
+                setError('');
+                const fencing = {};
+                changed.forEach(node => {
+                    const row = draft[node];
+                    // no type takes the fence of the node away
+                    fencing[node] = row.type ? {
+                        type: row.type, host: row.host.trim(), user: row.user.trim(),
+                        ...(row.password ? { password: row.password } : {}),
+                    } : null;
+                });
+                let res;
+                try {
+                    res = await haNodeSend(authFetch, `${API_URL}/clusters/${clusterId}/ha/config`, 'PUT', { fencing }, t('operationFailed'));
+                } finally {
+                    setBusy(false);
+                    // a typed BMC password goes out with this request and no further: after a
+                    // refusal the rows keep the rest, the password is typed again
+                    setDraft(d => Object.fromEntries(Object.entries(d).map(([n, row]) => [n, { ...row, password: '' }])));
+                }
+                if (!res.ok) {
+                    // "fencing: <node>: <why>" says which row it is about
+                    const why = res.error.replace(/^fencing:\s*/, '');
+                    const node = res.code === 'HA_FENCING_INVALID'
+                        ? names.filter(n => why.startsWith(n + ': ')).sort((a, b) => b.length - a.length)[0] : null;
+                    if (node) setRowError({ node, error: why.slice(node.length + 2) });
+                    else setError(res.error);
+                    return;
+                }
+                setDraft({});
+                if (res.data.status) onStatus(res.data.status);
+                addToast(t('haNodeFencingSaved'));
+            };
+
+            const input = 'w-full bg-proxmox-darker border border-proxmox-border rounded px-2 py-1 text-white text-sm disabled:opacity-50';
+            const cell = 'py-2 pr-2';
+            return (
+                <div className="p-4 bg-proxmox-dark border border-proxmox-border rounded-xl mb-4 space-y-3" data-ha-node-fencing>
+                    <h4 className="font-medium text-white flex items-center gap-2">
+                        <Icons.Power className="w-4 h-4 text-proxmox-orange" />
+                        {t('haNodeFencingTitle')}
+                    </h4>
+                    <p className="text-xs text-gray-400">{t('haNodeFencingHint')}</p>
+                    {names.length === 0 ? (
+                        <p className="text-sm text-gray-500">{t('haNodeFencingNoNodes')}</p>
+                    ) : (
+                        <div className="overflow-x-auto">
+                            <table className="w-full text-sm">
+                                <thead>
+                                    <tr className="text-left text-xs text-gray-500 border-b border-proxmox-border">
+                                        <th className={`${cell} font-medium`}>{t('node')}</th>
+                                        <th className={`${cell} font-medium`}>{t('type')}</th>
+                                        <th className={`${cell} font-medium`}>{t('host')}</th>
+                                        <th className={`${cell} font-medium`}>{t('user')}</th>
+                                        <th className="py-2 font-medium">{t('password')}</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {names.map(node => {
+                                        const row = rowOf(node);
+                                        const was = stored[node];
+                                        // the stored password stays only while the type does
+                                        const keeps = !!was?.password_set && row.type === was.type;
+                                        const off = !row.type || locked || busy;
+                                        const bad = rowError && rowError.node === node;
+                                        return (
+                                            <React.Fragment key={node}>
+                                                <tr data-ha-node-fence={node} className={bad ? '' : 'border-b border-proxmox-border'}>
+                                                    <td className={`${cell} whitespace-nowrap`}>
+                                                        <span className="font-mono text-xs text-gray-200">{node}</span>
+                                                        {was && (was.verifiable ? (
+                                                            <span title={t('haNodeFenceVerifiableHint')} data-ha-node-verifiable
+                                                                className="ml-2 px-1.5 py-0.5 rounded-full border text-[11px] bg-green-500/20 text-green-300 border-green-500/30">
+                                                                {t('haNodeFenceVerifiable')}
+                                                            </span>
+                                                        ) : (
+                                                            <span title={t('haNodeFenceUnverifiedHint')}
+                                                                className="ml-2 px-1.5 py-0.5 rounded-full border text-[11px] bg-gray-500/20 text-gray-300 border-gray-500/30">
+                                                                {t('haNodeFenceUnverified')}
+                                                            </span>
+                                                        ))}
+                                                    </td>
+                                                    <td className={cell} style={{ minWidth: 104 }}>
+                                                        <select value={row.type} onChange={e => edit(node, 'type', e.target.value)} disabled={locked || busy}
+                                                            aria-label={`${t('type')} ${node}`} aria-invalid={bad ? 'true' : undefined} className={input}>
+                                                            <option value="">{t('haNodeFenceNone')}</option>
+                                                            {types.map(k => <option key={k} value={k}>{k}</option>)}
+                                                            {row.type && !types.includes(row.type) && <option value={row.type}>{row.type}</option>}
+                                                        </select>
+                                                    </td>
+                                                    <td className={cell} style={{ minWidth: 140 }}>
+                                                        <input value={row.host} onChange={e => edit(node, 'host', e.target.value)} disabled={off}
+                                                            aria-label={`${t('host')} ${node}`} autoComplete="off"
+                                                            placeholder={row.type === 'ipmi' ? t('haNodeFenceBmc') : row.type === 'ssh' ? node : ''}
+                                                            className={input} />
+                                                    </td>
+                                                    <td className={cell} style={{ minWidth: 100 }}>
+                                                        <input value={row.user} onChange={e => edit(node, 'user', e.target.value)} disabled={off}
+                                                            aria-label={`${t('user')} ${node}`} autoComplete="off"
+                                                            placeholder={row.type === 'ipmi' ? 'ADMIN' : row.type === 'ssh' ? 'root' : ''}
+                                                            className={input} />
+                                                    </td>
+                                                    <td className="py-2" style={{ minWidth: 120 }}>
+                                                        <input type="password" value={row.password} onChange={e => edit(node, 'password', e.target.value)}
+                                                            disabled={off} aria-label={`${t('password')} ${node}`}
+                                                            autoComplete="new-password" data-lpignore="true" data-1p-ignore="true" data-bwignore="true"
+                                                            placeholder={keeps ? t('haNodeFenceUnchanged') : ''} className={input} />
+                                                    </td>
+                                                </tr>
+                                                {bad && (
+                                                    <tr className="border-b border-proxmox-border" data-ha-node-fence-error={node}>
+                                                        <td colSpan={5} className="pb-2">
+                                                            <p role="alert" className="rounded px-2 py-1 text-xs border bg-red-500/10 border-red-500/30 text-red-300" style={{ overflowWrap: 'anywhere' }}>
+                                                                {rowError.error}
+                                                            </p>
+                                                        </td>
+                                                    </tr>
+                                                )}
+                                            </React.Fragment>
+                                        );
+                                    })}
+                                </tbody>
+                            </table>
+                        </div>
+                    )}
+                    {error && <p role="alert" className="text-sm text-red-300" style={{ overflowWrap: 'anywhere' }} data-ha-node-fencing-error>{error}</p>}
+                    {names.length > 0 && (
+                        <div className="flex justify-end">
+                            <button type="button" onClick={save} disabled={!changed.length || busy || locked}
+                                className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium bg-proxmox-orange hover:bg-orange-600 text-white disabled:opacity-50 disabled:cursor-not-allowed">
+                                <Icons.Save className="w-4 h-4" />
+                                {t('haNodeFencingSave')}
+                            </button>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // The cluster claim: off unless an admin writes it, with the account password and
+        // the words typed out. A claim of another instance is taken over the same way, and
+        // switching it off says what became of the file.
+        function HaNodeClaim({ t, clusterId, status, authFetch, addToast, onStatus, locked }) {
+            const { language } = useTranslation();
+            const { user, isAdmin, logout } = useAuth();
+            const [action, setAction] = useState(null);       // 'enable' | 'disable' | 'release' while its form is open
+            const [typed, setTyped] = useState('');
+            const [password, setPassword] = useState('');
+            const [busy, setBusy] = useState(false);
+            const [refused, setRefused] = useState(null);     // {code, error} of the last refusal
+            const [answer, setAnswer] = useState(null);       // {removed, warning, by_hand} of the last switch off
+            const claim = status?.cluster_claim;
+            if (!claim || typeof claim !== 'object') return null;
+
+            const on = claim.enabled === true;
+            const state = on ? (claim.state || 'unknown') : 'off';
+            const kind = haNodeClaimKind(state);
+            const foreign = on && HA_NODE_CLAIM_FOREIGN.includes(state);
+            // SSO accounts have no password here: the server asks for a fresh sign-in instead
+            const sso = ['oidc', 'entra'].includes(user?.auth_source);
+            const word = HA_NODE_CLAIM_WORD[action] || '';
+            const ready = !!action && (sso || !!password) && (!word || typed === word);
+            const open = (what) => {
+                setAction(what);
+                setTyped('');
+                setPassword('');
+                setRefused(null);
+                if (what) setAnswer(null);
+            };
+
+            const send = async () => {
+                const what = action;
+                setBusy(true);
+                setRefused(null);
+                const body = { action: what, ...(word ? { confirm: typed } : {}), ...(sso ? {} : { user_password: password }) };
+                let res;
+                try {
+                    res = await haNodeSend(authFetch, `${API_URL}/clusters/${clusterId}/ha/claim`, 'POST', body, t('operationFailed'));
+                } finally {
+                    setBusy(false);
+                    // the account password is for this request alone, whatever the answer
+                    setPassword('');
+                }
+                // a refusal can carry the claim as it is now too (a release of our own claim)
+                const now = res.data && res.data.claim && typeof res.data.claim === 'object' ? res.data.claim : null;
+                if (now) onStatus(s => ({ ...(s || {}), cluster_claim: now }));
+                if (!res.ok) {
+                    setRefused({ code: res.code, error: res.error });
+                    return;
+                }
+                open(null);
+                if (what === 'disable') {
+                    setAnswer({ removed: res.data.removed, warning: res.data.warning, by_hand: res.data.by_hand });
+                    addToast(t('haNodeClaimSwitchedOff'), res.data.warning ? 'warning' : 'success');
+                    return;
+                }
+                const result = now?.state;
+                if (result === 'ours') addToast(t(what === 'release' ? 'haNodeClaimTakenOver' : 'haNodeClaimSwitchedOn'));
+                else addToast(t(HA_NODE_CLAIM_MEANS[result] || 'haNodeClaimMeansUnknown'), 'warning');
+            };
+
+            const reauth = refused && (refused.code === 'HA_REAUTH' || refused.code === 'HA_REAUTH_RECENT');
+            const field = 'w-full bg-proxmox-darker border border-proxmox-border rounded-lg px-3 py-2 text-white text-sm';
+            return (
+                <div className="p-4 bg-proxmox-dark border border-proxmox-border rounded-xl mb-4 space-y-3" data-ha-node-claim={state}>
+                    <div className="flex items-start justify-between gap-4">
+                        <div className="min-w-0">
+                            <h4 className="font-medium text-white flex flex-wrap items-center gap-2">
+                                <Icons.Lock className="w-4 h-4 text-proxmox-orange" />
+                                <label htmlFor="ha-node-claim">{t('haNodeClaimTitle')}</label>
+                                <span data-ha-node-claim-state={kind}
+                                    className={`px-2 py-0.5 rounded-full border text-xs font-medium ${HA_NODE_CLAIM_TONE[kind]}`}>
+                                    {t(HA_NODE_CLAIM_LABEL[kind])}
+                                </span>
+                            </h4>
+                            <p className="text-xs text-gray-500 font-mono mt-1 break-all">{claim.path || '/etc/pve/pegaprox/claim'}</p>
+                        </div>
+                        <button id="ha-node-claim" type="button" role="switch" aria-checked={on}
+                            title={isAdmin ? undefined : t('haNodeClaimAdminOnly')}
+                            onClick={() => open(action ? null : on ? 'disable' : 'enable')}
+                            disabled={busy || locked || !isAdmin}
+                            className={`toggle-switch flex-shrink-0 disabled:opacity-50 disabled:cursor-not-allowed ${on ? 'active' : ''}`} />
+                    </div>
+                    {on && HA_NODE_CLAIM_MEANS[state] && (
+                        <p className={`text-sm ${kind === 'ours' ? 'text-green-300' : kind === 'foreign' || kind === 'unreadable' ? 'text-red-300' : 'text-gray-300'}`}
+                            data-ha-node-claim-means>
+                            {t(HA_NODE_CLAIM_MEANS[state])}
+                        </p>
+                    )}
+                    {on && (claim.instance || claim.checked_at) && (
+                        <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-gray-400">
+                            {claim.instance && (
+                                <span title={claim.instance}>
+                                    {t('haNodeClaimHolder').replace('{instance}', () => String(claim.instance).slice(0, 8))
+                                        .replace('{epoch}', () => claim.epoch ?? '-')}
+                                </span>
+                            )}
+                            {claim.checked_at && (
+                                <span title={fmtDate(claim.checked_at)}>{t('haNodeClaimChecked').replace('{time}', haRelTime(claim.checked_at, language))}</span>
+                            )}
+                        </div>
+                    )}
+                    {claim.warning && <p className="text-xs text-gray-400">{claim.warning}</p>}
+                    {claim.residual && (
+                        <p className="text-xs text-yellow-300" data-ha-node-claim-residual>{claim.residual}</p>
+                    )}
+                    {!isAdmin && <p className="text-xs text-gray-500">{t('haNodeClaimAdminOnly')}</p>}
+                    {foreign && isAdmin && !action && (
+                        <button type="button" onClick={() => open('release')} disabled={busy || locked}
+                            className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium bg-red-600 hover:bg-red-700 text-white disabled:opacity-50 disabled:cursor-not-allowed">
+                            <Icons.Unlock className="w-4 h-4" />
+                            {t('haNodeClaimRelease')}
+                        </button>
+                    )}
+                    {action && (
+                        <div className={`rounded-lg p-3 space-y-3 border ${action === 'disable' ? 'bg-proxmox-darker border-proxmox-border' : 'bg-red-500/10 border-red-500/30'}`}
+                            data-ha-node-claim-form={action}>
+                            <p className={`text-sm ${action === 'disable' ? 'text-gray-300' : 'text-red-300'}`}>
+                                {t(action === 'enable' ? 'haNodeClaimEnableDesc' : action === 'release' ? 'haNodeClaimReleaseDesc' : 'haNodeClaimDisableDesc')}
+                            </p>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                {!sso && (
+                                    <div>
+                                        <label className="block text-xs text-gray-400 mb-1" htmlFor="ha-node-claim-password">{t('pgHaPassword')}</label>
+                                        <input id="ha-node-claim-password" type="password" autoComplete="current-password"
+                                            data-lpignore="true" data-1p-ignore="true" data-bwignore="true"
+                                            value={password} onChange={e => setPassword(e.target.value)}
+                                            aria-invalid={reauth ? 'true' : undefined} className={field} />
+                                    </div>
+                                )}
+                                {word && (
+                                    <div>
+                                        <label className="block text-xs text-gray-400 mb-1" htmlFor="ha-node-claim-typed">
+                                            {t('pgHaTypeToConfirm').replace('{word}', word)}
+                                        </label>
+                                        <input id="ha-node-claim-typed" value={typed} onChange={e => setTyped(e.target.value)} autoComplete="off"
+                                            className={`${field} font-mono`} />
+                                    </div>
+                                )}
+                            </div>
+                            {refused && (
+                                <div role="alert" data-ha-node-claim-refused={refused.code || 'error'}
+                                    className="rounded-lg p-2 text-sm border bg-red-500/10 border-red-500/30 text-red-300 space-y-2">
+                                    <div style={{ overflowWrap: 'anywhere' }}>{refused.error}</div>
+                                    {refused.code === 'HA_REAUTH_RECENT' && (
+                                        <button type="button" onClick={() => logout()}
+                                            className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white hover:border-gray-500">
+                                            <Icons.LogOut />
+                                            {t('pgHaSignInAgain')}
+                                        </button>
+                                    )}
+                                </div>
+                            )}
+                            <div className="flex flex-wrap justify-end gap-2">
+                                <button type="button" onClick={() => open(null)}
+                                    className="px-3 py-1.5 text-sm bg-proxmox-dark hover:bg-proxmox-hover border border-proxmox-border rounded-lg">
+                                    {t('cancel')}
+                                </button>
+                                <button type="button" onClick={send} disabled={!ready || busy || locked}
+                                    className={`px-3 py-1.5 text-sm font-medium text-white rounded-lg disabled:opacity-50 disabled:cursor-not-allowed ${action === 'disable' ? 'bg-proxmox-orange hover:bg-orange-600' : 'bg-red-600 hover:bg-red-700'}`}>
+                                    {t(action === 'enable' ? 'haNodeClaimEnable' : action === 'release' ? 'haNodeClaimRelease' : 'haNodeClaimDisable')}
+                                </button>
+                            </div>
+                        </div>
+                    )}
+                    {answer && (
+                        <div className={`rounded-lg p-3 text-sm border space-y-2 ${answer.warning ? 'bg-yellow-500/10 border-yellow-500/40 text-yellow-200' : 'bg-green-500/10 border-green-500/30 text-green-300'}`}
+                            data-ha-node-claim-answer={answer.removed || ''}>
+                            {answer.removed === 'removed' && <p>{t('haNodeClaimFileRemoved')}</p>}
+                            {answer.removed === 'absent' && <p>{t('haNodeClaimFileAbsent')}</p>}
+                            {answer.warning && <HaNodeText text={answer.warning} t={t} />}
+                            {answer.by_hand && !String(answer.warning || '').includes(answer.by_hand) && (<>
+                                <p>{t('haNodeByHand')}</p>
+                                <HaNodeCommand value={answer.by_hand} t={t} />
+                            </>)}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // HA is off, but the server could not tell for every node that its agents are gone, or
+        // could not take the claim off: its words stay on screen until the admin closes them
+        function HaNodeDisableReport({ report, onClose, t }) {
+            const failed = Array.isArray(report.agents_failed) ? report.agents_failed : [];
+            const unconfirmed = Array.isArray(report.agents_unconfirmed) ? report.agents_unconfirmed : [];
+            const byHand = report.claim && report.claim.by_hand;
+            return (
+                <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4" onClick={onClose}>
+                    <div role="alertdialog" aria-labelledby="ha-node-disable-title" data-ha-node-disable-report onClick={e => e.stopPropagation()}
+                        className="bg-proxmox-card border border-yellow-500/40 rounded-xl w-full max-w-xl max-h-[85vh] overflow-y-auto">
+                        <div className="flex items-start gap-3 p-4 border-b border-proxmox-border bg-proxmox-dark">
+                            <span className="mt-1 flex-shrink-0 text-yellow-400"><Icons.AlertTriangle /></span>
+                            <div className="min-w-0">
+                                <h2 id="ha-node-disable-title" className="text-lg font-semibold text-white">{t('haNodeDisableTitle')}</h2>
+                                {report.cluster && <p className="text-sm text-gray-500">{report.cluster}</p>}
+                            </div>
+                        </div>
+                        <div className="p-4 space-y-3">
+                            {failed.length > 0 && (
+                                <p className="text-sm text-red-300" data-ha-node-disable-failed>{t('haNodeDisableFailed').replace('{nodes}', () => failed.join(', '))}</p>
+                            )}
+                            {unconfirmed.length > 0 && (
+                                <p className="text-sm text-yellow-300" data-ha-node-disable-unconfirmed>{t('haNodeDisableUnconfirmed').replace('{nodes}', () => unconfirmed.join(', '))}</p>
+                            )}
+                            <HaNodeText text={report.warning} t={t} className="text-sm text-gray-200" />
+                            {byHand && !String(report.warning || '').includes(byHand) && <HaNodeCommand value={byHand} t={t} />}
+                        </div>
+                        <div className="flex justify-end p-4 border-t border-proxmox-border bg-proxmox-dark">
+                            <button type="button" onClick={onClose} autoFocus
+                                className="px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-white">
+                                {t('close')}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
         function PegaProxDashboard() {
             const { t } = useTranslation();
             const { user, sessionId, logout, getAuthHeaders, isAdmin, passwordExpiry, updatePreferences, ha, haReadOnly, haStandby, haConsolesElsewhere, haServing, refreshHa } = useAuth();
@@ -8127,6 +8927,9 @@
             // what the account holds, the standby rule aside: only for a tab that just reads,
             // so a standby keeps showing it (#625); its buttons still ask can()
             const holds = (permission) => isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes(permission));
+            // #625: the node HA parts of the HA settings write through routes that want
+            // ha.config; with ha.view alone they show what is set and change nothing
+            const haWrite = can('ha.config');
             // not can(): the auto-install routes also refuse tenant/cluster-confined callers
             // (capped admins included), the server folds that into this flag for us
             const canAutoInstall = !!user?.autoinstall_access;
@@ -8619,7 +9422,7 @@
             
             // HA Settings state
             // NS: these defaults should probably come from backend
-            const [haSettings, setHaSettings] = useState({
+            const haSettingsDefaults = {
                 quorum_enabled: true,
                 quorum_hosts: '',
                 quorum_gateway: '',
@@ -8637,9 +9440,15 @@
                 poison_pill_enabled: true,
                 strict_fencing: false,
                 pegaprox_vmid: '',
-            });
+            };
+            const [haSettings, setHaSettings] = useState(haSettingsDefaults);
             const [haStatus, setHaStatus] = useState(null);
+            // the status request of the selected cluster failed: {text} with the server's words
+            const [haStatusError, setHaStatusError] = useState(null);
             const [showHaSettings, setShowHaSettings] = useState(false);
+            // #625: the last agent check of the open HA settings, and what HA disable left behind
+            const [haAgentCheck, setHaAgentCheck] = useState(null);
+            const [haDisableReport, setHaDisableReport] = useState(null);
             
             // NS: Global Search state - Jan 2026
             const [globalSearchQuery, setGlobalSearchQuery] = useState('');
@@ -10701,11 +11510,19 @@
             // HA Settings functions
             const fetchHAStatus = async (clusterId) => {
                 if (!clusterId) return;
+                // the HA settings show this instead of a form while no status has come
+                const failed = (text) => {
+                    if (selectedClusterRef.current?.id === clusterId) setHaStatusError({ text });
+                };
                 try {
                     const response = await authFetch(`${API_URL}/clusters/${clusterId}/ha/status`);
                     if (response && response.ok) {
                         const data = await response.json();
+                        // an answer for a cluster that is no longer the selected one fills
+                        // nothing: the HA settings would show it and write to the other (#625)
+                        if (selectedClusterRef.current?.id !== clusterId) return;
                         setHaStatus(data);
+                        setHaStatusError(null);
                         setHaSettings({
                             quorum_enabled: data.split_brain_prevention?.quorum_enabled ?? true,
                             quorum_hosts: (data.split_brain_prevention?.quorum_hosts || []).join(', '),
@@ -10749,14 +11566,54 @@
                             });
                             setNodeAlerts(newAlerts);
                         }
+                    } else {
+                        failed(await PegaProxApiErrors.message(response, ''));
                     }
                 } catch (err) {
                     console.error('fetching HA status:', err);
+                    failed('');
+                }
+            };
+
+            // the node HA parts read the status again after a change of theirs; unlike
+            // fetchHAStatus this leaves the form above them as the admin typed it
+            const reloadHaStatus = async () => {
+                const id = selectedCluster?.id;
+                if (!id) return;
+                const r = await authFetch(`${API_URL}/clusters/${id}/ha/status`);
+                if (r && r.ok && selectedClusterRef.current?.id === id) {
+                    const data = await r.json();
+                    setHaStatus(s => s ? data : s);
+                }
+            };
+
+            // what a node part was answered goes to the cluster it asked for; an answer that
+            // comes once another cluster is selected would fill that one's settings
+            const haFor = (id, set) => (v) => { if (selectedClusterRef.current?.id === id) set(v); };
+            // and it only updates a status that was loaded: an answer that lands while the
+            // settings were reopened and are still loading would show a form of defaults
+            const haStatusFor = (id) => haFor(id, (v) => setHaStatus(s => s ? (typeof v === 'function' ? v(s) : v) : s));
+
+            const installSelfFence = async () => {
+                try {
+                    const res = await authFetch(`${API_URL}/clusters/${selectedCluster.id}/ha/install-self-fence`, { method: 'POST' });
+                    if (res && res.ok) {
+                        addToast(t('selfFenceInstalling'), 'success');
+                        // what the last check read is out of date once the agents are replaced
+                        setHaAgentCheck(null);
+                        setTimeout(() => fetchHAStatus(selectedCluster.id), 5000);
+                    } else {
+                        // a refused upgrade said nothing before
+                        addToast(await PegaProxApiErrors.message(res, t('operationFailed')), 'error');
+                    }
+                } catch (e) {
+                    addToast(t('error') + ': ' + e.message, 'error');
                 }
             };
 
             const handleSaveHASettings = async () => {
-                if (!selectedCluster) return;
+                // the form holds this cluster's values only once its status is here
+                if (!selectedCluster || !haStatus || !haWrite || haReadOnly) return;
                 try {
                     const response = await authFetch(`${API_URL}/clusters/${selectedCluster.id}/ha/config`, {
                         method: 'PUT',
@@ -10773,6 +11630,11 @@
                             // 2-Node Cluster Mode - uses cluster credentials automatically
                             two_node_mode: haSettings.two_node_mode,
                             force_quorum_on_failure: haSettings.two_node_mode,
+                            // #625: what the status shows as off is saved as off. A flag stored on
+                            // under a 2-node mode that was off must not come back with it; going
+                            // unsafe is the switch below, with its word typed out. Never true from here.
+                            ...(haStatus?.split_brain_prevention?.unsafe_two_node_recovery === false
+                                ? { unsafe_two_node_recovery: false } : {}),
                             // Storage-based Split-Brain Protection - NS Jan 2026
                             storage_heartbeat_enabled: haSettings.storage_heartbeat_enabled,
                             storage_heartbeat_path: haSettings.storage_heartbeat_path,
@@ -10895,6 +11757,9 @@
 
             // Fetch tasks when cluster changes
             useEffect(() => {
+                // LW Oct 2026 (#625) - the HA settings belong to the cluster they were opened
+                // for: a switch through the palette must not leave them open on another one
+                setShowHaSettings(false);
                 if (selectedCluster) {
                     console.log('Cluster changed, fetching tasks for:', selectedCluster.id);
                     taskUpdateTimestamp.current = 0;
@@ -13266,7 +14131,11 @@
                     
                     if (response && response.ok) {
                         setSelectedCluster(prev => prev ? {...prev, ha_enabled: enable} : prev);
-                        addToast(enable ? t('haEnabled') : t('haDisabled'));
+                        // #625: HA is off, but agents the server could not confirm as gone, or a
+                        // cluster claim it could not remove, are still out there. Its words stay up.
+                        const done = enable ? null : await response.json().catch(() => null);
+                        if (done && done.warning) setHaDisableReport({ ...done, cluster: selectedCluster.name });
+                        else addToast(enable ? t('haEnabled') : t('haDisabled'));
                         
                         // Also update the clusters list
                         setClusters(prev => prev.map(c => 
@@ -14288,6 +15157,7 @@
                     {/* LW: Password Expiry Warning */}
                     <PasswordExpiryBanner onChangePassword={() => setShowProfile(true)} />
                     <HaStandbyBanner onOpenHa={openHaSettings} />
+                    <HaCopiesBanner onOpenHa={openHaSettings} />
                     
                     {/* Node Offline Alert Banner */}
                     <NodeAlertBanner 
@@ -17665,7 +18535,7 @@
                                                                     <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 p-4" onClick={() => setHardenConfirm(null)}>
                                                                         <div className="bg-proxmox-card border border-proxmox-border rounded-xl max-w-lg w-full p-5" onClick={e => e.stopPropagation()}>
                                                                             <h3 className="text-base font-semibold text-white mb-2 flex items-center gap-2"><Icons.Shield className="w-4 h-4 text-green-400" /> {t('hardenApplyTitle') || 'Apply hardening controls'}</h3>
-                                                                            <p className="text-sm text-gray-400 mb-3">{(t('hardenApplyBody') || 'This applies {n} control(s) to "{node}". System configuration files will be modified; some changes may require a reboot.').replace('{n}', hardenConfirm.toApply.length).replace('{node}', hardenNode)}</p>
+                                                                            <p className="text-sm text-gray-400 mb-3">{(t('hardenApplyBody') || 'This applies {n} control(s) to "{node}". System configuration files will be modified; some changes may require a reboot.').replace('{n}', hardenConfirm.toApply.length).replace('{node}', () => hardenNode)}</p>
                                                                             {hardenConfirm.needsLockoutAck && (
                                                                                 <div className="rounded-lg bg-red-500/10 border border-red-500/40 p-3 mb-3">
                                                                                     <p className="text-xs text-red-300 mb-2 leading-snug">⚠ {t('cmSshdRootLockoutNote')}</p>
@@ -19106,11 +19976,14 @@
                                                     <div className="pt-4 border-t border-proxmox-border">
                                                         <h4 className="text-sm font-medium text-gray-400 mb-3">{t('highAvailability')}</h4>
                                                         <div className="space-y-3">
-                                                            <Toggle
-                                                                checked={selectedCluster.ha_enabled || false}
-                                                                onChange={v => updateConfig('ha_enabled', v)}
-                                                                label={t('haEnabled')}
-                                                            />
+                                                            {/* LW Oct 2026 (#625) - switching HA on or off wants ha.config */}
+                                                            <div className={haWrite ? '' : 'opacity-50 pointer-events-none'} aria-disabled={!haWrite}>
+                                                                <Toggle
+                                                                    checked={selectedCluster.ha_enabled || false}
+                                                                    onChange={v => { if (haWrite) updateConfig('ha_enabled', v); }}
+                                                                    label={t('haEnabled')}
+                                                                />
+                                                            </div>
                                                             <div className="text-xs text-gray-500 pl-12">
                                                                 {t('haMonitorDesc')}
                                                             </div>
@@ -19154,7 +20027,7 @@
                                                             {/* Split-Brain Prevention Settings Button */}
                                                             {selectedCluster.ha_enabled && (
                                                                 <button
-                                                                    onClick={() => { setShowHaSettings(true); fetchHAStatus(selectedCluster.id); }}
+                                                                    onClick={() => { setShowHaSettings(true); setHaAgentCheck(null); setHaStatus(null); setHaStatusError(null); setHaSettings(haSettingsDefaults); fetchHAStatus(selectedCluster.id); }}
                                                                     className="ml-12 mt-2 text-xs text-proxmox-orange hover:text-orange-400 flex items-center gap-1"
                                                                 >
                                                                     <Icons.Settings className="w-3 h-3" />
@@ -23230,7 +24103,7 @@
                                         {pbsTestResult && (
                                             <div className={`p-3 rounded-lg text-sm ${pbsTestResult.success ? 'bg-green-500/10 border border-green-500/30 text-green-400' : 'bg-red-500/10 border border-red-500/30 text-red-400'}`}>
                                                 {pbsTestResult.success ? (
-                                                    <span>{(t('pbsConnectionSuccessful') || 'Connection successful! PBS v{version} - {datastores} datastore(s)').replace('{version}', pbsTestResult.version?.version ?? '').replace('{datastores}', pbsTestResult.datastores ?? '')}</span>
+                                                    <span>{(t('pbsConnectionSuccessful') || 'Connection successful! PBS v{version} - {datastores} datastore(s)').replace('{version}', () => pbsTestResult.version?.version ?? '').replace('{datastores}', () => pbsTestResult.datastores ?? '')}</span>
                                                 ) : (
                                                     <span>{t('connectionFailed') || 'Connection failed'}: {pbsTestResult.error}</span>
                                                 )}
@@ -23717,7 +24590,7 @@
                     {/* HA Split-Brain Prevention Settings Modal */}
                     {showHaSettings && selectedCluster && (
                         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4" onClick={() => setShowHaSettings(false)}>
-                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl w-full max-w-xl max-h-[85vh] overflow-hidden" onClick={e => e.stopPropagation()}>
+                            <div data-ha-cluster-settings className={`bg-proxmox-card border border-proxmox-border rounded-xl w-full ${haNodePartsShown(haStatus) ? 'max-w-3xl' : 'max-w-xl'} max-h-[85vh] overflow-hidden`} onClick={e => e.stopPropagation()}>
                                 <div className="flex justify-between items-center p-4 border-b border-proxmox-border bg-proxmox-dark">
                                     <div>
                                         <h2 className="text-lg font-semibold text-white flex items-center gap-2">
@@ -23732,248 +24605,296 @@
                                 </div>
                                 
                                 <div className="p-4 overflow-y-auto" style={{ maxHeight: 'calc(85vh - 140px)' }}>
-                                    {/* MK 2026-06-03: HA fence-strategy banner — surfaces the result of
-                                        _ha_detect_fence_strategy from the server. 'wait' = 2-node-no-qdevice,
-                                        we explicitly skip auto-fencing so a planned reboot can't take the cluster
-                                        down. Banner is the load-bearing signal: admins reading the HA dashboard
-                                        now SEE that auto-fencing is disabled and why, instead of having to grep
-                                        /var/log/pegaprox-agent.log on each node. */}
-                                    {(() => {
-                                        const fs = haStatus?.split_brain_prevention?.fence_strategy;
-                                        const warn = haStatus?.split_brain_prevention?.fence_strategy_warning;
-                                        if (!fs && !warn) return null;
-                                        const strat = fs?.strategy || 'unknown';
-                                        const colour = (
-                                            strat === 'wait'    ? 'bg-yellow-500/10 border-yellow-500/30 text-yellow-300' :
-                                            strat === 'quorum'  ? 'bg-blue-500/10 border-blue-500/30 text-blue-300' :
-                                                                  'bg-gray-500/10 border-gray-500/30 text-gray-300'
-                                        );
-                                        const icon = strat === 'wait' ? '⚠️' : strat === 'quorum' ? '🛡️' : 'ℹ️';
-                                        return (
-                                            <div className={`p-4 ${colour} border rounded-xl mb-4`}>
-                                                <div className="flex items-center gap-2 mb-2">
-                                                    <span className="text-xl">{icon}</span>
-                                                    <h4 className="font-medium">
-                                                        {t('fenceStrategyLabel') || 'Fence strategy'}: <span className="font-mono text-sm uppercase">{strat}</span>
-                                                    </h4>
-                                                    {fs?.expected_votes != null && (
-                                                        <span className="text-xs opacity-70 ml-auto">
-                                                            {fs.expected_votes} votes · qdevice: {fs.has_qdevice ? 'yes' : 'no'}
-                                                        </span>
-                                                    )}
-                                                </div>
-                                                {warn && (
-                                                    <p className="text-sm mb-2">{warn}</p>
-                                                )}
-                                                {fs?.reason && (
-                                                    <p className="text-xs opacity-80">{fs.reason}</p>
-                                                )}
-                                                {fs?.detected_at && (
-                                                    <p className="text-xs opacity-60 mt-2">
-                                                        {t('detectedAt') || 'detected'}: {new Date(fs.detected_at).toLocaleString()}
-                                                    </p>
-                                                )}
-                                            </div>
-                                        );
-                                    })()}
-
-                                    {/* SELF-FENCE - Main Feature */}
-                                    <div className="p-4 bg-green-500/10 border border-green-500/30 rounded-xl mb-4">
-                                        <div className="flex items-center gap-2 mb-3">
-                                            <span className="text-2xl">🛡️</span>
-                                            <h4 className="text-green-400 font-medium">{t('selfFenceProtection')}</h4>
-                                            <span className="px-2 py-1 rounded text-xs bg-green-500/20 text-green-400 ml-auto">
-                                                {t('recommended')}
-                                            </span>
-                                        </div>
-                                        
-                                        <p className="text-sm text-gray-300 mb-3">
-                                            {t('selfFenceExplain')}
-                                        </p>
-                                        
-                                        {/* Status */}
-                                        {haStatus?.self_fence_installed ? (
-                                            <div className="p-3 bg-green-500/20 rounded-lg">
-                                                <div className="flex items-center justify-between">
-                                                    <div>
-                                                        <p className="text-green-400 font-medium">✅ {t('selfFenceActive')}</p>
-                                                        <p className="text-xs text-gray-400 mt-1">
-                                                            {t('agentInstalledOnNodes')}: {haStatus.self_fence_nodes?.join(', ') || t('allNodes')}
-                                                        </p>
-                                                    </div>
-                                                    <button
-                                                        onClick={async () => {
-                                                            if (!confirm(t('confirmUninstallAgent'))) return;
-                                                            try {
-                                                                const res = await authFetch(`${API_URL}/clusters/${selectedCluster.id}/ha/uninstall-self-fence`, { method: 'POST' });
-                                                                if (res.ok) {
-                                                                    addToast(t('selfFenceUninstalling'), 'success');
-                                                                    setTimeout(() => fetchHAStatus(selectedCluster.id), 3000);
-                                                                }
-                                                            } catch (e) {
-                                                                addToast(t('error') + ': ' + e.message, 'error');
-                                                            }
-                                                        }}
-                                                        className="px-3 py-1 text-xs bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded-lg"
-                                                    >
-                                                        {t('uninstall')}
-                                                    </button>
-                                                </div>
+                                    {/* the form fills from this cluster's status: until that is here it shows nothing
+                                        and Save stays off, so no value of the cluster before is written to this one */}
+                                    {!haStatus ? (
+                                        haStatusError ? (
+                                            <div role="alert" data-ha-settings-error className="p-3 rounded-lg border bg-red-500/10 border-red-500/30 text-sm text-red-300 space-y-1">
+                                                <p>{t('haSettingsLoadFailed')}</p>
+                                                {haStatusError.text && <p style={{ overflowWrap: 'anywhere' }}>{haStatusError.text}</p>}
                                             </div>
                                         ) : (
-                                            <div className="space-y-3">
+                                            <p data-ha-settings-loading className="flex items-center gap-2 text-sm text-gray-400">
+                                                <span className="inline-flex animate-spin"><Icons.RefreshCw className="w-4 h-4" /></span>
+                                                {t('loading')}
+                                            </p>
+                                        )
+                                    ) : (<>
+                                        <HaNodeWarnings status={haStatus} t={t} />
+
+                                        {/* MK 2026-06-03: HA fence-strategy banner - surfaces the result of
+                                            _ha_detect_fence_strategy from the server. 'wait' = 2-node-no-qdevice,
+                                            we explicitly skip auto-fencing so a planned reboot can't take the cluster
+                                            down. Banner is the load-bearing signal: admins reading the HA dashboard
+                                            now SEE that auto-fencing is disabled and why, instead of having to grep
+                                            /var/log/pegaprox-agent.log on each node. */}
+                                        {(() => {
+                                            const fs = haStatus?.split_brain_prevention?.fence_strategy;
+                                            const warn = haStatus?.split_brain_prevention?.fence_strategy_warning;
+                                            if (!fs && !warn) return null;
+                                            const strat = fs?.strategy || 'unknown';
+                                            const colour = (
+                                                strat === 'wait'    ? 'bg-yellow-500/10 border-yellow-500/30 text-yellow-300' :
+                                                strat === 'quorum'  ? 'bg-blue-500/10 border-blue-500/30 text-blue-300' :
+                                                                      'bg-gray-500/10 border-gray-500/30 text-gray-300'
+                                            );
+                                            const icon = strat === 'wait' ? '⚠️' : strat === 'quorum' ? '🛡️' : 'ℹ️';
+                                            return (
+                                                <div className={`p-4 ${colour} border rounded-xl mb-4`}>
+                                                    <div className="flex items-center gap-2 mb-2">
+                                                        <span className="text-xl">{icon}</span>
+                                                        <h4 className="font-medium">
+                                                            {t('fenceStrategyLabel') || 'Fence strategy'}: <span className="font-mono text-sm uppercase">{strat}</span>
+                                                        </h4>
+                                                        {fs?.expected_votes != null && (
+                                                            <span className="text-xs opacity-70 ml-auto">
+                                                                {fs.expected_votes} votes · qdevice: {fs.has_qdevice ? 'yes' : 'no'}
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                    {warn && (
+                                                        <p className="text-sm mb-2">{warn}</p>
+                                                    )}
+                                                    {fs?.reason && (
+                                                        <p className="text-xs opacity-80">{fs.reason}</p>
+                                                    )}
+                                                    {fs?.detected_at && (
+                                                        <p className="text-xs opacity-60 mt-2">
+                                                            {t('detectedAt') || 'detected'}: {new Date(fs.detected_at).toLocaleString()}
+                                                        </p>
+                                                    )}
+                                                </div>
+                                            );
+                                        })()}
+
+                                        {/* SELF-FENCE - Main Feature */}
+                                        <div className="p-4 bg-green-500/10 border border-green-500/30 rounded-xl mb-4">
+                                            <div className="flex items-center gap-2 mb-3">
+                                                <span className="text-2xl">🛡️</span>
+                                                <h4 className="text-green-400 font-medium">{t('selfFenceProtection')}</h4>
+                                                <span className="px-2 py-1 rounded text-xs bg-green-500/20 text-green-400 ml-auto">
+                                                    {t('recommended')}
+                                                </span>
+                                            </div>
+
+                                            <p className="text-sm text-gray-300 mb-3">
+                                                {t('selfFenceExplain')}
+                                            </p>
+
+                                            {/* Status */}
+                                            {haStatus?.self_fence_installed ? (
+                                                <div className="p-3 bg-green-500/20 rounded-lg">
+                                                    <div className="flex items-center justify-between">
+                                                        <div>
+                                                            <p className="text-green-400 font-medium">✅ {t('selfFenceActive')}</p>
+                                                            <p className="text-xs text-gray-400 mt-1">
+                                                                {t('agentInstalledOnNodes')}: {haStatus.self_fence_nodes?.join(', ') || t('allNodes')}
+                                                            </p>
+                                                        </div>
+                                                        {/* the route wants ha.config, as the install does */}
+                                                        {haWrite && (
+                                                            <button
+                                                                onClick={async () => {
+                                                                    if (!confirm(t('confirmUninstallAgent'))) return;
+                                                                    try {
+                                                                        const res = await authFetch(`${API_URL}/clusters/${selectedCluster.id}/ha/uninstall-self-fence`, { method: 'POST' });
+                                                                        if (res.ok) {
+                                                                            addToast(t('selfFenceUninstalling'), 'success');
+                                                                            setTimeout(() => fetchHAStatus(selectedCluster.id), 3000);
+                                                                        }
+                                                                    } catch (e) {
+                                                                        addToast(t('error') + ': ' + e.message, 'error');
+                                                                    }
+                                                                }}
+                                                                className="px-3 py-1 text-xs bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded-lg"
+                                                            >
+                                                                {t('uninstall')}
+                                                            </button>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                            ) : (
                                                 <div className="p-3 bg-yellow-500/20 rounded-lg">
                                                     <p className="text-yellow-400 font-medium">⚡ {t('selfFenceNotInstalled')}</p>
                                                     <p className="text-xs text-gray-300 mt-1">{t('selfFenceInstallHint')}</p>
                                                 </div>
-                                                <button
-                                                    onClick={async () => {
-                                                        try {
-                                                            const res = await authFetch(`${API_URL}/clusters/${selectedCluster.id}/ha/install-self-fence`, { method: 'POST' });
-                                                            if (res.ok) {
-                                                                addToast(t('selfFenceInstalling'), 'success');
-                                                                setTimeout(() => fetchHAStatus(selectedCluster.id), 5000);
+                                            )}
+
+                                            {/* the install is also how an agent of an earlier PegaProx is replaced,
+                                                and how what the agent check found is put right (#625) */}
+                                            {(() => {
+                                                const fa = haStatus?.fence_agent;
+                                                const upgrade = Array.isArray(fa?.outdated) && fa.outdated.length > 0;
+                                                const repair = !!haAgentCheck && Object.values(haAgentCheck.nodes || {})
+                                                    .some(n => n && n.fence_agent && !n.fence_agent.current);
+                                                if (!haWrite || (haStatus?.self_fence_installed && !upgrade && !repair)) return null;
+                                                return (
+                                                    <button
+                                                        onClick={installSelfFence}
+                                                        data-ha-node-install={upgrade ? 'upgrade' : repair && haStatus?.self_fence_installed ? 'again' : 'install'}
+                                                        className="w-full mt-3 px-4 py-2 bg-green-600 hover:bg-green-500 rounded-lg text-white font-medium"
+                                                    >
+                                                        🛡️ {upgrade ? t('haNodeUpgradeAgent').replace('{version}', () => fa.expected_version || 2)
+                                                            : repair && haStatus?.self_fence_installed ? t('haNodeInstallAgain')
+                                                            : t('installSelfFenceAgent')}
+                                                    </button>
+                                                );
+                                            })()}
+
+                                            <HaNodeAgents t={t} clusterId={selectedCluster.id} status={haStatus}
+                                                check={haAgentCheck} onCheck={haFor(selectedCluster.id, setHaAgentCheck)} authFetch={authFetch}
+                                                onReload={reloadHaStatus} locked={haReadOnly || !haWrite} />
+
+                                            <div className="mt-3 text-xs text-gray-400">
+                                                ✓ {t('noSharedStorageNeeded')} • ✓ {t('worksWithLvmIscsi')}
+                                            </div>
+
+                                            {/* PegaProx VM Auto-Recovery */}
+                                            {haStatus?.self_fence_installed && (
+                                                <div className="mt-3 p-3 bg-blue-500/10 border border-blue-500/30 rounded-lg">
+                                                    <label className="block text-sm text-blue-400 font-medium mb-1">
+                                                        {t('pegaproxVmRecovery')}
+                                                    </label>
+                                                    <p className="text-xs text-gray-400 mb-2">{t('pegaproxVmRecoveryDesc')}</p>
+                                                    <fieldset disabled={!haWrite || haReadOnly} className="min-w-0">
+                                                        <select
+                                                            value={haSettings.pegaprox_vmid}
+                                                            onChange={(e) => setHaSettings({...haSettings, pegaprox_vmid: e.target.value})}
+                                                            className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white text-sm disabled:opacity-50"
+                                                        >
+                                                            <option value="">{t('noVmSelected')}</option>
+                                                            {(clusterResources || [])
+                                                                .filter(v => v.type === 'qemu')
+                                                                .sort((a, b) => a.vmid - b.vmid)
+                                                                .map(v => (
+                                                                    <option key={v.vmid} value={v.vmid}>
+                                                                        {v.vmid} - {v.name} ({v.node})
+                                                                    </option>
+                                                                ))
                                                             }
-                                                        } catch (e) {
-                                                            addToast(t('error') + ': ' + e.message, 'error');
-                                                        }
-                                                    }}
-                                                    className="w-full px-4 py-2 bg-green-600 hover:bg-green-500 rounded-lg text-white font-medium"
-                                                >
-                                                    🛡️ {t('installSelfFenceAgent')}
-                                                </button>
-                                            </div>
-                                        )}
-                                        
-                                        <div className="mt-3 text-xs text-gray-400">
-                                            ✓ {t('noSharedStorageNeeded')} • ✓ {t('worksWithLvmIscsi')}
+                                                        </select>
+                                                    </fieldset>
+                                                    {haSettings.pegaprox_vmid && (
+                                                        <p className="text-xs text-blue-300 mt-1">{t('pegaproxVmRecoveryActive')}</p>
+                                                    )}
+                                                </div>
+                                            )}
                                         </div>
 
-                                        {/* PegaProx VM Auto-Recovery */}
-                                        {haStatus?.self_fence_installed && (
-                                            <div className="mt-3 p-3 bg-blue-500/10 border border-blue-500/30 rounded-lg">
-                                                <label className="block text-sm text-blue-400 font-medium mb-1">
-                                                    {t('pegaproxVmRecovery')}
-                                                </label>
-                                                <p className="text-xs text-gray-400 mb-2">{t('pegaproxVmRecoveryDesc')}</p>
-                                                <select
-                                                    value={haSettings.pegaprox_vmid}
-                                                    onChange={(e) => setHaSettings({...haSettings, pegaprox_vmid: e.target.value})}
-                                                    className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white text-sm"
-                                                >
-                                                    <option value="">{t('noVmSelected')}</option>
-                                                    {(clusterResources || [])
-                                                        .filter(v => v.type === 'qemu')
-                                                        .sort((a, b) => a.vmid - b.vmid)
-                                                        .map(v => (
-                                                            <option key={v.vmid} value={v.vmid}>
-                                                                {v.vmid} - {v.name} ({v.node})
-                                                            </option>
-                                                        ))
-                                                    }
-                                                </select>
-                                                {haSettings.pegaprox_vmid && (
-                                                    <p className="text-xs text-blue-300 mt-1">{t('pegaproxVmRecoveryActive')}</p>
-                                                )}
+                                        {/* 2-Node Cluster Mode */}
+                                        <fieldset disabled={!haWrite || haReadOnly} className="min-w-0">
+                                            <label className="flex items-center gap-3 p-3 bg-proxmox-dark border border-proxmox-border rounded-xl mb-4 cursor-pointer hover:border-proxmox-orange/50">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={haSettings.two_node_mode}
+                                                    onChange={(e) => setHaSettings({...haSettings, two_node_mode: e.target.checked})}
+                                                    className="w-5 h-5 rounded border-proxmox-border bg-proxmox-darker text-proxmox-orange disabled:opacity-50"
+                                                />
+                                                <div>
+                                                    <span className="text-white font-medium">{t('enable2NodeMode')}</span>
+                                                    <p className="text-xs text-gray-500">{t('twoNodeModeDesc')}</p>
+                                                </div>
+                                            </label>
+                                        </fieldset>
+
+                                        <HaNodeSafety t={t} clusterId={selectedCluster.id} status={haStatus} authFetch={authFetch}
+                                            addToast={addToast} onStatus={haStatusFor(selectedCluster.id)} locked={haReadOnly || !haWrite} />
+
+                                        <fieldset disabled={!haWrite || haReadOnly} className="min-w-0">
+                                            {/* Basic Settings */}
+                                            <div className="grid grid-cols-2 gap-4 mb-4">
+                                                <div>
+                                                    <label className="block text-sm text-gray-400 mb-1">{t('recoveryDelay')}</label>
+                                                    <input
+                                                        type="number"
+                                                        min="10"
+                                                        max="300"
+                                                        value={haSettings.recovery_delay}
+                                                        onChange={(e) => setHaSettings({...haSettings, recovery_delay: parseInt(e.target.value) || 30})}
+                                                        className="w-full bg-proxmox-dark border border-proxmox-border rounded-lg px-3 py-2 text-white disabled:opacity-50"
+                                                    />
+                                                    <p className="text-xs text-gray-500 mt-1">{t('recoveryDelayHint')}</p>
+                                                </div>
+                                                <div>
+                                                    <label className="block text-sm text-gray-400 mb-1">{t('failureThreshold')}</label>
+                                                    <input
+                                                        type="number"
+                                                        min="1"
+                                                        max="10"
+                                                        value={haSettings.failure_threshold}
+                                                        onChange={(e) => setHaSettings({...haSettings, failure_threshold: parseInt(e.target.value) || 3})}
+                                                        className="w-full bg-proxmox-dark border border-proxmox-border rounded-lg px-3 py-2 text-white disabled:opacity-50"
+                                                    />
+                                                    <p className="text-xs text-gray-500 mt-1">{t('failureThresholdHint')}</p>
+                                                </div>
+                                            </div>
+
+                                            {/* Advanced Settings - Collapsed */}
+                                            {/* MK #652: native <details> needs the `group` class + group-open:rotate on the
+                                                chevron, otherwise the arrow stays put and never signals the open state */}
+                                            <details className="group bg-proxmox-dark border border-proxmox-border rounded-xl overflow-hidden">
+                                                <summary className="p-3 cursor-pointer hover:bg-proxmox-hover flex items-center justify-between text-sm">
+                                                    <span className="text-gray-400">{t('advancedSettings')}</span>
+                                                    <Icons.ChevronDown className="w-4 h-4 text-gray-400 transition-transform group-open:rotate-180" />
+                                                </summary>
+                                                <div className="p-3 pt-0 space-y-3 border-t border-proxmox-border">
+                                                    <div className="grid grid-cols-2 gap-3">
+                                                        <label className="flex items-center gap-2 p-2 bg-proxmox-darker rounded-lg">
+                                                            <input
+                                                                type="checkbox"
+                                                                checked={haSettings.self_fence_enabled}
+                                                                onChange={(e) => setHaSettings({...haSettings, self_fence_enabled: e.target.checked})}
+                                                                className="w-4 h-4 rounded disabled:opacity-50"
+                                                            />
+                                                            <span className="text-sm text-white">{t('selfFencing')}</span>
+                                                        </label>
+                                                        <label className="flex items-center gap-2 p-2 bg-proxmox-darker rounded-lg">
+                                                            <input
+                                                                type="checkbox"
+                                                                checked={haSettings.verify_network}
+                                                                onChange={(e) => setHaSettings({...haSettings, verify_network: e.target.checked})}
+                                                                className="w-4 h-4 rounded disabled:opacity-50"
+                                                            />
+                                                            <span className="text-sm text-white">{t('networkCheck')}</span>
+                                                        </label>
+                                                    </div>
+
+                                                    <div>
+                                                        <label className="block text-xs text-gray-400 mb-1">{t('additionalQuorumHosts')}</label>
+                                                        <input
+                                                            type="text"
+                                                            value={haSettings.quorum_hosts}
+                                                            onChange={(e) => setHaSettings({...haSettings, quorum_hosts: e.target.value})}
+                                                            placeholder="8.8.8.8, 1.1.1.1"
+                                                            className="w-full bg-proxmox-darker border border-proxmox-border rounded-lg px-3 py-2 text-white text-sm disabled:opacity-50"
+                                                        />
+                                                    </div>
+
+                                                    <div>
+                                                        <label className="block text-xs text-gray-400 mb-1">{t('gatewayIp')}</label>
+                                                        <input
+                                                            type="text"
+                                                            value={haSettings.quorum_gateway}
+                                                            onChange={(e) => setHaSettings({...haSettings, quorum_gateway: e.target.value})}
+                                                            placeholder="192.168.1.1"
+                                                            className="w-full bg-proxmox-darker border border-proxmox-border rounded-lg px-3 py-2 text-white text-sm disabled:opacity-50"
+                                                        />
+                                                    </div>
+                                                </div>
+                                            </details>
+                                        </fieldset>
+
+                                        {/* each saves on its own, apart from the form above */}
+                                        {(haStatus?.split_brain_prevention?.fencing || haStatus?.cluster_claim) && (
+                                            <div className="mt-4">
+                                                <HaNodeFencing t={t} clusterId={selectedCluster.id} status={haStatus}
+                                                    nodeNames={Object.keys(clusterMetrics || {})} authFetch={authFetch}
+                                                    addToast={addToast} onStatus={haStatusFor(selectedCluster.id)} locked={haReadOnly || !haWrite} />
+                                                <HaNodeClaim t={t} clusterId={selectedCluster.id} status={haStatus} authFetch={authFetch}
+                                                    addToast={addToast} onStatus={haStatusFor(selectedCluster.id)} locked={haReadOnly} />
                                             </div>
                                         )}
-                                    </div>
-
-                                    {/* 2-Node Cluster Mode */}
-                                    <label className="flex items-center gap-3 p-3 bg-proxmox-dark border border-proxmox-border rounded-xl mb-4 cursor-pointer hover:border-proxmox-orange/50">
-                                        <input
-                                            type="checkbox"
-                                            checked={haSettings.two_node_mode}
-                                            onChange={(e) => setHaSettings({...haSettings, two_node_mode: e.target.checked})}
-                                            className="w-5 h-5 rounded border-proxmox-border bg-proxmox-darker text-proxmox-orange"
-                                        />
-                                        <div>
-                                            <span className="text-white font-medium">{t('enable2NodeMode')}</span>
-                                            <p className="text-xs text-gray-500">{t('twoNodeModeDesc')}</p>
-                                        </div>
-                                    </label>
-                                    
-                                    {/* Basic Settings */}
-                                    <div className="grid grid-cols-2 gap-4 mb-4">
-                                        <div>
-                                            <label className="block text-sm text-gray-400 mb-1">{t('recoveryDelay')}</label>
-                                            <input
-                                                type="number"
-                                                min="10"
-                                                max="300"
-                                                value={haSettings.recovery_delay}
-                                                onChange={(e) => setHaSettings({...haSettings, recovery_delay: parseInt(e.target.value) || 30})}
-                                                className="w-full bg-proxmox-dark border border-proxmox-border rounded-lg px-3 py-2 text-white"
-                                            />
-                                            <p className="text-xs text-gray-500 mt-1">{t('recoveryDelayHint')}</p>
-                                        </div>
-                                        <div>
-                                            <label className="block text-sm text-gray-400 mb-1">{t('failureThreshold')}</label>
-                                            <input
-                                                type="number"
-                                                min="1"
-                                                max="10"
-                                                value={haSettings.failure_threshold}
-                                                onChange={(e) => setHaSettings({...haSettings, failure_threshold: parseInt(e.target.value) || 3})}
-                                                className="w-full bg-proxmox-dark border border-proxmox-border rounded-lg px-3 py-2 text-white"
-                                            />
-                                            <p className="text-xs text-gray-500 mt-1">{t('failureThresholdHint')}</p>
-                                        </div>
-                                    </div>
-                                    
-                                    {/* Advanced Settings - Collapsed */}
-                                    {/* MK #652: native <details> needs the `group` class + group-open:rotate on the
-                                        chevron, otherwise the arrow stays put and never signals the open state */}
-                                    <details className="group bg-proxmox-dark border border-proxmox-border rounded-xl overflow-hidden">
-                                        <summary className="p-3 cursor-pointer hover:bg-proxmox-hover flex items-center justify-between text-sm">
-                                            <span className="text-gray-400">{t('advancedSettings')}</span>
-                                            <Icons.ChevronDown className="w-4 h-4 text-gray-400 transition-transform group-open:rotate-180" />
-                                        </summary>
-                                        <div className="p-3 pt-0 space-y-3 border-t border-proxmox-border">
-                                            <div className="grid grid-cols-2 gap-3">
-                                                <label className="flex items-center gap-2 p-2 bg-proxmox-darker rounded-lg">
-                                                    <input
-                                                        type="checkbox"
-                                                        checked={haSettings.self_fence_enabled}
-                                                        onChange={(e) => setHaSettings({...haSettings, self_fence_enabled: e.target.checked})}
-                                                        className="w-4 h-4 rounded"
-                                                    />
-                                                    <span className="text-sm text-white">{t('selfFencing')}</span>
-                                                </label>
-                                                <label className="flex items-center gap-2 p-2 bg-proxmox-darker rounded-lg">
-                                                    <input
-                                                        type="checkbox"
-                                                        checked={haSettings.verify_network}
-                                                        onChange={(e) => setHaSettings({...haSettings, verify_network: e.target.checked})}
-                                                        className="w-4 h-4 rounded"
-                                                    />
-                                                    <span className="text-sm text-white">{t('networkCheck')}</span>
-                                                </label>
-                                            </div>
-                                            
-                                            <div>
-                                                <label className="block text-xs text-gray-400 mb-1">{t('additionalQuorumHosts')}</label>
-                                                <input
-                                                    type="text"
-                                                    value={haSettings.quorum_hosts}
-                                                    onChange={(e) => setHaSettings({...haSettings, quorum_hosts: e.target.value})}
-                                                    placeholder="8.8.8.8, 1.1.1.1"
-                                                    className="w-full bg-proxmox-darker border border-proxmox-border rounded-lg px-3 py-2 text-white text-sm"
-                                                />
-                                            </div>
-                                            
-                                            <div>
-                                                <label className="block text-xs text-gray-400 mb-1">{t('gatewayIp')}</label>
-                                                <input
-                                                    type="text"
-                                                    value={haSettings.quorum_gateway}
-                                                    onChange={(e) => setHaSettings({...haSettings, quorum_gateway: e.target.value})}
-                                                    placeholder="192.168.1.1"
-                                                    className="w-full bg-proxmox-darker border border-proxmox-border rounded-lg px-3 py-2 text-white text-sm"
-                                                />
-                                            </div>
-                                        </div>
-                                    </details>
+                                    </>)}
                                 </div>
                                 
                                 {/* Footer */}
@@ -23986,7 +24907,8 @@
                                     </button>
                                     <button
                                         onClick={handleSaveHASettings}
-                                        className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded-lg"
+                                        disabled={!haStatus || !haWrite || haReadOnly}
+                                        className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed"
                                     >
                                         <Icons.Save className="w-4 h-4" />
                                         {t('saveSettings')}
@@ -23994,6 +24916,10 @@
                                 </div>
                             </div>
                         </div>
+                    )}
+
+                    {haDisableReport && (
+                        <HaNodeDisableReport report={haDisableReport} onClose={() => setHaDisableReport(null)} t={t} />
                     )}
 
                     {/* Sponsor footer.

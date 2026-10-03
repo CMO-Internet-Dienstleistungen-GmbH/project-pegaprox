@@ -2724,7 +2724,9 @@
         // Proxmox Native HA Section for Settings
         function ProxmoxHaSection({ clusterId }) {
             const { t } = useTranslation();
-            const { getAuthHeaders } = useAuth();
+            const { getAuthHeaders, user, isAdmin, haReadOnly } = useAuth();
+            // LW Oct 2026 (#625) - taking a guest out of HA wants ha.config; ha.view only looks
+            const canEdit = !haReadOnly && (isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes('ha.config')));
             const [resources, setResources] = useState([]);
             const [loading, setLoading] = useState(true);
 
@@ -2804,13 +2806,15 @@
                                                 Max Restart: {resource.max_restart || 3}
                                             </span>
                                         </div>
-                                        <button
-                                            onClick={() => removeFromHa(resource.sid)}
-                                            className="p-1 rounded hover:bg-red-500/20 text-gray-500 hover:text-red-400"
-                                            title={t('removeFromHa')}
-                                        >
-                                            <Icons.X />
-                                        </button>
+                                        {canEdit && (
+                                            <button
+                                                onClick={() => removeFromHa(resource.sid)}
+                                                className="p-1 rounded hover:bg-red-500/20 text-gray-500 hover:text-red-400"
+                                                title={t('removeFromHa')}
+                                            >
+                                                <Icons.X />
+                                            </button>
+                                        )}
                                     </div>
                                 );
                             })}

@@ -9761,6 +9761,8 @@
         //     standby; read-only only where it is
         // v8: who is active is set on the leader, per member, up to three with the leader.
         //     The switch of v6 is gone; a member shows what the leader made it
+        // v9: the config version in the head card, and the copies of what a sync replaced
+        //     here: listed, downloaded after the password, dismissed for good
         // ═══════════════════════════════════════════════
 
         // "3 minutes ago" in the UI language. Intl speaks all nine, so no keys for it.
@@ -9870,17 +9872,21 @@
             const [removing, setRemoving] = useState(null);             // the member a 'remove' is about
             const [typed, setTyped] = useState('');
             const [restarting, setRestarting] = useState(null);         // role we restart into
-            const [passwords, setPasswords] = useState({ code: '', join: '', confirm: '' });
+            const [passwords, setPasswords] = useState({ code: '', join: '', confirm: '', copy: '' });
             const [reauth, setReauth] = useState(null);                 // {form, code, error} of a refused re-auth
             const [unconfirmed, setUnconfirmed] = useState(false);      // the remove was refused as HA_REMOVE_UNCONFIRMED
             const [shutDown, setShutDown] = useState(false);            // the admin ticked "shut down for good"
             const [promoteSync, setPromoteSync] = useState(false);      // the promote was refused as HA_PROMOTE_SYNC
             const [forcePromote, setForcePromote] = useState(false);    // the admin ticked "promote without it"
             const [lastRemoval, setLastRemoval] = useState(null);       // {name, told} of the last removal
+            const [copyAction, setCopyAction] = useState(null);         // {what: 'download' | 'dismiss', name}
+            const [copyError, setCopyError] = useState(null);           // {text, code} for the open copy box
 
             // Every status request gets a number. One that left before a code was made cannot
             // know about it, so only a later answer may say the code is gone.
             const loadSeq = useRef(0);
+            // likewise a copy: an answer to a request sent before it was dismissed still lists it
+            const copiesSeq = useRef(0);
             const load = async () => {
                 const seq = ++loadSeq.current;
                 try {
@@ -9895,7 +9901,8 @@
                     // tab. An expired one stays, the box says so itself.
                     setCode(c => c && seq > c.seq && data.pairing_open_until !== c.expires_at
                         && c.expires_at * 1000 > Date.now() ? null : c);
-                    setStatus(data);
+                    if (seq <= copiesSeq.current) setStatus(s => ({ ...data, orphans: s?.orphans ?? data.orphans }));
+                    else setStatus(data);
                     setLoadError('');
                     // prefill once, never over something typed
                     setOwnUrl(v => v || data.suggested_url || '');
@@ -9941,6 +9948,22 @@
             // the code on screen is spent once someone pairs with it: this instance turns active,
             // or its group grows. A removal hides it as well, and the open-code note shows instead.
             useEffect(() => { setCode(null); }, [role, standbyCount]);
+
+            // LW Oct 2026 - what this instance held and a sync replaced is kept as a copy, in
+            // every role, until an admin dismisses it. The banner counts the copies too and is
+            // only polled on a standby: once the count here differs from it (a dismiss, a poll,
+            // another admin), it is read again.
+            const { ha: haBanner } = useAuth();
+            const copies = status?.orphans && typeof status.orphans === 'object' ? status.orphans : null;
+            // an item is shown, and can be acted on, only with a name to address it by
+            const copyItems = Array.isArray(copies?.items)
+                ? copies.items.filter(c => c && typeof c === 'object' && typeof c.name === 'string' && c.name) : [];
+            const copyCount = copies ? (Number(copies.count) || 0) : 0;
+            useEffect(() => {
+                if (!status) return;
+                const shown = typeof haBanner?.orphans === 'number' ? haBanner.orphans : 0;
+                if (shown !== copyCount) refreshHa?.();
+            }, [!!status, copyCount]);
 
             // POST/PUT to /api/ha/*; the error text comes from the server as is, the
             // code tells a refused re-auth apart from everything else
@@ -10062,7 +10085,7 @@
                     ...(typeof res.data.actives === 'number' ? { actives: res.data.actives } : {}),
                     members: (s?.members || []).map(x => x.instance_id === m.instance_id ? { ...x, serve } : x),
                 }));
-                addToast?.(t(serve ? 'pgHaMemberServeOn' : 'pgHaMemberServeOff').replace('{name}', memberName(m)), 'success');
+                addToast?.(t(serve ? 'pgHaMemberServeOn' : 'pgHaMemberServeOff').replace('{name}', () => memberName(m)), 'success');
                 load();
             });
 
@@ -10076,6 +10099,90 @@
                 addToast?.(t(res.data.reloaded ? 'pgHaReloaded' : 'pgHaNothingToApply'), res.data.reloaded ? 'success' : 'info');
                 load();
             });
+
+            // A copy holds account rows, so handing one out wants the password again, as the
+            // config backup does. Dismissing deletes it for good and asks first. One box at a
+            // time, under the copy it is about.
+            const openCopy = (what, name = null) => {
+                setCopyAction(what ? { what, name } : null);
+                setCopyError(null);
+                setPassword('copy', '');
+                setReauth(null);
+            };
+            const saveCopy = (name) => run('copy', async () => {
+                setReauth(null);
+                setCopyError(null);
+                let r;
+                try {
+                    r = await fetch(`${API_URL}/ha/orphans/${encodeURIComponent(name)}/download`, {
+                        method: 'POST', credentials: 'include',
+                        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                        body: JSON.stringify(withPassword('copy', {}))
+                    });
+                } finally {
+                    // the password was for this one request, whatever came back (or nothing)
+                    setPassword('copy', '');
+                }
+                if (!r.ok) {
+                    const code = (await r.clone().json().catch(() => null))?.code || '';
+                    const res = { code, error: await PegaProxApiErrors.message(r, t('haCopiesDownloadFailed')) };
+                    if (r.status === 404) {
+                        // dismissed in the meantime, from another tab or by another admin
+                        openCopy(null);
+                        addToast?.(res.error, 'error');
+                        load();
+                        return;
+                    }
+                    setCopyAction({ what: 'download', name });
+                    if (reauthRefused('copy', res)) return;
+                    // 409: it does not open on this instance, and the server says why
+                    setCopyError({ text: res.error, code });
+                    load();
+                    return;
+                }
+                // saved under the name the server gives it, never opened in the page
+                const blob = await r.blob();
+                const named = /filename="?([^";]+)"?/.exec(r.headers.get('Content-Disposition') || '');
+                const href = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = href;
+                a.download = named ? named[1] : `pegaprox-ha-${name}.json.gz`;
+                a.style.display = 'none';
+                document.body.appendChild(a);
+                a.click();
+                setTimeout(() => { URL.revokeObjectURL(href); a.remove(); }, 200);
+                openCopy(null);
+                addToast?.(t('haCopiesDownloaded'), 'success');
+            });
+            // an SSO account has no password to type: it goes out at once, and the box only
+            // opens when the server refuses
+            const askCopy = (name) => sso ? saveCopy(name) : openCopy('download', name);
+            const dismissCopy = (name) => run('copy', async () => {
+                setCopyError(null);
+                const res = await send('POST', `orphans/${encodeURIComponent(name)}/dismiss`, { confirm: true }, t('haCopiesDismissFailed'));
+                if (!res.ok) {
+                    // a sync is looking at the copies: nothing went, the box stays for the next try
+                    if (res.code === 'HA_SYNC_RUNNING') { setCopyError({ text: t('haCopiesSyncRunning'), code: res.code }); return; }
+                    setCopyError({ text: res.error, code: res.code });
+                    load();
+                    return;
+                }
+                openCopy(null);
+                // the answer carries the list as it is now; a poll already on its way does not
+                // bring the row back
+                copiesSeq.current = loadSeq.current;
+                if (res.data.orphans && typeof res.data.orphans === 'object') {
+                    setStatus(s => ({ ...(s || {}), orphans: res.data.orphans }));
+                }
+                addToast?.(t('haCopiesDismissed'), 'success');
+                load();
+            });
+            // a box whose copy is no longer listed (dismissed elsewhere, gone at the last
+            // poll) closes, and the password typed into it goes with it
+            const copyNames = copyItems.map(c => c.name).join('\n');
+            useEffect(() => {
+                if (copyAction && !copyItems.some(c => c.name === copyAction.name)) openCopy(null);
+            }, [copyAction, copyNames]);
 
             const WORD = { promote: 'PROMOTE', unpair: 'UNPAIR', remove: 'REMOVE' };
             // null closes the box; either way nothing typed survives into the next one.
@@ -10204,11 +10311,11 @@
                         <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
                             {canSetActive && (
                                 <span className={`text-xs ${activesFull ? 'text-yellow-300' : 'text-gray-400'}`} data-ha-actives={actives}>
-                                    {t('pgHaActiveCount').replace('{n}', actives).replace('{max}', activeLimit)}
+                                    {t('pgHaActiveCount').replace('{n}', actives).replace('{max}', () => activeLimit)}
                                 </span>
                             )}
                             <span className="text-xs text-gray-400" data-ha-count>
-                                {t('pgHaMemberCount').replace('{n}', members.length + 1).replace('{max}', maxMembers)}
+                                {t('pgHaMemberCount').replace('{n}', members.length + 1).replace('{max}', () => maxMembers)}
                             </span>
                         </div>
                     </div>
@@ -10276,8 +10383,8 @@
                                                 <td className={cell}>
                                                     {/* a standby can only be made active while there is room; off always works */}
                                                     <button type="button" role="switch" aria-checked={m.serve === true}
-                                                        aria-label={t('pgHaServeMember').replace('{name}', memberName(m))}
-                                                        title={activesFull && m.serve !== true ? t('pgHaActiveLimit').replace('{max}', activeLimit) : undefined}
+                                                        aria-label={t('pgHaServeMember').replace('{name}', () => memberName(m))}
+                                                        title={activesFull && m.serve !== true ? t('pgHaActiveLimit').replace('{max}', () => activeLimit) : undefined}
                                                         onClick={() => setMemberServe(m, m.serve !== true)}
                                                         disabled={!!busy || broken || (activesFull && m.serve !== true)}
                                                         data-ha-serve={m.serve === true ? 'on' : 'off'}
@@ -10305,7 +10412,7 @@
                             <p className="text-xs text-gray-500">{t('pgHaActiveHint')}</p>
                             {activesFull && (
                                 <p className="text-xs text-yellow-300" data-ha-active-limit>
-                                    {t('pgHaActiveLimit').replace('{max}', activeLimit)}
+                                    {t('pgHaActiveLimit').replace('{max}', () => activeLimit)}
                                 </p>
                             )}
                         </div>
@@ -10459,7 +10566,7 @@
                 <div className="rounded-xl p-4 space-y-3 border bg-red-500/10 border-red-500/30" data-ha-confirm={confirmAction}>
                     <p className="text-sm text-red-300">
                         {confirmAction === 'promote' ? (serving ? t('pgHaPromoteLeaderDesc') : `${t('pgHaPromoteDesc')} ${t('pgHaPromoteSyncFirst')}`)
-                            : confirmAction === 'remove' ? t('pgHaRemoveDesc').replace('{name}', removing.url || removing.instance_id.slice(0, 8))
+                            : confirmAction === 'remove' ? t('pgHaRemoveDesc').replace('{name}', () => removing.url || removing.instance_id.slice(0, 8))
                             : role === 'standby' ? t('pgHaUnpairStandbyDesc') : t('pgHaUnpairActiveDesc')}
                     </p>
                     {needForce && (
@@ -10518,8 +10625,8 @@
                         : 'bg-green-500/10 border-green-500/30 text-green-300'}`}>
                     <span className="mt-0.5 flex-shrink-0">{lastRemoval.told === false ? <Icons.AlertTriangle /> : <Icons.Check />}</span>
                     <span className="flex-1 min-w-0" style={{ overflowWrap: 'anywhere' }}>
-                        {lastRemoval.told === true ? t('pgHaRemovedTold').replace('{name}', lastRemoval.name)
-                            : lastRemoval.told === false ? t('pgHaRemovedNotReached').replace('{name}', lastRemoval.name)
+                        {lastRemoval.told === true ? t('pgHaRemovedTold').replace('{name}', () => lastRemoval.name)
+                            : lastRemoval.told === false ? t('pgHaRemovedNotReached').replace('{name}', () => lastRemoval.name)
                             : t('pgHaMemberRemoved')}
                     </span>
                     <button onClick={() => setLastRemoval(null)} title={t('close')} aria-label={t('close')}
@@ -10540,11 +10647,165 @@
                     </div>
                     <div className="text-xs text-gray-400">
                         <span title={removedHere.by || ''}>
-                            {t('pgHaRemovedBy').replace('{by}', (removedHere.by || '-').slice(0, 8)).replace('{epoch}', removedHere.epoch ?? '-')}
+                            {t('pgHaRemovedBy').replace('{by}', () => (removedHere.by || '-').slice(0, 8)).replace('{epoch}', () => removedHere.epoch ?? '-')}
                         </span>
                         {removedHere.at && <> · {when(removedHere.at)}</>}
                     </div>
                     <p className="text-sm text-gray-300">{t('pgHaRemovedHereNext')}</p>
+                </div>
+            );
+
+            // What a copy holds: per table the rows only here and the ones only in what replaced
+            // them, the files a sync replaced, and how many journal lines say who wrote them.
+            const copyContent = (c) => {
+                const diff = c.differences && typeof c.differences === 'object' ? c.differences : {};
+                const tables = Object.entries(diff).filter(([name, d]) => name !== 'files' && d && typeof d === 'object'
+                    && (d.only_here > 0 || d.only_there > 0));
+                const files = Array.isArray(diff.files) ? diff.files.filter(f => typeof f === 'string') : [];
+                if (!tables.length && !files.length && !(c.journal_rows > 0)) return '-';
+                return (
+                    <ul className="space-y-0.5">
+                        {tables.map(([name, d]) => (
+                            <li key={name} data-ha-copy-table={name}>
+                                <span className="font-mono text-xs">{name}</span>
+                                {': '}
+                                {[d.only_here > 0 && t('haCopiesOnlyHere').replace('{n}', d.only_here),
+                                  d.only_there > 0 && t('haCopiesOnlyThere').replace('{n}', d.only_there)].filter(Boolean).join(', ')}
+                            </li>
+                        ))}
+                        {files.length > 0 && (
+                            <li data-ha-copy-files>{t('haCopiesFiles')} <span className="font-mono text-xs">{files.join(', ')}</span></li>
+                        )}
+                        {c.journal_rows > 0 && <li data-ha-copy-journal>{t('haCopiesJournal').replace('{n}', c.journal_rows)}</li>}
+                    </ul>
+                );
+            };
+            const copyRow = (label, value) => (
+                <div className="flex flex-wrap gap-x-4 text-sm">
+                    <span className="text-gray-400 w-28 flex-shrink-0">{label}</span>
+                    <span className="text-gray-200 flex-1 min-w-0" style={{ overflowWrap: 'anywhere' }}>{value}</span>
+                </div>
+            );
+            const copyErrorBox = copyError && (
+                <div data-ha-copy-error={copyError.code || 'error'} style={{ overflowWrap: 'anywhere' }}
+                    className={`rounded-lg p-2 text-sm border ${copyError.code === 'HA_SYNC_RUNNING'
+                        ? 'bg-yellow-500/10 border-yellow-500/40 text-yellow-200'
+                        : 'bg-red-500/10 border-red-500/30 text-red-300'}`}>
+                    {copyError.text}
+                </div>
+            );
+            const copyBox = (c, sealed) => !copyAction || copyAction.name !== c.name ? null : copyAction.what === 'download' ? (
+                <div className="rounded-lg p-3 space-y-3 border bg-proxmox-dark border-proxmox-border" data-ha-copy-box="download">
+                    <p className="text-sm text-gray-300">{t('haCopiesDownloadDesc')}</p>
+                    {!sso && <div className="max-w-sm">{passwordInput('copy', 'pgha-copy-password')}</div>}
+                    {reauthNote('copy', 'pgha-copy-password')}
+                    {copyErrorBox}
+                    <div className="flex flex-wrap items-center gap-2">
+                        <button onClick={() => saveCopy(c.name)} disabled={needsPassword('copy') || !!busy || sealed}
+                            className={`${btn} bg-proxmox-orange hover:bg-proxmox-orange/90 text-white`}>
+                            <Icons.Download />
+                            {t('haCopiesDownload')}
+                        </button>
+                        <button onClick={() => openCopy(null)} className={btnGhost}>{t('cancel')}</button>
+                    </div>
+                </div>
+            ) : (
+                <div className="rounded-lg p-3 space-y-3 border bg-red-500/10 border-red-500/30" data-ha-copy-box="dismiss">
+                    <p className="text-sm text-red-300">{t('haCopiesDismissDesc')}</p>
+                    {copyErrorBox}
+                    <div className="flex flex-wrap items-center gap-2">
+                        <button onClick={() => dismissCopy(c.name)} disabled={!!busy}
+                            className={`${btn} bg-red-600 hover:bg-red-700 text-white`}>
+                            <Icons.Trash />
+                            {t('haCopiesDismissConfirm')}
+                        </button>
+                        <button onClick={() => openCopy(null)} className={btnGhost}>{t('cancel')}</button>
+                    </div>
+                </div>
+            );
+            // A copy sealed under a key this instance does not hold does not open here, so
+            // it cannot be handed out either; the fingerprints tell which instance opens it.
+            const copiesCard = copyCount > 0 && (
+                <div className={card} data-ha-copies={copyCount}>
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                        <h4 className="font-medium text-white flex items-center gap-2">
+                            <Icons.Archive />
+                            {t('haCopiesTitle')}
+                        </h4>
+                        <span className="text-xs text-gray-400" data-ha-copies-total>
+                            {t('haCopiesTotal').replace('{n}', copyCount).replace('{size}', formatBytes(Number(copies.bytes) || 0))}
+                        </span>
+                    </div>
+                    <p className="text-sm text-gray-400 max-w-3xl">{t('haCopiesIntro')}</p>
+                    {copies.over_limit === true && (
+                        <div className="rounded-lg p-3 text-sm border bg-yellow-500/10 border-yellow-500/40 text-yellow-200 flex items-start gap-2" data-ha-copies-over>
+                            <span className="mt-0.5 flex-shrink-0"><Icons.AlertTriangle /></span>
+                            <span>{t('haCopiesOverLimit')}</span>
+                        </div>
+                    )}
+                    <div className="space-y-3">
+                        {copyItems.map(c => {
+                            const sealed = !!c.seal && c.seal.opens === false;
+                            const oldKey = !sealed && c.key && c.key.current === false;
+                            return (
+                                <div key={c.name} data-ha-copy={c.name} data-ha-copy-opens={sealed ? 'no' : 'yes'}
+                                    className="bg-proxmox-card border border-proxmox-border rounded-lg p-3 space-y-2">
+                                    <div className="flex flex-wrap items-start justify-between gap-3">
+                                        <div className="min-w-0">
+                                            <div className="text-sm text-white flex flex-wrap items-center gap-2">
+                                                <span title={fmtDate(c.captured_at)} data-ha-copy-kept>
+                                                    {t('haCopiesKept').replace('{time}', haRelTime(c.captured_at, language) || '-')}
+                                                </span>
+                                                <span className="text-xs text-gray-400" data-ha-copy-size>{formatBytes(Number(c.bytes) || 0)}</span>
+                                            </div>
+                                            <div className="font-mono text-[11px] text-gray-500 break-all">{c.name}</div>
+                                        </div>
+                                        <div className="flex flex-wrap items-center gap-2">
+                                            <button onClick={() => askCopy(c.name)} disabled={!!busy || sealed} className={btnGhost}>
+                                                <Icons.Download />
+                                                {t('haCopiesDownload')}
+                                            </button>
+                                            <button onClick={() => openCopy('dismiss', c.name)} disabled={!!busy} className={btnGhost}>
+                                                <Icons.Trash />
+                                                {t('haCopiesDismiss')}
+                                            </button>
+                                        </div>
+                                    </div>
+                                    <div className="space-y-1">
+                                        {copyRow(t('haCopiesReason'), <span data-ha-copy-reason>{typeof c.reason === 'string' && c.reason ? c.reason : '-'}</span>)}
+                                        {copyRow(t('haCopiesContent'), copyContent(c))}
+                                        {c.repeats > 0 && copyRow(t('haCopiesRepeated'), (
+                                            <span title={c.last_at ? fmtDate(c.last_at) : undefined} data-ha-copy-repeats={c.repeats}>
+                                                {(c.last_at ? t('haCopiesRepeatedLast') : t('haCopiesRepeatedCount'))
+                                                    .replace('{n}', c.repeats).replace('{time}', haRelTime(c.last_at, language))}
+                                            </span>
+                                        ))}
+                                    </div>
+                                    {sealed && (
+                                        <div className="rounded-lg p-2 text-xs border bg-yellow-500/10 border-yellow-500/40 text-yellow-200 flex items-start gap-2" data-ha-copy-sealed>
+                                            <span className="flex-shrink-0"><Icons.Lock className="w-4 h-4" /></span>
+                                            <span style={{ overflowWrap: 'anywhere' }}>
+                                                {t('haCopiesNoOpen').replace('{fp}', () => c.seal.fp || '-')}
+                                                {copies.seal?.fp && ` ${t('haCopiesOwnSeal').replace('{fp}', () => copies.seal.fp)}`}
+                                            </span>
+                                        </div>
+                                    )}
+                                    {oldKey && (
+                                        <p className="text-xs text-gray-400" style={{ overflowWrap: 'anywhere' }} data-ha-copy-key={c.key.backup ? 'backup' : 'gone'}>
+                                            {c.key.backup ? t('haCopiesValuesBackup').replace('{file}', () => c.key.backup) : t('haCopiesValuesLost')}
+                                        </p>
+                                    )}
+                                    {/* a poll can find it sealed while its box is open */}
+                                    {copyBox(c, sealed)}
+                                </div>
+                            );
+                        })}
+                    </div>
+                    {copyCount > copyItems.length && (
+                        <p className="text-xs text-gray-500" data-ha-copies-more>
+                            {t('haCopiesNewest').replace('{shown}', copyItems.length).replace('{n}', copyCount)}
+                        </p>
+                    )}
                 </div>
             );
 
@@ -10558,7 +10819,7 @@
                         {adding ? t('pgHaAddStandbyTitle') : t('pgHaMakeActiveTitle')}
                     </h4>
                     {adding && groupFull ? (
-                        <p className="text-sm text-yellow-300">{t('pgHaGroupFull').replace('{max}', maxMembers)}</p>
+                        <p className="text-sm text-yellow-300">{t('pgHaGroupFull').replace('{max}', () => maxMembers)}</p>
                     ) : (
                         <>
                             <p className="text-sm text-gray-400">{adding ? t('pgHaAddStandbyDesc') : t('pgHaMakeActiveDesc')}</p>
@@ -10632,6 +10893,15 @@
                 : serving ? t('pgHaRoleDescActive')
                 : role === 'standby' && !status.removed ? t('pgHaRoleDescStandby') : '';
 
+            // The version of the configuration the group shares, as this instance holds it: a
+            // member in step shows what its leader shows. by is the instance that stepped it,
+            // at when; a fresh member has none until its first sync.
+            const cv = role !== 'standalone' && status.config_version && Array.isArray(status.config_version.cv)
+                ? status.config_version : null;
+            const cvText = cv && (cv.cv[0] > 0 || cv.cv[1] > 0) ? `${cv.cv[0]}.${cv.cv[1]}` : '';
+            const cvBy = typeof cv?.by !== 'string' || !cv.by ? '' : cv.by === status.instance_id ? t('haCvThisInstance')
+                : memberName(members.find(m => m.instance_id === cv.by) || { instance_id: cv.by });
+
             return (
                 <div className="space-y-4" data-ha-role={role}>
                     {restarting && <HaRestartOverlay t={t} expectRole={restarting} />}
@@ -10654,6 +10924,18 @@
                         <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-gray-400">
                             <span>{t('pgHaEpoch')}: <span className="text-gray-200">{status.epoch}</span></span>
                             <span>{t('pgHaInstanceId')}: <span className="font-mono text-gray-200" title={status.instance_id}>{(status.instance_id || '').slice(0, 8)}</span></span>
+                            {cv && (
+                                <span data-ha-cv={cvText || (cv.joined ? 'joined' : 'none')} title={t('haCvHint')}>
+                                    {t('haCvLabel')}:{' '}
+                                    {cvText ? (
+                                        <>
+                                            <span className="font-mono text-gray-200">{cvText}</span>
+                                            {cvBy && <> · {t('haCvBy').replace('{who}', () => cvBy)}</>}
+                                            {cv.at && <> · {when(cv.at)}</>}
+                                        </>
+                                    ) : <span className="text-gray-500">{t(cv.joined ? 'haCvJoined' : 'haCvNone')}</span>}
+                                </span>
+                            )}
                         </div>
                         {broken && (
                             <div className="rounded-lg p-3 text-sm border bg-red-500/10 border-red-500/30 text-red-300 space-y-1" data-ha-broken>
@@ -10666,6 +10948,7 @@
 
                     {removedNote}
                     {removalNote}
+                    {copiesCard}
 
                     {role === 'standalone' && (
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -10748,7 +11031,7 @@
                                         {row(t('pgHaLastSync'), when(sync.last_ok_at))}
                                         {row(t('pgHaLastAttempt'), when(sync.last_attempt_at))}
                                         {sync.rows != null && row(t('pgHaSyncContent'),
-                                            t('pgHaRowsTables').replace('{rows}', sync.rows).replace('{tables}', sync.tables ?? 0))}
+                                            t('pgHaRowsTables').replace('{rows}', () => sync.rows).replace('{tables}', () => sync.tables ?? 0))}
                                     </div>
                                     {sync.last_error && (
                                         <div className="rounded-lg p-2 text-xs border bg-red-500/10 border-red-500/30 text-red-300 break-all">

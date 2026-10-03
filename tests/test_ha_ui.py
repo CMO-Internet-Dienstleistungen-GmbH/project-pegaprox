@@ -261,7 +261,8 @@ def test_the_banner_shows_on_a_standby_only(banner):
     assert 'if (!standby) return null;' in banner
     # read-only, or carried out on the active while the standby forwards
     assert ": ha.forwarding === true ? 'pgHaBannerForwarding' : 'pgHaBannerStandby')" in banner
-    assert ".replace('{url}', ha.peer_url || '-')" in banner
+    # a server value goes in through a function: a string replacement reads $& and $`
+    assert ".replace('{url}', () => ha.peer_url || '-')" in banner
     # the HA tab button is for admins
     assert 'const button = isAdmin && onOpenHa && (' in banner
 
@@ -2557,7 +2558,7 @@ def test_the_members_table_shows_what_the_contract_carries(panel):
     assert "data-ha-source={m.is_source ? '' : undefined}" in card
     assert card.index('{m.is_source && (') < card.index("{t('pgHaSource')}")
     # this instance counts too
-    assert ".replace('{n}', members.length + 1).replace('{max}', maxMembers)" in card
+    assert ".replace('{n}', members.length + 1).replace('{max}', () => maxMembers)" in card
     # Remove only on the active, one per row
     assert "const canRemove = role === 'active';" in body
     remove_at = card.index("openConfirm('remove', m)")
@@ -2572,7 +2573,7 @@ def test_remove_goes_through_the_box_promote_and_unpair_use(panel):
     box = body[body.index('const removeStale = '):body.index('const pairingCard = (')]
     assert ("confirmAction === 'remove'\n                && (role !== 'active' || "
             "!members.some(m => m.instance_id === removing?.instance_id));") in box
-    assert "t('pgHaRemoveDesc').replace('{name}', removing.url || removing.instance_id.slice(0, 8))" in box
+    assert "t('pgHaRemoveDesc').replace('{name}', () => removing.url || removing.instance_id.slice(0, 8))" in box
     assert "passwordInput('confirm', 'pgha-confirm-password')" in box
     assert "confirmAction === 'remove' ? (needShutDown ? t('pgHaRemoveAnyway') : t('pgHaRemove'))" in box
     # the remove box sits under the table, the unpair box under its button
@@ -5028,7 +5029,7 @@ def test_the_leader_sets_who_is_active(panel):
     assert "send('PUT', `members/${encodeURIComponent(m.instance_id)}/serve`, { serve: on })" in save
     # HA_ACTIVE_LIMIT and every other refusal: the server's words, then the real count
     assert "if (!res.ok) { addToast?.(res.error, 'error'); load(); return; }" in save
-    assert "t(serve ? 'pgHaMemberServeOn' : 'pgHaMemberServeOff').replace('{name}', memberName(m))" in save
+    assert "t(serve ? 'pgHaMemberServeOn' : 'pgHaMemberServeOff').replace('{name}', () => memberName(m))" in save
     assert "const canSetActive = role === 'active';" in body
     card = _block(body, 'const membersCard = (', 'const intervalCard = (')
     # one switch per row, only on the leader; a standby is locked at the limit, off always works
@@ -5039,7 +5040,7 @@ def test_the_leader_sets_who_is_active(panel):
     assert 'role="switch" aria-checked={m.serve === true}' in toggle
     assert 'disabled={!!busy || broken || (activesFull && m.serve !== true)}' in toggle
     assert card.count('setMemberServe(') == 1
-    assert '{activesFull && (' in card and "t('pgHaActiveLimit').replace('{max}', activeLimit)" in card
+    assert '{activesFull && (' in card and "t('pgHaActiveLimit').replace('{max}', () => activeLimit)" in card
     assert ('<HaRoleBadge role={memberRole(m)} serving={m.serve === true} pending={m.serving_seen !== true} t={t} />'
             in card)
 

@@ -1951,6 +1951,51 @@
             );
         }
 
+        // LW Oct 2026 (#625) - the HA page of this layout shows the Proxmox HA groups
+        // (ProxmoxHaSection, since aed792d CloudHA above is no longer mounted). What the
+        // node HA settings of the cluster warn about gets one line each on top of it: an
+        // agent of an earlier PegaProx on a node, and unsafe two-node recovery. Nothing at
+        // all when neither applies, or the server does not report them.
+        function CloudHaNodeNotes({ clusterId, t, authFetch }) {
+            const [ha, setHa] = React.useState(null);
+            React.useEffect(() => {
+                let gone = false;
+                setHa(null);
+                if (!clusterId || !authFetch) return undefined;
+                authFetch(`${API_URL}/clusters/${clusterId}/ha/status`)
+                    .then(r => (r && r.ok ? r.json() : null))
+                    .then(d => { if (!gone) setHa(d); })
+                    .catch(() => {});
+                return () => { gone = true; };
+            }, [clusterId]);
+            if (!ha || !ha.enabled) return null;
+            const sbp = ha.split_brain_prevention || {};
+            const fa = ha.fence_agent || {};
+            const outdated = Array.isArray(fa.outdated) ? fa.outdated : [];
+            const unsafe = sbp.unsafe_two_node_recovery === true;
+            if (!outdated.length && !unsafe) return null;
+            const line = { display: 'flex', alignItems: 'center', gap: 8, fontSize: 13 };
+            return (
+                <div className="cloud-card" data-ha-node-cloud
+                    style={{ marginBottom: 16, borderLeft: `3px solid ${unsafe ? '#f87171' : '#f59e0b'}` }}>
+                    {unsafe && (
+                        <div data-ha-node-cloud-line="unsafe" title={sbp.unsafe_two_node_warning || undefined}
+                            style={{ ...line, color: 'var(--cloud-error, #f87171)' }}>
+                            <span style={{ display: 'inline-flex' }}><Icons.AlertTriangle /></span>
+                            <span><strong>{t('haNodeUnsafeSwitch')}</strong>: {t('enabled')}</span>
+                        </div>
+                    )}
+                    {outdated.length > 0 && (
+                        <div data-ha-node-cloud-line="outdated" title={fa.outdated_warning || undefined}
+                            style={{ ...line, color: 'var(--cloud-warning, #e0a82e)', marginTop: unsafe ? 6 : 0 }}>
+                            <span style={{ display: 'inline-flex' }}><Icons.AlertTriangle /></span>
+                            <span><strong>{t('haNodeCloudOutdated')}</strong>: {outdated.join(', ')}</span>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
         // NS 2026-06-11 — sponsors show in every layout, Cloud included. Same slots
         // + OC button as the classic footer, just sized for the cloud content area.
         // Reuses the global SponsorSlot so the mirror/GitHub self-heal applies here too.
@@ -2395,7 +2440,7 @@
                         body = <CloudNodes metrics={clusterMetrics} act={act} isAdmin={isAdmin} t={T} />;
                         break;
                     case 'ha':
-                        body = <div className="cloud-mounted"><ProxmoxHaSection clusterId={cid} /></div>;
+                        body = <div className="cloud-mounted"><CloudHaNodeNotes clusterId={cid} t={t} authFetch={authFetch} /><ProxmoxHaSection clusterId={cid} /></div>;
                         break;
                     case 'storage':
                         body = <div className="cloud-mounted"><DatastoreTab clusterId={cid} addToast={addToast} sharedDatastoreData={clusterDatastores} /></div>;
@@ -2538,6 +2583,10 @@
                         />
                         {/* #625 - same banner as the classic layouts, in the shell's colours */}
                         <HaStandbyBanner cloud onOpenHa={() => {
+                            onOpenSettings && onOpenSettings();
+                            window.dispatchEvent(new CustomEvent('pegaprox-navigate-ha'));
+                        }} />
+                        <HaCopiesBanner cloud onOpenHa={() => {
                             onOpenSettings && onOpenSettings();
                             window.dispatchEvent(new CustomEvent('pegaprox-navigate-ha'));
                         }} />
