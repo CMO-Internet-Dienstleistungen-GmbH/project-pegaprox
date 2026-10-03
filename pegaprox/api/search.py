@@ -2,6 +2,7 @@
 """search, favorites & tags routes - split from monolith dec 2025, NS/LW"""
 
 import os
+import re
 import json
 import logging
 from datetime import datetime
@@ -24,76 +25,129 @@ from pegaprox.api.helpers import get_connected_manager, safe_error, check_cluste
 bp = Blueprint('search', __name__)
 
 # ============================================
+# User favorites: the star next to a global search result.
+#
+# MK Oct 2026 - this never stored anything. The loader handed back a flat list of VM
+# rows per user, the route worked on three lists (vms/nodes/clusters), and the saver
+# walked that dict's keys as if they were rows: AttributeError, logged, nothing
+# written - after a DELETE of every user's rows that the next commit on the
+# connection made stick. Now one row per favorite in user_favorites with its kind
+# (db.py), written and read per user, and the three lists the dashboard reads.
 
-# User favorites storage
-FAVORITES_FILE = os.path.join(CONFIG_DIR, 'user_favorites.json')  # Legacy
+FAVORITE_BUCKETS = {'vm': 'vms', 'node': 'nodes', 'cluster': 'clusters'}
+# Per user and kind. The star shows in the global search dropdown only: 20 rows of
+# the at most 100 results one search returns. 500 VMs are five such answers, 200
+# nodes twice the 100 a large installation runs, 100 clusters more than anyone
+# runs from one instance. A script stops there, the table stays small, and it goes
+# to every member of an instance group with each sync.
+FAVORITES_MAX = {'vm': 500, 'node': 200, 'cluster': 100}
+# ids as the rest of the API hands them out: cluster ids are uuid4()[:8] (an ESXi
+# host's too), node names are host names, vmids are PVE's range (XCP-ng counts from 100)
+_FAV_CLUSTER_RE = re.compile(r'[A-Za-z0-9_.\-]{1,64}')
+_FAV_NODE_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._\-]{0,62}')
+_FAV_VMID_RE = re.compile(r'[0-9]{1,9}')
+_FAV_NAME_MAX = 128
+# the key the unique index idx_favorites_unique holds. IFNULL: on a member that got the
+# two columns from a sync (ha._add_column) they carry their default but no NOT NULL
+_FAV_KEY =("username = ? AND IFNULL(kind, 'vm') = ? AND cluster_id = ? "
+            "AND IFNULL(vmid, -1) = ? AND IFNULL(node, '') = ?")
 
-def load_favorites():
-    """Load user favorites from SQLite database
-    
-    SQLite migration
-    """
+
+def load_favorites(username):
+    """One user's favorites, oldest first: {'vms': [{cluster_id, vmid, type, name}],
+    'nodes': [{cluster_id, node}], 'clusters': [cluster_id, ...]}. Unfiltered; the
+    routes hand out only what the caller may see (_favorite_filter)."""
+    out = {bucket: [] for bucket in FAVORITE_BUCKETS.values()}
+    rows = get_db().conn.execute(
+        'SELECT kind, cluster_id, vmid, vm_type, vm_name, node FROM user_favorites '
+        'WHERE username = ? ORDER BY id', (username,)).fetchall()
+    for r in rows:
+        kind = r['kind'] or 'vm'
+        if kind == 'vm' and r['vmid'] is not None:
+            out['vms'].append({'cluster_id': r['cluster_id'], 'vmid': r['vmid'],
+                               'type': r['vm_type'] or 'qemu', 'name': r['vm_name'] or ''})
+        elif kind == 'node' and r['node']:
+            out['nodes'].append({'cluster_id': r['cluster_id'], 'node': r['node']})
+        elif kind == 'cluster':
+            out['clusters'].append(r['cluster_id'])
+    return out
+
+
+def _favorite_filter():
+    """Whether the caller may see a favorite: what global_search checks on its results,
+    with the same token-scoped identity. The cluster by tenant, group and pool grant,
+    a VM by its own grant as well. A favorite outside of that is neither listed nor
+    taken; the row stays, and shows again when the access comes back."""
+    user_data = build_authz_user(request.session.get('user', ''), request.session)
+    accessible = get_user_clusters(user_data)  # None = all
+
+    def visible(kind, cluster_id, vmid=None):
+        if accessible is not None and cluster_id not in accessible:
+            return False
+        if kind == 'vm':
+            # no type: PVE numbers guests per cluster, and a stored type could be stale
+            return user_can_access_vm(user_data, cluster_id, vmid, 'vm.view')
+        return True
+    return visible
+
+
+def _visible_favorites(username, visible):
+    favs = load_favorites(username)
+    return {
+        'vms': [f for f in favs['vms'] if visible('vm', f['cluster_id'], f['vmid'])],
+        'nodes': [f for f in favs['nodes'] if visible('node', f['cluster_id'])],
+        'clusters': [c for c in favs['clusters'] if visible('cluster', c)],
+    }
+
+
+def _favorite_from_body(data):
+    """(kind, cluster_id, vmid, node, vm_type) from a POST body, or an error text."""
+    fav_type = data.get('type')
+    cluster_id = data.get('cluster_id')
+    if not fav_type or not cluster_id:
+        return 'type and cluster_id required'
+    if not isinstance(cluster_id, str) or not _FAV_CLUSTER_RE.fullmatch(cluster_id):
+        return 'Invalid cluster_id'
+    if fav_type in ('vm', 'ct'):
+        vmid = data.get('vmid')
+        if not vmid:
+            return 'vmid required for vm favorites'
+        if isinstance(vmid, bool) or not isinstance(vmid, (int, str)) or not _FAV_VMID_RE.fullmatch(str(vmid)):
+            return 'Invalid vmid'
+        vmid = int(vmid)
+        # a standalone ESXi host lists its VMs by their small moId numbers, PVE from 100
+        if vmid < 1:
+            return 'Invalid vmid'
+        # a container row of the search sends 'ct'
+        vm_type = data.get('vm_type') or ('lxc' if fav_type == 'ct' else 'qemu')
+        if vm_type not in ('qemu', 'lxc'):
+            return 'vm_type is qemu or lxc'
+        return 'vm', cluster_id, vmid, '', vm_type
+    if fav_type == 'node':
+        node = data.get('node')
+        if not node:
+            return 'node required for node favorites'
+        if not isinstance(node, str) or not _FAV_NODE_RE.fullmatch(node):
+            return 'Invalid node name'
+        return 'node', cluster_id, None, node, None
+    if fav_type == 'cluster':
+        return 'cluster', cluster_id, None, '', None
+    return 'Invalid type. Use vm, node, or cluster'
+
+
+def _live_vm(cluster_id, vmid):
+    """(name, type) of a VM as its cluster lists it now, (None, None) when it does not."""
+    mgr = cluster_managers.get(cluster_id)
     try:
-        db = get_db()
-        cursor = db.conn.cursor()
-        cursor.execute('SELECT * FROM user_favorites')
-        
-        favorites = {}
-        for row in cursor.fetchall():
-            username = row['username']
-            if username not in favorites:
-                favorites[username] = []
-            favorites[username].append({
-                'cluster_id': row['cluster_id'],
-                'vmid': row['vmid'],
-                'vm_type': row['vm_type'],
-                'vm_name': row['vm_name'],
-            })
-        
-        return favorites
+        if mgr is not None and mgr.is_connected:
+            for r in mgr.get_vm_resources() or []:
+                if str(r.get('vmid')) == str(vmid):
+                    name, vtype = r.get('name'), r.get('type')
+                    return (name[:_FAV_NAME_MAX] if isinstance(name, str) else None,
+                            vtype if vtype in ('qemu', 'lxc') else None)
     except Exception as e:
-        logging.error(f"Error loading favorites from database: {e}")
-        # Legacy fallback
-        try:
-            if os.path.exists(FAVORITES_FILE):
-                with open(FAVORITES_FILE, 'r') as f:
-                    return json.load(f)
-        except:
-            pass
-    return {}
-
-
-def save_favorites(favorites):
-    """Save user favorites to SQLite database
-    
-    SQLite migration
-    """
-    try:
-        db = get_db()
-        cursor = db.conn.cursor()
-        
-        # Clear existing favorites
-        cursor.execute('DELETE FROM user_favorites')
-        
-        now = datetime.now().isoformat()
-        for username, user_favs in favorites.items():
-            for fav in user_favs:
-                cursor.execute('''
-                    INSERT INTO user_favorites 
-                    (username, cluster_id, vmid, vm_type, vm_name, added_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (
-                    username,
-                    fav.get('cluster_id'),
-                    fav.get('vmid'),
-                    fav.get('vm_type', fav.get('type', '')),
-                    fav.get('vm_name', fav.get('name', '')),
-                    now
-                ))
-        
-        db.conn.commit()
-    except Exception as e:
-        logging.error(f"Error saving favorites: {e}")
+        logging.debug(f"[favorites] no live name for {cluster_id}/{vmid}: {e}")
+    return None, None
 
 
 @bp.route('/api/global/search', methods=['GET'])
@@ -418,92 +472,88 @@ def global_summary():
 @bp.route('/api/user/favorites', methods=['GET'])
 @require_auth()
 def get_favorites():
-    """Get user's favorite/pinned VMs and nodes"""
+    """The caller's favorites
+
+    vms [{cluster_id, vmid, type, name}], nodes [{cluster_id, node}], clusters
+    [cluster_id], each only while the caller may still see it.
+    """
     user = request.session.get('user', '')
-    favorites = load_favorites()
-    
-    user_favs = favorites.get(user, {
-        'vms': [],      # [{cluster_id, vmid, type}]
-        'nodes': [],    # [{cluster_id, node}]
-        'clusters': []  # [cluster_id]
-    })
-    
-    return jsonify(user_favs)
+    try:
+        return jsonify(_visible_favorites(user, _favorite_filter()))
+    except Exception as e:
+        logging.error(f"Error loading favorites: {e}")
+        return jsonify({'error': safe_error(e, 'Could not load favorites')}), 500
 
 
 @bp.route('/api/user/favorites', methods=['POST'])
 @require_auth()
 def update_favorites():
-    """Add or remove a favorite
-    
+    """Add or remove a favorite of the caller
+
     Body:
-    - action: 'add' or 'remove'
-    - type: 'vm', 'node', or 'cluster'
+    - action: 'add' (default) or 'remove'
+    - type: 'vm' ('ct' for a container), 'node', or 'cluster'
     - cluster_id: Cluster ID
     - vmid: (for vm) VM ID
     - vm_type: (for vm) 'qemu' or 'lxc'
     - node: (for node) Node name
+
+    Answers with the favorites as GET does. Only what the caller may see is taken,
+    and at most 500 VMs, 200 nodes and 100 clusters (409 FAVORITES_LIMIT beyond).
     """
     user = request.session.get('user', '')
-    data = request.json or {}
-    
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': 'JSON object required'}), 400
     action = data.get('action', 'add')
-    fav_type = data.get('type')
-    cluster_id = data.get('cluster_id')
-    
-    if not fav_type or not cluster_id:
-        return jsonify({'error': 'type and cluster_id required'}), 400
-    
-    favorites = load_favorites()
-    
-    if user not in favorites:
-        favorites[user] = {'vms': [], 'nodes': [], 'clusters': []}
-    
-    user_favs = favorites[user]
-    
-    if fav_type == 'vm':
-        vmid = data.get('vmid')
-        vm_type = data.get('vm_type', 'qemu')
-        if not vmid:
-            return jsonify({'error': 'vmid required for vm favorites'}), 400
-        
-        fav_entry = {'cluster_id': cluster_id, 'vmid': vmid, 'type': vm_type}
-        
+    if action not in ('add', 'remove'):
+        return jsonify({'error': "action is 'add' or 'remove'"}), 400
+    parsed = _favorite_from_body(data)
+    if isinstance(parsed, str):
+        return jsonify({'error': parsed}), 400
+    kind, cluster_id, vmid, node, vm_type = parsed
+    visible = _favorite_filter()
+    key = (user, kind, cluster_id, -1 if vmid is None else vmid, node)
+
+    # the same answer for a cluster that is not there as for one out of reach
+    if action == 'add' and (cluster_id not in cluster_managers or not visible(kind, cluster_id, vmid)):
+        return jsonify({'error': 'Access denied'}), 403
+
+    conn = get_db().conn
+    full = False
+    try:
         if action == 'add':
-            # Check if already exists
-            if not any(f['cluster_id'] == cluster_id and f['vmid'] == vmid for f in user_favs['vms']):
-                user_favs['vms'].append(fav_entry)
+            if not conn.execute(f'SELECT 1 FROM user_favorites WHERE {_FAV_KEY}', key).fetchone():
+                name = None
+                if kind == 'vm':
+                    name, live_type = _live_vm(cluster_id, vmid)
+                    vm_type = live_type or vm_type
+                # count and insert in one statement: two adds at once cannot pass the cap together
+                cur = conn.execute(
+                    'INSERT OR IGNORE INTO user_favorites (username, kind, cluster_id, vmid, vm_type, '
+                    'vm_name, node, added_at) SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE (SELECT COUNT(*) '
+                    'FROM user_favorites WHERE username = ? AND kind = ?) < ?',
+                    (user, kind, cluster_id, vmid, vm_type, name, node, datetime.now().isoformat(),
+                     user, kind, FAVORITES_MAX[kind]))
+                full = cur.rowcount == 0 and not conn.execute(
+                    f'SELECT 1 FROM user_favorites WHERE {_FAV_KEY}', key).fetchone()
         else:
-            user_favs['vms'] = [f for f in user_favs['vms'] 
-                               if not (f['cluster_id'] == cluster_id and f['vmid'] == vmid)]
-    
-    elif fav_type == 'node':
-        node = data.get('node')
-        if not node:
-            return jsonify({'error': 'node required for node favorites'}), 400
-        
-        fav_entry = {'cluster_id': cluster_id, 'node': node}
-        
-        if action == 'add':
-            if not any(f['cluster_id'] == cluster_id and f['node'] == node for f in user_favs['nodes']):
-                user_favs['nodes'].append(fav_entry)
-        else:
-            user_favs['nodes'] = [f for f in user_favs['nodes']
-                                 if not (f['cluster_id'] == cluster_id and f['node'] == node)]
-    
-    elif fav_type == 'cluster':
-        if action == 'add':
-            if cluster_id not in user_favs['clusters']:
-                user_favs['clusters'].append(cluster_id)
-        else:
-            user_favs['clusters'] = [c for c in user_favs['clusters'] if c != cluster_id]
-    
-    else:
-        return jsonify({'error': 'Invalid type. Use vm, node, or cluster'}), 400
-    
-    save_favorites(favorites)
-    
-    return jsonify({'success': True, 'favorites': user_favs})
+            # one's own row goes whether it is still in reach or not
+            conn.execute(f'DELETE FROM user_favorites WHERE {_FAV_KEY}', key)
+        # also when nothing went in: the INSERT took the write lock all the same
+        conn.commit()
+        if full:
+            what = {'vm': 'VMs', 'node': 'nodes', 'cluster': 'clusters'}[kind]
+            return jsonify({'error': f'At most {FAVORITES_MAX[kind]} {what} can be favorites - '
+                                     'remove one first', 'code': 'FAVORITES_LIMIT'}), 409
+        return jsonify({'success': True, 'favorites': _visible_favorites(user, visible)})
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logging.error(f"Error saving favorite: {e}")
+        return jsonify({'error': safe_error(e, 'Could not save favorite')}), 500
 
 
 # ============================================

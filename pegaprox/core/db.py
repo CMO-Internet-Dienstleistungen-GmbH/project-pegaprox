@@ -628,12 +628,39 @@ class PegaProxDB:
                 vmid INTEGER,
                 vm_type TEXT,
                 vm_name TEXT,
-                added_at TEXT
+                added_at TEXT,
+                kind TEXT NOT NULL DEFAULT 'vm',
+                node TEXT NOT NULL DEFAULT ''
             )
         ''')
         cursor.execute('''
             CREATE INDEX IF NOT EXISTS idx_favorites_user ON user_favorites(username)
         ''')
+        # MK Oct 2026 - a favorite is a VM, a node or a cluster (api/search.py). The table
+        # had columns for a VM only; its rows from before are VMs, which is what the two
+        # defaults say, so they read the same before and after (a sync hashes them alike).
+        try:
+            cursor.execute("PRAGMA table_info(user_favorites)")
+            columns = [col[1] for col in cursor.fetchall()]
+            if 'kind' not in columns:
+                cursor.execute("ALTER TABLE user_favorites ADD COLUMN kind TEXT NOT NULL DEFAULT 'vm'")
+            if 'node' not in columns:
+                cursor.execute("ALTER TABLE user_favorites ADD COLUMN node TEXT NOT NULL DEFAULT ''")
+            # One row per user and thing. Nodes and clusters have no vmid, and two NULLs
+            # never collide in a unique index, hence the IFNULL.
+            cursor.execute("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_favorites_unique'")
+            if not cursor.fetchone():
+                cursor.execute('''
+                    DELETE FROM user_favorites WHERE id NOT IN (
+                        SELECT MIN(id) FROM user_favorites
+                        GROUP BY username, kind, cluster_id, IFNULL(vmid, -1), node)
+                ''')
+                cursor.execute('''
+                    CREATE UNIQUE INDEX idx_favorites_unique
+                    ON user_favorites(username, kind, cluster_id, IFNULL(vmid, -1), node)
+                ''')
+        except Exception as e:
+            logging.error(f"user_favorites migration failed, favorites stay unavailable: {e}")
         
         # Scheduled actions table - NS Jan 2026
         cursor.execute('''
@@ -3704,7 +3731,7 @@ class PegaProxDB:
         route has done this for its own deletions since #556; everything else had not.
         MK Sep 2026
         """
-        removed = {'vm_acls': 0, 'scheduled_actions': 0}
+        removed = {'vm_acls': 0, 'scheduled_actions': 0, 'favorites': 0}
         cursor = self.conn.cursor()
         try:
             cursor.execute('DELETE FROM vm_acls WHERE cluster_id = ? AND vmid = ?',
@@ -3718,6 +3745,13 @@ class PegaProxDB:
             removed['scheduled_actions'] = cursor.rowcount or 0
         except Exception as e:
             logging.error(f"Failed to purge schedules for {cluster_id}/{vmid}: {e}")
+        try:
+            # a star on the number would light the next guest that takes it, and hold a slot
+            cursor.execute("DELETE FROM user_favorites WHERE cluster_id = ? AND kind = 'vm' AND vmid = ?",
+                           (cluster_id, int(vmid)))
+            removed['favorites'] = cursor.rowcount or 0
+        except Exception as e:
+            logging.error(f"Failed to purge favorites for {cluster_id}/{vmid}: {e}")
         self.conn.commit()
         if any(removed.values()):
             logging.info(f"purged grants for removed VM {cluster_id}/{vmid}: {removed}")
@@ -3732,6 +3766,8 @@ class PegaProxDB:
         """Delete user"""
         cursor = self.conn.cursor()
         cursor.execute('DELETE FROM users WHERE username = ?', (username,))
+        # the next account under this name starts without them
+        cursor.execute('DELETE FROM user_favorites WHERE username = ?', (username,))
         self.conn.commit()
         # the grants outlive the account otherwise, and the next account with this
         # name inherits them

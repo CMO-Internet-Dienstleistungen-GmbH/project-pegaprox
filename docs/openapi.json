@@ -33408,7 +33408,8 @@
             "description": "Not authenticated"
           }
         },
-        "summary": "Get user's favorite/pinned VMs and nodes",
+        "summary": "The caller's favorites",
+        "description": "vms [{cluster_id, vmid, type, name}], nodes [{cluster_id, node}], clusters\n[cluster_id], each only while the caller may still see it.",
         "x-pegaprox-auth": "decorator",
         "security": [
           {
@@ -33435,8 +33436,8 @@
             "description": "Not authenticated"
           }
         },
-        "summary": "Add or remove a favorite",
-        "description": "Body:\n- action: 'add' or 'remove'\n- type: 'vm', 'node', or 'cluster'\n- cluster_id: Cluster ID\n- vmid: (for vm) VM ID\n- vm_type: (for vm) 'qemu' or 'lxc'\n- node: (for node) Node name",
+        "summary": "Add or remove a favorite of the caller",
+        "description": "Body:\n- action: 'add' (default) or 'remove'\n- type: 'vm' ('ct' for a container), 'node', or 'cluster'\n- cluster_id: Cluster ID\n- vmid: (for vm) VM ID\n- vm_type: (for vm) 'qemu' or 'lxc'\n- node: (for node) Node name\n\nAnswers with the favorites as GET does. Only what the caller may see is taken,\nand at most 500 VMs, 200 nodes and 100 clusters (409 FAVORITES_LIMIT beyond).",
         "requestBody": {
           "required": false,
           "content": {

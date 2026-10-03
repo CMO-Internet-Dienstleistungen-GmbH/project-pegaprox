@@ -76,7 +76,7 @@ def test_purging_leaves_the_same_vmid_on_another_cluster_alone(db, seed):
 
 
 def test_purging_a_vm_with_no_grants_is_a_no_op(db):
-    assert db.purge_vm_grants('cluster_1', 999) == {'vm_acls': 0, 'scheduled_actions': 0}
+    assert db.purge_vm_grants('cluster_1', 999) == {'vm_acls': 0, 'scheduled_actions': 0, 'favorites': 0}
 
 
 # --- the xcpng allocator must not hand the number back ------------------------
