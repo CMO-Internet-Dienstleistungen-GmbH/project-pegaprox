@@ -4667,6 +4667,9 @@ class PegaProxManager:
                                     # Trigger HA recovery
                                     self._ha_trigger_recovery(node_name)
                             elif (node_name in self.__dict__.get('_ha_recovery_retry', ())
+                                    # asked before the rest: a hold counts from the first
+                                    # pass that finds the node offline, cooldown or not
+                                    and self._ha_retry_due(node_name)
                                     and node_name not in self.nodes_in_maintenance
                                     and node_name not in self.ha_recovery_in_progress):
                                 # MK Oct 2026 (#625) - the recovery above runs once, on the
@@ -4708,6 +4711,13 @@ class PegaProxManager:
             self.ha_recovery_in_progress.pop(failed_node, None)
             return
         
+        # MK Oct 2026 (#625) - the outage this recovery is for: the one after the last
+        # pass that saw the node online. A pass that sees it online again ends it, and
+        # a later one is counted afresh and gets a recovery of its own
+        with self.ha_lock:
+            seen_online = (self.ha_node_status.get(failed_node) or {}).get('last_seen')
+        # the worker's looks at the node, see _ha_node_back
+        looked = {'last_seen': seen_online}
         locked = False
         must_fence = []
         try:
@@ -4715,8 +4725,17 @@ class PegaProxManager:
             # STEP 0: Try to acquire recovery lock (if storage configured)
             # ============================================
             if self.ha_config.get('storage_heartbeat_enabled'):
+                # held here already: the recovery of the outage before this one, which
+                # a pass saw end. It cancels once it wakes, so nothing would be left
+                # to recover this outage - it is tried again once that one is done
+                earlier = failed_node in self.ha_recovery_locks
                 if not self._ha_acquire_recovery_lock(failed_node):
-                    self.logger.warning(f"[HA] Another instance is already recovering {failed_node}")
+                    if earlier:
+                        self.logger.warning(f"[HA] An earlier recovery of {failed_node} still holds its "
+                                            "lock - this one is tried again once it is done")
+                        self._ha_retry_recovery(failed_node)
+                    else:
+                        self.logger.warning(f"[HA] Another instance is already recovering {failed_node}")
                     return
                 locked = True
             
@@ -4734,6 +4753,21 @@ class PegaProxManager:
                 if failed_node in self.ha_node_status:
                     if self.ha_node_status[failed_node].get('status') == 'online':
                         self.logger.info(f"[HA] Node {failed_node} came back online - cancelling recovery")
+                        self._ha_release_recovery_lock(failed_node)
+                        return
+                    # back and offline again: this wait counted from the outage before,
+                    # while the node's agent counts from the moment it lost quorum again.
+                    # Not caught: a return between two passes that none of them sees
+                    # (5 to 9 s at the default interval). The agent starts its fence
+                    # delay over then and this wait does not; only corosync's join
+                    # count on the node (over SSH) would tell. Left open on purpose
+                    if self.ha_node_status[failed_node].get('last_seen') != seen_online:
+                        self.logger.info(f"[HA] Node {failed_node} was back online during the wait - "
+                                         "cancelling, its recovery counts from that pass")
+                        # declared again meanwhile: that recovery may have met the lock
+                        # this one still holds, and given up
+                        if self.ha_node_status[failed_node].get('status') == 'offline':
+                            self._ha_retry_recovery(failed_node)
                         self._ha_release_recovery_lock(failed_node)
                         return
             if not ha.is_active():
@@ -4923,6 +4957,8 @@ class PegaProxManager:
             
             # Get list of VMs that were on the failed node
             vms_on_failed_node = self._ha_get_vms_on_node(failed_node)
+            # this recovery only moves what it finds running
+            self._ha_say_left_again(failed_node)
             
             if not vms_on_failed_node:
                 self.logger.info(f"[HA] No VMs found on failed node {failed_node}")
@@ -4951,8 +4987,11 @@ class PegaProxManager:
             recovered = 0
             failed = 0
             skipped_local = 0
+            started = []    # (vmid, target) of what was brought up elsewhere
+            unstarted = []  # (vmid, target) moved while the node was back, and not started
+            left = []       # what stays with the node once it is back
             
-            for vm in vms_on_failed_node:
+            for i, vm in enumerate(vms_on_failed_node):
                 if not ha.is_active():
                     self.logger.warning(f"[HA] Recovery of {failed_node} stopped after {recovered} VM(s) "
                                         "- this PegaProx instance stepped down")
@@ -4978,6 +5017,13 @@ class PegaProxManager:
                     failed += 1
                     continue
                 
+                # The node is asked again for every guest, afresh: the wait above decided
+                # once that it is gone. One that never fenced itself, or that rebooted and
+                # started its guests, runs what is still on it, and moving the next config
+                # away started that guest a second time elsewhere. The rest stays with it
+                if self._ha_node_back(failed_node, looked, vmid) is True:
+                    left = vms_on_failed_node[i:]
+                    break
                 # asked again after the storage check and the target choice, both API reads
                 # that can take seconds: the loop-top check alone would still start this VM
                 # next to the new active (#625)
@@ -4989,11 +5035,26 @@ class PegaProxManager:
                 
                 # Try to start the VM on the target node
                 # Note: This relies on shared storage - the VM config should already be available
-                success = self._ha_start_vm_on_node(vmid, vm_type, target_node, failed_node)
+                success = self._ha_start_vm_on_node(vmid, vm_type, target_node, failed_node, looked)
+                if success is None or success == 'moved':
+                    # nothing was moved: the node was back right before the move, or this
+                    # instance stepped down while it looked. Or the config moved while
+                    # the node was back, and this guest is the admin's now
+                    rest = i
+                    if success == 'moved':
+                        unstarted.append((vmid, target_node))
+                        rest = i + 1
+                    if ha.is_active():
+                        left = vms_on_failed_node[rest:]
+                    else:
+                        self.logger.warning(f"[HA] Recovery of {failed_node} stopped after {recovered} VM(s) "
+                                            "- this PegaProx instance stepped down")
+                    break
                 
                 if success:
                     self.logger.info(f"[HA] ✓ Successfully recovered {vm_name} on {target_node}")
                     recovered += 1
+                    started.append((vmid, target_node))
                 else:
                     self.logger.error(f"[HA] ✗ Failed to recover {vm_name}")
                     failed += 1
@@ -5001,7 +5062,45 @@ class PegaProxManager:
                 # Small delay between VM starts
                 time.sleep(2)
             
-            self.logger.info(f"[HA] ========== HA RECOVERY COMPLETE ==========")
+            if left or unstarted:
+                states = self._ha_leave_to_node(failed_node, left) if left else []
+                # what is down now (left stopped, or moved and not started) is said again
+                # by the next recovery of the node, which only moves guests it finds running
+                self.__dict__.setdefault('_ha_left_guests', {})[failed_node] = (
+                    [v for v, what in states if what != 'running'] + [v for v, _t in unstarted])
+                details = (f"{failed_node} is back online: its recovery stopped after {len(started)} guest(s). "
+                           f"Recovered: {', '.join(f'{v} on {t}' for v, t in started) or 'none'}. ")
+                if unstarted:
+                    details += (f"Moved, not started: {', '.join(f'{v} to {t}' for v, t in unstarted)} - "
+                                f"{failed_node} was online while the config moved and may still run it "
+                                f"without a config there: check {failed_node} before you start it by hand "
+                                "where it belongs. ")
+                details += f"Left on {failed_node}: {', '.join(f'{v} ({what})' for v, what in states) or 'none'}"
+                self.logger.warning(f"[HA] {details}")
+                try:
+                    from pegaprox.utils.audit import log_audit
+                    log_audit('system', 'ha.recovery_node_back', f"Cluster {self.config.name}: {details}",
+                              cluster=self.config.name)
+                except Exception:
+                    pass
+                # critical while a guest needs an admin, as _ha_refuse pushes it
+                down = unstarted or [w for _v, w in states if w != 'running']
+                try:
+                    broadcast_sse('ha_status', {'event': 'ha.recovery_node_back', 'node': failed_node,
+                                                'message': details, 'cluster_id': self.id,
+                                                'severity': 'critical' if down else 'warning'}, self.id)
+                except Exception:
+                    pass
+                # seen back by this worker only: should it be gone again, the monitor
+                # tries the rest once this one has cooled down, as after a refusal that
+                # can pass, and not before its agent can have fenced (_ha_retry_due).
+                # A pass that sees it online takes the mark off; one that did already
+                # counts a new outage from there
+                with self.ha_lock:
+                    unseen = (self.ha_node_status.get(failed_node) or {}).get('last_seen') == seen_online
+                if unseen:
+                    self._ha_retry_recovery(failed_node, held=True)
+            self.logger.info(f"[HA] ========== HA RECOVERY {'ENDED' if left or unstarted else 'COMPLETE'} ==========")
             self.logger.info(f"[HA] Recovered: {recovered}, Failed: {failed}, Skipped (local storage): {skipped_local}")
             
             if skipped_local > 0:
@@ -5021,8 +5120,196 @@ class PegaProxManager:
 
             # Keep recovery flag for a while to prevent duplicate recovery
             time.sleep(60)  # 60s cooldown, maybe make this configurable?
-            self.ha_recovery_in_progress.pop(failed_node, None)
+            # a pass that saw the node online took this flag off already: one that is
+            # there now is the recovery of a later outage
+            with self.ha_lock:
+                ours = (self.ha_node_status.get(failed_node) or {}).get('last_seen') == seen_online
+            if ours:
+                self.ha_recovery_in_progress.pop(failed_node, None)
     
+    def _ha_node_listed_online(self, node) -> bool:
+        """Whether the API host lists `node` as online: GET /nodes, the list the HA
+        monitor reads, asked now rather than taken from its last pass. When the host
+        does not answer, what that pass found stands."""
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes"
+            resp = self._create_session().get(url, timeout=10)
+            if resp.status_code == 200:
+                return any(isinstance(n, dict) and n.get('node') == node and n.get('status') == 'online'
+                           for n in resp.json().get('data') or [])
+            self.logger.warning(f"[HA] Could not list the nodes to look at {node}: {resp.status_code}")
+        except Exception as e:
+            self.logger.warning(f"[HA] Could not list the nodes to look at {node}: {e}")
+        with self.ha_lock:
+            return (self.ha_node_status.get(node) or {}).get('status') == 'online'
+
+    NODE_BACK_RESTARTS = 3     # watches started over in one look before the node is taken as back
+
+    def _ha_node_back(self, node, looked=None, vmid=None) -> bool:
+        """Whether a node whose guests are being recovered is back (#625). Asked
+        before each guest, right before its config moves, before the start of one
+        that moved and after a move that did not go through; what is left of the
+        guests then stays with the node.
+
+        The rule: the API host lists the node as online now (_ha_node_listed_online).
+        Where the node's v2 agent stops its guests on its own (self_fences in
+        _ha_fence_timing), it also has to stay listed online for that agent's
+        fence_delay, at a look every monitor interval, so it is back once it was not
+        seen offline for a fence delay. Its guests were stopped by its fence and the
+        agent starts none of them, so a node that is online for a moment and gone
+        again does not end the recovery they need: when one of the looks finds it
+        gone, it is not back. It had quorum until a moment ago, though, and back
+        from a reboot it started its onboot guests: its agent stops them a fence
+        delay after it lost quorum. So nothing is moved before fence_delay + margin
+        from that look, the floor the wait of a v2 recovery has from the first pass
+        that sees the node offline, and then it is looked at again. Nothing is moved
+        while this looks either. Any other node may still run its guests and is back
+        as soon as it is listed online.
+
+        looked is the worker's record of its looks. A monitor pass that saw the node
+        online since the last one (last_seen moved) counts like a look that found
+        it online, even when it is gone again by now: the worker's own looks can
+        miss a return that a long step (a fence over SSH, a slow config move) hid.
+        Such a node is back, unless it fences itself: then the floor, and it is
+        looked at again.
+
+        vmid is the guest of the moment. Watched is a guest the node reports
+        running. One it reports stopped cannot run twice, so no fence delay is
+        waited for it: only one turn of the node's agent (2 x its check interval),
+        after which the agent is in order again. Listed still, the node is back and
+        the guest stays with it, stopped, for an admin (_ha_leave_to_node); gone,
+        the floor as above. A node that comes back again after NODE_BACK_RESTARTS
+        floors is taken as back, so a flap in step with the watch does not hold the
+        recovery for as long as it lasts."""
+        def look():
+            # last_seen before the list: a pass that sees the node after it counts next time
+            with self.ha_lock:
+                seen = (self.ha_node_status.get(node) or {}).get('last_seen')
+            passed = looked is not None and seen != looked['last_seen']
+            if looked is not None:
+                looked['last_seen'] = seen
+            return self._ha_node_listed_online(node), passed
+
+        listed, passed = look()
+        if not listed and not passed:
+            return False
+        timing = self._ha_fence_timing(node)
+        if not timing.get('self_fences'):
+            return True
+        step = self._ha_interval()
+        floor = timing['fence_delay'] + timing['margin']
+        for _ in range(self.NODE_BACK_RESTARTS + 1):
+            if listed:
+                guests = self._ha_guests_now() if vmid is not None else None
+                guest = (guests or {}).get(vmid) or {}
+                if guests is not None and (guest.get('node') != node or guest.get('status') == 'stopped'):
+                    pauses = [2 * self.FENCE_AGENT_INTERVAL]
+                    self.logger.warning(f"[HA] {node} is listed online again and reports {vmid} stopped - "
+                                        f"its recovery waits {pauses[0]}s, one turn of its agent, to see "
+                                        "whether it stays")
+                else:
+                    pauses = [step] * int(-(-timing['fence_delay'] // step))
+                    self.logger.warning(f"[HA] {node} is listed online again - its recovery waits up to "
+                                        f"{sum(pauses)}s to see whether it stays")
+                for pause in pauses:
+                    time.sleep(pause)
+                    listed = look()[0]
+                    if not listed:
+                        break
+                else:
+                    return True
+                self.logger.warning(f"[HA] {node} is gone again - its recovery goes on in {floor}s, "
+                                    "once its agent has stopped what it may have started")
+            else:
+                self.logger.warning(f"[HA] {node} was seen online by a pass and is gone again - its recovery "
+                                    f"goes on in {floor}s, once its agent has stopped what it may have started")
+            time.sleep(floor)
+            if not ha.is_active():
+                return False
+            listed, passed = look()
+            if not listed and not passed:
+                return False
+        if not listed:
+            # the last look did not list it: not back, the recovery goes on
+            return False
+        self.logger.warning(f"[HA] {node} keeps coming back - what is left of its recovery stays with it")
+        return True
+
+    def _ha_guests_now(self):
+        """{vmid: entry} of /cluster/resources, None when it could not be read."""
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/cluster/resources"
+            resp = self._create_session().get(url, params={'type': 'vm'}, timeout=10)
+            if resp.status_code == 200:
+                return {r.get('vmid'): r for r in resp.json().get('data') or [] if isinstance(r, dict)}
+            self.logger.warning(f"[HA] Could not read the guests: {resp.status_code}")
+        except Exception as e:
+            self.logger.warning(f"[HA] Could not read the guests: {e}")
+        return None
+
+    def _ha_say_left_again(self, node):
+        """A new recovery of `node` starts, and an earlier one did not start guests while
+        the node was briefly back (left with it, or moved and not started): this one only
+        moves guests it finds running, so nothing will start them. Those still not
+        running are said once more, critical, and the note is forgotten."""
+        left = (self.__dict__.get('_ha_left_guests') or {}).pop(node, None)
+        if not left:
+            return
+        now = self._ha_guests_now()
+        if now is not None:
+            # an admin may have started them meanwhile
+            left = [v for v in left if (now.get(v) or {}).get('status') != 'running']
+            if not left:
+                return
+        details = (f"{node} is offline again; guests an earlier recovery did not start while it was "
+                   f"back are {'still stopped' if now is not None else 'maybe still stopped (the guests could not be read)'}: "
+                   f"{', '.join(str(v) for v in left)} - start them by hand where they belong")
+        self.logger.warning(f"[HA] {details}")
+        try:
+            from pegaprox.utils.audit import log_audit
+            log_audit('system', 'ha.recovery_left_guests', f"Cluster {self.config.name}: {details}",
+                      cluster=self.config.name)
+        except Exception:
+            pass
+        try:
+            broadcast_sse('ha_status', {'event': 'ha.recovery_left_guests', 'node': node, 'message': details,
+                                        'cluster_id': self.id, 'severity': 'critical'}, self.id)
+        except Exception:
+            pass
+
+    def _ha_leave_to_node(self, node, guests):
+        """The state of each guest a recovery leaves with a node that is back (#625),
+        as (vmid, what) for its report. Read once while the node is listed online,
+        so the statuses are the node's own, and only where the API host reports the
+        cluster quorate: a node cut off from the others lists itself online, with
+        the copy of /etc/pve from before the split.
+
+        Nothing is started here. The recovery never starts a guest on the node it
+        recovers from, as the node's self-fence agent starts none it stopped:
+        whether the node is in order, and stays, is for an admin to judge. One it
+        reports stopped is named for them."""
+        if not self._ha_node_listed_online(node):
+            return [(vm.get('vmid'), f'not known, {node} is offline again') for vm in guests]
+        if self._ha_cluster_quorum()[0] is not True:
+            why = f'not known, {self.current_host or self.host} does not report the cluster quorate'
+            return [(vm.get('vmid'), why) for vm in guests]
+        now = self._ha_guests_now()
+        if now is None:
+            return [(vm.get('vmid'), 'not known, the guests could not be read') for vm in guests]
+        states = []
+        for vm in guests:
+            guest = now.get(vm.get('vmid'))
+            if guest is None:
+                what = 'not found'
+            elif guest.get('node') != node:
+                what = f"{guest.get('status')} on {guest.get('node')}"
+            elif guest.get('status') == 'stopped':
+                what = f'stopped - start it by hand once {node} is in order'
+            else:
+                what = str(guest.get('status'))
+            states.append((vm.get('vmid'), what))
+        return states
+
     def _ha_check_vm_storage(self, vmid: int, vm_type: str, node: str) -> str:
         """check if VM uses shared or local storage
 
@@ -5294,7 +5581,8 @@ class PegaProxManager:
         scored_nodes.sort(key=lambda x: x[1])
         return scored_nodes[0][0] if scored_nodes else None
     
-    def _ha_start_vm_on_node(self, vmid: int, vm_type: str, target_node: str, original_node: str) -> bool:
+    def _ha_start_vm_on_node(self, vmid: int, vm_type: str, target_node: str, original_node: str,
+                             looked=None) -> bool:
         """Attempt to start a VM on a target node after HA failover
         
         CRITICAL FOR 2-NODE CLUSTERS:
@@ -5302,6 +5590,11 @@ class PegaProxManager:
         2. THEN move config, clear locks, start VM
         
         Without quorum, /etc/pve is read-only and nothing works!
+
+        None when nothing was moved because original_node is back (_ha_node_back),
+        or because this instance stepped down while it waited to see. 'moved' when
+        the config moved but the guest was not started: original_node was back by
+        the start. looked is the recovery worker's, for _ha_node_back.
         """
         host = self.host
         
@@ -5353,6 +5646,12 @@ class PegaProxManager:
             if not self._ha_clear_vm_lock(vmid, vm_type, target_node, original_node):
                 self.logger.warning(f"[HA] ⚠ Failed to clear lock on {vm_type}/{vmid} - continuing anyway")
             
+            # right before the config leaves the node: forcing quorum, the fence and the
+            # reads above can take a while, and the node may be back by now (#625)
+            if self._ha_node_back(original_node, looked, vmid) is True or not ha.is_active():
+                self.logger.warning(f"[HA] {vm_type}/{vmid} is left on {original_node}, nothing was moved")
+                return None
+
             # Move VM config to target node
             # The config must be in /etc/pve/nodes/<target>/qemu-server/<vmid>.conf
             self.logger.info(f"[HA] Moving VM {vmid} config from {original_node} to {target_node}")
@@ -5360,6 +5659,26 @@ class PegaProxManager:
             if config_moved:
                 self.logger.info(f"[HA] ✓ VM {vmid} config moved to {target_node}")
                 time.sleep(2)  # Give pmxcfs time to sync
+                # Looked at once more right before the start: the mv over SSH can hang
+                # for seconds before it runs, and a node back from a reboot meanwhile
+                # started the guest before its config went (a pass need not fall in
+                # between). Whatever it started keeps running there without a config,
+                # where neither its agent (qm list, qm stop) nor anything else sees it,
+                # whatever kind of agent the node runs - so the guest stays where its
+                # config is now, not started, and an admin decides
+                if looked is not None:
+                    with self.ha_lock:
+                        seen = (self.ha_node_status.get(original_node) or {}).get('last_seen')
+                    if seen != looked['last_seen'] or self._ha_node_listed_online(original_node):
+                        looked['last_seen'] = seen
+                        self.logger.warning(f"[HA] {vm_type}/{vmid} was moved to {target_node} and is not "
+                                            f"started: {original_node} was online while its config moved")
+                        return 'moved'
+            elif self._ha_node_back(original_node, looked, vmid) is True or not ha.is_active():
+                # the attempts of the move can take long; it did not go through, and
+                # the guest stays with its node
+                self.logger.warning(f"[HA] {vm_type}/{vmid} is left on {original_node}, its config did not move")
+                return None
             else:
                 self.logger.warning(f"[HA] Could not move config - will try to start anyway")
             
@@ -5646,14 +5965,39 @@ class PegaProxManager:
         self.__dict__.pop('_ha_status_ips', None)
         return True
 
-    def _ha_retry_recovery(self, node, again=True):
+    def _ha_retry_recovery(self, node, again=True, held=False):
         """Mark a node's recovery as refused for a reason that can pass, or take the
-        mark off. _ha_check_nodes tries a marked node again while it stays down."""
+        mark off. _ha_check_nodes tries a marked node again while it stays down.
+        held: the node was back at the recovery worker's looks, no pass saw it, see
+        _ha_retry_due."""
         marked = self.__dict__.setdefault('_ha_recovery_retry', set())
+        holds = self.__dict__.setdefault('_ha_retry_holds', {})
         if again:
             marked.add(node)
+            if held:
+                holds[node] = None
         else:
             marked.discard(node)
+            holds.pop(node, None)
+
+    def _ha_retry_due(self, node) -> bool:
+        """Whether a marked node may be tried again, asked at every pass that finds
+        it offline (#625).
+
+        A held one (_ha_retry_recovery) was listed online at the worker's last look
+        or shortly before, and it lost quorum again after that, by the first pass
+        that finds it offline at the latest. Its v2 agent counts its fence delay
+        from that moment, while the next recovery would count its wait from a
+        declaration long before: with a threshold of passes at or above fence_delay
+        + margin it does not wait at all. So it is not tried before fence_delay +
+        margin from that pass. A node without the v2 agent is not held."""
+        holds = self.__dict__.get('_ha_retry_holds') or {}
+        if node not in holds:
+            return True
+        if holds[node] is None:
+            timing = self._ha_fence_timing(node)
+            holds[node] = time.monotonic() + (timing['fence_delay'] + timing['margin'] if timing['v2'] else 0)
+        return time.monotonic() >= holds[node]
 
     def _ha_recovery_settled(self, node):
         """The node is back, or its recovery goes ahead: nothing to try again, and
@@ -7067,7 +7411,12 @@ WantedBy=multi-user.target
         value that cannot be counted with too. A JSON true or false is a number to
         time.sleep and to the monitor's comparison, and was handed on as it was:
         the recovery of a v2 node then began after 0 to 30 s. node=None answers for
-        a node with the v2 agent."""
+        a node with the v2 agent.
+
+        self_fences: the node's v2 agent stops its guests after fence_delay without
+        quorum whatever a leader answers (_ha_minority_fences). Where a leader can
+        hold the node up, or there is no v2 agent, its guests may still run.
+        _ha_node_back goes by it. v2: the wait is counted for the v2 agent."""
         fence_delay, margin = self.FENCE_AGENT_T_SF, self.FENCE_AGENT_MARGIN
         wait = self.ha_config.get('recovery_delay', 30)
         threshold = getattr(self, 'ha_failure_threshold', 3)
@@ -7080,11 +7429,11 @@ WantedBy=multi-user.target
             need = fence_delay + margin
             wait = max(wait, need - declared) if self._ha_countable(wait) else need
             return {'fence_delay': fence_delay, 'margin': margin, 'wait': wait,
-                    'earliest_recovery': declared + wait}
+                    'earliest_recovery': declared + wait, 'self_fences': self._ha_minority_fences(), 'v2': True}
         counted = all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (wait, threshold))
         declared = max(threshold - 1, 0) * interval if counted else None
         return {'fence_delay': fence_delay, 'margin': margin, 'wait': wait,
-                'earliest_recovery': declared + wait if counted else None}
+                'earliest_recovery': declared + wait if counted else None, 'self_fences': False, 'v2': False}
 
     @staticmethod
     def _ha_countable(value) -> bool:
@@ -8976,6 +9325,12 @@ echo "AGENT_INSTALLED_OK"
                     _recovery_lock_owners[lock_dir] = (self, None)
                     reserved = True
             if not reserved:
+                if owner is self:
+                    # an earlier recovery of this cluster, not a second one: the worker
+                    # tries again once that is done (#625)
+                    self.logger.info(f"[HA] Recovery lock for {failed_node} is held by an earlier "
+                                     "recovery of this cluster")
+                    return False
                 other = getattr(getattr(owner, 'config', None), 'name', '?')
                 self._ha_lock_conflict(failed_node, f"{lock_dir} is held by the recovery of cluster "
                                        f"{other} in this PegaProx - one recovery per node directory; "

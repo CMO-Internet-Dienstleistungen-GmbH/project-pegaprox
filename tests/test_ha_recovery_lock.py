@@ -360,6 +360,22 @@ def test_one_recovery_per_node_directory_in_this_process(storage, monkeypatch, a
     assert _files(storage) == [f'0-{A}']
 
 
+def test_a_lock_held_by_an_earlier_recovery_of_this_cluster_is_no_conflict(storage, monkeypatch, audits):
+    """The recovery of a node that was back for a pass and down again, while the one
+    of the outage before still waits out its delay with the lock: the same manager,
+    not a cluster added twice. Refused, without the audit line that asks whether it
+    is; the worker marks the node to be tried again (test_ha_recovery_midloop)."""
+    _as(monkeypatch, A, 0)
+    one = _mgr(storage)
+    assert one._ha_acquire_recovery_lock('pve2') is True
+
+    assert one._ha_acquire_recovery_lock('pve2') is False
+
+    assert audits == [] and _files(storage) == [f'0-{A}'] and list(one.ha_recovery_locks) == ['pve2']
+    one._ha_release_recovery_lock('pve2')
+    assert _files(storage) == [] and one.ha_recovery_locks == {}
+
+
 def test_the_directory_is_given_up_only_after_the_file(storage, monkeypatch, audits):
     """A second manager here that comes while the first one lets go: it must not meet
     the first one's file under its own name, take it for one left from before a
