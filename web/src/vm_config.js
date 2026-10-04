@@ -117,6 +117,277 @@
             );
         }
 
+        // LW Oct 2026 - the feature flags of a container after creation. It saves on its own
+        // (not through the modal's Save): Proxmox keeps every flag but nesting for root@pam,
+        // every flag of a privileged container too, and the server knows whether this
+        // cluster connection is root@pam (an API token never is).
+        const LXC_FEATURE_ROWS = [
+            { key: 'nesting', label: 'ctFeatNesting', hint: 'ctFeatNestingHint' },
+            { key: 'keyctl', label: 'ctFeatKeyctl', hint: 'ctFeatKeyctlHint' },
+            { key: 'fuse', label: 'ctFeatFuse', hint: 'ctFeatFuseHint' },
+            { key: 'mknod', label: 'ctFeatMknod', hint: 'ctFeatMknodHint' },
+            { key: 'nfs', label: 'ctFeatNfs', hint: 'ctFeatNfsHint' },
+            { key: 'cifs', label: 'ctFeatCifs', hint: 'ctFeatCifsHint' },
+        ];
+
+        function lxcFeatureFlags(f) {
+            const m = (f && f.mount) || {};
+            return { nesting: !!f?.nesting, keyctl: !!f?.keyctl, fuse: !!f?.fuse, mknod: !!f?.mknod, nfs: !!m.nfs, cifs: !!m.cifs };
+        }
+
+        // why this connection cannot make a root@pam change, from the server's access.reason
+        function pveRootReasonText(t, reason) {
+            if (reason === 'token') return t('pveRootToken');
+            if (reason === 'no_password') return t('pveRootNoPassword');
+            return t('pveRootOtherUser');
+        }
+
+        function LxcFeaturesCard({ vm, clusterId, authFetch, addToast, t, haReadOnly }) {
+            const [state, setState] = useState(null);
+            const [edit, setEdit] = useState(null);
+            const [loadError, setLoadError] = useState('');
+            const [saving, setSaving] = useState(false);
+            const base = `${API_URL}/clusters/${clusterId}/vms/${vm.node}/lxc/${vm.vmid}/features`;
+
+            const load = async () => {
+                setLoadError('');
+                try {
+                    const r = await authFetch(base);
+                    if (r && r.ok) {
+                        const d = await r.json();
+                        setState(d);
+                        setEdit(lxcFeatureFlags(d.features));
+                        return;
+                    }
+                    const e = r ? await r.json().catch(() => ({})) : {};
+                    setLoadError(e.error || t('ctFeaturesLoadFailed'));
+                } catch (e) {
+                    setLoadError(t('ctFeaturesLoadFailed'));
+                }
+            };
+            useEffect(() => { load(); }, [vm.vmid, vm.node, clusterId]);
+
+            const header = (
+                <div className="flex items-center justify-between mb-1">
+                    <label className="text-sm font-medium text-gray-300 flex items-center gap-2">
+                        <Icons.Layers className="w-4 h-4" />
+                        {t('ctFeatures')}
+                    </label>
+                    {vm.status === 'running' && (
+                        <span className="text-[10px] px-1.5 py-0.5 bg-red-500/20 text-red-400 rounded font-medium">{t('needsRestart')}</span>
+                    )}
+                </div>
+            );
+
+            if (loadError || !state || !edit) {
+                return (
+                    <div className="p-4 bg-proxmox-dark rounded-lg border border-proxmox-border" data-ct-features="">
+                        {header}
+                        {loadError ? (
+                            <div className="flex items-center justify-between gap-3 text-xs text-red-400">
+                                <span>{loadError}</span>
+                                <button type="button" onClick={load} className="px-2 py-1 rounded bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white">{t('retry')}</button>
+                            </div>
+                        ) : (
+                            <div className="flex justify-center py-3">
+                                <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-proxmox-orange"></div>
+                            </div>
+                        )}
+                    </div>
+                );
+            }
+
+            const shown = lxcFeatureFlags(state.features);
+            const running = lxcFeatureFlags(state.current);
+            const unprivileged = !!state.unprivileged;
+            const access = state.access || {};
+            const changed = Object.keys(edit).filter(k => edit[k] !== shown[k]);
+            // Proxmox compares what runs now with what is sent, value by value
+            const vsRunning = Object.keys(edit).filter(k => edit[k] !== running[k]);
+            const needsRoot = changed.length > 0 && vsRunning.length > 0 && (!unprivileged || vsRunning.some(k => k !== 'nesting'));
+            const blocked = needsRoot && !access.root;
+            const rowLocked = (key) => !access.root && (!unprivileged || key !== 'nesting');
+
+            const apply = async () => {
+                const body = {};
+                changed.forEach(k => {
+                    if (k === 'nfs' || k === 'cifs') body.mount = { ...(body.mount || {}), [k]: edit[k] };
+                    else body[k] = edit[k];
+                });
+                setSaving(true);
+                try {
+                    const r = await authFetch(base, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body),
+                    });
+                    const d = r ? await r.json().catch(() => ({})) : {};
+                    if (r && r.ok) {
+                        addToast(d.pending ? t('ctFeaturesSavedRestart') : t('ctFeaturesSaved'), 'success');
+                        await load();
+                    } else if (d.code === 'PVE_ROOT_REQUIRED') {
+                        addToast(pveRootReasonText(t, d.reason), 'error');
+                    } else {
+                        addToast(d.error || t('saveFailed'), 'error');
+                    }
+                } catch (e) {
+                    addToast(t('connectionError'), 'error');
+                }
+                setSaving(false);
+            };
+
+            return (
+                <div className="p-4 bg-proxmox-dark rounded-lg border border-proxmox-border" data-ct-features="">
+                    {header}
+                    <p className="text-xs text-gray-500 mb-3">{t('ctFeaturesHint')}</p>
+                    <div className="grid grid-cols-2 gap-3">
+                        {LXC_FEATURE_ROWS.map(row => {
+                            const locked = rowLocked(row.key);
+                            // keyctl is for unprivileged containers, as in the Proxmox UI
+                            const privOnly = row.key === 'keyctl' && !unprivileged && !edit.keyctl;
+                            return (
+                                <label key={row.key} className={`flex items-start gap-2 ${locked || privOnly ? 'opacity-60' : 'cursor-pointer'}`} data-ct-feature={row.key}>
+                                    <input
+                                        type="checkbox"
+                                        checked={edit[row.key]}
+                                        disabled={locked || privOnly || saving}
+                                        onChange={e => setEdit(prev => ({ ...prev, [row.key]: e.target.checked }))}
+                                        className="w-4 h-4 mt-0.5 rounded border-proxmox-border bg-proxmox-card text-proxmox-orange focus:ring-proxmox-orange"
+                                    />
+                                    <span className="min-w-0">
+                                        <span className="text-sm text-gray-300 flex items-center gap-1.5">
+                                            {t(row.label)}
+                                            {locked && <span className="text-[10px] px-1.5 py-0.5 bg-yellow-500/20 text-yellow-400 rounded font-medium" title={t('ctFeaturesRootOnly')}>root@pam</span>}
+                                        </span>
+                                        <span className="block text-xs text-gray-500">{privOnly ? t('ctFeatUnprivilegedOnly') : t(row.hint)}</span>
+                                    </span>
+                                </label>
+                            );
+                        })}
+                    </div>
+                    {state.kept?.length > 0 && (
+                        <p className="mt-3 text-xs text-gray-500">{t('ctFeaturesKept')} <code className="font-mono text-gray-400">{state.kept.join(', ')}</code></p>
+                    )}
+                    {state.pending && (
+                        <div className="mt-3 text-xs text-yellow-400 flex items-center gap-2" data-ct-features-pending="">
+                            <Icons.Clock className="w-3.5 h-3.5" />
+                            {t('ctFeaturesPending')}
+                        </div>
+                    )}
+                    {!access.root && (
+                        <div className="mt-3 p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg text-xs text-yellow-300 flex items-start gap-2" data-ct-features-root={access.reason || ''}>
+                            <Icons.Lock className="w-4 h-4 shrink-0 mt-0.5" />
+                            <span>
+                                {unprivileged ? t('ctFeaturesRootRule') : t('ctFeaturesRootPrivileged')}{' '}
+                                {pveRootReasonText(t, access.reason)}
+                            </span>
+                        </div>
+                    )}
+                    {needsRoot && access.fresh_ticket && (
+                        <p className="mt-3 text-xs text-gray-500 flex items-center gap-2"><Icons.Info className="w-3.5 h-3.5" />{t('pveRootViaLogin')}</p>
+                    )}
+                    {!haReadOnly && (
+                        <div className="mt-4 flex items-center justify-end gap-2">
+                            {changed.length > 0 && (
+                                <button type="button" onClick={() => setEdit(shown)} disabled={saving}
+                                    className="px-3 py-1.5 rounded-lg text-sm bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white disabled:opacity-50">
+                                    {t('revert')}
+                                </button>
+                            )}
+                            <button type="button" onClick={apply} disabled={!changed.length || saving || blocked}
+                                className="px-3 py-1.5 rounded-lg text-sm bg-proxmox-orange text-white hover:bg-orange-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                                data-ct-features-apply="">
+                                {saving ? t('saving') : t('ctFeaturesApply')}
+                            </button>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // one cluster resource mapping to pick in the passthrough dialog: what
+        // it is, the nodes it has a device on (a VM with it starts and migrates only there),
+        // and what Proxmox found wrong with it on this VM's node
+        function PassthroughMappingPicker({ kind, info, value, onChange, node, t }) {
+            if (!info || info.loading) {
+                return (
+                    <div className="flex justify-center py-3">
+                        <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-proxmox-orange"></div>
+                    </div>
+                );
+            }
+            if (info.error) return <div className="text-xs text-red-400">{info.error}</div>;
+            const list = info.mappings || [];
+            if (!list.length) {
+                return <div className="text-xs text-gray-500" data-pt-no-mappings="">{t(kind === 'pci' ? 'ptNoPciMappings' : 'ptNoUsbMappings')}</div>;
+            }
+            const picked = list.find(m => m.id === value);
+            return (
+                <div className="space-y-2">
+                    <select
+                        value={value}
+                        onChange={e => onChange(e.target.value)}
+                        className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white"
+                        data-pt-mapping-select={kind}
+                    >
+                        <option value="">-- {t('ptSelectMapping')} --</option>
+                        {list.map(m => (
+                            <option key={m.id} value={m.id}>
+                                {m.id}{m.description ? ` - ${m.description}` : ''}{m.on_node === false ? ` (${t('ptNotOnThisNode')})` : ''}
+                            </option>
+                        ))}
+                    </select>
+                    {picked && (
+                        <div className="p-3 bg-proxmox-dark rounded text-sm space-y-1" data-pt-mapping-detail={picked.id}>
+                            <div className="text-gray-400">{t('ptMappingNodes')}: <span className="text-white">{picked.nodes.length ? picked.nodes.join(', ') : '-'}</span></div>
+                            {picked.entries.filter(e => e.node === node).map((e, i) => (
+                                <div key={i} className="text-gray-400">{node}: <span className="font-mono text-white">{e.path || e.id}</span></div>
+                            ))}
+                            {picked.on_node === false && (
+                                <div className="text-xs text-yellow-400" data-pt-mapping-off-node="">{t('ptMappingNotHere').replace(/\{node\}/g, () => node)}</div>
+                            )}
+                            {(picked.checks || []).map((c, i) => (
+                                <div key={i} className={`text-xs ${c.severity === 'error' ? 'text-red-400' : 'text-yellow-400'}`}>{c.message}</div>
+                            ))}
+                        </div>
+                    )}
+                    <p className="text-xs text-gray-500">{t('ptMappingNodesHint')}</p>
+                </div>
+            );
+        }
+
+        // the choice between a mapped device (first) and a raw one, and why raw is shut
+        function PassthroughModeSwitch({ mode, setMode, t }) {
+            const modes = [['mapping', 'ptModeMapped'], ['raw', 'ptModeRaw']];
+            return (
+                <div className="flex gap-1 p-1 bg-proxmox-dark rounded-lg border border-proxmox-border">
+                    {modes.map(([id, label]) => (
+                        <button key={id} type="button" onClick={() => setMode(id)} data-pt-mode={id}
+                            className={`flex-1 px-3 py-1.5 rounded text-sm transition-colors ${mode === id ? 'bg-proxmox-orange text-white' : 'text-gray-400 hover:text-white'}`}>
+                            {t(label)}
+                        </button>
+                    ))}
+                </div>
+            );
+        }
+
+        function PassthroughRawNote({ info, t }) {
+            const access = info?.access;
+            if (!access) return null;
+            if (!access.root) {
+                return (
+                    <div className="p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg text-xs text-yellow-300 flex items-start gap-2" data-pt-raw-refused={access.reason || ''}>
+                        <Icons.Lock className="w-4 h-4 shrink-0 mt-0.5" />
+                        <span>{t('ptRawRootOnly')} {pveRootReasonText(t, access.reason)}</span>
+                    </div>
+                );
+            }
+            if (access.fresh_ticket) {
+                return <p className="text-xs text-gray-500 flex items-center gap-2"><Icons.Info className="w-3.5 h-3.5" />{t('pveRootViaLogin')}</p>;
+            }
+            return null;
+        }
+
         function ConfigModal({ vm, clusterId, allClusters = [], dashboardAuthFetch, onClose, addToast, isCorporate = false }) {
             const { t } = useTranslation();
             const { getAuthHeaders, haReadOnly, haStandby } = useAuth();
@@ -237,6 +508,14 @@
             const [usbOptions, setUsbOptions] = useState({ usb3: false });
             const [serialType, setSerialType] = useState('socket');
             const [passthroughLoading, setPassthroughLoading] = useState(false);
+            // LW Oct 2026 - cluster resource mappings for the passthrough dialogs, per kind:
+            // { loading, error, mappings, access }. A mapped device is the first choice, a
+            // raw one only where this cluster connection is root@pam
+            const [ptMappings, setPtMappings] = useState({});
+            const [pciMode, setPciMode] = useState('mapping');
+            const [usbMode, setUsbMode] = useState('mapping');
+            const [selectedPciMapping, setSelectedPciMapping] = useState('');
+            const [selectedUsbMapping, setSelectedUsbMapping] = useState('');
 
             // Firewall states
             const [fwOptions, setFwOptions] = useState({});
@@ -362,7 +641,12 @@
                     // Fetch current passthrough config
                     const ptRes = await authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/qemu/${vm.vmid}/passthrough`);
                     if (ptRes && ptRes.ok) {
-                        setPassthrough(await ptRes.json());
+                        const pt = await ptRes.json();
+                        setPassthrough(pt);
+                        // the nodes a mapped device covers, only when the VM has one
+                        ['pci', 'usb'].forEach(kind => {
+                            if ((pt[kind] || []).some(d => d.parsed?.mapping)) loadPtMappings(kind);
+                        });
                     }
                     
                     // Fetch available PCI devices
@@ -381,15 +665,71 @@
                 }
             };
 
+            const loadPtMappings = async (kind) => {
+                setPtMappings(prev => ({ ...prev, [kind]: { ...(prev[kind] || {}), loading: true, error: '' } }));
+                try {
+                    const r = await authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/qemu/${vm.vmid}/passthrough/mappings?kind=${kind}`);
+                    const d = r ? await r.json().catch(() => ({})) : {};
+                    if (r && r.ok) {
+                        setPtMappings(prev => ({ ...prev, [kind]: { loading: false, error: '', mappings: d.mappings || [], access: d.access || null } }));
+                        return d;
+                    }
+                    setPtMappings(prev => ({ ...prev, [kind]: { loading: false, error: d.error || t('operationFailed'), mappings: [], access: null } }));
+                } catch (e) {
+                    setPtMappings(prev => ({ ...prev, [kind]: { loading: false, error: t('connectionError'), mappings: [], access: null } }));
+                }
+                return null;
+            };
+
+            // opens the add dialog on a mapped device, or on a raw one when the cluster has no
+            // mapping of that kind and this connection may attach raw devices
+            const openAddPassthrough = async (kind) => {
+                const setMode = kind === 'pci' ? setPciMode : setUsbMode;
+                (kind === 'pci' ? setSelectedPciMapping : setSelectedUsbMapping)('');
+                setMode('mapping');
+                (kind === 'pci' ? setShowAddPci : setShowAddUsb)(true);
+                const d = await loadPtMappings(kind);
+                if (d && !(d.mappings || []).length && d.access?.root) setMode('raw');
+            };
+
+            // under an attached mapped device: the nodes it can start and migrate to
+            const ptMappedLine = (kind, dev) => {
+                const id = dev.parsed?.mapping;
+                if (!id) return null;
+                const m = (ptMappings[kind]?.mappings || []).find(x => x.id === id);
+                return (
+                    <span className="block text-xs text-gray-500" data-pt-mapped={id}>
+                        {t('ptMappingNodes')}: {m ? (m.nodes.length ? m.nodes.join(', ') : '-') : '...'}
+                        {m && !m.nodes.includes(vm.node) && <span className="ml-2 text-yellow-400">{t('ptNotOnThisNode')}</span>}
+                    </span>
+                );
+            };
+
+            const ptRefused = async (response) => {
+                const err = response ? await response.json().catch(() => ({})) : {};
+                if (err.code === 'PVE_ROOT_REQUIRED') addToast(`${t('ptRawRootOnly')} ${pveRootReasonText(t, err.reason)}`, 'error');
+                else addToast(err.error || t('operationFailed'), 'error');
+            };
+
+            const ptAdded = (response) => response.json().catch(() => ({})).then(d => {
+                // a mapping without a device on this node: the VM does not start here
+                if (d.mapping && d.covers_node === false) {
+                    addToast(t('ptMappingNotHere').replace(/\{node\}/g, () => vm.node), 'warning');
+                } else {
+                    addToast(t('deviceAdded'));
+                }
+            });
+
             const handleAddPciDevice = async () => {
-                if (!selectedPciDevice) return;
+                const mapped = pciMode === 'mapping';
+                if (mapped ? !selectedPciMapping : !selectedPciDevice) return;
                 setPassthroughLoading(true);
                 try {
                     const response = await authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/qemu/${vm.vmid}/passthrough/pci`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
-                            device_id: selectedPciDevice.id,
+                            ...(mapped ? { mapping: selectedPciMapping } : { device_id: selectedPciDevice.id }),
                             pcie: pciOptions.pcie,
                             rombar: pciOptions.rombar
                         })
@@ -397,11 +737,11 @@
                     if (response && response.ok) {
                         setShowAddPci(false);
                         setSelectedPciDevice(null);
+                        setSelectedPciMapping('');
                         fetchPassthrough();
-                        addToast(t('deviceAdded'));
+                        await ptAdded(response);
                     }else{
-                        const err = await response.json();
-                        addToast(err.error || t('operationFailed'), 'error');
+                        await ptRefused(response);
                     }
                 } catch (error) {
                     addToast(t('connectionError'), 'error');
@@ -410,26 +750,26 @@
             };
 
             const handleAddUsbDevice = async () => {
-                if (!selectedUsbDevice) return;
+                const mapped = usbMode === 'mapping';
+                if (mapped ? !selectedUsbMapping : !selectedUsbDevice) return;
                 setPassthroughLoading(true);
                 try {
                     const response = await authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/qemu/${vm.vmid}/passthrough/usb`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
-                            vendorid: selectedUsbDevice.vendid,
-                            productid: selectedUsbDevice.prodid,
+                            ...(mapped ? { mapping: selectedUsbMapping } : { vendorid: selectedUsbDevice.vendid, productid: selectedUsbDevice.prodid }),
                             usb3: usbOptions.usb3
                         })
                     });
                     if (response && response.ok) {
                         setShowAddUsb(false);
                         setSelectedUsbDevice(null);
+                        setSelectedUsbMapping('');
                         fetchPassthrough();
-                        addToast(t('deviceAdded'));
+                        await ptAdded(response);
                     }else{
-                        const err = await response.json();
-                        addToast(err.error || t('operationFailed'), 'error');
+                        await ptRefused(response);
                     }
                 } catch (error) {
                     addToast(t('connectionError'), 'error');
@@ -471,7 +811,7 @@
                         fetchPassthrough();
                         addToast(t('deviceRemoved'));
                     }else{
-                        addToast(t('operationFailed'), 'error');
+                        await ptRefused(response);
                     }
                 } catch (error) {
                     addToast(t('connectionError'), 'error');
@@ -2454,7 +2794,7 @@
                                                             <div className="flex justify-between items-center mb-2">
                                                                 <span className="text-sm text-gray-400">{t('pciDevices')}</span>
                                                                 <button
-                                                                    onClick={() => setShowAddPci(true)}
+                                                                    onClick={() => openAddPassthrough('pci')}
                                                                     className="text-xs px-2 py-1 bg-proxmox-orange/20 text-proxmox-orange rounded hover:bg-proxmox-orange/30"
                                                                 >
                                                                     + {t('addPci')}
@@ -2464,7 +2804,10 @@
                                                                 <div className="space-y-1">
                                                                     {passthrough.pci.map((dev, idx) => (
                                                                         <div key={idx} className="flex items-center justify-between p-2 bg-proxmox-dark rounded text-sm">
-                                                                            <span className="font-mono text-gray-300">{dev.key}: {dev.value}</span>
+                                                                            <span className="min-w-0">
+                                                                                <span className="font-mono text-gray-300">{dev.key}: {dev.value}</span>
+                                                                                {ptMappedLine('pci', dev)}
+                                                                            </span>
                                                                             <button
                                                                                 onClick={() => handleRemovePassthrough('pci', dev.key)}
                                                                                 className="text-red-400 hover:text-red-300 p-1"
@@ -2484,7 +2827,7 @@
                                                             <div className="flex justify-between items-center mb-2">
                                                                 <span className="text-sm text-gray-400">{t('usbDevices')}</span>
                                                                 <button
-                                                                    onClick={() => setShowAddUsb(true)}
+                                                                    onClick={() => openAddPassthrough('usb')}
                                                                     className="text-xs px-2 py-1 bg-proxmox-orange/20 text-proxmox-orange rounded hover:bg-proxmox-orange/30"
                                                                 >
                                                                     + {t('addUsb')}
@@ -2494,7 +2837,10 @@
                                                                 <div className="space-y-1">
                                                                     {passthrough.usb.map((dev, idx) => (
                                                                         <div key={idx} className="flex items-center justify-between p-2 bg-proxmox-dark rounded text-sm">
-                                                                            <span className="font-mono text-gray-300">{dev.key}: {dev.value}</span>
+                                                                            <span className="min-w-0">
+                                                                                <span className="font-mono text-gray-300">{dev.key}: {dev.value}</span>
+                                                                                {ptMappedLine('usb', dev)}
+                                                                            </span>
                                                                             <button
                                                                                 onClick={() => handleRemovePassthrough('usb', dev.key)}
                                                                                 className="text-red-400 hover:text-red-300 p-1"
@@ -4792,6 +5138,7 @@
                                                             needsRestart={true}
                                                             t={t}
                                                         />
+                                                        <LxcFeaturesCard vm={vm} clusterId={clusterId} authFetch={authFetch} addToast={addToast} t={t} haReadOnly={haReadOnly} />
                                                     </>
                                                 )}
                                             </div>
@@ -5761,27 +6108,39 @@
                             <div className="w-full max-w-lg bg-proxmox-card border border-proxmox-border rounded-xl p-6">
                                 <h3 className="text-lg font-semibold text-white mb-4">{t('addPci')}</h3>
                                 <div className="space-y-4">
-                                    <div>
-                                        <label className="block text-xs text-gray-400 mb-1">{t('availableDevices')}</label>
-                                        <select
-                                            value={selectedPciDevice?.id || ''}
-                                            onChange={(e) => setSelectedPciDevice(availablePci.find(d => d.id === e.target.value))}
-                                            className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white"
-                                        >
-                                            <option value="">-- {t('selectDevice')} --</option>
-                                            {availablePci.filter(d => d.iommugroup >= 0).map(dev => (
-                                                <option key={dev.id} value={dev.id}>
-                                                    {dev.id} - {dev.vendor_name} {dev.device_name} (IOMMU: {dev.iommugroup})
-                                                </option>
-                                            ))}
-                                        </select>
-                                    </div>
-                                    {selectedPciDevice && (
-                                        <div className="p-3 bg-proxmox-dark rounded text-sm">
-                                            <div className="text-gray-400">{t('vendor')}: <span className="text-white">{selectedPciDevice.vendor_name}</span></div>
-                                            <div className="text-gray-400">Device: <span className="text-white">{selectedPciDevice.device_name}</span></div>
-                                            <div className="text-gray-400">{t('iommuGroup')}: <span className="text-white">{selectedPciDevice.iommugroup}</span></div>
-                                        </div>
+                                    <PassthroughModeSwitch mode={pciMode} setMode={setPciMode} t={t} />
+                                    {pciMode === 'mapping' ? (
+                                        <PassthroughMappingPicker kind="pci" info={ptMappings.pci} value={selectedPciMapping} onChange={setSelectedPciMapping} node={vm.node} t={t} />
+                                    ) : (
+                                        <>
+                                            <PassthroughRawNote info={ptMappings.pci} t={t} />
+                                            {ptMappings.pci?.access?.root !== false && (
+                                                <>
+                                                    <div>
+                                                        <label className="block text-xs text-gray-400 mb-1">{t('availableDevices')}</label>
+                                                        <select
+                                                            value={selectedPciDevice?.id || ''}
+                                                            onChange={(e) => setSelectedPciDevice(availablePci.find(d => d.id === e.target.value))}
+                                                            className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white"
+                                                        >
+                                                            <option value="">-- {t('selectDevice')} --</option>
+                                                            {availablePci.filter(d => d.iommugroup >= 0).map(dev => (
+                                                                <option key={dev.id} value={dev.id}>
+                                                                    {dev.id} - {dev.vendor_name} {dev.device_name} (IOMMU: {dev.iommugroup})
+                                                                </option>
+                                                            ))}
+                                                        </select>
+                                                    </div>
+                                                    {selectedPciDevice && (
+                                                        <div className="p-3 bg-proxmox-dark rounded text-sm">
+                                                            <div className="text-gray-400">{t('vendor')}: <span className="text-white">{selectedPciDevice.vendor_name}</span></div>
+                                                            <div className="text-gray-400">Device: <span className="text-white">{selectedPciDevice.device_name}</span></div>
+                                                            <div className="text-gray-400">{t('iommuGroup')}: <span className="text-white">{selectedPciDevice.iommugroup}</span></div>
+                                                        </div>
+                                                    )}
+                                                </>
+                                            )}
+                                        </>
                                     )}
                                     <div className="space-y-2">
                                         <label className="flex items-center gap-2">
@@ -5794,8 +6153,8 @@
                                         </label>
                                     </div>
                                     <div className="flex gap-2 justify-end pt-4">
-                                        <button onClick={() => { setShowAddPci(false); setSelectedPciDevice(null); }} className="px-4 py-2 bg-proxmox-dark hover:bg-proxmox-hover rounded">{t('cancel')}</button>
-                                        <button onClick={handleAddPciDevice} disabled={!selectedPciDevice || passthroughLoading} className="px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded disabled:opacity-50">
+                                        <button onClick={() => { setShowAddPci(false); setSelectedPciDevice(null); setSelectedPciMapping(''); }} className="px-4 py-2 bg-proxmox-dark hover:bg-proxmox-hover rounded">{t('cancel')}</button>
+                                        <button onClick={handleAddPciDevice} disabled={(pciMode === 'mapping' ? !selectedPciMapping : (!selectedPciDevice || ptMappings.pci?.access?.root === false)) || passthroughLoading} className="px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded disabled:opacity-50" data-pt-add="pci">
                                             {passthroughLoading ? t('adding') : t('add')}
                                         </button>
                                     </div>
@@ -5810,31 +6169,41 @@
                             <div className="w-full max-w-lg bg-proxmox-card border border-proxmox-border rounded-xl p-6">
                                 <h3 className="text-lg font-semibold text-white mb-4">{t('addUsb')}</h3>
                                 <div className="space-y-4">
-                                    <div>
-                                        <label className="block text-xs text-gray-400 mb-1">{t('availableDevices')}</label>
-                                        <select
-                                            value={selectedUsbDevice ? `${selectedUsbDevice.vendid}:${selectedUsbDevice.prodid}` : ''}
-                                            onChange={(e) => {
-                                                const [vid, pid] = e.target.value.split(':');
-                                                setSelectedUsbDevice(availableUsb.find(d => d.vendid === vid && d.prodid === pid));
-                                            }}
-                                            className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white"
-                                        >
-                                            <option value="">-- {t('selectDevice')} --</option>
-                                            {availableUsb.map((dev, idx) => (
-                                                <option key={idx} value={`${dev.vendid}:${dev.prodid}`}>
-                                                    {dev.manufacturer || dev.vendid} - {dev.product || dev.prodid}
-                                                </option>
-                                            ))}
-                                        </select>
-                                    </div>
+                                    <PassthroughModeSwitch mode={usbMode} setMode={setUsbMode} t={t} />
+                                    {usbMode === 'mapping' ? (
+                                        <PassthroughMappingPicker kind="usb" info={ptMappings.usb} value={selectedUsbMapping} onChange={setSelectedUsbMapping} node={vm.node} t={t} />
+                                    ) : (
+                                        <>
+                                            <PassthroughRawNote info={ptMappings.usb} t={t} />
+                                            {ptMappings.usb?.access?.root !== false && (
+                                                <div>
+                                                    <label className="block text-xs text-gray-400 mb-1">{t('availableDevices')}</label>
+                                                    <select
+                                                        value={selectedUsbDevice ? `${selectedUsbDevice.vendid}:${selectedUsbDevice.prodid}` : ''}
+                                                        onChange={(e) => {
+                                                            const [vid, pid] = e.target.value.split(':');
+                                                            setSelectedUsbDevice(availableUsb.find(d => d.vendid === vid && d.prodid === pid));
+                                                        }}
+                                                        className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white"
+                                                    >
+                                                        <option value="">-- {t('selectDevice')} --</option>
+                                                        {availableUsb.map((dev, idx) => (
+                                                            <option key={idx} value={`${dev.vendid}:${dev.prodid}`}>
+                                                                {dev.manufacturer || dev.vendid} - {dev.product || dev.prodid}
+                                                            </option>
+                                                        ))}
+                                                    </select>
+                                                </div>
+                                            )}
+                                        </>
+                                    )}
                                     <label className="flex items-center gap-2">
                                         <input type="checkbox" checked={usbOptions.usb3} onChange={(e) => setUsbOptions({...usbOptions, usb3: e.target.checked})} className="rounded" />
                                         <span className="text-sm text-gray-300">{t('usb3')}</span>
                                     </label>
                                     <div className="flex gap-2 justify-end pt-4">
-                                        <button onClick={() => { setShowAddUsb(false); setSelectedUsbDevice(null); }} className="px-4 py-2 bg-proxmox-dark hover:bg-proxmox-hover rounded">{t('cancel')}</button>
-                                        <button onClick={handleAddUsbDevice} disabled={!selectedUsbDevice || passthroughLoading} className="px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded disabled:opacity-50">
+                                        <button onClick={() => { setShowAddUsb(false); setSelectedUsbDevice(null); setSelectedUsbMapping(''); }} className="px-4 py-2 bg-proxmox-dark hover:bg-proxmox-hover rounded">{t('cancel')}</button>
+                                        <button onClick={handleAddUsbDevice} disabled={(usbMode === 'mapping' ? !selectedUsbMapping : (!selectedUsbDevice || ptMappings.usb?.access?.root === false)) || passthroughLoading} className="px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded disabled:opacity-50" data-pt-add="usb">
                                             {passthroughLoading ? t('adding') : t('add')}
                                         </button>
                                     </div>
