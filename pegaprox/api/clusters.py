@@ -568,6 +568,49 @@ def repin_cluster_host_keys(cluster_id):
         return jsonify({'error': safe_error(e, 'Re-pin failed')}), 500
 
 
+@bp.route('/api/clusters/<cluster_id>/connection-check', methods=['POST'])
+@require_auth(perms=['cluster.config'])
+def check_cluster_connection(cluster_id):
+    """Read-only connection check of one Proxmox VE cluster, on demand (core/conncheck.py).
+
+    MK Oct 2026 - API addresses with timing and certificate, the credential and the
+    privileges it carries, versions, clocks, quorum and SSH per node. POST because it
+    logs in to the nodes over SSH (once each, only where a credential applies), which
+    an admin should ask for; {"ssh": false} leaves that part out. A standby forwards it
+    to the active or refuses it like any other write (app.py), so the check always
+    runs where the clusters are acted on.
+    """
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
+
+    mgr = cluster_managers[cluster_id]
+    if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
+        return jsonify({'error': 'The connection check covers Proxmox VE clusters only',
+                        'code': 'PVE_ONLY'}), 400
+    data = request.get_json(silent=True) or {}
+    with_ssh = data.get('ssh', True) is not False
+    from pegaprox.core import conncheck
+    try:
+        report = conncheck.run_check(mgr, include_ssh=with_ssh)
+    except Exception as e:
+        logging.exception(f"connection check failed for {_sl(cluster_id)}")
+        return jsonify({'error': safe_error(e, 'The connection check failed')}), 500
+    report['cluster_id'] = cluster_id
+    report['ssh_checked'] = with_ssh
+    s = report['summary']
+    log_audit(request.session['user'], 'cluster.connection_check',
+              f"Connection check of {mgr.config.name}: {s['ok']} ok, {s['warn']} warnings, "
+              f"{s['fail']} failed" + ('' if with_ssh else ' (without SSH)'),
+              cluster=mgr.config.name)
+    return jsonify(report)
+
+
 def _retire_cluster_claim(mgr, every_node=False):
     """Take our cluster claim off the cluster and switch the claim off, for HA disable,
     for deleting the cluster and for the switch itself. What the response reports

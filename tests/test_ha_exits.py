@@ -294,7 +294,11 @@ EXITS = {
     ('pegaprox/core/manager.py', 'PegaProxManager.connect_to_proxmox', 'http-session'): (1, 'guard'),
     ('pegaprox/core/manager.py', 'PegaProxManager.create_privileged_session', 'http-session'): (1, 'guard'),
     ('pegaprox/core/manager.py', 'PegaProxManager.mint_console_auth_ticket', 'http-urllib'): (1, 'console'),
-    ('pegaprox/core/manager.py', 'PegaProxManager.get_cluster_fingerprint', 'socket'): (1, 'read'),
+    ('pegaprox/core/manager.py', 'PegaProxManager.tls_fingerprint', 'socket'): (1, 'read'),
+    # the connection check: GET /version per API address (the session only while it is
+    # known good), and `sudo -n true` on a client from the guarded _ssh_connect
+    ('pegaprox/core/conncheck.py', 'probe_host', 'http-session'): (1, 'read'),
+    ('pegaprox/core/conncheck.py', 'probe_ssh', 'ssh-exec'): (1, 'client'),
     # PBS
     ('pegaprox/core/pbs.py', 'PBSManager.__init__', 'http-session'): (1, 'guard'),
     ('pegaprox/core/pbs.py', 'PBSManager._ssh_connect', 'ssh-paramiko'): (1, 'guard'),
@@ -499,12 +503,13 @@ def test_the_inventory_counts_what_the_report_says():
     by = Counter()
     for (_f, _q, kind), (n, verdict) in EXITS.items():
         by[verdict] += n
-    # S4 with the witness and the lease link: 264 calls out of this process, 154 (function,
-    # kind) pairs in 139 functions; 46 of them guarded at the exit and 83 execs on a client
-    # from a guarded factory. No route relies on the write gate alone any more
-    assert sum(n for n, _v in EXITS.values()) == 264 and len(EXITS) == 154
-    assert len({(f, q) for f, q, _k in EXITS}) == 139
-    assert by['guard'] == 46 and by['client'] == 83
+    # S4 with the witness and the lease link, and the connection check: 266 calls out of
+    # this process, 156 (function, kind) pairs in 141 functions; 46 of them guarded at the
+    # exit and 84 execs on a client from a guarded factory. No route relies on the write
+    # gate alone any more
+    assert sum(n for n, _v in EXITS.values()) == 266 and len(EXITS) == 156
+    assert len({(f, q) for f, q, _k in EXITS}) == 141
+    assert by['guard'] == 46 and by['client'] == 84
 
 
 @pytest.mark.parametrize('key', sorted(k for k, v in EXITS.items() if v[1] == 'guard'),

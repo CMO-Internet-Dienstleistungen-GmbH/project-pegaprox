@@ -11640,7 +11640,8 @@ echo "AGENT_INSTALLED_OK"
             return None
         return 'SSH_NO_CREDENTIALS'
 
-    def _ssh_connect(self, host: str, retries: int = 3, retry_delay: float = 2.0):
+    def _ssh_connect(self, host: str, retries: int = 3, retry_delay: float = 2.0,
+                     connect_timeout: int = 30, failure: dict = None):
         """SSH connect with retry logic and connection rate limiting
 
         NS: Jan 2026 - Limits concurrent CONNECTION ATTEMPTS (not active sessions).
@@ -11649,12 +11650,18 @@ echo "AGENT_INSTALLED_OK"
         while not blocking long-running operations.
 
         HA operations use separate methods without any rate limiting.
+
+        MK Oct 2026 - `failure`, when given, gets {'kind', 'detail'} on a None return
+        (auth, host_key, unreachable, key, blocked, error); the connection check names
+        the reason per node instead of a bare "SSH failed".
         """
         # #941 — decide before we open a socket. Every SSH path to a PVE node comes
         # through here, so refusing here is what stops the traffic AND stops the token
         # secret being offered as a password. Callers all handle None already.
         _blocked = self.ssh_blocked_reason()
         if _blocked:
+            if failure is not None:
+                failure.update(kind='blocked', detail=_blocked)
             if _blocked != getattr(self, '_last_ssh_block_logged', None):
                 self._last_ssh_block_logged = _blocked
                 if _blocked == 'SSH_DISABLED':
@@ -11704,8 +11711,8 @@ echo "AGENT_INSTALLED_OK"
                     'hostname': host,
                     'port': ssh_port,
                     'username': username,
-                    'timeout': 30,
-                    'banner_timeout': 30,
+                    'timeout': connect_timeout,
+                    'banner_timeout': connect_timeout,
                     'allow_agent': False,
                     'look_for_keys': False
                 }
@@ -11731,6 +11738,8 @@ echo "AGENT_INSTALLED_OK"
 
                     if not pkey:
                         self.logger.error("Could not load SSH key - unsupported format")
+                        if failure is not None:
+                            failure.update(kind='key', detail='unsupported key format')
                         return None
                     
                     connect_kwargs['pkey'] = pkey
@@ -11747,6 +11756,8 @@ echo "AGENT_INSTALLED_OK"
                 
             except paramiko.ssh_exception.AuthenticationException as e:
                 self.logger.error(f"SSH auth failed for {username}@{host}: {e}")
+                if failure is not None:
+                    failure.update(kind='auth', detail=str(e)[:300])
                 return None
                 
             except (paramiko.ssh_exception.NoValidConnectionsError, socket.timeout, TimeoutError) as e:
@@ -11756,6 +11767,8 @@ echo "AGENT_INSTALLED_OK"
                     time.sleep(delay)
                     continue
                 self.logger.error(f"SSH to {host} failed after {retries} attempts: {e}")
+                if failure is not None:
+                    failure.update(kind='unreachable', detail=str(e)[:300] or type(e).__name__)
                 return None
                 
             except Exception as e:
@@ -11765,6 +11778,9 @@ echo "AGENT_INSTALLED_OK"
                     time.sleep(delay)
                     continue
                 self.logger.error(f"SSH to {host} failed: {e}")
+                if failure is not None:
+                    _hk = isinstance(e, paramiko.ssh_exception.BadHostKeyException) or 'host key' in str(e).lower()
+                    failure.update(kind='host_key' if _hk else 'error', detail=str(e)[:300] or type(e).__name__)
                 return None
                 
             finally:
@@ -12451,6 +12467,36 @@ echo "AGENT_INSTALLED_OK"
             self.logger.error(f"[ERROR] Remote migration error: {e}")
             return {'success': False, 'error': str(e)}
     
+    @staticmethod
+    def tls_fingerprint(host, port, timeout=None):
+        """SHA-256 of the certificate host:port presents, colon-separated uppercase.
+
+        Not verified: this reads what is on the wire, whatever signed it. Shared by the
+        cross-cluster migration (#733) and the connection check, which compares it with
+        the certificate the node reports for itself.
+        """
+        if host and host.startswith('[') and host.endswith(']'):
+            host = host[1:-1]
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with context.wrap_socket(sock, server_hostname=host) as ssock:
+                cert_der = ssock.getpeercert(binary_form=True)
+        fingerprint = hashlib.sha256(cert_der).hexdigest()
+        # Format as colon-separated UPPERCASE hex.
+        #
+        # (#733) This is not cosmetic. PVE looks the fingerprint we hand it up as a
+        # raw hash key with no case normalisation - PVE::APIClient::LWP does
+        # `$fingerprint->{cache}->{$fp}`, and the $fp it compares against comes from
+        # Net::SSLeay::X509_get_fingerprint, which formats with "%02X:" (uppercase).
+        # A lowercase fingerprint parses fine (the pve-fingerprint-sha256 format
+        # accepts [A-Fa-f0-9]) but never matches, so remote_migrate aborts on the
+        # cert check and PVE returns a bare {"data":null}/500 with the real reason
+        # swallowed. Every other fingerprint path here already uppercases -
+        # api/vms.py:421, :470, :2748 - this one was the outlier.
+        return ':'.join(fingerprint[i:i+2].upper() for i in range(0, len(fingerprint), 2))
+
     def get_cluster_fingerprint(self) -> Dict[str, Any]:
         
         if not self.is_connected:
@@ -12458,31 +12504,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect to Proxmox'}
         
         try:
-            import ssl
-            import socket
-            import hashlib
-            
-            # Get SSL certificate
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-            
-            with socket.create_connection((self.config.host, 8006)) as sock:
-                with context.wrap_socket(sock, server_hostname=self.config.host) as ssock:
-                    cert_der = ssock.getpeercert(binary_form=True)
-                    fingerprint = hashlib.sha256(cert_der).hexdigest()
-                    # Format as colon-separated UPPERCASE hex.
-                    #
-                    # (#733) This is not cosmetic. PVE looks the fingerprint we hand it up as a
-                    # raw hash key with no case normalisation — PVE::APIClient::LWP does
-                    # `$fingerprint->{cache}->{$fp}`, and the $fp it compares against comes from
-                    # Net::SSLeay::X509_get_fingerprint, which formats with "%02X:" (uppercase).
-                    # A lowercase fingerprint parses fine (the pve-fingerprint-sha256 format
-                    # accepts [A-Fa-f0-9]) but never matches, so remote_migrate aborts on the
-                    # cert check and PVE returns a bare {"data":null}/500 with the real reason
-                    # swallowed. Every other fingerprint path here already uppercases —
-                    # api/vms.py:421, :470, :2748 — this one was the outlier.
-                    fingerprint_formatted = ':'.join(fingerprint[i:i+2].upper() for i in range(0, len(fingerprint), 2))
+            fingerprint_formatted = PegaProxManager.tls_fingerprint(self.config.host, 8006)
             
             return {
                 'success': True, 
