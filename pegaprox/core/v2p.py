@@ -3543,14 +3543,17 @@ def _pvesm_alloc_disk(pve_mgr, node, storage, vmid, disk_index, size_bytes, errb
     
     # MK: Apr 2026 — always try raw first, only fall back to qcow2 if raw fails on all attempts (#222)
     # Mixed formats (raw+qcow2) cause confusion and the dd/importdisk path always uses --format raw
+    # MK Oct 2026 (#816) - and say so on every attempt. PVE 9 can put qcow2 on LVM, so an alloc
+    # without --format may hand back a .qcow2 volume that the raw dd then writes over.
     alloc_attempts = [
-        f"pvesm alloc {storage} {vmid} {fn_raw} {size_gb}G 2>&1",
-        f"pvesm alloc {storage} {vmid} {fn_raw} {size_kb} 2>&1",
         f"pvesm alloc {storage} {vmid} {fn_raw} {size_gb}G --format raw 2>&1",
-        f"pvesm alloc {storage} {vmid} {fn_raw} {size_mb}M 2>&1",
-        # last resort: qcow2 for dir/nfs storage that requires a file extension
-        f"pvesm alloc {storage} {vmid} {fn_qcow} {size_gb}G --format qcow2 2>&1",
+        f"pvesm alloc {storage} {vmid} {fn_raw} {size_kb} --format raw 2>&1",
+        f"pvesm alloc {storage} {vmid} {fn_raw} {size_mb}M --format raw 2>&1",
     ]
+    if fn_qcow != fn_raw:
+        # last resort: qcow2 for dir/nfs storage that requires a file extension.
+        # Never on block storage, that is the same qcow2-on-LVM volume again.
+        alloc_attempts.append(f"pvesm alloc {storage} {vmid} {fn_qcow} {size_gb}G --format qcow2 2>&1")
     
     last_error = ''
     for attempt_cmd in alloc_attempts:
