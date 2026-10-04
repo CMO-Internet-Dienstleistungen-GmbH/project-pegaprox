@@ -2881,7 +2881,8 @@
                                                             {(pbsJob.output_lines || []).map((line, i) => {
                                                                 // LW: output_lines can carry a non-string entry (e.g. an exit code) — String() it
                                                                 // so .includes() can't blow up the whole page (#584 white-screen)
-                                                                const s = String(line);
+                                                                // update tasks keep each line as {timestamp, text} (#964, #971)
+                                                                const s = line && typeof line === 'object' && line.text != null ? String(line.text) : String(line);
                                                                 return <div key={i} className={`${s.includes('[ERROR]') ? 'text-red-400' : s.includes('[OK]') ? 'text-green-400' : 'text-gray-300'}`}>{s}</div>;
                                                             })}
                                                             {pbsJob.error && <div className="text-red-400 mt-2">⚠ {pbsJob.error}</div>}
