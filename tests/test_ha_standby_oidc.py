@@ -290,7 +290,9 @@ def test_a_group_set_that_is_not_the_whole_keeps_what_is_stored(ha_env, db, monk
 def test_what_agrees_with_a_synced_row():
     """The helper on its own: a missing row or one another identity source owns is
     never a match, whatever the sign-in would store."""
-    from pegaprox.api.auth import _idp_agrees_with_synced_row as agrees
+    import functools
+    from pegaprox.api.auth import _idp_agrees_with_synced_row
+    agrees = functools.partial(_idp_agrees_with_synced_row, username='olga')
     row = {'auth_source': 'oidc', 'role': 'admin', 'tenant_id': 'acme', 'permissions': ['a', 'b'],
            'tenant_permissions': copy.deepcopy(ACME_ADMIN)}
     assert agrees(copy.deepcopy(row), row)

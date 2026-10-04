@@ -85,8 +85,8 @@ def test_user_pool_grant_gives_portal_visibility_of_all_pool_vms(seed):
 
 def test_group_pool_grant_resolves_when_user_carries_groups(seed):
     """The group→pool resolution works when the user object carries its groups (subject_type='group').
-    NOTE: portal / load_users user records don't populate 'groups' today, so group-pool grants are
-    dormant there — this locks in the resolution semantics for when a groups-carrying user hits it."""
+    Since #940 the stored user row carries them (directory_groups), filled at LDAP/OIDC sign-in;
+    tests/test_directory_groups_940.py drives that end to end."""
     seed.pool('cluster_x', 'pool_1', 'engineering', ['pool.view', 'vm.view'], subject_type='group')
     _seed_pool_membership('cluster_x', {100: ('qemu', 'pool_1')})
     bob = seed.user('bob', role='viewer')

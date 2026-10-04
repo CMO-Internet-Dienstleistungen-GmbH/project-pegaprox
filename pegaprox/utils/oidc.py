@@ -649,7 +649,7 @@ def oidc_map_groups_to_role(config: dict, groups: list, id_token_claims: dict = 
 
     LW: Works with Entra group IDs and generic OIDC group claims
     Returns: {'role': str, 'tenant': str, 'permissions': [], 'tenant_permissions': {},
-              '_authoritative': bool}
+              'groups': [], '_authoritative': bool}
 
     NS Sep 2026 - `_authoritative` says whether this mapping may be used to REVOKE, not
     just to grant. It is true only when we know the full group set: either the Entra
@@ -663,6 +663,7 @@ def oidc_map_groups_to_role(config: dict, groups: list, id_token_claims: dict = 
         'tenant': '',
         'permissions': [],
         'tenant_permissions': {},
+        'groups': [],
         '_authoritative': False,
     }
     if groups_complete:
@@ -700,7 +701,24 @@ def oidc_map_groups_to_role(config: dict, groups: list, id_token_claims: dict = 
     if id_token_claims:
         for gid in id_token_claims.get('groups', []):
             group_ids.add(str(gid).lower())
-    
+
+    # MK Oct 2026 (#940) - the groups oidc_build_user_row stores on the user, which is what
+    # a pool grant on a group is matched against. Entra groups go in by object id only: the
+    # display name is the squattable identifier the name-match warning further down is
+    # about, and a pool grant must not be claimable by creating a group of the right name.
+    # A generic provider's groups claim is taken as the signed token carries it.
+    _claim = (id_token_claims or {}).get('groups') or []
+    if isinstance(_claim, str):
+        _claim = [_claim]
+    _seen = set()
+    for g in list(groups or []) + (list(_claim) if isinstance(_claim, (list, tuple)) else []):
+        v = g.get('id') if isinstance(g, dict) else g
+        if isinstance(v, int) and not isinstance(v, bool):
+            v = str(v)
+        if isinstance(v, str) and v.strip() and v.strip().lower() not in _seen:
+            _seen.add(v.strip().lower())
+            result['groups'].append(v.strip())
+
     # MK: Built-in group mappings (admin > user > viewer priority)
     admin_group = config.get('admin_group_id', '').strip().lower()
     user_group = config.get('user_group_id', '').strip().lower()
@@ -903,6 +921,9 @@ def oidc_build_user_row(user_info: dict, role_mapping: dict, auth_source: str, u
             user['tenant_permissions'] = dict(role_mapping.get('tenant_permissions') or {})
             if role_mapping.get('tenant'):
                 user['tenant_id'] = role_mapping['tenant']  # NS: Must be tenant_id
+            # the full set (#940), so a group the IdP dropped stops granting pool
+            # access with this sign-in
+            user['groups'] = list(role_mapping.get('groups') or [])
         else:
             logging.warning(
                 f"[OIDC] group set for '{username}' is not authoritative (fetch failed, "
@@ -923,6 +944,12 @@ def oidc_build_user_row(user_info: dict, role_mapping: dict, auth_source: str, u
                 if 'tenant_permissions' not in user:
                     user['tenant_permissions'] = {}
                 user['tenant_permissions'].update(role_mapping['tenant_permissions'])
+            # groups the same way as the permissions: add what this login saw, drop nothing.
+            # The stored ones by username - the users table a caller hands in leaves them out.
+            _held = get_db().get_user_directory_groups(username)
+            _have = {g.lower() for g in _held if isinstance(g, str)}
+            user['groups'] = _held + [g for g in (role_mapping.get('groups') or [])
+                                      if isinstance(g, str) and g.lower() not in _have]
     else:
         # Create new user
         user = {
@@ -940,7 +967,8 @@ def oidc_build_user_row(user_info: dict, role_mapping: dict, auth_source: str, u
             'auth_source': auth_source,
             'oidc_sub': user_info.get('sub', ''),
             'last_oidc_sync': datetime.now().isoformat(),
-            'created_at': datetime.now().isoformat()
+            'created_at': datetime.now().isoformat(),
+            'groups': list(role_mapping.get('groups') or []),
         }
     return username, user
 

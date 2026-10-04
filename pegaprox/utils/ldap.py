@@ -418,6 +418,11 @@ def ldap_build_user_row(ldap_result: dict, existing: dict = None):
         tp.update(new_ldap_tp)
         user['tenant_permissions'] = tp
         user['ldap_tenant_permissions'] = new_ldap_tp
+        # MK Oct 2026 (#940) - the memberships this login saw, replacing the stored ones.
+        # Pool grants on a group read them from here; nothing stored them before, so such
+        # a grant matched nobody. Replaced, not merged: a group the directory dropped stops
+        # granting with this sign-in.
+        user['groups'] = _directory_groups_of(ldap_result)
     else:
         # Create new user
         user = {
@@ -439,9 +444,20 @@ def ldap_build_user_row(ldap_result: dict, existing: dict = None):
             'auth_source': 'ldap',
             'ldap_dn': ldap_result.get('user_dn', ''),
             'last_ldap_sync': datetime.now().isoformat(),
-            'created_at': datetime.now().isoformat()
+            'created_at': datetime.now().isoformat(),
+            'groups': _directory_groups_of(ldap_result),
         }
     return user
+
+
+def _directory_groups_of(ldap_result):
+    """The group DNs of an ldap_authenticate() result, deduplicated case-insensitively."""
+    out, seen = [], set()
+    for g in ldap_result.get('groups') or []:
+        if isinstance(g, str) and g.strip() and g.strip().lower() not in seen:
+            seen.add(g.strip().lower())
+            out.append(g.strip())
+    return out
 
 
 def ldap_provision_user(ldap_result: dict) -> dict:

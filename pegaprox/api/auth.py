@@ -254,7 +254,7 @@ def oidc_callback():
                 }), 409
             if not row.get('enabled', True):
                 return jsonify({'error': 'Account is disabled'}), 403
-            if not _idp_agrees_with_synced_row(would_be, row):
+            if not _idp_agrees_with_synced_row(would_be, row, username):
                 logging.warning(f"[OIDC] '{username}' signs in on a standby with access at the "
                                 f"identity provider that differs from the synced account - refused")
                 return jsonify({
@@ -607,22 +607,31 @@ def _directory_agrees_with_synced_row(ldap_result, row):
     would_be = ldap_build_user_row(ldap_result, row)
     if would_be is None:
         return False
-    return _same_access(would_be, row)
+    return _same_access(would_be, row, (ldap_result.get('username') or '').lower())
 
 
-def _same_access(would_be, row):
+def _same_access(would_be, row, username):
     """Role, tenant, extra permissions (as a set) and per-tenant overrides: what a
-    sign-in rewrites and a check reads."""
+    sign-in rewrites and a check reads. And no stored group a pool grant names that the
+    sign-in no longer brings."""
     def _perms(u):
         return sorted(set(u.get('permissions') or []))
 
+    # MK Oct 2026 (#940) - the groups only one way. A group the directory dropped would
+    # keep granting its pools here until the next sync, so that is refused - when a grant
+    # names it; other memberships churn without changing access. A group the row does not
+    # have yet grants nothing here, so it is not: rows written before the groups were
+    # stored have none, and refusing on that would keep every directory user out of a
+    # standby until they signed in on the active once.
     return (would_be.get('role') == row.get('role')
             and would_be.get('tenant_id') == row.get('tenant_id')
             and _perms(would_be) == _perms(row)
-            and (would_be.get('tenant_permissions') or {}) == (row.get('tenant_permissions') or {}))
+            and (would_be.get('tenant_permissions') or {}) == (row.get('tenant_permissions') or {})
+            and not get_db().group_grants_lost(get_db().get_user_directory_groups(username),
+                                               would_be.get('groups') or []))
 
 
-def _idp_agrees_with_synced_row(would_be, row):
+def _idp_agrees_with_synced_row(would_be, row, username):
     """#625 - the same question for an OIDC / Entra sign-in, and the same four answers
     to compare. `would_be` is the row oidc_build_user_row says the sign-in would store;
     display name, mail and the oidc_* bookkeeping change nothing a check reads here
@@ -631,7 +640,7 @@ def _idp_agrees_with_synced_row(would_be, row):
     """
     if not isinstance(row, dict) or row.get('auth_source', 'local') not in OIDC_AUTH_SOURCES:
         return False
-    return isinstance(would_be, dict) and _same_access(would_be, row)
+    return isinstance(would_be, dict) and _same_access(would_be, row, username)
 
 
 def _ha_banner(username='', session=None):

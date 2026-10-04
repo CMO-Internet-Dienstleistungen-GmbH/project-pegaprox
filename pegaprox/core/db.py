@@ -80,12 +80,20 @@ def _group_grant_spellings(group):
 
     The role/tenant mapping side of LDAP is unaffected: its field is called `group_dn`
     and compares whole strings, which is consistent with what it asks for. MK
+
+    Oct 2026 (#940) - the same for a group path as Keycloak's group mapper sends it by
+    default ("/Org/PVE-Admins"): its last segment, with the same caveat.
     """
     import re as _re
     g = (group or '').strip()
     if not g:
         return []
     out = [g]
+    if g.startswith('/'):
+        leaf = g.rstrip('/').rsplit('/', 1)[-1].strip()
+        if leaf and leaf.lower() != g.lower():
+            out.append(leaf)
+        return out
     # first RDN of a DN — split on a comma that is not escaped (RFC 4514 allows "\,")
     head = _re.split(r'(?<!\\),', g, maxsplit=1)[0].strip()
     if '=' in head:
@@ -93,6 +101,39 @@ def _group_grant_spellings(group):
         if leaf and leaf.lower() != g.lower():
             out.append(leaf)
     return out
+
+
+def _group_grant_keys(groups):
+    """Lowercased spellings of every group in `groups`, for matching grants in one pass."""
+    keys = set()
+    for g in groups or []:
+        if isinstance(g, str):
+            keys.update(s.lower() for s in _group_grant_spellings(g))
+    return keys
+
+
+# auth_source values whose rows carry directory groups. The groups come from the LDAP
+# result or the IdP's claims at sign-in and from nowhere else, so a local account never
+# has any - whatever the column holds, and whatever a restored backup put there.
+# MK Oct 2026 (#940)
+DIRECTORY_AUTH_SOURCES = ('ldap', 'oidc', 'entra')
+
+
+def _directory_groups(auth_source, value):
+    """The group list a user row may carry: non-empty strings, none for a local account.
+
+    `value` is the stored JSON or a list. A broken value reads as no groups - this runs
+    in every pool lookup, and one bad row must not break them for that user."""
+    if (auth_source or 'local') not in DIRECTORY_AUTH_SOURCES:
+        return []
+    if isinstance(value, str):
+        try:
+            value = json.loads(value or '[]')
+        except (ValueError, TypeError):
+            return []
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [g for g in value if isinstance(g, str) and g]
 
 
 class PegaProxDB:
@@ -324,7 +365,10 @@ class PegaProxDB:
                 denied_permissions TEXT DEFAULT '[]',
                 oidc_sub TEXT DEFAULT '',
                 last_oidc_sync TEXT DEFAULT '',
-                layout_chosen INTEGER DEFAULT 0
+                layout_chosen INTEGER DEFAULT 0,
+                -- the user's directory / IdP groups as of the last sign-in, read by
+                -- username in the pool-grant lookups (#940)
+                directory_groups TEXT DEFAULT '[]'
             )
         ''')
         
@@ -1143,6 +1187,15 @@ class PegaProxDB:
                     logging.info("Added layout_chosen column to users table")
                 except Exception as e:
                     logging.error(f"Failed to add layout_chosen column: {e}")
+
+            # MK Oct 2026 (#940) - the groups an LDAP/OIDC sign-in saw. Without a column
+            # user['groups'] was never stored, so a pool grant on a group matched nobody.
+            if 'directory_groups' not in columns:
+                try:
+                    cursor.execute("ALTER TABLE users ADD COLUMN directory_groups TEXT DEFAULT '[]'")
+                    logging.info("Added directory_groups column to users table")
+                except Exception as e:
+                    logging.error(f"Failed to add directory_groups column: {e}")
 
         except Exception as e:
             logging.error(f"Error checking users schema: {e}")
@@ -3477,7 +3530,12 @@ class PegaProxDB:
     def get_all_users(self) -> dict:
         """Get all users"""
         cursor = self.conn.cursor()
-        cursor.execute('SELECT * FROM users')
+        # MK Oct 2026 (#940) - every column but directory_groups. This read runs on every
+        # authorized request, and a directory user's nested memberships run to hundreds of
+        # DNs; the pool lookups read them by username (get_user_directory_groups).
+        cursor.execute('PRAGMA table_info(users)')
+        _cols = ', '.join('"%s"' % r[1] for r in cursor.fetchall() if r[1] != 'directory_groups')
+        cursor.execute(f'SELECT {_cols or "*"} FROM users')
         
         def build_avatar_url(row_data: dict) -> str:
             avatar_mime = row_data.get('avatar_mime', '') or ''
@@ -3624,14 +3682,16 @@ class PegaProxDB:
              auth_source, display_name, email, avatar_mime, avatar_data, ldap_dn, last_ldap_sync,
              ldap_permissions, ldap_tenant,
              tenant_permissions, denied_permissions, oidc_sub, last_oidc_sync,
-             layout_chosen, portal_only, sidebar_show_vmid, user_folder)
+             layout_chosen, portal_only, sidebar_show_vmid, user_folder,
+             directory_groups)
             VALUES (?, ?, ?, ?, ?, ?,
                     COALESCE((SELECT created_at FROM users WHERE username = ?), ?),
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?,
                     ?, ?,
                     ?, ?, ?, ?,
-                    ?, ?, ?, ?)
+                    ?, ?, ?, ?,
+                    COALESCE(?, (SELECT directory_groups FROM users WHERE username = ?), '[]'))
         ''', (
             username,
             data.get('password_salt', ''),
@@ -3669,6 +3729,12 @@ class PegaProxDB:
             1 if data.get('portal_only', False) else 0,
             1 if data.get('sidebar_show_vmid', False) else 0,
             data.get('user_folder', ''),
+            # #940 - user dicts from get_all_users carry no groups, and a sign-in writes the
+            # whole table back: without a 'groups' key the stored ones stay as they are
+            (json.dumps(_directory_groups(data.get('auth_source', 'local'), data.get('groups')))
+             if 'groups' in data or data.get('auth_source', 'local') not in DIRECTORY_AUTH_SOURCES
+             else None),
+            username,
         ))
         self.conn.commit()
     
@@ -4352,65 +4418,87 @@ class PegaProxDB:
         # an exact match silently missed and the pool user saw zero VMs. User grants stay
         # case-sensitive (usernames are). Caveat: two groups differing only by case would
         # collide here — realm group names are unique case-wise in practice.
-        if groups:
-            for group in groups:
-                # #940 — match the DN as stored AND its bare group name, because the
-                # dialog that writes these grants asks for a name while the login stores
-                # a DN.
-                _spellings = _group_grant_spellings(group)
-                if not _spellings:
+        # #940 - match the DN as stored AND its bare group name, because the dialog that
+        # writes these grants asks for a name while the login stores a DN.
+        # One read of this cluster's group grants, matched here: a query per group was
+        # free while `groups` was always empty, but a directory user now brings every
+        # group the login saw, nested AD memberships included - easily a few hundred.
+        # The stored groups are read only when a group grant exists, and by username,
+        # so callers need not carry them (get_all_users leaves them out).
+        cursor.execute('''
+            SELECT pool_id, subject_id, permissions FROM pool_permissions
+            WHERE cluster_id = ? AND subject_type = 'group'
+        ''', (cluster_id,))
+        _grants = cursor.fetchall()
+        _want = self._group_keys_of(username, groups) if _grants else set()
+        if _want:
+            for row in _grants:
+                if (row[1] or '').lower() not in _want:
                     continue
-                _ph = ','.join('?' * len(_spellings))
-                cursor.execute(f'''
-                    SELECT pool_id, permissions FROM pool_permissions
-                    WHERE cluster_id = ? AND subject_type = 'group'
-                      AND LOWER(subject_id) IN ({_ph})
-                ''', (cluster_id, *[v.lower() for v in _spellings]))
-                
-                for row in cursor.fetchall():
-                    pool_id = row[0]
-                    perms = json.loads(row[1]) if row[1] else []
-                    if pool_id in result:
-                        # Merge permissions (union)
-                        result[pool_id] = list(set(result[pool_id] + perms))
-                    else:
-                        result[pool_id] = perms
-        
+                pool_id = row[0]
+                perms = json.loads(row[2]) if row[2] else []
+                if pool_id in result:
+                    # Merge permissions (union)
+                    result[pool_id] = list(set(result[pool_id] + perms))
+                else:
+                    result[pool_id] = perms
+
         return result
 
     def get_user_pool_clusters(self, username: str, groups: List[str] = None) -> List[str]:
         """#555 — distinct cluster_ids where this user (or their groups) holds ANY pool
-        permission. Cheap: one indexed SELECT per subject on pool_permissions
-        (idx_pool_perms_cluster). Used by the cluster-list + get_user_clusters gates."""
+        permission. Cheap: one SELECT for the user and one for all of their groups on
+        pool_permissions. Used by the cluster-list + get_user_clusters gates."""
         cursor = self.conn.cursor()
-        subjects = [('user', username)]
-        for g in (groups or []):
-            subjects.append(('group', g))
         out = set()
-        for stype, sid in subjects:
-            # MK #555 — group names match case-insensitively (see get_user_pool_permissions),
-            # users stay exact.
-            if stype == 'group':
-                # #940 — same two spellings as get_user_pool_permissions. This one gates
-                # whether the cluster is visible at all, so missing it left the pool user
-                # without even the cluster the grant was on.
-                _spellings = _group_grant_spellings(sid)
-                if not _spellings:
-                    continue
-                _ph = ','.join('?' * len(_spellings))
-                cursor.execute(
-                    "SELECT DISTINCT cluster_id FROM pool_permissions "
-                    f"WHERE subject_type = 'group' AND LOWER(subject_id) IN ({_ph})"
-                    + _NON_EMPTY_GRANT,
-                    tuple(v.lower() for v in _spellings))
-            else:
-                cursor.execute(
-                    "SELECT DISTINCT cluster_id FROM pool_permissions "
-                    "WHERE subject_type = ? AND subject_id = ?" + _NON_EMPTY_GRANT,
-                    (stype, sid))
-            for row in cursor.fetchall():
+        cursor.execute(
+            "SELECT DISTINCT cluster_id FROM pool_permissions "
+            "WHERE subject_type = 'user' AND subject_id = ?" + _NON_EMPTY_GRANT,
+            (username,))
+        for row in cursor.fetchall():
+            out.add(row[0])
+        # MK #555 - group names match case-insensitively (see get_user_pool_permissions),
+        # users stay exact.
+        # #940 - same two spellings as get_user_pool_permissions. This one gates whether
+        # the cluster is visible at all, so missing it left the pool user without even the
+        # cluster the grant was on. One read for all groups, as there.
+        cursor.execute(
+            "SELECT cluster_id, subject_id FROM pool_permissions "
+            "WHERE subject_type = 'group'" + _NON_EMPTY_GRANT)
+        _grants = cursor.fetchall()
+        _want = self._group_keys_of(username, groups) if _grants else set()
+        for row in _grants:
+            if (row[1] or '').lower() in _want:
                 out.add(row[0])
         return list(out)
+
+    def get_user_directory_groups(self, username: str) -> List[str]:
+        """The directory / IdP groups the account's last sign-in stored (#940), none for a
+        local account. One indexed row, so the users-table read on every request does not
+        have to carry hundreds of DNs per directory user."""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT auth_source, directory_groups FROM users WHERE username = ?',
+                       (username,))
+        row = cursor.fetchone()
+        return _directory_groups(row[0], row[1]) if row else []
+
+    def _group_keys_of(self, username, groups=None):
+        # what the caller passed (tests, an in-flight row) plus what is stored
+        return _group_grant_keys(list(groups or []) + self.get_user_directory_groups(username))
+
+    def group_grants_lost(self, held: List[str], kept: List[str]) -> bool:
+        """Whether going from groups `held` to `kept` drops a spelling that a pool grant
+        with permissions names (#625 standby check, #940).
+
+        Not every dropped group: nested AD memberships churn (distribution lists, an OU
+        move that keeps the CN) without touching anything a grant reads. MK Oct 2026"""
+        lost = _group_grant_keys(held) - _group_grant_keys(kept)
+        if not lost:
+            return False
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT subject_id FROM pool_permissions WHERE subject_type = 'group'"
+                       + _NON_EMPTY_GRANT)
+        return any((row[0] or '').lower() in lost for row in cursor.fetchall())
 
     # ========================================
     # KEY ROTATION (HIPAA/ISO Compliance)
