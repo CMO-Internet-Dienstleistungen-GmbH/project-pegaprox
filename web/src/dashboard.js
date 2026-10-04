@@ -16434,50 +16434,6 @@
                                     aria-label={t('close') || 'Close'}
                                     onClick={() => setMobileSidebarOpen(false)}>&times;</button>
                                 <div className={`sticky top-6 ${isCorporate ? 'space-y-0.5 px-1 py-2' : 'space-y-3 pr-1'} pb-4`} style={{ maxHeight: 'calc(100vh - 3rem)', overflowY: 'auto', overflowX: 'hidden', scrollbarWidth: 'thin', scrollbarColor: '#4a4a4a transparent' }}>
-                                    {/* LW Oct 2026 - corporate: the global views get a section of their own instead of
-                                        hanging off All Clusters. It sits above the view switcher, filter and tree, so an
-                                        expanded cluster never pushes it out of reach. Same conditions as in Modern, so
-                                        nothing here before the first cluster; the empty card has the auto-install link. */}
-                                    {isCorporate && clusters.length > 0 && (() => {
-                                        const tools = [
-                                            { id: 'topology', show: true, active: sidebarTopology, label: t('topologyView') || 'Topology', onClick: openTopology,
-                                              icon: <Icons.Network className="w-4 h-4" /> },
-                                            // Globe always draws at w-5, zoom puts it in the 16px column of the others
-                                            { id: 'worldmap', show: true, active: sidebarWorldmap, label: t('worldMap') || 'World Map', onClick: openWorldmap,
-                                              icon: <span className="flex" style={{zoom: 0.8}}><Icons.Globe /></span> },
-                                            // not on a standby (#625)
-                                            { id: 'autoinstall', show: canAutoInstall && !haStandby, active: sidebarAutoInstall, label: t('autoInstall'), onClick: () => openAutoInstall(),
-                                              icon: <Icons.Disc className="w-4 h-4" /> },
-                                            { id: 'xhm', show: hasXhmPair, active: sidebarXHM, label: t('xhmTitle') || 'Hypervisor Migration', onClick: openXhm,
-                                              icon: <Icons.FolderInput /> },
-                                            // Network is taken by Topology right above
-                                            { id: 'mcevpn', show: clusters.length >= 2, active: sidebarMultiSdn, label: t('mcevpnTitle') || 'Multi-Cluster EVPN', onClick: openMultiSdn,
-                                              icon: <Icons.Layers /> },
-                                        ].filter(tool => tool.show);
-                                        if (tools.length === 0) return null;
-                                        // folded with one of its views open: the header keeps the accent
-                                        const lit = corpToolsCollapsed && tools.some(tool => tool.active);
-                                        return (
-                                            <div className="pb-3 mb-2 border-b border-proxmox-border" data-corp-tools="">
-                                                <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider px-1 mb-2">
-                                                    {/* the whole header folds, the chevron sits where the + of the other headers is */}
-                                                    <button type="button" onClick={toggleCorpTools} aria-expanded={!corpToolsCollapsed}
-                                                            className="w-full flex items-center justify-between gap-2 py-1 uppercase"
-                                                            style={lit ? {color: 'var(--corp-accent)'} : undefined}>
-                                                        <span className="min-w-0 truncate">{t('sidebarToolsSection')}</span>
-                                                        <span className="flex flex-shrink-0 mr-2" style={{color: lit ? 'var(--corp-accent)' : 'var(--corp-text-muted)'}}>
-                                                            {corpToolsCollapsed ? <Icons.ChevronRight className="w-3 h-3" /> : <Icons.ChevronDown className="w-3 h-3" />}
-                                                        </span>
-                                                    </button>
-                                                </h2>
-                                                {!corpToolsCollapsed && (
-                                                    <div className="space-y-1.5">
-                                                        {tools.map(tool => <CorpSidebarToolRow key={tool.id} {...tool} />)}
-                                                    </div>
-                                                )}
-                                            </div>
-                                        );
-                                    })()}
                                     {/* LW: view switcher (tree/pools/datastores) - horizontal icon toggle */}
                                     {isCorporate && (
                                         <div className="corp-view-switcher">
@@ -16848,6 +16804,50 @@
                                         </div>
                                     )}
 
+                                    {/* LW Oct 2026 - corporate: the global views get a section of their own instead of
+                                        hanging off All Clusters, under the clusters and above Backup Servers like the
+                                        other sections. Same conditions as in Modern, so nothing here before the first
+                                        cluster; the empty card has the auto-install link. */}
+                                    {isCorporate && clusters.length > 0 && (() => {
+                                        const tools = [
+                                            { id: 'topology', show: true, active: sidebarTopology, label: t('topologyView') || 'Topology', onClick: openTopology,
+                                              icon: <Icons.Network className="w-4 h-4" /> },
+                                            // Globe always draws at w-5, zoom puts it in the 16px column of the others
+                                            { id: 'worldmap', show: true, active: sidebarWorldmap, label: t('worldMap') || 'World Map', onClick: openWorldmap,
+                                              icon: <span className="flex" style={{zoom: 0.8}}><Icons.Globe /></span> },
+                                            // not on a standby (#625)
+                                            { id: 'autoinstall', show: canAutoInstall && !haStandby, active: sidebarAutoInstall, label: t('autoInstall'), onClick: () => openAutoInstall(),
+                                              icon: <Icons.Disc className="w-4 h-4" /> },
+                                            { id: 'xhm', show: hasXhmPair, active: sidebarXHM, label: t('xhmTitle') || 'Hypervisor Migration', onClick: openXhm,
+                                              icon: <Icons.FolderInput /> },
+                                            // Network is taken by Topology right above
+                                            { id: 'mcevpn', show: clusters.length >= 2, active: sidebarMultiSdn, label: t('mcevpnTitle') || 'Multi-Cluster EVPN', onClick: openMultiSdn,
+                                              icon: <Icons.Layers /> },
+                                        ].filter(tool => tool.show);
+                                        if (tools.length === 0) return null;
+                                        // folded with one of its views open: the header keeps the accent
+                                        const lit = corpToolsCollapsed && tools.some(tool => tool.active);
+                                        return (
+                                            <div className="mt-4 pt-4 border-t border-proxmox-border" data-corp-tools="">
+                                                <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider px-1 mb-2">
+                                                    {/* the whole header folds, the chevron sits where the + of the other headers is */}
+                                                    <button type="button" onClick={toggleCorpTools} aria-expanded={!corpToolsCollapsed}
+                                                            className="w-full flex items-center justify-between gap-2 py-1 uppercase"
+                                                            style={lit ? {color: 'var(--corp-accent)'} : undefined}>
+                                                        <span className="min-w-0 truncate">{t('sidebarToolsSection')}</span>
+                                                        <span className="flex flex-shrink-0 mr-2" style={{color: lit ? 'var(--corp-accent)' : 'var(--corp-text-muted)'}}>
+                                                            {corpToolsCollapsed ? <Icons.ChevronRight className="w-3 h-3" /> : <Icons.ChevronDown className="w-3 h-3" />}
+                                                        </span>
+                                                    </button>
+                                                </h2>
+                                                {!corpToolsCollapsed && (
+                                                    <div className="space-y-1.5">
+                                                        {tools.map(tool => <CorpSidebarToolRow key={tool.id} {...tool} />)}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        );
+                                    })()}
                                 {/* LW: Feb 2026 - Proxmox Backup Servers */}
                                 {pbsServers.length > 0 && (
                                     <div className="mt-4 pt-4 border-t border-proxmox-border">

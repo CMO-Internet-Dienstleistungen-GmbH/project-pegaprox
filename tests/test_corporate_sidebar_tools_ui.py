@@ -3,8 +3,7 @@
 Topology, World Map, Automated Installations, Hypervisor Migration and Multi-Cluster
 EVPN used to hang off All Clusters in corporate, indented as if they were its children
 and 12px apart while the tree below them is compact. They now have a section of their
-own at the top of the sidebar, above the view switcher, filter and tree, so an expanded
-cluster never pushes them out of reach. The header looks like Backup Servers and ESXi
+own under the clusters and above Backup Servers, like the other sections. The header looks like Backup Servers and ESXi
 and folds the section away, remembered per browser. Modern keeps them where they were.
 
 The runtime tests drive the built bundle in headless Chromium against the fake server
@@ -43,7 +42,7 @@ def dash():
 @pytest.fixture(scope='module')
 def section(dash):
     start = dash.index('{/* LW Oct 2026 - corporate: the global views get a section of their own')
-    return dash[start:dash.index('{/* LW: view switcher (tree/pools/datastores)', start)]
+    return dash[start:dash.index('{/* LW: Feb 2026 - Proxmox Backup Servers */}', start)]
 
 
 @pytest.fixture(scope='module')
@@ -77,7 +76,7 @@ def test_no_em_dash_and_every_class_ships(dash, section, row):
     css = _read('static', 'css', 'tailwind.min.css') + _read('web', 'index.html.original')
     have = {m.group(1).replace('\\', '') for m in re.finditer(r'\.((?:\\.|[A-Za-z0-9_-])+)', css)}
     names = _classes(section) | _classes(row)
-    assert {'pl-3', 'mr-2', 'py-1', 'leading-5', 'pb-3', 'border-b', 'gap-2', 'min-w-0', 'truncate',
+    assert {'pl-3', 'mr-2', 'py-1', 'leading-5', 'mt-4', 'pt-4', 'border-t', 'gap-2', 'min-w-0', 'truncate',
             'flex-shrink-0', 'space-y-1.5'} <= names, sorted(names)
     # the padding that keeps 12px between cluster groups now that the corporate list has no gap
     assert "className={isCorporate ? 'space-y-2 pt-3' : 'space-y-2'}" in dash
@@ -132,7 +131,7 @@ def _tools(page):
     return page.evaluate('() => Array.from(document.querySelectorAll("[data-corp-tool]")).map(b => b.dataset.corpTool)')
 
 
-def test_runtime_the_section_sits_above_the_inventory(open_app):
+def test_runtime_the_section_sits_under_the_clusters(open_app):
     app = _corporate(open_app, extra=WITH_PBS)
     page = app.page
     page.get_by_text('pbs02').first.wait_for(timeout=5000)
@@ -153,12 +152,11 @@ def test_runtime_the_section_sits_above_the_inventory(open_app):
         const follows = (a, b) => !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
         return {
             header: tools.querySelector('h2').innerText.trim(),
-            order: [follows(tools, switcher), follows(switcher, byText('CLUSTER(S)')), follows(byText('CLUSTER(S)'), all),
-                    follows(clusters[clusters.length - 1], backup)],
-            first: sb.querySelector('div.sticky').firstElementChild === tools,
-            toolsBox: box(tools), switcher: box(switcher),
-            dividedLikePbs: getComputedStyle(tools).borderBottomWidth === getComputedStyle(backup.closest('.border-t')).borderTopWidth
-                && getComputedStyle(tools).borderBottomColor === getComputedStyle(backup.closest('.border-t')).borderTopColor,
+            order: [follows(switcher, byText('CLUSTER(S)')), follows(byText('CLUSTER(S)'), all),
+                    follows(clusters[clusters.length - 1], tools), follows(tools, backup)],
+            toolsBox: box(tools), lastCluster: box(clusters[clusters.length - 1]), backupBox: box(backup),
+            dividedLikePbs: getComputedStyle(tools).borderTopWidth === getComputedStyle(backup.closest('.border-t')).borderTopWidth
+                && getComputedStyle(tools).borderTopColor === getComputedStyle(backup.closest('.border-t')).borderTopColor,
             headerFont: [getComputedStyle(tools.querySelector('h2')).fontSize, getComputedStyle(tools.querySelector('button')).textTransform],
             clusterFont: [getComputedStyle(byText('CLUSTER(S)')).fontSize, getComputedStyle(byText('CLUSTER(S)')).textTransform],
             chevron: icon(tools.querySelector('h2')), plus: box(plus),
@@ -168,9 +166,9 @@ def test_runtime_the_section_sits_above_the_inventory(open_app):
         };
     }""")
     assert geo['header'].upper() == 'TOOLS'
-    # first thing in the sidebar, then the switcher, filter and tree as one block
-    assert geo['first'] and geo['order'] == [True, True, True, True], geo['order']
-    assert geo['toolsBox']['bottom'] <= geo['switcher']['top']
+    # switcher, filter and tree first, then the tools as a section of their own, then Backup Servers
+    assert geo['order'] == [True, True, True, True], geo['order']
+    assert geo['lastCluster']['bottom'] <= geo['toolsBox']['top'] < geo['toolsBox']['bottom'] <= geo['backupBox']['top']
     assert geo['dividedLikePbs']
     assert geo['headerFont'] == geo['clusterFont'] == ['14px', 'uppercase']
     # the chevron sits where the + of Backup Servers is
@@ -193,8 +191,9 @@ def test_runtime_the_section_sits_above_the_inventory(open_app):
     assert not app.errors, app.errors
 
 
-def test_runtime_an_expanded_cluster_does_not_bury_the_section(open_app):
-    """A cluster with 120 guests open in the tree: the tools stay on screen."""
+def test_runtime_an_expanded_cluster_comes_before_the_section(open_app):
+    """A cluster with 120 guests open in the tree: the tools follow its guests, as Backup
+    Servers and ESXi do - the owner's choice over keeping them on the first screen."""
     nodes = {f'pve{i}': dict(NODE_METRICS['pve1']) for i in range(1, 4)}
     guests = [dict(VM, vmid=100 + i, name=f'vm-{i:03d}', node=f'pve{1 + i % 3}') for i in range(120)]
     app = _corporate(open_app, clusters=(CLUSTER, PVE2), resources=guests, metrics=nodes, extra=WITH_PBS)
@@ -211,9 +210,9 @@ def test_runtime_an_expanded_cluster_does_not_bury_the_section(open_app):
     }""")
     # the tree is several screens long, the last guest is far below the fold
     assert where['height'] > 2 * where['view'] and where['guest'] > where['view'], where
-    # every tool row is on the first screen
-    assert where['scroll'] == 0 and len(where['tools']) == 4, where
-    assert all(b <= where['view'] for b in where['tools']), where
+    # the tools come after the last guest and stay reachable by scrolling the sidebar
+    assert len(where['tools']) == 4, where
+    assert all(where['guest'] < b <= where['height'] for b in where['tools']), where
     assert not app.errors, app.errors
 
 
