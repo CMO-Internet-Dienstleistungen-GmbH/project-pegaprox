@@ -66,7 +66,9 @@ jobs:
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          # NS Oct 2026 - arm/v7 for 32-bit ARM hosts (a Raspberry Pi witness); it compiles
+          # the packages that have no armv7 wheel, which is fine for a tag build
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

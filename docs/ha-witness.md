@@ -141,9 +141,9 @@ that of your leader's release; a leader that follows the Testing branch names
 `ghcr.io/pegaprox/pegaprox-testing:latest`, which every push to Testing builds. Release
 1.2.0 and older have no witness in their image: a leader that runs one of them (and
 does not follow Testing) shows no Docker line, and says so - use the Linux line there.
-The release image is built for amd64 and arm64, the Testing image for amd64 only: on a
-32-bit Raspberry Pi OS (armv7), or an ARM host with the Testing image, Docker answers
-"no matching manifest" - use the Linux line there as well.
+The release image is built for amd64, arm64 and 32-bit ARM (armv7, from the release
+after 1.2.0 on), the Testing image for amd64 and arm64: on a 32-bit Raspberry Pi OS with
+the Testing image, Docker answers "no matching manifest" - use the Linux line there.
 The first start pairs with the code; every start after just
 runs (the code is used up by then, that is fine). Its state lives in the volume
 `pegaprox-witness`. With a new code on a volume that is still paired, it pairs anew only

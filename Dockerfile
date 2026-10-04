@@ -14,9 +14,15 @@ LABEL maintainer="support@pegaprox.com"
 # with no cache (docker.yml: no-cache: true) — otherwise the GHA layer cache
 # kept this step frozen and the stale openssl got republished. Build is
 # tag-triggered so the full rebuild cost is fine.
+# NS Oct 2026 - 32-bit ARM (arm/v7) has no wheels for gevent, greenlet, cffi, pynacl,
+# pillow and a few more: they compile below, which wants a C++ compiler, make and the
+# headers pillow builds against
+ARG TARGETARCH
+ARG TARGETVARIANT
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     gcc libffi-dev libssl-dev \
     openssh-client sshpass \
+    $(if [ "$TARGETARCH/$TARGETVARIANT" = "arm/v7" ]; then echo g++ make zlib1g-dev libjpeg62-turbo-dev; fi) \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
