@@ -555,7 +555,12 @@ def ha_status():
     offers automatic failover: the mode, the lease and the findings, and pending while
     a switch to automatic failover is pending on this instance (by and by_url, the
     instance that started it, own, since and text), which is why it is not promoted by
-    hand until the switch is through or taken back there."""
+    hand until the switch is through or taken back there. site is the label of this
+    instance, members[].site the one of each member. split_safety, once this release
+    offers automatic failover and on an instance of a group: whether the group survives
+    the loss of a site and whether its clusters are ready (voters, majority, tolerates,
+    level, sites, unlabeled, clusters, findings), with the very findings the switch goes
+    by."""
     denied = _refuse_confined_admin()
     if denied:
         return denied
@@ -1149,6 +1154,124 @@ def set_member_agent_vmid(instance_id):
         # the HA routes tell nobody by themselves (app.py): the member list changed
         ha.nudge_members()
     return jsonify({'success': True, 'changed': changed})
+
+
+# MK Oct 2026 (#625) - what an admin sets per member on the leader (design 3.1, 8): the
+# site, a label the split checks go by, and vote and may lead, which in an automatic group
+# are a change of the voter config (4.12).
+
+@bp.route('/api/ha/members/<instance_id>/site', methods=['PUT'])
+@require_auth(roles=[ROLE_ADMIN])
+def set_member_site(instance_id):
+    """The site a member runs at, on the leader: site, a label of up to 64 characters
+    ('' for none). instance_id may be the leader itself, a member or the witness.
+
+    It decides nothing about who votes, leads or acts: the split checks (status
+    split_safety, the switch's checklist) group the votes by it. So a manual group takes
+    it as well, and so does a release that does not offer automatic failover yet. The
+    members learn it with their next sync, which they are asked for right away. No
+    password: it names a place, it does not act. 404 for an instance that is not in the
+    group, 409 HA_STANDBY anywhere but on the leader, 409 HA_AUTO_MODE while a switch to
+    automatic failover is pending, 503 HA_NO_LEASE on a leader without its lease."""
+    denied = _refuse_confined_admin()
+    if denied:
+        return denied
+    site = _body().get('site')
+    if not isinstance(site, str) or ha._clean_site(site) is None:
+        return jsonify({'error': ha.SITE_ERROR}), 400
+    if ha.role() != ha.ROLE_ACTIVE or not ha.members():
+        return jsonify({'code': 'HA_STANDBY', 'error': ha.SITE_LEADER_ERROR}), 409
+    if ha.mode() == ha_vote.MODE_PENDING:
+        return jsonify({'code': 'HA_AUTO_MODE', 'error': ha.AUTO_PENDING_ERROR}), 409
+    refused = no_lease_refusal()
+    if refused:
+        return refused
+    witness = ha.witness() or {}
+    if instance_id != ha.instance_id() and not ha.member(instance_id) and witness.get('instance_id') != instance_id:
+        return jsonify({'error': ha.NOT_A_MEMBER_ERROR}), 404
+    before = ha._site_of(ha._load(), instance_id)
+    try:
+        changed = ha.set_member_site(instance_id, site)
+    except ha.AutoMode as e:
+        return jsonify({'code': 'HA_AUTO_MODE', 'error': str(e)}), 409
+    except ha.NoLease as e:
+        return no_lease_refusal() or (jsonify({'code': 'HA_NO_LEASE', 'error': str(e)}), 503)
+    except ha.HaError as e:
+        return jsonify({'error': str(e)}), 409
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Could not save the site')}), 500
+    label = ha._clean_site(site)
+    if changed:
+        log_audit(_user(), 'ha.member_site_changed',
+                  f"{ha._who(ha._load(), instance_id)} runs at site {sanitize_log_message(label) or '(none)'} "
+                  f"(was {sanitize_log_message(before) or '(none)'})")
+        # the HA routes tell nobody by themselves (app.py): the member list changed
+        ha.nudge_members()
+    return jsonify({'success': True, 'site': label, 'changed': changed})
+
+
+@bp.route('/api/ha/members/<instance_id>/vote', methods=['PUT'])
+@require_auth(roles=[ROLE_ADMIN])
+def set_member_vote(instance_id):
+    """Whether a data member votes and may lead on its own, on the leader: voter and/or
+    may_lead (true or false), and user_password. instance_id may be the leader itself
+    (may_lead only: the leader keeps its vote).
+
+    In a group that fails over automatically this is a change of the voter config: the
+    leader confirms its lease with a majority first, makes one change at a time (409
+    HA_VOTE_REFUSED while one waits or is on its way), never leaves fewer than three
+    votes, never takes its own vote, gives none to a member that does not answer its
+    renewals, and makes no change after which the members that answer would not make a
+    majority. It answers once the change is on disk and is in force once a majority
+    holds it. In a manual group it is noted for the next switch, which takes it into
+    the voter config. 409 HA_VOTE_REFUSED says which rule stands in the way, 409
+    HA_STANDBY anywhere but on the leader, HA_AUTO_MODE while a switch is pending,
+    HA_AUTO_NOT_SHIPPED while this release does not offer automatic failover, 503
+    HA_NO_LEASE on a leader without its lease."""
+    denied = _refuse_confined_admin()
+    if denied:
+        return denied
+    data = _body()
+    asked = {k: data[k] for k in ('voter', 'may_lead') if k in data}
+    if not asked or not all(isinstance(v, bool) for v in asked.values()):
+        return jsonify({'error': 'voter and may_lead are true or false, one of them at least'}), 400
+    if not ha_vote.AUTO_MODE_SHIPPED:
+        return jsonify({'code': 'HA_AUTO_NOT_SHIPPED', 'error': ha_vote.NOT_SHIPPED_ERROR}), 409
+    if ha.role() != ha.ROLE_ACTIVE or not ha.members():
+        return jsonify({'code': 'HA_STANDBY', 'error': ha.VOTE_LEADER_ERROR}), 409
+    if ha.mode() == ha_vote.MODE_PENDING:
+        return jsonify({'code': 'HA_AUTO_MODE', 'error': ha.AUTO_PENDING_ERROR}), 409
+    refused = no_lease_refusal()
+    if refused:
+        return refused
+    witness = ha.witness() or {}
+    if instance_id != ha.instance_id() and not ha.member(instance_id) and witness.get('instance_id') != instance_id:
+        return jsonify({'error': ha.NOT_A_MEMBER_ERROR}), 404
+    denied = _refuse_without_reauth('changing the vote of a member')
+    if denied:
+        return denied
+    automatic = ha.lease_in_force()
+    try:
+        changed = ha.set_member_vote(instance_id, **asked)
+    except ha.VoteRefused as e:
+        return jsonify({'code': 'HA_VOTE_REFUSED', 'error': str(e)}), 409
+    except ha.AutoMode as e:
+        return jsonify({'code': 'HA_AUTO_MODE', 'error': str(e)}), 409
+    except ha.NoLease as e:
+        return no_lease_refusal() or (jsonify({'code': 'HA_NO_LEASE', 'error': str(e)}), 503)
+    except ha.HaError as e:
+        return jsonify({'error': str(e)}), 409
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Could not change the vote of the member')}), 500
+    if changed:
+        what = ', '.join(f"{'vote' if k == 'voter' else 'may lead'} {'on' if v else 'off'}"
+                         for k, v in asked.items())
+        log_audit(_user(), 'ha.member_vote_changed',
+                  f"{ha._who(ha._load(), instance_id)}: {what} "
+                  + ('(a change of the voter config, in force once a majority holds it)' if automatic
+                     else '(taken into the voter config at the next switch to automatic failover)'))
+        ha.nudge_members()
+    return jsonify({'success': True, 'changed': changed, 'automatic': automatic, **asked})
 
 
 @bp.route('/api/ha/mode', methods=['PUT'])

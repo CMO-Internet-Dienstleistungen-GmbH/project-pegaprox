@@ -43553,7 +43553,7 @@
           }
         },
         "summary": "Role, epoch, members and last sync of this instance.",
-        "description": "members lists every other instance of the group, is_source marks the one a\nstandby pulls from; peer is that one (or the first member) for older readers.\nsuggested_url and own_fingerprint are what a pairing code made here would carry,\nso the UI can prefill the form. forward_writes is this instance's switch, forwarding\nwhether a standby hands its writes to the active right now. serve_assigned says the\nleader made this standby active, serving that it serves users right now, actives\nand active_limit how many instances do and may; serve on a member is the leader's\nword, serving_seen what the member said. config_version is the cv of the\nconfiguration here, change_gap what a member was known to hold when this instance\ntook the lead without it, and orphans the copies of what a sync did not carry over\n(count, bytes, over_limit, seal, items). An item names two keys. seal is the key the\ncopy itself is sealed under: under ('master', derived from the master key of the key\nstore, or 'field', the field key on plain SQLite), fp, current, backup and opens,\nwhether this instance can open it; a copy under another master key has opens false.\nkey is the field key the sealed values inside it are under: fp, current, and backup,\nthe key file that still holds it once the key was rotated. seal next to items is\nwhat this instance seals a copy under now (under, fp). auto, once this release\noffers automatic failover: the mode, the lease and the findings, and pending while\na switch to automatic failover is pending on this instance (by and by_url, the\ninstance that started it, own, since and text), which is why it is not promoted by\nhand until the switch is through or taken back there.",
+        "description": "members lists every other instance of the group, is_source marks the one a\nstandby pulls from; peer is that one (or the first member) for older readers.\nsuggested_url and own_fingerprint are what a pairing code made here would carry,\nso the UI can prefill the form. forward_writes is this instance's switch, forwarding\nwhether a standby hands its writes to the active right now. serve_assigned says the\nleader made this standby active, serving that it serves users right now, actives\nand active_limit how many instances do and may; serve on a member is the leader's\nword, serving_seen what the member said. config_version is the cv of the\nconfiguration here, change_gap what a member was known to hold when this instance\ntook the lead without it, and orphans the copies of what a sync did not carry over\n(count, bytes, over_limit, seal, items). An item names two keys. seal is the key the\ncopy itself is sealed under: under ('master', derived from the master key of the key\nstore, or 'field', the field key on plain SQLite), fp, current, backup and opens,\nwhether this instance can open it; a copy under another master key has opens false.\nkey is the field key the sealed values inside it are under: fp, current, and backup,\nthe key file that still holds it once the key was rotated. seal next to items is\nwhat this instance seals a copy under now (under, fp). auto, once this release\noffers automatic failover: the mode, the lease and the findings, and pending while\na switch to automatic failover is pending on this instance (by and by_url, the\ninstance that started it, own, since and text), which is why it is not promoted by\nhand until the switch is through or taken back there. site is the label of this\ninstance, members[].site the one of each member. split_safety, once this release\noffers automatic failover and on an instance of a group: whether the group survives\nthe loss of a site and whether its clusters are ready (voters, majority, tolerates,\nlevel, sites, unlabeled, clusters, findings), with the very findings the switch goes\nby.",
         "x-pegaprox-auth": "decorator",
         "security": [
           {
@@ -44078,6 +44078,118 @@
           }
         },
         "summary": "The VM a member runs as on one cluster, on the leader: cluster_id and vmid (null forgets it). instance_id may be the leader itself. Force leader switches autostart off on the VMs of the members it cuts out (design 7.3); the members learn it with their next sync. No password: it names a VM, it does not act on one. 404 for a cluster this instance does not manage, 409 anywhere but on the leader, 409 HA_AUTO_NOT_SHIPPED while this release does not offer automatic failover (Force leader is refused then too), 503 HA_NO_LEASE on a leader without its lease.",
+        "parameters": [
+          {
+            "name": "instance_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-roles": [
+          "admin"
+        ]
+      }
+    },
+    "/api/ha/members/{instance_id}/site": {
+      "put": {
+        "operationId": "ha.set_member_site_put",
+        "tags": [
+          "ha"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "The site a member runs at, on the leader: site, a label of up to 64 characters ('' for none). instance_id may be the leader itself, a member or the witness.",
+        "description": "It decides nothing about who votes, leads or acts: the split checks (status\nsplit_safety, the switch's checklist) group the votes by it. So a manual group takes\nit as well, and so does a release that does not offer automatic failover yet. The\nmembers learn it with their next sync, which they are asked for right away. No\npassword: it names a place, it does not act. 404 for an instance that is not in the\ngroup, 409 HA_STANDBY anywhere but on the leader, 409 HA_AUTO_MODE while a switch to\nautomatic failover is pending, 503 HA_NO_LEASE on a leader without its lease.",
+        "parameters": [
+          {
+            "name": "instance_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-roles": [
+          "admin"
+        ]
+      }
+    },
+    "/api/ha/members/{instance_id}/vote": {
+      "put": {
+        "operationId": "ha.set_member_vote_put",
+        "tags": [
+          "ha"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Whether a data member votes and may lead on its own, on the leader: voter and/or may_lead (true or false), and user_password. instance_id may be the leader itself (may_lead only: the leader keeps its vote).",
+        "description": "In a group that fails over automatically this is a change of the voter config: the\nleader confirms its lease with a majority first, makes one change at a time (409\nHA_VOTE_REFUSED while one waits or is on its way), never leaves fewer than three\nvotes, never takes its own vote, gives none to a member that does not answer its\nrenewals, and makes no change after which the members that answer would not make a\nmajority. It answers once the change is on disk and is in force once a majority\nholds it. In a manual group it is noted for the next switch, which takes it into\nthe voter config. 409 HA_VOTE_REFUSED says which rule stands in the way, 409\nHA_STANDBY anywhere but on the leader, HA_AUTO_MODE while a switch is pending,\nHA_AUTO_NOT_SHIPPED while this release does not offer automatic failover, 503\nHA_NO_LEASE on a leader without its lease.",
         "parameters": [
           {
             "name": "instance_id",

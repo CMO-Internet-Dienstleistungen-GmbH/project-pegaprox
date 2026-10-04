@@ -2317,13 +2317,47 @@ def _member_list(st):
                         fingerprint=st.get('own_fingerprint') or ''))
         if st.get('agent_vmid'):
             out[-1]['agent_vmid'] = st['agent_vmid']
+        out[-1].update(_member_marks(st))
     for mid, rec in (st.get('members') or {}).items():
         out.append(dict(_credentials(rec), instance_id=mid, url=rec.get('url') or '',
                         fingerprint=rec.get('fingerprint') or '', serve=rec.get('serve') is True))
         # the VM it runs as per cluster, where an admin named it (set_agent_vmid)
         if rec.get('agent_vmid'):
             out[-1]['agent_vmid'] = rec['agent_vmid']
+        out[-1].update(_member_marks(rec))
     return sorted(out, key=lambda e: e['instance_id'])
+
+
+# MK Oct 2026 (#625) - what an admin sets per member on the leader: the site label and, in
+# a release with automatic failover, vote and may lead. Kept on the member records (the
+# leader's own in its state) and handed out with the member list, so a member that leads
+# one day starts from the same; only what differs from the default goes along
+_MEMBER_MARKS = ('site', 'voter', 'may_lead')
+_SITE_BAD_RE = re.compile(r'[\x00-\x1f\x7f]')
+
+
+def _clean_site(value):
+    """A site label as an admin sets it or a member list carries it: up to SITE_MAX
+    characters on one line, '' for none. None for anything that is no label."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if len(value) > ha_vote.SITE_MAX or _SITE_BAD_RE.search(value):
+        return None
+    return value
+
+
+def _member_marks(rec):
+    """The marks of a member record (or of the leader's own state) as the member list
+    carries them: the site when it has one, vote and may lead only when taken."""
+    out = {}
+    site = _clean_site(rec.get('site'))
+    if site:
+        out['site'] = site
+    for key in ('voter', 'may_lead'):
+        if rec.get(key) is False:
+            out[key] = False
+    return out
 
 
 def _clean_entries(entries):
@@ -2355,6 +2389,8 @@ def _clean_entries(entries):
         vmids = _clean_agent_vmid(e.get('agent_vmid'))
         if vmids and out[mid].get('public_key') == key:
             out[mid]['agent_vmid'] = vmids
+        if out[mid].get('public_key') == key and out[mid].get('secret_hash') == digest:
+            out[mid].update(_member_marks(e))
     return out
 
 
@@ -2494,6 +2530,10 @@ def accept_pairing(code_secret, standby_id, standby_url, standby_fp, standby_pub
             'joined_at': _now(),
             'group_seen': True,
         }
+        if _lease_mode(st):
+            # it joins the voter config without a vote (_lease_member_joined), and its
+            # record says the same for the next switch
+            ms[standby_id]['voter'] = False
         tombs = dict(st.get('tombstones') or {})
         tombs.pop(standby_id, None)
         new = dict(st, role=ROLE_ACTIVE, epoch=new_epoch, pairing=None, signing_key=signing_key,
@@ -3673,6 +3713,14 @@ def _group_etag(etag, meta):
         if e.get('agent_vmid'):
             h.update(b'V')
             _hash_value(h, json.dumps(e['agent_vmid'], sort_keys=True))
+        # site, vote and may lead, as for serve
+        if e.get('site'):
+            h.update(b'T')
+            _hash_value(h, e['site'])
+        if e.get('voter') is False:
+            h.update(b'N')
+        if e.get('may_lead') is False:
+            h.update(b'L')
     for t in tombs or []:
         h.update(b'R')
         for key in ('instance_id', 'epoch', 'at', 'by', 'public_key', 'secret_hash'):
@@ -3966,6 +4014,11 @@ def _merged_members(st, sender, entries, tombstones=None):
             rec['agent_vmid'] = entry['agent_vmid']
         else:
             rec.pop('agent_vmid', None)
+        for key in _MEMBER_MARKS:
+            if key in entry:
+                rec[key] = entry[key]
+            else:
+                rec.pop(key, None)
         if mid != sender and _matches_tombstone(rec, tombs.get(mid)):
             continue
         out[mid] = rec
@@ -4004,6 +4057,12 @@ def _adopt_group(snap):
                     new['agent_vmid'] = own['agent_vmid']
                 else:
                     new.pop('agent_vmid', None)
+                # its site and may lead as well, the leader's word like the rest
+                for key in ('site', 'may_lead'):
+                    if key in own:
+                        new[key] = own[key]
+                    else:
+                        new.pop(key, None)
                 # MK Oct 2026 (#625) - where the leader reaches this member; after a
                 # promotion it is also what the node agents are given to ask
                 if own.get('url'):
@@ -7060,6 +7119,8 @@ def _member_view(rec, src, st):
         'last_error': rec.get('last_error') or '',
         'joined_at': rec.get('joined_at'),
         'is_source': rec['instance_id'] == src,
+        # where it runs, as an admin labelled it on the leader ('' for no label)
+        'site': _clean_site(rec.get('site')) or '',
     }
 
 
@@ -7069,6 +7130,8 @@ def public_status():
     src = source_id()
     pairing = st.get('pairing') or {}
     removed = st.get('removed')
+    # the checks of automatic failover once, for the card and the split-safety panel
+    checks = _group_checks(st) if ha_vote.AUTO_MODE_SHIPPED else None
     return {
         'role': st['role'],
         'epoch': int(st.get('epoch') or 0),
@@ -7119,8 +7182,14 @@ def public_status():
         # the group's zone where this host has no time zone data for it: its schedules
         # run by the clock of this host while it leads ('' when there is none such)
         'timezone_unreadable': _zone_unreadable(st),
+        # where this instance runs, as an admin labelled it on the leader
+        'site': _clean_site(st.get('site')) or '',
         # automatic failover: None until this release offers it
-        'auto': lease_status() if ha_vote.AUTO_MODE_SHIPPED else None,
+        'auto': lease_status(st, checks) if checks is not None else None,
+        # whether the group survives the loss of a site, and what stands in the way:
+        # the findings the switch goes by (split_safety); None until this release
+        # offers automatic failover, and on an instance of its own
+        'split_safety': split_safety(st, checks) if checks is not None else None,
     }
 
 
@@ -7196,7 +7265,8 @@ _LEASE_KEYS = ('voted_for', 'gen', 'cfg', 'cfg_chain', 'floor_cv', 'led', 'relea
 _WITNESS_KEYS = ('instance_id', 'url', 'fingerprint', 'public_key', 'site')
 # what a group decided, in the state file of each of its instances: gone when the
 # instance is on its own again, and never taken into the next group
-_GROUP_KEYS = ('lease', 'leader', 'witness', 'witness_pairing', 'timezone', 'group_mode', 'agent_vmid')
+_GROUP_KEYS = ('lease', 'leader', 'witness', 'witness_pairing', 'timezone', 'group_mode', 'agent_vmid',
+               'site', 'may_lead', 'leader_seen')
 # a vote round and a renewal both have two seconds (ha_vote.Timings)
 LEASE_CALL_TIMEOUT = 2
 # how long a status answer counts for the checks before the switch
@@ -7883,6 +7953,8 @@ class _LeaseRuntime:
         self.boot_lag_max = 0.0
         self.witness_asked = None       # (node gen, what) the voter config was asked to name
         self.planned = None             # (leader, until) while a planned restart holds the lease
+        self.takeover = None            # (leader, until): the winner's takeover wait, as a member reckons it
+        self.renewed_at = None          # start of the last round of this leader a majority answered
         self.switch_heard = None        # when the instance that started a pending switch was last heard
         # the claim watch: last pass, cluster -> (what it saw, look again from), the
         # clusters whose write still runs, and the one pass that may run
@@ -8009,6 +8081,10 @@ class _LeaseHooks:
         if name == 'lease':
             if rt.loop:
                 rt.armed = True
+            t0 = info.get('t0')
+            if type(t0) in (int, float) and (rt.renewed_at is None or t0 > rt.renewed_at):
+                # "lease renewed N s ago" on the status page
+                rt.renewed_at = t0
             return
         if name == 'clock_jump':
             # a token from before the step of the clock is void (design 4.2): the next
@@ -8133,6 +8209,7 @@ def _lease_event(rt, name, info):
             text = f"automatic failover is on: this instance leads with a lease at epoch {info['epoch']}"
             logging.warning(f"[HA] {text}")
             _audit('ha.auto_on', text)
+            _note_leader(rt.instance, info['epoch'])
             # the mode travels with the snapshot too, for a member without a voter config
             nudge_members()
             return
@@ -8140,6 +8217,8 @@ def _lease_event(rt, name, info):
                 f"{', '.join(acks) or 'nobody else'}")
         logging.warning(f"[HA] {me}: {text}")
         _audit('ha.elected', text)
+        # before the restart, and before the renewal that tells the members (_lease_fetch)
+        _note_leader(rt.instance, info['epoch'], prev=rt.node.leader_seen if rt.node is not None else None)
         gap = _load().get('change_gap')
         if isinstance(gap, dict):
             _say_change_gap(gap)
@@ -8306,6 +8385,10 @@ def _lease_fetch(item):
         held = peer_cv()
         if held:
             body = dict(body, leader_cv=held['cv'], leader_cv_at=held.get('cv_at'))
+        # since when this instance leads, so every member names the same moment
+        seen = _leader_seen(_load())
+        if seen is not None and seen['id'] == _load()['instance_id'] and seen['since']:
+            body = dict(body, leader_since=seen['since'])
     try:
         # on the member's kept session: a TLS handshake per call would cost renewals
         resp = _peer_call('POST', rec['url'], rec.get('fingerprint') or '', path, json_body=body,
@@ -8484,6 +8567,10 @@ def _lease_heard(sender, body):
                 new = dict(new, source=sender, sync=dict(st.get('sync') or {}, etag=None))
             if rec.get('role_seen') != ROLE_ACTIVE:
                 new = dict(new, members=dict(ms, **{sender: dict(rec, role_seen=ROLE_ACTIVE)}))
+            seen = _leader_seen_after(st, sender, body.get('epoch'), prev=before,
+                                      since=body.get('leader_since'))
+            if seen is not None:
+                new = dict(new, leader_seen=seen)
             if new is not st:
                 _commit_locked(new)
                 if before != sender:
@@ -8541,6 +8628,10 @@ def lease_request(sender, kind, body):
                 rt.planned = ((sender, ha_clock() + min(hold, ha_vote.HOLD_MAX))
                               if body.get('planned') is True and type(hold) in (int, float) and hold > 0
                               else None)
+                if type(hold) in (int, float) and hold > 0 and body.get('planned') is not True:
+                    # the winner's one renewal before its restart: it acts once its
+                    # takeover wait is over, about W_take from its vote (the banner)
+                    rt.takeover = (sender, ha_clock() + node.t.W_take)
             elif (kind == 'renew' and body.get('switch') is True and ans.get('ok') is True
                   and node.view.mode == ha_vote.MODE_PENDING and node.view.cfg.get('by') == sender):
                 # the instance that started the switch still drives it (Force leader, Q13)
@@ -8990,14 +9081,14 @@ def _voter_body(st, lease_s, quarantined=()):
     """The body of a voter config in manual mode for the group as the member list has it
     now: this instance, every member (voter, may_lead and site as their records say,
     a vote and the lead for each unless an admin took them) and the witness."""
+    # the leader keeps its vote whatever its record says (set_member_vote)
     voters = [{'id': st['instance_id'], 'public_key': own_public_key(), 'voter': True,
-               'may_lead': True, 'site': ''}]
+               'may_lead': st.get('may_lead') is not False, 'site': _clean_site(st.get('site')) or ''}]
     for mid, rec in (st.get('members') or {}).items():
-        site = rec.get('site')
         voters.append({'id': mid, 'public_key': rec.get('public_key') or '',
                        'voter': rec.get('voter') is not False,
                        'may_lead': rec.get('may_lead') is not False,
-                       'site': site if isinstance(site, str) and len(site) <= ha_vote.SITE_MAX else ''})
+                       'site': _clean_site(rec.get('site')) or ''})
     witness = _witness(st)
     body = {'mode': ha_vote.MODE_MANUAL, 'lease_s': lease_s,
             'voters': sorted(voters, key=lambda rec: rec['id']),
@@ -9054,9 +9145,20 @@ def _holds_a_chain_of_its_own(seen, st):
 
 def auto_findings(st=None, lease_s=ha_vote.LEASE_DEFAULT):
     """What stands in the way of automatic failover in this group (level 'block') or
-    weakens it ('warn'), as this instance sees it from the last answers of its members:
-    [{code, level, text, member}]. In a group that runs automatically the same list
-    says what to look at; nothing blocks there."""
+    weakens it ('warn'), and what an admin should know about it ('info'), as this
+    instance sees it from the last answers of its members and the clusters it runs:
+    [{code, level, text, member}], with site or cluster where a finding is about one.
+    In a group that runs automatically the same list says what to look at; nothing
+    blocks there. The switch refuses on a block, wants the code of every warn ticked,
+    and takes a block about one cluster (FOREIGN_CLAIM) as a warn: it stops nothing but
+    that cluster. The split-safety panel shows this very list (split_safety)."""
+    return _group_checks(st, lease_s)['findings']
+
+
+def _group_checks(st=None, lease_s=ha_vote.LEASE_DEFAULT):
+    """auto_findings, and what the split-safety panel shows next to them: {findings,
+    body (the voter config the checks went by), running, layout (_site_layout),
+    clusters (_cluster_checks)}. One pass, so the switch and the panel agree."""
     st = st or _load()
     rt = _rt()
     now = time.monotonic()
@@ -9177,13 +9279,16 @@ def auto_findings(st=None, lease_s=ha_vote.LEASE_DEFAULT):
     for mid in body.get('quarantined') or ():
         out.append(_finding('QUARANTINED', 'warn', f'{_label(mid)} came back with an older state. '
                             'Check it, then re-admit it.', mid))
+    layout = _site_layout(st, body)
     w = body.get('witness') or {}
-    shared = w.get('site') and sorted({r.get('site') for r in body.get('voters') or ()
-                                       if r.get('voter') and r.get('site') == w['site']})
-    if shared:
-        out.append(_finding('WITNESS_SAME_SITE', 'warn', f"The witness shares site {w['site']} with "
-                            'data members: losing that site may stop automation. It belongs at a '
-                            'third site.', w.get('id')))
+    wsite = layout['of'].get(w.get('id')) if w else ''
+    # only where the data members span more than its site: in a group at one site the
+    # witness has no third site to go to (design 3.4)
+    if (wsite and any(layout['of'].get(v) == wsite for v in layout['data'])
+            and any(layout['of'].get(v) not in ('', wsite) for v in layout['data'])):
+        out.append(dict(_finding('WITNESS_SAME_SITE', 'warn', f"The witness shares site {wsite} with "
+                                 'data members: losing that site may stop automation. It belongs at a '
+                                 'third site.', w.get('id')), site=wsite))
     if n >= ha_vote.MIN_VOTERS and n % 2 == 0:
         lost = n - ha_vote.majority(n)
         out.append(_finding('EVEN_VOTERS', 'warn',
@@ -9214,7 +9319,293 @@ def auto_findings(st=None, lease_s=ha_vote.LEASE_DEFAULT):
                             f'state file the last time it tried ({rt.write_failed}): it gives no '
                             'vote and takes no renewal that needs a write until it can. Check '
                             'its disk.'))
+    out += _site_findings(st, layout, n)
+    clusters, found = _cluster_checks(st, layout)
+    out += found
+    out += _zone_findings(st, targets, wid)
+    return {'findings': out, 'body': body, 'running': running, 'layout': layout, 'clusters': clusters}
+
+
+# --- split safety (design 3.4 and 8) ---------------------------------------------------
+#
+# MK Oct 2026 (#625) - whether the group survives the loss of a site, from the sites an
+# admin labelled the members with, and whether the clusters with node HA are ready for a
+# leader that sits wherever the majority is (6.2). One pass in _group_checks: the switch's
+# checklist and the split-safety panel read the same findings.
+
+LEVELS = ('ok', 'info', 'warn', 'block')
+LEADER_CHANGED_SHOWN = 600
+
+
+def _site_of(st, iid, body=None):
+    """The site label of the instance `iid` as this instance holds it: its own, a
+    member's record, the witness record (or the voter config's word for a witness it
+    holds no record of). '' for none."""
+    if iid == st['instance_id']:
+        return _clean_site(st.get('site')) or ''
+    rec = (st.get('members') or {}).get(iid)
+    if rec is not None:
+        return _clean_site(rec.get('site')) or ''
+    w = _witness(st)
+    if w and w['instance_id'] == iid:
+        return w['site'] or ''
+    bw = (body or {}).get('witness') or {}
+    return (_clean_site(bw.get('site')) or '') if bw.get('id') == iid else ''
+
+
+def _site_layout(st, body):
+    """The voters of `body` by site: {sites: [{site, voters, votes, candidates, members,
+    witness, survives_loss}], unlabeled: [voter ids], candidates: [ids], data: [data
+    voter ids], of: {id: site}, n, m}. A candidate leads on its own (a data voter with
+    may lead that is not quarantined); members lists every instance with that label,
+    voters or not. survives_loss: the group elects a leader on its own once that site
+    is gone (3.4: the others hold a majority and a candidate among them)."""
+    voters = ha_vote.voter_ids(body)
+    n = len(voters)
+    m = ha_vote.majority(n) if n else 0
+    quarantined = set(body.get('quarantined') or ())
+    wid = (body.get('witness') or {}).get('id')
+    records = {r['id']: r for r in body.get('voters') or ()}
+    data = [v for v in voters if v != wid]
+    candidates = [v for v in data if records.get(v, {}).get('may_lead') and v not in quarantined]
+    everyone = set(voters) | set(records) | {st['instance_id']} | set(st.get('members') or {})
+    if wid:
+        everyone.add(wid)
+    of = {iid: _site_of(st, iid, body) for iid in everyone}
+    sites = {}
+    for iid in sorted(everyone):
+        if of[iid]:
+            sites.setdefault(of[iid], {'site': of[iid], 'voters': [], 'candidates': [], 'members': [],
+                                       'witness': False})['members'].append(iid)
+    for v in voters:
+        if of[v]:
+            entry = sites[of[v]]
+            entry['voters'].append(v)
+            entry['witness'] = entry['witness'] or v == wid
+            if v in candidates:
+                entry['candidates'].append(v)
+    for entry in sites.values():
+        entry['votes'] = len(entry['voters'])
+        entry['survives_loss'] = bool(n and n - entry['votes'] >= m
+                                      and any(c not in entry['candidates'] for c in candidates))
+    return {'sites': [sites[s] for s in sorted(sites)], 'unlabeled': [v for v in voters if not of[v]],
+            'candidates': candidates, 'data': data, 'of': of, 'n': n, 'm': m}
+
+
+def _names(st, ids):
+    return ', '.join(_who(st, i) for i in ids)
+
+
+def _who(st, iid):
+    """How an instance is named in a text: its address, the short id where none is known."""
+    if not iid:
+        return ''
+    if iid == st['instance_id']:
+        return st.get('own_url') or iid[:8]
+    rec = (st.get('members') or {}).get(iid)
+    if rec is not None:
+        return rec.get('url') or iid[:8]
+    w = _witness(st)
+    if w and w['instance_id'] == iid:
+        return f"the witness {w['url'] or iid[:8]}"
+    return iid[:8]
+
+
+def _site_findings(st, layout, n):
+    """What the sites say about a split (3.4), and who leads on its own."""
+    out = []
+    m, sites, candidates = layout['m'], layout['sites'], layout['candidates']
+    if n and not candidates:
+        out.append(_finding('NO_CANDIDATE', 'warn', 'No member leads on its own (may lead is off for '
+                            'every data member with a vote): when the leader fails, automation stops '
+                            'until an admin uses Make leader.'))
+    if layout['unlabeled']:
+        out.append(dict(_finding('NO_SITE_LABELS', 'warn', 'Set a site for each member to check split '
+                                 f"safety (no site yet: {_names(st, layout['unlabeled'])})."),
+                        members=list(layout['unlabeled'])))
+        return out
+    if n < ha_vote.MIN_VOTERS or not sites:
+        # TOO_FEW_VOTERS says what there is to say
+        return out
+    if len(sites) == 1:
+        k = n - m
+        out.append(dict(_finding('ALL_ONE_SITE', 'info', f"Survives the loss of any {k} "
+                                 f"member{'' if k == 1 else 's'}. A site outage stops PegaProx "
+                                 'automation until the site is back.'), site=sites[0]['site']))
+        return out
+    fatal = [e for e in sites if n - e['votes'] < m]
+    if len(sites) == 2 and len(fatal) == 2:
+        out.append(_finding('TWO_SITES_NO_THIRD_VOTE', 'warn', 'Two sites need a third vote at a third '
+                            'location, or a WAN cut stops automation in both.'))
+    else:
+        for e in fatal:
+            out.append(dict(_finding('SITE_HOLDS_MAJORITY', 'warn', f"Losing site {e['site']} stops "
+                                     'automation everywhere.'), site=e['site']))
+    lead = sorted({layout['of'][c] for c in candidates})
+    if len(lead) == 1 and lead[0] not in {e['site'] for e in fatal}:
+        out.append(dict(_finding('CANDIDATES_ONE_SITE', 'warn', f'Only members in {lead[0]} lead on '
+                                 f'their own. Losing {lead[0]} stops automation until an admin uses '
+                                 '"Make leader".'), site=lead[0]))
     return out
+
+
+def _zone_findings(st, targets, wid):
+    """TZ_MISMATCH: a member that runs in another zone than the group's schedules. Since
+    the owner decision of 01.10.2026 (Q11) members may: the schedules run in the group's
+    zone whichever member leads, so this is something to know, not to fix."""
+    zone = _zone(st.get('timezone')) and st['timezone']
+    if not zone:
+        return []
+    rt, now, out = _rt(), time.monotonic(), []
+    for rec in targets:
+        mid = rec['instance_id']
+        seen = rt.seen.get(mid) or {}
+        theirs = seen.get('zone')
+        if (mid == wid or not theirs or now - seen.get('at', -1e9) > LEASE_SEEN_FRESH
+                or theirs == zone):
+            continue
+        out.append(_finding('TZ_MISMATCH', 'info', f"{rec.get('url') or mid[:8]} runs in time zone "
+                            f"{theirs}. The group's schedules run in {zone} whichever member leads.",
+                            mid))
+    return out
+
+
+def _cluster_nodes(mgr):
+    """The node names of a cluster as its manager knows them without asking it: the HA
+    monitor's view, the agents seen and the fences configured."""
+    names = set()
+    for source in (getattr(mgr, 'ha_node_status', None), (mgr.ha_config or {}).get('fence_agent_versions'),
+                   (mgr.ha_config or {}).get('fencing')):
+        if isinstance(source, dict):
+            names.update(k for k in list(source) if isinstance(k, str) and k)
+    return sorted(names)
+
+
+def _cluster_row(st, cid, mgr, layout, reach_of, url_ids):
+    """One cluster with node HA for the split-safety panel, and its findings. Only what
+    the manager holds in memory: nothing here goes to a node."""
+    name = str(getattr(getattr(mgr, 'config', None), 'name', None) or cid)
+    row = {'id': cid, 'name': name, 'kind': 'proxmox', 'nodes': [], 'agents': {},
+           'agent_version': None, 'fence': {}, 'fence_verified': [], 'ready': None, 'not_ready': [],
+           'two_node': False, 'unsafe_two_node': False, 'claim': None,
+           'reach': {iid: ok for iid, ok in reach_of.items() if ok is not None},
+           'reach_sites': [], 'unreachable_from': {}, 'unreachable_checked_at': None}
+    sites = sorted({layout['of'].get(iid) for iid, ok in row['reach'].items()
+                    if ok and iid in layout['data'] and layout['of'].get(iid)})
+    row['reach_sites'] = sites
+    found = []
+    # only where every other site with a data voter said it does not reach it: a site
+    # nobody heard from says nothing
+    others = [[row['reach'][v] for v in e['voters'] if v in layout['data'] and v in row['reach']]
+              for e in layout['sites'] if e['site'] not in sites and any(v in layout['data'] for v in e['voters'])]
+    if len(sites) == 1 and others and all(said and not any(said) for said in others) and not layout['unlabeled']:
+        found.append(dict(_finding('CLUSTER_ONE_SITE', 'info', f'Cluster {name} is reachable only from '
+                                   f'members in site {sites[0]}.'), cluster=cid, site=sites[0]))
+    if not callable(getattr(mgr, '_ha_claim_status', None)):
+        # node HA of another kind (an XCP-ng pool): none of the rules of 6.2 apply
+        row['kind'] = 'other'
+        return row, found
+    cfg = mgr.ha_config or {}
+    nodes = _cluster_nodes(mgr)
+    want = getattr(mgr, 'FENCE_AGENT_VERSION', 2)
+    seen = cfg.get('fence_agent_versions') if isinstance(cfg.get('fence_agent_versions'), dict) else {}
+    agents = {n: (seen.get(n) if type(seen.get(n)) is int else 0) for n in nodes}
+    fencing = cfg.get('fencing') if isinstance(cfg.get('fencing'), dict) else {}
+    fence = {n: (str((fencing.get(n) or {}).get('type') or '').lower() or None) for n in nodes}
+    verified = [n for n in nodes if mgr._ha_fence_readable(n)]
+    not_ready = [n for n in nodes if agents[n] != want and n not in verified]
+    strategy = cfg.get('fence_strategy') if isinstance(cfg.get('fence_strategy'), dict) else {}
+    votes = strategy.get('expected_votes')
+    # corosync's word where it was read (a qdevice makes two nodes three votes), the
+    # node count where not
+    two = bool(mgr._ha_forces_quorum() or strategy.get('two_node_flag') is True
+               or (votes == 2 if type(votes) is int else len(nodes) == 2))
+    unsafe = bool(mgr._ha_unsafe_two_node())
+    claim = mgr._ha_claim_status()
+    row.update(nodes=nodes, agents=agents, agent_version=want, fence=fence, fence_verified=verified,
+               ready=(not not_ready) if nodes else None, not_ready=not_ready, two_node=two,
+               unsafe_two_node=unsafe,
+               claim={k: claim.get(k) for k in ('enabled', 'state', 'epoch', 'instance', 'checked_at', 'residual')})
+    # who the nodes of a two-node cluster could not reach, at the last agent check
+    checked = cfg.get('agent_unreachable') if isinstance(cfg.get('agent_unreachable'), dict) else {}
+    for node, urls in sorted((checked.get('nodes') or {}).items()):
+        for url in urls if isinstance(urls, list) else ():
+            iid = url_ids.get(str(url).rstrip('/'), str(url))
+            row['unreachable_from'].setdefault(iid, []).append(node)
+    row['unreachable_checked_at'] = checked.get('at') if isinstance(checked.get('at'), str) else None
+    fenceless = two and not unsafe and (not nodes or len(verified) < len(nodes))
+    if fenceless:
+        found.append(dict(_finding('TWO_NODE_NO_FENCE', 'warn', f'Two-node cluster {name} has no verified '
+                                   'hardware fence. PegaProx will not recover it automatically.'), cluster=cid))
+    elif not row['ready']:
+        found.append(dict(_finding('RECOVERY_NOT_READY', 'warn', f'Cluster {name}: node recovery needs '
+                                   'agents v2 on every node or a verified IPMI fence.'), cluster=cid,
+                          nodes=list(not_ready)))
+    state = claim.get('state')
+    if claim.get('enabled') and state == 'unreachable':
+        found.append(dict(_finding('NO_CLAIM', 'warn', f'Cluster {name} has no SSH access, so it carries no '
+                                   'leader claim.'), cluster=cid))
+    elif claim.get('enabled') and state in ('higher', 'same', 'unreadable', 'foreign'):
+        who, ep = claim.get('instance'), claim.get('epoch')
+        if who and ep is not None:
+            text = (f'Cluster {name} is claimed by {_who(st, who)} at epoch {ep}. Nothing acts on it until '
+                    'the claim is released.')
+        else:
+            text = (f'Cluster {name} carries a claim file that names no instance of this group. Nothing '
+                    'acts on it until the claim is released.')
+        found.append(dict(_finding('FOREIGN_CLAIM', 'block', text), cluster=cid))
+    return row, found
+
+
+def _cluster_checks(st, layout):
+    """([cluster row], [finding]) for every cluster with node HA this instance runs a
+    manager for (an instance that runs none, a standby with the live view off, has
+    none). A cluster whose manager cannot say is left out; never raises."""
+    try:
+        from pegaprox.globals import cluster_managers
+        todo = [(str(cid), mgr) for cid, mgr in sorted(list(cluster_managers.items()), key=lambda x: str(x[0]))
+                if getattr(mgr, 'ha_enabled', False) is True]
+    except Exception:
+        return [], []
+    if not todo:
+        return [], []
+    rt, now, me = _rt(), time.monotonic(), st['instance_id']
+    fresh = {mid: seen for mid, seen in list(rt.seen.items())
+             if now - seen.get('at', -1e9) <= LEASE_SEEN_FRESH and isinstance(seen.get('reach'), dict)}
+    url_ids = {(rec.get('url') or '').rstrip('/'): mid for mid, rec in (st.get('members') or {}).items()
+               if rec.get('url')}
+    if st.get('own_url'):
+        url_ids[st['own_url'].rstrip('/')] = me
+    rows, found = [], []
+    for cid, mgr in todo:
+        reach_of = {me: rt.reach['clusters'].get(cid)}
+        for mid, seen in fresh.items():
+            reach_of[mid] = seen['reach'].get(cid)
+        try:
+            row, said = _cluster_row(st, cid, mgr, layout, reach_of, url_ids)
+        except Exception as e:
+            logging.debug(f"[HA] split safety: cluster {cid}: {e}")
+            continue
+        rows.append(row)
+        found += said
+    return rows, found
+
+
+def split_safety(st=None, checks=None):
+    """public_status.split_safety, once this release offers automatic failover, on an
+    instance of a group: {voters, majority, tolerates, level, sites, unlabeled,
+    clusters, findings}. findings is auto_findings, the list the switch goes by; level
+    is the worst of them ('ok' for none). None on an instance of its own and while
+    automatic failover is not offered."""
+    st = st or _load()
+    if not ha_vote.AUTO_MODE_SHIPPED or st['role'] == ROLE_STANDALONE:
+        return None
+    checks = checks or _group_checks(st)
+    layout, findings = checks['layout'], checks['findings']
+    worst = max((LEVELS.index(f['level']) for f in findings if f.get('level') in LEVELS), default=0)
+    return {'voters': layout['n'], 'majority': layout['m'], 'tolerates': max(0, layout['n'] - layout['m']),
+            'level': LEVELS[worst], 'sites': layout['sites'], 'unlabeled': layout['unlabeled'],
+            'clusters': checks['clusters'], 'findings': findings}
 
 
 def _lease_found(st, lease_s):
@@ -9303,10 +9694,12 @@ def switch_auto_on(lease_s=ha_vote.LEASE_DEFAULT, accept=()):
             if st['role'] != ROLE_ACTIVE or not st.get('members'):
                 raise HaError('Automatic failover is switched on on the leader of a group')
             findings = auto_findings(st, lease_s)
-            blocks = [f for f in findings if f['level'] == 'block']
+            # a block about one cluster stops nothing but that cluster: it wants a tick
+            blocks = [f for f in findings if f['level'] == 'block' and not f.get('cluster')]
             if blocks:
                 raise AutoRefused(blocks[0]['text'], findings)
-            open_ = [f for f in findings if f['level'] == 'warn' and f['code'] not in accept]
+            open_ = [f for f in findings if (f['level'] == 'warn' or (f['level'] == 'block' and f.get('cluster')))
+                     and f['code'] not in accept]
             if open_:
                 raise AutoRefused(open_[0]['text'], findings, confirm=True)
             if _zone(st.get('timezone')) is None and local_timezone():
@@ -9678,20 +10071,164 @@ def no_lease():
     return {'error': NO_LEASE_ERROR, 'retry_after': None}
 
 
-def lease_status():
+# --- who leads, as each instance saw it change (the status line and the banners) ---
+#
+# MK Oct 2026 (#625) - 'leader_seen' in the state file: {id, epoch, from, since}, the
+# leader this instance last knew and since when it leads (from: the one before it). The
+# winner notes it when it wins, a member with the first renewal of a new leader, taking
+# the moment the leader sends along so every member names the same one. since stays
+# None while this instance saw no change (the switch, the first leader it knew).
+
+def _leader_seen(st):
+    rec = st.get('leader_seen')
+    if (not isinstance(rec, dict) or not isinstance(rec.get('id'), str) or not _ID_RE.fullmatch(rec['id'])
+            or _epoch_value(rec.get('epoch')) is None):
+        return None
+    frm, since = rec.get('from'), rec.get('since')
+    return {'id': rec['id'], 'epoch': rec['epoch'],
+            'from': frm if isinstance(frm, str) and _ID_RE.fullmatch(frm) else None,
+            'since': since if _since_ok(since) else None}
+
+
+def _since_ok(value):
+    """Whether `value` is a moment a leader may say it leads since: an ISO time with its
+    zone, not ahead of this clock by more than the signature window."""
+    if not isinstance(value, str) or not 0 < len(value) <= 40:
+        return False
+    try:
+        at = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return at.tzinfo is not None and at.timestamp() <= time.time() + SIGNATURE_WINDOW
+
+
+def _leader_seen_after(st, leader_id, epoch, prev=None, since=None):
+    """The record after this instance learned that `leader_id` leads at `epoch`, None when
+    it stays as it is. `prev` is the leader it knew where the record names none, `since`
+    what the leader says (taken only when it can be one, _since_ok)."""
+    if not isinstance(leader_id, str) or not _ID_RE.fullmatch(leader_id) or _epoch_value(epoch) is None:
+        return None
+    old = _leader_seen(st)
+    if old is not None and epoch < old['epoch']:
+        return None
+    if old is not None and old['id'] == leader_id:
+        return dict(old, epoch=epoch) if epoch > old['epoch'] else None
+    before = (old or {}).get('id') or (prev if isinstance(prev, str) and _ID_RE.fullmatch(prev) else None)
+    if before == leader_id:
+        before = None
+    return {'id': leader_id, 'epoch': epoch, 'from': before,
+            'since': (since if _since_ok(since) else _now()) if before else None}
+
+
+def _note_leader(leader_id, epoch, prev=None):
+    """This instance leads now (it won, or switched the group on). Never raises."""
+    try:
+        with _lock:
+            st = _load()
+            seen = _leader_seen_after(st, leader_id, epoch, prev=prev)
+            if seen is not None:
+                _commit_locked(dict(st, leader_seen=seen))
+    except Exception as e:
+        logging.warning(f"[HA] could not note the change of the leader: {e}")
+
+
+def _leader_change(st):
+    """The last change of the leader this instance saw: {from, from_url, to, to_url,
+    epoch, at}, None when it saw none."""
+    seen = _leader_seen(st)
+    if seen is None or not seen['since']:
+        return None
+    return {'from': seen['from'], 'from_url': _who(st, seen['from']) if seen['from'] else '',
+            'to': seen['id'], 'to_url': _who(st, seen['id']), 'epoch': seen['epoch'], 'at': seen['since']}
+
+
+def lease_banner(st=None):
+    """What every signed-in user is told about an automatic group, {} anywhere else (a
+    manual group, an instance of its own). automatic: true, and at most one of
+    no_leader (true: changes and automation are paused, consoles keep working) and
+    takeover ({leader, resume_in}: the leader acts in about that many seconds), and
+    leader_changed ({to, from, at, epoch}) for LEADER_CHANGED_SHOWN after a change.
+    Names are addresses, as the standby banner shows the one it follows."""
+    st = st or _load()
+    if not ha_vote.AUTO_MODE_SHIPPED or not _lease_mode(st):
+        return {}
+    out = {'automatic': True}
+    node = _lease_live(st)
+    clock = ha_clock()
+    if st.get('leader') and st['role'] == ROLE_ACTIVE:
+        if node is not None and node.is_active():
+            pass
+        elif node is not None and node.holds_lease() and node.acting_from < float('inf'):
+            out['takeover'] = {'leader': _who(st, st['instance_id']),
+                               'resume_in': max(1, int(node.acting_from - clock) + 1)}
+        else:
+            out['no_leader'] = True
+    elif node is not None:
+        if node.promise_to and clock < node.promise_until:
+            rt = _rt()
+            take = rt.takeover
+            if take is not None and take[0] == node.promise_to and clock < take[1]:
+                out['takeover'] = {'leader': _who(st, take[0]), 'resume_in': max(1, int(take[1] - clock) + 1)}
+        else:
+            out['no_leader'] = True
+    change = _leader_change(st)
+    if change is not None:
+        try:
+            ago = time.time() - datetime.fromisoformat(change['at']).timestamp()
+        except ValueError:
+            ago = None
+        if ago is not None and ago <= LEADER_CHANGED_SHOWN:
+            out['leader_changed'] = {'to': change['to_url'], 'from': change['from_url'] or None,
+                                     'at': change['at'], 'epoch': change['epoch']}
+    return out
+
+
+def _cv_pair(value):
+    return list(value[:2]) if isinstance(value, (list, tuple)) and len(value) >= 2 else None
+
+
+def _behind(mine, theirs):
+    """How many changes `mine` (epoch, seq) is behind `theirs`, None where that cannot be
+    counted (another epoch: another line of history)."""
+    if mine is None or theirs is None or mine[0] != theirs[0]:
+        return None
+    return max(0, theirs[1] - mine[1])
+
+
+def lease_status(st=None, checks=None):
     """Automatic failover on the status page: the mode, who holds the lease as this
     instance sees it, what the voter config says about each member, what the watch
     last heard from it, and the findings (auto_findings). pending, while a switch to
     automatic failover is pending here: who started it and since when (pending_switch),
-    which is why a promotion by hand is refused on this instance."""
-    st = _load()
+    which is why a promotion by hand is refused on this instance.
+
+    The status line (MK Oct 2026, #625): renewed_ago (seconds since the last round of
+    this leader a majority answered, on a member since the last renewal it took),
+    leader_change, unconfirmed (on the leader: {count, cv, floor}, the changes it holds
+    that no majority holds yet; count None where they sit in another epoch), promise
+    (this member's: {to, to_url, left}), leader_cv and behind (this member against the
+    leader it follows), change_pending (the leader waits for a change of the voter
+    config, and takes no other). Per member: cv, behind and current (as the leader saw
+    it answer), promised_to and promised_left, unreached_from ([{cluster, name, node}],
+    the nodes of a two-node cluster that could not reach it at the last agent check).
+
+    In a manual group the members' marks (vote, may lead, site) are read from the
+    member records, which the next switch takes into the voter config."""
+    st = st or _load()
     rt = _rt()
     now = time.monotonic()
     node = _lease_live(st)
     lease = _lease(st)
-    body = lease['cfg']['body'] if lease else _voter_body(st, ha_vote.LEASE_DEFAULT)
+    held = lease['cfg']['body'] if lease else None
+    if held is not None and (lease.get('mode') != ha_vote.MODE_MANUAL or _lease_mode(st)):
+        body = held
+    else:
+        body = _voter_body(st, held['lease_s'] if held else ha_vote.LEASE_DEFAULT)
     quarantined = set(body.get('quarantined') or ())
     voters = ha_vote.voter_ids(body)
+    me = st['instance_id']
+    findings = checks['findings'] if checks is not None else auto_findings(st)
+    clusters = checks['clusters'] if checks is not None else _cluster_checks(st, _site_layout(st, body))[0]
     out = {
         'mode': mode(st), 'lease_s': body.get('lease_s'), 'voters': len(voters),
         'majority': ha_vote.majority(len(voters)) if voters else 0,
@@ -9699,45 +10236,99 @@ def lease_status():
         'acting_process': acting_process(), 'holder': None, 'lease_left': None, 'acting_in': None,
         'epoch': int(st.get('epoch') or 0), 'cfg_id': lease['cfg']['id'] if lease else None,
         'voted_for': None, 'switch_waiting': None, 'pending': pending_switch(st),
-        'findings': auto_findings(st),
+        'findings': findings,
         'reach': dict(rt.reach['clusters']),
         'hub_lag_max': round(rt.lag_max, 3), 'boot_hub_lag_max': round(rt.boot_lag_max, 3),
+        'site': _site_of(st, me, body), 'may_lead': st.get('may_lead') is not False,
+        'renewed_ago': None, 'leader_change': _leader_change(st), 'unconfirmed': None, 'promise': None,
+        'leader_cv': None, 'behind': None, 'change_pending': False,
     }
+    clock = ha_clock()
+    holds = False
     if node is not None:
-        clock = ha_clock()
         holds = node.lease_mode() and node.holds_lease()
         out.update(holds_lease=holds, voted_for=node.st.get('voted_for'))
         if holds:
-            out.update(holder=st['instance_id'], lease_left=round(max(0.0, node.lease_until - clock), 1))
+            out.update(holder=me, lease_left=round(max(0.0, node.lease_until - clock), 1))
             if not node.is_active() and node.acting_from < float('inf'):
                 out['acting_in'] = round(max(0.0, node.acting_from - clock), 1)
+            if rt.renewed_at is not None:
+                out['renewed_ago'] = round(max(0.0, clock - rt.renewed_at), 1)
+            cv, floor = _cv_pair(node.cv), _cv_pair(node.floor)
+            if cv is not None and floor is not None and floor < cv:
+                out['unconfirmed'] = {'count': _behind(floor, cv), 'cv': cv, 'floor': floor}
+            out['change_pending'] = node.change_pending()
         elif node.promise_to and clock < node.promise_until:
             out.update(holder=node.promise_to, lease_left=round(node.promise_until - clock, 1))
+            out['promise'] = {'to': node.promise_to, 'to_url': _who(st, node.promise_to),
+                              'left': round(node.promise_until - clock, 1)}
+        if not holds and node.heard_at is not None:
+            out['renewed_ago'] = round(max(0.0, clock - node.heard_at), 1)
         if node.switch is not None and not node.switch.get('cancelled'):
             out['switch_waiting'] = sorted(
-                mid for mid in node.view.members - {st['instance_id']}
+                mid for mid in node.view.members - {me}
                 if (rt.seen.get(mid) or {}).get('mode') != ha_vote.MODE_PENDING)
-    rows = []
     ms = st.get('members') or {}
+    if not holds:
+        # where the leader this member follows is at, as it said with its renewals
+        lead = out['holder'] or st.get('source')
+        theirs = _one_cv((ms.get(lead) or {}).get('cv_seen')) if lead else None
+        mine = cv_entry(st)
+        if theirs is not None:
+            out['leader_cv'] = theirs[:2]
+            if mine is not None and mine[2] == theirs[2]:
+                out['behind'] = max(0, theirs[1] - mine[1])
+    unreached = {}
+    for row in clusters:
+        for iid, nodes in (row.get('unreachable_from') or {}).items():
+            unreached.setdefault(iid, []).extend({'cluster': row['id'], 'name': row['name'], 'node': n}
+                                                 for n in nodes)
+    t = node.t if node is not None else ha_vote.Timings()
+    window = 2 * (t.R + t.renew_timeout)
+
+    def promised(iid):
+        # the leader counts on the promise of every voter that acked one of its last rounds
+        if holds and clock - rt.acked.get(iid, -1e9) <= window:
+            return me, round(max(0.0, rt.acked[iid] + t.P - clock), 1)
+        seen = rt.seen.get(iid) or {}
+        if now - seen.get('at', -1e9) <= LEASE_SEEN_FRESH and isinstance(seen.get('holder'), str):
+            return seen['holder'], None
+        return None, None
+
+    def as_cv(iid):
+        if holds:
+            theirs = _cv_pair(node.cv_seen(iid))
+            return theirs, _behind(theirs, _cv_pair(node.cv))
+        if iid == out['holder'] and out['leader_cv'] is not None:
+            return out['leader_cv'], 0
+        return None, None
+
+    rows = []
     leading = node is not None and st.get('leader') and node.lease_mode()
     for rec in body.get('voters') or ():
-        if rec['id'] == st['instance_id']:
+        if rec['id'] == me:
             continue
         seen = rt.seen.get(rec['id']) or {}
         # Make leader on this row, from here: the leader says whether it would hand over
         why = _transfer_refusal(st, rt, node, rec['id']) if leading else ''
+        to, left = promised(rec['id'])
+        cv, behind = as_cv(rec['id'])
         rows.append({'instance_id': rec['id'], 'kind': ha_vote.KIND_DATA, 'voter': rec.get('voter'),
-                     'may_lead': rec.get('may_lead'), 'site': rec.get('site') or '',
+                     'may_lead': rec.get('may_lead'), 'site': _site_of(st, rec['id'], body),
                      'quarantined': rec['id'] in quarantined, 'skew': seen.get('skew'),
                      'release': seen.get('release'), 'mode': seen.get('mode'),
                      'zone': seen.get('zone'),
                      'holds': seen.get('holds') is True, 'reach': seen.get('reach'),
                      'seen_ago': round(now - seen['at'], 1) if 'at' in seen else None,
                      'make_leader': bool(leading and not why), 'make_leader_why': why,
-                     'agent_vmid': dict((ms.get(rec['id']) or {}).get('agent_vmid') or {})})
+                     'agent_vmid': dict((ms.get(rec['id']) or {}).get('agent_vmid') or {}),
+                     'cv': cv, 'behind': behind, 'current': behind == 0,
+                     'promised_to': to, 'promised_left': left,
+                     'unreached_from': unreached.get(rec['id'], [])})
     witness = _witness(st)
     if witness:
         seen = rt.seen.get(witness['instance_id']) or {}
+        to, left = promised(witness['instance_id'])
         rows.append({'instance_id': witness['instance_id'], 'kind': ha_vote.KIND_WITNESS,
                      'voter': True, 'may_lead': False, 'site': witness['site'],
                      'quarantined': witness['instance_id'] in quarantined, 'skew': seen.get('skew'),
@@ -9747,7 +10338,8 @@ def lease_status():
                      'last_heard': (witness_view(st) or {}).get('last_heard'),
                      'seen_ago': round(now - seen['at'], 1) if 'at' in seen else None,
                      'make_leader': False, 'make_leader_why': 'The witness holds no data and never leads',
-                     'agent_vmid': {}})
+                     'agent_vmid': {}, 'cv': None, 'behind': None, 'current': False,
+                     'promised_to': to, 'promised_left': left, 'unreached_from': []})
     out['members'] = rows
     out['witness'] = witness_view(st)
     out['agent_vmid'] = dict(st.get('agent_vmid') or {})
@@ -11239,6 +11831,191 @@ def set_agent_vmid(member_id, cluster_id, vmid):
         else:
             ms[member_id] = dict(ms[member_id], agent_vmid=held)
             _commit_locked(dict(st, members=ms))
+    return True
+
+
+SITE_LEADER_ERROR = 'The site of a member is set on the leader of a group'
+VOTE_LEADER_ERROR = 'Vote and may lead are set on the leader of a group'
+SITE_ERROR = f'The site is a label of up to {ha_vote.SITE_MAX} characters on one line'
+NOT_A_MEMBER_ERROR = 'That instance is not a member of this group'
+VOTE_OWN_ERROR = 'The leader keeps its own vote - make another member leader first'
+VOTE_WITNESS_ERROR = 'The witness always votes and never leads - remove it to take its vote'
+VOTE_FEW_ERROR = (f'Without this vote the group would have fewer than {ha_vote.MIN_VOTERS} votes, too '
+                  'few for automatic failover. Add a member or a witness first')
+VOTE_BUSY_ERROR = 'A change of the voter config is on its way - try again in a moment'
+VOTE_MAJORITY_ERROR = ('After this change the members that answer would not make a majority of the '
+                       'votes, and the leader would lose its lease. Bring the members that do not '
+                       'answer back first')
+
+
+class VoteRefused(HaError):
+    """set_member_vote: a rule of the voter config stands in the way (design 4.12)."""
+
+
+def set_member_site(member_id, site):
+    """Leader: the site the instance `member_id` runs at (this instance, a member or the
+    witness), '' for none. A label for the split checks (_site_findings): it decides
+    nothing about who votes, leads or acts, so a manual group takes it too, whether or
+    not this release offers automatic failover. It travels with the member list, the
+    witness's with its record; in an automatic group the voter config follows the
+    witness record (_witness_into_config). Not while a switch to automatic failover is
+    pending (the pending config names the sites it was made with), and in an automatic
+    group only while this instance may act. Returns True when it changed."""
+    label = _clean_site(site)
+    if label is None:
+        raise HaError(SITE_ERROR)
+    witness_changed = False
+    with _lock:
+        st = _load()
+        if st['role'] != ROLE_ACTIVE or not st.get('members') or st.get('removed') or st.get('broken'):
+            raise HaError(SITE_LEADER_ERROR)
+        if mode(st) == ha_vote.MODE_PENDING:
+            raise AutoMode(AUTO_PENDING_ERROR)
+        if _lease_mode(st) and not is_active():
+            raise NoLease(NO_LEASE_ERROR)
+        me, ms, w = st['instance_id'], dict(st.get('members') or {}), _witness(st)
+        if member_id == me:
+            if (_clean_site(st.get('site')) or '') == label:
+                return False
+            new = dict(st, site=label) if label else {k: v for k, v in st.items() if k != 'site'}
+        elif member_id in ms:
+            if (_clean_site(ms[member_id].get('site')) or '') == label:
+                return False
+            rec = dict(ms[member_id], site=label)
+            if not label:
+                rec.pop('site')
+            ms[member_id] = rec
+            new = dict(st, members=ms)
+        elif w is not None and member_id == w['instance_id']:
+            if w['site'] == label:
+                return False
+            new = dict(st, witness=dict(w, site=label))
+            witness_changed = True
+        else:
+            raise HaError(NOT_A_MEMBER_ERROR)
+        _commit_locked(new)
+    if witness_changed and _lease_mode(_load()):
+        _witness_into_config()
+    return True
+
+
+def set_member_vote(member_id, voter=None, may_lead=None):
+    """Leader: whether the data member `member_id` (this instance included) votes and may
+    lead on its own. In an automatic group a change of the voter config (4.12): under a
+    confirm round, one change at a time (refused while one waits or is on its way),
+    never below MIN_VOTERS votes, never the vote of the leader itself, never a vote for a
+    member that does not answer the renewals, and never one after which the members that
+    answer would not make a majority. Back once the change is on disk, in force once a
+    majority holds it; the member record follows. In a manual group the member records,
+    which the next switch takes into the voter config (_voter_body); the leader keeps
+    its vote there too. Returns True when something changed. Raises VoteRefused, NoLease,
+    AutoMode or HaError, and then nothing changed."""
+    if not ha_vote.AUTO_MODE_SHIPPED:
+        raise HaError(ha_vote.NOT_SHIPPED_ERROR)
+    asked = {k: v for k, v in (('voter', voter), ('may_lead', may_lead)) if v is not None}
+    if not asked or not all(type(v) is bool for v in asked.values()):
+        raise HaError('voter and may_lead are true or false, one of them at least')
+    st = _load()
+    if st['role'] != ROLE_ACTIVE or not st.get('members') or st.get('removed') or st.get('broken'):
+        raise HaError(VOTE_LEADER_ERROR)
+    if mode(st) == ha_vote.MODE_PENDING:
+        raise AutoMode(AUTO_PENDING_ERROR)
+    me = st['instance_id']
+    if (_witness(st) or {}).get('instance_id') == member_id:
+        raise VoteRefused(VOTE_WITNESS_ERROR)
+    if member_id != me and member_id not in (st.get('members') or {}):
+        raise HaError(NOT_A_MEMBER_ERROR)
+    if member_id == me and asked.get('voter') is False:
+        raise VoteRefused(VOTE_OWN_ERROR)
+    if _lease_mode(st):
+        changed = _vote_in_config(member_id, asked)
+    else:
+        with _lock:
+            st = _load()
+            body = _voter_body(st, ha_vote.LEASE_DEFAULT)
+            rec = next((r for r in body['voters'] if r['id'] == member_id), None)
+            if rec is None:
+                raise HaError(NOT_A_MEMBER_ERROR)
+            if asked.get('voter') is False and rec['voter'] and len(ha_vote.voter_ids(body)) - 1 < ha_vote.MIN_VOTERS:
+                raise VoteRefused(VOTE_FEW_ERROR)
+            changed = any(rec[k] != v for k, v in asked.items())
+    if changed:
+        _vote_marks(member_id, asked)
+    return changed
+
+
+def _vote_marks(member_id, asked):
+    """The member record (this instance's own state for itself) after a change of vote
+    or may lead: only what differs from the default is kept."""
+    with _lock:
+        st = _load()
+        if member_id == st['instance_id']:
+            rec, ms = dict(st), None
+        else:
+            ms = dict(st.get('members') or {})
+            if member_id not in ms:
+                return
+            rec = dict(ms[member_id])
+        for key, value in asked.items():
+            if key == 'voter' and ms is None:
+                continue
+            if value:
+                rec.pop(key, None)
+            else:
+                rec[key] = False
+        _commit_locked(rec if ms is None else dict(st, members=dict(ms, **{member_id: rec})))
+
+
+def _vote_in_config(member_id, asked):
+    """set_member_vote in an automatic group: one change of the voter config, made by
+    the node of this leader once a majority confirmed its lease again."""
+    if not confirm_lease(NEED_STEP):
+        raise NoLease(NO_LEASE_ERROR)
+    rt = _rt()
+    with rt.lock:
+        st = _load()
+        node = _lease_node(rt)
+        if node is None or not st.get('leader') or not node.is_active():
+            raise NoLease(NO_LEASE_ERROR)
+        if node.view.mode != ha_vote.MODE_AUTO:
+            raise HaError(SWITCHING_OFF_ERROR)
+        if node.transfer is not None:
+            raise HaError(TRANSFER_ERROR)
+        if node.change_pending():
+            raise VoteRefused(VOTE_BUSY_ERROR)
+        rec = node.view.records.get(member_id)
+        if rec is None:
+            raise VoteRefused(f'{_label(member_id)} is not in the voter config yet - try again in a moment')
+        want = dict(rec, **asked)
+        if want == rec:
+            return False
+
+        def change(body):
+            voters = [dict(r, **asked) if r['id'] == member_id else r for r in body['voters']]
+            out = dict(body, voters=voters)
+            if asked.get('voter') is False:
+                out['quarantined'] = [q for q in body.get('quarantined') or () if q != member_id]
+            return out
+        after = ha_vote.CfgView({'id': list(node.view.id), 'body': change(node.view.cfg['body'])})
+        if asked.get('voter') is False and rec.get('voter') and after.n < ha_vote.MIN_VOTERS:
+            raise VoteRefused(VOTE_FEW_ERROR)
+        t = node.t
+        window = 2 * (t.R + t.renew_timeout)
+        # this leader, and every voter that acked one of its last rounds
+        heard = {st['instance_id']} | {v for v in after.voters if ha_clock() - rt.acked.get(v, -1e9) <= window}
+        if asked.get('voter') is True and not rec.get('voter') and member_id not in heard:
+            raise VoteRefused(f'{_label(member_id)} does not answer the renewals of this leader: a vote '
+                              'it cannot give would only take one from the majority')
+        if len(heard & after.counting) < after.m:
+            raise VoteRefused(VOTE_MAJORITY_ERROR)
+        node.change_cfg(change)
+        rt.due = node.next_wake()
+    _lease_after(rt)
+    _lease_wait(_Until(lambda: node.dead or node.view.records.get(member_id) == want), CFG_CHANGE_WAIT)
+    with rt.lock:
+        if node.view.records.get(member_id) != want:
+            node.cancel_change(change)
+            raise HaError('The change of the voter config did not go through in time - try again in a moment')
     return True
 
 

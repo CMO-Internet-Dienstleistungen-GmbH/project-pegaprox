@@ -8152,6 +8152,12 @@ fi
             # an agent from before v2: it runs on as it is until it is installed again
             fa['outdated'] = 0 < fa['version'] < self.FENCE_AGENT_VERSION
         self.ha_config['fence_agent_versions'] = versions
+        # MK Oct 2026 (#625) - the instances each node could not reach, for the member
+        # table of the HA tab (ha.lease_status); memory only, until the next check
+        self.ha_config['agent_unreachable'] = {
+            'at': datetime.now().isoformat(),
+            'nodes': {n: list(info['members_unreachable']) for n, info in results.items()
+                      if info and info.get('members_unreachable')}}
         return {'nodes': results, 'expected_version': self.FENCE_AGENT_VERSION,
                 'mode': plan['mode'], 'strategy': plan['strategy'], 'members': plan['members']}
 

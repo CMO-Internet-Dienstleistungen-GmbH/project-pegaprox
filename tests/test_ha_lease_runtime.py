@@ -845,7 +845,10 @@ def test_the_status_shows_the_zone_of_each_member_and_a_group_that_runs_without_
         status = h.public_status()
         rows = {m['instance_id']: m['zone'] for m in status['auto']['members']}
         assert rows == {IDS['b']: 'America/New_York', IDS['c']: 'America/New_York'}
-        assert status['timezone'] == 'Europe/Vienna' and status['auto']['findings'] == []
+        assert status['timezone'] == 'Europe/Vienna'
+        # members in another zone are allowed (Q11): something to know, nothing to tick
+        assert {(f['code'], f['level'], f['member']) for f in status['auto']['findings']} == {
+            ('TZ_MISMATCH', 'info', IDS['b']), ('TZ_MISMATCH', 'info', IDS['c'])}
         # a state from before the switch took a zone: said, and nothing blocks
         h._update(timezone=None)
         found = [f for f in h.auto_findings() if f['code'] == 'NO_GROUP_ZONE']

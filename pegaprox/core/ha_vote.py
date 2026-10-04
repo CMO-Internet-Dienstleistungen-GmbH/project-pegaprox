@@ -1768,6 +1768,19 @@ class Node:
         """The voter config id `member` last said it holds, None while it said none."""
         return self._cfg_seen.get(member)
 
+    def cv_seen(self, member):
+        """The cv `member` last answered a round of this leader with, None while it said none."""
+        return self._cv_seen.get(member)
+
+    def change_pending(self):
+        """Whether a change of the voter config waits or is on its way: one queued, the
+        newest config not committed yet, or the config of a new term still to come
+        (4.12). The next change waits for all of it."""
+        if self._changes or not self._is_committed():
+            return True
+        led = self.st.get('led')
+        return bool(led) and self.view.id[0] < led['epoch']
+
     def campaigning(self):
         return self._campaign is not None
 

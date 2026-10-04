@@ -639,7 +639,13 @@ def _ha_banner():
     view off its cluster list is empty on purpose, and the UI has to say so. forwarding
     says whether a change made here goes to the active right now or is refused, serving
     whether this standby serves its users like an active instance (consoles here), and
-    leader_reachable whether the leader answered the last time this instance asked."""
+    leader_reachable whether the leader answered the last time this instance asked.
+
+    MK Oct 2026 (#625) - in a group that fails over automatically, for every signed-in
+    user: automatic, and no_leader (changes and automation paused, consoles keep
+    working), takeover {leader, resume_in} and leader_changed {to, from, at, epoch} for
+    ten minutes after a change (ha.lease_banner). Nothing of it in a manual group or on
+    an instance of its own."""
     from pegaprox.core import ha
     out = ha.banner()
     if out.get('role') == ha.ROLE_STANDBY:
@@ -647,6 +653,11 @@ def _ha_banner():
         out['forwarding'] = bool(ha.forwarding())
         out['serving'] = bool(ha.serving())
         out['leader_reachable'] = bool(ha.leader_reachable())
+    try:
+        out.update(ha.lease_banner())
+    except Exception as e:
+        # the sign-in and the session check answer whatever the lease state says
+        logging.warning(f"[HA] no lease banner: {e}")
     return out
 
 

@@ -376,6 +376,8 @@ def test_a_group_that_changed_in_manual_mode_switches_on_as_it_is_now(auto, seed
     auto.run(2 * T.R, dt=1.0)
     # d joins while the group is in manual mode: it has no lease state at all
     assert _pair(auto.g, auto.admin, 'd').status_code == 200
+    with auto.at('a') as ha:
+        ha.set_member_site(IDS['d'], 'dc-d')
     assert _sync(auto.g, auto.admin, 'd') == 'applied'
     assert 'lease' not in auto.file('d')
     auto.members = 'abcd'
@@ -398,6 +400,8 @@ def test_a_leader_that_never_held_the_chain_founds_it_anew(auto, seed):
     auto.put('a', '/api/ha/mode', OFF)
     auto.run(2 * T.R, dt=1.0)
     assert _pair(auto.g, auto.admin, 'd').status_code == 200
+    with auto.at('a') as ha:
+        ha.set_member_site(IDS['d'], 'dc-d')
     for n in 'dbc':
         # the member list with d in it reaches the others with their next sync
         assert _sync(auto.g, auto.admin, n) == 'applied'

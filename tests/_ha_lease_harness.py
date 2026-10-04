@@ -24,7 +24,7 @@ import pytest
 from pegaprox.core import ha as _ha
 from pegaprox.core import ha_vote as hv
 from test_ha_api import ADMIN_PW
-from test_ha_members import IDS, NAMES, _built, _fresh_windows, _watch
+from test_ha_members import IDS, NAMES, _built, _fresh_windows, _sync, _watch
 
 # taken before a test replaces it (tests/conftest.py)
 _REAL_LEASE_START = _ha.lease_start
@@ -254,10 +254,18 @@ class Auto:
 
     # --- forming the group ---
 
-    def pair(self, seed, standbys='bc'):
-        """a active with `standbys`, synced, and the watch of a has heard every member."""
-        self.admin = _built(self.g, seed, standbys)
+    def pair(self, seed, standbys='bc', sites=True):
+        """a active with `standbys`, synced, and the watch of a has heard every member.
+        With `sites` each instance runs at a site of its own (dc-a, dc-b, ...): a group
+        that names none wants NO_SITE_LABELS ticked at the switch."""
+        self.admin = _built(self.g, seed, standbys, sync=False)
         self.members = 'a' + standbys
+        if sites:
+            with self.g.at('a') as ha:
+                for n in self.members:
+                    ha.set_member_site(IDS[n], f'dc-{n}')
+        for n in standbys:
+            assert _sync(self.g, self.admin, n) == 'applied'
         self.watch('a')
         return self.admin
 

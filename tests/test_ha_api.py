@@ -59,6 +59,9 @@ ADMIN_ROUTES = [
     ('post', '/api/ha/force-leader', {'confirm': 'FORCE LEADER', 'cut_out': [], 'reason': 'test',
                                       'user_password': ADMIN_PW}),
     ('put', f'/api/ha/members/{B_ID}/agent-vmid', {'cluster_id': 'c1', 'vmid': 101}),
+    # what an admin sets per member (tests/test_ha_member_settings.py)
+    ('put', f'/api/ha/members/{B_ID}/site', {'site': 'dc1'}),
+    ('put', f'/api/ha/members/{B_ID}/vote', {'voter': False, 'user_password': ADMIN_PW}),
 ]
 PEER_ROUTES = [
     ('POST', '/api/ha/peer/pair'),
@@ -372,6 +375,8 @@ def test_an_admin_reaches_every_route(ha_env, seed):
         '/api/ha/make-leader': 409,                 # not offered by this release yet
         '/api/ha/force-leader': 409,                # not offered by this release yet
         f'/api/ha/members/{B_ID}/agent-vmid': 409,  # not the leader of a group
+        f'/api/ha/members/{B_ID}/site': 409,        # not the leader of a group
+        f'/api/ha/members/{B_ID}/vote': 409,        # not offered by this release yet
     }
     for method, path, body in ADMIN_ROUTES:
         r = _send(c, method, path, body)
