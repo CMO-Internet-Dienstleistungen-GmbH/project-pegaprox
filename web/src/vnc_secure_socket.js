@@ -63,6 +63,12 @@
             this._sendSeq = 0;
             this._recvSeq = 0;
             this._sendQueue = [];   // queued plaintext sends while crypto warms up
+            // LW Oct 2026 (#955) - frames reach noVNC and the socket in the order they came,
+            // whatever order WebCrypto settles its promises in: both ends check the sequence
+            // number of every frame
+            this._recvChain = Promise.resolve();
+            this._sendChain = Promise.resolve();
+            this._integrityFailed = false;
 
             // open the underlying WebSocket once the key is ready, so we never
             // accept inbound frames before we can decrypt them
@@ -107,19 +113,11 @@
                 }
             });
 
-            this._ws.addEventListener('message', async (e) => {
-                try {
-                    const plain = await this._decrypt(e.data);
-                    // synthesize a MessageEvent so noVNC sees `event.data`
-                    const ev = new MessageEvent('message', { data: plain });
-                    this._dispatch('message', ev);
-                } catch (err) {
-                    console.error('[SecureVncSocket] integrity check FAILED:', err);
-                    this._dispatch('integrityerror', new MessageEvent('integrityerror', { data: String(err) }));
-                    // closing with code 4099 (private range) so the app-level
-                    // disconnect handler can recognize this as our integrity-fail signal
-                    try { this._ws.close(4099, 'integrity_check_failed'); } catch (_) {}
-                }
+            // an async listener of its own per frame let the second frame reach _decrypt
+            // while the first was still being decrypted: 'out-of-order', 4099, on a healthy
+            // stream. Chained, frame n+1 starts once frame n has been handed to noVNC.
+            this._ws.addEventListener('message', (e) => {
+                this._recvChain = this._recvChain.then(() => this._deliver(e.data));
             });
 
             this._ws.addEventListener('close', (e) => {
@@ -133,6 +131,23 @@
             this._ws.addEventListener('error', () => {
                 this._dispatch('error', new Event('error'));
             });
+        }
+
+        async _deliver(data) {
+            if (this._integrityFailed) return;   // closing already, the rest cannot verify
+            try {
+                const plain = await this._decrypt(data);
+                // synthesize a MessageEvent so noVNC sees `event.data`
+                const ev = new MessageEvent('message', { data: plain });
+                this._dispatch('message', ev);
+            } catch (err) {
+                this._integrityFailed = true;
+                console.error('[SecureVncSocket] integrity check FAILED:', err);
+                this._dispatch('integrityerror', new MessageEvent('integrityerror', { data: String(err) }));
+                // closing with code 4099 (private range) so the app-level
+                // disconnect handler can recognize this as our integrity-fail signal
+                try { this._ws.close(4099, 'integrity_check_failed'); } catch (_) {}
+            }
         }
 
         async _encrypt(plaintext) {
@@ -173,24 +188,27 @@
             if (seq !== expected) {
                 throw new Error(`out-of-order frame: got seq=${seq}, expected ${expected}`);
             }
+            // taken before the await, so nothing else can be checked against the same number
+            this._recvSeq = (this._recvSeq + 1) >>> 0;
 
             // crypto.subtle.decrypt throws on auth-tag mismatch
             const pt = await window.crypto.subtle.decrypt(
                 { name: 'AES-GCM', iv: iv, additionalData: seqBytes, tagLength: 128 },
                 this._key, ct
             );
-
-            this._recvSeq = (this._recvSeq + 1) >>> 0;
             return pt;
         }
 
-        async _encryptAndSend(plaintext) {
-            try {
-                const frame = await this._encrypt(plaintext);
-                this._ws.send(frame);
-            } catch (err) {
-                console.error('[SecureVncSocket] encrypt failed:', err);
-            }
+        _encryptAndSend(plaintext) {
+            // the encrypt starts right here: WebCrypto copies the bytes on the call, and noVNC
+            // reuses its buffer for the next message. Only the hand-over to the socket waits,
+            // so frames leave in send order - the server rejects any but the next number
+            const frame = this._encrypt(plaintext);
+            this._sendChain = this._sendChain
+                .then(() => frame)
+                .then((f) => { this._ws.send(f); })
+                .catch((err) => { console.error('[SecureVncSocket] encrypt failed:', err); });
+            return this._sendChain;
         }
 
         send(data) {
@@ -375,11 +393,11 @@
             const seq = new DataView(seqBytes.buffer, seqBytes.byteOffset, 4).getUint32(0, false);
             const expected = this._recvSeq >>> 0;
             if (seq !== expected) throw new Error(`out-of-order frame: got ${seq}, expected ${expected}`);
+            this._recvSeq = (this._recvSeq + 1) >>> 0;   // before the await, as in SecureVncSocket
             const pt = await window.crypto.subtle.decrypt(
                 { name: 'AES-GCM', iv: iv, additionalData: seqBytes, tagLength: 128 },
                 this._key, ct
             );
-            this._recvSeq = (this._recvSeq + 1) >>> 0;
             return pt;
         }
 

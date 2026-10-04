@@ -4011,14 +4011,85 @@
                 '!':0x31,'@':0x32,'#':0x33,'$':0x34,'%':0x35,'^':0x36,'&':0x37,'*':0x38,'(':0x39,')':0x30,
                 '_':0x2D,'+':0x3D,'{':0x5B,'}':0x5D,'|':0x5C,':':0x3B,'"':0x27,'<':0x2C,'>':0x2E,'?':0x2F,'~':0x60,
             };
+            // LW Oct 2026 (#959) - that still left every other keymap with bare keysyms, and qemu
+            // never presses a modifier for a keysym: '@' on a Spanish guest arrived as a plain 2.
+            // So paste types like a hand on that keyboard: the physical key (KeyboardEvent.code,
+            // which noVNC turns into a scancode) with Shift and/or AltGr held - what noVNC itself
+            // sends for a real key press. One string per modifier level, the 48 keys in the order
+            // of PASTE_KEYS, rows split by a space, '•' where that level has nothing. Positions
+            // that are dead keys on Windows AND Linux get a Space after them; where only Windows
+            // has a dead key (the '~' of es and fr, for one) the key is sent as it is.
+            const PASTE_KEYS = ('Backquote 1 2 3 4 5 6 7 8 9 0 Minus Equal Q W E R T Y U I O P BracketLeft BracketRight '
+                + 'A S D F G H J K L Semicolon Quote Backslash IntlBackslash Z X C V B N M Comma Period Slash')
+                .split(' ').map(k => k.length > 1 ? k : ((k >= '0' && k <= '9' ? 'Digit' : 'Key') + k));
+            const PASTE_LAYOUTS = {
+                'en-gb': { base:  '`1234567890-= qwertyuiop[] asdfghjkl;\'# \\zxcvbnm,./',
+                           shift: '¬!"£$%^&*()_+ QWERTYUIOP{} ASDFGHJKL:@~ |ZXCVBNM<>?',
+                           altgr: '••••€•••••••• •••••••••••• •••••••••••• •••••••••••' },
+                de: { base:  '^1234567890ß´ qwertzuiopü+ asdfghjklöä# <yxcvbnm,.-',
+                      shift: '°!"§$%&/()=?` QWERTZUIOPÜ* ASDFGHJKLÖÄ\' >YXCVBNM;:_',
+                      altgr: '••²³•••{[]}\\• @•€••••••••~ •••••••••••• |••••••µ•••',
+                      dead: '^´`' },
+                es: { base:  'º1234567890\'¡ qwertyuiop`+ asdfghjklñ´ç <zxcvbnm,.-',
+                      shift: 'ª!"·$%&/()=?¿ QWERTYUIOP^* ASDFGHJKLÑ¨Ç >ZXCVBNM;:_',
+                      altgr: '\\|@#~•¬•••••• ••€•••••••[] ••••••••••{} •••••••••••',
+                      dead: '`^´¨' },
+                fr: { base:  '²&é"\'(-è_çà)= azertyuiop^$ qsdfghjklmù* <wxcvbn,;:!',
+                      shift: '•1234567890°+ AZERTYUIOP¨£ QSDFGHJKLM%µ >WXCVBN?./§',
+                      altgr: '••~#{[|`\\^@]} ••€••••••••¤ •••••••••••• •••••••••••',
+                      dead: '^¨' },
+                it: { base:  '\\1234567890\'ì qwertyuiopè+ asdfghjklòàù <zxcvbnm,.-',
+                      shift: '|!"£$%&/()=?^ QWERTYUIOPé* ASDFGHJKLç°§ >ZXCVBNM;:_',
+                      altgr: '•••••••••••`~ ••€•••••••[] •••••••••@#• •••••••••••',
+                      altgrShift: '••••••••••••• ••••••••••{} •••••••••••• •••••••••••' },
+                pt: { base:  '\\1234567890\'« qwertyuiop+´ asdfghjklçº~ <zxcvbnm,.-',
+                      shift: '|!"#$%&/()=?» QWERTYUIOP*` ASDFGHJKLÇª^ >ZXCVBNM;:_',
+                      altgr: '••@£§••{[]}•• ••€•••••••¨• •••••••••••• •••••••••••',
+                      dead: '´`~^¨' },
+                pl: { base:  '`1234567890-= qwertyuiop[] asdfghjkl;\'\\ •zxcvbnm,./',
+                      shift: '~!@#$%^&*()_+ QWERTYUIOP{} ASDFGHJKL:"| •ZXCVBNM<>?',
+                      altgr: '••••••••••••• ••ę•••€•ó••• ąś••••••ł••• •żźć••ń••••',
+                      altgrShift: '••••••••••••• ••Ę•••••Ó••• ĄŚ••••••Ł••• •ŻŹĆ••Ń••••' },
+            };
+            const PASTE_SHIFT = [0xFFE1, 'ShiftLeft'];
+            const PASTE_ALTGR = [0xFE03, 'AltRight'];     // ISO_Level3_Shift, as noVNC sends AltGraph
+            const DEAD_KEYSYMS = { '`': 0xFE50, '´': 0xFE51, '^': 0xFE52, '~': 0xFE53, '¨': 0xFE57 };
+            // Latin-2 letters have keysyms of their own, and a keymap only knows those
+            const LATIN2_KEYSYMS = { 'ą': 0x1B1, 'Ą': 0x1A1, 'ć': 0x1E6, 'Ć': 0x1C6, 'ę': 0x1EA, 'Ę': 0x1CA,
+                'ł': 0x1B3, 'Ł': 0x1A3, 'ń': 0x1F1, 'Ń': 0x1D1, 'ś': 0x1B6, 'Ś': 0x1A6,
+                'ź': 0x1BC, 'Ź': 0x1AC, 'ż': 0x1BF, 'Ż': 0x1AF };
+            const pasteKeyMap = (keymap) => {
+                const layout = PASTE_LAYOUTS[keymap];
+                if (!layout) return null;
+                const map = {};
+                [['base', []], ['shift', [PASTE_SHIFT]], ['altgr', [PASTE_ALTGR]],
+                 ['altgrShift', [PASTE_ALTGR, PASTE_SHIFT]]].forEach(([level, mods]) => {
+                    Array.from((layout[level] || '').replace(/ /g, '')).forEach((ch, i) => {
+                        if (ch === '•' || map[ch] || !PASTE_KEYS[i]) return;
+                        const cp = ch.codePointAt(0);
+                        const dead = (layout.dead || '').includes(ch);
+                        map[ch] = { code: PASTE_KEYS[i], mods, dead,
+                                    keysym: dead ? DEAD_KEYSYMS[ch]
+                                          : (cp <= 0xFF ? cp : (LATIN2_KEYSYMS[ch] || 0x01000000 + cp)) };
+                    });
+                });
+                return map;
+            };
             const typeTextToVM = (conn, text, keymap) => {
                 const usLayout = !keymap || keymap === 'en-us';
+                const keys = usLayout ? null : pasteKeyMap(keymap);
                 for (const ch of text) {
                     const code = ch.charCodeAt(0);
+                    const key = keys && keys[ch];
                     if (code === 10 || code === 13) {
                         conn.sendKey(0xFF0D); // Return
                     } else if (code === 9) {
                         conn.sendKey(0xFF09); // Tab
+                    } else if (key) {
+                        key.mods.forEach(([ks, c]) => conn.sendKey(ks, c, true));
+                        conn.sendKey(key.keysym, key.code);
+                        key.mods.slice().reverse().forEach(([ks, c]) => conn.sendKey(ks, c, false));
+                        if (key.dead) conn.sendKey(0x20, 'Space');   // dead key + Space = the character itself
                     } else if (usLayout && SHIFTED_US[ch] !== undefined) {
                         conn.sendKey(0xFFE1, 'ShiftLeft', true);   // Shift_L down
                         conn.sendKey(SHIFTED_US[ch]);              // tap the unshifted base key
