@@ -979,7 +979,7 @@
         }
 
         // Cluster Sidebar Item Component - NS Jan 2026
-        function ClusterSidebarItem({ cluster, idx, selectedCluster, setSelectedCluster, nodeAlerts, clusterGroups, isAdmin, handleDeleteCluster, setShowAssignGroup, setRenamingCluster, setRenameValue, setReconfigureCluster, t, getAuthHeaders, fetchClusters, addToast, isCorporate, expandedSidebarClusters, toggleSidebarCluster, onContextMenu, hwHealth }) {
+        function ClusterSidebarItem({ cluster, idx, selectedCluster, setSelectedCluster, nodeAlerts, clusterGroups, isAdmin, handleDeleteCluster, setShowAssignGroup, setRenamingCluster, setRenameValue, setReconfigureCluster, t, getAuthHeaders, fetchClusters, addToast, isCorporate, expandedSidebarClusters, toggleSidebarCluster, onContextMenu, hwHealth, onCheckConnection }) {
             const offlineNodesCount = Object.values(nodeAlerts || {})
                 .filter(alert => alert.cluster_id === cluster.id && alert.status === 'offline')
                 .length;
@@ -1068,6 +1068,15 @@
                                     <Icons.Settings className="w-3.5 h-3.5" />
                                 </button>
                             )}
+                            {isAdmin && onCheckConnection && cluster.cluster_type !== 'xcpng' && (
+                                <button
+                                    onClick={(e) => { e.stopPropagation(); onCheckConnection(cluster); }}
+                                    className="p-1 rounded hover:bg-green-500/10 text-gray-500 hover:text-green-400 transition-colors"
+                                    title={t('connCheckTitle')}
+                                >
+                                    <Icons.Activity className="w-3.5 h-3.5" />
+                                </button>
+                            )}
                             <button
                                 onClick={(e) => {
                                     e.stopPropagation();
@@ -1134,6 +1143,223 @@
                     <span className="flex flex-shrink-0" style={{color: active ? 'var(--corp-accent)' : 'var(--corp-text-muted)'}}>{icon}</span>
                     <span className="flex-1 text-left truncate">{label}</span>
                 </button>
+            );
+        }
+
+        // LW Oct 2026 - the connection check of one PVE cluster: read-only probes on the
+        // server (core/conncheck.py), started here by the admin and never on a timer. The
+        // server answers with codes; the words and the fix for each come from translations.
+        const CONN_CHECK_HINTS = {
+            api_unreachable: 'connCheckHintApiUnreachable', api_tls_untrusted: 'connCheckHintApiTlsUntrusted',
+            api_tls_mismatch: 'connCheckHintApiTlsMismatch', api_auth: 'connCheckHintApiAuth',
+            api_http: 'connCheckHintApiHttp', api_slow: 'connCheckHintApiSlow', api_no_fallback: 'connCheckHintApiNoFallback',
+            cred_not_connected: 'connCheckHintCredNotConnected', cred_needs_2fa: 'connCheckHintCredNeeds2fa',
+            cred_auth_backoff: 'connCheckHintCredAuthBackoff', cred_token_rejected: 'connCheckHintCredTokenRejected',
+            cred_token_note: 'connCheckHintCredTokenNote', cred_password_note: 'connCheckHintCredPasswordNote',
+            priv_missing: 'connCheckHintPrivMissing', priv_unreadable: 'connCheckHintPrivUnreadable',
+            ver_mixed: 'connCheckHintVerMixed', ver_old: 'connCheckHintVerOld', ver_unknown: 'connCheckHintNoAnswer',
+            clock_skew: 'connCheckHintClockSkew', clock_unknown: 'connCheckHintNoAnswer',
+            quorum_lost: 'connCheckHintQuorumLost', quorum_offline: 'connCheckHintQuorumOffline',
+            quorum_standalone: 'connCheckHintQuorumStandalone',
+            ssh_disabled: 'connCheckHintSshDisabled', ssh_no_credentials: 'connCheckHintSshNoCredentials',
+            ssh_backoff: 'connCheckHintSshBackoff', ssh_node_offline: 'connCheckHintSshNodeOffline',
+            ssh_no_ip: 'connCheckHintSshNoIp', ssh_auth_refused: 'connCheckHintSshAuthRefused',
+            ssh_host_key: 'connCheckHintSshHostKey', ssh_unreachable: 'connCheckHintSshUnreachable',
+            ssh_key_unusable: 'connCheckHintSshKeyUnusable', ssh_sudo: 'connCheckHintSshSudo', ssh_error: 'connCheckHintSshError',
+            needs_connection: 'connCheckHintNeedsConnection', status_unreadable: 'connCheckHintStatusUnreadable',
+        };
+        const CONN_CHECK_FEATURES = {
+            monitoring: 'connCheckFeatMonitoring', guests: 'connCheckFeatGuests', power: 'connCheckFeatPower',
+            migration: 'connCheckFeatMigration', consoles: 'connCheckFeatConsoles', snapshots: 'connCheckFeatSnapshots',
+            backups: 'connCheckFeatBackups', create: 'connCheckFeatCreate', clone: 'connCheckFeatClone',
+            hardware: 'connCheckFeatHardware', agent: 'connCheckFeatAgent', storage: 'connCheckFeatStorage',
+            disks: 'connCheckFeatDisks', uploads: 'connCheckFeatUploads', nodePower: 'connCheckFeatNodePower',
+            nodeConfig: 'connCheckFeatNodeConfig', syslog: 'connCheckFeatSyslog', sdn: 'connCheckFeatSdn',
+        };
+        const CONN_CHECK_SECTIONS = [
+            ['credentials', 'connCheckSecCredentials', ['credentials']],
+            ['api', 'connCheckSecApi', ['api_host', 'api_fallbacks']],
+            ['privileges', 'connCheckSecPrivileges', ['privileges']],
+            ['quorum', 'connCheckSecQuorum', ['quorum']],
+            ['versions', 'connCheckSecVersions', ['versions']],
+            ['clock', 'connCheckSecClock', ['clock']],
+            ['ssh', 'connCheckSecSsh', ['ssh']],
+        ];
+        const CONN_CHECK_TONE = {
+            ok: { icon: 'CheckCircle', cls: 'text-green-400' },
+            warn: { icon: 'AlertTriangle', cls: 'text-yellow-400' },
+            fail: { icon: 'XCircle', cls: 'text-red-400' },
+            skip: { icon: 'Info', cls: 'text-gray-500' },
+        };
+
+        function ConnectionCheckModal({ cluster, onClose, authFetch, apiUrl, t }) {
+            const [withSsh, setWithSsh] = React.useState(true);
+            const [running, setRunning] = React.useState(false);
+            const [report, setReport] = React.useState(null);
+            const [error, setError] = React.useState('');
+
+            const run = async () => {
+                setRunning(true); setError('');
+                try {
+                    const res = await authFetch(`${apiUrl}/clusters/${cluster.id}/connection-check`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ ssh: withSsh }),
+                    });
+                    const body = res ? await res.json().catch(() => ({})) : {};
+                    if (res && res.ok) setReport(body);
+                    else setError(body.error || t('connCheckFailed'));
+                } catch (e) {
+                    setError(t('connCheckFailed'));
+                }
+                setRunning(false);
+            };
+
+            const hint = (it) => {
+                const key = it.hint && CONN_CHECK_HINTS[it.hint];
+                if (!key) return null;
+                return t(key).replace('{seconds}', String(it.retry_in ?? ''));
+            };
+            const mono = (s) => <span className="font-mono">{s}</span>;
+            const chips = (obj, fmt) => (
+                <div className="flex flex-wrap gap-1.5 mt-1">
+                    {Object.entries(obj || {}).sort(([a], [b]) => a.localeCompare(b)).map(([n, v]) => (
+                        <span key={n} className="text-xs px-2 py-0.5 rounded bg-proxmox-dark border border-proxmox-border">{n} {mono(fmt(v))}</span>
+                    ))}
+                </div>
+            );
+
+            const body = (it) => {
+                switch (it.kind) {
+                    case 'credentials': {
+                        const label = it.type === 'api_token' ? t('connCheckCredToken') : it.type === 'minted_token' ? t('connCheckCredMinted') : t('connCheckCredPassword');
+                        return (<div>
+                            <div className="text-sm font-medium">{label}</div>
+                            <div className="text-xs text-gray-400">{mono(it.token_id || it.user || '')}{it.active ? <span> - {t('connCheckInUse')}: {mono(it.active)}</span> : null}</div>
+                        </div>);
+                    }
+                    case 'api_host': {
+                        const tls = it.tls === 'match' ? t('connCheckTlsMatch') : it.tls === 'mismatch' ? t('connCheckTlsMismatch') : t('connCheckTlsUnknown');
+                        return (<div>
+                            <div className="text-sm font-medium flex flex-wrap items-center gap-2">
+                                {mono(it.host)}
+                                <span className="text-xs px-1.5 py-0.5 rounded bg-proxmox-dark border border-proxmox-border">{it.role === 'primary' ? t('connCheckPrimary') : t('connCheckFallback')}</span>
+                                {it.node && <span className="text-xs text-gray-400">{it.node}</span>}
+                                {it.ms != null && <span className="text-xs text-gray-400">{it.ms} ms</span>}
+                                {it.http != null && <span className="text-xs text-gray-400">HTTP {it.http}</span>}
+                            </div>
+                            {it.fingerprint && <div className="text-xs text-gray-400 truncate" title={it.fingerprint}>{tls} - {mono(it.fingerprint)}</div>}
+                        </div>);
+                    }
+                    case 'api_fallbacks':
+                        return <div className="text-sm font-medium">{t('connCheckOneAddress')}</div>;
+                    case 'privileges':
+                        if (!it.missing) return null;
+                        if (!it.missing.length) return <div className="text-sm">{t('connCheckPrivAll').replace('{n}', String(it.checked))}</div>;
+                        return (<div className="space-y-1.5">
+                            {it.missing.map(m => (
+                                <div key={m.privs.join('|') + m.path} className="text-sm">
+                                    {mono(m.privs.join(' / '))} <span className="text-xs text-gray-400">{t('connCheckOnPath')} {mono(m.path)}{m.partial ? ` (${t('connCheckPartial')})` : ''}</span>
+                                    <div className="text-xs text-gray-400">{t('connCheckDisables')}: {m.features.map(f => t(CONN_CHECK_FEATURES[f] || f)).join(', ')}</div>
+                                </div>
+                            ))}
+                        </div>);
+                    case 'quorum':
+                        if (it.quorate == null) return null;
+                        return (<div>
+                            <div className="text-sm font-medium">{it.standalone ? t('connCheckStandalone') : it.quorate
+                                ? t('connCheckQuorate').replace('{online}', String(it.nodes_online)).replace('{total}', String(it.nodes_total))
+                                : t('connCheckNoQuorum')}</div>
+                            {(it.offline || []).length > 0 && <div className="text-xs text-gray-400">{t('connCheckOffline')}: {mono(it.offline.join(', '))}</div>}
+                        </div>);
+                    case 'versions':
+                        return it.nodes ? chips(it.nodes, v => v) : null;
+                    case 'clock':
+                        if (!it.nodes) return null;
+                        return (<div>
+                            {it.max_skew != null && <div className="text-sm">{t('connCheckMaxSkew').replace('{s}', String(it.max_skew))}</div>}
+                            {chips(it.nodes, v => `${v > 0 ? '+' : ''}${v} s`)}
+                        </div>);
+                    case 'ssh':
+                        return (<div>
+                            <div className="text-sm font-medium flex flex-wrap items-center gap-2">
+                                {it.node ? mono(it.node) : null}
+                                {it.code && <span className="text-xs px-1.5 py-0.5 rounded bg-proxmox-dark border border-proxmox-border font-mono">{it.code}</span>}
+                                {it.status === 'ok' && <span className="text-xs text-gray-400">{t('connCheckSshOk')}</span>}
+                            </div>
+                            {it.user && it.ip && <div className="text-xs text-gray-400">{mono(`${it.user}@${it.ip}`)} - {it.method === 'key' ? t('connCheckSshKey') : t('connCheckSshPassword')}</div>}
+                        </div>);
+                    default:
+                        return null;
+                }
+            };
+
+            const row = (it, i) => {
+                const tone = CONN_CHECK_TONE[it.status] || CONN_CHECK_TONE.skip;
+                const Icon = Icons[tone.icon];
+                const h = hint(it);
+                return (
+                    <div key={it.id} data-check-item={it.id} data-check-status={it.status} className={`flex gap-3 py-2 ${i ? 'border-t border-proxmox-border' : ''}`}>
+                        <Icon className={`w-4 h-4 mt-0.5 flex-shrink-0 ${tone.cls}`} />
+                        <div className="min-w-0 flex-1">
+                            {body(it)}
+                            {h && <div className={`text-xs mt-1 ${it.status === 'fail' ? 'text-red-300' : it.status === 'warn' ? 'text-yellow-300' : 'text-gray-400'}`}>{h}</div>}
+                            {it.detail && <div className="text-xs text-gray-500 mt-0.5 font-mono break-all">{it.detail}</div>}
+                        </div>
+                    </div>
+                );
+            };
+
+            const s = report?.summary;
+            return (
+                <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
+                    <div data-conn-check={cluster.id} className="bg-proxmox-card border border-proxmox-border rounded-xl w-full max-w-3xl shadow-2xl flex flex-col" style={{ maxHeight: '88vh' }} onClick={e => e.stopPropagation()}>
+                        <div className="flex items-center justify-between px-6 py-4 border-b border-proxmox-border">
+                            <div className="flex items-center gap-2 min-w-0">
+                                <Icons.Activity className="w-5 h-5 text-proxmox-orange flex-shrink-0" />
+                                <h3 className="text-lg font-semibold truncate">{t('connCheckTitle')} - {cluster.display_name || cluster.name}</h3>
+                            </div>
+                            <button onClick={onClose} className="text-gray-400 hover:text-white" title={t('close')}><Icons.X className="w-4 h-4" /></button>
+                        </div>
+                        <div className="px-6 py-4 overflow-y-auto">
+                            <p className="text-sm text-gray-400">{t('connCheckIntro')}</p>
+                            <p className="text-xs text-gray-500 mt-1">{t('connCheckPveOnly')}</p>
+                            <div className="flex flex-wrap items-center justify-between gap-3 mt-4">
+                                <label className="flex items-center gap-2 text-sm cursor-pointer">
+                                    <input type="checkbox" checked={withSsh} disabled={running} onChange={e => setWithSsh(e.target.checked)} />
+                                    {t('connCheckWithSsh')}
+                                </label>
+                                <button onClick={run} disabled={running}
+                                    className="px-4 py-2 rounded-lg text-sm font-medium bg-proxmox-orange hover:bg-orange-600 disabled:opacity-50 flex items-center gap-2">
+                                    {running ? <Icons.Loader className="w-4 h-4 animate-spin" /> : <Icons.Activity className="w-4 h-4" />}
+                                    {running ? t('connCheckRunning') : report ? t('connCheckRunAgain') : t('connCheckRun')}
+                                </button>
+                            </div>
+                            {error && <div className="mt-4 p-3 rounded-lg bg-red-500/10 border border-red-500/30 text-sm text-red-300">{error}</div>}
+                            {report && (
+                                <div className="mt-4">
+                                    <div className="flex flex-wrap gap-2 text-xs">
+                                        <span className="px-2 py-1 rounded bg-green-500/10 text-green-400">{s.ok} {t('connCheckPassed')}</span>
+                                        <span className="px-2 py-1 rounded bg-yellow-500/10 text-yellow-400">{s.warn} {t('connCheckWarnings')}</span>
+                                        <span className="px-2 py-1 rounded bg-red-500/10 text-red-400">{s.fail} {t('connCheckFailedCount')}</span>
+                                        {s.skip > 0 && <span className="px-2 py-1 rounded bg-gray-500/10 text-gray-400">{s.skip} {t('connCheckSkipped')}</span>}
+                                    </div>
+                                    {CONN_CHECK_SECTIONS.map(([sid, titleKey, kinds]) => {
+                                        const items = (report.items || []).filter(i => kinds.includes(i.kind));
+                                        if (!items.length && !(sid === 'ssh' && report.ssh_checked === false)) return null;
+                                        return (
+                                            <div key={sid} data-check-section={sid} className="mt-4">
+                                                <div className="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-1">{t(titleKey)}</div>
+                                                {items.map(row)}
+                                                {!items.length && <div className="text-xs text-gray-500 py-2">{t('connCheckSshNotRun')}</div>}
+                                            </div>
+                                        );
+                                    })}
+                                    <div className="text-xs text-gray-500 mt-4">{t('connCheckCheckedAt').replace('{time}', new Date(report.checked_at).toLocaleString()).replace('{s}', (report.duration_ms / 1000).toFixed(1))}</div>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
             );
         }
 
@@ -9548,6 +9774,7 @@
             const [loadingSidebarClusters, setLoadingSidebarClusters] = useState({}); // NS: Mar 2026 - spinner while fetching tree data
             const [ctxMenu, setCtxMenu] = useState(null); // LW: Mar 2026 - right-click context menu { type, target, position }
             const [renamingCluster, setRenamingCluster] = useState(null);
+            const [connCheckCluster, setConnCheckCluster] = useState(null);  // LW Oct 2026 - connection check modal
             const [renameValue, setRenameValue] = useState('');
             // #256: Re-configure cluster
             const [reconfigureCluster, setReconfigureCluster] = useState(null);
@@ -15011,6 +15238,9 @@
                         { separator: true },
                         { label: t('refreshData') || 'Refresh', icon: <Icons.RefreshCw className="w-3.5 h-3.5" />, onClick: () => { fetchSidebarClusterData(cluster.id); if (selectedCluster?.id === cluster.id) { fetchClusterMetrics(cluster.id); fetchClusterResources(cluster.id); } } },
                         { separator: true },
+                        ...(cluster.cluster_type === 'xcpng' ? [] : [
+                            { perm: 'cluster.config', label: t('connCheckTitle'), icon: <Icons.Activity className="w-3.5 h-3.5" />, onClick: () => setConnCheckCluster(cluster) },
+                        ]),
                         { perm: 'cluster.config', label: t('reconfigureCluster') || 'Re-configure', icon: <Icons.Settings className="w-3.5 h-3.5" />, onClick: () => setReconfigureCluster(cluster) },
                         { perm: 'cluster.config', label: t('repinHostKeys') || 'Re-pin SSH host keys', icon: <Icons.Key className="w-3.5 h-3.5" />, onClick: () => handleRepinHostKeys(cluster.id) },
                         { perm: 'cluster.delete', label: t('deleteCluster') || 'Remove Cluster', icon: <Icons.Trash className="w-3.5 h-3.5" />, danger: true, onClick: () => handleDeleteCluster(cluster.id) },
@@ -16302,6 +16532,7 @@
                                                                             toggleSidebarCluster={toggleSidebarCluster}
                                                                             hwHealth={allClusterMetrics[cluster.id]?.data?.hardware?.health}
                                                                             onContextMenu={(type, target, pos) => setCtxMenu({type, target, position: pos})}
+                                                                            onCheckConnection={setConnCheckCluster}
                                                                         />
                                                                         {sidebarViewMode === 'datastores' ? renderDatastoreTree(cluster.id) : sidebarViewMode === 'pools' ? renderPoolTree(cluster.id) : sidebarViewMode === 'networks' ? renderNetworkTree(cluster.id) : renderInlineNodeTree(cluster.id)}
                                                                         {expandedSidebarClusters[cluster.id] && <div className="h-px my-0.5" style={{background: 'var(--corp-border-subtle)', marginLeft: '20px'}} />}
@@ -16350,6 +16581,7 @@
                                                                     toggleSidebarCluster={toggleSidebarCluster}
                                                                     hwHealth={allClusterMetrics[cluster.id]?.data?.hardware?.health}
                                                                     onContextMenu={(type, target, pos) => setCtxMenu({type, target, position: pos})}
+                                                                    onCheckConnection={setConnCheckCluster}
                                                                 />
                                                                 {sidebarViewMode === 'datastores' ? renderDatastoreTree(cluster.id) : sidebarViewMode === 'pools' ? renderPoolTree(cluster.id) : sidebarViewMode === 'networks' ? renderNetworkTree(cluster.id) : renderInlineNodeTree(cluster.id)}
                                                                         {expandedSidebarClusters[cluster.id] && <div className="h-px my-0.5" style={{background: 'var(--corp-border-subtle)', marginLeft: '20px'}} />}
@@ -26347,6 +26579,11 @@
                     )}
                     
                     {/* Rename Cluster Modal — NS Mar 2026 */}
+                    {connCheckCluster && (
+                        <ConnectionCheckModal cluster={connCheckCluster} onClose={() => setConnCheckCluster(null)}
+                            authFetch={authFetch} apiUrl={API_URL} t={t} />
+                    )}
+
                     {renamingCluster && (
                         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={() => setRenamingCluster(null)}>
                             <div className="bg-proxmox-card border-proxmox-border border rounded-xl w-full max-w-md p-6" onClick={e => e.stopPropagation()}>
