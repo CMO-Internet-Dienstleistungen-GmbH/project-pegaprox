@@ -2246,16 +2246,18 @@
                                         placeholder="root@pam" />
                                 </div>
                                 <div>
-                                    <label className="block text-sm font-medium text-gray-300 mb-2">{t('password')}</label>
+                                    <label className="block text-sm font-medium text-gray-300 mb-2">{t('passwordOrToken') || t('password')}</label>
                                     <input type="password" value={pbsConfig.password} onChange={e => setPbsConfig({...pbsConfig, password: e.target.value})} required
                                         className="w-full px-4 py-2.5 bg-proxmox-dark border border-proxmox-border rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-blue-400 transition-colors"
-                                        placeholder="Password" />
+                                        placeholder={pbsConfig.user.includes('!') ? 'Token Secret' : 'Password'} />
                                 </div>
                                 <div>
                                     <label className="block text-sm font-medium text-gray-300 mb-2">Port</label>
                                     <input type="number" value={pbsConfig.port} onChange={e => setPbsConfig({...pbsConfig, port: parseInt(e.target.value) || 8007})}
                                         className="w-full px-4 py-2.5 bg-proxmox-dark border border-proxmox-border rounded-lg text-white focus:outline-none focus:border-blue-400 transition-colors" />
                                 </div>
+                                {/* LW Oct 2026 (#805) - a token goes in like on the PVE tab, the backend reads the '!' */}
+                                <p className="col-span-3 -mt-2 text-xs text-gray-500">{t('apiTokenHint') || 'For API tokens use: user@realm!tokenid'}</p>
                             </div>
                             <div>
                                 <label className="block text-sm font-medium text-gray-300 mb-2">Fingerprint ({t('optional') || 'Optional'})</label>

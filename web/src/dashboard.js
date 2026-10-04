@@ -9856,6 +9856,7 @@
             // This was causing tasks to "jump back" when SSE and polling raced
             const taskUpdateTimestamp = useRef(0);
             const initialTaskFetchPending = useRef(true);  // NS: skip stale check on initial load
+            const taskFetchGen = useRef(0);  // LW Oct 2026 (#828) - moves on with every cluster switch
             const [showTaskBar, setShowTaskBar] = useState(true);  // localStorage.getItem('showTaskBar') !== 'false'
             const [actionLoading, setActionLoading] = useState({});
             const [warningBannerDismissed, setWarningBannerDismissed] = useState(false);
@@ -12426,10 +12427,14 @@
             const fetchTasks = async (clusterId) => {
                 const fetchStartTime = Date.now();
                 const isInitialFetch = initialTaskFetchPending.current;
+                const gen = taskFetchGen.current;
                 try {
                     const response = await authFetch(`${API_URL}/clusters/${clusterId}/tasks`);
                     if (response && response.ok) {
                         const data = await response.json();
+                        // a cluster switch since this was asked makes it another cluster's list,
+                        // the initial fetch too, which skips the timestamp check below
+                        if (gen !== taskFetchGen.current || selectedClusterRef.current?.id !== clusterId) return;
 
                         if (Array.isArray(data)) {
                             // NS: On initial fetch, always accept response (no stale check)
@@ -12476,6 +12481,7 @@
                 setShowHaSettings(false);
                 if (selectedCluster) {
                     console.log('Cluster changed, fetching tasks for:', selectedCluster.id);
+                    taskFetchGen.current++;
                     taskUpdateTimestamp.current = 0;
                     initialTaskFetchPending.current = true;
                     setTasks([]);
@@ -12488,6 +12494,7 @@
 
                     return () => clearInterval(haInterval);
                 } else {
+                    taskFetchGen.current++;
                     setTasks([]);
                     setNodeAlerts({});
                 }
@@ -13407,9 +13414,12 @@
                 } catch (e) { addToast('Delete failed: ' + e.message, 'error'); }
             };
             
-            const handleTestPBS = async (config) => {
+            // LW Oct 2026 (#805) - an edit form holds '********' for stored secrets, so test
+            // through the server's own route, which fills the mask in for the same host
+            const handleTestPBS = async (config, pbsId) => {
                 try {
-                    const resp = await authFetch(`${API_URL}/pbs/test-connection`, {
+                    const url = pbsId ? `${API_URL}/pbs/${encodeURIComponent(pbsId)}/test` : `${API_URL}/pbs/test-connection`;
+                    const resp = await authFetch(url, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(config),
@@ -24910,7 +24920,7 @@
                                     <div className="flex justify-between mt-6">
                                         <button onClick={async () => {
                                             setPbsTestLoading(true); setPbsTestResult(null);
-                                            const result = await handleTestPBS(pbsForm);
+                                            const result = await handleTestPBS(pbsForm, editingPBS?.id);
                                             setPbsTestResult(result);
                                             setPbsTestLoading(false);
                                         }} disabled={pbsTestLoading || !pbsForm.host} className="px-4 py-2 rounded-lg bg-proxmox-dark border border-proxmox-border text-gray-300 hover:text-white text-sm flex items-center gap-2 disabled:opacity-50">

@@ -1293,15 +1293,26 @@
             const [data, setData] = React.useState(null);
             const [loading, setLoading] = React.useState(true);
             const [err, setErr] = React.useState(null);
+            // LW Oct 2026 (#828) - only the newest request for the current path may answer: a
+            // slow one for the cluster shown before must not replace the data, set an error
+            // or end the load
+            const seqRef = React.useRef(0);
+            const pathRef = React.useRef(path);      // whose data is held
+            const currentRef = React.useRef(path);
+            currentRef.current = path;
             const reload = React.useCallback(() => {
-                if (!path) { setLoading(false); return; }
+                // the reload a mutation kept from before the switch
+                if (currentRef.current !== path) return;
+                const seq = ++seqRef.current;
+                if (pathRef.current !== path) { pathRef.current = path; setData(null); }
+                if (!path) { setLoading(false); setErr(null); return; }
                 setLoading(true); setErr(null);
                 fetch(path, { headers: getAuthHeaders() })
                     .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
-                    .then(d => { setData(d); setLoading(false); })
-                    .catch(e => { setErr(String(e && e.message || e)); setLoading(false); });
+                    .then(d => { if (seq !== seqRef.current) return; setData(d); setLoading(false); })
+                    .catch(e => { if (seq !== seqRef.current) return; setErr(String(e && e.message || e)); setLoading(false); });
             }, [path]);
-            React.useEffect(() => { reload(); }, [reload]);
+            React.useEffect(() => { reload(); return () => { seqRef.current++; }; }, [reload]);
             return { data, loading, err, reload };
         }
         function CloudSectionState({ loading, err, empty, emptyIcon, emptyTitle, emptyText, t, children }) {

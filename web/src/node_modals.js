@@ -4869,6 +4869,16 @@
             const [perfTimeframe, setPerfTimeframe] = useState('hour');
             const [loading, setLoading] = useState(false);
             const [data, setData] = useState({});
+            // LW Oct 2026 (#828) - an answer belongs to the node it was asked for. navGen moves
+            // on every node or cluster switch, slotSeq on every new request for one slot, so a
+            // late answer for the previous node (or an older reload) never lands, and loading
+            // only counts the requests that still matter
+            const navGenRef = useRef(0);
+            const slotSeqRef = useRef({});
+            const inflightRef = useRef(new Set());
+            const navKey = `${clusterId}/${node}`;
+            const navKeyRef = useRef(navKey);
+            navKeyRef.current = navKey;
             // LW: Feb 2026 - edit states for configure tab
             const [editingDns, setEditingDns] = useState(false);
             const [editingHosts, setEditingHosts] = useState(false);
@@ -4958,6 +4968,14 @@
 
             // Fetch tab data
             const loadTabData = async (tab, tf) => {
+                // a save that finished after the switch reloads its own node, not this one
+                if (navKeyRef.current !== navKey) return;
+                const gen = navGenRef.current;
+                const seq = (slotSeqRef.current[tab] || 0) + 1;
+                slotSeqRef.current[tab] = seq;
+                const inflight = inflightRef.current;
+                const token = {};
+                inflight.add(token);
                 setLoading(true);
                 try {
                     const endpoints = {
@@ -4994,8 +5012,9 @@
                         ],
                     };
                     const urls = endpoints[tab] || [];
-                    if (urls.length === 0) { setLoading(false); return; }
+                    if (urls.length === 0) return;
                     const results = await Promise.all(urls.map(u => authFetch(u).then(r => r && r.ok ? r.json() : null).catch(() => null)));
+                    if (gen !== navGenRef.current || navKeyRef.current !== navKey || slotSeqRef.current[tab] !== seq) return;
                     // NS: Feb 2026 - Use functional setData to avoid stale closure bugs
                     setData(prev => {
                         const newData = { ...prev };
@@ -5028,11 +5047,17 @@
                         return newData;
                     });
                 } catch (e) { console.error(e); }
-                setLoading(false);
+                finally {
+                    inflight.delete(token);
+                    if (inflight === inflightRef.current) setLoading(inflight.size > 0);
+                }
             };
 
             // LW: Feb 2026 - reset data and load summary when node changes
-            useEffect(() => { setData({}); setConfigSubTab('network'); setMonitorSubTab('performance'); setActiveDetailTab('summary'); loadTabData('summary'); }, [node]);
+            useEffect(() => {
+                setData({}); setConfigSubTab('network'); setMonitorSubTab('performance'); setActiveDetailTab('summary'); loadTabData('summary');
+                return () => { navGenRef.current++; inflightRef.current = new Set(); };
+            }, [clusterId, node]);
 
             useEffect(() => {
                 let cancelled = false;

@@ -1663,7 +1663,15 @@
                 catch(e) { console.error(e); return null; }
             };
 
+            // LW Oct 2026 (#828) - every fetch and every VM switch moves the counter on; an
+            // answer only lands while it is still the newest one for this VM
+            const snapSeqRef = React.useRef(0);
+            const snapKey = `${clusterId}/${vm.vmid}`;
+            const snapKeyRef = React.useRef(snapKey);
+            snapKeyRef.current = snapKey;
             const fetchSnapshots = async () => {
+                if (snapKeyRef.current !== snapKey) return;  // a create/delete that finished after the switch
+                const seq = ++snapSeqRef.current;
                 setSnapsLoading(true);
                 try {
                     const base = `${API_URL}/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}`;
@@ -1671,16 +1679,20 @@
                         authFetch(`${base}/snapshots`),
                         authFetch(`${base}/efficient-snapshots${haStandby ? '' : '?refresh=true'}`)
                     ]);
-                    if (stdRes?.ok) setSnapshots(await stdRes.json());
-                    if (effRes?.ok) setEfficientSnapshots(await effRes.json());
+                    const std = stdRes?.ok ? await stdRes.json() : undefined;
+                    const eff = effRes?.ok ? await effRes.json() : undefined;
+                    if (seq !== snapSeqRef.current) return;
+                    if (std !== undefined) setSnapshots(std);
+                    if (eff !== undefined) setEfficientSnapshots(eff);
                 } catch(e) { console.error('snapshots fetch:', e); }
-                setSnapsLoading(false);
+                if (seq === snapSeqRef.current) setSnapsLoading(false);
             };
 
             // refetch when VM changes while snapshots tab is open
             React.useEffect(() => {
-                setSnapshots([]); setEfficientSnapshots([]);
+                setSnapshots([]); setEfficientSnapshots([]); setSnapsLoading(false);
                 if (activeDetailTab === 'snapshots') fetchSnapshots();
+                return () => { snapSeqRef.current++; };
             }, [vm.vmid, clusterId]);
 
             const handleCreateSnap = async () => {
@@ -1774,18 +1786,24 @@
             }, [showActionsMenu]);
 
             // Fetch lock status
-            const fetchLockStatus = async () => {
+            const fetchLockStatus = async (isStale) => {
+                let next = { locked: false, lock_reason: null, lock_description: null, unlock_command: null };
                 try {
                     const response = await authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}/lock`);
                     if (response && response.ok) {
                         const data = await response.json();
-                        setLockInfo({ locked: data.locked || false, lock_reason: data.lock_reason || null, lock_description: data.lock_description || null, unlock_command: data.unlock_command || null });
-                    } else {
-                        setLockInfo({ locked: false, lock_reason: null, lock_description: null, unlock_command: null });
+                        next = { locked: data.locked || false, lock_reason: data.lock_reason || null, lock_description: data.lock_description || null, unlock_command: data.unlock_command || null };
                     }
-                } catch (error) { setLockInfo({ locked: false, lock_reason: null, lock_description: null, unlock_command: null }); }
+                } catch (error) {}
+                // #828 - the lock of the VM shown before must not offer Unlock on this one
+                if (!isStale()) setLockInfo(next);
             };
-            useEffect(() => { fetchLockStatus(); }, [vm.vmid, clusterId]);
+            useEffect(() => {
+                let stale = false;
+                setLockInfo({ locked: false, lock_reason: null, lock_description: null, unlock_command: null });
+                fetchLockStatus(() => stale);
+                return () => { stale = true; };
+            }, [vm.vmid, clusterId]);
 
             // Unlock VM
             const handleUnlock = async () => {
@@ -1809,24 +1827,32 @@
                 const gkey = `${clusterId}:${vm.vmid}`;
                 // #560 — also fetch for LXC (backend returns os/ip via config+pct, no agent)
                 if (!(isQemu || vm.type === 'lxc') || vm.status !== 'running') { delete _guestInfoCache[gkey]; setGuestInfo(null); return; }
+                // LW Oct 2026 (#828) - this VM's own last-known info (or none) while it loads; an
+                // answer for the VM shown before still fills its cache, never this view
+                setGuestInfo(_guestInfoCache[gkey] || null);
+                let stale = false;
                 authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}/guest-info`)
                     .then(r => r && r.ok ? r.json() : null)
                     .then(data => {
                         // LXC has no guest agent → accept on is_lxc, not just agent_running
-                        if (data && (data.agent_running || data.is_lxc)) { _guestInfoCache[gkey] = data; setGuestInfo(data); }
-                        else setGuestInfo(_guestInfoCache[gkey] || null);  // keep last-known on transient miss, don't flip
+                        if (data && (data.agent_running || data.is_lxc)) { _guestInfoCache[gkey] = data; if (!stale) setGuestInfo(data); }
+                        else if (!stale) setGuestInfo(_guestInfoCache[gkey] || null);  // keep last-known on transient miss, don't flip
                     })
-                    .catch(() => setGuestInfo(_guestInfoCache[gkey] || null));
+                    .catch(() => { if (!stale) setGuestInfo(_guestInfoCache[gkey] || null); });
+                return () => { stale = true; };
             }, [vm.vmid, vm.status, clusterId]);
 
             // MK #334 — fsinfo. Only polls when guest agent is alive to avoid hammering the
             // proxmox API with 500s for VMs without an agent.
             useEffect(() => {
-                if (!isQemu || vm.status !== 'running' || !guestInfo) { setFsInfo(null); return; }
+                setFsInfo(null);
+                if (!isQemu || vm.status !== 'running' || !guestInfo) return;
+                let stale = false;
                 authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}/guest-fsinfo`)
                     .then(r => r && r.ok ? r.json() : null)
-                    .then(d => setFsInfo(d || null))
-                    .catch(() => setFsInfo(null));
+                    .then(d => { if (!stale) setFsInfo(d || null); })
+                    .catch(() => { if (!stale) setFsInfo(null); });
+                return () => { stale = true; };
             }, [vm.vmid, vm.status, clusterId, !!guestInfo]);
 
             // Fetch VM hardware config
@@ -1863,31 +1889,40 @@
 
             // Fetch HA status
             useEffect(() => {
+                let stale = false;
                 authFetch(`${API_URL}/clusters/${clusterId}/proxmox-ha/resources`)
                     .then(r => r && r.ok ? r.json() : null)
                     .then(resources => {
-                        if (resources) {
+                        // #828 - the HA switch acts on this VM, so it must not show another one's state
+                        if (resources && !stale) {
                             setHaResources(resources);
                             const vmType = isQemu ? 'vm' : 'ct';
                             setHaEnabled(resources.some(r => r.sid === `${vmType}:${vm.vmid}`));
                         }
                     })
                     .catch(() => {});
+                return () => { stale = true; };
             }, [vm.vmid, clusterId]);
 
             // NS: inline perf charts - only bother fetching when vm is actually up
             const [metricsRefreshTick, setMetricsRefreshTick] = useState(0);
+            // LW Oct 2026 (#828) - only the newest request draws the charts, and another VM
+            // starts with empty ones instead of the previous VM's
+            const metricsSeqRef = React.useRef(0);
+            useEffect(() => { setMetricsData(null); }, [vm.vmid, clusterId]);
             const fetchMetrics = React.useCallback(() => {
-                if (!isRunning) return;
+                const seq = ++metricsSeqRef.current;
+                if (!isRunning) { setMetricsLoading(false); return; }
                 setMetricsLoading(true);
                 authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}/rrd/${metricsTimeframe}`)
                     .then(r => r?.ok ? r.json() : null)
-                    .then(d => { setMetricsData(d); setMetricsLoading(false); })
-                    .catch(() => setMetricsLoading(false));
+                    .then(d => { if (seq !== metricsSeqRef.current) return; setMetricsData(d); setMetricsLoading(false); })
+                    .catch(() => { if (seq === metricsSeqRef.current) setMetricsLoading(false); });
             }, [metricsTimeframe, vm.vmid, isRunning, clusterId]);
 
             useEffect(() => {
                 fetchMetrics();
+                return () => { metricsSeqRef.current++; };
             }, [fetchMetrics, metricsRefreshTick]);
 
             const maxMemGB = vm.maxmem ? vm.maxmem / (1024 * 1024 * 1024) : 0;
