@@ -10290,6 +10290,26 @@
                 const kindIcon = (row) => row.kind === 'cluster' ? <Icons.Database /> : row.kind === 'node' ? <Icons.Server />
                     : row.ct ? <Icons.Box className="w-4 h-4" /> : <Icons.Monitor />;
                 const open = (row) => openFavorite(row.kind, row.fav);
+                // LW Oct 2026 - corporate: a favorite opens the right-click menu its row in the tree
+                // has. A guest whose cluster is not loaded yet has nothing to show: browser menu then
+                const onCtx = (row) => (e) => {
+                    const position = { x: e.clientX, y: e.clientY };
+                    let menu = null;
+                    if (row.kind === 'cluster') {
+                        const c = byId.get(row.fav);
+                        if (c) menu = { type: 'cluster', target: c, position };
+                    } else if (row.kind === 'node') {
+                        const cid = row.fav.cluster_id;
+                        const met = (selectedCluster && selectedCluster.id === cid ? clusterMetrics : sidebarClusterData[cid]?.metrics) || {};
+                        const m = met[row.fav.node];
+                        menu = { type: 'node', position,
+                            target: { nodeName: row.fav.node, clusterId: cid, online: !!m && m.status !== 'offline', maintenance: !!(m && m.maintenance_mode) } };
+                    } else {
+                        const live = favoriteGuestLive[`${row.fav.cluster_id}:${row.fav.vmid}`];
+                        if (live) menu = { type: 'vm', target: { ...live, _clusterId: row.fav.cluster_id }, position };
+                    }
+                    if (menu) { e.preventDefault(); setCtxMenu(menu); }
+                };
                 const onKey = (row) => (e) => { if (e.key === 'Enter') { e.preventDefault(); open(row); } };
                 const unstar = (row) => !haReadOnly && (
                     <button onClick={(e) => { e.stopPropagation(); unstarFavorite(row.kind, row.fav); }}
@@ -10319,7 +10339,7 @@
                                 <div key={row.key} tabIndex={0} data-fav-row={row.key}
                                     className="corp-tree-child flex items-center gap-1.5 pl-5 pr-2 py-0.5 text-[13px] leading-5 cursor-pointer"
                                     style={{ color: 'var(--corp-text-secondary)' }}
-                                    onClick={() => open(row)} onKeyDown={onKey(row)}
+                                    onClick={() => open(row)} onKeyDown={onKey(row)} onContextMenu={onCtx(row)}
                                     onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--color-hover)'; e.currentTarget.style.color = 'var(--color-text)'; }}
                                     onMouseLeave={(e) => { e.currentTarget.style.background = ''; e.currentTarget.style.color = 'var(--corp-text-secondary)'; }}>
                                     <span className="flex flex-shrink-0" style={{ color: 'var(--corp-accent)' }}>{kindIcon(row)}</span>
