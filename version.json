@@ -118,6 +118,7 @@
     "pegaprox/core/cache.py",
     "pegaprox/core/compliance_mapping.py",
     "pegaprox/core/config.py",
+    "pegaprox/core/conncheck.py",
     "pegaprox/core/db.py",
     "pegaprox/core/dbcrypto.py",
     "pegaprox/core/esxi_cluster.py",
