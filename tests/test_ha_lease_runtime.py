@@ -9,6 +9,7 @@ MK Oct 2026 (#625)
 """
 import ast
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -246,6 +247,8 @@ def test_the_watchdog_kills_the_children_says_one_line_and_exits_with_75(tmp_pat
     assert r.returncode == _ha.EXIT_RESTART == 75, (r.returncode, r.stderr)
     assert r.stderr.strip().endswith(
         '[HA] watchdog: the lease ran out and the process did not step down - leaving')
+    # with the time in front: the journal of a plain start has none of its own
+    assert re.search(r'^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d \[HA\] watchdog: ', r.stderr, re.M)
     pid = int(r.stdout.split()[0])
     for _ in range(50):
         if not os.path.exists(f'/proc/{pid}'):

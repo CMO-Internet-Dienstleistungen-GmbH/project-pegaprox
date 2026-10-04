@@ -1479,3 +1479,47 @@ def test_a_step_down_backoff_from_an_earlier_process_does_not_outlive_a_fresh_on
     box2.node._arm_timer(box2.now)
     if boot_id:
         assert box2.node.election_at >= 5e5
+
+
+def test_members_do_not_all_campaign_the_moment_a_hold_ends():
+    """A planned-restart hold ends at the same instant on every member: each one's
+    election waits a random part of L/4 past it, so they do not split the vote."""
+    times = []
+    for seed in (7, 11, 23):
+        box = settled(Box('c', genesis()))
+        box.node.rng = random.Random(seed)
+        box.renew('b', 2, hold_s=90)
+        end = box.node.promise_until
+        assert end <= box.node.election_at <= end + T.L / 4
+        times.append(box.node.election_at - end)
+    assert len(set(round(t, 6) for t in times)) == 3
+
+
+def test_a_leader_that_acts_at_once_says_so_at_its_boot():
+    """take_after lies behind it: acting starts with the boot round, and so does the line,
+    not a tick later."""
+    led = {'epoch': 2, 'cv': (1, 5), 'take_after': {'boot_id': 'boot-1', 'at': 990.0}}
+    box = Box('a', genesis(), role=hv.ROLE_LEADER, led=led, epoch=2)
+    box.answer_all('renew', _ok)
+    names = box.names()
+    assert box.node.is_active() and names.index('acting') == names.index('booted') + 1
+    box.later(T.R)
+    assert box.names().count('acting') == 1
+
+
+def test_a_promise_that_ends_before_the_timer_leaves_the_timer_as_it_was():
+    """The normal case: the promise from a renewal ends before heard_at + P + jitter, so
+    no second random part is drawn on top of the timer's own."""
+    box = settled(Box('c', genesis()))
+    draws = []
+
+    class Counting(random.Random):
+        def uniform(self, a, b):
+            draws.append((a, b))
+            return super().uniform(a, b)
+    box.node.rng = Counting(7)
+    box.renew('b', 2)
+    heard = box.node.heard_at
+    assert box.node.promise_until < box.node.election_at
+    assert heard + T.P <= box.node.election_at <= heard + T.P + T.L / 4
+    assert draws == [(0, T.L / 4)]

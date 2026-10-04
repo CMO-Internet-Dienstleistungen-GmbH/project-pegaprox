@@ -909,17 +909,14 @@ def perform_pegaprox_update():
                         if result.returncode == 0:
                             return
 
-                    # let systemd restart us
-                    logging.info("Exiting for systemd restart (Restart=always)...")
-                    os._exit(0)
             except:
                 pass
 
-            # Fallback: restart via Python
-            try:
-                os.execv(sys.executable, [sys.executable] + sys.argv)
-            except:
-                os._exit(0)
+            # systemctl could not do it (no root, no sudo - the unit of the .deb runs with
+            # NoNewPrivileges): the process restarts itself (ha.leave_process), it never
+            # just exits 0, which a unit with Restart=on-failure leaves stopped
+            logging.info("Restarting in place...")
+            ha.leave_process()
 
         if deps_ok:
             threading.Thread(target=restart_server, daemon=True).start()
@@ -1085,15 +1082,11 @@ def rollback_pegaprox_update():
                         )
                         if result.returncode == 0:
                             return
-                    # Fallback: exit for systemd restart
-                    logging.info("Exiting for systemd restart...")
-                    os._exit(0)
             except:
                 pass
-            try:
-                os.execv(sys.executable, [sys.executable] + sys.argv)
-            except:
-                os._exit(0)
+            # as after an update: never a plain exit 0
+            logging.info("Restarting in place...")
+            ha.leave_process()
         
         import threading
         threading.Thread(target=restart_server, daemon=True).start()
@@ -2001,9 +1994,10 @@ def restart_server():
             except Exception:
                 pass
             
-            # Fallback: exit and let systemd restart
-            logging.info("Exiting for systemd restart...")
-            os._exit(0)
+            # systemctl could not do it: restart in place (never a plain exit 0, which a
+            # unit with Restart=on-failure leaves stopped)
+            logging.info("Restarting in place...")
+            ha.leave_process()
         
         restart_thread = threading.Thread(target=do_restart)
         restart_thread.daemon = True

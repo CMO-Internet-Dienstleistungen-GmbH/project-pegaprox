@@ -8921,7 +8921,7 @@ def _watchdog_leave(why):
         except OSError:
             pass
     try:
-        os.write(2, f'[HA] watchdog: {why} - leaving\n'.encode())
+        os.write(2, f'{time.strftime("%Y-%m-%d %H:%M:%S")} [HA] watchdog: {why} - leaving\n'.encode())
     except OSError:
         pass
     if not _supervised():

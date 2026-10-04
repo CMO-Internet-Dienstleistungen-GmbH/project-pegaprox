@@ -10382,7 +10382,23 @@ async def main():
         else:
             raise
 
+def _watch_parent():
+    # the server goes with the PegaProx that started it, also after a kill -9 of that one,
+    # which left it holding its port for the next start (start_new_session: no signal
+    # reaches it from the parent's group)
+    import time as _time
+    parent = os.getppid()
+
+    def watch():
+        while True:
+            _time.sleep(5)
+            if os.getppid() != parent:
+                os._exit(0)
+    threading.Thread(target=watch, daemon=True).start()
+
+
 if __name__ == '__main__':
+    _watch_parent()
     asyncio.run(main())
 '''
     

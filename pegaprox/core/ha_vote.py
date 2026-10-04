@@ -822,6 +822,10 @@ class Node:
         self._acting_said = False
         self.acting_from = max(now, at)
         self._event('booted', acting_from=self.acting_from)
+        if self.acting_from <= now:
+            # it acts at once: said now, not at the next tick after the monitor's first pass
+            self._acting_said = True
+            self._event('acting', epoch=self.st['led']['epoch'])
 
     def _boot_failed(self, now, why):
         # nothing acted yet: no restart, the process goes on as a standby. The boot rounds
@@ -1270,8 +1274,10 @@ class Node:
             at = base + self.t.election_delay(self.rng, self.lower_reach())
             # my own vote counts only after the hold after start
             at = max(at, self.hold_until)
-        if self._promise_live(now):
-            at = max(at, self.promise_until)
+        if self._promise_live(now) and self.promise_until > at:
+            # pushed past a promise (a planned-restart hold most of all), which ends on
+            # every member at once: a random part of L/4 on top, or they split the vote
+            at = self.promise_until + self.rng.uniform(0, self.t.L / 4)
         after = self.st.get('campaign_after')
         if after and after.get('boot_id') == self.boot_id:
             wait = after.get('at') or 0.0
@@ -1288,7 +1294,7 @@ class Node:
             return
         if self._promise_live(now):
             # never while our own promise to a leader runs
-            self.election_at = self.promise_until
+            self.election_at = self.promise_until + self.rng.uniform(0, self.t.L / 4)
             return
         self._prevote(now, 'timer')
 
