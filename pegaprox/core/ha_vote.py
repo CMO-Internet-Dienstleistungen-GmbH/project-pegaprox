@@ -671,6 +671,10 @@ class Node:
         # as a candidate
         self._campaign = None
         self.election_at = _INF
+        # how the last election this member ran failed: {at, kind, epoch, why, reached,
+        # m, reasons}. reached counts the voters that answered at all, refusals included
+        # (7.3: only a majority that does not answer may be gone)
+        self.last_failed = None
         self._boot(now)
 
     # --- what the gates read ---
@@ -1418,6 +1422,11 @@ class Node:
         r.done = True
         self._rounds.pop(r.tag, None)
         self._campaign = None
+        reached = ({self.me} | r.acks | {frm for frm, _a in r.refusals}) & self.view.counting
+        self.last_failed = {'at': now, 'kind': r.kind, 'epoch': r.epoch, 'why': r.why,
+                            'reached': len(reached), 'm': self.view.m,
+                            'reasons': sorted({str(a.get('reason') or '') for _f, a in r.refusals})}
+        self._event('campaign_failed', **self.last_failed)
         if r.kind == 'prevote' and not r.catchup_done:
             src = catchup_source(r.refusals, self.st['cv'])
             if src is not None and self.kind == KIND_DATA:
@@ -1747,6 +1756,21 @@ class Node:
         self.next_round_at = min(self.next_round_at, self.clock())
         return ''
 
+    def cancel_change(self, change):
+        """Take a queued change back before it is made. False when it is made already
+        (or was refused): it is no longer in the queue."""
+        if change in self._changes:
+            self._changes.remove(change)
+            return True
+        return False
+
+    def cfg_seen(self, member):
+        """The voter config id `member` last said it holds, None while it said none."""
+        return self._cfg_seen.get(member)
+
+    def campaigning(self):
+        return self._campaign is not None
+
     def readmit(self, voter):
         """The admin looked at a quarantined voter and takes it back (4.5). What this
         leader held against it goes with the change, or the next pass would quarantine
@@ -1995,7 +2019,8 @@ class Node:
         self.lease_until = min(self.lease_until, now)
         self._acting = False
         self._fail_waiters()
-        self._start_round(now, kind='release', extra={'hold_s': min(hold_s, HOLD_MAX)})
+        # planned: the members say "leader restarting" for the hold, not "taking over"
+        self._start_round(now, kind='release', extra={'hold_s': min(hold_s, HOLD_MAX), 'planned': True})
         self._event('planned_restart', hold_s=hold_s)
         self._exit('planned restart')
         return ''

@@ -6579,9 +6579,10 @@ if ours; then rm -f "$F" && { rmdir "$D" 2>/dev/null; echo "CLAIM_REMOVED"; } ||
         self.ha_config['claim_state'] = result
         return result
 
-    def _ha_claim_ensure(self, takeover=False) -> dict:
+    def _ha_claim_ensure(self, takeover=False, limit=None) -> dict:
         """Make the claim of this cluster ours, or say whose it is. Writes nothing
-        while the claim is off for the cluster.
+        while the claim is off for the cluster. `limit`: how many nodes are tried
+        (_ha_claim_run), all of them by default.
 
         'ours' is the only state a recovery goes ahead on. A foreign claim under a
         higher epoch means this instance is the stale one; under our epoch, that a
@@ -6591,7 +6592,9 @@ if ours; then rm -f "$F" && { rmdir "$D" 2>/dev/null; echo "CLAIM_REMOVED"; } ||
         if not ha.is_active():
             return {'state': 'standby'}
         instance, epoch = ha.lock_holder()
-        words, node = self._ha_claim_run(self._claim_write_cmd(epoch, instance, takeover=takeover))
+        # marked forced at the epoch a Force leader made this instance the active (7.3)
+        words, node = self._ha_claim_run(self._claim_write_cmd(epoch, instance, takeover=takeover,
+                                                               forced=ha.claim_forced()), limit=limit)
         result = self._ha_claim_result(words, node)
         if result['state'] == 'higher':
             self._ha_refuse('ha.claim_foreign',

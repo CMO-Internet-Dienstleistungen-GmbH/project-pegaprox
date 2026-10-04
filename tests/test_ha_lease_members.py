@@ -398,7 +398,10 @@ def test_nobody_leaves_an_automatic_group_by_hand(auto, seed):
         with auto.at(n) as ha:
             r = _post(auto.admin, '/api/ha/unpair', UNPAIR)
             assert r.status_code == 409 and r.get_json()['code'] == 'HA_AUTO_MODE', (n, r.data)
-            assert 'Switch automatic failover off' in r.get_json()['error']
+            # the leader hands its lead on first; a voter of three takes a vote the group
+            # cannot do without (with more, it leaves through the leader, design 7.4)
+            assert {'a': 'make another member leader first',
+                    'c': 'Switch automatic failover off'}[n] in r.get_json()['error']
             # said before the password is asked for, like the promotion
             r = _post(auto.admin, '/api/ha/unpair', {'confirm': 'UNPAIR'})
             assert r.status_code == 409 and r.get_json()['code'] == 'HA_AUTO_MODE'
@@ -526,6 +529,8 @@ def _by_hand(auto, n):
     ha = auto.ha
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(ha, '_members_say_auto', lambda timeout=5: None)
+        # and what S7 refuses on top: a state older than what it knew of its group
+        mp.setattr(ha, 'way_out_check', lambda: '')
         with auto.at(n) as h:
             return h.promote()
 

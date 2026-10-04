@@ -190,7 +190,12 @@ FORWARD_PATH = '/api/ha/peer/forward'
 # the calls of automatic failover (ha_vote.py): a vote or pre-vote, and the leader's renewal
 VOTE_PATH = '/api/ha/peer/vote'
 RENEW_PATH = '/api/ha/peer/renew'
-LEASE_PATHS = {'vote': VOTE_PATH, 'renew': RENEW_PATH}
+# the leader hands its term to a member: that member votes at once (design 7.1)
+CAMPAIGN_PATH = '/api/ha/peer/campaign'
+LEASE_PATHS = {'vote': VOTE_PATH, 'renew': RENEW_PATH, 'campaign': CAMPAIGN_PATH}
+# a member asks the leader to hand it the lead, or to take it out of the group (7.1, 7.4)
+TRANSFER_PATH = '/api/ha/peer/transfer'
+LEAVE_PATH = '/api/ha/peer/leave'
 FINGERPRINT_PATH = '/api/ha/peer/fingerprint'
 FORWARD_ENVIRON = 'pegaprox.ha_forward'
 FORWARD_MAX_BODY = 50 * 1024 * 1024
@@ -820,6 +825,84 @@ def _note_marker(st):
         logging.warning(f"[HA] could not update {path}: {e}")
 
 
+# MK Oct 2026 (#625) - what this instance knew about its group, next to the state file:
+# whether the group ever failed over automatically, the newest voter config held and
+# the witness. It only grows while the instance stays in its group, so a state file put
+# back from an older copy shows up as behind it (way_out_refusal), and a promotion still
+# finds the witness that copy never knew. Nothing is written before automatic failover
+# ships, and a group that never went automatic writes nothing but the witness.
+
+GROUP_SEEN_SUFFIX = '.group'
+_group_seen_cache = {}
+
+
+def _group_seen_path():
+    return STATE_FILE + GROUP_SEEN_SUFFIX
+
+
+def _group_seen(st):
+    """{auto, cfg_id, witness} this instance noted while in its group, None when nothing
+    was noted (or it was noted by another instance id)."""
+    path = _group_seen_path()
+    if path not in _group_seen_cache:
+        try:
+            with open(path, encoding='utf-8') as fh:
+                rec = json.load(fh)
+        except (OSError, ValueError):
+            rec = None
+        _group_seen_cache[path] = rec if isinstance(rec, dict) else None
+    rec = _group_seen_cache[path]
+    if not rec or rec.get('instance_id') != st.get('instance_id'):
+        return None
+    return {'auto': rec.get('auto') is True, 'cfg_id': ha_vote.pair(rec.get('cfg_id')),
+            'witness': _clean_witness(rec.get('witness'))}
+
+
+def _note_group_seen(st):
+    """After a commit: what `st` knows about the group, where it knows more than the
+    note says. Never lowers it, never raises."""
+    if not ha_vote.AUTO_MODE_SHIPPED or st.get('broken') or not _in_group(st):
+        return
+    lease = _lease(st)
+    chain = (list(lease.get('cfg_chain') or []) + [lease['cfg']]) if lease is not None else []
+    auto = (st.get('leader') is True or st.get('group_mode') in (ha_vote.MODE_AUTO, ha_vote.MODE_PENDING)
+            or any(isinstance(c, dict) and (c.get('body') or {}).get('mode') in (ha_vote.MODE_AUTO, ha_vote.MODE_PENDING)
+                   for c in chain))
+    cfg_id = ha_vote.pair(lease['cfg']['id']) if lease is not None else None
+    witness = _witness(st)
+    seen = _group_seen(st)
+    if seen is not None:
+        grows = ((auto and not seen['auto']) or (cfg_id is not None and (seen['cfg_id'] is None or cfg_id > seen['cfg_id']))
+                 or (witness is not None and witness != seen['witness']))
+        if not grows:
+            return
+        auto = auto or seen['auto']
+        if cfg_id is None or (seen['cfg_id'] is not None and seen['cfg_id'] > cfg_id):
+            cfg_id = seen['cfg_id']
+        witness = witness or seen['witness']
+    elif not auto and witness is None:
+        return
+    rec = {'instance_id': st['instance_id'], 'auto': auto,
+           'cfg_id': list(cfg_id) if cfg_id is not None else None, 'witness': witness}
+    try:
+        _write_private(_group_seen_path(), json.dumps(rec, sort_keys=True).encode())
+        _group_seen_cache[_group_seen_path()] = rec
+    except OSError as e:
+        logging.warning(f"[HA] could not note what this instance knows about its group: {e}")
+
+
+def _drop_group_seen():
+    """The instance left its group (or joins a new one): what it knew goes with it."""
+    path = _group_seen_path()
+    _group_seen_cache.pop(path, None)
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logging.warning(f"[HA] could not remove {path}: {e}")
+
+
 def _commit_locked(new):
     """Write `new`, then make it the state. Memory never runs ahead of the file:
     a failed write leaves both as they were."""
@@ -839,6 +922,7 @@ def _commit_locked(new):
                 logging.error(f"[HA] could not put the state file back after a failed write: {e}")
         raise
     _note_marker(new)
+    _note_group_seen(new)
     _state.clear()
     _state.update(new)
     rt = _rts.get(new.get('instance_id'))
@@ -942,6 +1026,7 @@ def reset_for_tests():
     global _state
     with _lock:
         _state = None
+        _group_seen_cache.clear()
 
 
 def role():
@@ -2230,9 +2315,14 @@ def _member_list(st):
     if own['public_key'] or own['secret_hash']:
         out.append(dict(own, instance_id=st['instance_id'], url=st.get('own_url') or '',
                         fingerprint=st.get('own_fingerprint') or ''))
+        if st.get('agent_vmid'):
+            out[-1]['agent_vmid'] = st['agent_vmid']
     for mid, rec in (st.get('members') or {}).items():
         out.append(dict(_credentials(rec), instance_id=mid, url=rec.get('url') or '',
                         fingerprint=rec.get('fingerprint') or '', serve=rec.get('serve') is True))
+        # the VM it runs as per cluster, where an admin named it (set_agent_vmid)
+        if rec.get('agent_vmid'):
+            out[-1]['agent_vmid'] = rec['agent_vmid']
     return sorted(out, key=lambda e: e['instance_id'])
 
 
@@ -2262,6 +2352,9 @@ def _clean_entries(entries):
             fp = ''
         out.setdefault(mid, {'url': url, 'fingerprint': fp, 'public_key': key, 'secret_hash': digest,
                              'serve': e.get('serve') is True})
+        vmids = _clean_agent_vmid(e.get('agent_vmid'))
+        if vmids and out[mid].get('public_key') == key:
+            out[mid]['agent_vmid'] = vmids
     return out
 
 
@@ -2413,6 +2506,7 @@ def accept_pairing(code_secret, standby_id, standby_url, standby_fp, standby_pub
                 new.pop(key, None)
             if local_timezone():
                 new['timezone'] = local_timezone()
+            _drop_group_seen()
         _commit_locked(new)
         _note_member_in_db(st['instance_id'])
         _drop_recovery_locks(st['instance_id'])
@@ -2521,6 +2615,7 @@ def join(code, own_url, own_fingerprint):
             new = {k: v for k, v in st.items() if k not in _GROUP_KEYS}
             if said in (ha_vote.MODE_AUTO, ha_vote.MODE_PENDING):
                 new['group_mode'] = said
+            _drop_group_seen()
             _commit_locked(dict(new, role=ROLE_STANDBY, epoch=new_epoch, pairing=None, sync={},
                                 signing_key=my_key, member_secret=None, members=ms,
                                 tombstones=_bounded_tombstones(tombs), removed=None,
@@ -2583,7 +2678,7 @@ def _install_field_key(new_key):
                       + (stats.get('error') or '; '.join(stats.get('errors') or []) or 'unknown error'))
 
 
-def unpair():
+def unpair(said=(), leader_agreed=False):
     """Leave the group. A standby becomes standalone, which means it starts acting
     after the restart the caller schedules; an active becomes standalone and the
     members go on without it. Telling the members is the caller's part.
@@ -2594,7 +2689,7 @@ def unpair():
     """
     with _lock:
         st = _load()
-        why = unpair_refusal(st)
+        why = unpair_refusal(st, said=said, leader_agreed=leader_agreed)
         if why:
             raise AutoMode(why)
         was = st['role']
@@ -2610,6 +2705,7 @@ def unpair():
         for key in _GROUP_KEYS:
             new.pop(key, None)
         _commit_locked(new)
+        _drop_group_seen()
     _group_left(st['instance_id'], zone)
     # now, not at the next boot: the route restarts only a former standby
     _note_member_in_db('')
@@ -2737,6 +2833,8 @@ def forget_peer(peer_id, whole_group=False):
             for key in _GROUP_KEYS:
                 new.pop(key, None)
         _commit_locked(new)
+        if alone:
+            _drop_group_seen()
     if alone:
         _group_left(st['instance_id'], zone)
         _note_member_in_db('')
@@ -2785,19 +2883,30 @@ def remove_member(member_id, shut_down=False):
     back to a group that refuses it, and act. It stays on record as removed (a
     tombstone), handed out with the member list, so its calls get 410 everywhere and
     a stale member list does not take it back. Removing the last one makes this
-    instance standalone, as that standby's own unpairing would."""
+    instance standalone, as that standby's own unpairing would.
+
+    In an automatic group only the lease holder removes a member, and the member leaves
+    the voter config first, one change at a time; never below MIN_VOTERS (7.4)."""
     if not shut_down and not member_confirmed(member_id):
         # the last tick may predate our epoch (a promotion minutes ago): ask it now
         # rather than send the admin to the shut-down confirmation for nothing
         refresh_member(member_id)
+    st = _load()
+    if st['role'] == ROLE_ACTIVE and mode(st) == ha_vote.MODE_AUTO and _lease_mode(st):
+        if _switching_off(st):
+            raise HaError(SWITCHING_OFF_ERROR)
+        if not isinstance(member_id, str) or member_id not in (st.get('members') or {}):
+            raise HaError('That instance is not a member of this group')
+        if not shut_down and not member_confirmed(member_id):
+            raise RemoveUnconfirmed(REMOVE_UNCONFIRMED_ERROR)
+        _remove_voter(member_id)
     with _lock:
         st = _load()
         if st['role'] != ROLE_ACTIVE:
             raise HaError('Only the active instance removes members')
-        if mode(st) != ha_vote.MODE_MANUAL:
-            # a member that leaves takes a vote out of the majority: until that is a
-            # change of the voter config, it waits for manual mode
-            raise AutoMode(AUTO_REMOVE_ERROR)
+        if mode(st) != ha_vote.MODE_MANUAL and not (_lease_mode(st) and holds_lease()):
+            # a pending switch, or a leader without its lease
+            raise AutoMode(AUTO_PENDING_ERROR if mode(st) == ha_vote.MODE_PENDING else AUTO_REMOVE_ERROR)
         ms = dict(st.get('members') or {})
         if not isinstance(member_id, str) or member_id not in ms:
             raise HaError('That instance is not a member of this group')
@@ -2814,6 +2923,8 @@ def remove_member(member_id, shut_down=False):
             for key in _GROUP_KEYS:
                 new.pop(key, None)
         _commit_locked(new)
+        if not ms:
+            _drop_group_seen()
     if not ms:
         _group_left(st['instance_id'], zone)
         _note_member_in_db('')
@@ -2915,6 +3026,11 @@ def promote():
         raise AutoMode(f"{who} {said.get('url') or said['instance_id'][:8]} says this group "
                        'fails over automatically: its members elect the leader, and none is '
                        'promoted by hand')
+    # a manual config nobody confirmed, or a state older than what this instance knew
+    # about its group: Force leader is the way out, never a plain promotion (S7)
+    why = way_out_check()
+    if why:
+        raise AutoMode(why)
     waited = _pull_lock.acquire(timeout=PROMOTE_PULL_WAIT)
     try:
         new_epoch, gap = _promote()
@@ -3553,6 +3669,10 @@ def _group_etag(etag, meta):
         # only when set: a group where nobody serves keeps the etag it had before
         if e.get('serve') is True:
             h.update(b'S')
+        # the VMs an admin named for it (set_agent_vmid), as for serve
+        if e.get('agent_vmid'):
+            h.update(b'V')
+            _hash_value(h, json.dumps(e['agent_vmid'], sort_keys=True))
     for t in tombs or []:
         h.update(b'R')
         for key in ('instance_id', 'epoch', 'at', 'by', 'public_key', 'secret_hash'):
@@ -3842,6 +3962,10 @@ def _merged_members(st, sender, entries, tombstones=None):
         rec.setdefault('url', '')
         rec.setdefault('fingerprint', '')
         rec['serve'] = entry['serve']
+        if entry.get('agent_vmid'):
+            rec['agent_vmid'] = entry['agent_vmid']
+        else:
+            rec.pop('agent_vmid', None)
         if mid != sender and _matches_tombstone(rec, tombs.get(mid)):
             continue
         out[mid] = rec
@@ -3874,6 +3998,12 @@ def _adopt_group(snap):
                 # not listed at all is no flag either
                 own = _clean_entries(snap['members']).get(st['instance_id']) or {}
                 new['serve_assigned'] = own.get('serve') is True
+                # the VM it runs as, as the leader holds it: should it lead one day, its
+                # own entry of the list it hands out carries it on (Force leader, 7.3)
+                if own.get('agent_vmid'):
+                    new['agent_vmid'] = own['agent_vmid']
+                else:
+                    new.pop('agent_vmid', None)
                 # MK Oct 2026 (#625) - where the leader reaches this member; after a
                 # promotion it is also what the node agents are given to ask
                 if own.get('url'):
@@ -6875,6 +7005,11 @@ def _loop():
                 watch_once()
                 _lease_housekeeping()
                 stamps_settle()
+                # the cluster claims (6.3, Q4 b), on a greenlet of their own, and the
+                # autostart of the VMs a Force leader cut out (7.3); neither does
+                # anything where nothing asks for it
+                claim_watch_soon()
+                forced_onboot_pass()
         except Exception as e:
             logging.error(f"[HA] loop: {e}")
         try:
@@ -7061,7 +7196,7 @@ _LEASE_KEYS = ('voted_for', 'gen', 'cfg', 'cfg_chain', 'floor_cv', 'led', 'relea
 _WITNESS_KEYS = ('instance_id', 'url', 'fingerprint', 'public_key', 'site')
 # what a group decided, in the state file of each of its instances: gone when the
 # instance is on its own again, and never taken into the next group
-_GROUP_KEYS = ('lease', 'leader', 'witness', 'witness_pairing', 'timezone', 'group_mode')
+_GROUP_KEYS = ('lease', 'leader', 'witness', 'witness_pairing', 'timezone', 'group_mode', 'agent_vmid')
 # a vote round and a renewal both have two seconds (ha_vote.Timings)
 LEASE_CALL_TIMEOUT = 2
 # how long a status answer counts for the checks before the switch
@@ -7239,7 +7374,7 @@ def lease_in_force():
     return _lease_mode(_load())
 
 
-def unpair_refusal(st=None):
+def unpair_refusal(st=None, said=(), leader_agreed=False):
     """Why this instance cannot leave its group by hand right now, '' when it can.
 
     In an automatic group nobody does: a leader that left would go on acting on its
@@ -7251,7 +7386,13 @@ def unpair_refusal(st=None):
     group took out (the way out for both), a release that does not run automatic
     failover, and a standby whose leader says the group is manual again while the
     config held here still says automatic - it missed the switch back, and pairing it
-    again is how it catches up."""
+    again is how it catches up.
+
+    MK Oct 2026 (#625, S7): a member of an automatic group leaves through its leader,
+    which takes it out of the voter config first (unpair_needs_leader,
+    leave_through_leader; then `leader_agreed`); the leader itself hands its lead on
+    first. Nor does a member whose way out is Force leader (way_out_refusal, `said` as
+    there)."""
     st = st or _load()
     if (not ha_vote.AUTO_MODE_SHIPPED or st.get('broken') or st.get('removed')
             or st['role'] == ROLE_STANDALONE):
@@ -7259,12 +7400,45 @@ def unpair_refusal(st=None):
     rec = st.get('lease')
     held = rec.get('mode') if isinstance(rec, dict) else None
     if held == ha_vote.MODE_AUTO or _lease_mode(st):
-        if st['role'] == ROLE_STANDBY and st.get('group_mode') == ha_vote.MODE_MANUAL:
+        if st['role'] == ROLE_STANDBY and (st.get('group_mode') == ha_vote.MODE_MANUAL or leader_agreed):
             return ''
-        return AUTO_UNPAIR_ERROR
+        return AUTO_LEAVE_LEADER_ERROR if st.get('leader') else AUTO_UNPAIR_ERROR
     if held == ha_vote.MODE_PENDING and st['role'] == ROLE_ACTIVE:
         return AUTO_PENDING_ERROR
-    return ''
+    return way_out_refusal(st, said)
+
+
+def unpair_needs_leader(st=None):
+    """A follower of an automatic group: its unpairing goes through the leader (7.4).
+    Not where its vote is one the group cannot do without (fewer than MIN_VOTERS would
+    be left): that is refused here, as the leader would, before anybody is asked."""
+    st = st or _load()
+    if not (ha_vote.AUTO_MODE_SHIPPED and st['role'] == ROLE_STANDBY and not st.get('removed')
+            and not st.get('broken') and unpair_refusal(st) == AUTO_UNPAIR_ERROR):
+        return False
+    lease = _lease(st)
+    voters = ha_vote.voter_ids(lease['cfg']['body']) if lease is not None else []
+    return st['instance_id'] not in voters or len(voters) - 1 >= ha_vote.MIN_VOTERS
+
+
+def unpair_check():
+    """(why this instance is not unpaired by hand, '' when it is; what the members said
+    just now). A manual config nobody confirmed asks the members first."""
+    why = unpair_refusal()
+    said = []
+    if why == MANUAL_UNKNOWN_ERROR:
+        said = _members_said()[1]
+        why = unpair_refusal(said=said)
+    return why, said
+
+
+def way_out_check():
+    """way_out_refusal, with the members asked where the manual config held here wants
+    a majority that holds it as well."""
+    why = way_out_refusal()
+    if why == MANUAL_UNKNOWN_ERROR:
+        why = way_out_refusal(said=_members_said()[1])
+    return why
 
 
 def _takes_a_vote_too_many(st, member_id):
@@ -7299,6 +7473,10 @@ def _group_left(instance, zone):
 
 
 def _members_say_auto(timeout=5):
+    return _members_said(timeout)[0]
+
+
+def _members_said(timeout=5):
     """Before a promotion by hand: the record of a member that says this group fails
     over automatically, or is switching to it, None when none that answers does. The
     promotion asks its own state first (mode); this is for the instance whose state
@@ -7312,17 +7490,20 @@ def _members_say_auto(timeout=5):
     The witness is asked as well and answers like a member (its record comes back with
     kind 'witness'): of two data members and a witness it is the only voter besides
     the leader. It never holds a lease itself, so a promise it keeps counts as the
-    lease of the one it names."""
+    lease of the one it names. So is the witness this instance noted while in its group
+    (_group_seen), where its state names another one or none: a state put back from
+    before the witness was paired knows none. _members_said returns that record and
+    what each member said ([(member id, its status or None)], for way_out_refusal)."""
     if not ha_vote.AUTO_MODE_SHIPPED:
-        return None
+        return None, []
     st = _load()
     recs = members()
     if st['role'] != ROLE_STANDBY or not recs:
-        return None
-    witness = _witness(st)
-    if witness and witness.get('url'):
-        # signed only, as _ask_witness: the witness takes no old secret
-        recs.append(dict(witness, key_acked=True, kind=ha_vote.KIND_WITNESS))
+        return None, []
+    for witness in (_witness(st), (_group_seen(st) or {}).get('witness')):
+        if witness and witness.get('url') and all(r['instance_id'] != witness['instance_id'] for r in recs):
+            # signed only, as _ask_witness: the witness takes no old secret
+            recs.append(dict(witness, key_acked=True, kind=ha_vote.KIND_WITNESS))
     lease = _lease(st)
     mine = ha_vote.pair(lease['cfg']['id']) if lease is not None else None
     try:
@@ -7330,7 +7511,7 @@ def _members_say_auto(timeout=5):
         results = _fan_out([lambda rec=rec: _ask(rec, signer, timeout) for rec in recs], timeout + 1)
     except Exception as e:
         logging.warning(f"[HA] could not ask the members about the group's mode: {e}")
-        return None
+        return None, []
     said = [(rec['instance_id'], value[5] if err is None and len(value) > 5 else None)
             for rec, (value, err) in zip(recs, results)]
     known = lease is not None and _manual_known(st, lease, said)
@@ -7338,14 +7519,14 @@ def _members_say_auto(timeout=5):
         if not seen or seen.get('mode') == ha_vote.MODE_MANUAL:
             continue
         if seen.get('holds') is True:
-            return rec
+            return rec, said
         if rec.get('kind') == ha_vote.KIND_WITNESS and seen.get('holder'):
-            return rec
+            return rec, said
         theirs = seen.get('cfg_id')
         if known and (theirs is None or theirs < mine):
             continue
-        return rec
-    return None
+        return rec, said
+    return None, said
 
 
 def _manual_known(st, lease, said=()):
@@ -7701,6 +7882,11 @@ class _LeaseRuntime:
         self.lag_max = 0.0
         self.boot_lag_max = 0.0
         self.witness_asked = None       # (node gen, what) the voter config was asked to name
+        self.planned = None             # (leader, until) while a planned restart holds the lease
+        self.switch_heard = None        # when the instance that started a pending switch was last heard
+        # the claim watch: last pass, cluster -> (what it saw, look again from), the
+        # clusters whose write still runs, and the one pass that may run
+        self.claims = {'at': None, 'seen': {}, 'jobs': set(), 'busy': threading.Lock()}
 
 
 def _rt():
@@ -8026,6 +8212,18 @@ def _lease_event(rt, name, info):
                 "stays as it was")
         logging.error(f"[HA] {me}: {text}")
         _audit('ha.voter_config_refused', text)
+    elif name == 'transfer':
+        logging.warning(f"[HA] {me}: handing the lead to {_label(info.get('to'))}: writes paused "
+                        "until it caught up")
+    elif name == 'acting_stop':
+        logging.warning(f"[HA] {me}: acting stop: {info.get('why')}")
+    elif name == 'transfer_refused':
+        text = f"the lead was not handed on ({info.get('why')}): this instance goes on leading"
+        logging.warning(f"[HA] {me}: {text}")
+        _audit('ha.transfer_refused', text)
+    elif name == 'campaign_failed':
+        logging.info(f"[HA] {me}: {info.get('kind')} at epoch {info.get('epoch')} failed: "
+                     f"{info.get('reached')} of the {info.get('m')} votes needed answered")
     elif name in ('write_failed', 'no_node'):
         logging.error(f"[HA] {me}: lease {name}: {info}")
     elif name == 'adopt_refused':
@@ -8337,15 +8535,49 @@ def lease_request(sender, kind, body):
                     ans = node.on_request(sender, kind, body)
             took = (kind == 'renew' and ans.get('ok') is True
                     and node.view.mode == ha_vote.MODE_AUTO)
+            if took:
+                # a planned restart of the leader: the members say so for its hold (7.2)
+                hold = body.get('hold_s')
+                rt.planned = ((sender, ha_clock() + min(hold, ha_vote.HOLD_MAX))
+                              if body.get('planned') is True and type(hold) in (int, float) and hold > 0
+                              else None)
+            elif (kind == 'renew' and body.get('switch') is True and ans.get('ok') is True
+                  and node.view.mode == ha_vote.MODE_PENDING and node.view.cfg.get('by') == sender):
+                # the instance that started the switch still drives it (Force leader, Q13)
+                rt.switch_heard = ha_clock()
             rt.due = node.next_wake()
     if took:
         _lease_heard(sender, body)
     elif kind == 'renew' and body.get('switch') is not True:
         _look_soon(rt)
+    elif kind == 'renew' and body.get('taken_back') is True and body.get('settled') is True:
+        _settled_by(sender, body, ans)
     _lease_after(rt)
     if rt.node is not None and not rt.loop:
         lease_start()
     return ans
+
+
+def _settled_by(sender, body, ans):
+    """A manual config handed out by the active of the manual group (_switch_back_again,
+    settled) is the group's: noted as known (_manual_known, MK Oct 2026 #625 S7), once it
+    is the config held here. Never raises."""
+    try:
+        seg = body.get('chain') if isinstance(body.get('chain'), list) else []
+        top = seg[-1] if seg and isinstance(seg[-1], dict) else None
+        with _lock:
+            st = _load()
+            lease = _lease(st)
+            if (top is None or lease is None or st['role'] != ROLE_STANDBY
+                    or sender not in (st.get('members') or {})):
+                return
+            digest = ha_vote.cfg_digest(lease['cfg'])
+            if (lease.get('mode') != ha_vote.MODE_MANUAL or ha_vote.cfg_digest(top) != digest
+                    or ans.get('cfg_digest') != digest or lease.get('settled') == digest):
+                return
+            _commit_locked(dict(st, lease=dict(lease, settled=digest)))
+    except Exception as e:
+        logging.warning(f"[HA] could not note the manual config of member {sender} as the group's: {e}")
 
 
 def _look_soon(rt):
@@ -8414,7 +8646,9 @@ def _cv_loop(rt):
     walk over the shared tables must not hold a renewal up."""
     while not rt.stop:
         try:
-            if _lease_mode(_load()) and is_active() and cv_tick() == 'stepped':
+            # not while the lead is being handed on: the member it goes to catches up
+            # with a configuration that holds still (7.1)
+            if _lease_mode(_load()) and is_active() and not handing_over() and cv_tick() == 'stepped':
                 rt.wake.set()
         except Exception as e:
             logging.warning(f"[HA] config version tick: {e}")
@@ -9154,16 +9388,20 @@ def _switch_taken_back(st, automatic=False):
     return block
 
 
-def _hand_switch_back(lease, epoch, targets, me):
+def _hand_switch_back(lease, epoch, targets, me, settled=False):
     """The manual config of `lease`, which took a pending switch back, to the members in
     `targets`: one switch round as the node sends it after a cancel, side by side and
     each with the two seconds of a lease call, marked taken_back: only a member that
     holds a pending config takes anything from it, and only what hangs off a config it
-    holds (lease_request). `epoch` is the one this instance (`me`) is at now. Returns
-    the ids that hold the config after it."""
+    holds (lease_request). `epoch` is the one this instance (`me`) is at now. `settled`:
+    the sender is the active of the manual group, so the config is the group's, and the
+    member knows that from here on (_manual_known). Returns the ids that hold the config
+    after it."""
     cfg = lease['cfg']
     body = {'epoch': epoch, 'leader': me, 'switch': True, 'taken_back': True,
             'lease_s': cfg['body']['lease_s'], 'chain': list(lease.get('cfg_chain') or []) + [cfg]}
+    if settled:
+        body['settled'] = True
     results = _fan_out([lambda mid=mid: _lease_fetch((mid, 'renew', body)) for mid in targets],
                        LEASE_CALL_TIMEOUT + 1)
     digest = ha_vote.cfg_digest(cfg)
@@ -9241,7 +9479,8 @@ def _switch_back_again():
                      and seen['cfg_id'] < mine)
     if not targets:
         return []
-    took = _hand_switch_back(lease, int(st.get('epoch') or 0), targets, me)
+    took = _hand_switch_back(lease, int(st.get('epoch') or 0), targets, me,
+                             settled=st['role'] == ROLE_ACTIVE and not st.get('leader'))
     if took:
         logging.warning(f"[HA] {len(took)} member(s) that still held a pending switch took the "
                         "manual config held here")
@@ -9479,17 +9718,23 @@ def lease_status():
                 mid for mid in node.view.members - {st['instance_id']}
                 if (rt.seen.get(mid) or {}).get('mode') != ha_vote.MODE_PENDING)
     rows = []
+    ms = st.get('members') or {}
+    leading = node is not None and st.get('leader') and node.lease_mode()
     for rec in body.get('voters') or ():
         if rec['id'] == st['instance_id']:
             continue
         seen = rt.seen.get(rec['id']) or {}
+        # Make leader on this row, from here: the leader says whether it would hand over
+        why = _transfer_refusal(st, rt, node, rec['id']) if leading else ''
         rows.append({'instance_id': rec['id'], 'kind': ha_vote.KIND_DATA, 'voter': rec.get('voter'),
                      'may_lead': rec.get('may_lead'), 'site': rec.get('site') or '',
                      'quarantined': rec['id'] in quarantined, 'skew': seen.get('skew'),
                      'release': seen.get('release'), 'mode': seen.get('mode'),
                      'zone': seen.get('zone'),
                      'holds': seen.get('holds') is True, 'reach': seen.get('reach'),
-                     'seen_ago': round(now - seen['at'], 1) if 'at' in seen else None})
+                     'seen_ago': round(now - seen['at'], 1) if 'at' in seen else None,
+                     'make_leader': bool(leading and not why), 'make_leader_why': why,
+                     'agent_vmid': dict((ms.get(rec['id']) or {}).get('agent_vmid') or {})})
     witness = _witness(st)
     if witness:
         seen = rt.seen.get(witness['instance_id']) or {}
@@ -9500,9 +9745,13 @@ def lease_status():
                      'zone': seen.get('zone'), 'holds': False,
                      'reach': None, 'url': witness['url'],
                      'last_heard': (witness_view(st) or {}).get('last_heard'),
-                     'seen_ago': round(now - seen['at'], 1) if 'at' in seen else None})
+                     'seen_ago': round(now - seen['at'], 1) if 'at' in seen else None,
+                     'make_leader': False, 'make_leader_why': 'The witness holds no data and never leads',
+                     'agent_vmid': {}})
     out['members'] = rows
     out['witness'] = witness_view(st)
+    out['agent_vmid'] = dict(st.get('agent_vmid') or {})
+    out.update(make_leader_status(st, node, rt))
     return out
 
 
@@ -9939,6 +10188,1098 @@ def check_not_a_witness_dir(path=None):
     if os.path.exists(os.path.join(folder, ha_wire.WITNESS_STATE_NAME)):
         raise HaError(f'{folder} is the state directory of a PegaProx witness - run PegaProx on a '
                       'config directory of its own')
+
+
+# --- make leader, planned restarts, Force leader, removal (design 7) ------------------
+#
+# MK Oct 2026 (#625) - what an admin does with the lead of an automatic group. "Make
+# leader" hands the lead on: the leader pauses writes, lets the member catch up, stops
+# acting and hands its next term to exactly that member, which votes at once (7.1).
+# Without an answering leader the member campaigns at once instead, with the pre-vote
+# and every rule. A planned restart of the leader asks the members to hold its lease
+# until it is back (7.2). Force leader is the way out of a group that lost its majority
+# for good: the member becomes the manual active of the group at a new epoch, and the
+# members it cut out are out of the group (7.3). Members leave and are removed only on
+# the lease holder, one change of the voter config at a time (7.4).
+
+LEADER_PHRASE = 'LEADER'
+FORCE_PHRASE = 'FORCE LEADER'
+FORCE_REASON_MAX = 500
+# the leader waits this long for the member it hands the lead to (TRANSFER_CATCHUP), the
+# member for the election that follows
+TRANSFER_WAIT = ha_vote.TRANSFER_CATCHUP + LEASE_CALL_TIMEOUT + 2
+CAMPAIGN_WAIT = ha_vote.CATCHUP_TIMEOUT + 3 * LEASE_CALL_TIMEOUT + 2
+HANDED_WAIT = 2 * LEASE_CALL_TIMEOUT + 2
+# a change of the voter config is on disk within a few renewal rounds
+CFG_CHANGE_WAIT = 10
+# the claim watch: once per watch pass at most, on a greenlet of its own, at most this
+# many clusters at once and CLAIM_WATCH_NODES nodes of each (30 s apiece over SSH); a
+# foreign claim it cannot act on is looked at again after CLAIM_REPEAT, a cluster that
+# answered late or not at all after CLAIM_RETRY
+CLAIM_WATCH = 30
+CLAIM_WATCH_AT_ONCE = 8
+CLAIM_WATCH_NODES = 2
+CLAIM_WATCH_WAIT = CLAIM_WATCH_NODES * 30 + 5
+CLAIM_REPEAT = 600
+CLAIM_RETRY = 120
+# Force leader sets autostart off on the cut-out members' VMs; a cluster that does not
+# answer is tried again at the next passes, this many in all
+ONBOOT_TRIES = 20
+
+TRANSFER_ERROR = ('The leader is handing its role to another member - changes resume in a '
+                  'few seconds')
+AUTO_REMOVE_FEW_ERROR = (f'Without this member the group would have fewer than '
+                         f'{ha_vote.MIN_VOTERS} votes, too few for automatic failover. Switch '
+                         'automatic failover off first, or add a member or a witness')
+AUTO_REMOVE_SELF_ERROR = 'The leader does not remove itself - make another member leader first'
+AUTO_LEAVE_LEADER_ERROR = ('This instance leads a group that fails over automatically - make '
+                           'another member leader first, then unpair it there')
+NO_LEADER_TO_LEAVE_ERROR = ('This group fails over automatically and no leader answers, so '
+                            'nobody can take this instance out of its voter config. Wait for '
+                            'the leader, or use Force leader if the group lost its majority for good')
+MANUAL_UNKNOWN_ERROR = ('This instance holds a manual voter config that follows an automatic one, '
+                        'and no majority of the group has confirmed it: the group may still fail '
+                        'over automatically elsewhere. It is not promoted or unpaired by hand - '
+                        'let it reach the group, or use Force leader if the group lost its '
+                        'majority for good')
+RESTORED_ERROR = ('The state of this instance is older than what it knew about its group (it was '
+                  'put back from a copy): the group fails over automatically and may have a '
+                  'leader. It is not promoted or unpaired by hand - let it reach the group, or '
+                  'use Force leader if the group lost its majority for good')
+FORCE_WARNING = ('If any of these members still runs somewhere, two instances may act on the '
+                 'clusters both of them reach: on a cluster with the cluster claim on until the '
+                 "older one sees this member's claim (up to 30 s), and steps over SSH are refused "
+                 'there at once; on a cluster without it until the two can reach each other '
+                 'again. Tick a member only when it is powered off or destroyed.')
+FORCE_FOLLOW = 'the group has a leader or an active - follow it'
+
+
+class TransferRefused(HaError):
+    """Make leader: why the lead is not handed on, or why the election did not win it."""
+
+
+class ForceRefused(HaError):
+    """Force leader: why it is not offered here, or what the request got wrong."""
+
+
+class _Until:
+    """A condition _lease_wait can wait for: polled here, stepped in the tests."""
+
+    def __init__(self, cond):
+        self.cond = cond
+
+    def is_set(self):
+        return bool(self.cond())
+
+    def wait(self, seconds):
+        end = time.monotonic() + seconds
+        while not self.cond():
+            if time.monotonic() >= end:
+                return False
+            time.sleep(0.1)
+        return True
+
+
+def handing_over():
+    """Whether this instance is the leader of an automatic group that hands its lead on
+    right now: writes are paused (503 HA_TRANSFER) until it went through or failed."""
+    st = _load()
+    if not st.get('leader'):
+        return False
+    node = _lease_live(st)
+    return node is not None and node.transfer is not None
+
+
+def _known_leader(st, node=None):
+    """The record of the member that leads this member's automatic group as far as it
+    knows: the holder of its promise, a member that said it holds the lease, the member
+    it pulls from. None when it knows none."""
+    ms = st.get('members') or {}
+    names = []
+    if node is not None and node.promise_to and ha_clock() < node.promise_until:
+        names.append(node.promise_to)
+    names += sorted(mid for mid in ms if _says_it_holds(mid))
+    if st.get('source'):
+        names.append(st['source'])
+    for mid in names:
+        if mid in ms:
+            return dict(ms[mid], instance_id=mid)
+    return None
+
+
+def _transfer_refusal(st, rt, node, target):
+    """Why the leader does not hand its lead to `target` right now, '' when it does: the
+    target has to be able to win (a data voter that is not quarantined, answers the
+    renewals, holds the newest voter config and can write its state)."""
+    if node is None or not st.get('leader') or not node.lease_mode():
+        return 'This instance does not lead an automatic group'
+    if node.view.mode != ha_vote.MODE_AUTO:
+        return SWITCHING_OFF_ERROR
+    if node.transfer is not None:
+        return 'The lead is being handed on already'
+    if not node.is_active():
+        return NO_LEASE_ERROR
+    if target == st['instance_id']:
+        return 'This instance leads already'
+    rec = node.view.records.get(target)
+    label = _label(target)
+    if rec is None or not rec.get('voter'):
+        return f'{label} holds no vote in this group: only a data member with a vote leads'
+    if target not in node.view.counting:
+        return f'{label} is quarantined (it came back with an older state): re-admit it first'
+    t = node.t
+    if ha_clock() - rt.acked.get(target, -1e9) > 2 * (t.R + t.renew_timeout):
+        return f'{label} does not answer the renewals of this leader'
+    if (rt.seen.get(target) or {}).get('write_failed'):
+        return f'{label} cannot write its HA state file, so it cannot vote for itself'
+    if node.cfg_seen(target) != node.view.id:
+        return f'{label} does not hold the newest voter config yet - try again in a few seconds'
+    return ''
+
+
+def _nudge_one(member_id):
+    """The note about a change, to one member and now: it pulls what it does not hold."""
+    try:
+        from pegaprox.api.ha import current_etag
+        body = {'etag': current_etag()}
+        body.update(peer_cv())
+        tell_members('POST', NUDGE_PATH, json_body=body, timeout=NUDGE_TIMEOUT,
+                     only=[member_id], note=False)
+    except Exception as e:
+        logging.info(f"[HA] could not tell {_label(member_id)} to catch up: {e}")
+
+
+def hand_over(target):
+    """Leader of an automatic group: hand the lead to the member `target` (7.1). Writes
+    pause, the target is told to pull, and once it holds the configuration of now this
+    instance stops acting and hands it the next term; the target votes at once, and this
+    instance steps down when it votes for it. Returns 'handed' once the term went out
+    ('catching up' when the node still waits past TRANSFER_WAIT). Raises TransferRefused
+    when the target cannot win or did not catch up in time (writes are open again then),
+    NoLease without the lease."""
+    rt = _rt()
+    with rt.lock:
+        st = _load()
+        node = _lease_node(rt)
+        why = _transfer_refusal(st, rt, node, target)
+        if why:
+            raise (NoLease if why == NO_LEASE_ERROR else TransferRefused)(why)
+        code = node.transfer_to(target)
+        if code:
+            raise TransferRefused(f'The lead was not handed on ({code})')
+        rt.due = node.next_wake()
+    _lease_after(rt)
+    _lease_spawn(lambda: _nudge_one(target), 'ha-transfer-nudge')
+    _lease_wait(_Until(lambda: node.dead or node.transfer is None or node.transfer.get('phase') != 'catchup'),
+                TRANSFER_WAIT)
+    with rt.lock:
+        phase = (node.transfer or {}).get('phase')
+        if node.dead or phase in ('release', 'wait'):
+            return 'handed'
+        if phase == 'catchup':
+            return 'catching up'
+    raise TransferRefused(f'{_label(target)} could not catch up with the configuration of this leader '
+                          f'within {ha_vote.TRANSFER_CATCHUP} s - it goes on leading, and writes are '
+                          'open again')
+
+
+def _campaign_refusal(node, before):
+    """Why the election this member just ran did not make it the leader."""
+    failed = node.last_failed
+    if failed is None or failed is before:
+        return 'The election did not finish in time - look at the status in a moment'
+    reached, m = failed['reached'], failed['m']
+    if reached >= m:
+        if 'PROMISED' in failed['reasons']:
+            return 'The leader holds a majority - this member is cut off from it'
+        return (f'A majority answers ({reached} of the {m} votes needed) and refused: '
+                f"{', '.join(r for r in failed['reasons'] if r) or 'no reason given'}")
+    return (f'Only {reached} of the {m} votes a leader needs answer: no majority can be reached '
+            'from here. If the members that do not answer are down for good, Force leader takes '
+            'over without them')
+
+
+def make_leader(target=None):
+    """'Make leader' (7.1). On the leader: hand the lead to `target` (hand_over). On a
+    data voter, for itself: ask the leader to hand it over, and where no leader answers,
+    campaign at once (pre-vote and every rule kept). Returns 'handed' (the leader let go
+    and the vote is out), 'elected' (this instance won and restarts) or 'catching up'.
+    Raises TransferRefused with the reason, NoLease, HaError."""
+    if not ha_vote.AUTO_MODE_SHIPPED:
+        raise HaError(ha_vote.NOT_SHIPPED_ERROR)
+    st = _load()
+    me = st['instance_id']
+    target = target or me
+    if st.get('leader') and _lease_mode(st):
+        if target == me:
+            raise TransferRefused('This instance leads already')
+        return hand_over(target)
+    if target != me:
+        raise TransferRefused('Another member is made leader on the leader, or on that member itself')
+    if st['role'] != ROLE_STANDBY or mode(st) != ha_vote.MODE_AUTO or st.get('removed'):
+        raise HaError('Make leader is for a member of a group that fails over automatically')
+    rt = _rt()
+    with rt.lock:
+        node = _lease_node(rt)
+        if node is None or node.view.mode != ha_vote.MODE_AUTO or not node.view.candidate(me, timer=False):
+            raise TransferRefused('This instance holds no vote in the voter config of its group, or '
+                                  'is quarantined: it cannot lead')
+        leader = _known_leader(st, node)
+    if leader is not None:
+        try:
+            resp = call_member(leader, 'POST', TRANSFER_PATH, json_body={}, timeout=TRANSFER_WAIT + 5)
+        except PeerNoAnswer:
+            # it took the call: whether it handed over shows in the term it hands on
+            resp = None
+        except HaError as e:
+            logging.info(f"[HA] the leader {leader.get('url')} did not answer the request to "
+                         f"hand over ({_error_text(e)}) - campaigning")
+            leader, resp = None, None
+        if resp is not None and resp.status_code != 200:
+            raise TransferRefused(_peer_error(resp, 'The leader did not hand over'))
+        if leader is not None:
+            # the leader let go once this member caught up; the call that starts the vote
+            # here follows its last round
+            _lease_wait(_Until(lambda: node.dead or node.campaigning()), HANDED_WAIT)
+            if node.campaigning():
+                _lease_wait(_Until(lambda: node.dead or not node.campaigning()), CAMPAIGN_WAIT)
+            if node.dead:
+                return 'elected'
+            if resp is None:
+                raise TransferRefused('The leader took the request and did not answer - look at the '
+                                      'status in a moment')
+            return 'handed'
+    with rt.lock:
+        before = node.last_failed
+        if node.campaign_now('make_leader'):
+            raise TransferRefused('This instance cannot campaign right now - look at the status in a moment')
+        rt.due = node.next_wake()
+    _lease_after(rt)
+    _lease_wait(_Until(lambda: node.dead or not node.campaigning()), CAMPAIGN_WAIT)
+    if node.dead:
+        return 'elected'
+    raise TransferRefused(_campaign_refusal(node, before))
+
+
+def planned_restart(reason, hold_s=ha_vote.PLANNED_HOLD):
+    """Before a restart an admin asked for (an update, a rollback, the restart button) on
+    the leader of an automatic group: stop acting and ask the members to hold the lease
+    for hold_s while this instance is gone; after the start it renews at the epoch it won
+    and goes on leading, with no failover (7.2). The caller restarts as it would anyway;
+    the watchdog sees to it should that not come. A no-op returning False anywhere else,
+    a manual group and an instance of its own included. Never raises."""
+    if not ha_vote.AUTO_MODE_SHIPPED:
+        return False
+    try:
+        return _planned_restart(reason, hold_s)
+    except Exception as e:
+        logging.error(f"[HA] the planned restart could not ask the members to hold the lease: {e}")
+        return False
+
+
+def _planned_restart(reason, hold_s):
+    st = _load()
+    if not (st.get('leader') and _lease_mode(st)):
+        return False
+    rt = _rt()
+    with rt.lock:
+        node = _lease_live(st)
+        if node is None or not node.holds_lease() or node.planned_restart(hold_s):
+            return False
+        calls = list(rt.outbox)
+        rt.outbox.clear()
+        # the caller restarts: the node's own way out is not taken a second time
+        events = [e for e in rt.events if e[0] != 'exit']
+        rt.events.clear()
+        rt.exit_at = ha_clock()
+    for name, info in events:
+        try:
+            _lease_event(rt, name, info)
+        except Exception as e:
+            logging.warning(f"[HA] could not handle the lease event {name}: {e}")
+    held = []
+    if calls:
+        results = _fan_out([lambda item=item: _lease_fetch(item) for item in calls], LEASE_CALL_TIMEOUT + 1)
+        held = [_label(item[0]) for item, (ans, err) in zip(calls, results)
+                if err is None and isinstance(ans, dict) and ans.get('ok') is True]
+    kill_children()
+    hold = min(hold_s, ha_vote.HOLD_MAX)
+    text = (f"planned restart ({reason}): stopped acting, {', '.join(held) or 'no member'} "
+            f"hold{'s' if len(held) == 1 else ''} the lease for {hold} s; if this instance is not "
+            'back by then, the members elect another leader')
+    logging.warning(f"[HA] {text}")
+    _audit('ha.planned_restart', text)
+    flush_journal()
+    return True
+
+
+# --- the way out of a group that is or was automatic (S7, from the S5 attack) ---
+
+def way_out_refusal(st=None, said=()):
+    """Why this instance takes neither a promotion by hand nor an unpairing by hand right
+    now, '' when it may. A member of a group that has ever been automatic whose manual
+    voter config is not known to be the group's (_manual_known; `said` is what the
+    members answered just now), or whose state is older than what it knew about the
+    group (_group_seen: a copy put back), could act next to the leader the others elect.
+    Its only way out without the leader is Force leader.
+
+    Known limit: a member restored as a whole (a VM snapshot rolled back, the whole config
+    directory put back) brings its state file and the note next to it back from the same
+    moment. From before the switch it cannot be told from a live member that never saw
+    automatic failover, and this says ''. The HA guide tells the operator: never roll a
+    member back while its group runs; unpair it and pair it again."""
+    if not ha_vote.AUTO_MODE_SHIPPED:
+        return ''
+    st = st or _load()
+    if st.get('broken') or st.get('removed') or st['role'] == ROLE_STANDALONE:
+        return ''
+    lease = _lease(st)
+    if (lease is not None and lease.get('mode') == ha_vote.MODE_MANUAL and not st.get('leader')
+            and not _manual_known(st, lease, said)):
+        return MANUAL_UNKNOWN_ERROR
+    seen = _group_seen(st)
+    if seen is not None and seen['auto'] and seen['cfg_id'] is not None:
+        held = ha_vote.pair(lease['cfg']['id']) if lease is not None else None
+        if held is None or held < seen['cfg_id']:
+            return RESTORED_ERROR
+    return ''
+
+
+def _group_says(timeout=5):
+    """What every member and every witness this instance knows of answers now: its own
+    witness and the one its group note names (an older state may know none). [(record,
+    status or None, error or None)], status as _ask returns it."""
+    st = _load()
+    targets = [dict(rec, instance_id=mid) for mid, rec in sorted((st.get('members') or {}).items())]
+    known = {t['instance_id'] for t in targets}
+    for w in (_witness(st), (_group_seen(st) or {}).get('witness')):
+        if w and w.get('url') and w['instance_id'] not in known:
+            known.add(w['instance_id'])
+            # signed only: the witness takes no old secret
+            targets.append(dict(w, key_acked=True, kind=ha_vote.KIND_WITNESS))
+    if not targets:
+        return []
+    try:
+        signer = _signer()
+    except HaError:
+        return [(rec, None, HaError('Not paired')) for rec in targets]
+    results = _fan_out([lambda rec=rec: _ask(rec, signer, timeout) for rec in targets], timeout + 1)
+    return [(rec, value if err is None else None, err) for rec, (value, err) in zip(targets, results)]
+
+
+# --- Force leader (7.3, Q3 b, Q13 b) ---
+
+def _force_case(st, node):
+    """Which way out Force leader would be here: 'auto' (a data voter of an automatic
+    group), 'pending' (a member holding a switch another instance started), 'unknown'
+    (way_out_refusal), None for none."""
+    if st['role'] != ROLE_STANDBY or st.get('removed') or st.get('broken'):
+        return None
+    lease = _lease(st)
+    if lease is not None and lease.get('mode') == ha_vote.MODE_AUTO:
+        return 'auto' if node is not None and st['instance_id'] in node.view.data else None
+    if (lease is not None and lease.get('mode') == ha_vote.MODE_PENDING
+            and lease['cfg'].get('by') != st['instance_id']):
+        return 'pending'
+    if way_out_refusal(st):
+        return 'unknown'
+    return None
+
+
+def _force_voters(st):
+    """{voter id: kind} of the group as this instance holds it, itself left out."""
+    lease = _lease(st)
+    me = st['instance_id']
+    if lease is not None:
+        view = ha_vote.CfgView(lease['cfg'])
+        return {v: (ha_vote.KIND_WITNESS if v == view.witness else ha_vote.KIND_DATA)
+                for v in view.voters if v != me}
+    out = {mid: ha_vote.KIND_DATA for mid in st.get('members') or {}}
+    for w in (_witness(st), (_group_seen(st) or {}).get('witness')):
+        if w:
+            out[w['instance_id']] = ha_vote.KIND_WITNESS
+    return out
+
+
+def _quiet_for(st, rt, node):
+    """Seconds since this member last heard a leader (a renewal; the switch rounds of a
+    pending switch), or since it started."""
+    if node is None:
+        return time.monotonic() - rt.born
+    now = ha_clock()
+    last = node.heard_at if node.heard_at is not None else node.started
+    if rt.switch_heard is not None:
+        last = max(last, rt.switch_heard)
+    return now - last
+
+
+def force_leader_view(st=None, probe=False):
+    """Whether Force leader is offered on this instance, and for which members: {offered,
+    case, why, cut_out: [{instance_id, url, kind}], quiet, last_campaign}. With `probe`
+    every member and witness is asked now, as the route does before it acts; without, the
+    status page goes by what the watch heard last."""
+    st = st or _load()
+    out = {'offered': False, 'case': None, 'why': '', 'cut_out': [], 'epochs': [],
+           'warning': FORCE_WARNING, 'phrase': FORCE_PHRASE}
+    if not ha_vote.AUTO_MODE_SHIPPED:
+        out['why'] = ha_vote.NOT_SHIPPED_ERROR
+        return out
+    rt = _rt()
+    node = _lease_live(st)
+    case = _force_case(st, node)
+    out['case'] = case
+    if case is None:
+        out['why'] = ('Force leader is the way out for a member of a group that fails over '
+                      'automatically and lost its majority')
+        return out
+    me = st['instance_id']
+    t = node.t if node is not None else ha_vote.Timings()
+    quiet = _quiet_for(st, rt, node)
+    out['quiet'] = round(quiet, 1)
+    if node is not None and node.promise_to and ha_clock() < node.promise_until:
+        out['why'] = (f'{_label(node.promise_to)} holds the promise of this member for '
+                      f'{node.promise_until - ha_clock():.0f} s more: the group has a leader')
+        return out
+    if quiet < t.P + t.L / 2:
+        out['why'] = (f'A leader was heard {quiet:.0f} s ago: Force leader is offered once no '
+                      f'leader was heard for {t.P + t.L / 2:.0f} s')
+        return out
+    if case == 'auto':
+        failed = node.last_failed
+        since = node.heard_at if node.heard_at is not None else node.started
+        if failed is None or failed['at'] < since:
+            out['why'] = ('No election ran from here since the leader went quiet - use Make leader '
+                          'first: Force leader is offered when it finds no majority')
+            return out
+        out['last_campaign'] = {'reached': failed['reached'], 'majority': failed['m']}
+        if failed['reached'] >= failed['m']:
+            out['why'] = (f"The last election reached a majority ({failed['reached']} of the "
+                          f"{failed['m']} votes needed): the group can still elect a leader")
+            return out
+    voters = _force_voters(st)
+    if probe:
+        answers = {rec['instance_id']: (seen, err) for rec, seen, err in _group_says()}
+        if _load().get('removed'):
+            out['why'] = REMOVED_ERROR
+            return out
+    else:
+        now = time.monotonic()
+        ms = st.get('members') or {}
+        # the role from the same look of the watch
+        answers = {mid: (((ms.get(mid) or {}).get('role_seen'), None, None, None, None, seen), None)
+                   for mid, seen in list(rt.seen.items())
+                   if now - seen.get('at', -1e9) <= LEASE_SEEN_FRESH}
+    # MK Oct 2026 (#625) - 'pending' and 'unknown' need no failed election, so what
+    # answers decides: an active, a member that fails over automatically or holds a
+    # switch other than the one held here, and the group has somebody to follow
+    maker = _lease(st)['cfg'].get('by') if case == 'pending' else None
+    allowed = {me, maker} - {None}
+    reached, said = set(), []
+    for mid, (value, err) in answers.items():
+        if value is None and not isinstance(err, PeerRefused):
+            continue
+        reached.add(mid)
+        if value is None:
+            if case in ('pending', 'unknown'):
+                # it is there and refuses this instance's calls: nothing it said is known,
+                # and it may be the leader, the active or the maker. Counted as reached it
+                # would not be cut out either (a clock far off refuses every member)
+                out['why'] = (f'{_label(mid)} answers but refuses the calls of this instance (the '
+                              f'clocks are more than {ha_wire.SIGNATURE_WINDOW} s apart, or it does '
+                              'not know this instance): fix that first')
+                return out
+            continue
+        if value[1] is not None:
+            out['epochs'].append(value[1])
+        seen = value[5] if len(value) > 5 else None
+        said.append((mid, seen))
+        if case == 'pending' and mid == maker:
+            out['why'] = (f'{_label(mid)}, which started the switch, answers: take the switch back '
+                          'there, or let it go through')
+            return out
+        if case in ('pending', 'unknown') and value[0] == ROLE_ACTIVE:
+            out['why'] = f'{_label(mid)} answers as an active instance: {FORCE_FOLLOW}'
+            return out
+        if not isinstance(seen, dict):
+            continue
+        if seen.get('holds') is True or (seen.get('holder') and seen.get('mode') != ha_vote.MODE_MANUAL
+                                         and seen.get('holder') != me):
+            who = seen.get('holder') if seen.get('holds') is not True else mid
+            out['why'] = (f"{_label(mid)} answers, and {'it holds' if who == mid else _label(who) + ' holds'} "
+                          'the lease: the group has a leader. Follow it, or make this member leader there')
+            return out
+        if case == 'pending' and seen.get('mode') == ha_vote.MODE_AUTO:
+            out['why'] = (f'{_label(mid)} fails over automatically: the switch went through. This '
+                          'member takes the config from its leader')
+            return out
+        if case == 'unknown' and seen.get('mode') == ha_vote.MODE_AUTO:
+            out['why'] = f'{_label(mid)} answers and fails over automatically: {FORCE_FOLLOW}'
+            return out
+        if (case in ('pending', 'unknown') and seen.get('mode') == ha_vote.MODE_PENDING
+                and seen.get('pending_by') not in allowed):
+            out['why'] = (f"{_label(mid)} holds a switch to automatic failover that "
+                          f"{_label(seen.get('pending_by')) if seen.get('pending_by') else 'another instance'} "
+                          f'started: {FORCE_FOLLOW}')
+            return out
+    if case == 'unknown':
+        lease = _lease(st)
+        if lease is not None and lease.get('mode') == ha_vote.MODE_MANUAL and _manual_known(st, lease, said) \
+                and not way_out_refusal(st, said):
+            out['why'] = ('The members that answer confirm the manual config of this instance: '
+                          'promote it as usual')
+            return out
+    if case == 'auto':
+        view = node.view
+        count = len(({me} | reached) & view.counting)
+        if count >= view.m:
+            out['why'] = (f'{count} of the {view.n} votes answer, a majority: the group can still '
+                          'elect a leader - use Make leader')
+            return out
+    noted = (_group_seen(st) or {}).get('witness') or {}
+    out['cut_out'] = [{'instance_id': vid, 'kind': kind,
+                       'url': (_lease_target(vid) or (noted if noted.get('instance_id') == vid else {})).get('url') or ''}
+                      for vid, kind in sorted(voters.items()) if vid not in reached]
+    out['offered'] = True
+    return out
+
+
+def _forced_config(st, lease, epoch, cut_out):
+    """The lease block of the forced leader: one more voter config, in manual mode at its
+    new epoch, without the members it cut out, chained to the one it held so the members
+    that took that one take this one from its answers (a candidate asks for votes and
+    hears MODE_MANUAL with the chain). Known as the group's: this instance is its manual
+    active from now on."""
+    private = _signer().private
+    if private is None:
+        raise HaError('This instance has no key pair to sign a voter config with')
+    me = st['instance_id']
+    prev = lease['cfg']
+    body = dict(prev['body'], mode=ha_vote.MODE_MANUAL)
+    body['voters'] = [rec for rec in body.get('voters') or () if rec['id'] not in cut_out]
+    if (body.get('witness') or {}).get('id') in cut_out:
+        body['witness'] = None
+    ids = set(ha_vote.voter_ids(body))
+    body['quarantined'] = [q for q in body.get('quarantined') or () if q in ids]
+    if ha_vote.body_error(body):
+        raise HaError(f'The voter config cannot be made ({ha_vote.body_error(body)})')
+
+    def sign(message):
+        return base64.b64encode(private.sign(message)).decode()
+    chain = list(lease.get('cfg_chain') or [])
+    if me in ha_vote.CfgView(prev).data:
+        cfg = ha_vote.make_cfg(prev, epoch, me, body, sign)
+        chain = (chain + [prev])[-ha_vote.CFG_KEEP:]
+    else:
+        # no data voter of the config held: a chain of its own, as _lease_found does
+        pid = ha_vote.pair(prev['id'])
+        cfg = {'id': [max(epoch, pid[0]), pid[1] + 1], 'prev': '', 'by': me, 'body': body}
+        cfg['sig'] = sign(bytes.fromhex(ha_vote.cfg_digest(cfg)))
+        chain = []
+    block = dict(lease, cfg=cfg, cfg_chain=chain, mode=ha_vote.MODE_MANUAL, epoch=epoch,
+                 voted_for=None, led=None, released=None, campaign_after=None,
+                 gen=(lease['gen'] if type(lease.get('gen')) is int else 0) + 1,
+                 settled=ha_vote.cfg_digest(cfg))
+    block.pop('pending_since', None)
+    return block
+
+
+def force_leader(cut_out, reason, user='system'):
+    """Force leader (7.3): this member becomes the manual active of its group at an epoch
+    above every one it has seen. `cut_out` names every voter that does not answer, each
+    confirmed by the admin as powered off or destroyed, `reason` says why. The members in
+    it are out of the group (tombstones: they hear 410 and go passive when they come
+    back), the witness among them is let go, the voter config goes to manual mode, and
+    automatic failover comes back only through the switch with all its checks. After the
+    restart the caller schedules, this instance writes its claim on every cluster with
+    the claim on (marked forced) and sets autostart off on the VMs of the cut-out members
+    an admin named (agent_vmid). Returns {epoch, cut_out, case}; raises ForceRefused."""
+    if not ha_vote.AUTO_MODE_SHIPPED:
+        raise ForceRefused(ha_vote.NOT_SHIPPED_ERROR)
+    reason = reason.strip() if isinstance(reason, str) else ''
+    if not reason or len(reason) > FORCE_REASON_MAX or any(ord(ch) < 32 for ch in reason):
+        raise ForceRefused(f'Say why, in up to {FORCE_REASON_MAX} characters on one line')
+    if not isinstance(cut_out, list) or not all(isinstance(x, str) for x in cut_out):
+        raise ForceRefused('cut_out is the list of the members that do not answer')
+    view = force_leader_view(probe=True)
+    if not view['offered']:
+        raise ForceRefused(view['why'])
+    expected = {c['instance_id'] for c in view['cut_out']}
+    given = set(cut_out)
+    if given - expected:
+        raise ForceRefused('These answer and are not cut out: '
+                           f"{', '.join(_label(x) for x in sorted(given - expected))}")
+    if expected - given:
+        raise ForceRefused('Tick every member that does not answer, each one powered off or destroyed: '
+                           f"{', '.join(_label(x) for x in sorted(expected - given))}")
+    rt = _rt()
+    with rt.lock:
+        with _lock:
+            st = _load()
+            if st['role'] != ROLE_STANDBY or st.get('removed') or st.get('broken'):
+                raise ForceRefused('Only a member that follows is forced to lead')
+            me = st['instance_id']
+            ms = dict(st.get('members') or {})
+            lease = _lease(st)
+            seen = [int(st.get('epoch') or 0)] + [int(rec.get('epoch_seen') or 0) for rec in ms.values()]
+            seen += [e for e in view['epochs'] if type(e) is int]
+            if lease is not None:
+                seen += [int(lease.get('epoch') or 0), ha_vote.pair(lease['cfg']['id'])[0],
+                         int((lease.get('led') or {}).get('epoch') or 0)]
+            new_epoch = max(seen) + 1
+            if new_epoch > EPOCH_MAX:
+                raise ForceRefused('The group has reached the highest epoch there is')
+            tombs = dict(st.get('tombstones') or {})
+            onboot = {}
+            for mid in sorted(given):
+                rec = ms.pop(mid, None)
+                if rec is None:
+                    continue
+                tombs[mid] = dict(_credentials(rec), epoch=new_epoch, at=_now(), by=me)
+                for cid, vmid in sorted((rec.get('agent_vmid') or {}).items()):
+                    onboot.setdefault(cid, []).append(vmid)
+            new = {k: v for k, v in st.items() if k not in ('group_mode', 'leader')}
+            if (_witness(st) or {}).get('instance_id') in given:
+                new.pop('witness', None)
+            if lease is not None:
+                new['lease'] = _forced_config(st, lease, new_epoch, given)
+            cvr = _cv_record(st)
+            if cvr is not None and cvr.get('joined'):
+                cvr = None
+            new.update(role=ROLE_ACTIVE, epoch=new_epoch, source=None, serve_assigned=False,
+                       members={mid: dict(rec, role_seen=None) if rec.get('role_seen') == ROLE_ACTIVE
+                                else dict(rec) for mid, rec in ms.items()},
+                       tombstones=_bounded_tombstones(tombs), cv=cvr, change_gap=_gap_at_promotion(st),
+                       forced={'epoch': new_epoch, 'at': _now(), 'by': str(user)[:64], 'reason': reason,
+                               'case': view['case'], 'cut_out': sorted(given), 'onboot': onboot,
+                               'tries': 0})
+            _commit_locked(new)
+            # the note of the group starts over from this state: one put back from before
+            # the switch holds no voter config, and the old note would call it a copy
+            _drop_group_seen()
+            _note_group_seen(new)
+        rt.stale = True
+    _lease_after(rt)
+    text = (f"forced to lead by {user} at epoch {new_epoch} ({view['case']}), manual mode: "
+            f"{reason}; cut out as powered off or destroyed: "
+            f"{', '.join(_label(x) for x in sorted(given)) or 'nobody'}")
+    # the route writes the audit line under the admin's name
+    logging.critical(f"[HA] {text}")
+    _forced_alert(new_epoch, given)
+    return {'epoch': new_epoch, 'cut_out': sorted(given), 'case': view['case']}
+
+
+def _forced_alert(epoch, cut_out):
+    """Force leader is a break-glass: it goes out on both paths every other alert takes,
+    the plugin hook (push and whatever registered there) and the webhook channels, and
+    as an ha_status event. Not with the reason: that is the admin's own text, and goes
+    to the audit row. Never raises."""
+    st = _load()
+    me = st.get('own_url') or st['instance_id'][:8]
+    message = (f'PegaProx instance {me} was forced to lead its HA group at epoch {epoch} and runs '
+               f'in manual mode from now on; {len(cut_out)} member(s) cut out as powered off or '
+               'destroyed. See the audit log.')
+    alert = {'alert_name': 'HA group: Force leader', 'severity': 'critical', 'metric': 'ha_forced_leader',
+             'target_type': 'instance', 'target_name': me, 'cluster_id': '',
+             'current_value': f'epoch {epoch}', 'timestamp': _now(), 'message': message}
+    try:
+        from pegaprox.globals import _notification_handlers
+        for handler in list(_notification_handlers):
+            try:
+                handler(alert)
+            except Exception as e:
+                logging.debug(f"[HA] notification handler failed: {e}")
+    except Exception as e:
+        logging.warning(f"[HA] could not hand the Force leader alert on: {e}")
+    try:
+        # the handlers above are the plugin hook, not the channels (#815)
+        from pegaprox.utils.webhooks import send_to_channels
+        send_to_channels(alert)
+    except Exception as e:
+        logging.warning(f"[HA] webhook dispatch of the Force leader alert failed: {e}")
+    try:
+        from pegaprox.globals import cluster_managers
+        from pegaprox.utils.realtime import broadcast_sse
+        # every cluster this instance acts on from now on
+        broadcast_sse('ha_status', {'event': 'ha.forced_leader', 'message': message, 'epoch': epoch,
+                                    'severity': 'critical'}, target_clusters=sorted(cluster_managers))
+    except Exception as e:
+        logging.debug(f"[HA] could not push the Force leader event: {e}")
+
+
+def claim_forced():
+    """Whether the claim this instance writes at its epoch is a forced one (7.3)."""
+    st = _load()
+    forced = st.get('forced') if isinstance(st.get('forced'), dict) else {}
+    return st['role'] == ROLE_ACTIVE and forced.get('epoch') == int(st.get('epoch') or 0)
+
+
+def forced_onboot_pass():
+    """On the instance Force leader made the active, with every look at the group:
+    autostart off on the VMs of the members it cut out, where an admin named them
+    (agent_vmid) and their cluster answers (A5), so a node that boots does not start an
+    instance the admin powered off. Each VM once; a cluster that does not answer is
+    tried again at the next passes, ONBOOT_TRIES in all. Returns what was done now."""
+    st = _load()
+    forced = st.get('forced') if isinstance(st.get('forced'), dict) else None
+    if (not forced or not forced.get('onboot') or st['role'] != ROLE_ACTIVE
+            or forced.get('epoch') != int(st.get('epoch') or 0) or not is_active()):
+        return []
+    # the role in manual mode, at once; a round should automatic failover be on again
+    if not confirm_step('autostart off on the VMs of the cut-out members'):
+        return []
+    from pegaprox.globals import cluster_managers
+    left, done = {}, []
+    for cid, vmids in sorted(forced['onboot'].items()):
+        mgr = cluster_managers.get(cid)
+        try:
+            found = {str(r.get('vmid')): r for r in (mgr.get_vm_resources() or [])} if mgr else {}
+        except Exception as e:
+            logging.info(f"[HA] could not read the guests of cluster {cid}: {e}")
+            found = {}
+        for vmid in vmids:
+            r = found.get(str(vmid))
+            ok = False
+            if r is not None and r.get('node'):
+                try:
+                    ok = bool((mgr.update_vm_config(r['node'], int(vmid), r.get('type') or 'qemu',
+                                                    {'onboot': 0}) or {}).get('success'))
+                except Exception as e:
+                    logging.warning(f"[HA] could not switch autostart off for {cid}/{vmid}: {e}")
+            if ok:
+                done.append(f'{cid}/{vmid}')
+            else:
+                left.setdefault(cid, []).append(vmid)
+    tries = int(forced.get('tries') or 0) + 1
+    if tries >= ONBOOT_TRIES and left:
+        _audit('ha.forced_onboot', 'autostart could not be switched off for the VMs of the cut-out '
+                                   f"members: {json.dumps(left, sort_keys=True)} - do it by hand")
+        left = {}
+    with _lock:
+        st = _load()
+        if isinstance(st.get('forced'), dict) and st['forced'].get('epoch') == forced.get('epoch'):
+            _commit_locked(dict(st, forced=dict(st['forced'], onboot=left, tries=tries)))
+    if done:
+        _audit('ha.forced_onboot', f"autostart switched off for the VMs of the cut-out members: {', '.join(done)}")
+    return done
+
+
+# --- removal and leaving (7.4) ---
+
+def _remove_voter(member_id):
+    """Leader of an automatic group: `member_id` out of the voter config, one change at
+    a time, and back once that is on disk. Never below MIN_VOTERS, never the leader
+    itself. Raises NoLease, AutoMode or HaError, and then nothing changed."""
+    rt = _rt()
+    with rt.lock:
+        st = _load()
+        node = _lease_node(rt)
+        if node is None or not st.get('leader') or not node.is_active():
+            raise NoLease(NO_LEASE_ERROR)
+        if node.view.mode != ha_vote.MODE_AUTO:
+            raise HaError(SWITCHING_OFF_ERROR)
+        if member_id == st['instance_id']:
+            raise AutoMode(AUTO_REMOVE_SELF_ERROR)
+        if node.transfer is not None:
+            raise HaError(TRANSFER_ERROR)
+        if member_id not in node.view.records:
+            return
+        left = [v for v in node.view.voters if v != member_id]
+        if member_id in node.view.voters and len(left) < ha_vote.MIN_VOTERS:
+            raise AutoMode(AUTO_REMOVE_FEW_ERROR)
+
+        def drop(body):
+            return dict(body, voters=[rec for rec in body['voters'] if rec['id'] != member_id],
+                        quarantined=[q for q in body.get('quarantined') or () if q != member_id])
+        node.change_cfg(drop)
+        rt.due = node.next_wake()
+    _lease_after(rt)
+    _lease_wait(_Until(lambda: node.dead or member_id not in node.view.records), CFG_CHANGE_WAIT)
+    with rt.lock:
+        if member_id in node.view.records:
+            node.cancel_change(drop)
+            raise HaError('The change of the voter config did not go through in time (a change '
+                          'before it waits for a majority) - try again in a moment')
+
+
+def member_leaves(member_id):
+    """Leader of an automatic group: the member `member_id` unpairs (its route asked us
+    first, 7.4). Out of the voter config, then out of the member list with a tombstone,
+    as remove_member leaves one: should our answer get lost, the member's next call hears
+    410 and it lets go of the group there. Raises NoLease, AutoMode, HaError."""
+    st = _load()
+    if not _lease_mode(st) or not st.get('leader'):
+        raise HaError('This instance does not lead an automatic group')
+    if member_id not in (st.get('members') or {}):
+        raise HaError('That instance is not a member of this group')
+    _remove_voter(member_id)
+    with _lock:
+        st = _load()
+        ms = dict(st.get('members') or {})
+        rec = ms.pop(member_id, None)
+        if rec is None:
+            return
+        tombs = dict(st.get('tombstones') or {})
+        tombs[member_id] = dict(_credentials(rec), epoch=int(st.get('epoch') or 0), at=_now(),
+                                by=st['instance_id'])
+        zone = group_timezone()
+        new = dict(st, members=ms, tombstones=_bounded_tombstones(tombs))
+        if not ms:
+            new.update(role=ROLE_STANDALONE, member_secret=None)
+            for key in _GROUP_KEYS:
+                new.pop(key, None)
+        _commit_locked(new)
+        if not ms:
+            _drop_group_seen()
+    if not ms:
+        _group_left(st['instance_id'], zone)
+        _note_member_in_db('')
+
+
+def leave_through_leader():
+    """A member of an automatic group unpairs: the leader takes it out of the voter
+    config first (7.4). Returns the leader's record; raises AutoMode when no leader
+    answers or it refuses.
+
+    A leader that took this instance out before, whose answer got lost, holds its
+    tombstone and answers 410 (call_member lets go of the group here): this instance is
+    out, and leaves. A 401 is no such answer - an instance that left the group since
+    answers every call with it, and the group would keep counting this vote."""
+    st = _load()
+    rt = _rt()
+    with rt.lock:
+        node = _lease_live(st)
+    leader = _known_leader(st, node)
+    if leader is None:
+        raise AutoMode(NO_LEADER_TO_LEAVE_ERROR)
+    try:
+        resp = call_member(leader, 'POST', LEAVE_PATH, json_body={}, timeout=CFG_CHANGE_WAIT + 10)
+    except HaError as e:
+        raise AutoMode(f'{NO_LEADER_TO_LEAVE_ERROR} ({_error_text(e)})')
+    if resp.status_code == 410 and _load().get('removed'):
+        return leader
+    if resp.status_code != 200:
+        raise AutoMode(_peer_error(resp, 'The leader did not take this instance out'))
+    return leader
+
+
+# --- the claim watch (4.10, 6.3, Q4 b) ---
+
+def _step_down_for_claim(st, who, their, reason):
+    me = st['instance_id']
+    if _lease_mode(st):
+        rt = _rt()
+        with rt.lock:
+            node = _lease_live(st)
+            if node is None:
+                return 'idle'
+            node.step_down(reason)
+        _lease_after(rt)
+        _audit('ha.stepped_down', f'the claim watch: {reason}')
+        return 'stepped down'
+    if who != me and step_down(their, who):
+        _audit('ha.stepped_down', f'the claim watch: {reason}')
+        restart_process('stepped down to standby')
+        return 'stepped down'
+    if step_aside(their, reason):
+        _audit('ha.stepped_aside', f'the claim watch: {reason}')
+        restart_process('stepped aside to standby')
+        return 'stepped aside'
+    return 'ok'
+
+
+# what _ha_claim_ensure says when no node took the write (manager._CLAIM_PASSING)
+_CLAIM_NO_ANSWER = ('busy', 'unreachable', 'readonly', 'failed')
+
+
+def claim_watch_soon():
+    """The loop's way to the claim watch: on a greenlet of its own, one pass at a time, so
+    a cluster whose nodes do not answer never holds up the look at the group. Returns True
+    when it started a pass. Never raises."""
+    try:
+        st = _load()
+        if st['role'] != ROLE_ACTIVE or not st.get('members'):
+            return False
+        watched = _rt().claims
+    except Exception as e:
+        logging.warning(f"[HA] claim watch: {e}")
+        return False
+    if not watched['busy'].acquire(blocking=False):
+        return False
+
+    def run():
+        try:
+            claim_watch()
+        except Exception as e:
+            logging.error(f"[HA] claim watch: {e}")
+        finally:
+            watched['busy'].release()
+    try:
+        _lease_spawn(run, 'ha-claim-watch')
+    except Exception as e:
+        watched['busy'].release()
+        logging.warning(f"[HA] could not start the claim watch: {e}")
+        return False
+    return True
+
+
+def _claim_job(watched, cid, mgr):
+    """The claim write of one cluster as the watch sends it, on CLAIM_WATCH_NODES nodes at
+    most. It stays in watched['jobs'] until it returned, late or not."""
+    job = as_job(mgr._ha_claim_ensure, 'the claim watch')
+
+    def run():
+        try:
+            return job(limit=CLAIM_WATCH_NODES)
+        finally:
+            watched['jobs'].discard(cid)
+    return run
+
+
+def claim_watch(force=False):
+    """Every look at the group, on the active of a manual group and on the leader of an
+    automatic one: the claim of every cluster with node HA and the claim switched on
+    (6.3), at most once per CLAIM_WATCH. Ours goes on where it is lower or missing (the
+    write is a compare-and-swap); a claim of this instance or of a member at a higher
+    epoch means this one is the stale one, and it steps down. One of an instance this
+    group does not know is refused there and said (_ha_claim_ensure), not followed.
+    Nothing where no cluster has the claim on. Returns what it did.
+
+    The loop runs it through claim_watch_soon. A cluster is asked on CLAIM_WATCH_NODES
+    of its nodes, never while its write from a pass before still runs, and one that
+    answered late or not at all is left alone for CLAIM_RETRY."""
+    st = _load()
+    if st['role'] != ROLE_ACTIVE or not st.get('members') or st.get('removed') or st.get('broken'):
+        return 'idle'
+    if not is_active():
+        return 'idle'
+    watched = _rt().claims
+    now = time.monotonic()
+    if not force and watched['at'] is not None and 0 <= now - watched['at'] < CLAIM_WATCH:
+        return 'cached'
+    from pegaprox.globals import cluster_managers
+    todo = []
+    for cid, mgr in sorted(list(cluster_managers.items()), key=lambda x: str(x[0])):
+        on = getattr(mgr, '_ha_claim_enabled', None)
+        if getattr(mgr, 'ha_enabled', False) is not True or not callable(on) or not on():
+            continue
+        if cid in watched['jobs']:
+            continue
+        last = watched['seen'].get(cid)
+        if last is not None and last[1] is not None and now < last[1]:
+            # a foreign claim this watch cannot act on, or no answer: looked at again later
+            continue
+        todo.append((cid, mgr))
+    watched['at'] = now
+    if not todo:
+        return 'none'
+    results = []
+    for i in range(0, len(todo), CLAIM_WATCH_AT_ONCE):
+        batch = todo[i:i + CLAIM_WATCH_AT_ONCE]
+        watched['jobs'].update(cid for cid, _m in batch)
+        try:
+            results += _fan_out([_claim_job(watched, cid, mgr) for cid, mgr in batch], CLAIM_WATCH_WAIT)
+        except Exception:
+            # the threads did not start: these clusters are asked again at the next pass
+            watched['jobs'].difference_update(cid for cid, _m in batch)
+            raise
+    # the state as it is now: the look at the group went on meanwhile
+    st = _load()
+    if st['role'] != ROLE_ACTIVE or st.get('removed') or not is_active():
+        return 'idle'
+    me, mine = st['instance_id'], int(st.get('epoch') or 0)
+    ms = st.get('members') or {}
+    now = time.monotonic()
+    for (cid, mgr), (res, err) in zip(todo, results):
+        if err is not None or not isinstance(res, dict) or res.get('state') in _CLAIM_NO_ANSWER:
+            # late, failed, or no node took it
+            watched['seen'][cid] = (None, now + CLAIM_RETRY)
+            continue
+        state, who, their = res.get('state'), res.get('instance'), res.get('epoch')
+        stale = state == 'higher' and type(their) is int and their > mine and (who == me or who in ms)
+        foreign = state in ('higher', 'same', 'unreadable') and not stale
+        watched['seen'][cid] = ((state, who, their), now + CLAIM_REPEAT if foreign else None)
+        if stale:
+            name = getattr(getattr(mgr, 'config', None), 'name', None) or cid
+            whose = 'a newer copy of this instance' if who == me else _label(who)
+            return _step_down_for_claim(st, who, their, f'cluster {name} carries the claim of {whose} '
+                                                       f"at epoch {their}, above this instance's {mine}")
+    return 'ok'
+
+
+# --- what an admin sets per member ---
+
+def set_agent_vmid(member_id, cluster_id, vmid):
+    """Leader: the VM the member `member_id` (this instance included) runs as on cluster
+    `cluster_id`, None to forget it. Force leader switches autostart off on it when it
+    cuts that member out (7.3). It travels with the member list. Returns True when it
+    changed."""
+    if not isinstance(cluster_id, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', cluster_id):
+        raise HaError('cluster_id is the id of a cluster')
+    if vmid is not None and (isinstance(vmid, bool) or not isinstance(vmid, int) or not 100 <= vmid <= 999999999):
+        raise HaError('vmid is the id of a VM (100 or more), or null')
+    with _lock:
+        st = _load()
+        if st['role'] != ROLE_ACTIVE or not st.get('members'):
+            raise HaError('The VM of a member is set on the leader of a group')
+        if _lease_mode(st) and not is_active():
+            raise NoLease(NO_LEASE_ERROR)
+        me = st['instance_id']
+        ms = dict(st.get('members') or {})
+        if member_id != me and member_id not in ms:
+            raise HaError('That instance is not a member of this group')
+        held = dict((st.get('agent_vmid') if member_id == me else ms[member_id].get('agent_vmid')) or {})
+        if held.get(cluster_id) == vmid or (vmid is None and cluster_id not in held):
+            return False
+        if vmid is None:
+            held.pop(cluster_id, None)
+        else:
+            held[cluster_id] = vmid
+        if member_id == me:
+            _commit_locked(dict(st, agent_vmid=held))
+        else:
+            ms[member_id] = dict(ms[member_id], agent_vmid=held)
+            _commit_locked(dict(st, members=ms))
+    return True
+
+
+def _clean_agent_vmid(value):
+    if not isinstance(value, dict):
+        return {}
+    return {k: v for k, v in list(value.items())[:64]
+            if isinstance(k, str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', k)
+            and type(v) is int and 100 <= v <= 999999999}
+
+
+# --- on the status page ---
+
+def make_leader_status(st, node, rt):
+    """For the status page: what Make leader, a planned restart and Force leader look like
+    from here (field names in lease_status)."""
+    out = {'transfer': None, 'planned_restart': None, 'last_campaign': None,
+           'make_leader': {'phrase': LEADER_PHRASE, 'self': False}}
+    now = ha_clock()
+    if node is not None and node.transfer is not None:
+        t = node.transfer
+        out['transfer'] = {'to': t['to'], 'to_url': (_lease_target(t['to']) or {}).get('url') or '',
+                           'phase': t['phase'], 'left': round(max(0.0, t['until'] - now), 1)}
+    if rt.planned is not None and now < rt.planned[1]:
+        by = rt.planned[0]
+        out['planned_restart'] = {'by': by, 'by_url': (_lease_target(by) or {}).get('url') or '',
+                                  'hold_left': round(rt.planned[1] - now, 1)}
+    if node is not None and node.last_failed is not None:
+        f = node.last_failed
+        out['last_campaign'] = {'ago': round(max(0.0, now - f['at']), 1), 'kind': f['kind'],
+                                'reached': f['reached'], 'majority': f['m'], 'reasons': f['reasons'],
+                                'unreachable': f['reached'] < f['m']}
+    out['make_leader']['self'] = bool(
+        node is not None and st['role'] == ROLE_STANDBY and node.view.mode == ha_vote.MODE_AUTO
+        and node.view.candidate(st['instance_id'], timer=False))
+    forced = st.get('forced') if isinstance(st.get('forced'), dict) else None
+    out['forced'] = ({k: forced.get(k) for k in ('epoch', 'at', 'by', 'reason', 'case', 'cut_out')}
+                     | {'onboot_left': forced.get('onboot') or {}}) if forced else None
+    out['force_leader'] = {k: v for k, v in force_leader_view(st).items() if k != 'epochs'}
+    out['way_out'] = way_out_refusal(st)
+    return out
 
 
 # --- the transport guard (design 5.3) ------------------------------------------------

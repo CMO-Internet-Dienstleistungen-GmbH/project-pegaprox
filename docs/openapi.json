@@ -43772,7 +43772,7 @@
           }
         },
         "summary": "Leave the group. Every member is told first if it answers. Wants user_password.",
-        "description": "A standby leaves on its own: the active drops it, and with the next sync so does\neverybody else. It becomes standalone and restarts, because from then on it acts on\nthe configuration it holds. An active leaves the group entirely: every member drops\nit and it becomes standalone; the standbys keep each other and wait for one of them\nto be promoted. 409 HA_AUTO_MODE in a group that fails over automatically, where\nautomatic failover is switched off first (ha.unpair_refusal).",
+        "description": "A standby leaves on its own: the active drops it, and with the next sync so does\neverybody else. It becomes standalone and restarts, because from then on it acts on\nthe configuration it holds. An active leaves the group entirely: every member drops\nit and it becomes standalone; the standbys keep each other and wait for one of them\nto be promoted.\n\nIn a group that fails over automatically a member leaves through the leader, which\ntakes it out of the voter config first (left_through names it); without an answering\nleader that is 409 HA_AUTO_MODE, as it is on the leader itself (it hands its lead on\nfirst), on a member that holds a switch another instance started, and on one whose\nonly way out is Force leader (auto.way_out of the status, ha.unpair_refusal).",
         "requestBody": {
           "required": false,
           "content": {
@@ -43818,7 +43818,7 @@
           }
         },
         "summary": "Take a standby out of the group, on the active. Wants user_password.",
-        "description": "Only a member that answered as a standby under the current epoch: anything else\nmay be an old active that is merely down, and would act again once it is back.\nshut_down: true is the admin confirming that the instance is shut down for good;\nwithout it such a member gets 409 HA_REMOVE_UNCONFIRMED. The removed instance\nstays on record as removed, and every remaining member hears so at once: from\nthen on its calls get 410 everywhere, and it lets go of the group when it hears\nthat. It is told right away if it answers (told), and stays a passive standby\nuntil an admin unpairs it there. Removing the last standby makes this instance\nstandalone.",
+        "description": "Only a member that answered as a standby under the current epoch: anything else\nmay be an old active that is merely down, and would act again once it is back.\nshut_down: true is the admin confirming that the instance is shut down for good;\nwithout it such a member gets 409 HA_REMOVE_UNCONFIRMED. The removed instance\nstays on record as removed, and every remaining member hears so at once: from\nthen on its calls get 410 everywhere, and it lets go of the group when it hears\nthat. It is told right away if it answers (told), and stays a passive standby\nuntil an admin unpairs it there. Removing the last standby makes this instance\nstandalone.\n\nIn a group that fails over automatically only the instance that holds the lease\nremoves a member, once a majority confirmed that again (503 HA_NO_LEASE otherwise),\nand the member leaves the voter config first, one change at a time. 409 HA_AUTO_MODE\nwhere that would leave fewer than three votes, for the leader itself, and while a\nswitch to automatic failover is pending.",
         "parameters": [
           {
             "name": "instance_id",
@@ -43931,6 +43931,153 @@
         },
         "summary": "Take a quarantined voter back, on the leader of an automatic group. Wants user_password.",
         "description": "A voter that reports an older state than it reported before (a restored backup, a\nreverted VM snapshot) is quarantined by the leader: it may have forgotten a vote,\nso its votes and acks stop counting, and it still counts in the majority to reach.\nOnce an admin has looked at it, this lets it count again, in force when a majority\nholds the change. 409 in a manual group and for a member that is not quarantined,\n503 HA_NO_LEASE on an instance that does not hold the lease.",
+        "parameters": [
+          {
+            "name": "instance_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-roles": [
+          "admin"
+        ]
+      }
+    },
+    "/api/ha/make-leader": {
+      "post": {
+        "operationId": "ha.make_leader_post",
+        "tags": [
+          "ha"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Hand the lead of an automatic group to a data member with a vote. Wants confirm: LEADER and user_password.",
+        "description": "On the leader, target names the member. The leader pauses writes (503 HA_TRANSFER),\nthe member catches up, and the leader stops acting and hands it its next term; the\nmember votes at once and restarts as the leader, the old leader restarts as a\nstandby. On a member, without target (or naming itself): it asks the leader to do\nthat, and where no leader answers it campaigns at once, with the pre-vote and every\nrule. result: handed (the leader let go, the vote is out), elected (this instance won\nand restarts) or catching up. 409 HA_TRANSFER_REFUSED says why not: the target cannot\nwin (no vote, quarantined, does not answer, behind on the voter config), it did not\ncatch up within 10 s (writes are open again), the leader holds a majority this member\nis cut off from, or no majority answers at all (Force leader is offered then). 409\nHA_MANUAL in a group in manual mode, HA_AUTO_NOT_SHIPPED while this release does not\noffer automatic failover, 503 HA_NO_LEASE on a leader without its lease.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-roles": [
+          "admin"
+        ]
+      }
+    },
+    "/api/ha/force-leader": {
+      "post": {
+        "operationId": "ha.force_leader_post",
+        "tags": [
+          "ha"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Force leader: this member of an automatic group that lost its majority for good becomes the manual active of its group. Wants confirm: FORCE LEADER, user_password, reason (free text) and cut_out, the instance ids of every voter that does not answer, each one powered off or destroyed - auto.force_leader of the status lists them, with the warning the dialog shows.",
+        "description": "Offered only where no leader was heard for the lease and a half, the last election\nfrom here found no majority answering, and nothing that answers holds the lease; also\non a member that holds a pending switch to automatic failover whose maker is gone,\nand on one whose only way out is Force leader (auto.way_out). The members in cut_out\nare out of the group (they hear 410 and go passive when they come back), the voter\nconfig goes to manual mode at a new epoch, and automatic failover comes back only\nthrough the switch. After the restart this instance writes its claim (marked forced)\non every cluster with the claim on, and switches autostart off on the VMs of the\ncut-out members an admin named (agent_vmid). The members that answer hear of the\nnew epoch at once. 409 HA_FORCE_REFUSED with the reason where it is not offered or\ncut_out does not name exactly the members that do not answer.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-roles": [
+          "admin"
+        ]
+      }
+    },
+    "/api/ha/members/{instance_id}/agent-vmid": {
+      "put": {
+        "operationId": "ha.set_member_agent_vmid_put",
+        "tags": [
+          "ha"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "The VM a member runs as on one cluster, on the leader: cluster_id and vmid (null forgets it). instance_id may be the leader itself. Force leader switches autostart off on the VMs of the members it cuts out (design 7.3); the members learn it with their next sync. No password: it names a VM, it does not act on one. 404 for a cluster this instance does not manage, 409 anywhere but on the leader, 409 HA_AUTO_NOT_SHIPPED while this release does not offer automatic failover (Force leader is refused then too), 503 HA_NO_LEASE on a leader without its lease.",
         "parameters": [
           {
             "name": "instance_id",
@@ -44779,6 +44926,123 @@
         ]
       }
     },
+    "/api/ha/peer/campaign": {
+      "post": {
+        "operationId": "ha.peer_campaign_post",
+        "tags": [
+          "ha"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not the paired instance"
+          },
+          "410": {
+            "description": "HA_REMOVED: the caller was removed from the group"
+          }
+        },
+        "summary": "The leader of an automatic group handed this member its next term (Make leader, design 7.1): {epoch}, the term it leads. This member votes at once, without the pre-vote, only while it holds the allowance for exactly the next term from that leader's renewal; a late or replayed call does nothing. The answer is 200 with {ok, reason}, NO_ALLOWANCE when nothing was handed to it.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "inline",
+        "security": [
+          {
+            "haPeer": []
+          }
+        ]
+      }
+    },
+    "/api/ha/peer/transfer": {
+      "post": {
+        "operationId": "ha.peer_transfer_post",
+        "tags": [
+          "ha"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not the paired instance"
+          },
+          "410": {
+            "description": "HA_REMOVED: the caller was removed from the group"
+          }
+        },
+        "summary": "A member asks this leader to hand it the lead: an admin chose Make leader there (design 7.1). Only for the member itself, only from one that signs its calls, only on the leader of an automatic group (409 with follow anywhere else). The answer waits until the member caught up and the term went out: result handed or catching up; 409 HA_TRANSFER_REFUSED says why not (it cannot win, it did not catch up in time), 503 HA_NO_LEASE on a leader without its lease.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "inline",
+        "security": [
+          {
+            "haPeer": []
+          }
+        ]
+      }
+    },
+    "/api/ha/peer/leave": {
+      "post": {
+        "operationId": "ha.peer_leave_post",
+        "tags": [
+          "ha"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not the paired instance"
+          },
+          "410": {
+            "description": "HA_REMOVED: the caller was removed from the group"
+          }
+        },
+        "summary": "A member of an automatic group unpairs, and asks this leader first (design 7.4): it goes out of the voter config, one change at a time and once a majority confirmed the lease again, then out of the member list. left: true once it may go. 409 HA_AUTO_MODE where that would leave fewer than three votes, 409 with follow on an instance that does not lead, 503 HA_NO_LEASE on a leader without its lease.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "inline",
+        "security": [
+          {
+            "haPeer": []
+          }
+        ]
+      }
+    },
     "/api/ha/peer/pair-witness": {
       "post": {
         "operationId": "ha.peer_pair_witness_post",
@@ -44873,7 +45137,7 @@
           }
         },
         "summary": "A write a standby would have refused, handed to us to run as the user it names.",
-        "description": "The body is {method, path, query, content_type, body_b64, user, sign_in,\nclient_ip}, the browser's request as the standby took it, and the peer signature\ncovers it like the body of every peer call: neither the request nor the user can\nchange on the way. Only on the active (409 anywhere else, which also stops a write\nthat would travel on; 503 HA_NO_LEASE on a leader without its lease, said to a\nmember before the body is read), only from a member that signs its calls, only a\nwrite under\n/api/ and never under /api/ha/ - or a GET of ha.FORWARDED_READS, the progress of a\njob or a view only our tables hold, or of a plugin route that opens no console -\nand only for an account that exists and is enabled here. sign_in is the\nstandby's digest of the account's password (ha.sign_in_digest): 403\nHA_FORWARD_STALE_SIGN_IN when ours differs, the password changed here since.\nThe request then goes through our routing and every check on the way, CSRF and\nthe IP list included, under a session for that user that holds for this one\nrequest: role, tenant and permissions are ours, whatever the standby thinks of\nthem. Its audit lines name the standby and carry the client address the standby\nsaw. The answer is {status, headers, body_b64}.",
+        "description": "The body is {method, path, query, content_type, body_b64, user, sign_in,\nclient_ip}, the browser's request as the standby took it, and the peer signature\ncovers it like the body of every peer call: neither the request nor the user can\nchange on the way. Only on the active (409 anywhere else, which also stops a write\nthat would travel on; 503 HA_NO_LEASE on a leader without its lease, said to a\nmember before the body is read, and 503 HA_TRANSFER for a write while it hands its\nlead on), only from a member that signs its calls, only a\nwrite under\n/api/ and never under /api/ha/ - or a GET of ha.FORWARDED_READS, the progress of a\njob or a view only our tables hold, or of a plugin route that opens no console -\nand only for an account that exists and is enabled here. sign_in is the\nstandby's digest of the account's password (ha.sign_in_digest): 403\nHA_FORWARD_STALE_SIGN_IN when ours differs, the password changed here since.\nThe request then goes through our routing and every check on the way, CSRF and\nthe IP list included, under a session for that user that holds for this one\nrequest: role, tenant and permissions are ours, whatever the standby thinks of\nthem. Its audit lines name the standby and carry the client address the standby\nsaw. The answer is {status, headers, body_b64}.",
         "requestBody": {
           "required": false,
           "content": {

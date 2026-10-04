@@ -519,7 +519,11 @@ def create_app():
         from pegaprox.core import ha
         view_args = request.view_args or {}
         if not ha.is_standby():
-            if ha.is_active():
+            # MK Oct 2026 (#625) - the leader hands its lead on: writes wait until the
+            # member it goes to caught up (design 7.1)
+            active = ha.is_active()
+            pausing = active and ha.handing_over()
+            if active and not pausing:
                 return None
             # MK Oct 2026 (#625) - automatic failover: this instance leads and holds no
             # lease right now (it ran out, or the takeover wait is on). A change taken now
@@ -528,6 +532,9 @@ def create_app():
             if (request.method, rule) in _STANDBY_CONSOLES or (
                     plugin_call and view_args.get('subpath') in _PLUGIN_CONSOLE_PATHS):
                 return None
+            if pausing:
+                from pegaprox.api.ha import transfer_refusal
+                return transfer_refusal()
             # never None: is_active() said no, and a second look at the state may find a
             # standby by now, which would wave the write through
             from pegaprox.api.ha import write_gate_refusal

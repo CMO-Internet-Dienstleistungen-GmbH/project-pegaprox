@@ -187,6 +187,9 @@ def test_the_promotion_says_when_the_old_active_refused_to_step_down(auto, seed,
     assert auto.put('a', '/api/ha/mode', OFF).status_code == 200
     auto.step('a')
     monkeypatch.setattr(auto.ha, '_members_say_auto', lambda timeout=5: None)
+    # b holds a switch back nobody confirmed, which S7 refuses a plain promotion for
+    # (tests/test_ha_way_out.py); this is about what the audit line says
+    monkeypatch.setattr(auto.ha, 'way_out_check', lambda: '')
     r = _promote(auto.g, auto.admin, 'b')
     assert r.status_code == 200, r.data
     assert auto.file('a')['role'] == 'leader'

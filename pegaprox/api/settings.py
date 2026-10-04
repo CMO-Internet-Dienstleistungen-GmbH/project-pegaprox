@@ -882,6 +882,8 @@ def perform_pegaprox_update():
         def restart_server():
             time.sleep(restart_delay)
             logging.info("Restarting PegaProx server...")
+            # the leader of an automatic group: the members hold its lease meanwhile (#625)
+            ha.planned_restart(f'update to {new_version}')
 
             is_root = os.geteuid() == 0 if hasattr(os, 'geteuid') else False
             has_sudo = shutil.which('sudo') is not None
@@ -1058,6 +1060,7 @@ def rollback_pegaprox_update():
         # Schedule restart
         def restart_server():
             time.sleep(3)
+            ha.planned_restart(f'rollback to {backup_name}')
             is_root = os.geteuid() == 0 if hasattr(os, 'geteuid') else False
             has_sudo = shutil.which('sudo') is not None
             
@@ -1968,6 +1971,7 @@ def restart_server():
         def do_restart():
             time.sleep(1)  # Give time for response to be sent
             logging.info("Server restart initiated by admin")
+            ha.planned_restart(f'restart asked for by {user}')
             
             is_root = os.geteuid() == 0 if hasattr(os, 'geteuid') else False
             has_sudo = shutil.which('sudo') is not None

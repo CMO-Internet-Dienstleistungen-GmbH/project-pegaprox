@@ -377,6 +377,9 @@ def test_an_active_that_did_not_start_the_switch_hands_the_chain_out_as_well(aut
     it hangs off the config held there, each link signed by a voter of the one before -
     whoever sends it."""
     _away_while_it_went_through_and_back(auto, seed, back=False)
+    # b heard from the manual active that the switch back went through: a switch back it
+    # holds and nobody confirmed would leave it Force leader as the only way out (S7)
+    assert _sync(auto.g, auto.admin, 'b') in ('applied', 'unchanged')
     auto.crash('a')
     auto.members = 'bc'
     r = _promote(auto.g, auto.admin, 'b')

@@ -54,6 +54,11 @@ ADMIN_ROUTES = [
     # the witness (tests/test_ha_witness.py)
     ('post', '/api/ha/witness/pairing-code', {'url': ACTIVE_URL, 'user_password': ADMIN_PW}),
     ('post', '/api/ha/witness/remove', {'confirm': 'REMOVE', 'user_password': ADMIN_PW}),
+    # the lead of an automatic group (tests/test_ha_make_leader.py, test_ha_force_leader.py)
+    ('post', '/api/ha/make-leader', {'confirm': 'LEADER', 'user_password': ADMIN_PW}),
+    ('post', '/api/ha/force-leader', {'confirm': 'FORCE LEADER', 'cut_out': [], 'reason': 'test',
+                                      'user_password': ADMIN_PW}),
+    ('put', f'/api/ha/members/{B_ID}/agent-vmid', {'cluster_id': 'c1', 'vmid': 101}),
 ]
 PEER_ROUTES = [
     ('POST', '/api/ha/peer/pair'),
@@ -70,6 +75,9 @@ PEER_ROUTES = [
     ('POST', '/api/ha/peer/fingerprint'),
     ('POST', '/api/ha/peer/pair-witness'),
     ('POST', '/api/ha/peer/witness-leave'),
+    ('POST', '/api/ha/peer/campaign'),
+    ('POST', '/api/ha/peer/transfer'),
+    ('POST', '/api/ha/peer/leave'),
 ]
 # what the self-fence agent of a node asks; no session, keyed with the cluster's agent
 # token (tests/test_ha_agent_script.py)
@@ -361,6 +369,9 @@ def test_an_admin_reaches_every_route(ha_env, seed):
         '/api/ha/timezone': 409,                    # not the leader of a group
         '/api/ha/witness/pairing-code': 409,        # not offered by this release yet
         '/api/ha/witness/remove': 409,              # not the leader of a group
+        '/api/ha/make-leader': 409,                 # not offered by this release yet
+        '/api/ha/force-leader': 409,                # not offered by this release yet
+        f'/api/ha/members/{B_ID}/agent-vmid': 409,  # not the leader of a group
     }
     for method, path, body in ADMIN_ROUTES:
         r = _send(c, method, path, body)
