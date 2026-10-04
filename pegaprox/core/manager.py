@@ -11449,7 +11449,13 @@ echo "AGENT_INSTALLED_OK"
             # pveproxy listens on every bridge incl. the corosync link, so
             # 8006 reachability says nothing about whether we can actually SSH
             # there. Default 22, override via cluster.ssh_port.
-            ssh_port = getattr(self.config, 'ssh_port', 22) or 22
+            # MK Oct 2026: with SSH switched off nothing ever connects there, and a
+            # knock on the SSH port of a hardened node is only noise in its log -
+            # the API port tells whether the address answers
+            if getattr(self.config, 'ssh_disabled', False):
+                probe_port = self.api_port or 8006
+            else:
+                probe_port = getattr(self.config, 'ssh_port', 22) or 22
 
             # ================================================================
             # STEP 1: Find which interface the PRIMARY node uses for management
@@ -11545,11 +11551,11 @@ echo "AGENT_INSTALLED_OK"
                                         in_mgmt_net = False
                                 if not in_mgmt_net:
                                     self.logger.debug(f"[NodeIP] {node_name}: cluster/status IP {node_direct_ip} outside mgmt net {primary_network}, skipping quick path (probably corosync)")
-                                elif _quick_probe(node_direct_ip, port=ssh_port):
-                                    self.logger.info(f"[NodeIP] {node_name} -> {node_direct_ip} (cluster/status, reachable on :{ssh_port})")
+                                elif _quick_probe(node_direct_ip, port=probe_port):
+                                    self.logger.info(f"[NodeIP] {node_name} -> {node_direct_ip} (cluster/status, reachable on :{probe_port})")
                                     return node_direct_ip
                                 else:
-                                    self.logger.debug(f"[NodeIP] {node_name}: cluster/status IP {node_direct_ip} not reachable on :{ssh_port}, continuing")
+                                    self.logger.debug(f"[NodeIP] {node_name}: cluster/status IP {node_direct_ip} not reachable on :{probe_port}, continuing")
                             break
             except Exception as e:
                 self.logger.debug(f"[NodeIP] cluster/status quick path failed: {e}")
@@ -11651,11 +11657,11 @@ echo "AGENT_INSTALLED_OK"
                     self.logger.debug(f"[NodeIP] {node_name}: probe cap reached, falling through to STEP 4")
                     break
                 probed += 1
-                if _quick_probe(ip, port=ssh_port):
-                    self.logger.info(f"[NodeIP] {node_name} -> {ip} (score={score}, {reason}) reachable on :{ssh_port}")
+                if _quick_probe(ip, port=probe_port):
+                    self.logger.info(f"[NodeIP] {node_name} -> {ip} (score={score}, {reason}) reachable on :{probe_port}")
                     return ip
                 else:
-                    self.logger.debug(f"[NodeIP] {node_name}: {ip} score={score} NOT reachable on :{ssh_port}")
+                    self.logger.debug(f"[NodeIP] {node_name}: {ip} score={score} NOT reachable on :{probe_port}")
 
             # ================================================================
             # STEP 4: Corosync -- ONLY if in management network
@@ -11674,8 +11680,8 @@ echo "AGENT_INSTALLED_OK"
                                     try:
                                         la = ipaddress.ip_address(link_ip)
                                         if primary_network and la in primary_network:
-                                            if _quick_probe(link_ip, port=ssh_port):
-                                                self.logger.info(f"[NodeIP] {node_name} -> {link_ip} (corosync {key}, mgmt net) reachable on :{ssh_port}")
+                                            if _quick_probe(link_ip, port=probe_port):
+                                                self.logger.info(f"[NodeIP] {node_name} -> {link_ip} (corosync {key}, mgmt net) reachable on :{probe_port}")
                                                 return link_ip
                                         else:
                                             self.logger.debug(f"[NodeIP] SKIP corosync {link_ip} ({key}) -- not in mgmt network")
@@ -11702,7 +11708,7 @@ echo "AGENT_INSTALLED_OK"
                 for af, socktype, proto, canonname, sa in addrs:
                     ip = sa[0]
                     if ip and ip != primary_ip and not ip.startswith('127.') and ip != '::1':
-                        if _quick_probe(ip, port=ssh_port):
+                        if _quick_probe(ip, port=probe_port):
                             self.logger.info(f"[NodeIP] Resolved {node_name} to {ip} (DNS, {'IPv6' if af == socket.AF_INET6 else 'IPv4'})")
                             return ip
                 # If probe failed, return first result anyway
