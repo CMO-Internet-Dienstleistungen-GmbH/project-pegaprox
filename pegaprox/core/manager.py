@@ -3262,11 +3262,13 @@ class PegaProxManager:
                     'restart': 1
                 }
                 if has_local_disks:
-                    # PVE wants "rootfs=stor,mp0=stor2" mapping for LXC
+                    # target-storage is a storage-pair list ("src:dst"), same as targetstorage below
                     stor_map = self._get_vm_storage_map(source_node, vmid, 'lxc')
                     if stor_map:
-                        # map each volume to itself (same storage name on target)
-                        data['target-storage'] = ','.join(f"{k}={v}" for k, v in stor_map.items())
+                        # MK Oct 2026 (#808) - this sent "rootfs=local-zfs", which PVE parses as one
+                        # storage ID and rejects. One pair per storage, PVE refuses a repeated source.
+                        unique = list(dict.fromkeys(stor_map.values()))
+                        data['target-storage'] = ','.join(f"{s}:{s}" for s in unique)
                     else:
                         stor = self._get_vm_storage(source_node, vmid, 'lxc')
                         if stor:
