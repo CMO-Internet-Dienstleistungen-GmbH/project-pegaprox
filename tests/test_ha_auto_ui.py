@@ -327,9 +327,10 @@ def test_the_requests_are_what_the_routes_read(stage2):
 
 def test_every_request_goes_to_a_route_the_cards_were_built_against(stage2):
     """The mode, witness and zone routes, and since slices S7 and S8 Make leader, Force leader and
-    the site and vote of a member (tests/test_ha_lead_ui.py pins those): nothing else."""
+    the site, vote and agent VM of a member (tests/test_ha_lead_ui.py pins those): nothing else."""
     paths = set(re.findall(r"haGroupSend\(getAuthHeaders, [^,]+, ([^,]+),", stage2))
-    assert paths == {'path', "'witness/pairing-code'", "'witness/remove'", "'timezone'", "'force-leader'"}, paths
+    assert paths == {'path', "'witness/pairing-code'", "'witness/remove'", "'timezone'", "'force-leader'",
+                     '`members/${encodeURIComponent(id)}/agent-vmid`'}, paths
     assert "const path = what === 'readmit' ? `members/${encodeURIComponent(target)}/readmit` : 'mode';" in stage2
     assert ("const path = what === 'site' ? `members/${encodeURIComponent(id)}/site`\n"
             "                    : leader ? 'make-leader' : `members/${encodeURIComponent(id)}/vote`;") in stage2

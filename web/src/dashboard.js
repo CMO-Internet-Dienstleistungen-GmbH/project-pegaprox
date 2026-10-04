@@ -899,15 +899,17 @@
         // when it has no leader (changes and automation wait, consoles go on), when a new one is
         // taking over and, for ten minutes, that the leader changed. The first two stay while
         // they hold; the change can be closed, and a later change shows again. Admins get a way
-        // to the HA tab. Every value is an address the server sends, put in as it is.
+        // to the HA tab. The addresses come only to an admin the HA tab is open to, every other
+        // user reads the same without them; whatever the server sends goes in as it is.
         function HaLeaderBanner({ onOpenHa, cloud = false }) {
             const { t } = useTranslation();
             const { ha, isAdmin } = useAuth();
             const [closed, setClosed] = useState('');          // the change of the leader the user closed
             const [, setTick] = useState(0);
             const automatic = ha?.automatic === true;
+            const named = (v) => typeof v === 'string' && v ? v : '';
             const takeover = automatic && ha.takeover && typeof ha.takeover === 'object' ? ha.takeover : null;
-            const changed = automatic && ha.leader_changed && typeof ha.leader_changed === 'object' && ha.leader_changed.to
+            const changed = automatic && ha.leader_changed && typeof ha.leader_changed === 'object' && named(ha.leader_changed.at)
                 ? ha.leader_changed : null;
             const noLeader = automatic && ha.no_leader === true;
             // resume_in counts from the answer that brought it, and on between two polls
@@ -917,18 +919,20 @@
                 const h = setInterval(() => setTick(n => n + 1), 1000);
                 return () => clearInterval(h);
             }, [!!takeover]);
-            const changeKey = changed ? `${changed.epoch ?? ''}|${changed.at || ''}` : '';
+            const changeKey = changed ? `${changed.at}|${named(changed.to)}` : '';
             const lines = [];
             if (noLeader) {
                 lines.push({ kind: 'no-leader', tone: 'red', icon: <Icons.AlertTriangle />, text: t('haNoLeader') });
             } else if (takeover) {
                 const left = Math.max(1, Math.round((Number(takeover.resume_in) || 0) - (Date.now() - heardAt) / 1000));
                 lines.push({ kind: 'takeover', tone: 'blue', icon: <Icons.RefreshCw />,
-                             text: t('haTakeover').replace('{leader}', () => takeover.leader || '-').replace('{n}', left) });
+                             text: (named(takeover.leader) ? t('haTakeover').replace('{leader}', () => takeover.leader) : t('haTakeoverUnnamed'))
+                                 .replace('{n}', left) });
             }
             if (changed && closed !== changeKey) {
                 lines.push({ kind: 'leader-changed', tone: 'blue', icon: <Icons.Info />, close: true,
-                             text: t('haLeaderChanged').replace('{to}', () => changed.to).replace('{time}', () => fmtTime(changed.at) || '-') });
+                             text: (named(changed.to) ? t('haLeaderChanged').replace('{to}', () => changed.to) : t('haLeaderChangedAt'))
+                                 .replace('{time}', () => fmtTime(changed.at) || '-') });
             }
             if (!lines.length) return null;
 
@@ -9848,6 +9852,11 @@
                     if ((res.status === 409 || res.status === 503) && haRefusedRef.current) {
                         const body = await res.clone().json().catch(() => null);
                         const code = body && body.code;
+                        // the leader of an automatic group without its lease, or handing it on: the
+                        // banner (no leader, takeover) is read again; the caller says what failed
+                        if (res.status === 503 && (code === 'HA_NO_LEASE' || code === 'HA_TRANSFER')) {
+                            window.dispatchEvent(new CustomEvent('pegaprox-ha-lease'));
+                        }
                         if ((res.status === 409 && code === 'HA_STANDBY') || (res.status === 503 && code === 'HA_ACTIVE_UNREACHABLE')) {
                             const read = res.status === 503 && (rest.method || 'GET').toUpperCase() === 'GET';
                             const error = haRefusedRef.current(quiet || read, code);

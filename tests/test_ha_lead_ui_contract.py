@@ -15,7 +15,7 @@ from _ha_lease_harness import T, auto  # noqa: F401  (the fixture)
 from test_ha_api import ADMIN_PW
 from test_ha_force_leader import _lost_majority
 from test_ha_make_leader import _formed
-from test_ha_member_settings import IPMI, _Pve, _banner, _clusters, _handed_to_b, _viewer
+from test_ha_member_settings import IPMI, V2, _Pve, _banner, _clusters, _handed_to_b, _viewer
 from test_ha_members import IDS, group  # noqa: F401  (the fixture)
 from test_ha_ui import _read
 
@@ -41,12 +41,17 @@ def FORCE(pw, cut_out, reason):
     return {'confirm': 'FORCE LEADER', 'cut_out': list(cut_out), 'reason': reason, 'user_password': pw}
 
 
+def VMID(cluster, vmid):
+    return {'cluster_id': cluster, 'vmid': vmid}
+
+
 # what the panel, the status line, the member cells and the lead card read
 LEAD_KEYS = {'transfer', 'planned_restart', 'last_campaign', 'make_leader', 'forced', 'force_leader', 'way_out',
              'renewed_ago', 'leader_change', 'unconfirmed', 'promise', 'leader_cv', 'behind', 'change_pending', 'site',
-             'may_lead', 'holds_lease', 'holder', 'lease_left', 'mode', 'epoch', 'members', 'witness', 'findings'}
+             'may_lead', 'holds_lease', 'holder', 'lease_left', 'mode', 'epoch', 'members', 'witness', 'findings',
+             'agent_vmid'}
 ROW_KEYS = {'instance_id', 'kind', 'voter', 'may_lead', 'site', 'cv', 'behind', 'current', 'promised_to',
-            'promised_left', 'unreached_from', 'make_leader', 'make_leader_why'}
+            'promised_left', 'unreached_from', 'make_leader', 'make_leader_why', 'agent_vmid'}
 SPLIT_KEYS = {'voters', 'majority', 'tolerates', 'level', 'sites', 'unlabeled', 'clusters', 'findings'}
 SITE_KEYS = {'site', 'voters', 'votes', 'candidates', 'members', 'witness', 'survives_loss'}
 CLUSTER_KEYS = {'id', 'name', 'kind', 'nodes', 'agents', 'agent_version', 'fence', 'fence_verified', 'ready',
@@ -74,7 +79,8 @@ def test_the_ui_tests_pin_these_bodies():
                     "{'target': B, 'confirm': 'LEADER', 'user_password': PASSWORD}",
                     "[{'confirm': 'LEADER', 'user_password': PASSWORD}]",
                     "{'confirm': 'FORCE LEADER', 'cut_out': [B, W],",
-                    "'reason': 'site A burned down', 'user_password': PASSWORD}"):
+                    "'reason': 'site A burned down', 'user_password': PASSWORD}",
+                    "[{'cluster_id': 'c2', 'vmid': 205},", "{'cluster_id': 'old', 'vmid': None}]"):
         assert literal in ui, literal
 
 
@@ -130,6 +136,29 @@ def test_the_status_carries_every_key_the_panel_reads(auto, seed, monkeypatch):
     member = _status(auto, 'b')['auto']
     assert member['holder'] == IDS['a'] and member['make_leader']['self'] is True
     assert member['promise']['to'] == IDS['a'] and isinstance(member['promise']['left'], (int, float))
+
+
+def test_the_agent_vm_bodies_pass_their_route_and_the_status_carries_them(auto, seed, monkeypatch):
+    _formed(auto, seed)
+    _clusters(monkeypatch, c1=_Pve(fence_agent_versions=V2))
+    for member, vmid in ((IDS['b'], 205), (IDS['a'], 100)):
+        r = _put(auto, 'a', member, 'agent-vmid', VMID('c1', vmid))
+        assert r.status_code == 200 and r.get_json() == {'success': True, 'changed': True}, r.data
+    status = _status(auto)
+    assert {r['instance_id']: r['agent_vmid'] for r in status['auto']['members']}[IDS['b']] == {'c1': 205}
+    assert status['auto']['agent_vmid'] == {'c1': 100}
+    # the form has a row for each of these
+    assert [(c['id'], c['kind']) for c in status['split_safety']['clusters']] == [('c1', 'proxmox')]
+    r = _put(auto, 'a', IDS['b'], 'agent-vmid', VMID('c1', None))
+    assert r.status_code == 200 and r.get_json()['changed'] is True
+    assert {r['instance_id']: r['agent_vmid'] for r in _status(auto)['auto']['members']}[IDS['b']] == {}
+    # what the input lets through and the route refuses, and the refusals the form shows
+    assert _put(auto, 'a', IDS['b'], 'agent-vmid', VMID('c1', 99)).status_code == 400
+    r = _put(auto, 'a', IDS['b'], 'agent-vmid', VMID('nope', 101))
+    assert r.status_code == 404 and r.get_json()['error'] == 'Cluster not found'
+    monkeypatch.setattr(hv, 'AUTO_MODE_SHIPPED', False)
+    r = _put(auto, 'a', IDS['b'], 'agent-vmid', VMID('c1', 101))
+    assert r.status_code == 409 and r.get_json()['code'] == 'HA_AUTO_NOT_SHIPPED'
 
 
 def test_the_site_bodies_pass_their_route(auto, seed):
@@ -197,9 +226,12 @@ def test_the_banner_carries_what_the_banners_read(auto, seed, when):
     if when == 'takeover':
         _handed_to_b(auto, seed)
         auto.run(T.W_take + 10, until=lambda: 'b' in auto.holders())
+        # a viewer: when, and no address; an admin the addresses as well (the banner names them then)
         got = _banner(auto, 'c', viewer)
-        assert got['automatic'] is True and set(got['takeover']) == {'leader', 'resume_in'}
-        assert set(got['leader_changed']) == {'to', 'from', 'at', 'epoch'}
+        assert got['automatic'] is True and set(got['takeover']) == {'resume_in'}
+        assert set(got['leader_changed']) == {'at'} and isinstance(got['leader_changed']['at'], str)
+        got = _banner(auto, 'c', auto.admin)
+        assert set(got['takeover']) == {'leader', 'resume_in'} and set(got['leader_changed']) == {'to', 'from', 'at'}
         assert isinstance(got['takeover']['leader'], str) and isinstance(got['leader_changed']['to'], str)
     else:
         _formed(auto, seed)

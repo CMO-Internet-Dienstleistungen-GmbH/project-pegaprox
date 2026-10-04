@@ -9979,6 +9979,7 @@
                 });
                 if (!r.ok) {
                     const code = (await r.clone().json().catch(() => null))?.code || '';
+                    haLeaseRefused(r.status, code);
                     return { ok: false, code, error: await PegaProxApiErrors.message(r, fallback || t('pgHaActionFailed')) };
                 }
                 return { ok: true, data: await r.json().catch(() => ({})) };
@@ -10317,9 +10318,10 @@
             const nameOf = (id) => id && id === status?.instance_id ? t('haAutoThisInstance')
                 : id && id === auto?.witness?.instance_id ? (auto.witness.url || t('haAutoTheWitness'))
                 : memberName(members.find(m => m.instance_id === id) || { instance_id: String(id || '') });
-            // The leader sets the site, vote and may lead of each member and makes one leader, in a
-            // form under its row (HaMemberForm). Held while a switch is pending, while the lead is
-            // handed on (writes pause then) and in an automatic group without the lease; a member reads.
+            // The leader sets the site, vote, may lead and agent VM of each member and makes one
+            // leader, in a form under the table (HaMemberForm, HaAgentVmForm). Held while a switch is
+            // pending, while the lead is handed on (writes pause then) and in an automatic group
+            // without the lease; a member reads.
             const locked = auto?.mode === 'auto_pending' ? t('haAutoLockedPending')
                 : auto?.transfer ? t('haAutoLockedTransfer')
                 : auto?.mode === 'auto' && auto.holds_lease !== true ? t('haAutoNoLeader') : '';
@@ -10332,6 +10334,9 @@
                 locked,
                 voteLocked: locked || (notShipped ? t('haAutoNotShipped') : ''),
                 leadLocked: locked,
+                // the clusters with node HA of the Proxmox kind: an agent VM is named per cluster
+                clusters: (Array.isArray(status?.split_safety?.clusters) ? status.split_safety.clusters : [])
+                    .filter(c => c && typeof c === 'object' && typeof c.id === 'string' && c.id && c.kind !== 'other'),
             } : null;
             // a form whose member is no longer the leader's to set closes, and what was typed goes with it
             useEffect(() => { if (!memberCtl || locked) setMemberEdit(null); }, [!!memberCtl, !!locked]);
@@ -10348,21 +10353,21 @@
                 if (status && (haBanner?.automatic === true) !== (auto?.mode === 'auto')) refreshHa?.();
             }, [auto?.mode]);
             const memberForm = (target) => memberCtl && memberEdit && memberEdit.id === target.instance_id && (
-                <HaMemberForm key={`${memberEdit.what}:${memberEdit.id}`} t={t} what={memberEdit.what} target={target}
-                    name={nameOf(target.instance_id)} value={memberEdit.value}
-                    phrase={typeof auto?.make_leader?.phrase === 'string' && auto.make_leader.phrase ? auto.make_leader.phrase : 'LEADER'}
-                    getAuthHeaders={getAuthHeaders} onClose={() => setMemberEdit(null)} onDone={() => { setMemberEdit(null); load(); }}
-                    onRefused={load} onRestart={setRestarting} addToast={addToast} />
+                memberEdit.what === 'vmid' ? (
+                    <HaAgentVmForm key={`vmid:${memberEdit.id}`} t={t} target={target} name={nameOf(target.instance_id)}
+                        clusters={memberCtl.clusters} getAuthHeaders={getAuthHeaders} onClose={() => setMemberEdit(null)}
+                        onSaved={load} addToast={addToast} />
+                ) : (
+                    <HaMemberForm key={`${memberEdit.what}:${memberEdit.id}`} t={t} what={memberEdit.what} target={target}
+                        name={nameOf(target.instance_id)} value={memberEdit.value}
+                        phrase={typeof auto?.make_leader?.phrase === 'string' && auto.make_leader.phrase ? auto.make_leader.phrase : 'LEADER'}
+                        getAuthHeaders={getAuthHeaders} onClose={() => setMemberEdit(null)} onDone={() => { setMemberEdit(null); load(); }}
+                        onRefused={load} onRestart={setRestarting} addToast={addToast} />
+                )
             );
-            const columns = 7 + (canSetActive ? 1 : 0) + (canRemove ? 1 : 0) + (autoRows ? (memberCtl ? 7 : 5) : 0);
-            const formRow = (row) => {
-                const form = row && memberForm(row);
-                return form && (
-                    <tr key={`${row.instance_id}:form`} data-ha-member-form-row={row.instance_id}>
-                        <td colSpan={columns} className="py-2">{form}</td>
-                    </tr>
-                );
-            };
+            // the member whose form is open: it goes under the table, not into a row of it, where it
+            // took the width of the whole table and its scroller cut the text off
+            const editRow = memberCtl && memberEdit ? (autoRows || []).find(r => r.instance_id === memberEdit.id) || null : null;
             const membersCard = (
                 <div className={card} data-ha-members={members.length}>
                     <div className="flex flex-wrap items-center justify-between gap-3">
@@ -10399,8 +10404,7 @@
                                     </tr>
                                 </thead>
                                 <tbody className="divide-y divide-proxmox-border">
-                                    {/* each member, and under its row the form the leader opened for it */}
-                                    {members.flatMap(m => [(
+                                    {members.map(m => (
                                         <tr key={m.instance_id} data-ha-member={m.instance_id} data-ha-source={m.is_source ? '' : undefined}
                                             data-ha-confirmed={typeof m.confirmed_standby === 'boolean' ? String(m.confirmed_standby) : undefined}>
                                             <td className={`${cell} whitespace-nowrap`}>
@@ -10465,7 +10469,7 @@
                                             )}
                                             {autoRows && <HaAutoMemberCells t={t} cell={cell} row={autoOf(m)} ctl={memberCtl} nameOf={nameOf} />}
                                         </tr>
-                                    ), formRow(autoOf(m))])}
+                                    ))}
                                     {/* the witness votes and holds nothing: no epoch, no sync, nothing to switch here */}
                                     {witnessRow && (
                                         <tr data-ha-member-witness={witnessRow.instance_id}>
@@ -10491,12 +10495,14 @@
                                             <HaAutoMemberCells t={t} cell={cell} row={witnessRow} ctl={memberCtl} nameOf={nameOf} />
                                         </tr>
                                     )}
-                                    {witnessRow && formRow(witnessRow)}
                                 </tbody>
                             </table>
                         </div>
                     ) : (
                         <p className="text-sm text-gray-400">{t('pgHaNoMembers')}</p>
+                    )}
+                    {editRow && (
+                        <div data-ha-member-form-row={editRow.instance_id}>{memberForm(editRow)}</div>
                     )}
                     {canSetActive && members.length > 0 && (
                         <div className="space-y-1">
@@ -10986,7 +10992,8 @@
                         )}
                         {split && (
                             <HaSplitCard t={t} status={status} split={split} auto={auto} nameOf={nameOf} ctl={memberCtl}
-                                selfForm={memberForm({ instance_id: status.instance_id, site: typeof auto?.site === 'string' ? auto.site : (status.site || '') })} />
+                                selfForm={memberForm({ instance_id: status.instance_id, site: typeof auto?.site === 'string' ? auto.site : (status.site || ''),
+                                                       agent_vmid: auto?.agent_vmid })} />
                         )}
                         {(witness || zone) && (
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -11320,9 +11327,18 @@
             const data = await r.json().catch(() => null);
             if (!r.ok) {
                 const said = typeof data?.error === 'string' ? data.error.trim() : '';
+                haLeaseRefused(r.status, data?.code);
                 return { ok: false, code: data?.code || '', error: said || fallback, data };
             }
             return { ok: true, code: '', error: '', data: data || {} };
+        }
+
+        // no leader right now, or the lead is handed on (503 HA_NO_LEASE / HA_TRANSFER): the banner
+        // says so as well, read again at once (contexts.js)
+        function haLeaseRefused(status, code) {
+            if (status === 503 && (code === 'HA_NO_LEASE' || code === 'HA_TRANSFER')) {
+                window.dispatchEvent(new CustomEvent('pegaprox-ha-lease'));
+            }
         }
 
         // the account password these actions want, and the server's word on it next to the field.
@@ -11491,19 +11507,25 @@
                     </td>
                     {ctl && (
                         <td className="py-2 pl-2 text-right">
-                            {data && row.voter === true && (row.make_leader === true ? (
-                                <button type="button" onClick={() => ctl.open('leader', row)} disabled={!!ctl.leadLocked}
-                                    title={ctl.leadLocked || undefined} data-ha-make-leader={row.instance_id}
-                                    className={`${HA_GROUP_GHOST} ml-auto whitespace-nowrap`}>
-                                    <Icons.Star className="w-4 h-4" />
-                                    {t('haAutoMakeLeader')}
-                                </button>
-                            ) : typeof row.make_leader_why === 'string' && row.make_leader_why ? (
-                                <span className="block max-w-xs text-left text-xs text-gray-500" style={{ overflowWrap: 'anywhere' }}
-                                    data-ha-make-leader-why={row.instance_id}>
-                                    {row.make_leader_why}
-                                </span>
-                            ) : null)}
+                            <div className="flex flex-col items-end gap-1">
+                                {data && row.voter === true && (row.make_leader === true ? (
+                                    <button type="button" onClick={() => ctl.open('leader', row)} disabled={!!ctl.leadLocked}
+                                        title={ctl.leadLocked || undefined} data-ha-make-leader={row.instance_id}
+                                        className={`${HA_GROUP_GHOST} whitespace-nowrap`}>
+                                        <Icons.Star className="w-4 h-4" />
+                                        {t('haAutoMakeLeader')}
+                                    </button>
+                                ) : typeof row.make_leader_why === 'string' && row.make_leader_why ? (
+                                    // wraps at words, never down to a letter per line in a narrow cell
+                                    <span className="block min-w-[160px] max-w-xs text-left text-xs text-gray-500" style={{ overflowWrap: 'break-word' }}
+                                        data-ha-make-leader-why={row.instance_id}>
+                                        {row.make_leader_why}
+                                    </span>
+                                ) : null)}
+                                {data && (
+                                    <HaAgentVmButton t={t} ctl={ctl} target={row} name={name} />
+                                )}
+                            </div>
                         </td>
                     )}
                 </>
@@ -12303,6 +12325,116 @@
             );
         }
 
+        // Agent VM id on the leader, for a member or the leader itself: the button that opens its form,
+        // and what is named so far, cluster by cluster.
+        function HaAgentVmButton({ t, ctl, target, name }) {
+            const held = Object.entries(target.agent_vmid && typeof target.agent_vmid === 'object' ? target.agent_vmid : {})
+                .filter(([, vmid]) => typeof vmid === 'number');
+            const clusterName = (cid) => (ctl.clusters.find(c => c.id === cid) || {}).name || cid;
+            return (
+                <span className="inline-flex flex-wrap items-center justify-end gap-2">
+                    <button type="button" onClick={() => ctl.open('vmid', target)} disabled={!!ctl.locked}
+                        title={ctl.locked || undefined} aria-label={t('haAutoVmidOf').replace('{name}', () => name)}
+                        data-ha-agent-vmid={target.instance_id} className={`${HA_GROUP_GHOST} whitespace-nowrap`}>
+                        <Icons.Monitor />
+                        {t('haAutoVmidOpen')}
+                    </button>
+                    {held.length > 0 && (
+                        <span className="text-xs text-gray-400" style={{ overflowWrap: 'break-word' }} data-ha-agent-vmid-set={held.length}>
+                            {held.map(([cid, vmid]) => `${clusterName(cid)}: ${vmid}`).join(', ')}
+                        </span>
+                    )}
+                </span>
+            );
+        }
+
+        // The VM a member runs as, one row per cluster with node HA (and any other it is still named
+        // on): Force leader switches autostart off on it when it cuts that member out. It names a VM
+        // and acts on none, so no password. Each row is saved on its own; a refusal stays in the form.
+        function HaAgentVmForm({ t, target, name, clusters, getAuthHeaders, onClose, onSaved, addToast }) {
+            const held = target.agent_vmid && typeof target.agent_vmid === 'object' ? target.agent_vmid : {};
+            const rows = [...clusters.map(c => ({ id: c.id, name: typeof c.name === 'string' && c.name ? c.name : c.id })),
+                          ...Object.keys(held).filter(cid => !clusters.some(c => c.id === cid)).map(cid => ({ id: cid, name: cid }))];
+            const [saved, setSaved] = useState(() => ({ ...held }));      // what the leader holds, as far as this form knows
+            const [typed, setTyped] = useState(() => Object.fromEntries(rows.map(r => [r.id, typeof held[r.id] === 'number' ? String(held[r.id]) : ''])));
+            const [refused, setRefused] = useState(null);                  // {code, error} of the last refusal
+            const [busy, setBusy] = useState('');                          // the cluster whose request is out
+            const id = target.instance_id;
+            const valid = (v) => /^\d{3,9}$/.test(v) && Number(v) >= 100;
+
+            const send = async (cid, vmid) => {
+                setBusy(cid);
+                setRefused(null);
+                let res;
+                try {
+                    res = await haGroupSend(getAuthHeaders, 'PUT', `members/${encodeURIComponent(id)}/agent-vmid`,
+                                            { cluster_id: cid, vmid }, t('pgHaActionFailed'));
+                } finally {
+                    setBusy('');
+                }
+                if (!res.ok) {
+                    setRefused({ code: res.code, error: res.error });
+                    return;
+                }
+                setSaved(s => {
+                    const next = { ...s };
+                    if (vmid === null) delete next[cid];
+                    else next[cid] = vmid;
+                    return next;
+                });
+                if (vmid === null) setTyped(v => ({ ...v, [cid]: '' }));
+                addToast?.(t(vmid === null ? 'haAutoVmidCleared' : 'haAutoVmidSaved'), 'success');
+                onSaved?.();
+            };
+
+            return (
+                <div data-ha-member-form="vmid" data-ha-member-form-for={id}
+                    className="rounded-lg p-3 space-y-3 border text-left bg-proxmox-card border-proxmox-border">
+                    <p className="text-sm text-gray-300" style={{ overflowWrap: 'anywhere' }}>{t('haAutoVmidDesc').replace('{name}', () => name)}</p>
+                    {rows.length === 0 ? (
+                        <p className="text-xs text-yellow-300" data-ha-agent-vmid-none>{t('haAutoVmidNoClusters')}</p>
+                    ) : (
+                        <div className="space-y-2">
+                            {rows.map(r => {
+                                const value = (typed[r.id] || '').trim();
+                                const now = typeof saved[r.id] === 'number' ? saved[r.id] : null;
+                                const bad = !!value && !valid(value);
+                                return (
+                                    <div key={r.id} data-ha-agent-vmid-row={r.id} className="flex flex-wrap items-center gap-2">
+                                        <label htmlFor={`pgha-vmid-${r.id}`} className="w-44 text-sm text-gray-200 truncate" title={r.id}>{r.name}</label>
+                                        <input id={`pgha-vmid-${r.id}`} value={typed[r.id] || ''} inputMode="numeric" maxLength={9} autoComplete="off"
+                                            placeholder={t('haAutoVmidPlaceholder')} aria-invalid={bad ? 'true' : undefined} disabled={!!busy}
+                                            onChange={e => { const v = e.target.value; setTyped(k => ({ ...k, [r.id]: v })); setRefused(null); }}
+                                            className={`w-32 ${HA_GROUP_FIELD} font-mono`} />
+                                        <button type="button" onClick={() => send(r.id, Number(value))}
+                                            disabled={!!busy || bad || !value || Number(value) === now}
+                                            className={`${HA_GROUP_BTN} bg-proxmox-orange hover:bg-proxmox-orange/90 text-white`}>
+                                            {t('save')}
+                                        </button>
+                                        {now !== null && (
+                                            <button type="button" onClick={() => send(r.id, null)} disabled={!!busy} className={HA_GROUP_GHOST}>
+                                                {t('remove')}
+                                            </button>
+                                        )}
+                                        {bad && <span className="text-xs text-yellow-300" data-ha-agent-vmid-bad>{t('haAutoVmidBad')}</span>}
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    )}
+                    {refused && (
+                        <div role="alert" data-ha-member-refused={refused.code || 'error'} style={{ overflowWrap: 'anywhere' }}
+                            className="rounded-lg p-2 text-sm border bg-red-500/10 border-red-500/30 text-red-300">
+                            {refused.error}
+                        </div>
+                    )}
+                    <div className="flex flex-wrap items-center gap-2">
+                        <button type="button" onClick={onClose} className={HA_GROUP_GHOST}>{t('close')}</button>
+                    </div>
+                </div>
+            );
+        }
+
         // Whether the group still elects a leader once it loses a site, or the link between two: the
         // votes per site and who leads on its own there, the clusters with node HA as a leader at
         // any site finds them, and the findings (the very list the switch goes by). The site and
@@ -12320,7 +12452,7 @@
                 .map((f, i) => ({ f, i, rank: HA_LEVEL_ORDER.includes(f.level) ? HA_LEVEL_ORDER.indexOf(f.level) : HA_LEVEL_ORDER.length }))
                 .sort((a, b) => a.rank - b.rank || a.i - b.i).map(x => x.f);
             const self = { instance_id: status.instance_id, site: typeof auto?.site === 'string' ? auto.site : (status.site || ''),
-                           may_lead: auto?.may_lead !== false };
+                           may_lead: auto?.may_lead !== false, agent_vmid: auto?.agent_vmid };
             // what a cluster without the claim leaves open, in the words of the server, once
             const residual = (clusters.map(c => c.claim).find(c => c && c.enabled === false && typeof c.residual === 'string' && c.residual) || {}).residual || '';
             const num = (v) => typeof v === 'number' && isFinite(v) ? v : 0;
@@ -12424,6 +12556,7 @@
                                 {t('haAutoColMayLead')}: {t(self.may_lead ? 'yes' : 'no')}
                             </span>
                         )}
+                        {ctl && <HaAgentVmButton t={t} ctl={ctl} target={self} name={nameOf(self.instance_id)} />}
                     </div>
                     {selfForm}
                     {sites.length > 0 && (

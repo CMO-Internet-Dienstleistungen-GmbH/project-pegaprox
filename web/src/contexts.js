@@ -217,20 +217,29 @@
             }, []);
 
             // a standby syncs every few seconds; without this the banner would show the
-            // sync time from the moment of login forever
+            // sync time from the moment of login forever.
+            // LW Oct 2026 (#625) - the leader too: a page opened there while the group was manual
+            // has to hear once it fails over automatically, and then within seconds when the
+            // leader is gone or a new one takes over
             useEffect(() => {
-                if (!isAuthenticated || ha.role !== 'standby') return;
-                const h = setInterval(refreshHa, 30000);
+                if (!isAuthenticated || (ha.role !== 'standby' && ha.role !== 'active')) return;
+                const h = setInterval(refreshHa, ha.automatic === true ? 10000 : 30000);
                 return () => clearInterval(h);
-            }, [isAuthenticated, ha.role, refreshHa]);
+            }, [isAuthenticated, ha.role, ha.automatic, refreshHa]);
 
-            // LW Oct 2026 (#625) - in a group that fails over automatically every role hears when
-            // the leader is gone or a new one takes over, within seconds rather than at login
+            // a change refused because the group has no leader right now, or hands the lead on
+            // (503 HA_NO_LEASE / HA_TRANSFER, see authFetch): the banner says so at once
             useEffect(() => {
-                if (!isAuthenticated || ha.automatic !== true) return;
-                const h = setInterval(refreshHa, 10000);
-                return () => clearInterval(h);
-            }, [isAuthenticated, ha.automatic, refreshHa]);
+                if (!isAuthenticated) return;
+                let last = 0;
+                const onLease = () => {
+                    if (Date.now() - last < 2000) return;
+                    last = Date.now();
+                    refreshHa();
+                };
+                window.addEventListener('pegaprox-ha-lease', onLease);
+                return () => window.removeEventListener('pegaprox-ha-lease', onLease);
+            }, [isAuthenticated, refreshHa]);
             
             // check if session still valid (cookie is sent automatically)
             const checkSession = async () => {

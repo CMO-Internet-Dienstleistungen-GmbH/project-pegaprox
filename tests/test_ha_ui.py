@@ -91,10 +91,11 @@ def test_anything_without_a_role_reads_as_standalone(ctx):
     assert "next.role) ? next : { role: 'standalone' }" in body
 
 
-def test_only_a_standby_polls_for_its_sync_time(ctx):
-    start = ctx.index('const h = setInterval(refreshHa, 30000);')
+def test_only_an_instance_of_a_group_polls_the_banner(ctx):
+    # a standby for its sync time, the leader for the banners of an automatic group (#625)
+    start = ctx.index('const h = setInterval(refreshHa, ha.automatic === true ? 10000 : 30000);')
     effect = ctx[ctx.rindex('useEffect(', 0, start):ctx.index('}, [', start)]
-    assert "if (!isAuthenticated || ha.role !== 'standby') return;" in effect
+    assert "if (!isAuthenticated || (ha.role !== 'standby' && ha.role !== 'active')) return;" in effect
 
 
 # -- settings modal -----------------------------------------------------------------
@@ -775,9 +776,12 @@ def browser():
 
 
 class _App:
-    def __init__(self, browser, server):
+    def __init__(self, browser, server, clock=False):
         self.server = server
         self.ctx = browser.new_context(viewport={'width': 1600, 'height': 1000})
+        if clock:
+            # Playwright's clock: time runs as usual, and page.clock.run_for() lets a poll interval pass at once
+            self.ctx.clock.install()
         # the monthly sponsor modal for admins would sit on top of everything
         self.ctx.add_init_script("""try {
             for (const u of ['admin', 'viewer']) localStorage.setItem('pegaprox_sponsor_v2:' + u, String(Date.now() + 1e10));
@@ -2562,7 +2566,7 @@ def test_the_members_table_shows_what_the_contract_carries(panel):
     # Remove only on the active, one per row
     assert "const canRemove = role === 'active';" in body
     remove_at = card.index("openConfirm('remove', m)")
-    assert card.rindex('{canRemove && (', 0, remove_at) > card.index('{members.flatMap(m => [(')
+    assert card.rindex('{canRemove && (', 0, remove_at) > card.index('{members.map(m => (')
     assert card.count("openConfirm('remove'") == 1
 
 
@@ -5036,7 +5040,7 @@ def test_the_leader_sets_who_is_active(panel):
     at = card.index('onClick={() => setMemberServe(m, m.serve !== true)}')
     gate = card.rindex('{canSetActive && (', 0, at)
     toggle = card[gate:card.index('</td>', at)]
-    assert card.index('{members.flatMap(m => [(') < gate
+    assert card.index('{members.map(m => (') < gate
     assert 'role="switch" aria-checked={m.serve === true}' in toggle
     assert 'disabled={!!busy || broken || (activesFull && m.serve !== true)}' in toggle
     assert card.count('setMemberServe(') == 1

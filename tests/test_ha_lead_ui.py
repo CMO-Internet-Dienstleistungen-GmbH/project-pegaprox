@@ -3,10 +3,11 @@
 The HA tab gets the split-safety panel (the votes per site, who leads on its own there, the clusters
 with node HA and every finding with the server's words), the settings of each member on the leader
 (the site, and vote and may lead as switches under the password), Make leader on every data voter
-with a vote (on a member for itself, through its own instance), the status line items of the lease
-and the danger zone with Force leader where, and only where, the server offers it. Every signed-in
-user gets the banners of a group that fails over automatically: no leader, a takeover, and for ten
-minutes a change of the leader.
+with a vote (on a member for itself, through its own instance), the agent VM of each data member and
+of the leader per HA cluster, the status line items of the lease and the danger zone with Force
+leader where, and only where, the server offers it. The forms open under the members table. Every
+signed-in user gets the banners of a group that fails over automatically: no leader, a takeover, and
+for ten minutes a change of the leader, with the addresses for an admin the HA tab is open to only.
 
 On this release the status says auto: null and split_safety: null, and none of it renders. The
 runtime tests drive the built bundle in headless Chromium against the fake server of
@@ -26,8 +27,8 @@ from test_ha_auto_ui import (  # noqa: F401  (browser is a fixture)
     B, B_URL, C, C_URL, EM_DASH, NOT_SHIPPED, OWN, W, W_URL, _GroupServer, _auto, _finding, _row, _running,
     _witness, browser)
 from test_ha_ui import (
-    BASE, LANGS, PASSWORD, SRC, _App, _block, _blocks, _classes, _member, _open_ha, _read, _toasts, _until,
-    _wait_for_toast)
+    BASE, CLUSTER, LANGS, PASSWORD, SRC, VM, _App, _block, _blocks, _classes, _member, _open_ha, _read, _toasts,
+    _until, _wait_for_toast)
 
 A_URL = 'https://pegaprox-a.example:5000'
 NO_LEASE = ('No leader at the moment - changes and automation are paused until the group has one again')
@@ -43,7 +44,7 @@ RESTARTING = 'Restarting PegaProx...'
 # a time of day as fmtTime gives it, in 24 or 12 hours
 TIME = r'[\d:.]+(\s*[APap]\.?\s?[Mm]\.?)?'
 # the parts of these slices in settings_modal.js
-PARTS = ('HaSplitCard', 'HaLeadCard', 'HaMemberForm', 'haCvText', 'haAutoGate')
+PARTS = ('HaSplitCard', 'HaLeadCard', 'HaMemberForm', 'haCvText', 'haAutoGate', 'HaAgentVmButton', 'HaAgentVmForm')
 
 
 def _site(name, voters, candidates=(), members=None, witness=False, survives=True):
@@ -101,13 +102,15 @@ class _LeadServer(_GroupServer):
     """
 
     def __init__(self, split=None, split_key=True, lease_banner=None, site='', vote_refusal=None, site_refusal=None,
-                 make_answers=(), force_answers=(), after_restart=None, **kw):
+                 make_answers=(), force_answers=(), after_restart=None, vmid_refusal=None, managed=(), **kw):
         kw.setdefault('shipped', True)
         super().__init__(**kw)
         self.split, self.split_key = copy.deepcopy(split), split_key
         self.lease_banner = copy.deepcopy(lease_banner or {})
         self.site = site
         self.vote_refusal, self.site_refusal = vote_refusal, site_refusal
+        # the agent VM: a refusal to answer with, and the clusters with no node HA this instance runs
+        self.vmid_refusal, self.managed = vmid_refusal, set(managed)
         self.make_answers, self.force_answers = list(make_answers), list(force_answers)
         self.after_restart = copy.deepcopy(after_restart)
 
@@ -205,6 +208,34 @@ class _LeadServer(_GroupServer):
             else:
                 self._row(iid).update(asked)
             return 200, dict({'success': True, 'changed': True, 'automatic': self.mode() == 'auto'}, **asked)
+        m = re.fullmatch(r'/api/ha/members/([^/]+)/agent-vmid', path)
+        if m and method == 'PUT':
+            cid, vmid = body.get('cluster_id'), body.get('vmid')
+            if not isinstance(cid, str) or not cid:
+                return 400, {'error': 'cluster_id is the id of a cluster'}
+            if vmid is not None and (isinstance(vmid, bool) or not isinstance(vmid, int) or vmid < 100):
+                return 400, {'error': 'vmid is the id of a VM (100 or more), or null'}
+            if not self.shipped:
+                return 409, {'code': 'HA_AUTO_NOT_SHIPPED', 'error': NOT_SHIPPED}
+            if self.role != 'active' or not self.group():
+                return 409, {'code': 'HA_STANDBY', 'error': 'The VM of a member is set on the leader of a group'}
+            refused = self._no_lease()
+            if refused:
+                return refused
+            if self.vmid_refusal:
+                return self.vmid_refusal
+            if cid not in {c['id'] for c in (self.split or {}).get('clusters') or []} | self.managed:
+                return 404, {'error': 'Cluster not found'}
+            iid = m.group(1)
+            if iid != OWN and self._row(iid) is None:
+                return 409, {'error': 'That instance is not a member of this group'}
+            held = (self.auto if iid == OWN else self._row(iid)).setdefault('agent_vmid', {})
+            changed = held.get(cid) != vmid
+            if vmid is None:
+                held.pop(cid, None)
+            else:
+                held[cid] = vmid
+            return 200, {'success': True, 'changed': changed}
         if path == '/api/ha/make-leader' and method == 'POST':
             if body.get('confirm') != 'LEADER':
                 return 400, {'error': 'Type LEADER to confirm'}
@@ -257,7 +288,7 @@ class _LeadServer(_GroupServer):
     def handle(self, route):
         req = route.request
         path = re.sub(r'^https?://[^/]+', '', req.url).split('?')[0]
-        ours = req.url.startswith(BASE) and (re.fullmatch(r'/api/ha/members/[^/]+/(site|vote)', path)
+        ours = req.url.startswith(BASE) and (re.fullmatch(r'/api/ha/members/[^/]+/(site|vote|agent-vmid)', path)
                                             or path in ('/api/ha/make-leader', '/api/ha/force-leader'))
         if not ours:
             return super().handle(route)
@@ -301,7 +332,7 @@ def leader_banner():
 def test_the_parts_exist_once(modal, ours):
     for name in PARTS:
         assert modal.count(f'function {name}(') == 1, name
-    for name in ('HaSplitCard', 'HaLeadCard', 'HaMemberForm', 'haCvText'):
+    for name in ('HaSplitCard', 'HaLeadCard', 'HaMemberForm', 'haCvText', 'HaAgentVmButton', 'HaAgentVmForm'):
         assert f'function {name}(' in ours, name
     assert _read('web', 'src', 'dashboard.js').count('function HaLeaderBanner(') == 1
 
@@ -347,6 +378,13 @@ def test_the_requests_are_what_the_routes_read(ours):
     for needle in ("data.get('confirm') != ha.FORCE_PHRASE", "cut_out = data.get('cut_out')", "reason = data.get('reason')",
                    "_refuse_without_reauth('forcing this member to lead')"):
         assert needle in force, needle
+    # the agent VM: cluster and VM id, null to forget it, no password (it names a VM, it acts on none)
+    vm = _block(ours, 'function HaAgentVmForm(', 'function HaSplitCard(')
+    assert ("haGroupSend(getAuthHeaders, 'PUT', `members/${encodeURIComponent(id)}/agent-vmid`,\n"
+            "                                            { cluster_id: cid, vmid }, t('pgHaActionFailed'));") in vm
+    assert 'send(r.id, Number(value))' in vm and 'send(r.id, null)' in vm and 'password' not in vm.lower()
+    route = _block(api, "@bp.route('/api/ha/members/<instance_id>/agent-vmid'", "\n\n\n")
+    assert "cluster_id, vmid = data.get('cluster_id'), data.get('vmid')" in route and '_refuse_without_reauth' not in route
     core = _read('pegaprox', 'core', 'ha.py')
     assert "LEADER_PHRASE = 'LEADER'" in core and "FORCE_PHRASE = 'FORCE LEADER'" in core and 'FORCE_REASON_MAX = 500' in core
     assert 'maxLength={500}' in lead and 'maxLength={64}' in form
@@ -378,15 +416,24 @@ def test_the_checklist_takes_a_block_about_one_cluster_as_a_warning(modal):
     assert ".flatMap(c => c.findings.filter(f => haAutoGate(f) === 'warn').map(f => f.code)))];" in card
     core = _read('pegaprox', 'core', 'ha.py')
     switch = _block(core, 'def switch_auto_on(', 'def _switch_taken_back(')
-    assert "blocks = [f for f in findings if f['level'] == 'block' and not f.get('cluster')]" in switch
+    assert "blocks = [f for f in findings if _gate(f) == 'block']" in switch
+    assert "open_ = [f for f in findings if _gate(f) == 'warn' and f['code'] not in accept]" in switch
+    # the split panel's level goes by the same gate
+    assert "return 'warn' if level == 'block' and finding.get('cluster') else level" in _block(core, 'def _gate(', '\n\n\n')
+    assert 'LEVELS.index(_gate(f))' in _block(core, 'def split_safety(', 'def _gate(')
 
 
 def test_the_banner_shows_in_an_automatic_group_only(leader_banner):
     assert 'const automatic = ha?.automatic === true;' in leader_banner
-    for needle in ("t('haNoLeader')", "t('haTakeover').replace('{leader}', () => takeover.leader || '-')",
-                   "t('haLeaderChanged').replace('{to}', () => changed.to).replace('{time}', () => fmtTime(changed.at) || '-')",
+    for needle in ("t('haNoLeader')", "t('haTakeover').replace('{leader}', () => takeover.leader) : t('haTakeoverUnnamed')",
+                   "t('haLeaderChanged').replace('{to}', () => changed.to) : t('haLeaderChangedAt')",
+                   ".replace('{time}', () => fmtTime(changed.at) || '-')",
                    "const button = isAdmin && onOpenHa && line.kind !== 'leader-changed' && ("):
         assert needle in leader_banner, needle
+    # the server names nobody to most users and sends no epoch: a change is the moment and, for an
+    # admin, the address it went to
+    assert "const changeKey = changed ? `${changed.at}|${named(changed.to)}` : '';" in leader_banner
+    assert 'epoch' not in leader_banner
     # only the change can be closed: no leader and a takeover stay while they hold
     assert leader_banner.count('close: true') == 1
 
@@ -399,8 +446,25 @@ def test_every_layout_mounts_the_banner_and_every_role_polls_it():
     shell = _read('web', 'src', 'cloud.js')
     assert shell.count('<HaLeaderBanner cloud onOpenHa={() => {') == 1
     ctx = _read('web', 'src', 'contexts.js')
-    effect = _block(ctx, "if (!isAuthenticated || ha.automatic !== true) return;", '}, [')
-    assert 'setInterval(refreshHa, 10000)' in effect
+    # the leader as well as a member: a page opened on it while the group was manual hears the switch
+    effect = _block(ctx, "if (!isAuthenticated || (ha.role !== 'standby' && ha.role !== 'active')) return;", '}, [')
+    assert 'setInterval(refreshHa, ha.automatic === true ? 10000 : 30000)' in effect
+    # and a change the group refuses for want of a leader reads the banner again at once
+    lease = _block(ctx, "window.addEventListener('pegaprox-ha-lease', onLease);", '}, [')
+    assert "window.removeEventListener('pegaprox-ha-lease', onLease);" in lease
+    dash = _read('web', 'src', 'dashboard.js')
+    fetcher = _block(dash, 'const authFetch = React.useCallback(async (url, opts = {}) => {', '}, [getAuthHeaders]);')
+    assert "if (res.status === 503 && (code === 'HA_NO_LEASE' || code === 'HA_TRANSFER'))" in fetcher
+    assert "window.dispatchEvent(new CustomEvent('pegaprox-ha-lease'))" in fetcher
+    # the HA tab's two senders, through one helper
+    modal = _read('web', 'src', 'settings_modal.js')
+    helper = _block(modal, 'function haLeaseRefused(status, code) {', '\n        }\n')
+    assert "if (status === 503 && (code === 'HA_NO_LEASE' || code === 'HA_TRANSFER')) {" in helper
+    assert "window.dispatchEvent(new CustomEvent('pegaprox-ha-lease'))" in helper
+    assert modal.count("new CustomEvent('pegaprox-ha-lease')") == 1
+    assert 'haLeaseRefused(r.status, data?.code);' in _block(modal, 'async function haGroupSend(', 'function haLeaseRefused(')
+    panel_send = _block(modal, 'const send = async (method, path, body, fallback) => {', '\n            };')
+    assert 'haLeaseRefused(r.status, code);' in panel_send
 
 
 def test_server_words_go_into_a_text_through_a_function(ours, leader_banner):
@@ -415,7 +479,7 @@ def test_server_words_go_into_a_text_through_a_function(ours, leader_banner):
 
 # -- translations ---------------------------------------------------------------------------------------
 
-BANNER_KEYS = ('haNoLeader', 'haTakeover', 'haLeaderChanged')
+BANNER_KEYS = ('haNoLeader', 'haTakeover', 'haLeaderChanged', 'haTakeoverUnnamed', 'haLeaderChangedAt')
 
 
 def _ours_keys():
@@ -424,7 +488,7 @@ def _ours_keys():
         if name.endswith('.js') and name != 'translations.js':
             keys.update(re.findall(r"'((?:haAuto(?:Split|Claim|Force|Forced|Make|Vote|MayLead|Site|Cv|Promis|Behind|"
                                    r"Locked|Lead|Renewed|Transfer|Planned|Unconfirmed|ChangePending|LastChange|Campaign|"
-                                   r"InStep|Unreached|CheckSites|CheckClusters))\w*)'", _read('web', 'src', name)))
+                                   r"InStep|Unreached|CheckSites|CheckClusters|Vmid))\w*)'", _read('web', 'src', name)))
     return sorted(keys)
 
 
@@ -443,9 +507,10 @@ def test_the_banner_keys_are_one_block_of_their_own(lang):
     block = _blocks()[lang]
     lines = block.splitlines()
     start = lines.index('                // LW Oct 2026 (#625) - the banners of a group that fails over automatically, for every user')
-    assert [re.match(r'^ +(\w+): ', line).group(1) for line in lines[start + 1:start + 4]] == list(BANNER_KEYS)
-    assert lines[start + 4] == ('                // LW Oct 2026 (#625) - stage 2: automatic failover, the witness, '
-                                'the time zone of the schedules')
+    end = start + 1 + len(BANNER_KEYS)
+    assert [re.match(r'^ +(\w+): ', line).group(1) for line in lines[start + 1:end]] == list(BANNER_KEYS)
+    assert lines[end] == ('                // LW Oct 2026 (#625) - stage 2: automatic failover, the witness, '
+                          'the time zone of the schedules')
     for key in BANNER_KEYS + tuple(_ours_keys()):
         assert len(re.findall(r'^ +%s: ' % key, block, re.M)) == 1, (lang, key)
 
@@ -514,8 +579,8 @@ def test_the_bundle_was_rebuilt():
 def open_app(browser):
     apps = []
 
-    def _open(**kw):
-        app = _App(browser, _LeadServer(**kw))
+    def _open(clock=False, **kw):
+        app = _App(browser, _LeadServer(**kw), clock=clock)
         apps.append(app)
         return app
     yield _open
@@ -976,6 +1041,47 @@ def test_runtime_make_leader_refused_or_still_catching_up(open_app, answer):
     assert not app.errors, app.errors
 
 
+@pytest.mark.parametrize('width', [1280, 390])
+def test_runtime_the_reason_make_leader_is_not_offered_wraps_at_words(open_app, width):
+    """In the narrow last cell of a wide table a text that may break anywhere stood one letter per line."""
+    auto = _leader(transfer={'to': B, 'to_url': B_URL, 'phase': 'catchup', 'left': 8.4})
+    why = 'Not while the lead is handed to another member - try again once the hand-over is through'
+    for row in auto['members'][:2]:
+        row.update(make_leader=False, make_leader_why=why)
+    app = open_app(auto=auto, split=_split())
+    app.page.set_viewport_size({'width': width, 'height': 900})
+    panel = _open_ha(app, 'active')
+    for iid in (B, C):
+        box = panel.locator(f'[data-ha-make-leader-why="{iid}"]').bounding_box()
+        assert box['width'] >= 150 and box['height'] < 120, (iid, box)
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('width', [1280, 390])
+def test_runtime_a_member_form_goes_under_the_table_and_is_not_cut_off(open_app, width):
+    """The form was a row of the table: as wide as the table, and its scroller cut off the text the
+    admin confirms with the password. Under the table it takes the width of the card."""
+    app = open_app(auto=_leader(), split=_split())
+    app.page.set_viewport_size({'width': width, 'height': 900})
+    panel = _open_ha(app, 'active')
+    card = panel.locator('[data-ha-members]')
+    for what, opener in (('voter', panel.locator(f'[data-ha-member="{B}"] [data-ha-auto-toggle="voter"]')),
+                         ('leader', panel.locator(f'[data-ha-member="{B}"] [data-ha-make-leader]')),
+                         ('site', panel.locator(f'[data-ha-member-witness="{W}"]').get_by_role('button', name=f'Site of {W_URL}'))):
+        opener.evaluate('el => el.click()')
+        form = card.locator(f'[data-ha-member-form="{what}"]')
+        form.wait_for(timeout=3000)
+        assert form.evaluate('el => !el.closest(".overflow-x-auto") && !el.closest("table")'), what
+        outer = card.bounding_box()
+        for part in (form.locator('p').first, form.locator('button').last):
+            box = part.bounding_box()
+            assert outer['x'] - 1 <= box['x'] and box['x'] + box['width'] <= outer['x'] + outer['width'] + 1, (what, box, outer)
+        form.get_by_role('button', name='Cancel').click()
+        form.wait_for(state='detached', timeout=3000)
+    assert not _writes(app)
+    assert not app.errors, app.errors
+
+
 def _member_auto(**more):
     kw = dict(mode='auto', holds_lease=False, holder=B, lease_left=14.2, acting=False, epoch=7,
               members=[_row('b', holds=True, mode='auto'), _row('c', mode='auto')], **_lead())
@@ -1336,6 +1442,201 @@ def test_runtime_a_manual_group_gets_no_lease_banner(open_app):
     assert not app.errors, app.errors
 
 
+def test_runtime_most_users_read_the_banners_without_addresses(open_app):
+    """The server names instances only to an admin the HA tab is open to: everyone else hears that a
+    leader takes over and when changes resume, and when the leader changed. Closed by the moment."""
+    first = '2026-10-04T10:02:11+00:00'
+    app = open_app(clock=True, role='standby', members=_standby_members(), admin=False,
+                   lease_banner={'automatic': True, 'takeover': {'resume_in': 12}, 'leader_changed': {'at': first}})
+    take, changed = _banner(app, 'takeover'), _banner(app, 'leader-changed')
+    take.wait_for(timeout=5000)
+    assert re.fullmatch(r'A new leader is taking over - changes resume in 1[12] s\.', take.inner_text().strip()), take.inner_text()
+    assert re.fullmatch(rf'The leader changed at {TIME}\.', changed.inner_text().strip()), changed.inner_text()
+    assert take.locator('button').count() == 0
+    changed.get_by_role('button', name='Close').click()
+    changed.wait_for(state='detached', timeout=3000)
+    # the same moment again stays closed, a later one shows
+    app.server.lease_banner = {'automatic': True, 'leader_changed': {'at': first}}
+    app.page.clock.run_for(11000)
+    take.wait_for(state='detached', timeout=5000)
+    assert _banner(app, 'leader-changed').count() == 0
+    app.server.lease_banner = {'automatic': True, 'leader_changed': {'at': '2026-10-04T10:09:40+00:00'}}
+    app.page.clock.run_for(11000)
+    _banner(app, 'leader-changed').wait_for(timeout=5000)
+    assert not app.errors, app.errors
+
+
+def test_runtime_a_page_on_the_leader_from_before_the_switch_hears_the_banners(open_app):
+    """Opened while the group was manual, the leader's page reads the banner every 30 s, and every
+    10 s once the group is automatic: no leader shows without a reload. An instance of its own asks
+    nothing."""
+    app = open_app(clock=True, admin=False)
+    page, calls = app.page, app.server.calls
+    page.wait_for_timeout(500)
+    reads = calls.count(('GET', '/api/auth/check'))
+    app.server.lease_banner = {'automatic': True, 'no_leader': True}
+    page.clock.run_for(31000)
+    _banner(app, 'no-leader').wait_for(timeout=5000)
+    assert calls.count(('GET', '/api/auth/check')) > reads
+    reads = calls.count(('GET', '/api/auth/check'))
+    app.server.lease_banner = {'automatic': True, 'takeover': {'resume_in': 20}}
+    page.clock.run_for(11000)
+    _banner(app, 'takeover').wait_for(timeout=5000)
+    assert _banner(app, 'no-leader').count() == 0 and calls.count(('GET', '/api/auth/check')) > reads
+    alone = open_app(clock=True, role='standalone')
+    alone.page.wait_for_timeout(500)
+    reads = alone.server.calls.count(('GET', '/api/auth/check'))
+    alone.page.clock.run_for(65000)
+    alone.page.wait_for_timeout(500)
+    assert alone.server.calls.count(('GET', '/api/auth/check')) == reads
+    assert not app.errors and not alone.errors, app.errors + alone.errors
+
+
+def test_runtime_a_change_the_leader_refuses_for_want_of_its_lease_reads_the_banner(open_app):
+    """503 HA_NO_LEASE (or HA_TRANSFER) on a change: the banner is read again at once, through the
+    HA tab's requests and through every other one (authFetch)."""
+    app = open_app(auto=_leader(), split=_split(), vote_refusal=(503, {'code': 'HA_NO_LEASE', 'error': NO_LEASE}))
+    page, calls = app.page, app.server.calls
+    panel = _open_ha(app, 'active')
+    reads = calls.count(('GET', '/api/auth/check'))
+    app.server.lease_banner = {'automatic': True, 'no_leader': True}
+    panel.locator(f'[data-ha-member="{B}"]').get_by_role('switch', name=f'May lead: {B_URL}').click()
+    page.fill('#pgha-member-password', PASSWORD)
+    panel.locator(f'[data-ha-member-form-row="{B}"]').get_by_role('button', name='Save').click()
+    panel.locator('[data-ha-member-refused="HA_NO_LEASE"]').wait_for(timeout=3000)
+    _banner(app, 'no-leader').wait_for(timeout=3000)
+    assert calls.count(('GET', '/api/auth/check')) > reads
+    # the panel's own requests (who is active, pairing, removal)
+    serve = f'/api/ha/members/{B}/serve'
+    tab = open_app(auto=_leader(), split=_split(), extra={('PUT', serve): (503, {'code': 'HA_NO_LEASE', 'error': NO_LEASE})})
+    panel = _open_ha(tab, 'active')
+    reads = tab.server.calls.count(('GET', '/api/auth/check'))
+    tab.server.lease_banner = {'automatic': True, 'no_leader': True}
+    panel.locator(f'[data-ha-member="{B}"] [data-ha-serve]').click()
+    _banner(tab, 'no-leader').wait_for(timeout=3000)
+    assert ('PUT', serve) in tab.server.calls and tab.server.calls.count(('GET', '/api/auth/check')) > reads
+    # a VM action through authFetch
+    shutdown = '/api/clusters/c1/vms/pve1/qemu/100/shutdown'
+    other = open_app(role='active', clusters=[CLUSTER], resources=[VM],
+                     extra={('POST', shutdown): (503, {'code': 'HA_TRANSFER', 'error': 'The lead is being handed on'})})
+    page = other.page
+    page.on('dialog', lambda d: d.accept())
+    page.get_by_text('Testi').first.click()
+    page.locator('button', has_text='Resources').first.click()
+    page.get_by_text('web01').first.wait_for(timeout=5000)
+    reads = other.server.calls.count(('GET', '/api/auth/check'))
+    other.server.lease_banner = {'automatic': True, 'takeover': {'leader': B_URL, 'resume_in': 9}}
+    page.locator('button[title="Shutdown"]').first.click()
+    _banner(other, 'takeover').wait_for(timeout=3000)
+    assert ('POST', shutdown) in other.server.calls and other.server.calls.count(('GET', '/api/auth/check')) > reads
+    assert not app.errors, app.errors
+
+
+# -- the agent VM of a member, on the leader ---------------------------------------------------------
+
+VM_CLUSTERS = [_cluster('c1', 'lab'), _cluster('c2', 'edge'), _cluster('x1', 'pool', kind='other', nodes=(), ready=None)]
+
+
+def test_runtime_the_agent_vm_of_a_member_one_row_per_ha_cluster(open_app):
+    """Every data member (not the witness) and the leader itself: one row per cluster with node HA of
+    the Proxmox kind, and one for a cluster the member is still named on; no password, each row saved
+    on its own, a number of 100 or more, Remove where one is set."""
+    auto = _leader(agent_vmid={'c1': 100})
+    auto['members'][0]['agent_vmid'] = {'c1': 104, 'old': 120}
+    app = open_app(auto=auto, split=_split(clusters=VM_CLUSTERS), managed=['old'])
+    page = app.page
+    panel = _open_ha(app, 'active')
+    b = panel.locator(f'[data-ha-member="{B}"]')
+    assert b.locator('[data-ha-agent-vmid-set]').inner_text().strip() == 'lab: 104, old: 120'
+    assert panel.locator(f'[data-ha-member="{C}"] [data-ha-agent-vmid]').count() == 1
+    assert panel.locator(f'[data-ha-member-witness="{W}"] [data-ha-agent-vmid]').count() == 0
+    b.get_by_role('button', name=f'Agent VM id of {B_URL}').click()
+    row = panel.locator(f'[data-ha-member-form-row="{B}"]')
+    form = row.locator('[data-ha-member-form="vmid"]')
+    form.wait_for(timeout=3000)
+    assert form.inner_text().startswith(f'The VM {B_URL} runs as, per cluster with node HA. Should Force leader cut '
+                                        'it out, autostart is switched off on that VM')
+    assert form.locator('[data-ha-agent-vmid-row]').evaluate_all('r => r.map(x => x.dataset.haAgentVmidRow)') == [
+        'c1', 'c2', 'old']
+    assert form.locator('input[type="password"]').count() == 0
+    assert page.input_value('#pgha-vmid-c1') == '104' and page.input_value('#pgha-vmid-c2') == ''
+    c1, c2 = form.locator('[data-ha-agent-vmid-row="c1"]'), form.locator('[data-ha-agent-vmid-row="c2"]')
+    assert c1.get_by_role('button', name='Save').is_disabled(), 'nothing changed'
+    assert c2.get_by_role('button', name='Remove').count() == 0
+    for bad in ('99', '12a', '-5'):
+        page.fill('#pgha-vmid-c2', bad)
+        assert c2.get_by_role('button', name='Save').is_disabled(), bad
+        assert c2.locator('[data-ha-agent-vmid-bad]').inner_text().strip() == 'A VM id is a number of 100 or more'
+    page.fill('#pgha-vmid-c2', '205')
+    c2.get_by_role('button', name='Save').click()
+    assert _wait_for_toast(page, 'VM id saved'), _toasts(page)
+    form.locator('[data-ha-agent-vmid-row="old"]').get_by_role('button', name='Remove').click()
+    assert _wait_for_toast(page, 'VM id removed'), _toasts(page)
+    # the form stays for the next row; the row of the table says what is set now
+    assert _until(page, lambda: b.locator('[data-ha-agent-vmid-set]').inner_text().strip() == 'lab: 104, edge: 205')
+    assert form.locator('[data-ha-agent-vmid-row="c2"]').get_by_role('button', name='Remove').count() == 1
+    assert _sent(app, f'/api/ha/members/{B}/agent-vmid') == [{'cluster_id': 'c2', 'vmid': 205},
+                                                            {'cluster_id': 'old', 'vmid': None}]
+    form.get_by_role('button', name='Close').click()
+    row.wait_for(state='detached', timeout=3000)
+    # the leader itself, in the split panel
+    me = panel.locator('[data-ha-split-self]')
+    assert me.locator('[data-ha-agent-vmid-set]').inner_text().strip() == 'lab: 100'
+    me.get_by_role('button', name='Agent VM id of this instance').click()
+    own = panel.locator('[data-ha-split] [data-ha-member-form="vmid"]')
+    own.wait_for(timeout=3000)
+    assert own.inner_text().startswith('The VM this instance runs as')
+    own.locator('[data-ha-agent-vmid-row="c1"]').get_by_role('button', name='Remove').click()
+    assert _until(page, lambda: me.locator('[data-ha-agent-vmid-set]').count() == 0)
+    assert _sent(app, f'/api/ha/members/{OWN}/agent-vmid') == [{'cluster_id': 'c1', 'vmid': None}]
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('refusal', ['not_shipped', 'no_lease', 'unknown'])
+def test_runtime_a_refused_agent_vm_stays_in_its_form(open_app, refusal):
+    said = {'not_shipped': (409, {'code': 'HA_AUTO_NOT_SHIPPED', 'error': NOT_SHIPPED}),
+            'no_lease': (503, {'code': 'HA_NO_LEASE', 'error': NO_LEASE}),
+            'unknown': (404, {'error': 'Cluster not found'})}[refusal]
+    app = open_app(auto=_leader(), split=_split(clusters=VM_CLUSTERS), vmid_refusal=said)
+    page = app.page
+    panel = _open_ha(app, 'active')
+    panel.locator(f'[data-ha-member="{C}"]').get_by_role('button', name=f'Agent VM id of {C_URL}').click()
+    page.fill('#pgha-vmid-c1', '310')
+    form = panel.locator(f'[data-ha-member-form-row="{C}"] [data-ha-member-form="vmid"]')
+    form.locator('[data-ha-agent-vmid-row="c1"]').get_by_role('button', name='Save').click()
+    note = form.locator(f'[data-ha-member-refused="{said[1].get("code") or "error"}"]')
+    note.wait_for(timeout=3000)
+    assert note.inner_text().strip() == said[1]['error']
+    assert not any(said[1]['error'] in t for t in _toasts(page))
+    # what was typed stays; typing again takes the note away
+    assert page.input_value('#pgha-vmid-c1') == '310'
+    page.fill('#pgha-vmid-c1', '311')
+    assert form.locator('[data-ha-member-refused]').count() == 0
+    assert _sent(app, f'/api/ha/members/{C}/agent-vmid') == [{'cluster_id': 'c1', 'vmid': 310}]
+    assert not app.errors, app.errors
+
+
+def test_runtime_the_agent_vm_is_held_where_the_server_would_refuse_and_a_member_reads_none(open_app):
+    app = open_app(auto=_leader(holds_lease=False, holder=None, lease_left=None), split=_split(clusters=VM_CLUSTERS))
+    panel = _open_ha(app, 'active')
+    for button in (panel.locator(f'[data-ha-member="{B}"] [data-ha-agent-vmid]'),
+                   panel.locator('[data-ha-split-self] [data-ha-agent-vmid]')):
+        assert button.is_disabled() and button.get_attribute('title') == 'No leader at the moment - changes and automation are paused'
+    # no cluster with node HA: the form says where the VM is named
+    bare = open_app(auto=_leader(), split=_split())
+    panel = _open_ha(bare, 'active')
+    panel.locator(f'[data-ha-member="{B}"] [data-ha-agent-vmid]').click()
+    assert panel.locator('[data-ha-agent-vmid-none]').inner_text().strip() == (
+        'No cluster with node HA yet - the VM is named per HA cluster.')
+    member = open_app(role='standby', members=_standby_members(), split=_split(clusters=VM_CLUSTERS),
+                      auto=_member_auto(agent_vmid={'c1': 100}))
+    panel = _open_ha(member, 'standby')
+    panel.locator('[data-ha-split]').wait_for(timeout=3000)
+    assert panel.locator('[data-ha-agent-vmid]').count() == 0
+    assert not _writes(app) and not _writes(bare) and not _writes(member)
+    assert not app.errors and not bare.errors and not member.errors
+
+
 # -- every language -----------------------------------------------------------------------------------
 
 def _shown(page, within):
@@ -1389,4 +1690,36 @@ def test_runtime_no_key_shows_raw_in_any_language(open_app, lang):
     shown = _shown(page, '[data-ha-auto], [data-ha-lead], [data-ha-lease-banner]')
     assert not RAW.search(shown), RAW.search(shown).group(0)
     assert re.search(r"^ +haNoLeader: '(.*)',$", blocks[lang], re.M).group(1).replace("\\'", "'") in shown
+    assert not app.errors, app.errors
+
+
+def _fragment(value):
+    """The longest part of a text between its placeholders."""
+    return max((p.strip() for p in re.split(r'\{\w+\}', value)), key=len)
+
+
+@pytest.mark.parametrize('lang', [lang for lang in LANGS if lang != 'en'])
+def test_runtime_the_agent_vm_and_the_banners_without_addresses_in_every_language(open_app, lang):
+    blocks = _blocks()
+    app = open_app(language=lang, auto=_leader(), split=_split(clusters=VM_CLUSTERS),
+                   lease_banner={'automatic': True, 'takeover': {'resume_in': 20},
+                                 'leader_changed': {'at': '2026-10-04T10:02:11+00:00'}})
+    page = app.page
+    _banner(app, 'takeover').wait_for(timeout=5000)
+    shown = _shown(page, '[data-ha-lease-banner]')
+    assert not RAW.search(shown), RAW.search(shown).group(0)
+    for key in ('haTakeoverUnnamed', 'haLeaderChangedAt'):
+        assert _fragment(_value(blocks[lang], key)) in shown, key
+    page.locator('[data-ha-lease-banner="takeover"] button').click()
+    panel = page.locator('[data-ha-role="active"]')
+    panel.locator(f'[data-ha-member="{B}"] [data-ha-agent-vmid]').click()
+    panel.locator('[data-ha-member-form="vmid"]').wait_for(timeout=5000)
+    page.fill('#pgha-vmid-c2', '9')
+    shown = _shown(page, '[data-ha-members], [data-ha-split]')
+    assert not RAW.search(shown), RAW.search(shown).group(0)
+    assert _value(blocks[lang], 'haAutoVmidDesc').replace('{name}', B_URL) in shown
+    for key in ('haAutoVmidOpen', 'haAutoVmidBad'):
+        assert _value(blocks[lang], key) in shown, key
+    assert page.get_attribute('#pgha-vmid-c1', 'placeholder') == _value(blocks[lang], 'haAutoVmidPlaceholder')
+    assert panel.get_by_role('button', name=_value(blocks[lang], 'haAutoVmidOf').replace('{name}', C_URL)).count() == 1
     assert not app.errors, app.errors
