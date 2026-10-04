@@ -121,7 +121,7 @@ def add_pbs_server():
     if not data.get('name') or not data.get('host'):
         return jsonify({'error': 'Name and host are required'}), 400
     
-    if not data.get('user'):
+    if not data.get('user') and not data.get('api_token_id'):
         return jsonify({'error': 'Username or API token is required'}), 400
     
     pbs_id = str(uuid.uuid4())[:8]
@@ -333,6 +333,26 @@ def test_pbs_connection(pbs_id):
     data = request.json or {}
     
     if data.get('host'):
+        # MK Oct 2026 (#805) - the edit dialog shows stored secrets as '********', and its Test
+        # button sent that mask to PBS as the password or token secret, so testing a saved
+        # server always failed with HTTP 401. Fill the mask from the stored server like the PUT
+        # does, but only for the same host and port: a new endpoint gets nothing not retyped.
+        masked = [k for k in ('password', 'api_token_secret') if data.get(k) == '********']
+        if masked:
+            ok, err = check_pbs_access(pbs_id)
+            if not ok:
+                return err
+            stored = pbs_managers.get(pbs_id)
+            try:
+                same_port = stored is not None and int(data.get('port') or 8007) == int(stored.port or 8007)
+            except (TypeError, ValueError):
+                return jsonify({'success': False, 'error': 'Invalid port'}), 400
+            if not same_port or data.get('host') != stored.host:
+                return jsonify({'success': False, 'error': 'Re-enter the PBS credentials when '
+                                                           'changing the host or port.'}), 400
+            data = dict(data)
+            for k in masked:
+                data[k] = getattr(stored, k, '') or ''
         # Test with provided credentials (before save)
         try:
             test_mgr = PBSManager('test', data)

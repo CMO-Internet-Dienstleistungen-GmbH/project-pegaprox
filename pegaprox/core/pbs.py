@@ -111,7 +111,19 @@ class PBSManager:
         ha_transport.guard_session(self._session)
         self._ticket = None
         self._csrf_token = None
-        self._using_api_token = bool(self.api_token_id and self.api_token_secret)
+        # MK Oct 2026 (#805) - accept the token the way PVE clusters take it as well:
+        # 'user@realm!tokenid' as the user name, secret in the password field (or in the
+        # secret field). PBS refuses a token id on /access/ticket, so such a user used to
+        # end in "Ticket auth failed: HTTP 401" without ever trying the token.
+        # The stored fields stay as entered; only the connection uses the resolved pair.
+        if self.api_token_id and self.api_token_secret:
+            self._token_id, self._token_secret = self.api_token_id, self.api_token_secret
+        elif '!' in (self.user or ''):
+            self._token_id = self.user
+            self._token_secret = self.api_token_secret or self.password
+        else:
+            self._token_id, self._token_secret = '', ''
+        self._using_api_token = bool(self._token_id)
         self._ticket_time = 0
         self.connected = False
         self.last_error = ''
@@ -133,8 +145,13 @@ class PBSManager:
         """
         try:
             if self._using_api_token:
+                if not self._token_secret:
+                    self.last_error = "API token secret missing"
+                    logging.warning(f"[PBS:{self.name}] {self.last_error}")
+                    self.connected = False
+                    return False
                 # API Token auth - just verify it works
-                self._session.headers['Authorization'] = f"PBSAPIToken={self.api_token_id}:{self.api_token_secret}"
+                self._session.headers['Authorization'] = f"PBSAPIToken={self._token_id}:{self._token_secret}"
                 resp = self._session.get(f"{self.base_url}/version", timeout=10)
                 if resp.status_code == 200:
                     self.connected = True
@@ -170,6 +187,9 @@ class PBSManager:
                     return True
                 else:
                     self.last_error = f"Ticket auth failed: HTTP {resp.status_code}"
+                    if self.api_token_id:
+                        # a token id without its secret falls back to the password login
+                        self.last_error += " (API token ID set, but no token secret)"
                     logging.warning(f"[PBS:{self.name}] {self.last_error}")
                     self.connected = False
                     return False
