@@ -310,9 +310,14 @@ def test_the_requests_are_what_the_routes_read(stage2):
     assert "haGroupSend(getAuthHeaders, 'POST', 'witness/pairing-code', sso ? body : { ...body, user_password: password }," in stage2
     code = _block(api, "@bp.route('/api/ha/witness/pairing-code'", "@bp.route('/api/ha/witness/remove'")
     for needle in ("url = _https_url(data.get('url'))", "site = data.get('site', '')", "'commands': {",
-                   "'package': f'pegaprox-witness join {code}", "'docker': f'docker run",
-                   "_refuse_without_reauth('a witness pairing code')"):
+                   "'package': f\"pegaprox-witness join '{code}'", "'install': install",
+                   "'docker': install['docker']", "_refuse_without_reauth('a witness pairing code')"):
         assert needle in code, needle
+    # what "Add witness" answers with: one line per way, and what the card says around them
+    ways = _block(api, 'def witness_install_commands(', "@bp.route('/api/ha/witness/installer'")
+    for key in ("'linux'", "'offline'", "'docker'", "'manual'", "'placeholder'", "'placeholder_in'", "'note'",
+                "'firewall'", "'installer_sha256'"):
+        assert key in ways, key
     assert "const body = { confirm: 'REMOVE' };" in stage2
     remove = _block(api, "@bp.route('/api/ha/witness/remove'", '# --- node agents')
     assert "_body().get('confirm') != 'REMOVE'" in remove and "_refuse_without_reauth('removing the witness')" in remove

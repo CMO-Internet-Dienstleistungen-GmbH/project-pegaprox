@@ -11873,7 +11873,7 @@
             const [url, setUrl] = useState('');
             const [site, setSite] = useState('');
             const [password, setPassword] = useState('');
-            const [code, setCode] = useState(null);           // {code, expires_at, commands}, shown once
+            const [code, setCode] = useState(null);           // {code, expires_at, install, commands}, shown once
             const [now, setNow] = useState(Date.now());
             const [removing, setRemoving] = useState(false);
             const [typed, setTyped] = useState('');
@@ -11918,7 +11918,10 @@
                     setRefused({ code: res.code, error: res.error });
                     return;
                 }
+                // install: one line per way (linux, offline, docker, manual); commands is what an
+                // older server sends instead
                 setCode({ code: res.data.code, expires_at: res.data.expires_at,
+                          install: res.data.install && typeof res.data.install === 'object' ? res.data.install : null,
                           commands: res.data.commands && typeof res.data.commands === 'object' ? res.data.commands : {} });
                 setNow(Date.now());
                 load();
@@ -11956,24 +11959,75 @@
             );
             const left = code ? Math.max(0, Math.floor(code.expires_at - now / 1000)) : 0;
             const commands = code ? code.commands : {};
+            const install = code ? code.install : null;
+            // how the witness is kept up to date: its last update, and WITNESS_OUTDATED with the
+            // command that updates it by hand
+            const update = witness && witness.update && typeof witness.update === 'object' ? witness.update : null;
+            const outdated = witness && Array.isArray(auto?.findings)
+                ? auto.findings.find(f => f && f.code === 'WITNESS_OUTDATED') || null : null;
+            const behind = !!witness && (witness.outdated === true || !!outdated);
+            const updateCommand = (outdated && typeof outdated.command === 'string' && outdated.command)
+                || (witness && typeof witness.update_command === 'string' && witness.update_command) || '';
+            // a failed fetch is tried again with the leader's next word; only code it went back
+            // from (back) or a witness that does not update itself wants the hand
+            const failed = update?.state === 'failed';
+            const wentBack = failed && update.back === true;
+            const byHand = witness?.auto_update !== true || wentBack;
+            const updateSays = witness?.auto_update !== true ? ''
+                : wentBack ? t('haWitnessUpdateWentBack') : failed ? t('haWitnessUpdateRetries') : t('haWitnessUpdatesItself');
+            // newer code than this instance's (the leader went back): WITNESS_AHEAD, and the
+            // command that takes the leader's release by hand
+            const aheadFinding = witness && Array.isArray(auto?.findings)
+                ? auto.findings.find(f => f && f.code === 'WITNESS_AHEAD') || null : null;
+            const ahead = !!witness && (witness.ahead === true || !!aheadFinding);
+            const toLeaderCommand = (aheadFinding && typeof aheadFinding.command === 'string' && aheadFinding.command)
+                || (witness && typeof witness.to_leader_command === 'string' && witness.to_leader_command) || '';
+            // 'installed' is for the way into an update: once the witness runs that release
+            // (an older witness never says more), it is up to date
+            const updateState = update && update.state === 'installed' && typeof witness?.release === 'string'
+                && witness.release !== '' && update.release === witness.release ? 'current' : update?.state;
+            const updateText = update && {
+                failed: t('haWitnessUpdateFailed').replace('{error}', () => String(update.error || '-')),
+                installed: t('haWitnessUpdateInstalled'),
+                current: t('haWitnessUpdateCurrent'),
+            }[updateState];
             const row = (label, value) => (
                 <div className="flex items-start justify-between gap-4 text-sm">
                     <span className="text-gray-400 whitespace-nowrap">{label}</span>
                     <span className="text-gray-200 text-right min-w-0 break-all">{value}</span>
                 </div>
             );
-            // what to run on the witness host, as the server spells it out, each with a copy button
+            // what to run on the witness host, as the server spells it out, each with a copy button;
+            // spaces kept as they are (sha256sum reads '<digest>  install.sh'), also when selected
             const command = (kind, label, value) => typeof value === 'string' && value !== '' && (
                 <div className="space-y-1" data-ha-witness-command={kind}>
                     {label && <div className="text-xs text-gray-400">{label}</div>}
                     <div className="flex items-start gap-2">
-                        <code className="flex-1 min-w-0 px-3 py-2 bg-black/40 rounded text-xs text-gray-200 break-all font-mono select-all">{value}</code>
+                        <code className="flex-1 min-w-0 px-3 py-2 bg-black/40 rounded text-xs text-gray-200 break-all whitespace-pre-wrap font-mono select-all">{value}</code>
                         <span className="shrink-0 inline-flex">
                             <CopyButton value={value} size="md" title={t('copy')} className="w-8 h-8 border border-proxmox-border hover:border-gray-500" />
                         </span>
                     </div>
                 </div>
             );
+            // one way to install the witness, and under a line that names the witness host by
+            // a placeholder, what to put there
+            const way = (kind, label) => {
+                const value = install && typeof install[kind] === 'string' ? install[kind] : '';
+                if (!value) return null;
+                const marked = Array.isArray(install.placeholder_in) && install.placeholder_in.includes(kind)
+                    && typeof install.placeholder === 'string' && install.placeholder !== '';
+                return (
+                    <div className="space-y-1" data-ha-witness-way={kind}>
+                        {command(kind, label, value)}
+                        {marked && (
+                            <p className="text-[11px] text-gray-500" data-ha-witness-placeholder>
+                                {t('haWitnessPlaceholder').replace('{placeholder}', () => install.placeholder)}
+                            </p>
+                        )}
+                    </div>
+                );
+            };
 
             return (
                 <div className={HA_GROUP_CARD} data-ha-witness={witness ? 'paired' : code && !expired ? 'waiting' : 'none'}>
@@ -11994,7 +12048,35 @@
                                 {typeof witness.skew === 'number' && row(t('haAutoColSkew'), (
                                     <span className={Math.abs(witness.skew) > HA_SKEW_LIMIT ? 'text-red-300' : undefined} data-ha-witness-skew>{haSkewText(witness.skew)}</span>
                                 ))}
+                                {typeof witness.release === 'string' && witness.release !== '' && row(t('haWitnessRelease'), (
+                                    <span className="font-mono text-xs" data-ha-witness-release>{witness.release}</span>
+                                ))}
+                                {updateText && row(t('haWitnessLastUpdate'), (
+                                    <span className={updateState === 'failed' ? 'text-red-300' : undefined} data-ha-witness-update={updateState}
+                                        style={{ wordBreak: 'normal', overflowWrap: 'anywhere' }}>{updateText}</span>
+                                ))}
                             </div>
+                            {behind && (
+                                <div className="rounded-lg p-3 text-sm border bg-yellow-500/10 border-yellow-500/40 text-yellow-200 space-y-2" data-ha-witness-outdated>
+                                    <div className="flex items-start gap-2">
+                                        <span className="mt-0.5 flex-shrink-0"><Icons.AlertTriangle /></span>
+                                        <span>
+                                            {t('haWitnessOutdated').replace('{release}', () => witness.release || '?')}
+                                            {updateSays && <span data-ha-witness-says={wentBack ? 'back' : failed ? 'retries' : 'itself'}>{` ${updateSays}`}</span>}
+                                        </span>
+                                    </div>
+                                    {byHand && command('update', t('haWitnessUpdateByHand'), updateCommand)}
+                                </div>
+                            )}
+                            {ahead && (
+                                <div className="rounded-lg p-3 text-sm border bg-yellow-500/10 border-yellow-500/40 text-yellow-200 space-y-2" data-ha-witness-ahead>
+                                    <div className="flex items-start gap-2">
+                                        <span className="mt-0.5 flex-shrink-0"><Icons.AlertTriangle /></span>
+                                        <span>{t('haWitnessAhead').replace('{release}', () => witness.release || '?')}</span>
+                                    </div>
+                                    {command('to-leader', t('haWitnessToLeader'), toLeaderCommand)}
+                                </div>
+                            )}
                             {witness.write_failed === true && (
                                 <div className="rounded-lg p-3 text-sm border bg-yellow-500/10 border-yellow-500/40 text-yellow-200 flex items-start gap-2" data-ha-witness-unwritten>
                                     <span className="mt-0.5 flex-shrink-0"><Icons.AlertTriangle /></span>
@@ -12085,9 +12167,37 @@
                                                         <Icons.Clock />
                                                         <span>{t('pgHaCodeExpiresIn').replace('{time}', () => `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`)}</span>
                                                     </div>
-                                                    <p className="text-xs text-gray-400">{t('haWitnessRunOne')}</p>
-                                                    {command('package', t('haWitnessPackage'), commands.package)}
-                                                    {command('docker', t('haWitnessDocker'), commands.docker)}
+                                                    {install ? (
+                                                        <div className="space-y-3" data-ha-witness-install>
+                                                            <p className="text-xs text-gray-400">{t('haWitnessRunOneWay')}</p>
+                                                            {!(typeof install.linux === 'string' && install.linux) && (
+                                                                <div className="rounded-lg p-2 text-xs border bg-blue-500/10 border-blue-500/30 text-blue-200 flex items-start gap-2" data-ha-witness-no-installer>
+                                                                    <span className="mt-0.5 flex-shrink-0"><Icons.Info /></span>
+                                                                    <span>{t('haWitnessNoInstaller')}</span>
+                                                                </div>
+                                                            )}
+                                                            {way('linux', t('haWitnessWayLinux'))}
+                                                            {way('offline', t('haWitnessWayOffline'))}
+                                                            {way('docker', t('haWitnessWayDocker'))}
+                                                            {!(typeof install.docker === 'string' && install.docker) && typeof install.docker_note === 'string' && install.docker_note && (
+                                                                <div className="rounded-lg p-2 text-xs border bg-blue-500/10 border-blue-500/30 text-blue-200 flex items-start gap-2" data-ha-witness-no-docker>
+                                                                    <span className="mt-0.5 flex-shrink-0"><Icons.Info /></span>
+                                                                    <span>{t('haWitnessNoDockerImage').replace('{version}', () => String(install.version || '?'))}</span>
+                                                                </div>
+                                                            )}
+                                                            {way('manual', t('haWitnessWayManual'))}
+                                                            <p className="text-xs text-gray-400 flex items-start gap-2" data-ha-witness-firewall>
+                                                                <span className="mt-0.5 flex-shrink-0"><Icons.Shield /></span>
+                                                                <span>{t('haWitnessFirewall').replace('{port}', () => String(Number.isInteger(install.port) ? install.port : 5005))}</span>
+                                                            </p>
+                                                        </div>
+                                                    ) : (
+                                                        <>
+                                                            <p className="text-xs text-gray-400">{t('haWitnessRunOne')}</p>
+                                                            {command('package', t('haWitnessPackage'), commands.package)}
+                                                            {command('docker', t('haWitnessDocker'), commands.docker)}
+                                                        </>
+                                                    )}
                                                     <p className="text-xs text-gray-400 flex items-center gap-2" data-ha-witness-waiting>
                                                         <span className="inline-flex animate-spin"><Icons.RefreshCw /></span>
                                                         {t('haWitnessWaiting')}

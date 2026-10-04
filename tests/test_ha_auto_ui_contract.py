@@ -157,7 +157,8 @@ def test_the_witness_bodies_pass_their_routes(auto, host, seed):
     assert r.status_code == 200, r.data
     body = r.get_json()
     assert set(body) >= {'code', 'expires_at', 'commands'} and set(body['commands']) == {'package', 'docker'}
-    assert body['commands']['package'].startswith(f"pegaprox-witness join {body['code']} --url https://")
+    # quoted: a placeholder left in reaches the witness, which says what to put there (#625)
+    assert body['commands']['package'].startswith(f"pegaprox-witness join '{body['code']}' --url 'https://")
     assert host.w.join(body['code'], WURL) == IDS['a']
     host.w.start()
     witness = _status(auto)['auto']
