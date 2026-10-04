@@ -43,8 +43,25 @@ bp = Blueprint('templates_lib', __name__)
 # Catalog
 # Curated list — kept small intentionally. Adding entries: image_url must
 # be a direct .img / .qcow2 URL the node can wget.
+# MK Oct 2026 - `eol` is the day security support ends (Debian/Ubuntu: end of
+# LTS); `cpu` is set where the image won't start on the kvm64 qm create defaults
+# to (EL9 needs x86-64-v2, EL10 v3). A weekly workflow runs
+# scripts/check_image_catalog.py, which parses this literal and fails on a dead
+# URL or a passed eol. Prefer latest/ or current/ paths where a distro has them.
 # ──────────────────────────────────────────────────────────────────────────
 CATALOG = [
+    {
+        'id': 'ubuntu-2604',
+        'name': 'Ubuntu 26.04 LTS (Resolute)',
+        'distro': 'ubuntu',
+        'version': '26.04',
+        'image_url': 'https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img',
+        'default_user': 'ubuntu',
+        'cores': 2, 'memory': 2048, 'disk_gb': 10,
+        'description': 'Latest LTS - cloud-init ready.',
+        'tags': ['lts', 'general', 'recommended'],
+        'eol': '2031-05-29',
+    },
     {
         'id': 'ubuntu-2404',
         'name': 'Ubuntu 24.04 LTS (Noble)',
@@ -53,8 +70,9 @@ CATALOG = [
         'image_url': 'https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img',
         'default_user': 'ubuntu',
         'cores': 2, 'memory': 2048, 'disk_gb': 10,
-        'description': 'Latest LTS — cloud-init ready.',
-        'tags': ['lts', 'general', 'recommended'],
+        'description': 'Previous LTS - broad compatibility.',
+        'tags': ['lts', 'general'],
+        'eol': '2029-05-31',
     },
     {
         'id': 'ubuntu-2204',
@@ -64,8 +82,21 @@ CATALOG = [
         'image_url': 'https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img',
         'default_user': 'ubuntu',
         'cores': 2, 'memory': 2048, 'disk_gb': 10,
-        'description': 'Previous LTS — broad compatibility.',
-        'tags': ['lts', 'general'],
+        'description': 'Older LTS, standard support until mid 2027.',
+        'tags': ['lts'],
+        'eol': '2027-06-01',
+    },
+    {
+        'id': 'debian-13',
+        'name': 'Debian 13 (Trixie)',
+        'distro': 'debian',
+        'version': '13',
+        'image_url': 'https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2',
+        'default_user': 'debian',
+        'cores': 1, 'memory': 1024, 'disk_gb': 8,
+        'description': 'Lean Debian generic-cloud image.',
+        'tags': ['lean', 'recommended'],
+        'eol': '2030-06-30',
     },
     {
         'id': 'debian-12',
@@ -75,19 +106,22 @@ CATALOG = [
         'image_url': 'https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2',
         'default_user': 'debian',
         'cores': 1, 'memory': 1024, 'disk_gb': 8,
-        'description': 'Lean Debian generic-cloud image.',
-        'tags': ['lean', 'recommended'],
+        'description': 'Previous stable Debian, now in LTS.',
+        'tags': ['lean'],
+        'eol': '2028-06-30',
     },
     {
-        'id': 'debian-11',
-        'name': 'Debian 11 (Bullseye)',
-        'distro': 'debian',
-        'version': '11',
-        'image_url': 'https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-genericcloud-amd64.qcow2',
-        'default_user': 'debian',
-        'cores': 1, 'memory': 1024, 'disk_gb': 8,
-        'description': 'Older stable Debian.',
-        'tags': ['lean'],
+        'id': 'almalinux-10',
+        'name': 'AlmaLinux 10',
+        'distro': 'almalinux',
+        'version': '10',
+        'image_url': 'https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2',
+        'default_user': 'almalinux',
+        'cores': 2, 'memory': 2048, 'disk_gb': 10,
+        'description': 'RHEL-compatible, needs a Haswell or newer host CPU.',
+        'tags': ['rhel'],
+        'eol': '2035-05-31',
+        'cpu': 'x86-64-v3',
     },
     {
         'id': 'almalinux-9',
@@ -99,6 +133,21 @@ CATALOG = [
         'cores': 2, 'memory': 2048, 'disk_gb': 10,
         'description': 'RHEL-compatible drop-in replacement.',
         'tags': ['rhel'],
+        'eol': '2032-05-31',
+        'cpu': 'x86-64-v2-AES',
+    },
+    {
+        'id': 'rocky-10',
+        'name': 'Rocky Linux 10',
+        'distro': 'rocky',
+        'version': '10',
+        'image_url': 'https://download.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base.latest.x86_64.qcow2',
+        'default_user': 'rocky',
+        'cores': 2, 'memory': 2048, 'disk_gb': 10,
+        'description': 'Community RHEL rebuild, needs a Haswell or newer host CPU.',
+        'tags': ['rhel'],
+        'eol': '2035-05-31',
+        'cpu': 'x86-64-v3',
     },
     {
         'id': 'rocky-9',
@@ -110,28 +159,36 @@ CATALOG = [
         'cores': 2, 'memory': 2048, 'disk_gb': 10,
         'description': 'Community RHEL rebuild.',
         'tags': ['rhel'],
+        'eol': '2032-05-31',
+        'cpu': 'x86-64-v2-AES',
     },
     {
-        'id': 'fedora-40',
-        'name': 'Fedora 40 Cloud',
+        # Fedora has no release-independent path: the GA image is fixed for a release and
+        # leaves the mirrors when it reaches end of life. Bump to the next release then.
+        'id': 'fedora-44',
+        'name': 'Fedora 44 Cloud',
         'distro': 'fedora',
-        'version': '40',
-        'image_url': 'https://download.fedoraproject.org/pub/fedora/linux/releases/40/Cloud/x86_64/images/Fedora-Cloud-Base-Generic.x86_64-40-1.14.qcow2',
+        'version': '44',
+        'image_url': 'https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2',
         'default_user': 'fedora',
         'cores': 2, 'memory': 2048, 'disk_gb': 10,
         'description': 'Cutting-edge Red Hat upstream.',
         'tags': ['cutting-edge'],
+        'eol': '2027-06-02',
     },
     {
-        'id': 'alpine-319',
-        'name': 'Alpine Linux 3.19',
+        # Alpine names its images by point release and keeps the old ones, so this stays
+        # downloadable; `apk upgrade` brings a deployed guest current.
+        'id': 'alpine-324',
+        'name': 'Alpine Linux 3.24',
         'distro': 'alpine',
-        'version': '3.19',
-        'image_url': 'https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/cloud/nocloud_alpine-3.19.1-x86_64-bios-cloudinit-r0.qcow2',
+        'version': '3.24',
+        'image_url': 'https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/cloud/generic_alpine-3.24.1-x86_64-bios-cloudinit-r0.qcow2',
         'default_user': 'alpine',
         'cores': 1, 'memory': 512, 'disk_gb': 4,
-        'description': 'Tiny musl-based — perfect for k3s.',
+        'description': 'Tiny musl-based - perfect for k3s.',
         'tags': ['minimal', 'container-host'],
+        'eol': '2028-06-01',
     },
 ]
 
@@ -345,6 +402,8 @@ def _run_deploy(dep_id, cluster_id, node, template_id, storage, vmid, vm_name):
             f"--memory {memory} --cores {cores} "
             f"--net0 virtio,bridge=vmbr0 --ostype l26 --agent 1 --serial0 socket --vga serial0"
         )
+        if tpl.get('cpu'):
+            create_cmd += f" --cpu {shlex.quote(str(tpl['cpu']))}"
         run(create_cmd, 'qm create')
         _update_dep(dep_id, progress=50, log_append='VM shell created')
 

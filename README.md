@@ -186,7 +186,7 @@ The name **PegaProx** is inspired by *Pegasus*, the winged horse of Greek mythol
 - 🛡️ **CVE Reporting** - Per-cluster severity counts + per-package detail + historical view of when each CVE first appeared.
 
 ### Operations & Deployment
-- ☁️ **Cloud-Init Template Library** - Curated catalog (Ubuntu 22.04/24.04, Debian 11/12, AlmaLinux 9, Rocky 9, Fedora 40, Alpine 3.19) plus admin-defined custom templates. One-click deploy to any cluster (download → import → cloudinit drive → convert to template).
+- ☁️ **Cloud-Init Template Library** - Curated catalog of the supported Ubuntu LTS, Debian, AlmaLinux, Rocky Linux, Fedora and Alpine cloud images (a weekly CI job checks every image URL and flags releases past their end of life) plus admin-defined custom templates. One-click deploy to any cluster (download → import → cloudinit drive → convert to template).
 - 🚑 **Site Recovery** - Configure DR plans (boot order, dependencies, replication mappings) and execute controlled failover with audit trail.
 - 📦 **Backup SLA Tracking** - SLA dashboard per cluster + datastore: last-backup age vs configured RPO, integrated with the Alert pipeline.
 - 🔁 **ZFS / Cross-Cluster Replication** - Native PVE replication monitor + cross-cluster replication for clusters without shared storage.
