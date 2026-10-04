@@ -1101,6 +1101,9 @@ READ_SITES = [
     ('pegaprox/core/manager.py', 'PegaProxManager._ha_ssh_stop_vms_on_node',
      {'_ssh_run_command_output': 1, '_ssh_run_command_with_key_output': 1,
       '_ssh_run_command_with_password_output': 1}),
+    # cat of a failed node's guest configs in /etc/pve on another node, before its
+    # recovery decides which of them can move
+    ('pegaprox/core/manager.py', 'PegaProxManager._ha_read_guest_configs', {'_ssh_node_output': 1}),
     ('pegaprox/core/bmc.py', 'read_node_bmc_inband',
      {'_ssh_run_command_with_key_output': 1, '_ssh_run_command_output': 1,
       '_ssh_run_command_with_password_output': 1}),

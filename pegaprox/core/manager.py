@@ -5052,9 +5052,13 @@ class PegaProxManager:
             recovered = 0
             failed = 0
             skipped_local = 0
+            unclassified = []   # vmids left where they are: where their disks are is not known
             started = []    # (vmid, target) of what was brought up elsewhere
             unstarted = []  # (vmid, target) moved while the node was back, and not started
             left = []       # what stays with the node once it is back
+            # the config of each guest: asked of failed_node while it answers, from /etc/pve
+            # on another node once it does not (_ha_guest_storage keeps that read here)
+            asked = {'node': True}
             
             for i, vm in enumerate(vms_on_failed_node):
                 if not ha.is_active():
@@ -5066,12 +5070,23 @@ class PegaProxManager:
                 vm_type = vm.get('type', 'qemu')
                 
                 # check VM uses shared storage
-                storage_type = self._ha_check_vm_storage(vmid, vm_type, failed_node)
+                storage_type = self._ha_check_vm_storage(vmid, vm_type, failed_node) if asked['node'] else None
+                if storage_type not in ('local', 'shared', 'nodisk'):
+                    # PVE proxies that read to the node: a node that is down never answers it,
+                    # and is not asked again for the next guest
+                    asked['node'] = False
+                    storage_type, why = self._ha_guest_storage(vmid, vm_type, failed_node, vms_on_failed_node,
+                                                               available_nodes, asked)
                 
                 if storage_type == 'local':
                     self.logger.warning(f"[HA] ⚠ SKIPPING {vm_name} ({vmid}) - Uses LOCAL storage, cannot recover!")
                     self.logger.warning(f"[HA]   → To enable HA for this VM, move its disks to shared storage")
                     skipped_local += 1
+                    continue
+                if storage_type not in ('shared', 'nodisk'):
+                    self.logger.warning(f"[HA] ⚠ SKIPPING {vm_name} ({vmid}) - {why}: its disks may be on "
+                                        f"{failed_node}, not recovered")
+                    unclassified.append(vmid)
                     continue
                 
                 # Select target node (round-robin or least loaded)
@@ -5165,12 +5180,21 @@ class PegaProxManager:
                     unseen = (self.ha_node_status.get(failed_node) or {}).get('last_seen') == seen_online
                 if unseen:
                     self._ha_retry_recovery(failed_node, held=True)
-            self.logger.info(f"[HA] ========== HA RECOVERY {'ENDED' if left or unstarted else 'COMPLETE'} ==========")
-            self.logger.info(f"[HA] Recovered: {recovered}, Failed: {failed}, Skipped (local storage): {skipped_local}")
+            self.logger.info(f"[HA] ========== HA RECOVERY "
+                             f"{'ENDED' if left or unstarted or unclassified else 'COMPLETE'} ==========")
+            self.logger.info(f"[HA] Recovered: {recovered}, Failed: {failed}, Skipped (local storage): {skipped_local}, "
+                             f"Skipped (storage not known): {len(unclassified)}")
             
             if skipped_local > 0:
                 self.logger.warning(f"[HA] {skipped_local} VMs were skipped because they use local storage!")
                 self.logger.warning(f"[HA] Move these VMs to shared storage for full HA protection.")
+            if unclassified:
+                # down until an admin looks: pushed and audited like any guest left for one
+                self._ha_refuse('ha.recovery_unclassified',
+                                f"{failed_node}: {len(unclassified)} guest(s) not recovered, no config of theirs "
+                                f"could be read to tell where their disks are: "
+                                f"{', '.join(str(v) for v in unclassified)} - check that before you start them "
+                                "elsewhere", node=failed_node)
             
         except Exception as e:
             self.logger.error(f"[HA] Error in recovery worker: {e}")
@@ -5405,6 +5429,11 @@ class PegaProxManager:
         """check if VM uses shared or local storage
 
         MK: checks proxmox 'shared' flag since LVM/ZFS can go either way
+
+        'local', 'shared' or 'nodisk' from the guest's config as it is now, see
+        _ha_volume_class. 'unknown' when the config or the storage list cannot be read.
+        PVE proxies the config read to `node`, so for a node that is down it is always
+        'unknown': the recovery reads the config on another node then (_ha_guest_storage).
         """
         try:
             host = self.host
@@ -5421,72 +5450,166 @@ class PegaProxManager:
                 return 'unknown'
             
             config = response.json().get('data', {})
-            
-            # Get storage configurations
-            storage_url = f"https://{host}:{self.api_port}/api2/json/storage"
-            storage_response = self._create_session().get(storage_url, timeout=10)
-            storage_configs = {}
-            if storage_response.status_code == 200:
-                for s in storage_response.json().get('data', []):
-                    storage_configs[s['storage']] = s
-            
-            shared_types = ['nfs', 'cifs', 'glusterfs', 'cephfs', 'rbd', 'iscsi', 'iscsidirect', 'drbd', 'pbs', 'starlvm']
-            # MK: starlvm = StarWind shared thin-LVM (snapshots on a shared SAN LUN), always added with -shared 1
-            local_types = ['dir', 'lvmthin']
-            # NS: LVM/ZFS treated as local unless proxmox 'shared' flag is set
-            # Claude helped optimize this logic - NS feb 2026
 
-            has_local = False
-            has_shared = False
-            
-            for key, value in config.items():
-                # Check QEMU disks (scsi0, virtio0, ide0, sata0, etc.)
-                if vm_type == 'qemu' and any(key.startswith(p) for p in ['scsi', 'virtio', 'ide', 'sata', 'efidisk', 'tpmstate']):
-                    if isinstance(value, str) and ':' in value:
-                        storage_name = value.split(':')[0]
-                        if storage_name in storage_configs:
-                            storage_cfg = storage_configs[storage_name]
-                            storage_type = storage_cfg.get('type', '')
-                            is_shared_flag = storage_cfg.get('shared', 0)
-
-                            if is_shared_flag:
-                                has_shared = True
-                            elif storage_type in shared_types:
-                                has_shared = True
-                            elif storage_type in local_types:
-                                has_local = True
-                            else:
-                                has_local = True
-
-                # Check LXC rootfs and mount points
-                if vm_type == 'lxc' and (key == 'rootfs' or key.startswith('mp')):
-                    if isinstance(value, str) and ':' in value:
-                        storage_name = value.split(':')[0]
-                        if storage_name in storage_configs:
-                            storage_cfg = storage_configs[storage_name]
-                            storage_type = storage_cfg.get('type', '')
-                            is_shared_flag = storage_cfg.get('shared', 0)
-                            
-                            if is_shared_flag:
-                                has_shared = True
-                            elif storage_type in shared_types:
-                                has_shared = True
-                            elif storage_type in local_types:
-                                has_local = True
-                            else:
-                                has_local = True
-
-            # If any disk is local, the VM can't be recovered
-            if has_local:
-                return 'local'
-            elif has_shared:
-                return 'shared'
-            else:
+            # without the storages every volume would be on one nobody knows
+            storage_configs = self._ha_storage_configs()
+            if storage_configs is None:
                 return 'unknown'
+            return self._ha_volume_class(config, vm_type, storage_configs)
                 
         except Exception as e:
             self.logger.debug(f"[HA] Error checking VM storage: {e}")
             return 'unknown'
+
+    HA_SHARED_STORAGE_TYPES = ('nfs', 'cifs', 'glusterfs', 'cephfs', 'rbd', 'iscsi', 'iscsidirect', 'drbd', 'pbs',
+                               'starlvm')
+    # MK: starlvm = StarWind shared thin-LVM (snapshots on a shared SAN LUN), always added with -shared 1
+    # the config keys a guest starts with that name a volume (unusedN does not)
+    _HA_VOLUME_KEYS = {'qemu': re.compile(r'(?:scsi|virtio|ide|sata)\d+|efidisk\d+|tpmstate\d+'),
+                       'lxc': re.compile(r'rootfs|mp\d+')}
+
+    @classmethod
+    def _ha_storage_shared(cls, cfg) -> bool:
+        # NS: LVM/ZFS treated as local unless proxmox 'shared' flag is set
+        return cls._storage_is_shared(cfg) or cfg.get('type', '') in cls.HA_SHARED_STORAGE_TYPES
+
+    # a cloud-init drive, as qemu-server's drive_is_cloudinit tells one
+    _HA_CLOUDINIT_RE = re.compile(r'.*[:/](?:vm-\d+-)?cloudinit(?:\.\w+)?')
+
+    @classmethod
+    def _ha_volume_class(cls, config, vm_type, storages) -> str:
+        """'local', 'shared' or 'nodisk' for a guest config; storages is GET /storage by name.
+
+        'shared' only when every volume it starts with is on shared storage: each disk,
+        the EFI and TPM state, the ISO in a CD-ROM drive (lxc: rootfs and the mpN). An
+        ISO on a node's own storage makes it 'local' as well, its start elsewhere would
+        fail. So does a device or directory of the host (a passthrough disk, the host's
+        cdrom drive, a bind mount unless it is marked shared=1) and a storage that is not
+        in `storages`. Not a cloud-init drive on a storage every node has: qemu-server
+        makes it afresh at the start where it is missing. An empty CD-ROM drive is no
+        volume; a guest without any volume is 'nodisk' and starts anywhere."""
+        keys = cls._HA_VOLUME_KEYS['lxc' if vm_type == 'lxc' else 'qemu']
+        found = False
+        for key, value in (config or {}).items():
+            if not isinstance(value, str) or not keys.fullmatch(str(key)):
+                continue
+            parts = value.split(',')
+            # the volume is the part without a key, or file= / volume= written out
+            volume = next((p.split('=', 1)[1] if '=' in p else p for p in parts
+                           if '=' not in p or p.startswith(('file=', 'volume='))), '')
+            if volume in ('', 'none'):
+                continue
+            found = True
+            if volume.startswith('/') or ':' not in volume:
+                if vm_type == 'lxc' and any(p.lower() in ('shared=1', 'shared=true', 'shared=yes', 'shared=on')
+                                            for p in parts[1:]):
+                    continue
+                return 'local'
+            cfg = storages.get(volume.split(':', 1)[0])
+            if not isinstance(cfg, dict):
+                return 'local'
+            if cls._ha_storage_shared(cfg):
+                continue
+            if (vm_type != 'lxc' and cls._HA_CLOUDINIT_RE.fullmatch(volume)
+                    and not cfg.get('nodes') and not cfg.get('disable')):
+                continue
+            return 'local'
+        return 'shared' if found else 'nodisk'
+
+    def _ha_storage_configs(self):
+        """GET /storage by name, None when it cannot be read."""
+        try:
+            r = self._create_session().get(f"https://{self.host}:{self.api_port}/api2/json/storage", timeout=10)
+            if r.status_code == 200:
+                return {s['storage']: s for s in r.json().get('data') or []
+                        if isinstance(s, dict) and s.get('storage')}
+            self.logger.debug(f"[HA] Could not read the storages: {r.status_code}")
+        except Exception as e:
+            self.logger.debug(f"[HA] Could not read the storages: {e}")
+        return None
+
+    # MK Oct 2026 - where the disks of a dead node's guests are. The recovery read each
+    # config through the API, and PVE proxies that read to the guest's node (proxyto =>
+    # 'node'): for a node that is down it only ever came back 'unknown', and the config of
+    # a guest whose disks sit on that node's local storage was moved all the same. Its
+    # start failed, and once the node was back each config had to be moved back by hand.
+    # Every node of the quorate part holds the configs of all nodes in /etc/pve (pmxcfs),
+    # the copy the config move itself works on: they are read there, over SSH like the
+    # move, once per recovery and as they are at the time of it.
+    HA_CONFIG_READ_NODES = 3    # nodes asked for them, each may cost a timeout
+
+    def _ha_guest_storage(self, vmid, vm_type, failed_node, guests, nodes, memo):
+        """(class, why) of a guest of failed_node that the node itself did not answer for:
+        'local', 'shared' or 'nodisk' (_ha_volume_class) from its config in /etc/pve as
+        another node holds it, None when that cannot be told. The configs of all of
+        `guests` are read for the first guest that needs them and kept in memo, the
+        recovery's dict. why is for the log of a guest that is skipped."""
+        if 'configs' not in memo:
+            memo['configs'] = self._ha_read_guest_configs(failed_node, guests, nodes)
+            memo['storages'] = self._ha_storage_configs() if memo['configs'] is not None else None
+        configs, storages = memo['configs'], memo['storages']
+        if configs is None:
+            return None, f'{failed_node} does not answer for its config, and no other node did over SSH'
+        if storages is None:
+            return None, 'the storages of the cluster could not be read'
+        config = configs.get(int(vmid)) if str(vmid).isdigit() else None
+        if config is None:
+            return None, f'its config is not in /etc/pve/nodes/{failed_node} any more'
+        return self._ha_volume_class(config, vm_type, storages), None
+
+    def _ha_read_guest_configs(self, failed_node, guests, nodes):
+        """{vmid: config} of `guests` (rows of /cluster/resources) as /etc/pve/nodes/
+        <failed_node> holds them now, in one command on the first of `nodes` that answers
+        (HA_CONFIG_READ_NODES at most). A guest whose config is not there is left out.
+        None when no node answered."""
+        paths = [f"{'qemu-server' if vm.get('type', 'qemu') == 'qemu' else 'lxc'}/{vm.get('vmid')}.conf"
+                 for vm in guests or ()
+                 if str(vm.get('vmid')).isdigit() and vm.get('type', 'qemu') in ('qemu', 'lxc')]
+        # sec: the node name is the API's and goes into a root shell on another node
+        if not paths or not validate_hostname(failed_node):
+            return None
+        # no line of a config starts like this (a description line starts with #), and the
+        # part of this read alone could not be guessed for one either. A cat that fails
+        # fails it all: half a config could leave out the one disk that is local
+        mark = f'--- {uuid.uuid4().hex}'
+        cmd = (f"cd /etc/pve/nodes/{failed_node} || exit 1; for f in {' '.join(paths)}; do "
+               f"[ -f \"$f\" ] && {{ echo; echo '{mark}' \"$f\"; cat \"$f\" || exit 1; }}; done; true")
+        out = None
+        for node in [n for n in nodes or () if n != failed_node][:self.HA_CONFIG_READ_NODES]:
+            # cat on a node: a read, no step of its own in an automatic group (#625)
+            with ha.reading():
+                out = self._ssh_node_output(node, cmd, timeout=20)
+            if out is not None:
+                break
+            self.logger.warning(f"[HA] Could not read the guest configs of {failed_node} on {node}")
+        if out is None:
+            return None
+        files, lines = {}, None
+        for line in out.splitlines():
+            if line.startswith(mark + ' '):
+                name = re.fullmatch(r'(?:qemu-server|lxc)/(\d+)\.conf', line[len(mark) + 1:])
+                lines = files.setdefault(int(name.group(1)), []) if name else None
+            elif lines is not None:
+                lines.append(line)
+        return {vmid: self._ha_parse_guest_config(text) for vmid, text in files.items()}
+
+    @staticmethod
+    def _ha_parse_guest_config(lines):
+        """A guest config file as GET .../config answers it: its main part with the
+        pending changes over it ([PENDING], [pve:pending] for a container: they apply at
+        the next start). Snapshots and the other sections are left out, so is the
+        description (the # lines)."""
+        config, section = {}, None
+        for line in lines:
+            line = line.strip()
+            head = re.fullmatch(r'\[([^\]]*)\]', line)
+            if head:
+                section = head.group(1).lower()
+            elif line and not line.startswith('#') and section in (None, 'pending', 'pve:pending'):
+                key, sep, value = line.partition(':')
+                if sep:
+                    config[key.strip()] = value.strip()
+        return config
     
     def get_balancing_excluded_vms(self) -> List[int]:
         """Get list of VMIDs excluded from load balancing for this cluster
@@ -5602,8 +5725,10 @@ class PegaProxManager:
             return False
 
     def check_vm_storage_type(self, node: str, vmid: int, vm_type: str) -> str:
-        # public wrapper for _ha_check_vm_storage
-        return self._ha_check_vm_storage(vmid, vm_type, node)
+        # public wrapper for _ha_check_vm_storage; a guest without disks stays 'unknown'
+        # here, as the balancer has always taken it
+        kind = self._ha_check_vm_storage(vmid, vm_type, node)
+        return 'unknown' if kind == 'nodisk' else kind
     
     def _ha_get_vms_on_node(self, node: str) -> List[Dict]:
         try:
