@@ -295,7 +295,7 @@ SYNC_TABLES = (
     'webauthn_credentials', 'custom_roles', 'tenants', 'vm_acls', 'pool_permissions',
     'clusters', 'cluster_groups', 'node_maintenance', 'balancing_excluded_vms',
     'balancing_excluded_pools', 'affinity_rules', 'vm_tags', 'alerts', 'cluster_alerts',
-    'scheduled_tasks', 'scheduled_actions', 'update_schedules', 'custom_scripts',
+    'alert_mutes', 'scheduled_tasks', 'scheduled_actions', 'update_schedules', 'custom_scripts',
     'node_bmc_endpoints', 'esxi_storages', 'storage_clusters', 'pbs_servers',
     'vmware_servers', 'xcpng_pools', 'xcpng_pool_members', 'xcpng_vmid_map',
     'cross_cluster_replications', 'efficient_snapshots', 'site_recovery_plans',

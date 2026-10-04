@@ -818,11 +818,33 @@ class PegaProxDB:
                 escalation_step INTEGER DEFAULT 0,
                 last_escalated_at TEXT,
                 resolved_at TEXT,
-                resolved_by TEXT
+                resolved_by TEXT,
+                object_key TEXT
             )
         ''')
+        # MK Oct 2026 - object_key: what an event incident is about (a task, a Ceph
+        # cluster, a replication job), see background/alert_events.py
+        cursor.execute("PRAGMA table_info(active_alerts)")
+        if 'object_key' not in [col[1] for col in cursor.fetchall()]:
+            cursor.execute("ALTER TABLE active_alerts ADD COLUMN object_key TEXT")
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_active_alerts_unresolved ON active_alerts(resolved_at)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_active_alerts_key ON active_alerts(alert_key)')
+        # a mute holds back what a rule, an object or both would send, until it runs out.
+        # Shared configuration (core/ha.py SYNC_TABLES); only the active reads it to send.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS alert_mutes (
+                id TEXT PRIMARY KEY,
+                cluster_id TEXT NOT NULL,
+                rule_id TEXT NOT NULL DEFAULT '',
+                object_key TEXT NOT NULL DEFAULT '',
+                object_label TEXT,
+                until TEXT NOT NULL,
+                reason TEXT,
+                created_by TEXT,
+                created_at TEXT
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_alert_mutes_cluster ON alert_mutes(cluster_id)')
 
         # LW: ESXi integration was a pain, but people kept asking for it
         cursor.execute('''

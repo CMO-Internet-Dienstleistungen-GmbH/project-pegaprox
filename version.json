@@ -97,6 +97,7 @@
     "pegaprox/api/xhm.py",
     "pegaprox/app.py",
     "pegaprox/background/__init__.py",
+    "pegaprox/background/alert_events.py",
     "pegaprox/background/alerts.py",
     "pegaprox/background/broadcast.py",
     "pegaprox/background/cross_cluster_lb.py",
