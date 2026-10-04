@@ -90,6 +90,7 @@ def _start(path, args=(), env=None):
         except OSError:
             if time.time() > deadline or proc.poll() is not None:
                 proc.kill()
+                proc.wait(10)
                 pytest.fail('the witness did not come up')
             time.sleep(0.2)
     return _Running(d, port, proc)

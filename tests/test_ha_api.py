@@ -87,6 +87,12 @@ PEER_ROUTES = [
 AGENT_ROUTES = [
     ('GET', '/api/ha/agent'),
 ]
+# what a witness host fetches: the installer the repository publishes, and the witness
+# code for the open code or the paired witness's signature (tests/test_ha_witness_delivery.py)
+WITNESS_DELIVERY_ROUTES = [
+    ('GET', '/api/ha/witness/installer'),
+    ('POST', '/api/ha/witness/bundle'),
+]
 
 
 _URL_SHAPE = re.compile(r'https://[A-Za-z0-9.\-\[\]:]+(:\d{1,5})?(/[A-Za-z0-9._~\-/]*)?')
@@ -286,7 +292,8 @@ def _joined(env, seed, monkeypatch):
 # --- every route, every caller ------------------------------------------------------
 
 def test_the_route_lists_are_every_ha_route(api):
-    listed = {(m.upper(), p) for m, p, _b in ADMIN_ROUTES} | set(PEER_ROUTES) | set(AGENT_ROUTES)
+    listed = {(m.upper(), p) for m, p, _b in ADMIN_ROUTES} | set(PEER_ROUTES) | set(AGENT_ROUTES) | \
+        set(WITNESS_DELIVERY_ROUTES)
     served = set()
     for rule in api.app.url_map.iter_rules():
         if rule.rule.startswith('/api/ha/'):

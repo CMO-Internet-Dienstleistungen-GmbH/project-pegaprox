@@ -39,6 +39,13 @@ CODE_PREFIX = 'pgxha1_'
 WITNESS_CODE_PREFIX = 'pgxwt1_'
 # the witness keeps its state here, in a directory of its own (pegaprox/witness.py)
 WITNESS_STATE_NAME = 'ha_witness.json'
+# The calls between the members and the witness, by version. 1: the witness as first
+# shipped, random nonces only and no updates. 2: stream nonces on votes and renewals,
+# and the witness updates itself from the leader (witness-update, the code bundle).
+# A member talks to a witness one version behind its own; the witness says its version
+# in its status, and a witness that says none is a 1.
+WITNESS_WIRE = 2
+BUNDLE_MARK = b'pegaprox-witness-bundle-1\n'
 
 MAX_URL_LEN = 512
 DNS_LABEL_RE = re.compile(r'(?!-)[a-z0-9-]{1,63}(?<!-)')
@@ -272,6 +279,12 @@ def take_stream(streams, nonce, ts, now, spend=True):
     if spend and ts > newest:
         rec[2] = ts
     return 'ok'
+
+
+def bundle_message(manifest):
+    """What a data voter signs over the witness code bundle it serves: the manifest,
+    which carries the archive's SHA-256 (ha.witness_bundle, witness.Witness.verify)."""
+    return BUNDLE_MARK + json.dumps(manifest, separators=(',', ':'), sort_keys=True).encode()
 
 
 # --- the sealed pairing answer -------------------------------------------------------

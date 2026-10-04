@@ -465,6 +465,9 @@ EXITS = {
     ('pegaprox/witness.py', 'https_call', 'http-session'): (1, 'peer'),
     # the health check of a witness: its own port
     ('pegaprox/witness.py', 'cmd_health', 'socket'): (1, 'local'),
+    # and its own port at the address it paired with (the other socket only binds, to
+    # tell an address of this host)
+    ('pegaprox/witness.py', '_dial_own', 'socket'): (2, 'local'),
 }
 
 VERDICTS = {'guard', 'client', 'console', 'login', 'read', 'local', 'external', 'peer', 'unused'}
@@ -496,11 +499,11 @@ def test_the_inventory_counts_what_the_report_says():
     by = Counter()
     for (_f, _q, kind), (n, verdict) in EXITS.items():
         by[verdict] += n
-    # S4 with the witness and the lease link: 262 calls out of this process, 153 (function,
-    # kind) pairs in 138 functions; 46 of them guarded at the exit and 83 execs on a client
+    # S4 with the witness and the lease link: 264 calls out of this process, 154 (function,
+    # kind) pairs in 139 functions; 46 of them guarded at the exit and 83 execs on a client
     # from a guarded factory. No route relies on the write gate alone any more
-    assert sum(n for n, _v in EXITS.values()) == 262 and len(EXITS) == 153
-    assert len({(f, q) for f, q, _k in EXITS}) == 138
+    assert sum(n for n, _v in EXITS.values()) == 264 and len(EXITS) == 154
+    assert len({(f, q) for f, q, _k in EXITS}) == 139
     assert by['guard'] == 46 and by['client'] == 83
 
 
@@ -781,6 +784,8 @@ AUTOMATIONS = {
     ('pegaprox/utils/vnc_tunnel.py', '_ssh_server'): (1, 'console'),
     # the witness process stopping its own server on SIGTERM
     ('pegaprox/witness.py', 'serve.stop'): (1, 'local'),
+    # and its upkeep: its own port for its health, the bundle from a member for an update
+    ('pegaprox/witness.py', 'serve'): (1, 'peer'),
 }
 
 

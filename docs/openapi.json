@@ -44539,7 +44539,7 @@
           }
         },
         "summary": "A one-time code for the witness of this group, on the leader. Wants user_password.",
-        "description": "url is this instance as the witness reaches it, site where the witness runs (a label,\nfor the split checks). On the witness host the admin runs `pegaprox-witness join\n<code> --url https://<witness>:5005` (in the Docker image: the command `witness join\n...`), which the answer spells out in commands. The code is good for 15 minutes and\none pairing; a new one replaces an open one. One witness per group: 409 while it has\none, and 409 HA_AUTO_NOT_SHIPPED while this release does not offer automatic failover,\nwhich is what a witness votes in. In an automatic group only the instance a majority\njust confirmed makes one (503 HA_NO_LEASE).",
+        "description": "url is this instance as the witness reaches it, site where the witness runs (a label,\nfor the split checks). The answer spells out one command per way to install the\nwitness with the code in it (install: linux, offline, docker, manual, with\ninstaller_sha256, image, branch, docker_note, placeholder, placeholder_in, note and\nfirewall; see witness_install_commands); docker is null with docker_note where no\nimage of this release runs the witness. commands is the older form. The code is good for 15 minutes and\none pairing; a new one replaces an open one. One witness per group: 409 while it has\none, and 409 HA_AUTO_NOT_SHIPPED while this release does not offer automatic failover,\nwhich is what a witness votes in. In an automatic group only the instance a majority\njust confirmed makes one (503 HA_NO_LEASE).",
         "requestBody": {
           "required": false,
           "content": {
@@ -44561,6 +44561,66 @@
         ],
         "x-pegaprox-roles": [
           "admin"
+        ]
+      }
+    },
+    "/api/ha/witness/installer": {
+      "get": {
+        "operationId": "ha.witness_installer_file_get",
+        "tags": [
+          "ha"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          }
+        },
+        "summary": "The witness installer this instance ships (packaging/witness/install.sh), for a witness host that reaches neither GitHub nor its mirror.",
+        "description": "No session: it is the file the repository publishes, and the line \"Add witness\"\nshows checks it against its SHA-256 (X-Checksum-Sha256 here too) before anything of\nit runs. Exactly this one file; 404 where this instance ships none.",
+        "x-pegaprox-auth": "public"
+      }
+    },
+    "/api/ha/witness/bundle": {
+      "post": {
+        "operationId": "ha.witness_code_bundle_post",
+        "tags": [
+          "ha"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not the witness of this group"
+          },
+          "403": {
+            "description": "Wrong, expired or spent witness code"
+          }
+        },
+        "summary": "The code the witness runs, as one archive signed with this instance's key (ha.witness_bundle): {manifest, sig, archive}, the manifest with the release, the wire, the archive's size, SHA-256 and files and who signed.",
+        "description": "For two callers and nobody else. The installer on the witness host, with the open\nwitness code in the body ({code}; looked at and not spent - only the leader holds\none): 403 for any other code. The paired witness, by a call signed with its key, for\nits update (any member serves it, the witness takes the signature of any data voter):\n401 for a wrong signature, 401 HA_CLOCK for a good one whose time is off; with\n{check: true} it only asks whether this group still counts it ({witness: true}, no\ncode). Nothing else can be fetched here: the bundle is a fixed list of files.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "inline",
+        "security": [
+          {
+            "haPeer": []
+          },
+          {}
         ]
       }
     },

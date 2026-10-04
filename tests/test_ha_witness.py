@@ -393,7 +393,9 @@ def test_the_status_is_its_own_and_small(box):
     assert status == 200
     assert set(ans) == {'instance_id', 'role', 'kind', 'epoch', 'group', 'lease_mark', 'wall',
                         'release', 'zone', 'mode', 'cfg_id', 'gen', 'voted_for', 'reach', 'lease',
-                        'floor_cv', 'skew', 'cfg_digest'}
+                        'floor_cv', 'skew', 'cfg_digest', 'wire', 'auto_update', 'install', 'code'}
+    # what the leader keeps it up to date by (tests/test_ha_witness_delivery.py)
+    assert ans['wire'] == ha_wire.WITNESS_WIRE and ans['auto_update'] is False and ans['code'] == ''
     assert (ans['instance_id'], ans['role'], ans['kind'], ans['mode']) == (W, 'witness', 'witness', 'auto')
     # the config it holds by digest, as a data member names it
     assert ans['cfg_digest'] == hv.cfg_digest(box.file()['cfg'])
@@ -768,14 +770,16 @@ def test_the_launcher_runs_the_witness_and_never_the_app(tmp_path):
     assert out.returncode == 0, out.stderr
     assert eval(out.stdout) == ['pegaprox', 'pegaprox.core', 'pegaprox.core.ha_vote',
                                 'pegaprox.core.ha_wire', 'pegaprox.utils', 'pegaprox.utils.ratelimit',
-                                'pegaprox.witness']
+                                'pegaprox.witness', 'pegaprox.witness_boot']
 
 
 def test_the_unit_and_the_image(tmp_path, monkeypatch):
     with open(os.path.join(ROOT, 'systemd', 'pegaprox-witness.service'), encoding='utf-8') as fh:
         unit = fh.read()
+    # the command and the user are the ones packaging/witness/install.sh makes
     for line in ('User=pegaprox-witness', 'NoNewPrivileges=true', 'StateDirectory=pegaprox-witness',
-                 'ExecStart=/usr/bin/pegaprox/pegaprox-wrapper witness run', 'Restart=on-failure'):
+                 'ExecStart=/usr/local/bin/pegaprox-witness run', 'Restart=on-failure',
+                 'ProtectSystem=strict', 'RestartForceExitStatus=75'):
         assert line in unit.splitlines(), line
     with open(os.path.join(ROOT, 'Dockerfile'), encoding='utf-8') as fh:
         docker = fh.read()

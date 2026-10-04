@@ -40,7 +40,7 @@ _INLINE_AUTH = ('_require_session', 'validate_session(', 'validate_api_token(',
                 # #625 - the other PegaProx instance of a standby pair
                 '_peer_or_refuse', 'accept_pairing',
                 # and its witness: the code at pairing, its signature after
-                'accept_witness', 'witness_verdict')
+                'accept_witness', 'witness_verdict', 'request_witness')
 
 # ...and those two take that token only, so advertising apiToken/sessionId on them
 # sends an integrator straight into a 403.
@@ -48,8 +48,10 @@ _INSTALL_TOKEN_AUTH = ('_profile_for_token', '_run_for_callback_token')
 
 # Same for the standby pair: the peer header and nothing else. The pairing route
 # is authenticated by the one-time code in its body, which no scheme describes.
-_HA_PEER_AUTH = ('_peer_or_refuse', 'witness_verdict')
+_HA_PEER_AUTH = ('_peer_or_refuse', 'witness_verdict', 'request_witness')
 _HA_PAIRING_AUTH = ('accept_pairing', 'accept_witness')
+# the witness code bundle: the witness's signature, or the open witness code in the body
+_HA_WITNESS_CODE = ('witness_code_ok',)
 
 _CONVERTER_TYPES = {
     'int': ('integer', None),
@@ -185,7 +187,12 @@ def build(app):
                 op['security'] = [{'installToken': []}]
                 op['responses'].pop('401', None)
                 op['responses']['403'] = {'description': 'Unknown, revoked or spent token'}
-            if kind == 'inline' and _uses(fn, _HA_PEER_AUTH):
+            if kind == 'inline' and _uses(fn, _HA_PEER_AUTH) and _uses(fn, _HA_WITNESS_CODE):
+                # MK Oct 2026 (#625): or no scheme at all, the open code in the body
+                op['security'] = [{'haPeer': []}, {}]
+                op['responses']['401'] = {'description': 'Not the witness of this group'}
+                op['responses']['403'] = {'description': 'Wrong, expired or spent witness code'}
+            elif kind == 'inline' and _uses(fn, _HA_PEER_AUTH):
                 op['security'] = [{'haPeer': []}]
                 op['responses']['401'] = {'description': 'Not the paired instance'}
                 op['responses']['410'] = {'description': 'HA_REMOVED: the caller was removed '

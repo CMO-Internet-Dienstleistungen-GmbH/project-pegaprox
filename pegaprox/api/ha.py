@@ -40,10 +40,12 @@ import base64
 import binascii
 import contextlib
 import contextvars
+import hashlib
 import hmac
 import io
 import ipaddress
 import logging
+import os
 import re
 import sys
 import threading
@@ -52,6 +54,8 @@ import time
 from flask import Blueprint, current_app, jsonify, request, Response
 from werkzeug.exceptions import RequestEntityTooLarge
 
+from pegaprox import witness_boot
+from pegaprox.constants import GITHUB_RAW_URL, MIRROR_RAW_URL
 from pegaprox.core import ha, ha_vote
 from pegaprox.models.permissions import ROLE_ADMIN
 from pegaprox.utils.auth import require_auth, build_authz_user
@@ -1611,9 +1615,11 @@ def create_witness_code():
     """A one-time code for the witness of this group, on the leader. Wants user_password.
 
     url is this instance as the witness reaches it, site where the witness runs (a label,
-    for the split checks). On the witness host the admin runs `pegaprox-witness join
-    <code> --url https://<witness>:5005` (in the Docker image: the command `witness join
-    ...`), which the answer spells out in commands. The code is good for 15 minutes and
+    for the split checks). The answer spells out one command per way to install the
+    witness with the code in it (install: linux, offline, docker, manual, with
+    installer_sha256, image, branch, docker_note, placeholder, placeholder_in, note and
+    firewall; see witness_install_commands); docker is null with docker_note where no
+    image of this release runs the witness. commands is the older form. The code is good for 15 minutes and
     one pairing; a new one replaces an open one. One witness per group: 409 while it has
     one, and 409 HA_AUTO_NOT_SHIPPED while this release does not offer automatic failover,
     which is what a witness votes in. In an automatic group only the instance a majority
@@ -1645,10 +1651,235 @@ def create_witness_code():
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Could not create a witness code')}), 500
     log_audit(_user(), 'ha.witness_code_created', f'witness code for {url}, valid for 15 minutes')
-    return jsonify({'code': code, 'expires_at': expires, 'commands': {
-        'package': f'pegaprox-witness join {code} --url https://<witness host>:5005',
-        'docker': f'docker run --rm -v pegaprox-witness:/app/witness ghcr.io/pegaprox/pegaprox '
-                  f'witness join {code} --url https://<witness host>:5005'}})
+    install = witness_install_commands(url, code)
+    return jsonify({'code': code, 'expires_at': expires, 'install': install, 'commands': {
+        'package': f"pegaprox-witness join '{code}' --url 'https://{WITNESS_HOST}:5005'",
+        'docker': install['docker']}})
+
+
+# --- how a witness gets installed -----------------------------------------------------
+#
+# MK Oct 2026 (#625) - one command per way, with the code in it. The Linux line fetches
+# packaging/witness/install.sh from GitHub, then from its mirror (the order update.sh
+# goes by), and runs it only when it matches the SHA-256 of the copy this instance
+# ships; where neither has that copy (another release on main, no internet), from this
+# instance itself. The installer takes the witness code from this instance too
+# (witness_code_bundle), pinned to the fingerprint in the code.
+
+WITNESS_HOST = '<witness-host>'
+INSTALLER_REL = 'packaging/witness/install.sh'
+# updates.pegaprox.com mirrors the repository, the raw files at their repo path
+INSTALLER_SOURCES = (f'{GITHUB_RAW_URL}/{INSTALLER_REL}', f'{MIRROR_RAW_URL}/{INSTALLER_REL}')
+WITNESS_IMAGE = 'ghcr.io/pegaprox/pegaprox'
+# what .github/workflows/docker-testing.yml publishes from every push to Testing
+WITNESS_TESTING_IMAGE = 'ghcr.io/pegaprox/pegaprox-testing:latest'
+# the last release whose image has no witness in it: its command `witness` starts a whole
+# PegaProx instead
+WITNESS_IMAGE_AFTER = '1.2.0'
+BRANCH_FILE = '.pegaprox-branch'
+_BRANCH_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,99}')
+
+
+def _git_branch(root):
+    """The branch a git checkout at `root` is on, '' for none (a worktree's .git is a file
+    that names its git directory)."""
+    git = os.path.join(root, '.git')
+    try:
+        if os.path.isfile(git):
+            with open(git, encoding='utf-8') as fh:
+                line = fh.read(4096).strip()
+            if not line.startswith('gitdir:'):
+                return ''
+            git = os.path.join(root, line[len('gitdir:'):].strip())
+        with open(os.path.join(git, 'HEAD'), encoding='utf-8') as fh:
+            head = fh.read(4096).strip()
+    except OSError:
+        return ''
+    return head[len('ref: refs/heads/'):] if head.startswith('ref: refs/heads/') else ''
+
+
+def update_branch():
+    """The branch of the repository this instance follows, 'main' unless its install says
+    another: PEGAPROX_BRANCH in its environment (the Testing image carries it, see
+    docker-testing.yml), else .pegaprox-branch next to its code (deploy.sh and update.sh
+    run with PEGAPROX_BRANCH write it), else the branch of a git checkout it runs from."""
+    root = ha.code_root()
+    value = (os.environ.get('PEGAPROX_BRANCH') or '').strip()
+    if not value:
+        try:
+            with open(os.path.join(root, BRANCH_FILE), encoding='utf-8') as fh:
+                value = fh.read(200).strip()
+        except OSError:
+            value = ''
+    if not value:
+        value = _git_branch(root)
+    return value if _BRANCH_RE.fullmatch(value) else 'main'
+
+
+def witness_image(version, branch):
+    """(image, note): the image whose command `witness` runs the witness of this code, or
+    None and why there is none. A Testing build names the Testing image, a release its own
+    image from the first one that ships the witness on; before that there is none."""
+    if branch.lower() == 'testing':
+        return WITNESS_TESTING_IMAGE, None
+    if witness_boot.release_key(version) > witness_boot.release_key(WITNESS_IMAGE_AFTER):
+        return f'{WITNESS_IMAGE}:{version}', None
+    return None, (f'The Docker image of release {version} has no witness yet, so there is no Docker line: '
+                  'use the Linux line, or the line by hand.')
+
+
+def witness_installer():
+    """(bytes, SHA-256) of the witness installer this instance ships, None where it ships
+    none (a build without packaging/)."""
+    try:
+        with open(os.path.join(ha.code_root(), *INSTALLER_REL.split('/')), 'rb') as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    return data, hashlib.sha256(data).hexdigest()
+
+
+def witness_install_commands(url, code, branch=None):
+    """The ready commands of "Add witness" for the code `code` of this instance at `url`
+    (both shapes the shell takes as they are, see ha_wire): linux, offline, docker and
+    manual, and what the UI says around them. linux and offline are None where this
+    instance ships no installer, docker where no image runs the witness of this code
+    (witness_image, docker_note says why). `branch`, the one this instance follows
+    (update_branch)."""
+    from pegaprox.constants import PEGAPROX_VERSION
+    branch = branch or update_branch()
+    # quoted: a placeholder left in reaches the witness, which says what to put there
+    # (the shell would take <witness-host> for a redirection)
+    own = f"'https://{WITNESS_HOST}:5005'"
+    image, image_note = witness_image(PEGAPROX_VERSION, branch)
+    out = {
+        'version': PEGAPROX_VERSION, 'branch': branch, 'image': image, 'docker_note': image_note, 'port': 5005,
+        'installer_sha256': None, 'linux': None, 'offline': None,
+        'docker': (f'docker run -d --name pegaprox-witness --restart unless-stopped -p 5005:5005 '
+                   f"-v pegaprox-witness:/app/witness {image} witness run --join '{code}' --url {own}"
+                   if image else None),
+        'manual': f"python3 pegaprox_multi_cluster.py witness run --join '{code}' --url {own}",
+        'placeholder': WITNESS_HOST, 'placeholder_in': ['docker', 'manual'] if image else ['manual'],
+        'note': (f'Replace {WITNESS_HOST} in the ' + ('Docker and manual commands' if image else 'manual command')
+                 + ' with the name or address the members reach the witness at. The Linux installer works '
+                 'it out on the witness host (add --url https://...:5005 to choose another). The code is '
+                 'good for 15 minutes and one witness.' + (f' {image_note}' if image_note else '')),
+        'firewall': ('Open TCP port 5005 on the witness host for the members of the group, and '
+                     'nothing else.'),
+    }
+    inst = witness_installer()
+    if inst is None:
+        return out
+    sha = inst[1]
+    check = f"echo '{sha}  install.sh' | sha256sum -c"
+    sudo = '$([ "$(id -u)" -eq 0 ] || echo sudo)'
+    # the code on stdin (printf is the shell's own): on a command line any user of the
+    # witness host reads it in the process list until it is spent
+    run = f"printf '%s\\n' '{code}' | {sudo} sh install.sh --code -"
+    here = f'{url}/api/ha/witness/installer'
+    # curl -k only because the digest is checked before anything runs; straight to this
+    # instance, never through a proxy of the environment, which may not reach it (the
+    # installer and the witness talk to it the same way). GitHub and the mirror go
+    # through one where it is set, and give up in time where the way out is dropped
+    from_here = f"curl -fsSLko install.sh --noproxy '*' '{here}'"
+    from_public = 'curl -fsSL --connect-timeout 10 --max-time 120 -o install.sh "$u"'
+    # the checksum is of this release's installer: once the leader runs another one, the
+    # line says where to go instead of a bare FAILED. The installer stays the last word of
+    # the line, so --url or --port can be added at its end
+    hint = ("echo 'pegaprox-witness: no install.sh that matches this line - it works while the leader runs "
+            "the release that made it. Where the witness is installed: sudo sh /opt/pegaprox-witness/install.sh "
+            "- else make a new code with Add witness on the leader' >&2")
+    checked = f'{{ {check} || {{ {hint}; false; }}; }} && {run}'
+    # nothing came from anywhere: not a release that does not match, but the way to this
+    # instance (its address, a firewall, its IP allow list answering 403)
+    got = (f"{{ [ -f install.sh ] || {{ echo 'pegaprox-witness: could not download install.sh from {here} "
+           "(curl says why above; a 403 there is the IP allow list of the leader - add this host in "
+           "Settings > Security)' >&2; false; }; }")
+    out['installer_sha256'] = sha
+    out['linux'] = (f'cd "$(mktemp -d)" && for u in {" ".join(INSTALLER_SOURCES)}; do '
+                    f'{from_public} && {check} --status && break; rm -f install.sh; done; '
+                    f'[ -f install.sh ] || {from_here}; {got} && {checked}')
+    out['offline'] = f'cd "$(mktemp -d)" && {from_here}; {got} && {checked}'
+    return out
+
+
+@bp.route('/api/ha/witness/installer', methods=['GET'])
+def witness_installer_file():
+    """The witness installer this instance ships (packaging/witness/install.sh), for a
+    witness host that reaches neither GitHub nor its mirror.
+
+    No session: it is the file the repository publishes, and the line "Add witness"
+    shows checks it against its SHA-256 (X-Checksum-Sha256 here too) before anything of
+    it runs. Exactly this one file; 404 where this instance ships none."""
+    inst = witness_installer()
+    if inst is None:
+        return jsonify({'error': 'This instance does not ship the witness installer'}), 404
+    resp = Response(inst[0], mimetype='text/x-shellscript')
+    resp.headers['Content-Disposition'] = 'attachment; filename="install.sh"'
+    resp.headers['Cache-Control'] = 'no-store'
+    resp.headers['X-Checksum-Sha256'] = inst[1]
+    return resp
+
+
+# every try with a code counts, as at the pairing routes; a signed call only when it fails
+_bundle_attempts = SlidingWindow(limit=10, window=300, max_keys=2048, name='ha-witness-bundle')
+
+
+@bp.route('/api/ha/witness/bundle', methods=['POST'])
+def witness_code_bundle():
+    """The code the witness runs, as one archive signed with this instance's key
+    (ha.witness_bundle): {manifest, sig, archive}, the manifest with the release, the
+    wire, the archive's size, SHA-256 and files and who signed.
+
+    For two callers and nobody else. The installer on the witness host, with the open
+    witness code in the body ({code}; looked at and not spent - only the leader holds
+    one): 403 for any other code. The paired witness, by a call signed with its key, for
+    its update (any member serves it, the witness takes the signature of any data voter):
+    401 for a wrong signature, 401 HA_CLOCK for a good one whose time is off; with
+    {check: true} it only asks whether this group still counts it ({witness: true}, no
+    code). Nothing else can be fetched here: the bundle is a fixed list of files."""
+    try:
+        request.max_content_length = _MAX_PEER_BODY
+        body = request.get_data(cache=True)
+    except Exception:
+        body = None
+    ip = get_client_ip()
+    if body is None or request.query_string:
+        return jsonify({'error': 'Bad request'}), 400
+    if request.headers.get(ha.PEER_HEADER):
+        kind, rec = request_witness()
+        if kind == 'skewed':
+            return jsonify({'code': 'HA_CLOCK',
+                            'error': f'The clocks of the two instances are more than '
+                                     f'{ha.SIGNATURE_WINDOW} seconds apart - set both by NTP'}), 401
+        if kind != 'witness':
+            if not _peer_failures.allow(ip):
+                resp = jsonify({'error': 'Too many failed peer calls'})
+                resp.headers['Retry-After'] = '300'
+                return resp, 429
+            logging.warning(f"[HA] refused a witness call from {ip} to {request.path}")
+            return jsonify({'error': 'Not the witness of this group', 'instance_id': ha.instance_id()}), 401
+        if _body().get('check') is True:
+            # the installer asks whether this group still counts the witness, not for code
+            return jsonify({'witness': True, 'instance_id': ha.instance_id()})
+        who = f"the witness {rec.get('url') or rec['instance_id']}"
+    else:
+        if not _bundle_attempts.allow(ip):
+            resp = jsonify({'error': 'Too many attempts - wait a few minutes'})
+            resp.headers['Retry-After'] = '300'
+            return resp, 429
+        if not ha.witness_code_ok(_str(_body().get('code'))):
+            logging.warning(f"[HA] witness code bundle for {ip} refused: {ha.PAIRING_CODE_ERROR}")
+            return jsonify({'error': ha.PAIRING_CODE_ERROR}), 403
+        who = f'the installer at {ip}'
+    try:
+        out = ha.witness_bundle()
+    except ha.HaError as e:
+        return jsonify({'error': str(e)}), 409
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Could not put the witness code together')}), 500
+    logging.info(f"[HA] witness code {out['manifest']['name']} sent to {who}")
+    return jsonify(out)
 
 
 @bp.route('/api/ha/witness/remove', methods=['POST'])
@@ -1778,6 +2009,36 @@ def request_peer():
         logging.warning(f"[HA] could not check a peer call to {request.path}: {e}")
         verdict = (None, None)
     env[_PEER_VERDICT] = verdict
+    return verdict
+
+
+_WITNESS_VERDICT = 'pegaprox.ha_witness'
+# the witness's own signed calls: its update and its leaving. The IP allow list lets them
+# through as it does a member's signed call (settings.ip_lists_pass)
+WITNESS_SIGNED_PATHS = ('/api/ha/witness/bundle', ha.WITNESS_LEAVE_PATH)
+
+
+def request_witness():
+    """Who sent this call in the witness's name, as ha.witness_verdict says: ('witness',
+    record), ('skewed', record) or (None, None). Worked out once per request, as
+    request_peer is (a nonce counts once): the IP allow list asks first, the route after
+    it. Only for the paths the witness signs."""
+    env = request.environ
+    if _WITNESS_VERDICT in env:
+        return env[_WITNESS_VERDICT]
+    verdict = (None, None)
+    try:
+        plain = not request.query_string and '?' not in request.path
+        if (plain and request.path in WITNESS_SIGNED_PATHS and request.headers.get(ha.PEER_HEADER)
+                and (request.content_length is None or request.content_length <= _MAX_PEER_BODY)):
+            request.max_content_length = _MAX_PEER_BODY
+            body = request.get_data(cache=True)
+            if len(body) <= _MAX_PEER_BODY:
+                verdict = ha.witness_verdict(request.headers, request.method, request.path, body)
+    except Exception as e:
+        logging.warning(f"[HA] could not check a witness call to {request.path}: {e}")
+        verdict = (None, None)
+    env[_WITNESS_VERDICT] = verdict
     return verdict
 
 
@@ -2375,8 +2636,7 @@ def peer_witness_leave():
         body = request.get_data(cache=True)
     except Exception:
         body = None
-    kind, rec = (None, None) if body is None or request.query_string else \
-        ha.witness_verdict(request.headers, request.method, request.path, body)
+    kind, rec = (None, None) if body is None or request.query_string else request_witness()
     if kind == 'skewed':
         return jsonify({'code': 'HA_CLOCK',
                         'error': f'The clocks of the two instances are more than '

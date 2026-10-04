@@ -851,6 +851,13 @@ def perform_pegaprox_update():
             if len(failed_files) > 5:
                 audit_detail += f" (+{len(failed_files) - 5} more)"
         log_audit(user, 'pegaprox.update_completed', audit_detail)
+        # MK Oct 2026 (#625): this updater takes main, whatever branch the install followed
+        # before (deploy.sh / update.sh with PEGAPROX_BRANCH, api/ha.py update_branch)
+        if downloaded_files:
+            try:
+                os.unlink(os.path.join(install_dir, '.pegaprox-branch'))
+            except OSError:
+                pass
 
         # MK 2026-08-11 — preflight the crypto/TLS stack in the interpreter the restarted
         # service will actually use (the venv), NOT this already-running one that still has the
@@ -2998,14 +3005,30 @@ def _peer_may_pass(client_ip, path):
     # free place to try credentials. The pairing call has no peer credential yet
     # and stays behind the list.
     # A blacklist entry is an explicit no and stays one, peer or not.
-    return (path.startswith('/api/ha/peer/') and path != '/api/ha/peer/pair'
+    # MK Oct 2026 (#625): the witness's signed calls the same way - its update (the code
+    # bundle) and its leaving, under the key it paired with. The open witness code (the
+    # installer, the pairing) stays behind the list.
+    return ((path.startswith('/api/ha/peer/') and path != '/api/ha/peer/pair' or path in _WITNESS_SIGNED)
             and not _ip_blacklisted(client_ip))
+
+
+# the calls the witness signs (api/ha.py WITNESS_SIGNED_PATHS)
+_WITNESS_SIGNED = ('/api/ha/witness/bundle', '/api/ha/peer/witness-leave')
+
+
+def _signed_call(path):
+    """Whether this request is a member's signed call, or the witness's on a path it signs."""
+    from pegaprox.api.ha import request_peer, request_witness
+    if path in _WITNESS_SIGNED and request_witness()[0]:
+        return True
+    return bool(request_peer()[0])
 
 
 def ip_lists_pass(client_ip, path, peer):
     """(passes, reason): whether the allow and block lists let a request to `path` from
-    `client_ip` through. `peer()` says whether the call is a member's signed call, asked
-    only where the lists refuse the address and a member may still pass (_peer_may_pass).
+    `client_ip` through. `peer()` says whether the call is a member's signed call (or the
+    witness's, on the paths it signs), asked only where the lists refuse the address and a
+    member may still pass (_peer_may_pass).
     check_ip_whitelist goes by it, and so do the HA lease routes that answer before
     Flask (app._LeaseFastPath, #625)."""
     if not _ip_whitelist_enabled:
@@ -3014,7 +3037,7 @@ def ip_lists_pass(client_ip, path, peer):
     if allowed:
         return True, reason
     if _peer_may_pass(client_ip, path) and peer():
-        return True, 'signed call of a member'
+        return True, 'signed call of a member or the witness'
     return False, reason
 
 
@@ -3034,11 +3057,7 @@ def check_ip_whitelist():
 
     client_ip = get_client_ip()
     path = request.path
-
-    def peer():
-        from pegaprox.api.ha import request_peer
-        return bool(request_peer()[0])
-    allowed, reason = ip_lists_pass(client_ip, path, peer)
+    allowed, reason = ip_lists_pass(client_ip, path, lambda: _signed_call(path))
 
     if not allowed:
         if _peer_may_pass(client_ip, path):

@@ -113,6 +113,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
+from pegaprox import witness_boot
 from pegaprox.constants import CONFIG_DIR, BRANDING_DIR, PLUGINS_DIR, PEGAPROX_VERSION
 from pegaprox.core import ha_vote, ha_wire
 
@@ -1958,11 +1959,25 @@ def _stream_nonce(stream, receiver):
     return ha_wire.stream_nonce(stream['id'], seq)
 
 
+def _takes_streams(receiver):
+    """Whether `receiver` takes stream nonces on its signed calls: every member, and a
+    witness that said it speaks wire 2 or later in its last status answer. A witness of
+    the first wire (or one not heard yet) gets random nonces, as it always did (N-1)."""
+    st = _load()
+    if receiver != ((st.get('witness') or {}).get('instance_id')):
+        return True
+    rt = _rts.get(st.get('instance_id'))
+    wire = ((rt.seen.get(receiver) if rt is not None else None) or {}).get('wire') or 1
+    return wire >= 2
+
+
 def _signed_headers(private, sender, receiver, method, path, body):
     # numbered, not random (_fresh_nonce): a vote or a renewal may come many times a
     # second, and so may the writes a serving member forwards. Each has a stream of its
     # own, and the receiver a share of its own for each: forwarded writes never use up
-    # what the renewals need
+    # what the renewals need. A witness of the first wire takes neither (N-1)
+    if not _takes_streams(receiver):
+        return ha_wire.signed_headers(private, sender, receiver, method, path, body, time.time())
     stream = _lease_stream if path in (VOTE_PATH, RENEW_PATH) else _call_stream
     return ha_wire.signed_headers(private, sender, receiver, method, path, body, time.time(),
                                   _stream_nonce(stream, receiver))
@@ -7970,6 +7985,7 @@ class _LeaseRuntime:
         # the claim watch: last pass, cluster -> (what it saw, look again from), the
         # clusters whose write still runs, and the one pass that may run
         self.claims = {'at': None, 'seen': {}, 'jobs': set(), 'busy': threading.Lock()}
+        self.witness_told = None        # (what the witness was told of an update, when)
 
 
 def _rt():
@@ -8954,6 +8970,7 @@ def _lease_seen(data, sent, back):
     said = data.get('mode')
     by = data.get('pending_by')
     digest = data.get('cfg_digest')
+    wire, install, update, code = data.get('wire'), data.get('install'), data.get('update'), data.get('code')
     return {
         'mark': LEASE_MARK, 'skew': skew, 'rtt': round(back - sent, 3),
         'release': str(data.get('release') or '')[:32],
@@ -8970,6 +8987,16 @@ def _lease_seen(data, sent, back):
         'holds': lease.get('holds') is True,
         'holder': lease.get('holder') if isinstance(lease.get('holder'), str) else None,
         'reach': {str(k)[:64]: v is True for k, v in list(reach.items())[:256]},
+        # a witness says which calls it speaks (none: the first one, 1) and how it is kept
+        # up to date (_witness_update_check)
+        'wire': wire if type(wire) is int and 0 < wire < 1000 else None,
+        'auto_update': data.get('auto_update') is True,
+        'install': install if install in witness_boot.INSTALL_KINDS else '',
+        'update': (dict({k: (str(v)[:200] if v is not None else None) for k, v in update.items()
+                         if k in ('state', 'release', 'error', 'at')}, back=update.get('back') is True)
+                   if isinstance(update, dict) else None),
+        # the bundle its code came from, '' where no bundle named it (_witness_other_code)
+        'code': code if isinstance(code, str) and witness_boot.NAME_RE.fullmatch(code) else '',
     }
 
 
@@ -9230,7 +9257,12 @@ def _group_checks(st=None, lease_s=ha_vote.LEASE_DEFAULT):
                                 + (' Switch automatic failover off before downgrading a member.'
                                    if running else ' Update it first.'), mid))
         else:
-            if seen.get('release') != PEGAPROX_VERSION:
+            # the witness by its wire: the calls it speaks, not the release it came with
+            other = (_witness_outdated(seen, label, mid, running) or _witness_ahead(seen, label, mid, running)
+                     if mid == wid else None)
+            if other is not None:
+                out.append(other)
+            elif seen.get('release') != PEGAPROX_VERSION and mid != wid:
                 out.append(_finding('RELEASE_MISMATCH', 'warn' if running else 'block',
                                     f"{label} runs release {seen.get('release') or 'unknown'}, this "
                                     f'instance {PEGAPROX_VERSION}. Every member has to run the '
@@ -10370,6 +10402,7 @@ def lease_status(st=None, checks=None):
                      'voter': True, 'may_lead': False, 'site': witness['site'],
                      'quarantined': witness['instance_id'] in quarantined, 'skew': seen.get('skew'),
                      'release': seen.get('release'), 'mode': seen.get('mode'),
+                     'wire': seen.get('wire') or (1 if seen.get('mark') else None),
                      'zone': seen.get('zone'), 'holds': False,
                      'reach': None, 'url': witness['url'],
                      'last_heard': (witness_view(st) or {}).get('last_heard'),
@@ -10522,7 +10555,7 @@ def _lease_housekeeping():
         known.add(witness['instance_id'])
     for mid in [m for m in rt.seen if m not in known]:
         rt.seen.pop(mid, None)
-    for step in (announce_fingerprint, measure_reach, _ask_witness, lease_start,
+    for step in (announce_fingerprint, measure_reach, _ask_witness, _witness_update_check, lease_start,
                  lambda: _say_downgraded(rt), _switch_back_again, _witness_into_config):
         try:
             step()
@@ -10803,12 +10836,290 @@ def witness_view(st=None):
         if rec['instance_id'] in rt.acked:
             acked = ha_clock() - rt.acked[rec['instance_id']]
             heard = acked if heard is None else min(heard, acked)
+    seen = (rt.seen.get(rec['instance_id']) if rt is not None else None) or {}
+    behind = bool(seen.get('mark')) and _witness_behind(seen)
+    ahead = bool(seen.get('mark')) and _witness_ahead_of_us(seen)
     return {'instance_id': rec['instance_id'], 'kind': ha_vote.KIND_WITNESS, 'url': rec['url'],
             'fingerprint': rec['fingerprint'], 'site': rec['site'],
             'key_fingerprint': peer_key_fingerprint(rec['public_key']),
             'last_heard': round(max(0.0, heard), 1) if heard is not None else None, 'skew': skew,
             # it cannot write its state, and gives no vote until it can (auto_findings)
-            'write_failed': unwritten}
+            'write_failed': unwritten,
+            # its code against this instance's, and how it is kept up to date
+            'release': seen.get('release'), 'wire': seen.get('wire') or (1 if seen.get('mark') else None),
+            'auto_update': seen.get('auto_update') is True, 'install': seen.get('install') or '',
+            'update': seen.get('update'), 'outdated': behind,
+            'update_command': witness_boot.update_command(seen.get('install')) if behind else None,
+            # newer code than this instance's: by hand down to it, never by itself
+            'ahead': ahead,
+            'to_leader_command': witness_boot.update_command(seen.get('install'), to_leader=True) if ahead else None}
+
+
+# --- keeping the witness up to date -----------------------------------------------------
+#
+# MK Oct 2026 (#625) - the witness host has no updater of its own, and the members change
+# the wire now and then. The leader keeps it up: its own witness code as one signed
+# bundle (witness_bundle, at /api/ha/witness/bundle for the installer with the open code
+# and for the paired witness by its signature), and a word to the witness when it runs
+# newer code and the data voters hold a majority without it (_witness_update_check). The
+# witness fetches, checks and starts into it (witness.py, Witness.run_update).
+
+WITNESS_UPDATE_PATH = '/api/ha/peer/witness-update'
+# what the witness runs (tests/test_ha_witness_delivery.py follows its imports), and its
+# unit for the installer: nothing else goes into the bundle
+WITNESS_BUNDLE_FILES = ('pegaprox/__init__.py', 'pegaprox/witness.py', 'pegaprox/witness_boot.py',
+                        'pegaprox/core/__init__.py', 'pegaprox/core/ha_vote.py',
+                        'pegaprox/core/ha_wire.py', 'pegaprox/utils/__init__.py',
+                        'pegaprox/utils/ratelimit.py', 'pegaprox/utils/url_security.py',
+                        'systemd/pegaprox-witness.service')
+WITNESS_BUNDLE_OPTIONAL = ('systemd/pegaprox-witness.service',)
+# how often the leader says it again to a witness that stays behind
+WITNESS_TELL_EVERY = 300
+_bundle_held = {}
+
+
+def code_root():
+    """The directory this instance runs from (pegaprox/ and packaging/ are in it)."""
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def pack_bundle(entries):
+    """{name: bytes} as a tar.gz with fixed times and owners, in name order: the same files
+    make the same archive, and the same digest, on every member."""
+    import io
+    import tarfile
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode='wb', mtime=0) as gz:
+        with tarfile.open(fileobj=gz, mode='w', format=tarfile.USTAR_FORMAT) as tar:
+            for name in sorted(entries):
+                info = tarfile.TarInfo(name)
+                info.size, info.mtime, info.mode = len(entries[name]), 0, 0o644
+                info.uid = info.gid = 0
+                info.uname = info.gname = ''
+                tar.addfile(info, io.BytesIO(entries[name]))
+    return buf.getvalue()
+
+
+def _bundle_archive():
+    """(archive, file names, SHA-256) of this instance's witness code (pack_bundle), built
+    once per set of file stamps. The unit is left out where this instance has none (an
+    install from a checkout before deploy.sh copied it): the installer writes its own."""
+    root = code_root()
+    stamps = []
+    for rel in WITNESS_BUNDLE_FILES:
+        try:
+            st = os.stat(os.path.join(root, *rel.split('/')))
+        except FileNotFoundError:
+            if rel not in WITNESS_BUNDLE_OPTIONAL:
+                raise
+            continue
+        stamps.append((rel, st.st_mtime_ns, st.st_size))
+    key = (tuple(stamps), PEGAPROX_VERSION, ha_wire.WITNESS_WIRE)
+    held = _bundle_held.get('archive')
+    if held is not None and held[0] == key:
+        return held[1]
+    entries = {}
+    for rel, _mtime, _size in stamps:
+        with open(os.path.join(root, *rel.split('/')), 'rb') as fh:
+            entries[rel] = fh.read()
+    # what the witness reads its release from (witness.release); the leader's own, as
+    # this file is not one of its files
+    entries['version.json'] = (json.dumps({'version': PEGAPROX_VERSION, 'wire': ha_wire.WITNESS_WIRE},
+                                          sort_keys=True) + '\n').encode()
+    archive = pack_bundle(entries)
+    out = (archive, sorted(entries), hashlib.sha256(archive).hexdigest())
+    _bundle_held['archive'] = (key, out)
+    return out
+
+
+def witness_bundle():
+    """This instance's witness code as the witness takes it: {manifest, sig, archive}.
+    The manifest names the release, the wire, the archive's size, SHA-256 and files and
+    who signs; the signature (ha_wire.bundle_message) is by this instance's key, which
+    the witness knows from the voter config. Raises HaError."""
+    try:
+        archive, files, digest = _bundle_archive()
+    except OSError as e:
+        raise HaError(f'The witness code of this instance is incomplete ({type(e).__name__})')
+    signer = _signer()
+    if signer.private is None:
+        raise HaError('This instance has no key pair to sign the witness code with')
+    manifest = {'release': PEGAPROX_VERSION, 'wire': ha_wire.WITNESS_WIRE, 'sha256': digest,
+                'size': len(archive), 'files': files, 'by': signer.instance_id,
+                'name': witness_boot.bundle_name(PEGAPROX_VERSION, digest)}
+    return {'manifest': manifest,
+            'sig': base64.b64encode(signer.private.sign(ha_wire.bundle_message(manifest))).decode(),
+            'archive': base64.b64encode(archive).decode()}
+
+
+def _witness_behind(seen):
+    """Whether the witness, by its last status answer `seen`, runs older code than this
+    instance: an older release, or the same one on an older wire."""
+    return witness_boot.release_key(seen.get('release'), seen.get('wire') or 1) < \
+        witness_boot.release_key(PEGAPROX_VERSION, ha_wire.WITNESS_WIRE)
+
+
+def _witness_outdated(seen, label, mid, running):
+    """The WITNESS_OUTDATED finding for a witness behind this instance, None for one that
+    is not. One wire behind is talked to as it is (N-1): a warning, while it updates
+    itself or until it is updated by hand. Further behind refuses the switch."""
+    if not _witness_behind(seen):
+        return None
+    wire = seen.get('wire') or 1
+    near = wire >= ha_wire.WITNESS_WIRE - 1
+    command = witness_boot.update_command(seen.get('install'))
+    last = seen.get('update') or {}
+    text = (f"{label} runs release {seen.get('release') or 'unknown'} (wire {wire}), this instance "
+            f"{PEGAPROX_VERSION} (wire {ha_wire.WITNESS_WIRE}). ")
+    if seen.get('auto_update') and last.get('state') != 'failed':
+        text += 'It updates itself from the leader once every data voter renewed the lease with it.'
+    elif seen.get('auto_update') and last.get('back') is True:
+        # code that did not come up there is not taken again by itself (witness.py, _told)
+        text += (f"Its last update failed: {last.get('error') or 'no reason given'}. It went back from that "
+                 f"code and does not take it again by itself - update it by hand once that is fixed: "
+                 f"{command or 'see docs/ha-witness.md'}")
+    elif seen.get('auto_update'):
+        # a fetch that did not get through (the leader out of reach for a moment): the next
+        # word of the leader tries again, nothing to do by hand
+        text += (f"Its last try to fetch the update failed: {last.get('error') or 'no reason given'}. It "
+                 f"tries again when the leader says so again (every {WITNESS_TELL_EVERY // 60} minutes).")
+    elif command:
+        text += f'Automatic updates are off on the witness. Update it by hand: {command}'
+    else:
+        text += ('It cannot update itself. Remove it here and add it again: "Add witness" shows the '
+                 'commands.')
+    if not near:
+        text += ' It is too old to vote with this release.'
+    finding = _finding('WITNESS_OUTDATED', 'warn' if near or running else 'block', text, mid)
+    finding['command'] = command
+    return finding
+
+
+def _own_bundle_name():
+    """The name of this instance's witness bundle (<release>-<digest>), '' where its code
+    is incomplete."""
+    try:
+        return witness_boot.bundle_name(PEGAPROX_VERSION, _bundle_archive()[2])
+    except OSError:
+        return ''
+
+
+def _witness_other_code(seen):
+    """Whether the witness, by its last status answer `seen`, runs other code than this
+    instance under the same release and wire (a fix pushed under the same release string):
+    told by the name of the bundle its code came from. A witness that runs code no bundle
+    named (the image's own, a checkout) is not told apart."""
+    if not seen.get('code') or witness_boot.release_key(seen.get('release'), seen.get('wire') or 1) != \
+            witness_boot.release_key(PEGAPROX_VERSION, ha_wire.WITNESS_WIRE):
+        return False
+    own = _own_bundle_name()
+    return bool(own) and seen['code'] != own
+
+
+def _witness_ahead_of_us(seen):
+    """Whether the witness, by its last status answer `seen`, runs newer code than this
+    instance (a leader that went back to an older release after the witness updated)."""
+    return witness_boot.release_key(seen.get('release'), seen.get('wire') or 1) > \
+        witness_boot.release_key(PEGAPROX_VERSION, ha_wire.WITNESS_WIRE)
+
+
+def _witness_ahead(seen, label, mid, running):
+    """The WITNESS_AHEAD finding for a witness that runs newer code than this instance,
+    None for one that does not. Judged by the wire, the calls it speaks: on the same wire
+    or one apart it votes as it is, a warning that names both releases and the way down
+    (update --to-leader, by hand only). Further apart refuses the switch."""
+    if not _witness_ahead_of_us(seen):
+        return None
+    wire = seen.get('wire') or 1
+    near = abs(wire - ha_wire.WITNESS_WIRE) <= 1
+    command = witness_boot.update_command(seen.get('install'), to_leader=True)
+    text = (f"{label} runs release {seen.get('release') or 'unknown'} (wire {wire}), newer than this "
+            f"instance's {PEGAPROX_VERSION} (wire {ha_wire.WITNESS_WIRE}). ")
+    text += ('It votes with this release as it is. ' if near else
+             'Its calls are too far from this release to vote with it. ')
+    text += (f'To bring it down to the release of this instance, run on the witness host: {command}' if command
+             else 'To bring it down to this release, remove it here and add it again: "Add witness" shows the '
+                  'commands.')
+    finding = _finding('WITNESS_AHEAD', 'warn' if near or running else 'block', text, mid)
+    finding['command'] = command
+    return finding
+
+
+def _data_voters_renewed(node, rt):
+    """Leader of an automatic group: whether every data voter of the voter config acked
+    one of the last two renewal rounds, so that they hold a majority without the witness."""
+    t = node.t
+    fresh = 2 * (t.R + t.renew_timeout)
+    now = ha_clock()
+    data = node.view.data & node.view.counting
+    if len(data) < node.view.m:
+        return False
+    return all(mid == node.me or now - rt.acked.get(mid, -1e9) <= fresh for mid in data)
+
+
+def _witness_update_check():
+    """Leader: a witness that runs other code is told so, with what this instance runs and
+    where its bundle is (and the other data voters' addresses), at most every
+    WITNESS_TELL_EVERY. update: true only for older code, while the data voters hold a
+    majority without the witness (every one renewed recently, or a manual group, where
+    the witness gives no vote that counts) and the witness updates itself: it fetches the
+    bundle and starts into it, and its vote is missing for that long. A witness with the
+    updates off, or ahead of this instance, is told all the same, for its own status and
+    update --to-leader. Other code of this very release (by the bundle it came from) is
+    told as older code is. Returns what it said, None for nothing. Never raises."""
+    try:
+        st = _load()
+        rec = _witness(st)
+        if st['role'] != ROLE_ACTIVE or rec is None or not rec.get('url'):
+            return None
+        rt = _rt()
+        seen = rt.seen.get(rec['instance_id']) or {}
+        behind = _witness_behind(seen) or _witness_other_code(seen)
+        # a witness ahead of this instance is told too, never to update: it keeps what this
+        # instance runs, and its admin takes that by hand (update --to-leader)
+        if seen.get('mark') != LEASE_MARK or time.monotonic() - seen.get('at', -1e9) > LEASE_SEEN_FRESH \
+                or not (behind or _witness_ahead_of_us(seen)):
+            return None
+        safe = False
+        if mode(st) == ha_vote.MODE_MANUAL and not _lease_mode(st):
+            safe = True
+        elif _lease_mode(st):
+            with rt.lock:
+                node = _lease_live(st)
+                safe = (node is not None and node.is_active() and node.transfer is None
+                        and node.switch is None and node.view.mode == ha_vote.MODE_AUTO
+                        and _data_voters_renewed(node, rt))
+        update = bool(safe and behind and seen.get('auto_update'))
+        # which code exactly: a witness where that code did not come up says so and stays
+        # as it is, instead of fetching and starting into it again; and of the same release
+        # it tells other code apart by it
+        name = _own_bundle_name()
+        said = (rec['instance_id'], PEGAPROX_VERSION, ha_wire.WITNESS_WIRE, update, name)
+        told = rt.witness_told
+        if told is not None and told[0] == said and time.monotonic() - told[1] < WITNESS_TELL_EVERY:
+            return None
+        rt.witness_told = (said, time.monotonic())
+        # where the witness fetches: this instance, and the other data voters where it cannot
+        # reach this one at own_url (an address only the members may reach)
+        others = [{'instance_id': mid, 'url': m['url'], 'fingerprint': m.get('fingerprint') or ''}
+                  for mid, m in sorted((st.get('members') or {}).items())
+                  if isinstance(m, dict) and m.get('url') and m.get('voter') is not False]
+        body = {'release': PEGAPROX_VERSION, 'wire': ha_wire.WITNESS_WIRE, 'update': update,
+                'url': st.get('own_url') or '', 'fingerprint': st.get('own_fingerprint') or '',
+                'voters': others[:8]}
+        if name:
+            body['name'] = name
+        resp = call_witness(rec, 'POST', WITNESS_UPDATE_PATH, json_body=body, timeout=10)
+        ans = resp.json() if resp.status_code == 200 else None
+        ans = ans if isinstance(ans, dict) else {}
+        if ans.get('accepted') is True:
+            logging.warning(f"[HA] told the witness {rec['url']} to update to release {PEGAPROX_VERSION}")
+            _audit('ha.witness_update', f"the witness {rec['url']} updates from release "
+                                        f"{seen.get('release') or 'unknown'} to {PEGAPROX_VERSION}")
+        return {'update': update, 'status': resp.status_code, 'answer': ans}
+    except Exception as e:
+        logging.info(f"[HA] could not tell the witness about release {PEGAPROX_VERSION}: {_error_text(e)}")
+        return None
 
 
 def check_not_a_witness_dir(path=None):
