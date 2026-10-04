@@ -3231,6 +3231,423 @@
             );
         }
 
+        // LW Oct 2026 - the bulk bar of the guest table acts through the per-guest routes the
+        // buttons of one row use, so the server still asks about each guest on its own and
+        // what it refuses is listed here guest by guest. A few requests at a time: a
+        // selection of 300 must not turn into 300 requests at once.
+        const GUEST_BULK_PARALLEL = 4;
+        const GUEST_BULK_POWER = ['start', 'shutdown', 'stop', 'reboot'];
+        const PVE_TAG_RE = /^[A-Za-z0-9_][A-Za-z0-9_+.\-]*$/;
+        const PVE_SNAPNAME_RE = /^[A-Za-z][A-Za-z0-9_\-]{0,39}$/;
+
+        const guestBulkFill = (s, vars) => String(s).replace(/\{(\w+)\}/g, (m, k) => (vars[k] != null ? vars[k] : m));
+
+        function guestBulkTags(guest) {
+            const raw = guest && guest.tags;
+            return (Array.isArray(raw) ? raw : String(raw || '').split(/[;,\s]+/))
+                .map(s => String(s).trim()).filter(Boolean);
+        }
+
+        // what Proxmox puts in an error body is JSON more often than not
+        function guestBulkError(text, fallback) {
+            if (!text) return fallback;
+            try {
+                const j = JSON.parse(String(text).replace(/\n/g, ' '));
+                const msg = j && (j.message || j.errors || j.error);
+                if (typeof msg === 'string' && msg.trim()) return msg.trim();
+                if (msg && typeof msg === 'object') return Object.entries(msg).map(([k, v]) => `${k}: ${v}`).join('; ');
+            } catch (_) { /* plain text */ }
+            return String(text).slice(0, 300);
+        }
+
+        // why a guest stays out of an action, '' when it takes part
+        function guestBulkSkip(action, guest, t) {
+            const running = guest.status === 'running';
+            if (action !== 'tags' && isGuestTemplate(guest)) return t('guestBulkSkipTemplate');
+            if (action === 'start' && running) return t('guestBulkSkipRunning');
+            if (['shutdown', 'stop', 'reboot'].includes(action) && !running) return t('guestBulkSkipStopped');
+            return '';
+        }
+
+        async function guestBulkRun(items, worker, onState) {
+            let next = 0;
+            const lane = async () => {
+                while (next < items.length) {
+                    const i = next++;
+                    onState(i, { state: 'busy' });
+                    let res;
+                    try { res = await worker(items[i]); }
+                    catch (e) { res = { state: 'failed', note: String((e && e.message) || e) }; }
+                    onState(i, res);
+                }
+            };
+            await Promise.all(Array.from({ length: Math.min(GUEST_BULK_PARALLEL, items.length) }, lane));
+        }
+
+        // the frame both bulk dialogs share, in the chrome of the layout
+        function GuestBulkFrame({ icon, title, meta, closable, onClose, footer, children, testId }) {
+            const { t } = useTranslation();
+            const { isCorporate } = useLayout();
+            if (isCorporate) {
+                return (
+                    <div className="corp-vm-modal-overlay" onClick={closable ? onClose : undefined}>
+                        <div className="corp-vm-modal" data-testid={testId} role="dialog" aria-modal="true"
+                            style={{ maxWidth: '640px', width: '100%', alignSelf: 'center', maxHeight: '90vh' }}
+                            onClick={e => e.stopPropagation()}>
+                            <div className="corp-vm-modal-header">
+                                <div className="flex items-center gap-3 min-w-0 flex-1">
+                                    <span className="flex flex-shrink-0" style={{ color: 'var(--corp-accent, #49afd9)' }}>{icon}</span>
+                                    <div className="min-w-0">
+                                        <div className="corp-vm-modal-title truncate">{title}</div>
+                                        {meta && <div className="corp-vm-modal-meta">{meta}</div>}
+                                    </div>
+                                </div>
+                                {closable && (
+                                    <div className="corp-vm-modal-actions">
+                                        <button onClick={onClose} className="corp-vm-btn corp-vm-btn-ghost" title={t('close')}><Icons.X /></button>
+                                    </div>
+                                )}
+                            </div>
+                            <div className="corp-vm-modal-body">{children}</div>
+                            <div className="corp-vm-modal-footer"><div className="flex items-center gap-2 ml-auto">{footer}</div></div>
+                        </div>
+                    </div>
+                );
+            }
+            return (
+                <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80" onClick={closable ? onClose : undefined}>
+                    <div className="w-full max-w-lg max-h-[90vh] flex flex-col bg-proxmox-card border border-proxmox-border rounded-xl animate-scale-in"
+                        data-testid={testId} role="dialog" aria-modal="true" onClick={e => e.stopPropagation()}>
+                        <div className="flex items-center gap-3 p-5 border-b border-proxmox-border">
+                            <span className="flex flex-shrink-0 text-proxmox-orange">{icon}</span>
+                            <div className="min-w-0 flex-1">
+                                <h3 className="text-lg font-semibold text-white truncate">{title}</h3>
+                                {meta && <div className="text-xs text-gray-400">{meta}</div>}
+                            </div>
+                            {closable && <button onClick={onClose} className="p-1 text-gray-400 hover:text-white rounded" title={t('close')}><Icons.X /></button>}
+                        </div>
+                        <div className="p-5 space-y-4 overflow-y-auto">{children}</div>
+                        <div className="flex justify-end gap-3 p-4 border-t border-proxmox-border">{footer}</div>
+                    </div>
+                </div>
+            );
+        }
+
+        function guestBulkButton(isCorporate, kind) {
+            if (isCorporate) {
+                return kind === 'ghost' ? 'corp-vm-btn corp-vm-btn-ghost'
+                    : kind === 'danger' ? 'corp-vm-btn corp-vm-btn-danger-ghost' : 'corp-vm-btn corp-vm-btn-primary';
+            }
+            if (kind === 'ghost') return 'flex items-center gap-2 px-4 py-2 text-gray-300 hover:text-white disabled:opacity-50';
+            return `flex items-center gap-2 px-4 py-2 rounded-lg text-white disabled:opacity-50 ${kind === 'danger' ? 'bg-red-600 hover:bg-red-700' : 'bg-blue-600 hover:bg-blue-700'}`;
+        }
+
+        const GUEST_BULK_BADGE = {
+            wait: 'text-gray-400', busy: 'text-blue-400', started: 'text-green-400',
+            done: 'text-green-400', skipped: 'text-gray-400', failed: 'text-red-400',
+        };
+
+        // start, shutdown, stop, reboot, snapshot or tags on the guests picked in the table
+        function GuestBulkActionModal({ action, guests, authFetch, onClose, onFinished }) {
+            const { t } = useTranslation();
+            const { isCorporate } = useLayout();
+            const [phase, setPhase] = useState('form');
+            const [results, setResults] = useState([]);
+            const [snapname, setSnapname] = useState(`snap_${Date.now()}`);
+            const [description, setDescription] = useState('');
+            const [vmstate, setVmstate] = useState(false);
+            const [tagMode, setTagMode] = useState('add');
+            const [tagText, setTagText] = useState('');
+
+            const labels = { start: t('start'), shutdown: t('shutdown'), stop: t('forceStop'), reboot: t('reboot'), snapshot: t('snapshot'), tags: t('tags') };
+            const icons = { start: <Icons.PlayCircle />, shutdown: <Icons.Power />, stop: <Icons.XCircle />, reboot: <Icons.RefreshCw />, snapshot: <Icons.Camera />, tags: <Icons.Tag /> };
+            const left = guests.map(g => ({ g, why: guestBulkSkip(action, g, t) }));
+            const targets = left.filter(x => !x.why).map(x => x.g);
+            const skipped = left.filter(x => x.why);
+            const tagList = tagText.split(/[\s,;]+/).map(s => s.trim()).filter(Boolean);
+            const tagsBad = tagList.some(x => !PVE_TAG_RE.test(x));
+            const snapBad = !PVE_SNAPNAME_RE.test(snapname.trim());
+            const formBad = !targets.length || (action === 'snapshot' && snapBad) || (action === 'tags' && (!tagList.length || tagsBad));
+
+            const runOne = async (g) => {
+                const base = `${API_URL}/clusters/${encodeURIComponent(g._clusterId)}/vms/${encodeURIComponent(g.node)}/${g.type}/${g.vmid}`;
+                const json = (method, body) => ({ method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+                let res;
+                if (GUEST_BULK_POWER.includes(action)) {
+                    // stop is the force stop of a single row, the same body
+                    res = await authFetch(`${base}/${action}`, action === 'stop' ? json('POST', { force: true }) : { method: 'POST' });
+                } else if (action === 'snapshot') {
+                    res = await authFetch(`${base}/snapshots`, json('POST', {
+                        snapname: snapname.trim(), description,
+                        vmstate: !!(vmstate && g.type === 'qemu' && g.status === 'running'),
+                    }));
+                } else {
+                    const have = guestBulkTags(g);
+                    const same = (a, b) => a.toLowerCase() === b.toLowerCase();
+                    const next = tagMode === 'add'
+                        ? have.concat(tagList.filter((x, i) => !have.some(h => same(h, x)) && tagList.findIndex(y => same(y, x)) === i))
+                        : have.filter(h => !tagList.some(x => same(h, x)));
+                    if (next.length === have.length && next.every((x, i) => x === have[i])) return { state: 'skipped', note: t('guestBulkTagsUnchanged') };
+                    res = await authFetch(`${base}/config`, json('PUT', next.length ? { tags: next.join(';') } : { delete: 'tags' }));
+                }
+                if (!res) return { state: 'failed', note: t('connectionError') };
+                if (res.ok) return { state: action === 'tags' ? 'done' : 'started' };
+                const body = await res.json().catch(() => null);
+                return { state: 'failed', note: guestBulkError(body && body.error, `${t('actionFailed')} (HTTP ${res.status})`) };
+            };
+
+            const run = async () => {
+                setPhase('run');
+                setResults(targets.map(() => ({ state: 'wait' })));
+                await guestBulkRun(targets, runOne, (i, r) => setResults(prev => { const n = prev.slice(); n[i] = r; return n; }));
+                setPhase('done');
+                if (onFinished) onFinished();
+            };
+
+            const stateText = (r) => r.state === 'busy' ? t('guestBulkBusy') : r.state === 'started' ? t('guestBulkStarted')
+                : r.state === 'done' ? t('guestBulkDone') : r.state === 'skipped' ? t('guestBulkLeftOut')
+                : r.state === 'failed' ? t('failed') : t('guestBulkWaiting');
+            const failed = results.filter(r => r.state === 'failed').length;
+            const ok = results.filter(r => r.state === 'started' || r.state === 'done').length;
+            const inputCls = isCorporate ? '' : 'w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm';
+            const labelCls = isCorporate ? 'corp-vm-section-title' : 'block text-sm text-gray-400 mb-1';
+            const boxCls = isCorporate ? 'p-2 space-y-1 overflow-y-auto' : 'p-3 bg-proxmox-dark rounded-lg space-y-1 overflow-y-auto';
+            const boxStyle = isCorporate ? { maxHeight: '240px', background: 'var(--corp-surface-2)', border: '1px solid var(--corp-border-medium)' } : { maxHeight: '240px' };
+
+            const guestRow = (g, right, note, key) => (
+                <div key={key} className="text-sm" data-guest={g.vmid}>
+                    <div className="flex items-center gap-2">
+                        <span className="font-mono text-xs text-gray-400">{g.vmid}</span>
+                        <span className="truncate flex-1 text-white">{g.name || '-'}</span>
+                        <span className="text-xs text-gray-500 truncate">{g.node}</span>
+                        {right}
+                    </div>
+                    {note && <div className="text-xs text-red-400 pl-10 break-all">{note}</div>}
+                </div>
+            );
+
+            const footer = phase === 'form' ? (<>
+                <button onClick={onClose} className={guestBulkButton(isCorporate, 'ghost')}>{t('cancel')}</button>
+                <button onClick={run} disabled={formBad} data-testid="guest-bulk-run"
+                    className={guestBulkButton(isCorporate, action === 'stop' ? 'danger' : 'primary')}>
+                    {guestBulkFill(t('guestBulkRun'), { count: targets.length })}
+                </button>
+            </>) : (
+                <button onClick={onClose} disabled={phase === 'run'} data-testid="guest-bulk-close" className={guestBulkButton(isCorporate, 'ghost')}>
+                    {phase === 'run' && <span className="flex animate-spin"><Icons.RotateCw /></span>}
+                    {t('close')}
+                </button>
+            );
+
+            return (
+                <GuestBulkFrame testId="guest-bulk-modal" icon={icons[action]} closable={phase !== 'run'} onClose={onClose} footer={footer}
+                    title={guestBulkFill(t('guestBulkTitle'), { action: labels[action], count: guests.length })}
+                    meta={phase === 'done' ? guestBulkFill(t('guestBulkSummary'), { ok, failed, total: results.length }) : null}>
+                    <div className="space-y-4">
+                        {phase === 'form' && action === 'stop' && (
+                            <div className={isCorporate ? 'text-[13px] flex items-start gap-2' : 'p-3 bg-red-500/10 border border-red-500/30 rounded-lg text-sm text-red-400 flex items-start gap-2'}
+                                style={isCorporate ? { color: '#f54f47' } : undefined}>
+                                <Icons.AlertTriangle />
+                                <span>{t('guestBulkStopWarning')}</span>
+                            </div>
+                        )}
+                        {phase === 'form' && action === 'snapshot' && (<>
+                            <div>
+                                <label className={labelCls}>{t('name')}</label>
+                                <input type="text" value={snapname} onChange={e => setSnapname(e.target.value)} className={inputCls} data-testid="guest-bulk-snapname" />
+                                {snapBad && <div className="text-xs mt-1 text-yellow-400">{t('guestBulkSnapnameRule')}</div>}
+                            </div>
+                            <div>
+                                <label className={labelCls}>{t('description')} ({t('optional')})</label>
+                                <input type="text" value={description} onChange={e => setDescription(e.target.value)} className={inputCls} placeholder={t('snapshotDescription')} />
+                            </div>
+                            <label className="flex items-start gap-2 text-sm text-gray-300">
+                                <input type="checkbox" checked={vmstate} onChange={e => setVmstate(e.target.checked)} className="mt-0.5" data-testid="guest-bulk-vmstate" />
+                                <span>{t('saveRamState')}<span className="block text-xs text-gray-500">{t('guestBulkRamNote')}</span></span>
+                            </label>
+                        </>)}
+                        {phase === 'form' && action === 'tags' && (<>
+                            <div className="flex gap-2">
+                                {['add', 'remove'].map(m => (
+                                    <button key={m} onClick={() => setTagMode(m)} data-testid={`guest-bulk-tags-${m}`}
+                                        className={isCorporate
+                                            ? `corp-vm-btn ${tagMode === m ? 'corp-vm-btn-primary' : 'corp-vm-btn-ghost'}`
+                                            : `px-3 py-1.5 rounded-lg text-sm border ${tagMode === m ? 'bg-blue-600/20 border-blue-500 text-blue-400' : 'bg-proxmox-dark border-proxmox-border text-gray-400'}`}>
+                                        {m === 'add' ? t('guestBulkTagsAdd') : t('guestBulkTagsRemove')}
+                                    </button>
+                                ))}
+                            </div>
+                            <div>
+                                <label className={labelCls}>{t('guestBulkTagsLabel')}</label>
+                                <input type="text" value={tagText} onChange={e => setTagText(e.target.value)} className={inputCls} data-testid="guest-bulk-tagtext" placeholder="prod web" />
+                                {tagsBad && <div className="text-xs mt-1 text-yellow-400">{t('guestBulkTagsRule')}</div>}
+                            </div>
+                        </>)}
+                        {phase === 'form' ? (<>
+                            <div className={boxCls} style={boxStyle}>
+                                {targets.length === 0
+                                    ? <div className="text-sm text-gray-400">{t('guestBulkNothing')}</div>
+                                    : targets.map(g => guestRow(g, null, null, `t-${g._clusterId}-${g.vmid}`))}
+                            </div>
+                            {skipped.length > 0 && (
+                                <div>
+                                    <div className={labelCls}>{guestBulkFill(t('guestBulkSkipped'), { count: skipped.length })}</div>
+                                    <div className={boxCls} style={boxStyle} data-testid="guest-bulk-skipped">
+                                        {skipped.map(({ g, why }) => guestRow(g, <span className="text-xs text-gray-400">{why}</span>, null, `s-${g._clusterId}-${g.vmid}`))}
+                                    </div>
+                                </div>
+                            )}
+                        </>) : (
+                            <div className={boxCls} style={{ ...boxStyle, maxHeight: '360px' }} data-testid="guest-bulk-results">
+                                {targets.map((g, i) => {
+                                    const r = results[i] || { state: 'wait' };
+                                    return guestRow(g, <span className={`text-xs ${GUEST_BULK_BADGE[r.state] || ''}`} data-state={r.state}>{stateText(r)}{r.state === 'skipped' && r.note ? ` (${r.note})` : ''}</span>,
+                                        r.state === 'failed' ? r.note : null, `r-${g._clusterId}-${g.vmid}`);
+                                })}
+                            </div>
+                        )}
+                    </div>
+                </GuestBulkFrame>
+            );
+        }
+
+        // start, shut down or migrate all guests of one node, through the node endpoints
+        // of Proxmox (one task there instead of one request per guest here)
+        function NodeGuestsModal({ action, clusterId, node, guests, nodes, authFetch, onClose, onDone }) {
+            const { t } = useTranslation();
+            const { isCorporate } = useLayout();
+            const fits = (g) => action === 'startall' ? (!isGuestTemplate(g) && g.status !== 'running')
+                : action === 'stopall' ? g.status === 'running' : true;
+            const eligible = (guests || []).filter(fits).sort((a, b) => a.vmid - b.vmid);
+            const targets = (nodes || []).filter(n => n.name !== node && n.online);
+            const [picked, setPicked] = useState(() => new Set(eligible.map(g => g.vmid)));
+            const [target, setTarget] = useState(targets[0] ? targets[0].name : '');
+            const [maxworkers, setMaxworkers] = useState(1);
+            const [localDisks, setLocalDisks] = useState(false);
+            const [busy, setBusy] = useState(false);
+            const [error, setError] = useState('');
+            const [result, setResult] = useState(null);
+
+            const titleKey = { startall: 'nodeGuestsTitleStart', stopall: 'nodeGuestsTitleStop', migrateall: 'nodeGuestsTitleMigrate' }[action];
+            const icon = action === 'startall' ? <Icons.PlayCircle /> : action === 'stopall' ? <Icons.Power /> : <Icons.ArrowRight />;
+            const chosen = eligible.filter(g => picked.has(g.vmid)).map(g => g.vmid);
+            const allOn = eligible.length > 0 && chosen.length === eligible.length;
+            const toggle = (vmid) => setPicked(prev => { const n = new Set(prev); if (n.has(vmid)) n.delete(vmid); else n.add(vmid); return n; });
+
+            const run = async () => {
+                setBusy(true);
+                setError('');
+                const body = { vms: chosen };
+                if (action === 'migrateall') Object.assign(body, { target, maxworkers, with_local_disks: localDisks });
+                const res = await authFetch(`${API_URL}/clusters/${encodeURIComponent(clusterId)}/nodes/${encodeURIComponent(node)}/guests/${action}`,
+                    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+                setBusy(false);
+                if (res && res.ok) {
+                    const data = await res.json().catch(() => ({}));
+                    setResult(data);
+                    if (onDone) onDone(data);
+                } else {
+                    setError(res ? await PegaProxApiErrors.message(res, t('actionFailed')) : t('connectionError'));
+                }
+            };
+
+            const inputCls = isCorporate ? '' : 'w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm';
+            const labelCls = isCorporate ? 'corp-vm-section-title' : 'block text-sm text-gray-400 mb-1';
+            const boxCls = isCorporate ? 'p-2 space-y-1 overflow-y-auto' : 'p-3 bg-proxmox-dark rounded-lg space-y-1 overflow-y-auto';
+            const boxStyle = isCorporate ? { maxHeight: '260px', background: 'var(--corp-surface-2)', border: '1px solid var(--corp-border-medium)' } : { maxHeight: '260px' };
+            const formBad = busy || !chosen.length || (action === 'migrateall' && !target);
+
+            const footer = result ? (
+                <button onClick={onClose} className={guestBulkButton(isCorporate, 'ghost')} data-testid="node-guests-close">{t('close')}</button>
+            ) : (<>
+                <button onClick={onClose} className={guestBulkButton(isCorporate, 'ghost')}>{t('cancel')}</button>
+                <button onClick={run} disabled={formBad} data-testid="node-guests-run"
+                    className={guestBulkButton(isCorporate, action === 'stopall' ? 'danger' : 'primary')}>
+                    {busy && <span className="flex animate-spin"><Icons.RotateCw /></span>}
+                    {guestBulkFill(t('guestBulkRun'), { count: chosen.length })}
+                </button>
+            </>);
+
+            return (
+                <GuestBulkFrame testId="node-guests-modal" icon={icon} closable={!busy} onClose={onClose} footer={footer}
+                    title={guestBulkFill(t(titleKey), { node })}>
+                    {result ? (
+                        <div className="space-y-3" data-testid="node-guests-result">
+                            <div className="flex items-start gap-2 text-sm text-green-400">
+                                <Icons.CheckCircle />
+                                <span>{guestBulkFill(t('nodeGuestsTaskStarted'), { node, count: (result.vms || []).length })}</span>
+                            </div>
+                            {(result.skipped || []).length > 0 && (
+                                <div>
+                                    <div className={labelCls}>{guestBulkFill(t('guestBulkSkipped'), { count: result.skipped.length })}</div>
+                                    <div className={boxCls} style={boxStyle}>
+                                        {result.skipped.map(s => (
+                                            <div key={s.vmid} className="flex items-center gap-2 text-sm">
+                                                <span className="font-mono text-xs text-gray-400">{s.vmid}</span>
+                                                <span className="flex-1 text-xs text-gray-400">{s.reason}</span>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    ) : (
+                        <div className="space-y-4">
+                            {action === 'startall' && <div className="text-sm text-gray-400">{t('nodeGuestsStartNote')}</div>}
+                            {action === 'stopall' && <div className="text-sm text-gray-400">{t('nodeGuestsStopNote')}</div>}
+                            {action === 'migrateall' && (<>
+                                <div>
+                                    <label className={labelCls}>{t('targetNode')}</label>
+                                    <select value={target} onChange={e => setTarget(e.target.value)} className={inputCls} data-testid="node-guests-target">
+                                        {targets.length === 0 && <option value="">-</option>}
+                                        {targets.map(n => <option key={n.name} value={n.name}>{n.name}</option>)}
+                                    </select>
+                                </div>
+                                <div className="flex items-center gap-3">
+                                    <label className="text-sm text-gray-300 flex-1">{t('nodeGuestsParallel')}</label>
+                                    <input type="number" min="1" max="16" value={maxworkers} data-testid="node-guests-workers"
+                                        onChange={e => setMaxworkers(Math.max(1, Math.min(16, parseInt(e.target.value, 10) || 1)))}
+                                        className={isCorporate ? '' : 'w-20 px-2 py-1 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm'}
+                                        style={isCorporate ? { width: '80px' } : undefined} />
+                                </div>
+                                <label className="flex items-center gap-2 text-sm text-gray-300">
+                                    <input type="checkbox" checked={localDisks} onChange={e => setLocalDisks(e.target.checked)} />
+                                    {t('nodeGuestsLocalDisks')}
+                                </label>
+                            </>)}
+                            {eligible.length === 0 ? (
+                                <div className="text-sm text-gray-400">{t('nodeGuestsNone')}</div>
+                            ) : (
+                                <div>
+                                    <label className="flex items-center gap-2 text-sm text-gray-300 mb-2">
+                                        <input type="checkbox" checked={allOn} data-testid="node-guests-all"
+                                            onChange={() => setPicked(allOn ? new Set() : new Set(eligible.map(g => g.vmid)))} />
+                                        {guestBulkFill(t('nodeGuestsPicked'), { count: chosen.length, total: eligible.length })}
+                                    </label>
+                                    <div className={boxCls} style={boxStyle}>
+                                        {eligible.map(g => (
+                                            <label key={g.vmid} className="flex items-center gap-2 text-sm cursor-pointer" data-guest={g.vmid}>
+                                                <input type="checkbox" checked={picked.has(g.vmid)} onChange={() => toggle(g.vmid)} />
+                                                <span className="font-mono text-xs text-gray-400">{g.vmid}</span>
+                                                <span className="truncate flex-1 text-white">{g.name || '-'}</span>
+                                                <span className="text-xs text-gray-500">{g.type === 'lxc' ? 'CT' : 'VM'}</span>
+                                            </label>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+                            {error && (
+                                <div className="text-sm text-red-400 flex items-start gap-2" data-testid="node-guests-error">
+                                    <Icons.AlertTriangle />
+                                    <span className="break-all">{error}</span>
+                                </div>
+                            )}
+                        </div>
+                    )}
+                </GuestBulkFrame>
+            );
+        }
+
         // Cross-Cluster Migration Modal
         // NS: The big one - SSH tunnel based migration between clusters
         // Uses same ISO detection logic as MigrateModal (copy-paste, I know...)

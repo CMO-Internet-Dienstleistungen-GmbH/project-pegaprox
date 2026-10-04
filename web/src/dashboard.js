@@ -10241,6 +10241,113 @@
             };
             const isSidebarGuestTemplate = (guest = {}) => guest.template === 1 || guest.template === '1' || guest.template === true;
 
+            // LW Oct 2026 - starred clusters, nodes and guests, flat rows at the top of the
+            // sidebar. Opening one goes where the tree and the global search go.
+            const openFavorite = (kind, f) => {
+                setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null);
+                if (kind === 'cluster') {
+                    const c = clusters.find(cl => cl.id === f);
+                    if (c) setSelectedCluster(c);
+                    return;
+                }
+                if (isCorporate) setExpandedSidebarClusters(prev => ({ ...prev, [f.cluster_id]: true }));
+                if (kind === 'node') { navigateToResult({ type: 'node', cluster_id: f.cluster_id, name: f.node }); return; }
+                const live = favoriteGuestLive[`${f.cluster_id}:${f.vmid}`];
+                navigateToResult({ type: f.type === 'lxc' ? 'lxc' : 'qemu', cluster_id: f.cluster_id, vmid: f.vmid,
+                    node: live?.node, name: live?.name || f.name, status: live?.status });
+            };
+            const unstarFavorite = (kind, f) => {
+                if (kind === 'cluster') toggleFavorite('cluster', f);
+                else if (kind === 'node') toggleNodeFavorite(f.cluster_id, f.node);
+                else toggleFavorite('vm', f.cluster_id, f.vmid, f.type === 'lxc' ? 'lxc' : 'qemu');
+            };
+            const renderFavoritesGroup = () => {
+                const byId = new Map(clusters.map(c => [c.id, c]));
+                const rows = [];
+                (favorites.clusters || []).forEach(cid => {
+                    const c = byId.get(cid);
+                    if (c) rows.push({ key: `c:${cid}`, kind: 'cluster', fav: cid, label: clusterLabel(c), sub: '' });
+                });
+                (favorites.nodes || []).forEach(f => {
+                    const c = byId.get(f.cluster_id);
+                    if (c) rows.push({ key: `n:${f.cluster_id}:${f.node}`, kind: 'node', fav: f, label: f.node, sub: clusterLabel(c) });
+                });
+                (favorites.vms || []).forEach(f => {
+                    const c = byId.get(f.cluster_id);
+                    if (!c) return;
+                    const live = favoriteGuestLive[`${f.cluster_id}:${f.vmid}`];
+                    rows.push({ key: `v:${f.cluster_id}:${f.vmid}`, kind: 'vm', fav: f, sub: clusterLabel(c), ct: f.type === 'lxc',
+                        label: (live && live.name) || f.name || `${f.type === 'lxc' ? 'CT' : 'VM'} ${f.vmid}`,
+                        running: live ? live.status === 'running' : null });
+                });
+                if (!rows.length) return null;
+                const kindIcon = (row) => row.kind === 'cluster' ? <Icons.Database /> : row.kind === 'node' ? <Icons.Server />
+                    : row.ct ? <Icons.Box className="w-4 h-4" /> : <Icons.Monitor />;
+                const open = (row) => openFavorite(row.kind, row.fav);
+                const onKey = (row) => (e) => { if (e.key === 'Enter') { e.preventDefault(); open(row); } };
+                const unstar = (row) => !haReadOnly && (
+                    <button onClick={(e) => { e.stopPropagation(); unstarFavorite(row.kind, row.fav); }}
+                        className="flex-shrink-0 opacity-60 hover:opacity-80" title={t('favRemove')} data-unstar={row.key}>
+                        <Icons.Star className="w-3.5 h-3.5 fill-yellow-400 text-yellow-400" />
+                    </button>
+                );
+                const dot = (row) => row.running === null || row.running === undefined ? null : (
+                    <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ background: row.running ? '#22c55e' : '#6b7280' }} />
+                );
+                const header = (
+                    <div role="button" tabIndex={0} aria-expanded={!favoritesCollapsed} data-testid="sidebar-favorites-toggle"
+                        onClick={toggleFavoritesCollapsed}
+                        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleFavoritesCollapsed(); } }}
+                        className={`flex items-center gap-1.5 cursor-pointer ${isCorporate ? 'px-1 py-0.5' : 'px-3 py-2'}`}>
+                        {favoritesCollapsed ? <Icons.ChevronRight className="w-3 h-3 text-gray-500" /> : <Icons.ChevronDown className="w-3 h-3 text-gray-500" />}
+                        <Icons.Star className="w-3.5 h-3.5 fill-yellow-400 text-yellow-400" />
+                        <h2 className="flex-1 text-sm font-semibold text-gray-400 uppercase tracking-wider">{t('favoritesGroup')}</h2>
+                        <span className="text-xs text-gray-500">{rows.length}</span>
+                    </div>
+                );
+                if (isCorporate) {
+                    return (
+                        <div className="pb-1" data-testid="sidebar-favorites">
+                            {header}
+                            {!favoritesCollapsed && rows.map(row => (
+                                <div key={row.key} tabIndex={0} data-fav-row={row.key}
+                                    className="corp-tree-child flex items-center gap-1.5 pl-5 pr-2 py-0.5 text-[13px] leading-5 cursor-pointer"
+                                    style={{ color: 'var(--corp-text-secondary)' }}
+                                    onClick={() => open(row)} onKeyDown={onKey(row)}
+                                    onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--color-hover)'; e.currentTarget.style.color = 'var(--color-text)'; }}
+                                    onMouseLeave={(e) => { e.currentTarget.style.background = ''; e.currentTarget.style.color = 'var(--corp-text-secondary)'; }}>
+                                    <span className="flex flex-shrink-0" style={{ color: 'var(--corp-accent)' }}>{kindIcon(row)}</span>
+                                    <span className="truncate flex-1">{row.label}</span>
+                                    {dot(row)}
+                                    {row.sub && <span className="text-[11px] truncate" style={{ color: 'var(--corp-text-muted)', maxWidth: '45%' }}>{row.sub}</span>}
+                                    {unstar(row)}
+                                </div>
+                            ))}
+                        </div>
+                    );
+                }
+                return (
+                    <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden" data-testid="sidebar-favorites">
+                        {header}
+                        {!favoritesCollapsed && (
+                            <div className="border-t border-proxmox-border py-1">
+                                {rows.map(row => (
+                                    <div key={row.key} role="button" tabIndex={0} data-fav-row={row.key}
+                                        className="flex items-center gap-2 px-3 py-1.5 text-sm text-gray-300 hover:bg-proxmox-hover hover:text-white cursor-pointer"
+                                        onClick={() => open(row)} onKeyDown={onKey(row)}>
+                                        <span className="flex flex-shrink-0 text-gray-400">{kindIcon(row)}</span>
+                                        <span className="truncate flex-1">{row.label}</span>
+                                        {dot(row)}
+                                        {row.sub && <span className="text-xs text-gray-500 truncate" style={{ maxWidth: '40%' }}>{row.sub}</span>}
+                                        {unstar(row)}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                );
+            };
+
             // LW: Feb 2026 - corporate inline inventory tree: nodes + VMs flat under cluster
             const renderInlineNodeTree = (clusterId) => {
                 if (!isCorporate || !expandedSidebarClusters[clusterId]) return null;
@@ -11141,6 +11248,44 @@
                 }
                 return false;
             };
+            // LW Oct 2026 - the favorites group at the top of the sidebar and the stars of the
+            // right-click menus. A starred guest shows its live row where the sidebar holds
+            // its cluster anyway, the stored name otherwise; only the clusters with a starred
+            // guest are walked, and only when their list changes.
+            const favoriteGuestLive = useMemo(() => {
+                const want = {};
+                (favorites.vms || []).forEach(f => { (want[f.cluster_id] = want[f.cluster_id] || new Set()).add(String(f.vmid)); });
+                const live = {};
+                Object.keys(want).forEach(cid => {
+                    const list = selectedCluster && selectedCluster.id === cid ? clusterResources : (sidebarClusterData[cid]?.resources || []);
+                    (list || []).forEach(r => {
+                        if ((r.type === 'qemu' || r.type === 'lxc') && want[cid].has(String(r.vmid))) live[`${cid}:${r.vmid}`] = r;
+                    });
+                });
+                return live;
+            }, [favorites, clusterResources, sidebarClusterData, selectedCluster?.id]);
+            // open or shut per viewer, in this browser
+            const favCollapseKey = `pegaprox-sidebar-favorites-${user?.username || '_'}`;
+            const [favoritesCollapsed, setFavoritesCollapsed] = useState(() => {
+                try { return localStorage.getItem(favCollapseKey) === '1'; } catch (e) { return false; }
+            });
+            const toggleFavoritesCollapsed = () => {
+                const next = !favoritesCollapsed;
+                setFavoritesCollapsed(next);
+                try { localStorage.setItem(favCollapseKey, next ? '1' : '0'); } catch (e) {}
+            };
+            const toggleGuestFavorite = (vm) => toggleFavorite('vm', vm._clusterId || selectedCluster?.id, vm.vmid, vm.type === 'lxc' ? 'lxc' : 'qemu');
+            const toggleNodeFavorite = (clusterId, nodeName) => toggleFavorite('node', clusterId, null, null, nodeName);
+            // a star writes the caller's own row: not where this standby refuses writes (#625)
+            const favMenuItems = (on, onClick) => haReadOnly ? [] : [{
+                label: on ? t('favRemove') : t('favAdd'),
+                icon: <Icons.Star className={`w-3.5 h-3.5 ${on ? 'fill-yellow-400 text-yellow-400' : ''}`} />,
+                onClick,
+            }];
+            // start, shut down or migrate all guests of a node ({action, clusterId, node})
+            const [nodeGuests, setNodeGuests] = useState(null);
+            // the bulk dialog of the Cloud list ({action, guests}); the table has its own
+            const [cloudBulk, setCloudBulk] = useState(null);
             
             // NS: Load datacenter summary
             const loadDatacenterSummary = async () => {
@@ -15236,6 +15381,7 @@
                         { perm: 'cluster.config', label: t('assignToGroup') || 'Assign to Group', icon: <Icons.FolderPlus className="w-3.5 h-3.5" />, onClick: () => setShowAssignGroup(cluster) },
                         { perm: 'vm.migrate', label: t('bulkMigration') || 'Bulk Migration', icon: <Icons.ArrowRight className="w-3.5 h-3.5" />, onClick: () => { setSelectedCluster(cluster); setActiveTab('resources'); setResourcesSubTab('management'); } },
                         { separator: true },
+                        ...favMenuItems(isFavorite('cluster', cluster.id), () => toggleFavorite('cluster', cluster.id)),
                         { label: t('refreshData') || 'Refresh', icon: <Icons.RefreshCw className="w-3.5 h-3.5" />, onClick: () => { fetchSidebarClusterData(cluster.id); if (selectedCluster?.id === cluster.id) { fetchClusterMetrics(cluster.id); fetchClusterResources(cluster.id); } } },
                         { separator: true },
                         ...(cluster.cluster_type === 'xcpng' ? [] : [
@@ -15286,7 +15432,13 @@
                         ...(haConsolesElsewhere ? onActiveItems('node.shell', '', !online) : [
                         { perm: 'node.shell', label: t('sshConsole') || 'SSH Console', icon: <Icons.Terminal className="w-3.5 h-3.5" />, onClick: () => { selectCluster(); const c = clusters.find(cl => cl.id === clusterId); if (c) { setConsoleInfo({ vmid: 0, node: nodeName, type: 'node', host: c.host }); setConsoleVm({ vmid: 0, node: nodeName, type: 'node', name: nodeName }); } }, disabled: !online, console: true },
                         ]),
+                        { label: t('nodeGuestsMenu'), icon: <Icons.Layers />, submenu: [
+                            { perm: 'vm.start', label: t('nodeGuestsStartAll'), icon: <Icons.PlayCircle />, onClick: () => setNodeGuests({ action: 'startall', clusterId, node: nodeName }), disabled: !online },
+                            { perm: 'vm.stop', label: t('nodeGuestsStopAll'), icon: <Icons.Power />, onClick: () => setNodeGuests({ action: 'stopall', clusterId, node: nodeName }), disabled: !online },
+                            { perm: 'vm.migrate', label: t('nodeGuestsMigrateAll'), icon: <Icons.ArrowRight />, onClick: () => setNodeGuests({ action: 'migrateall', clusterId, node: nodeName }), disabled: !online },
+                        ]},
                         { separator: true },
+                        ...favMenuItems(isFavorite('node', clusterId, null, nodeName), () => toggleNodeFavorite(clusterId, nodeName)),
                         { label: t('refreshData') || 'Refresh', icon: <Icons.RefreshCw className="w-3.5 h-3.5" />, onClick: () => { fetchSidebarClusterData(clusterId); } },
                     ];
                 }
@@ -15454,6 +15606,7 @@
                         { perm: 'vm.snapshot', label: t('snapshot') || 'Snapshot', icon: <Icons.Camera className="w-3.5 h-3.5" />, onClick: () => {
                             setDashSnapshotVm(vm);
                         }},
+                        ...favMenuItems(isFavorite('vm', cId, vm.vmid), () => toggleGuestFavorite(vm)),
                         { separator: true },
                         { perm: 'vm.delete', label: t('delete') || 'Delete', icon: <Icons.Trash className="w-3.5 h-3.5" />, onClick: () => {
                             if (isCorporate) { setDashDeleteVm(vm); }
@@ -15530,6 +15683,7 @@
                     del: (vm) => setDashDeleteVm(vm),
                     crossMigrate: (vm) => setDashCrossClusterVm(vm),
                     snapshot: (vm) => setDashSnapshotVm(vm),
+                    bulkGuests: (rows, action) => setCloudBulk({ action, guests: rows.map(r => ({ ...r, _clusterId: r._clusterId || selectedCluster?.id })) }),
                     createVm: (type) => setShowCreateVm(type || 'qemu'),
                     nodeAction: handleNodeAction,                     // (nodeName, 'reboot'|'shutdown')
                     maintenanceToggle: handleMaintenanceToggle,       // (nodeName, enable)
@@ -15555,7 +15709,7 @@
                     ['openConsole', 'openSpice', 'openLxcShell'].forEach(k => { delete cloudActions[k]; });
                 }
                 if (haReadOnly) {
-                    ['vmAction', 'forceStop', 'migrate', 'clone', 'del',
+                    ['vmAction', 'forceStop', 'migrate', 'clone', 'del', 'bulkGuests',
                      'crossMigrate', 'snapshot', 'createVm', 'nodeAction', 'maintenanceToggle', 'startUpdate']
                         .forEach(k => { delete cloudActions[k]; });
                 }
@@ -15592,6 +15746,11 @@
                             return; the skins are mutually exclusive so only one set ever mounts. */}
                         {configVm && (configVm._clusterId || selectedCluster) && (
                             <ConfigModal vm={configVm} clusterId={configVm._clusterId || selectedCluster.id} allClusters={clusters} dashboardAuthFetch={authFetch} onClose={handleCloseConfig} addToast={addToast} isCorporate={false} />
+                        )}
+                        {cloudBulk && (
+                            <GuestBulkActionModal action={cloudBulk.action} guests={cloudBulk.guests} authFetch={authFetch}
+                                onFinished={() => { const cid = selectedCluster?.id; if (cid) setTimeout(() => fetchClusterResources(cid), 1500); }}
+                                onClose={() => setCloudBulk(null)} />
                         )}
                         {configNode && selectedCluster && (
                             <NodeModal node={configNode} clusterId={selectedCluster.id} clusterType={selectedCluster.cluster_type || 'proxmox'} onClose={() => setConfigNode(null)} addToast={addToast} />
@@ -16290,6 +16449,7 @@
                                             </div>
                                         </div>
                                     )}
+                                    {renderFavoritesGroup()}
                                     {/* LW: Feb 2026 - group management header, compact in corporate */}
                                     <div className="flex items-center justify-between px-1">
                                         <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">{t('clusters')}</h2>
@@ -17201,6 +17361,10 @@
                                                                     onNodeAction={handleNodeAction}
                                                                     onRemoveNode={(nodeName) => { setNodeToRemoveDash({ name: nodeName }); setShowRemoveNodeDash(true); }}
                                                                     onMoveNode={(nodeName) => { setNodeToMoveDash(nodeName); setShowMoveNodeDash(true); }}
+                                                                    isFavorite={isFavorite('node', selectedCluster.id, null, node)}
+                                                                    onToggleFavorite={(nodeName) => toggleNodeFavorite(selectedCluster.id, nodeName)}
+                                                                    guestActions={[['startall', 'vm.start'], ['stopall', 'vm.stop'], ['migrateall', 'vm.migrate']].filter(([, perm]) => can(perm)).map(([a]) => a)}
+                                                                    onGuestsAction={(nodeName, action) => setNodeGuests({ action, clusterId: selectedCluster.id, node: nodeName })}
                                                                 />
                                                             ))}
                                                             {/* Offline nodes from knownNodes */}
@@ -17539,6 +17703,10 @@
                                                             pendingVmAction={pendingVmAction}
                                                             onPendingActionConsumed={() => setPendingVmAction(null)}
                                                             backupStatus={vmsBackupStatus}
+                                                            authFetch={authFetch}
+                                                            onBulkDone={() => { const cid = selectedCluster.id; setTimeout(() => fetchClusterResources(cid), 1500); }}
+                                                            favorites={favorites}
+                                                            onToggleFavorite={toggleGuestFavorite}
                                                             onVmNavigate={isCorporate ? (vm) => {
                                                                 setSelectedSidebarVm({...vm, _clusterId: selectedCluster.id});
                                                                 setSelectedSidebarNode(null);
@@ -24904,6 +25072,26 @@
                             onClose={() => setCtxMenu(null)}
                         />
                     )}
+
+                    {nodeGuests && (() => {
+                        const cid = nodeGuests.clusterId;
+                        const sel = selectedCluster && selectedCluster.id === cid;
+                        const res = (sel ? clusterResources : sidebarClusterData[cid]?.resources) || [];
+                        const met = (sel ? clusterMetrics : sidebarClusterData[cid]?.metrics) || {};
+                        return (
+                            <NodeGuestsModal
+                                action={nodeGuests.action}
+                                clusterId={cid}
+                                node={nodeGuests.node}
+                                guests={res.filter(r => r.node === nodeGuests.node && (r.type === 'qemu' || r.type === 'lxc'))}
+                                nodes={Object.entries(met).filter(([n, m]) => n !== 'error' && n !== 'offline' && m)
+                                    .map(([n, m]) => ({ name: n, online: m.status !== 'offline' && !m.offline }))}
+                                authFetch={authFetch}
+                                onClose={() => setNodeGuests(null)}
+                                onDone={() => setTimeout(() => { if (selectedCluster?.id === cid) fetchClusterResources(cid); else fetchSidebarClusterData(cid); }, 1500)}
+                            />
+                        );
+                    })()}
 
                     {/* Add/Edit VMware Server Modal */}
                     {showAddVMware && (

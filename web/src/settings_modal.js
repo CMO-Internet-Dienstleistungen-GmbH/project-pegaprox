@@ -4287,6 +4287,9 @@
                     'node.maintenance_entered': t('nodeMaintenanceEntered'),
                     'node.maintenance_exited': t('nodeMaintenanceExited'),
                     'node.update_started': t('nodeUpdateStarted'),
+                    'node.guests_started': t('auditNodeGuestsStarted'),
+                    'node.guests_stopped': t('auditNodeGuestsStopped'),
+                    'node.guests_migrated': t('auditNodeGuestsMigrated'),
                 };
                 return labels[action] || action;
             };

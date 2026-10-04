@@ -73,7 +73,7 @@
         }
 
         // Node Card Component
-        function NodeCard({ name, metrics, index, clusterId, nodeUiSuffix, onMaintenanceToggle, onStartUpdate, onOpenNodeConfig, onNodeAction, onRemoveNode, onMoveNode }) {
+        function NodeCard({ name, metrics, index, clusterId, nodeUiSuffix, onMaintenanceToggle, onStartUpdate, onOpenNodeConfig, onNodeAction, onRemoveNode, onMoveNode, isFavorite, onToggleFavorite, guestActions, onGuestsAction }) {
             const { t } = useTranslation();
             // #625 v2: a standby shows maintenance and update state, it does not change them
             const { getAuthHeaders, haReadOnly } = useAuth();
@@ -94,6 +94,7 @@
             const [showShutdownConfirm, setShowShutdownConfirm] = useState(false);
             const [actionLoading, setActionLoading] = useState(null);
             const [expanded, setExpanded] = useState(false);
+            const [guestsMenu, setGuestsMenu] = useState(false);
             const lastMetricsRef = useRef(null);
 
             // auto-dismiss update banner after 30s when completed (#183)
@@ -548,6 +549,51 @@
                             </div>
                         </div>
                         <div className="flex items-center gap-2">
+                            {/* LW Oct 2026 - the star and the guests of the node, what the
+                                right-click menu of a node offers in the corporate tree */}
+                            {!haReadOnly && onToggleFavorite && (
+                                <button
+                                    onClick={() => onToggleFavorite(name)}
+                                    className="p-2 rounded-lg bg-proxmox-dark hover:bg-yellow-500/20 text-gray-400 hover:text-yellow-400 transition-all"
+                                    title={isFavorite ? t('favRemove') : t('favAdd')}
+                                    data-fav={isFavorite ? 'on' : 'off'}
+                                >
+                                    <Icons.Star className={`w-5 h-5 ${isFavorite ? 'fill-yellow-400 text-yellow-400' : ''}`} />
+                                </button>
+                            )}
+                            {!haReadOnly && onGuestsAction && (guestActions || []).length > 0 && (
+                                <div className="relative">
+                                    <button
+                                        onClick={() => setGuestsMenu(v => !v)}
+                                        className="p-2 rounded-lg bg-proxmox-dark hover:bg-green-500/20 text-gray-400 hover:text-green-400 transition-all"
+                                        title={t('nodeGuestsMenu')}
+                                        aria-haspopup="menu"
+                                        aria-expanded={guestsMenu}
+                                        data-node-guests={name}
+                                    >
+                                        <Icons.Layers />
+                                    </button>
+                                    {guestsMenu && (
+                                        <>
+                                            <div className="fixed inset-0 z-40" onClick={() => setGuestsMenu(false)} />
+                                            <div className="absolute right-0 top-full mt-1 w-48 bg-proxmox-card border border-proxmox-border rounded-lg shadow-xl z-50 py-1" role="menu">
+                                                {guestActions.map(a => (
+                                                    <button
+                                                        key={a}
+                                                        role="menuitem"
+                                                        onClick={() => { setGuestsMenu(false); onGuestsAction(name, a); }}
+                                                        className="w-full px-3 py-2 text-left text-sm text-gray-300 hover:bg-proxmox-hover flex items-center gap-2"
+                                                        data-action={a}
+                                                    >
+                                                        {a === 'startall' ? <Icons.PlayCircle /> : a === 'stopall' ? <Icons.Power /> : <Icons.ArrowRight />}
+                                                        {t(a === 'startall' ? 'nodeGuestsStartAll' : a === 'stopall' ? 'nodeGuestsStopAll' : 'nodeGuestsMigrateAll')}
+                                                    </button>
+                                                ))}
+                                            </div>
+                                        </>
+                                    )}
+                                </div>
+                            )}
                             {!haReadOnly && !isInMaintenance && !isUpdating && (
                                 <button
                                     onClick={() => setShowMaintenanceConfirm(true)}
@@ -1296,7 +1342,7 @@
         // NS: Added bulk select for mass operations (migration, etc.)
         // This component does a lot... might need to split it up eventually
         // NS: filtering + sorting uses useMemo below (lines 1320+)
-        function ResourceTable({ resources, clusterId, clusters, sourceCluster, onVmAction, onOpenConsole, onOpenSpice, onOpenConfig, onMigrate, onBulkMigrate, onDelete, onClone, onForceStop, onCrossClusterMigrate, nodes, datastores, onOpenTags, highlightedVm, addToast, pendingVmAction, onPendingActionConsumed, onVmNavigate, backupStatus }) {
+        function ResourceTable({ resources, clusterId, clusters, sourceCluster, onVmAction, onOpenConsole, onOpenSpice, onOpenConfig, onMigrate, onBulkMigrate, onDelete, onClone, onForceStop, onCrossClusterMigrate, nodes, datastores, onOpenTags, highlightedVm, addToast, pendingVmAction, onPendingActionConsumed, onVmNavigate, backupStatus, authFetch, onBulkDone, favorites, onToggleFavorite }) {
             const { t } = useTranslation();
             const { getAuthHeaders, user, haReadOnly, haConsolesElsewhere } = useAuth();
             // #625 v2 - a standby shows the guests live but acts on none of them: no power,
@@ -1334,6 +1380,7 @@
             const [selectedVms, setSelectedVms] = useState([]);
             const [showMigrateModal, setShowMigrateModal] = useState(null);
             const [showBulkMigrate, setShowBulkMigrate] = useState(false);
+            const [bulkGuests, setBulkGuests] = useState(null);  // {action, guests}
             const [showDeleteConfirm, setShowDeleteConfirm] = useState(null);
             const [showCloneModal, setShowCloneModal] = useState(null);
             const [selectedDetailVm, setSelectedDetailVm] = useState(null); // For detail view
@@ -1579,6 +1626,28 @@
                 }
             };
 
+            // LW Oct 2026 - the bulk dialog gets the live row of each picked guest as it is at
+            // the click, so a guest that stopped since it was ticked counts as stopped
+            const openBulk = (action) => {
+                const byId = new Map(resources.map(r => [r.vmid, r]));
+                const guests = selectedVms.map(s => byId.get(s.vmid) || s)
+                    .map(r => ({ ...r, _clusterId: r._clusterId || clusterId }));
+                setBulkGuests({ action, guests });
+            };
+            const bulkButtons = [
+                { action: 'start', label: t('start'), cls: 'bg-green-600 hover:bg-green-700', icon: <Icons.PlayCircle /> },
+                { action: 'shutdown', label: t('shutdown'), cls: 'bg-yellow-600 hover:bg-yellow-700', icon: <Icons.Power /> },
+                { action: 'reboot', label: t('reboot'), cls: 'bg-orange-500 hover:bg-orange-600', icon: <Icons.RefreshCw /> },
+                { action: 'stop', label: t('forceStop'), cls: 'bg-red-600 hover:bg-red-700', icon: <Icons.XCircle /> },
+                { action: 'snapshot', label: t('snapshot'), cls: 'bg-purple-600 hover:bg-purple-700', icon: <Icons.Camera /> },
+                { action: 'tags', label: t('tags'), cls: 'bg-gray-600 hover:bg-gray-500', icon: <Icons.Tag /> },
+            ];
+
+            // the star of a guest, where the dashboard hands the favorites down
+            const favSet = useMemo(() => new Set(((favorites && favorites.vms) || []).map(f => `${f.cluster_id}:${f.vmid}`)), [favorites]);
+            const isFav = (r) => favSet.has(`${r._clusterId || clusterId}:${r.vmid}`);
+            const canStar = acts && !!onToggleFavorite;
+
             const availableNodes = useMemo(() => {
                 const nodeSet = new Set(resources.map(r => r.node).filter(Boolean));
                 return Array.from(nodeSet).sort();
@@ -1608,7 +1677,7 @@
                 <div className={isCorporate ? 'space-y-0' : 'space-y-4'}>
                     {/* LW: Mar 2026 - corporate flat toolbar vs modern rounded pills */}
                     {isCorporate ? (
-                        <div className="corp-vm-toolbar">
+                        <div className="corp-vm-toolbar" style={{flexWrap: 'wrap'}}>
                             <div className="relative">
                                 <Icons.Search className="w-3.5 h-3.5 absolute left-2 top-1/2 -translate-y-1/2" style={{color: '#728b9a'}} />
                                 <input
@@ -1640,12 +1709,18 @@
                                     {/* LW Sep 2026 (#798) - the bulk bar below is suppressed in corporate
                                         because it was meant to live up here, but only the count ever made
                                         it across, so selecting rows in this layout did nothing at all. */}
-                                    {acts && (
-                                    <button onClick={() => setShowBulkMigrate(true)}
+                                    {acts && (<>
+                                    {bulkButtons.map(b => (
+                                        <button key={b.action} onClick={() => openBulk(b.action)} data-bulk={b.action}
+                                            className="corp-toolbar-filter" style={b.action === 'stop' ? {color: '#f54f47'} : undefined}>
+                                            {b.label}
+                                        </button>
+                                    ))}
+                                    <button onClick={() => setShowBulkMigrate(true)} data-bulk="migrate"
                                         className="corp-toolbar-filter" style={{color: '#49afd9'}}>
                                         {t('migrate')}
                                     </button>
-                                    )}
+                                    </>)}
                                     <button onClick={() => setSelectedVms([])}
                                         className="corp-toolbar-filter">
                                         {t('clearSelection') || 'Clear selection'}
@@ -1759,12 +1834,20 @@
 
                     {/* Bulk Actions Bar (hidden in corporate - integrated in toolbar) */}
                     {!isCorporate && acts && selectedVms.length > 0 && (
-                        <div className="flex items-center gap-3 p-3 bg-proxmox-orange/10 border border-proxmox-orange/30 rounded-lg">
-                            <span className="text-sm text-proxmox-orange font-medium">
+                        <div className="flex flex-wrap items-center gap-2 p-3 bg-proxmox-orange/10 border border-proxmox-orange/30 rounded-lg">
+                            <span className="text-sm text-proxmox-orange font-medium mr-1">
                                 {selectedVms.length} {t('selectedItems')}
                             </span>
+                            {bulkButtons.map(b => (
+                                <button key={b.action} onClick={() => openBulk(b.action)} data-bulk={b.action}
+                                    className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-white text-sm ${b.cls}`}>
+                                    {b.icon}
+                                    {b.label}
+                                </button>
+                            ))}
                             <button
                                 onClick={() => setShowBulkMigrate(true)}
+                                data-bulk="migrate"
                                 className="flex items-center gap-2 px-3 py-1.5 bg-blue-600 rounded-lg text-white text-sm hover:bg-blue-700"
                             >
                                 <Icons.ArrowRight />
@@ -2047,6 +2130,16 @@
                                                                 </button>
                                                             )}
                                                             </>)}
+                                                            {canStar && (
+                                                                <button
+                                                                    onClick={() => { onToggleFavorite(resource); setOpenDropdown(null); }}
+                                                                    className="w-full px-3 py-2 text-left text-sm text-gray-300 hover:bg-proxmox-hover flex items-center gap-2"
+                                                                    data-fav={isFav(resource) ? 'on' : 'off'}
+                                                                >
+                                                                    <Icons.Star className={`w-4 h-4 ${isFav(resource) ? 'fill-yellow-400 text-yellow-400' : ''}`} />
+                                                                    {isFav(resource) ? t('favRemove') : t('favAdd')}
+                                                                </button>
+                                                            )}
                                                             <button
                                                                 onClick={() => { setShowMetricsModal(resource); setOpenDropdown(null); }}
                                                                 className="w-full px-3 py-2 text-left text-sm text-gray-300 hover:bg-proxmox-hover flex items-center gap-2"
@@ -2357,6 +2450,12 @@
                                                                 <button onClick={() => onOpenSpice(resource)} className="corp-action-btn" title={t('spiceConsole') || 'SPICE'}><Icons.ExternalLink className="w-3.5 h-3.5" /></button>
                                                             )}
                                                             <button onClick={() => onOpenConfig(resource)} className="corp-action-btn" title={t('configuration')}><Icons.Cog className="w-3.5 h-3.5" /></button>
+                                                            {canStar && (
+                                                                <button onClick={() => onToggleFavorite(resource)} className="corp-action-btn" data-fav={isFav(resource) ? 'on' : 'off'}
+                                                                    title={isFav(resource) ? t('favRemove') : t('favAdd')}>
+                                                                    <Icons.Star className={`w-3.5 h-3.5 ${isFav(resource) ? 'fill-yellow-400 text-yellow-400' : ''}`} />
+                                                                </button>
+                                                            )}
                                                             {acts && (<>
                                                             <button onClick={() => setShowMigrateModal(resource)} className="corp-action-btn" title={t('migrate')}><Icons.ArrowRight className="w-3.5 h-3.5" /></button>
                                                             <button onClick={() => setShowCloneModal(resource)} className="corp-action-btn" title={t('clone')}><Icons.Copy className="w-3.5 h-3.5" /></button>
@@ -2385,6 +2484,16 @@
                                                         >
                                                             <Icons.Cog />
                                                         </button>
+                                                        {canStar && (
+                                                        <button
+                                                            onClick={() => onToggleFavorite(resource)}
+                                                            className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-yellow-500/20 text-gray-400 hover:text-yellow-400 transition-all"
+                                                            data-fav={isFav(resource) ? 'on' : 'off'}
+                                                            title={isFav(resource) ? t('favRemove') : t('favAdd')}
+                                                        >
+                                                            <Icons.Star className={`w-5 h-5 ${isFav(resource) ? 'fill-yellow-400 text-yellow-400' : ''}`} />
+                                                        </button>
+                                                        )}
                                                         {acts && (
                                                         <button
                                                             onClick={() => onOpenTags && onOpenTags(resource)}
@@ -2751,6 +2860,16 @@
                                 setShowBulkMigrate(false);
                                 setSelectedVms([]);
                             }}
+                        />
+                    )}
+
+                    {bulkGuests && authFetch && (
+                        <GuestBulkActionModal
+                            action={bulkGuests.action}
+                            guests={bulkGuests.guests}
+                            authFetch={authFetch}
+                            onFinished={onBulkDone}
+                            onClose={() => setBulkGuests(null)}
                         />
                     )}
 

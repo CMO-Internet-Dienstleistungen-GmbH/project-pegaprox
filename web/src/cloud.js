@@ -718,7 +718,10 @@
                 </th>
             );
 
-            const bulk = (action) => selectedRows.forEach(r => act.vmAction(r, action));
+            // LW Oct 2026 - one dialog for the selection: one confirmation, a few requests at a
+            // time and a line per guest, instead of a prompt and a request per row at once
+            const bulk = (action) => act.has('bulkGuests') ? act.bulkGuests(selectedRows, action)
+                : selectedRows.forEach(r => act.vmAction(r, action));
             const canCreate = act.has('createVm');
             const canPower = act.has('vmAction');
 
@@ -742,6 +745,10 @@
                                         <button type="button" className="cloud-btn cloud-btn-sm" onClick={() => bulk('shutdown')}><Icons.Power /> {t('shutdown') || 'Shutdown'}</button>
                                         <button type="button" className="cloud-btn cloud-btn-sm" onClick={() => bulk('reboot')}><Icons.RotateCw /> {t('reboot') || 'Reboot'}</button>
                                         <button type="button" className="cloud-btn cloud-btn-sm cloud-btn-danger" onClick={() => bulk('stop')}><Icons.Square /> {t('stop') || 'Stop'}</button>
+                                        {act.has('bulkGuests') && (<>
+                                            <button type="button" className="cloud-btn cloud-btn-sm" onClick={() => bulk('snapshot')}><Icons.Camera /> {t('snapshot')}</button>
+                                            <button type="button" className="cloud-btn cloud-btn-sm" onClick={() => bulk('tags')}><Icons.Tag /> {t('tags')}</button>
+                                        </>)}
                                         <button type="button" className="cloud-sel-clear" onClick={() => setChecked({})}>{t('cloud.clear') || 'Clear'}</button>
                                     </div>
                                 ) : (
@@ -2341,6 +2348,7 @@
                 del: (r) => actions?.del?.(stamp(r)),
                 crossMigrate: (r) => actions?.crossMigrate?.(stamp(r)),
                 snapshot: (r) => actions?.snapshot?.(stamp(r)),
+                bulkGuests: (rows, a) => actions?.bulkGuests?.(rows.map(stamp), a),
                 createVm: (type) => actions?.createVm?.(type),
                 nodeAction: (n, a) => actions?.nodeAction?.(n, a),
                 maintenanceToggle: (n, e) => actions?.maintenanceToggle?.(n, e),
