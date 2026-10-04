@@ -5144,130 +5144,208 @@ def get_vm_passthrough_devices(cluster_id, node, vmid):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/qemu/<int:vmid>/passthrough/pci', methods=['POST'])
 @require_auth(perms=['vm.config'])
 def add_pci_passthrough(cluster_id, node, vmid):
-    """Add a PCI device passthrough to a VM"""
+    """Add a PCI device passthrough to a VM: a cluster resource mapping (mapping) or a raw device (device_id)"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
     denied = _require_vm_access(cluster_id, vmid, 'vm.config', 'qemu')
     if denied: return denied
+    if not _PVE_NODE_RE.fullmatch(node or ''):
+        return jsonify({'error': 'Invalid node name'}), 400
 
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
-    
-    data = request.json or {}
+
+    data = request.get_json(silent=True) or {}
     device_id = data.get('device_id')
-    
-    if not device_id:
-        return jsonify({'error': 'device_id required'}), 400
-    
+    mapping = data.get('mapping')
+    # both go into a property string as they are, so a comma would add options of its
+    # own (romfile= is one PVE keeps for root@pam)
+    if mapping:
+        if not isinstance(mapping, str) or not _MAPPING_ID_RE.fullmatch(mapping):
+            return jsonify({'error': 'Invalid mapping id'}), 400
+    elif device_id:
+        if not isinstance(device_id, str) or not _PCI_ID_RE.fullmatch(device_id):
+            return jsonify({'error': 'Invalid PCI device id'}), 400
+    else:
+        return jsonify({'error': 'device_id or mapping required'}), 400
+
+    priv = None
     try:
         host, port = manager.host, manager.api_port
-        
+        session = manager._create_session()
+        covered = None
+        if mapping:
+            known, read_err = _read_mappings(manager, 'pci')
+            if known is None:
+                return jsonify({'error': read_err}), 502
+            entry = next((m for m in known if m['id'] == mapping), None)
+            if entry is None:
+                return jsonify({'error': f'No PCI mapping "{mapping}" in this cluster'}), 404
+            covered = entry['nodes']
+        else:
+            # a raw address is root@pam's only (check_hostpci_perm in qemu-server)
+            access = manager.pve_root_access()
+            if not access['root']:
+                return _root_refusal(access, 'attach a raw PCI device - use a resource mapping instead')
+            session, priv, priv_err = _session_as_root(manager, access, 'raw PCI passthrough')
+            if priv_err:
+                return jsonify({'error': priv_err, 'code': 'PVE_ROOT_LOGIN_FAILED'}), 502
+
         # Find next available hostpci slot
         config_url = f"https://{host}:{port}/api2/json/nodes/{node}/qemu/{vmid}/config"
         config_response = manager._create_session().get(config_url, timeout=10)
         config = config_response.json().get('data', {}) if config_response.status_code == 200 else {}
-        
+
         # Find free slot (0-15)
-        used_slots = [int(k.replace('hostpci', '')) for k in config.keys() if k.startswith('hostpci')]
+        used_slots = [int(k[7:]) for k in config.keys() if re.fullmatch(r'hostpci\d+', k)]
         next_slot = 0
         while next_slot in used_slots and next_slot < 16:
             next_slot += 1
-        
+
         if next_slot >= 16:
             return jsonify({'error': 'No free PCI slots available'}), 400
-        
+
         # Build PCI passthrough config
-        pci_config = device_id
+        pci_config = f'mapping={mapping}' if mapping else device_id
         if data.get('pcie'):
             pci_config += ',pcie=1'
         if data.get('rombar') is False:
             pci_config += ',rombar=0'
         if data.get('x-vga'):
             pci_config += ',x-vga=1'
-        
+
         # Update VM config
         update_url = f"https://{host}:{port}/api2/json/nodes/{node}/qemu/{vmid}/config"
         update_data = {f'hostpci{next_slot}': pci_config}
-        response = manager._create_session().put(update_url, data=update_data, timeout=15)
-        
+        response = session.put(update_url, data=update_data, timeout=15)
+
         if response.status_code == 200:
             user = getattr(request, 'session', {}).get('user', 'system')
-            log_audit(user, 'vm.pci_added', f"VM {vmid}: Added PCI device {device_id} at slot {next_slot}", cluster=manager.config.name)
-            return jsonify({'message': f'PCI device added at hostpci{next_slot}', 'slot': next_slot})
+            what = f'mapped PCI device {mapping}' if mapping else f'PCI device {device_id}'
+            log_audit(user, 'vm.pci_added', f"VM {vmid}: Added {what} at slot {next_slot}", cluster=manager.config.name)
+            out = {'message': f'PCI device added at hostpci{next_slot}', 'slot': next_slot}
+            if mapping:
+                out.update(mapping=mapping, nodes=covered, covers_node=node in covered)
+            return jsonify(out)
         else:
             return jsonify({'error': parse_pve_error(response.text)}), 500
-            
+
     except Exception as e:
         logging.error(f"Error adding PCI passthrough: {e}")
         return jsonify({'error': safe_error(e, 'Failed to add PCI passthrough')}), 500
+    finally:
+        if priv is not None:
+            try: priv.close()
+            except Exception: pass
 
 
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/qemu/<int:vmid>/passthrough/usb', methods=['POST'])
 @require_auth(perms=['vm.config'])
 def add_usb_passthrough(cluster_id, node, vmid):
-    """Add a USB device passthrough to a VM"""
+    """Add a USB device passthrough to a VM: a cluster resource mapping (mapping), vendorid+productid or hostbus+hostport"""
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
     denied = _require_vm_access(cluster_id, vmid, 'vm.config', 'qemu')
     if denied: return denied
+    if not _PVE_NODE_RE.fullmatch(node or ''):
+        return jsonify({'error': 'Invalid node name'}), 400
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
-    
-    data = request.json or {}
-    
-    # USB can be specified by vendor:product ID or by host bus/port
+
+    data = request.get_json(silent=True) or {}
+
+    # USB can be specified by a mapping, by vendor:product ID or by host bus/port
+    mapping = data.get('mapping')
     vendor_id = data.get('vendorid')
     product_id = data.get('productid')
     host_bus = data.get('hostbus')
     host_port = data.get('hostport')
-    
-    if not ((vendor_id and product_id) or (host_bus and host_port)):
-        return jsonify({'error': 'Either vendorid+productid or hostbus+hostport required'}), 400
-    
+
+    if mapping:
+        if not isinstance(mapping, str) or not _MAPPING_ID_RE.fullmatch(mapping):
+            return jsonify({'error': 'Invalid mapping id'}), 400
+    elif vendor_id and product_id:
+        if not all(isinstance(v, str) and re.fullmatch(r'[0-9a-fA-F]{4}', v) for v in (vendor_id, product_id)):
+            return jsonify({'error': 'vendorid and productid are four hex digits each'}), 400
+    elif host_bus and host_port:
+        if not (re.fullmatch(r'[0-9]{1,3}', str(host_bus)) and re.fullmatch(r'[0-9]{1,3}(\.[0-9]{1,3})*', str(host_port))):
+            return jsonify({'error': 'Invalid hostbus or hostport'}), 400
+    else:
+        return jsonify({'error': 'Either mapping, vendorid+productid or hostbus+hostport required'}), 400
+
+    priv = None
     try:
         host, port = manager.host, manager.api_port
-        
+        session = manager._create_session()
+        covered = None
+        if mapping:
+            known, read_err = _read_mappings(manager, 'usb')
+            if known is None:
+                return jsonify({'error': read_err}), 502
+            entry = next((m for m in known if m['id'] == mapping), None)
+            if entry is None:
+                return jsonify({'error': f'No USB mapping "{mapping}" in this cluster'}), 404
+            covered = entry['nodes']
+        else:
+            # host= is root@pam's only (check_usb_perm in qemu-server)
+            access = manager.pve_root_access()
+            if not access['root']:
+                return _root_refusal(access, 'attach a raw USB device - use a resource mapping instead')
+            session, priv, priv_err = _session_as_root(manager, access, 'raw USB passthrough')
+            if priv_err:
+                return jsonify({'error': priv_err, 'code': 'PVE_ROOT_LOGIN_FAILED'}), 502
+
         # Find next available usb slot
         config_url = f"https://{host}:{port}/api2/json/nodes/{node}/qemu/{vmid}/config"
         config_response = manager._create_session().get(config_url, timeout=10)
         config = config_response.json().get('data', {}) if config_response.status_code == 200 else {}
-        
+
         # Find free slot (0-4)
         used_slots = [int(k.replace('usb', '')) for k in config.keys() if k.startswith('usb') and k[3:].isdigit()]
         next_slot = 0
         while next_slot in used_slots and next_slot < 5:
             next_slot += 1
-        
+
         if next_slot >= 5:
             return jsonify({'error': 'No free USB slots available (max 5)'}), 400
-        
+
         # Build USB config
-        if vendor_id and product_id:
+        if mapping:
+            usb_config = f"mapping={mapping}"
+        elif vendor_id and product_id:
             usb_config = f"host={vendor_id}:{product_id}"
         else:
             usb_config = f"host={host_bus}-{host_port}"
-        
+
         if data.get('usb3'):
             usb_config += ',usb3=1'
-        
+
         # Update VM config
         update_url = f"https://{host}:{port}/api2/json/nodes/{node}/qemu/{vmid}/config"
         update_data = {f'usb{next_slot}': usb_config}
-        response = manager._create_session().put(update_url, data=update_data, timeout=15)
-        
+        response = session.put(update_url, data=update_data, timeout=15)
+
         if response.status_code == 200:
             user = getattr(request, 'session', {}).get('user', 'system')
-            log_audit(user, 'vm.usb_added', f"VM {vmid}: Added USB device at slot {next_slot}", cluster=manager.config.name)
-            return jsonify({'message': f'USB device added at usb{next_slot}', 'slot': next_slot})
+            what = f'mapped USB device {mapping}' if mapping else 'USB device'
+            log_audit(user, 'vm.usb_added', f"VM {vmid}: Added {what} at slot {next_slot}", cluster=manager.config.name)
+            out = {'message': f'USB device added at usb{next_slot}', 'slot': next_slot}
+            if mapping:
+                out.update(mapping=mapping, nodes=covered, covers_node=node in covered)
+            return jsonify(out)
         else:
             return jsonify({'error': parse_pve_error(response.text)}), 500
-            
+
     except Exception as e:
         logging.error(f"Error adding USB passthrough: {e}")
         return jsonify({'error': safe_error(e, 'Failed to add USB passthrough')}), 500
+    finally:
+        if priv is not None:
+            try: priv.close()
+            except Exception: pass
 
 
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/qemu/<int:vmid>/passthrough/serial', methods=['POST'])
@@ -5337,65 +5415,459 @@ def remove_passthrough_device(cluster_id, node, vmid, device_type, key):
     valid_prefixes = {'pci': 'hostpci', 'usb': 'usb', 'serial': 'serial'}
     if device_type not in valid_prefixes:
         return jsonify({'error': 'Invalid device type'}), 400
-    
+
     # Key should be like hostpci0, usb1, serial0
     expected_prefix = valid_prefixes[device_type]
-    if not key.startswith(expected_prefix):
+    if not re.fullmatch(rf'{expected_prefix}\d+', key):
         return jsonify({'error': f'Invalid key for {device_type}'}), 400
-    
+    if not _PVE_NODE_RE.fullmatch(node or ''):
+        return jsonify({'error': 'Invalid node name'}), 400
+
+    priv = None
     try:
         host, port = manager.host, manager.api_port
-        
-        # Delete by setting to empty/delete
         update_url = f"https://{host}:{port}/api2/json/nodes/{node}/qemu/{vmid}/config"
+        session = manager._create_session()
+        # MK Oct 2026 - PVE checks the removed value like a new one: a raw PCI/USB device
+        # goes away as root@pam only. A mapped one or a serial port needs nothing more.
+        if device_type in ('pci', 'usb'):
+            current = session.get(update_url, timeout=10)
+            value = (current.json().get('data') or {}).get(key) if current.status_code == 200 else None
+            if value and _passthrough_is_raw(device_type, value):
+                access = manager.pve_root_access()
+                if not access['root']:
+                    return _root_refusal(access, f'remove a raw {device_type.upper()} device')
+                session, priv, priv_err = _session_as_root(manager, access, f'raw {device_type.upper()} passthrough')
+                if priv_err:
+                    return jsonify({'error': priv_err, 'code': 'PVE_ROOT_LOGIN_FAILED'}), 502
+
+        # Delete by setting to empty/delete
         update_data = {'delete': key}
-        response = manager._create_session().put(update_url, data=update_data, timeout=15)
-        
+        response = session.put(update_url, data=update_data, timeout=15)
+
         if response.status_code == 200:
             user = getattr(request, 'session', {}).get('user', 'system')
             log_audit(user, f'vm.{device_type}_removed', f"VM {vmid}: Removed {key}", cluster=manager.config.name)
             return jsonify({'message': f'Device {key} removed'})
         else:
             return jsonify({'error': parse_pve_error(response.text)}), 500
-            
+
     except Exception as e:
         logging.error(f"Error removing passthrough device: {e}")
         return jsonify({'error': safe_error(e, 'Failed to remove passthrough device')}), 500
+    finally:
+        if priv is not None:
+            try: priv.close()
+            except Exception: pass
 
 
 def _parse_pci_config(config_str):
     """Parse PCI passthrough config string"""
-    result = {'device': None, 'options': {}}
+    result = {'device': None, 'mapping': None, 'options': {}}
     if not config_str:
         return result
-    
+
     parts = config_str.split(',')
-    result['device'] = parts[0]
-    
-    for part in parts[1:]:
+    # the device is the default key, so it may come bare or as host=; a mapped one
+    # names its mapping instead
+    first = parts[0]
+    if '=' not in first:
+        result['device'] = first
+        parts = parts[1:]
+
+    for part in parts:
         if '=' in part:
             key, value = part.split('=', 1)
-            result['options'][key] = value
-    
+            if key == 'host':
+                result['device'] = value
+            elif key == 'mapping':
+                result['mapping'] = value
+            else:
+                result['options'][key] = value
+
     return result
 
 
 def _parse_usb_config(config_str):
     """Parse USB passthrough config string"""
-    result = {'host': None, 'options': {}}
+    result = {'host': None, 'mapping': None, 'options': {}}
     if not config_str:
         return result
-    
+
     parts = config_str.split(',')
     for part in parts:
         if '=' in part:
             key, value = part.split('=', 1)
             if key == 'host':
                 result['host'] = value
+            elif key == 'mapping':
+                result['mapping'] = value
             else:
                 result['options'][key] = value
-    
+
     return result
+
+
+# MK Oct 2026 - passthrough through cluster resource mappings, and the changes PVE keeps
+# for root@pam. A raw hostpci/usb address passes check_hostpci_perm / check_usb_perm as
+# root@pam only, which an API token never is (the clusters most often connected here:
+# a token, or the one we minted at the first password login, #110). A mapping needs
+# Mapping.Use on /mapping/<kind>/<id> and VM.Config.HWType, a token can hold both.
+_PVE_NODE_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9.\-]{0,62}$')
+# pve-configid
+_MAPPING_ID_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9_\-]{1,63}$')
+# [domain:]bus:dev[.fn], several joined by ';' (pve-qm-hostpci)
+_PCI_ID_RE = re.compile(r'^(?:[0-9a-fA-F]{4,}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}(?:\.[0-7])?'
+                        r'(?:;(?:[0-9a-fA-F]{4,}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}(?:\.[0-7])?)*$')
+
+
+def _passthrough_is_raw(device_type, value):
+    """Whether a hostpci/usb value names a host device rather than a mapping. USB's
+    host=spice is no device of the host and open to everyone."""
+    if device_type == 'pci':
+        return not _parse_pci_config(value)['mapping']
+    parsed = _parse_usb_config(value)
+    return not parsed['mapping'] and (parsed['host'] or '').lower() != 'spice'
+
+
+def _root_refusal(access, what):
+    """403 for a change only root@pam may make on Proxmox, with why this connection is
+    not root@pam. The UI words it from code and reason."""
+    why = {
+        'token': 'This cluster is connected with an API token, and Proxmox accepts none for this.',
+        'not_root': 'This cluster is connected as a user other than root@pam.',
+        'no_password': 'No root@pam password is stored for this cluster.',
+    }.get(access.get('reason'), '')
+    return jsonify({'error': f'Proxmox lets only root@pam {what}. {why}'.strip(),
+                    'code': 'PVE_ROOT_REQUIRED', 'reason': access.get('reason')}), 403
+
+
+def _session_as_root(manager, access, what):
+    """(session, owned, error) for a root@pam change: the cluster session when it is
+    root@pam's own password login, else a session on a fresh root@pam ticket, which the
+    caller closes (owned)."""
+    if not access.get('fresh_ticket'):
+        return manager._create_session(), None, None
+    priv, err = manager.create_privileged_session(what)
+    return priv, priv, err
+
+
+def _property_fields(text):
+    """'node=pve1,path=0000:01:00.0,description="a, b"' -> dict. Values PVE quoted may
+    hold commas."""
+    out, key, buf, quoted, i = {}, None, [], False, 0
+    text = str(text or '')
+    while i <= len(text):
+        ch = text[i] if i < len(text) else ','
+        if quoted:
+            if ch == '\\' and i + 1 < len(text):
+                buf.append(text[i + 1])
+                i += 1
+            elif ch == '"':
+                quoted = False
+            else:
+                buf.append(ch)
+        elif ch == '"':
+            quoted = True
+        elif ch == '=' and key is None:
+            key, buf = ''.join(buf).strip(), []
+        elif ch == ',':
+            if key is not None:
+                out[key] = ''.join(buf).strip()
+            key, buf = None, []
+        else:
+            buf.append(ch)
+        i += 1
+    return out
+
+
+def _read_mappings(manager, kind, check_node=None):
+    """The cluster's PCI or USB resource mappings, as ([...], None) or (None, error).
+
+    Each with the nodes it has a device on: a guest that uses it starts and migrates
+    there only. check_node asks PVE to check that node's devices against the mapping
+    (it answers from that node); a node that does not answer gets the plain list. One
+    request, two when the node is down - on opening the dialog, never in a loop."""
+    base = f"https://{manager.host}:{manager.api_port}/api2/json/cluster/mapping/{kind}"
+    session = manager._create_session()
+    resp = None
+    if check_node:
+        try:
+            resp = session.get(base, params={'check-node': check_node}, timeout=6)
+        except Exception:
+            resp = None
+        if resp is not None and resp.status_code != 200:
+            resp = None
+    if resp is None:
+        resp = session.get(base, timeout=10)
+    if resp.status_code != 200:
+        return None, f'Could not read the {kind.upper()} resource mappings: {parse_pve_error(resp.text)}'
+    out = []
+    for row in resp.json().get('data') or []:
+        if not isinstance(row, dict) or not row.get('id'):
+            continue
+        entries = []
+        for item in row.get('map') or []:
+            f = _property_fields(item)
+            entries.append({'node': f.get('node', ''), 'path': f.get('path', ''),
+                            'id': f.get('id', ''), 'description': f.get('description', '')})
+        nodes = sorted({e['node'] for e in entries if e['node']})
+        checks = [{'severity': c.get('severity', ''), 'message': str(c.get('message', ''))[:300]}
+                  for c in (row.get('checks') or []) if isinstance(c, dict)]
+        out.append({'id': str(row['id']), 'description': str(row.get('description') or ''),
+                    'nodes': nodes, 'entries': entries,
+                    'on_node': (check_node in nodes) if check_node else None,
+                    'mdev': bool(row.get('mdev')),
+                    'live_migration': bool(row.get('live-migration-capable')),
+                    'checks': checks})
+    out.sort(key=lambda m: m['id'].lower())
+    return out, None
+
+
+@bp.route('/api/clusters/<cluster_id>/vms/<node>/qemu/<int:vmid>/passthrough/mappings', methods=['GET'])
+@require_auth(perms=['vm.config'])
+def get_vm_passthrough_mappings(cluster_id, node, vmid):
+    """The PCI or USB resource mappings a VM can be given (?kind=pci|usb), the nodes each covers, and whether this connection may attach raw devices"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    denied = _require_vm_access(cluster_id, vmid, 'vm.config', 'qemu')
+    if denied: return denied
+    kind = request.args.get('kind', 'pci')
+    if kind not in ('pci', 'usb'):
+        return jsonify({'error': 'kind is pci or usb'}), 400
+    if not _PVE_NODE_RE.fullmatch(node or ''):
+        return jsonify({'error': 'Invalid node name'}), 400
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    if getattr(manager, 'cluster_type', 'proxmox') != 'proxmox':
+        return jsonify({'error': 'Resource mappings are a Proxmox VE feature'}), 400
+    try:
+        mappings, read_err = _read_mappings(manager, kind, check_node=node)
+        if mappings is None:
+            return jsonify({'error': read_err}), 502
+        access = manager.pve_root_access()
+        return jsonify({'kind': kind, 'node': node, 'mappings': mappings,
+                        'raw_allowed': access['root'], 'access': access})
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Failed to read resource mappings')}), 500
+
+
+# MK Oct 2026 - LXC feature flags after creation. pve-container keeps every flag of a
+# privileged container, and every flag but nesting of an unprivileged one, for root@pam
+# (check_ct_modify_config_perm); nesting alone wants VM.Allocate. It compares the new
+# string with the current one value by value, so a flag nobody touched keeps its exact
+# text here. Flags this editor does not know (force_rw_sys, other mount types) stay.
+_LXC_FEATURE_FLAGS = ('nesting', 'keyctl', 'fuse', 'mknod')
+_LXC_FEATURE_MOUNTS = ('nfs', 'cifs')
+
+
+def _parse_lxc_features(value):
+    """'nesting=1,mount=nfs;cifs' -> {'nesting': '1', 'mount': 'nfs;cifs'}, in order"""
+    out = {}
+    for part in str(value or '').split(','):
+        k, sep, v = part.strip().partition('=')
+        if k.strip():
+            out[k.strip()] = v.strip() if sep else ''
+    return out
+
+
+def _feature_on(value):
+    return str(value or '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _mount_types(value):
+    return [m for m in re.split(r'[;\s]+', str(value or '')) if m]
+
+
+def _lxc_feature_view(parsed):
+    flags = {f: _feature_on(parsed.get(f)) for f in _LXC_FEATURE_FLAGS}
+    types = _mount_types(parsed.get('mount'))
+    flags['mount'] = {m: m in types for m in _LXC_FEATURE_MOUNTS}
+    kept = [f'{k}={v}' if v != '' else k for k, v in parsed.items()
+            if k not in _LXC_FEATURE_FLAGS and k != 'mount']
+    kept += [f'mount={m}' for m in types if m not in _LXC_FEATURE_MOUNTS]
+    return flags, kept
+
+
+def _lxc_features_after(base, wanted):
+    """The features dict after `wanted` ({flag: bool, 'mount': {fstype: bool}}) on top of
+    `base`. Only what changes is rewritten."""
+    new = dict(base)
+    for flag in _LXC_FEATURE_FLAGS:
+        if flag in wanted and _feature_on(base.get(flag)) != wanted[flag]:
+            if wanted[flag]:
+                new[flag] = '1'
+            else:
+                new.pop(flag, None)
+    if 'mount' in wanted:
+        types = _mount_types(base.get('mount'))
+        after = list(types)
+        for fstype in _LXC_FEATURE_MOUNTS:
+            if fstype in wanted['mount'] and (fstype in after) != wanted['mount'][fstype]:
+                after = after + [fstype] if wanted['mount'][fstype] else [t for t in after if t != fstype]
+        if after != types:
+            if after:
+                new['mount'] = ';'.join(after)
+            else:
+                new.pop('mount', None)
+    return new
+
+
+def _format_lxc_features(parsed):
+    return ','.join(f'{k}={v}' if v != '' else k for k, v in parsed.items())
+
+
+def _lxc_pending(manager, node, vmid):
+    """{key: {'value', 'pending', 'delete'}} of a container: the running config and what
+    waits for its next start, in one request."""
+    url = f"https://{manager.host}:{manager.api_port}/api2/json/nodes/{node}/lxc/{vmid}/pending"
+    resp = manager._create_session().get(url, timeout=10)
+    if resp.status_code != 200:
+        return None, resp
+    rows = {}
+    for item in resp.json().get('data') or []:
+        if isinstance(item, dict) and item.get('key'):
+            rows[item['key']] = item
+    return rows, resp
+
+
+def _lxc_feature_state(rows):
+    """current: what runs now. effective: what the container gets at its next start."""
+    item = rows.get('features') or {}
+    current = str(item.get('value') or '')
+    if 'pending' in item:
+        effective = str(item.get('pending') or '')
+    elif item.get('delete'):
+        effective = ''
+    else:
+        effective = current
+    # PVE asks the running value too; it cannot change after creation anyway
+    unprivileged = _feature_on((rows.get('unprivileged') or {}).get('value'))
+    digest = str((rows.get('digest') or {}).get('value') or '')
+    return current, effective, unprivileged, digest
+
+
+def _lxc_features_manager(cluster_id, node):
+    if not _PVE_NODE_RE.fullmatch(node or ''):
+        return None, (jsonify({'error': 'Invalid node name'}), 400)
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return None, error
+    if getattr(manager, 'cluster_type', 'proxmox') != 'proxmox':
+        return None, (jsonify({'error': 'Container features are a Proxmox VE setting'}), 400)
+    return manager, None
+
+
+@bp.route('/api/clusters/<cluster_id>/vms/<node>/lxc/<int:vmid>/features', methods=['GET'])
+@require_auth(perms=['vm.view'])
+def get_lxc_features(cluster_id, node, vmid):
+    """The feature flags of a container (nesting, keyctl, fuse, mknod, NFS/CIFS mounts), what waits for its next start, and whether this cluster connection may change them"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    denied = _require_vm_access(cluster_id, vmid, 'vm.view', 'lxc')
+    if denied:
+        return denied
+    manager, err = _lxc_features_manager(cluster_id, node)
+    if err:
+        return err
+    try:
+        rows, resp = _lxc_pending(manager, node, vmid)
+        if rows is None:
+            return jsonify({'error': parse_pve_error(resp.text, 'Could not read the container config')}), 502
+        current, effective, unprivileged, _digest = _lxc_feature_state(rows)
+        flags, kept = _lxc_feature_view(_parse_lxc_features(effective))
+        running_flags, _ = _lxc_feature_view(_parse_lxc_features(current))
+        return jsonify({'features': flags, 'current': running_flags, 'kept': kept,
+                        'raw': effective, 'pending': effective != current,
+                        'unprivileged': unprivileged, 'access': manager.pve_root_access()})
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Failed to read container features')}), 500
+
+
+@bp.route('/api/clusters/<cluster_id>/vms/<node>/lxc/<int:vmid>/features', methods=['PUT'])
+@require_auth(perms=['vm.config'])
+def set_lxc_features(cluster_id, node, vmid):
+    """Change the feature flags of a container: {nesting, keyctl, fuse, mknod: bool, mount: {nfs, cifs: bool}}, each optional. A running container gets them at its next start."""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    denied = _require_vm_access(cluster_id, vmid, 'vm.config', 'lxc')
+    if denied:
+        return denied
+    manager, err = _lxc_features_manager(cluster_id, node)
+    if err:
+        return err
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': 'JSON object expected'}), 400
+    wanted = {}
+    for key, value in data.items():
+        if key in _LXC_FEATURE_FLAGS and isinstance(value, bool):
+            wanted[key] = value
+        elif key == 'mount' and isinstance(value, dict) and all(
+                k in _LXC_FEATURE_MOUNTS and isinstance(v, bool) for k, v in value.items()):
+            wanted['mount'] = dict(value)
+        else:
+            return jsonify({'error': f'Unknown or invalid feature: {str(key)[:40]}'}), 400
+
+    priv = None
+    try:
+        rows, resp = _lxc_pending(manager, node, vmid)
+        if rows is None:
+            return jsonify({'error': parse_pve_error(resp.text, 'Could not read the container config')}), 502
+        current, effective, unprivileged, digest = _lxc_feature_state(rows)
+        old = _parse_lxc_features(current)
+        base = _parse_lxc_features(effective)
+        new = _lxc_features_after(base, wanted)
+        new_text = _format_lxc_features(new)
+        if new == base:
+            return jsonify({'success': True, 'changed': False, 'features': effective,
+                            'pending': effective != current})
+        # what PVE will compare: the running value against the one sent
+        changed = sorted(k for k in set(old) | set(new) if old.get(k, '') != new.get(k, ''))
+        needs_root = bool(changed) and (not unprivileged or any(k != 'nesting' for k in changed))
+        access = manager.pve_root_access()
+        session = manager._create_session()
+        if needs_root:
+            if not access['root']:
+                what = ('change the feature flags of a privileged container' if not unprivileged
+                        else 'change feature flags other than nesting')
+                return _root_refusal(access, what)
+            session, priv, priv_err = _session_as_root(manager, access, 'LXC feature flags')
+            if priv_err:
+                return jsonify({'error': priv_err, 'code': 'PVE_ROOT_LOGIN_FAILED'}), 502
+        body = {'features': new_text} if new_text else {'delete': 'features'}
+        if digest:
+            body['digest'] = digest
+        url = f"https://{manager.host}:{manager.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
+        put = session.put(url, data=body, timeout=15)
+        if put.status_code != 200:
+            return jsonify({'error': parse_pve_error(put.text, 'Proxmox refused the change')}), 502
+        user = getattr(request, 'session', {}).get('user', 'system')
+        via = ' (through a root@pam login)' if needs_root and access.get('fresh_ticket') else ''
+        log_audit(user, 'vm.features_changed',
+                  f"CT {vmid}: features '{effective or '-'}' -> '{new_text or '-'}'{via}",
+                  cluster=manager.config.name)
+        # read back what PVE stored: a running container keeps it pending until it starts again
+        pending = None
+        try:
+            after, _r = _lxc_pending(manager, node, vmid)
+            if after is not None:
+                now_current, now_effective, _u, _d = _lxc_feature_state(after)
+                pending = now_effective != now_current
+        except Exception:
+            pending = None
+        return jsonify({'success': True, 'changed': True, 'features': new_text,
+                        'pending': pending, 'root_login': bool(needs_root and access.get('fresh_ticket'))})
+    except Exception as e:
+        logging.error(f"Error changing container features: {e}")
+        return jsonify({'error': safe_error(e, 'Failed to change container features')}), 500
+    finally:
+        if priv is not None:
+            try: priv.close()
+            except Exception: pass
 
 
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/resize', methods=['PUT'])

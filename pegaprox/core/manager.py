@@ -14337,7 +14337,7 @@ echo "AGENT_INSTALLED_OK"
                             f"{len(candidates)} host(s): {type(last).__name__ if last else 'no candidates'}")
         return (None, None) if with_csrf else None
 
-    def create_privileged_session(self):
+    def create_privileged_session(self, what='OSD create/destroy'):
         """Return a requests.Session authenticated with a FRESH password-based
         root@pam ticket (+CSRFPreventionToken), for the handful of PVE
         operations that reject API tokens and demand the real root@pam user —
@@ -14351,6 +14351,11 @@ echo "AGENT_INSTALLED_OK"
         NS 2026-07-17: mirrors mint_console_auth_ticket()'s ticket mint but also
         carries the CSRF token so the session can POST/DELETE. Caller must
         .close() the returned session.
+
+        MK Oct 2026: `what` names the operation in the refusals, LXC feature flags
+        and raw passthrough devices come through here as well. A root@pam with
+        two-factor login gets a partial ticket only, which is said now rather than
+        failing the call that follows.
         """
         usr = getattr(self.config, 'user', None) or 'root@pam'
         # NS 2026-07-17 (adversarial review): an inline-token cluster stores
@@ -14362,17 +14367,17 @@ echo "AGENT_INSTALLED_OK"
         # a valid ticket. Reject both cases up front with a clear message.
         if '!' in usr:
             return None, ('This cluster authenticates with an API token and has no '
-                          'root@pam password stored. Proxmox forbids OSD create/destroy '
-                          'over an API token — reconfigure the cluster with the root@pam '
+                          f'root@pam password stored. Proxmox forbids {what} '
+                          'over an API token - reconfigure the cluster with the root@pam '
                           'password to enable it.')
         if usr != 'root@pam':
-            return None, (f'Proxmox restricts OSD create/destroy to root@pam, but this '
+            return None, (f'Proxmox restricts {what} to root@pam, but this '
                           f'cluster authenticates as "{usr}". Configure root@pam '
                           f'credentials to enable it.')
         pwd = getattr(self.config, 'pass_', None) or getattr(self.config, 'password', None)
         if not pwd:
             return None, ('This operation requires the cluster root@pam password '
-                          '(Proxmox rejects API tokens for OSD create/destroy). '
+                          f'(Proxmox rejects API tokens for {what}). '
                           'Add the password in the cluster settings.')
         s = None
         try:
@@ -14395,6 +14400,11 @@ echo "AGENT_INSTALLED_OK"
                 except Exception: pass
                 return None, f'root@pam password authentication failed (HTTP {resp.status_code})'
             data = resp.json()['data']
+            if data.get('NeedTFA'):
+                try: s.close()
+                except Exception: pass
+                return None, ('root@pam has two-factor authentication enabled, so a password '
+                              f'login cannot open the session Proxmox wants for {what}.')
             s.cookies.set('PVEAuthCookie', data['ticket'])
             s.headers.update({'CSRFPreventionToken': data['CSRFPreventionToken']})
             return s, None
@@ -14404,6 +14414,33 @@ echo "AGENT_INSTALLED_OK"
                 except Exception: pass
             self.logger.warning(f"[CEPH] privileged-session mint failed: {type(e).__name__}")
             return None, f'Could not mint root@pam session: {type(e).__name__}'
+
+    def pve_root_access(self):
+        """What this connection may do of the changes Proxmox keeps for root@pam (most LXC
+        feature flags, raw PCI/USB devices on a VM). PVE compares the signed-in user with
+        'root@pam' as text, so an API token never passes, not even one of root's.
+
+        root: the change can be made from here. fresh_ticket: through a root@pam password
+        login of its own, because the cluster talks to the API with the token we minted
+        (#110). reason, when root is false: 'token' (added with a token, no password),
+        'not_root' (another user) or 'no_password'. Reads the config only, no request.
+        MK Oct 2026
+        """
+        usr = getattr(self.config, 'user', '') or ''
+        token = '!' in usr or bool(getattr(self, '_api_token', None))
+        out = {'via': 'token' if token else 'password', 'root': False,
+               'fresh_ticket': False, 'reason': None}
+        if '!' in usr:
+            out['reason'] = 'token'
+        elif usr != 'root@pam':
+            out['reason'] = 'not_root'
+        elif not token:
+            out['root'] = True
+        elif getattr(self.config, 'pass_', None) or getattr(self.config, 'password', None):
+            out['root'] = out['fresh_ticket'] = True
+        else:
+            out['reason'] = 'no_password'
+        return out
 
     def get_vnc_ticket(self, node: str, vmid: int, vm_type: str) -> Dict[str, Any]:
 

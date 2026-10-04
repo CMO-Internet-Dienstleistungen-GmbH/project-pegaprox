@@ -3321,6 +3321,62 @@
         ]
       }
     },
+    "/api/clusters/{cluster_id}/connection-check": {
+      "post": {
+        "operationId": "clusters.check_cluster_connection_post",
+        "tags": [
+          "clusters"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Read-only connection check of one Proxmox VE cluster, on demand (core/conncheck.py).",
+        "description": "MK Oct 2026 - API addresses with timing and certificate, the credential and the\nprivileges it carries, versions, clocks, quorum and SSH per node. POST because it\nlogs in to the nodes over SSH (once each, only where a credential applies), which\nan admin should ask for; {\"ssh\": false} leaves that part out. A standby forwards it\nto the active or refuses it like any other write (app.py), so the check always\nruns where the clusters are acted on.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "cluster.config"
+        ]
+      }
+    },
     "/api/clusters/{cluster_id}": {
       "delete": {
         "operationId": "clusters.delete_cluster_delete",
@@ -11165,7 +11221,7 @@
             "description": "Insufficient permissions"
           }
         },
-        "summary": "Add a PCI device passthrough to a VM",
+        "summary": "Add a PCI device passthrough to a VM: a cluster resource mapping (mapping) or a raw device (device_id)",
         "parameters": [
           {
             "name": "cluster_id",
@@ -11236,7 +11292,7 @@
             "description": "Insufficient permissions"
           }
         },
-        "summary": "Add a USB device passthrough to a VM",
+        "summary": "Add a USB device passthrough to a VM: a cluster resource mapping (mapping), vendorid+productid or hostbus+hostport",
         "parameters": [
           {
             "name": "cluster_id",
@@ -11421,6 +11477,197 @@
             }
           }
         ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "vm.config"
+        ]
+      }
+    },
+    "/api/clusters/{cluster_id}/vms/{node}/qemu/{vmid}/passthrough/mappings": {
+      "get": {
+        "operationId": "vms.get_vm_passthrough_mappings_get",
+        "tags": [
+          "vms"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "The PCI or USB resource mappings a VM can be given (?kind=pci|usb), the nodes each covers, and whether this connection may attach raw devices",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "node",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "vmid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "vm.config"
+        ]
+      }
+    },
+    "/api/clusters/{cluster_id}/vms/{node}/lxc/{vmid}/features": {
+      "get": {
+        "operationId": "vms.get_lxc_features_get",
+        "tags": [
+          "vms"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "The feature flags of a container (nesting, keyctl, fuse, mknod, NFS/CIFS mounts), what waits for its next start, and whether this cluster connection may change them",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "node",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "vmid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "vm.view"
+        ]
+      },
+      "put": {
+        "operationId": "vms.set_lxc_features_put",
+        "tags": [
+          "vms"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Change the feature flags of a container: {nesting, keyctl, fuse, mknod: bool, mount: {nfs, cifs: bool}}, each optional. A running container gets them at its next start.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "node",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "vmid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
         "x-pegaprox-auth": "decorator",
         "security": [
           {
