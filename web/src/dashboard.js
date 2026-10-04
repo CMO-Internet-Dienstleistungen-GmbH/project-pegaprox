@@ -18579,7 +18579,7 @@
                                                                                     <Icons.BellOff className="w-4 h-4" />
                                                                                 </button>
                                                                             )}
-                                                                            {!a.acked_at && (
+                                                                            {!a.acked_at && !haReadOnly && (
                                                                                 <button onClick={() => ackAlert(a.id)} className="px-3 py-1.5 text-xs bg-proxmox-dark hover:bg-proxmox-hover border border-proxmox-border rounded-lg shrink-0">
                                                                                     {t('acknowledge') || 'Acknowledge'}
                                                                                 </button>
@@ -18638,6 +18638,9 @@
                                                                         </div>
                                                                         {!haReadOnly && (
                                                                         <div className="flex items-center gap-1">
+                                                                            <button onClick={() => openEditAlert(alert)} title={t('editAlert') || 'Edit Alert'} className="p-1.5 hover:bg-proxmox-hover rounded text-gray-500 hover:text-proxmox-orange">
+                                                                                <Icons.Edit className="w-4 h-4" />
+                                                                            </button>
                                                                             {ruleMute(alert.id) ? (
                                                                                 <button onClick={() => unmuteAlert(ruleMute(alert.id).id)} title={t('alertUnmute')} className="p-1.5 hover:bg-proxmox-hover rounded text-proxmox-orange">
                                                                                     <Icons.BellOff className="w-4 h-4" />
@@ -18647,9 +18650,6 @@
                                                                                     <Icons.BellOff className="w-4 h-4" />
                                                                                 </button>
                                                                             )}
-                                                                            <button onClick={() => openEditAlert(alert)} title={t('editAlert') || 'Edit Alert'} className="p-1.5 hover:bg-proxmox-hover rounded text-gray-500 hover:text-proxmox-orange">
-                                                                                <Icons.Edit className="w-4 h-4" />
-                                                                            </button>
                                                                             <button onClick={() => deleteClusterAlert(alert.id)} title={t('delete') || 'Delete'} className="p-1.5 hover:bg-red-500/20 rounded text-gray-500 hover:text-red-400">
                                                                                 <Icons.Trash className="w-4 h-4" />
                                                                             </button>
