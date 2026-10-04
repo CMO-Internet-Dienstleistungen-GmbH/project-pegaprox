@@ -512,13 +512,15 @@ def read_node_bmc_inband(mgr, node, timeout=15):
         # the probe only reads, so the transport guard of an automatic leader lets it
         # through without a confirmed step (#625)
         from pegaprox.core import ha
+        from pegaprox.utils.ssh import ssh_password_for
         with ha.reading():
             if ssh_key:
                 raw = mgr._ssh_run_command_with_key_output(ip, user, INBAND_PROBE_CMD, ssh_key, timeout=timeout)
             if not _has_output(raw):
                 raw = mgr._ssh_run_command_output(ip, user, INBAND_PROBE_CMD, timeout=timeout)
             if not _has_output(raw):
-                ssh_pass = getattr(mgr.config, 'pass_', '') or ''
+                # not config.pass_ - on a token cluster that is the token secret
+                ssh_pass = ssh_password_for(mgr.config)
                 if ssh_pass:
                     raw = mgr._ssh_run_command_with_password_output(ip, user, INBAND_PROBE_CMD, ssh_pass, timeout=timeout)
         if not _has_output(raw):

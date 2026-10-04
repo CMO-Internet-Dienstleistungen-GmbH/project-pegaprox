@@ -41,6 +41,8 @@ def _mgr(api, **methods):
     # attribute is truthy, which would send read_node_bmc_inband down the key-auth branch instead
     # of the agent path (_ssh_run_command_output) these tests stub + assert. Model "no key set".
     m.config.ssh_key = ''
+    # same for ssh_disabled: unset it reads as "SSH switched off" and no password is offered
+    m.config.ssh_disabled = False
     return m
 
 

@@ -400,6 +400,43 @@ def _ssh_exec(host, user, password, cmd, timeout=30, use_controlmaster=False,
         return 1, '', f'All SSH methods failed: {last_err}; subprocess: {sub_err}'
 
 
+def ssh_password_for(config):
+    """The password an SSH login to this PVE cluster's nodes may offer - '' for none.
+
+    MK Oct 2026 - pass_ is only an SSH password when config.user is an account. With a
+    token id typed as the username ('user@realm!tokenid') it is the token SECRET, and
+    every ladder that went key -> BatchMode -> sshpass handed it to sshd whenever the
+    key was refused (#717 class). ssh_blocked_reason did not catch that: a stored key
+    is enough for it to say go. The marker is '!' in user, not _using_api_token - a
+    token we minted ourselves (#110) leaves pass_ the account password. The marker holds
+    only while user and pass_ change together, which is why the cluster edit routes do
+    not take 'user' on its own.
+    Use this (or PegaProxManager.ssh_password_to_offer) for every password step,
+    never config.pass_ directly.
+    """
+    if bool(getattr(config, 'ssh_disabled', False)):
+        return ''
+    if '!' in (getattr(config, 'user', '') or ''):
+        return ''
+    return getattr(config, 'pass_', '') or ''
+
+
+def ssh_blocked_for(mgr):
+    """Why SSH to this manager's nodes must not happen - a code, or None.
+
+    For the routes that build their own paramiko client from config.ssh_key: blanking the
+    password was not enough there, the key still logged in with SSH switched off (#941).
+    Managers without ssh_blocked_reason (XCP-ng) answer by the switch alone.
+    """
+    probe = getattr(mgr, 'ssh_blocked_reason', None)
+    if callable(probe):
+        reason = probe()
+        return reason if isinstance(reason, str) else None
+    if bool(getattr(getattr(mgr, 'config', None), 'ssh_disabled', False)):
+        return 'SSH_DISABLED'
+    return None
+
+
 _node_ip_cache = {}  # (cluster_id, node) -> (ip, timestamp)
 
 def _pve_node_exec(pve_mgr, node, cmd, timeout=600, use_controlmaster=True,
@@ -525,7 +562,7 @@ def _pve_node_exec(pve_mgr, node, cmd, timeout=600, use_controlmaster=True,
         # token WE minted (#110) keeps its password, and blanking it here took node
         # commands away from the most common configuration we have.
         _token_auth = '!' in (getattr(pve_mgr.config, 'user', '') or '')
-        _ssh_pass = '' if _token_auth else (getattr(pve_mgr.config, 'pass_', '') or '')
+        _ssh_pass = ssh_password_for(pve_mgr.config)
         if not _ssh_pass:
             # Say which of the three it actually is. The first version of this asserted a
             # stored key in every case, but the branch is also reached on a cluster with no

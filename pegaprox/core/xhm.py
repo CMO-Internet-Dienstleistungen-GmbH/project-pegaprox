@@ -16,7 +16,7 @@ from datetime import datetime
 
 from pegaprox.globals import cluster_managers, _xhm_migrations
 from pegaprox.core import ha_transport
-from pegaprox.utils.ssh import _ssh_exec, _pve_node_exec
+from pegaprox.utils.ssh import _ssh_exec, _pve_node_exec, ssh_password_for
 from pegaprox.utils.realtime import broadcast_sse
 from pegaprox.utils.audit import log_audit
 
@@ -721,7 +721,7 @@ def _run_xcpng_to_pve(task):
                     return
 
                 pve_user = getattr(tgt_mgr.config, 'ssh_user', '') or 'root'
-                pve_pass = getattr(tgt_mgr.config, 'pass_', '')
+                pve_pass = ssh_password_for(tgt_mgr.config)
                 pve_key = getattr(tgt_mgr.config, 'ssh_key', '')
                 pve_port = int(getattr(tgt_mgr.config, 'ssh_port', 22))
 
@@ -1234,7 +1234,7 @@ def _run_pve_to_xcpng(task):
             # SSH into PVE, stream disk -> PegaProx -> HTTP PUT to XCP-ng
             try:
                 pve_user = getattr(src_mgr.config, 'ssh_user', '') or 'root'
-                pve_pass = getattr(src_mgr.config, 'pass_', '')
+                pve_pass = ssh_password_for(src_mgr.config)
                 pve_key = getattr(src_mgr.config, 'ssh_key', '')
                 pve_port = int(getattr(src_mgr.config, 'ssh_port', 22))
 
@@ -1583,6 +1583,10 @@ def _connect_ssh(host, user, password, key_path=None, port=22):
         except Exception as e:
             logger.debug(f"[SSH] key auth failed for {user}@{host}: {e}")
 
+    # '' from ssh_password_for (a token cluster, SSH off): offer sshd nothing at all
+    if not password:
+        raise Exception(f"no SSH password to offer {user}@{host} and no key that worked")
+
     # keyboard-interactive via Transport (some hosts require this)
     try:
         transport = paramiko.Transport((host, port))
@@ -1854,7 +1858,7 @@ def _run_esxi_to_pve(task):
         esxi_user = getattr(src_mgr.config, 'ssh_user', 'root')
         esxi_pass = getattr(src_mgr.config, 'pass_', '')
         pve_user = getattr(tgt_mgr.config, 'ssh_user', '') or 'root'
-        pve_pass = getattr(tgt_mgr.config, 'pass_', '')
+        pve_pass = ssh_password_for(tgt_mgr.config)
         pve_key = getattr(tgt_mgr.config, 'ssh_key', '')
         pve_port = int(getattr(tgt_mgr.config, 'ssh_port', 22))
 

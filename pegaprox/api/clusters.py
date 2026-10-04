@@ -1434,8 +1434,11 @@ def get_cluster_resources(cluster_id):
 # whole: cluster.config (an API token too) could switch the cluster claim and the unsafe
 # two-node recovery on past their own routes, and the same request dropped the agent
 # token and what the agent installs had recorded. The HA routes write those settings.
+# 'user' is out too: it is half of the credential. Editing it alone turned a token cluster
+# ('user@realm!tokenid' + the token secret in pass_) into an account cluster whose SSH
+# password was that secret, offered to every node. /reconfigure changes both together.
 ALLOWED_CONFIG_FIELDS = {
-    'name', 'host', 'user', 'ssl_verification', 'migration_threshold', 'migration_tolerance',
+    'name', 'host', 'ssl_verification', 'migration_threshold', 'migration_tolerance',
     'check_interval', 'auto_migrate', 'balance_containers', 'balance_local_disks',
     'dry_run', 'enabled', 'ha_enabled', 'fallback_hosts', 'ssh_user', 'ssh_port',
     'excluded_nodes',

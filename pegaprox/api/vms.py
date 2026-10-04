@@ -46,7 +46,7 @@ from pegaprox.api.helpers import evacuation_options, evacuation_options_said
 from pegaprox.api.ha import standby_console_refusal, STANDBY_CONSOLE_ERROR
 from pegaprox.core import ha, ha_transport
 from pegaprox.background import guest_index
-from pegaprox.utils.ssh import get_paramiko
+from pegaprox.utils.ssh import get_paramiko, ssh_password_for, ssh_blocked_for
 from pegaprox.utils.sanitization import sanitize_int, validate_snapshot_name
 from urllib.parse import urlencode, quote as url_quote
 import signal
@@ -3440,6 +3440,14 @@ def remove_node_from_cluster(cluster_id, node_name):
     
     if not data.get('confirm'):
         return jsonify({'success': False, 'error': 'Confirmation required'}), 400
+
+    # #941 - pvecm delnode goes over SSH, and with SSH switched off the stored key used
+    # to log in here all the same
+    _blocked = ssh_blocked_for(mgr)
+    if _blocked:
+        return jsonify({'success': False, 'code': _blocked,
+                        'error': 'Removing a node runs pvecm delnode over SSH, which is not '
+                                 'available for this cluster'}), 409
     
     # LW: Feb 2026 - Maintenance is recommended but not strictly required
     # pvecm delnode runs on another node, not on the target
@@ -3454,7 +3462,7 @@ def remove_node_from_cluster(cluster_id, node_name):
         if not ssh_user:
             api_user = cluster_config.user
             ssh_user = (api_user or 'root').split('@')[0]  # PR #62 (ry-ops): null-safe
-        ssh_password = getattr(cluster_config, 'pass_', '') or ''
+        ssh_password = ssh_password_for(cluster_config)
         ssh_key_content = getattr(cluster_config, 'ssh_key', '') or ''
         
         # Find an online node to execute the removal from
@@ -4515,6 +4523,13 @@ _VM_SCREENSHOT_TTL = 60.0
 _VM_SCREENSHOT_FAIL_TTL = 120.0
 
 
+def _vnc_tunnel_wanted(mgr):
+    """vnc_tunnel is set and SSH to the nodes may go out. The tunnel is an SSH login like
+    any other - with SSH switched off (#941) it logged in with the stored key regardless,
+    from every tile poll. Without it the console goes direct, as when the tunnel fails."""
+    return bool(getattr(mgr.config, 'vnc_tunnel', False)) and not ssh_blocked_for(mgr)
+
+
 # NS Jun 2026 — RFB fallback for the console tile. screendump (qm monitor) is the
 # primary grab, but it comes back empty/black for some guests — the big one being
 # Windows on the virtio-gpu / QXL driver, where the HMP dump just doesn't render.
@@ -4578,7 +4593,7 @@ def _screenshot_via_rfb(mgr, node, vm_type, vmid, max_width=480, timeout=10):
     tunnel_endpoint = None
     target_host, target_port = host, _api_port
     try:
-        if bool(getattr(mgr.config, 'vnc_tunnel', False)):
+        if _vnc_tunnel_wanted(mgr):
             from pegaprox.utils import vnc_tunnel as _vt
             _ssh_user = getattr(mgr.config, 'ssh_user', None) or (mgr.config.user or 'root').split('@')[0]
             _ssh_port = getattr(mgr.config, 'ssh_port', 22) or 22
@@ -4586,7 +4601,7 @@ def _screenshot_via_rfb(mgr, node, vm_type, vmid, max_width=480, timeout=10):
                 cluster_id=getattr(mgr, 'id', ''), pve_host=host,
                 ssh_user=_ssh_user, ssh_port=_ssh_port,
                 ssh_key_content=getattr(mgr.config, 'ssh_key', '') or '',
-                ssh_password=getattr(mgr.config, 'pass_', '') or '',
+                ssh_password=ssh_password_for(mgr.config),
                 target_host='127.0.0.1', target_port=_api_port,
             )
             target_host, target_port = '127.0.0.1', tunnel_endpoint.local_port
@@ -4804,7 +4819,7 @@ def vnc_poll(cluster_id, node, vm_type, vmid):
         target_host = host
         target_port = port          # MK Sep 2026 (#956): the cluster's API port
         try:
-            if bool(getattr(mgr.config, 'vnc_tunnel', False)):
+            if _vnc_tunnel_wanted(mgr):
                 from pegaprox.utils import vnc_tunnel as _vt
                 _ssh_user = getattr(mgr.config, 'ssh_user', None) or (mgr.config.user or 'root').split('@')[0]
                 _ssh_port = getattr(mgr.config, 'ssh_port', 22) or 22
@@ -4812,7 +4827,7 @@ def vnc_poll(cluster_id, node, vm_type, vmid):
                     cluster_id=cluster_id, pve_host=host,
                     ssh_user=_ssh_user, ssh_port=_ssh_port,
                     ssh_key_content=getattr(mgr.config, 'ssh_key', '') or '',
-                    ssh_password=getattr(mgr.config, 'pass_', '') or '',
+                    ssh_password=ssh_password_for(mgr.config),
                     target_host='127.0.0.1', target_port=port,
                 )
                 target_host = '127.0.0.1'
@@ -10131,7 +10146,7 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
             # cluster reachable on a forwarded port worked everywhere except here.
             tunnel_target_port = port
             try:
-                _use_tunnel = bool(getattr(manager.config, 'vnc_tunnel', False))
+                _use_tunnel = _vnc_tunnel_wanted(manager)
             except Exception:
                 _use_tunnel = False
 
@@ -10141,7 +10156,7 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                     _ssh_user = getattr(manager.config, 'ssh_user', None) or (manager.config.user or 'root').split('@')[0]
                     _ssh_port = getattr(manager.config, 'ssh_port', 22) or 22
                     _ssh_key = getattr(manager.config, 'ssh_key', '') or ''
-                    _ssh_pass = getattr(manager.config, 'pass_', '') or ''
+                    _ssh_pass = ssh_password_for(manager.config)
                     # MK Apr 2026 — _vt.acquire() is sync. On the *first* call for a
                     # cluster it builds the SSH transport (~1-2s on a fast LAN, more
                     # over WAN). If we ran it directly on the event loop, that 1-2s

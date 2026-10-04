@@ -51,7 +51,7 @@ from pegaprox.globals import (
 from pegaprox.models.tasks import MaintenanceTask, PegaProxConfig
 from pegaprox.core.config import save_config
 from pegaprox.utils.realtime import broadcast_sse, is_cluster_watched
-from pegaprox.utils.ssh import get_ssh_connection_stats, _ssh_track_connection
+from pegaprox.utils.ssh import get_ssh_connection_stats, _ssh_track_connection, ssh_password_for
 from pegaprox.utils.concurrent import GEVENT_PATCHED
 from pegaprox.core.db import get_db
 from pegaprox.core import ha  # PegaProx's own warm standby (#625), not PVE HA
@@ -4826,12 +4826,13 @@ class PegaProxManager:
 
             ok = False
             ssh_key = getattr(self.config, 'ssh_key', '')
+            ssh_password = self.ssh_password_to_offer()
             if ssh_key:
                 ok = self._ssh_run_command_with_key(node_ip, ssh_user, cmd, ssh_key)
             if not ok:
                 ok = self._ssh_run_command(node_ip, ssh_user, cmd)
-            if not ok and self.config.pass_:
-                ok = self._ssh_run_command_with_password(node_ip, ssh_user, cmd, self.config.pass_)
+            if not ok and ssh_password:
+                ok = self._ssh_run_command_with_password(node_ip, ssh_user, cmd, ssh_password)
 
             if ok:
                 task.native_ha = True
@@ -5149,6 +5150,7 @@ class PegaProxManager:
             prefix = "sudo " if ssh_user != 'root' else ""
             cmd = f"{prefix}ha-manager crm-command node-maintenance disable {node_name}"
             ssh_key = getattr(self.config, 'ssh_key', '')
+            ssh_password = self.ssh_password_to_offer()
 
             # build list of IPs to try: target node first, then other cluster nodes
             candidate_ips = []
@@ -5180,8 +5182,8 @@ class PegaProxManager:
                     ok = self._ssh_run_command_with_key(ip, ssh_user, cmd, ssh_key)
                 if not ok:
                     ok = self._ssh_run_command(ip, ssh_user, cmd)
-                if not ok and self.config.pass_:
-                    ok = self._ssh_run_command_with_password(ip, ssh_user, cmd, self.config.pass_)
+                if not ok and ssh_password:
+                    ok = self._ssh_run_command_with_password(ip, ssh_user, cmd, ssh_password)
 
                 if ok:
                     self.logger.info(f"[MAINT] disabled native HA maintenance for {node_name} (via {ip})")
@@ -8080,7 +8082,7 @@ if ours; then rm -f "$F" && { rmdir "$D" 2>/dev/null; echo "CLAIM_REMOVED"; } ||
             # Get SSH credentials from cluster config
             api_user = self.config.user
             ssh_user = (api_user or 'root').split('@')[0]  # PR #62 (ry-ops): null-safe
-            ssh_password = self.config.pass_
+            ssh_password = self.ssh_password_to_offer()
             ssh_key = getattr(self.config, 'ssh_key', '')
             
             # Try SSH on ALL IPs (parallel for speed - reduces worst-case from N*30s to 30s)
@@ -8170,7 +8172,7 @@ if ours; then rm -f "$F" && { rmdir "$D" 2>/dev/null; echo "CLAIM_REMOVED"; } ||
             
             api_user = self.config.user
             ssh_user = (api_user or 'root').split('@')[0]  # PR #62 (ry-ops): null-safe
-            ssh_password = self.config.pass_
+            ssh_password = self.ssh_password_to_offer()
             ssh_key = getattr(self.config, 'ssh_key', '')
             
             self.logger.warning(f"[HA] ═══════════════════════════════════════════════════════")
@@ -8652,7 +8654,7 @@ WantedBy=multi-user.target
         when none of them got through."""
         ssh_user = getattr(self.config, 'ssh_user', None) or 'root'
         ssh_key = getattr(self.config, 'ssh_key_path', None) or getattr(self.config, 'ssh_key', None)
-        ssh_password = getattr(self.config, 'ssh_password', None) or self.config.pass_
+        ssh_password = self.ssh_password_to_offer()
         out = None
         if ssh_key:
             out = self._ssh_run_command_with_key_output(node_ip, ssh_user, cmd, ssh_key, timeout=timeout)
@@ -9491,7 +9493,7 @@ fi
 
             ssh_user = getattr(self.config, 'ssh_user', None) or 'root'
             ssh_key = getattr(self.config, 'ssh_key_path', None) or getattr(self.config, 'ssh_key', None)
-            ssh_password = getattr(self.config, 'ssh_password', None) or self.config.pass_
+            ssh_password = self.ssh_password_to_offer()
 
             import re as _re
             cmd = "pvecm status 2>/dev/null"
@@ -9644,7 +9646,7 @@ fi
 
             ssh_user = getattr(self.config, 'ssh_user', None) or 'root'
             ssh_key = getattr(self.config, 'ssh_key_path', None) or getattr(self.config, 'ssh_key', None)
-            ssh_password = getattr(self.config, 'ssh_password', None) or self.config.pass_
+            ssh_password = self.ssh_password_to_offer()
 
             # Defense-in-depth: refuse to rm -rf anything that doesn't look
             # like a heartbeat dir. Path must end in `.pegaprox` exactly.
@@ -10066,7 +10068,7 @@ echo "AGENT_INSTALLED_OK"
             
             api_user = self.config.user
             ssh_user = (api_user or 'root').split('@')[0]  # PR #62 (ry-ops): null-safe
-            ssh_password = self.config.pass_
+            ssh_password = self.ssh_password_to_offer()
             ssh_key = getattr(self.config, 'ssh_key', '')
             
             self.logger.info(f"[HA] 🔧 Installing node agent on {node} ({node_ip})...")
@@ -10364,6 +10366,10 @@ echo "AGENT_INSTALLED_OK"
         _blocked = self.ssh_blocked_reason()
         if _blocked:
             self.logger.debug(f"SSH suppressed ({_blocked}) for {host}")
+            return None
+        if self._withheld_from_sshd(password):
+            self.logger.debug(f"SSH password step refused for {host}: the stored secret is "
+                              "an API token, not an SSH password")
             return None
 
         # NS 2026-04-24 — auto-sudo for non-root SSH users (pegaprox@pam etc).
@@ -10902,7 +10908,7 @@ echo "AGENT_INSTALLED_OK"
             # User format is usually "root@pam" - extract just the username
             api_user = self.config.user  # e.g. "root@pam"
             ssh_user = (api_user or 'root').split('@')[0]  # PR #62 (ry-ops): null-safe
-            ssh_password = self.config.pass_
+            ssh_password = self.ssh_password_to_offer()
             ssh_key = getattr(self.config, 'ssh_key', '')  # SSH private key from cluster config
             
             self.logger.info(f"[HA] Using cluster credentials (user: {ssh_user})")
@@ -10988,7 +10994,7 @@ echo "AGENT_INSTALLED_OK"
             # Use cluster credentials
             api_user = self.config.user
             ssh_user = (api_user or 'root').split('@')[0]  # PR #62 (ry-ops): null-safe
-            ssh_password = self.config.pass_
+            ssh_password = self.ssh_password_to_offer()
             ssh_key = getattr(self.config, 'ssh_key', '')  # SSH key from cluster config
             
             restore_cmd = f'pvecm expected {total_nodes}'
@@ -11258,7 +11264,7 @@ echo "AGENT_INSTALLED_OK"
             # Get SSH credentials
             api_user = self.config.user
             ssh_user = (api_user or 'root').split('@')[0]  # PR #62 (ry-ops): null-safe
-            ssh_password = self.config.pass_
+            ssh_password = self.ssh_password_to_offer()
             
             surviving_ip = self._ha_get_node_ip(surviving_node)
             if not surviving_ip:
@@ -11291,7 +11297,8 @@ echo "AGENT_INSTALLED_OK"
                 fence_cmd = f"sg_persist --out --preempt --param-sark={failed_key} --prout-type=5 {disk} 2>&1"
                 
                 # Run on surviving node
-                success = self._ssh_run_command_with_password(surviving_ip, ssh_user, fence_cmd, ssh_password)
+                success = bool(ssh_password) and self._ssh_run_command_with_password(
+                    surviving_ip, ssh_user, fence_cmd, ssh_password)
                 
                 if success:
                     fenced_disks.append(disk)
@@ -11479,6 +11486,10 @@ echo "AGENT_INSTALLED_OK"
         if _blocked:
             self.logger.debug(f"SSH suppressed ({_blocked}) for {host}")
             return False
+        if self._withheld_from_sshd(password):
+            self.logger.debug(f"SSH password step refused for {host}: the stored secret is "
+                              "an API token, not an SSH password")
+            return False
 
         # NS 2026-04-24 — auto-sudo for non-root SSH users (pegaprox@pam etc).
         # Wrap multi-line/shell-redirect commands through base64 → `sudo bash`.
@@ -11590,7 +11601,7 @@ echo "AGENT_INSTALLED_OK"
             # Use cluster credentials for SSH
             api_user = self.config.user
             ssh_user = (api_user or 'root').split('@')[0]  # PR #62 (ry-ops): null-safe
-            ssh_password = self.config.pass_
+            ssh_password = self.ssh_password_to_offer()
             
             # Build the move command - use mv to atomically move the config
             # The /etc/pve filesystem (pmxcfs) is cluster-aware
@@ -12640,10 +12651,26 @@ echo "AGENT_INSTALLED_OK"
             return 'SSH_DISABLED'
         if getattr(self.config, 'ssh_key', ''):
             return None
-        _pass_is_token_secret = '!' in (getattr(self.config, 'user', '') or '')
-        if getattr(self.config, 'pass_', '') and not _pass_is_token_secret:
+        if ssh_password_for(self.config):
             return None
         return 'SSH_NO_CREDENTIALS'
+
+    def ssh_password_to_offer(self):
+        """The SSH password to offer this cluster's nodes, '' for none (token secret, SSH off).
+
+        A stored key gets ssh_blocked_reason past its check, and the key can still be
+        refused - every password step after that asks here, never config.pass_.
+        """
+        return ssh_password_for(self.config)
+
+    def _withheld_from_sshd(self, password):
+        """True for config.pass_ where that is no SSH password (the token secret).
+
+        The net under the two sshpass steps: a ladder that reaches for config.pass_ again
+        instead of ssh_password_to_offer() is refused at the step, not on the node.
+        """
+        stored = getattr(self.config, 'pass_', '') or ''
+        return bool(password) and password == stored and not ssh_password_for(self.config)
 
     def _ssh_connect(self, host: str, retries: int = 3, retry_delay: float = 2.0,
                      connect_timeout: int = 30, failure: dict = None):
@@ -12749,7 +12776,7 @@ echo "AGENT_INSTALLED_OK"
                     
                     connect_kwargs['pkey'] = pkey
                 else:
-                    connect_kwargs['password'] = self.config.pass_
+                    connect_kwargs['password'] = self.ssh_password_to_offer()
                 
                 ssh.connect(**connect_kwargs)
                 persist_host_keys(ssh)
@@ -16820,7 +16847,7 @@ echo "AGENT_INSTALLED_OK"
         self.logger.info(f"[SYNC] Source: {src_ip}:{src_file}")
 
         ssh_user = getattr(self.config, 'ssh_user', '') or 'root'
-        ssh_pass = getattr(self.config, 'ssh_password', None) or self.config.pass_
+        ssh_pass = self.ssh_password_to_offer()
 
         for tgt_node in online_nodes:
             # already an intersection with the live online-node list, but resolve it the same
@@ -19642,8 +19669,11 @@ echo "AGENT_INSTALLED_OK"
             return out, None
         last_err = self._last_ssh_stderr(node_ip) or last_err
 
-        if self.config.pass_:
-            out = self._ssh_run_command_with_password_output(node_ip, ssh_user, cmd, self.config.pass_, timeout=timeout)
+        # MK Oct 2026 - a stored key gets past ssh_blocked_reason, so a refused key used to
+        # land here with config.pass_ - the token secret on a token cluster.
+        ssh_password = self.ssh_password_to_offer()
+        if ssh_password:
+            out = self._ssh_run_command_with_password_output(node_ip, ssh_user, cmd, ssh_password, timeout=timeout)
             if out is not None:
                 return out, None
             last_err = self._last_ssh_stderr(node_ip) or last_err

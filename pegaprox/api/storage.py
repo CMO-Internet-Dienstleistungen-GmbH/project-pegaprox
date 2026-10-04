@@ -26,7 +26,7 @@ from pegaprox.utils.audit import log_audit
 from pegaprox.utils.rbac import user_can_access_vm
 from pegaprox.core.cache import APIRateLimiter, StorageDataCache
 from pegaprox.api.helpers import get_connected_manager, check_cluster_access, safe_error, parse_pve_error, scope_vm_rows, require_unconfined
-from pegaprox.utils.ssh import get_paramiko, _ssh_track_connection
+from pegaprox.utils.ssh import get_paramiko, _ssh_track_connection, ssh_password_for, ssh_blocked_for
 from pegaprox import globals as _g
 from pegaprox.utils.ssh import read_capped as _read_capped
 
@@ -1869,12 +1869,20 @@ def rescan_storage(cluster_id, storage_id):
             return jsonify({'error': 'No online nodes available for rescan'}), 400
         
         results = []
-        paramiko = get_paramiko() if deep_scan else None
+        # MK Oct 2026 (#941) - the deep scan logs in to every node with the stored key; with
+        # SSH switched off it stays out, and the API rescan below still runs
+        ssh_block = ssh_blocked_for(manager) if deep_scan else None
+        paramiko = get_paramiko() if deep_scan and not ssh_block else None
         
         for node in nodes:
             node_result = {'node': node, 'actions': [], 'success': True}
             
             try:
+                if ssh_block:
+                    node_result['actions'].append({
+                        'action': 'deep_scan', 'status': 'skipped', 'code': ssh_block,
+                        'error': 'SSH is not available for this cluster',
+                    })
                 # Deep scan using SSH for more thorough rescan
                 if deep_scan and paramiko:
                     ssh_acquired = False
@@ -1894,7 +1902,8 @@ def rescan_storage(cluster_id, storage_id):
                             ssh_user = manager.config.ssh_user if hasattr(manager.config, 'ssh_user') and manager.config.ssh_user else 'root'
                             ssh_port = getattr(manager.config, 'ssh_port', 22) or 22
                             ssh_key = getattr(manager.config, 'ssh_key', '')
-                            ssh_pass = manager.config.pass_ if hasattr(manager.config, 'pass_') else None
+                            # None rather than '' so paramiko offers no password at all
+                            ssh_pass = ssh_password_for(manager.config) or None
                             
                             # Determine node hostname
                             node_host = host if node == nodes[0] else f"{node}.{host.split('.', 1)[1] if '.' in host else host}"
