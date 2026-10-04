@@ -640,7 +640,7 @@ def test_ha_disable_shows_what_was_left(dash):
         assert needle in report
 
 
-def test_the_cloud_ha_page_gets_its_two_lines(cloud, notes):
+def test_the_cloud_ha_page_gets_its_lines(cloud, notes):
     shell = _function(cloud, 'CloudShell')
     case = shell[shell.index("case 'ha':"):]
     case = case[:case.index('break;')]
@@ -650,8 +650,10 @@ def test_the_cloud_ha_page_gets_its_two_lines(cloud, notes):
     assert 'if (!ha || !ha.enabled) return null;' in notes
     assert 'const unsafe = sbp.unsafe_two_node_recovery === true;' in notes
     assert 'const outdated = Array.isArray(fa.outdated) ? fa.outdated : [];' in notes
-    assert 'if (!outdated.length && !unsafe) return null;' in notes
+    # and the guests an interrupted recovery left, which this layout can only name
+    assert 'if (!outdated.length && !unsafe && !left.length) return null;' in notes
     assert "t('haNodeUnsafeSwitch')" in notes and "t('haNodeCloudOutdated')" in notes
+    assert "t('haNodeIrTitle')" in notes and "t('haNodeIrCloudHint')" in notes
 
 
 # -- translations --------------------------------------------------------------------------------

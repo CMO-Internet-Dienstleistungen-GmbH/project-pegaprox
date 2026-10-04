@@ -8877,6 +8877,139 @@
             );
         }
 
+        // Node recoveries a former leader of an automatic group left half done (design 5.6). Nothing
+        // resumes them on its own: the guests a run moved and did not start get one Start, the
+        // held ones only the note why not, and Dismiss says an admin dealt with the rest. The
+        // routes want ha.config, so the dashboard mounts this only for who holds it.
+        function HaNodeInterrupted({ t, clusterId, status, resources, authFetch, addToast, onReload }) {
+            const { language } = useTranslation();
+            const [busy, setBusy] = useState('');             // the run a request is out for
+            const [asking, setAsking] = useState(null);       // the run whose Dismiss asks first
+            const [results, setResults] = useState({});       // run -> {started, failed} of its last Start
+            const [error, setError] = useState(null);         // {run, text} of the last refusal
+            const alive = useRef(true);
+            useEffect(() => () => { alive.current = false; }, []);
+            const runs = Array.isArray(status?.interrupted_recoveries)
+                ? status.interrupted_recoveries.filter(r => r && typeof r === 'object' && typeof r.run === 'string' && r.run) : [];
+            const ids = (list) => Array.isArray(list) ? list.filter(v => typeof v === 'number' || typeof v === 'string') : [];
+            // the names of the guests shown here only (a started one has left the run by then), looked
+            // up once per status: the cluster may hold thousands
+            const names = useMemo(() => {
+                const want = new Set([...runs.flatMap(r => [...ids(r.moved), ...ids(r.held), ...ids(r.guests_open)]),
+                                      ...Object.values(results).flatMap(r => [...r.started, ...r.failed])].map(String));
+                const out = {};
+                if (want.size && Array.isArray(resources)) {
+                    resources.forEach(v => { if (v && want.has(String(v.vmid)) && typeof v.name === 'string' && v.name) out[v.vmid] = v.name; });
+                }
+                return out;
+            }, [status, resources, results]);
+            if (!runs.length) return null;
+
+            const guest = (vmid) => names[vmid] ? `${vmid} (${names[vmid]})` : String(vmid);
+            const send = async (rec, what) => {
+                setBusy(rec.run);
+                setError(null);
+                const res = await haNodeSend(authFetch, `${API_URL}/clusters/${clusterId}/ha/interrupted-recoveries/${what}`, 'POST',
+                                             { runs: [rec.run] }, t('operationFailed'));
+                // closed or reopened for another cluster meanwhile: this answer fills nothing there
+                if (!alive.current) return;
+                setBusy('');
+                if (!res.ok) { setError({ run: rec.run, text: res.error }); return; }
+                if (what === 'dismiss') {
+                    setAsking(null);
+                    addToast(t('haNodeIrDismissed'));
+                } else {
+                    const started = ids(res.data.started), failed = ids(res.data.failed);
+                    setResults(r => ({ ...r, [rec.run]: { started, failed } }));
+                    addToast(t(failed.length ? 'haNodeIrSomeFailed' : 'haNodeIrStartedAll'), failed.length ? 'warning' : 'success');
+                }
+                onReload();
+            };
+
+            return (
+                <div className="p-4 rounded-xl border bg-yellow-500/10 border-yellow-500/40 mb-4 space-y-3" data-ha-node-interrupted={runs.length}>
+                    <h4 className="font-medium text-yellow-300 flex items-center gap-2">
+                        <Icons.AlertTriangle className="w-4 h-4" />
+                        {t('haNodeIrTitle')}
+                    </h4>
+                    <p className="text-sm text-yellow-200">{t('haNodeIrIntro')}</p>
+                    {runs.map(rec => {
+                        const moved = ids(rec.moved), held = ids(rec.held), open = ids(rec.guests_open);
+                        const done = results[rec.run];
+                        const node = String(rec.node || '-');
+                        return (
+                            <div key={rec.run} data-ha-node-run={rec.run} className="p-3 bg-proxmox-dark border border-proxmox-border rounded-lg space-y-2">
+                                <div className="flex flex-wrap items-start justify-between gap-2">
+                                    <div className="text-sm text-white" style={{ overflowWrap: 'anywhere' }}>
+                                        {t('haNodeIrRun').replace('{node}', () => node)
+                                            .replace('{instance}', () => String(rec.instance_id || '-').slice(0, 8)).replace('{epoch}', () => rec.epoch ?? '-')}
+                                    </div>
+                                    {rec.at && <span className="text-xs text-gray-400" title={fmtDate(rec.at)}>{haRelTime(rec.at, language)}</span>}
+                                </div>
+                                {moved.length > 0 && (
+                                    <div className="space-y-2" data-ha-node-run-moved={moved.join(',')}>
+                                        <p className="text-sm text-gray-200">
+                                            {t('haNodeIrMoved')} <span className="font-mono text-xs">{moved.map(guest).join(', ')}</span>
+                                        </p>
+                                        <button type="button" onClick={() => send(rec, 'start')} disabled={!!busy}
+                                            className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium bg-green-600 hover:bg-green-500 text-white disabled:opacity-50 disabled:cursor-not-allowed">
+                                            <Icons.Play className="w-4 h-4" />
+                                            {t('haNodeIrStart')}
+                                        </button>
+                                    </div>
+                                )}
+                                {held.length > 0 && (
+                                    <div className="space-y-1" data-ha-node-run-held={held.join(',')}>
+                                        <p className="text-sm text-gray-200">
+                                            {t('haNodeIrHeld')} <span className="font-mono text-xs">{held.map(guest).join(', ')}</span>
+                                        </p>
+                                        <p className="text-xs text-yellow-300" data-ha-node-run-held-note>
+                                            {t('haNodeIrHeldNote').replace(/\{node\}/g, () => node)}
+                                        </p>
+                                    </div>
+                                )}
+                                {open.length > 0 && (
+                                    <p className="text-sm text-gray-300" data-ha-node-run-open={open.join(',')}>
+                                        {t('haNodeIrOpen')} <span className="font-mono text-xs">{open.map(guest).join(', ')}</span>
+                                    </p>
+                                )}
+                                {done && (
+                                    <div className="text-xs space-y-0.5" data-ha-node-run-result>
+                                        {done.started.length > 0 && <p className="text-green-300">{t('haNodeIrStarted').replace('{list}', () => done.started.map(guest).join(', '))}</p>}
+                                        {done.failed.length > 0 && <p className="text-red-300">{t('haNodeIrFailed').replace('{list}', () => done.failed.map(guest).join(', '))}</p>}
+                                    </div>
+                                )}
+                                {error && error.run === rec.run && (
+                                    <p role="alert" className="text-sm text-red-300" style={{ overflowWrap: 'anywhere' }} data-ha-node-run-error>{error.text}</p>
+                                )}
+                                {asking === rec.run ? (
+                                    <div className="rounded-lg p-2 space-y-2 border bg-proxmox-darker border-proxmox-border" data-ha-node-run-ask>
+                                        <p className="text-sm text-gray-300">{t('haNodeIrDismissAsk')}</p>
+                                        <div className="flex flex-wrap justify-end gap-2">
+                                            <button type="button" onClick={() => setAsking(null)}
+                                                className="px-3 py-1.5 text-sm bg-proxmox-dark hover:bg-proxmox-hover border border-proxmox-border rounded-lg">
+                                                {t('cancel')}
+                                            </button>
+                                            <button type="button" onClick={() => send(rec, 'dismiss')} disabled={!!busy}
+                                                className="px-3 py-1.5 text-sm font-medium bg-proxmox-orange hover:bg-orange-600 text-white rounded-lg disabled:opacity-50 disabled:cursor-not-allowed">
+                                                {t('haNodeIrDismiss')}
+                                            </button>
+                                        </div>
+                                    </div>
+                                ) : (
+                                    <button type="button" onClick={() => { setAsking(rec.run); setError(null); }} disabled={!!busy}
+                                        className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white hover:border-gray-500 disabled:opacity-50 disabled:cursor-not-allowed">
+                                        <Icons.X className="w-4 h-4" />
+                                        {t('haNodeIrDismiss')}
+                                    </button>
+                                )}
+                            </div>
+                        );
+                    })}
+                </div>
+            );
+        }
+
         // HA is off, but the server could not tell for every node that its agents are gone, or
         // could not take the claim off: its words stay on screen until the admin closes them
         function HaNodeDisableReport({ report, onClose, t }) {
@@ -24621,6 +24754,11 @@
                                         )
                                     ) : (<>
                                         <HaNodeWarnings status={haStatus} t={t} />
+                                        {/* LW Oct 2026 (#625) - runs a former leader left half done: its routes want ha.config */}
+                                        {haWrite && (
+                                            <HaNodeInterrupted key={selectedCluster.id} t={t} clusterId={selectedCluster.id} status={haStatus}
+                                                resources={clusterResources} authFetch={authFetch} addToast={addToast} onReload={reloadHaStatus} />
+                                        )}
 
                                         {/* MK 2026-06-03: HA fence-strategy banner - surfaces the result of
                                             _ha_detect_fence_strategy from the server. 'wait' = 2-node-no-qdevice,

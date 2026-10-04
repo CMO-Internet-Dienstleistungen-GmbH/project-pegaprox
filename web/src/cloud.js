@@ -1973,7 +1973,11 @@
             const fa = ha.fence_agent || {};
             const outdated = Array.isArray(fa.outdated) ? fa.outdated : [];
             const unsafe = sbp.unsafe_two_node_recovery === true;
-            if (!outdated.length && !unsafe) return null;
+            // LW Oct 2026 (#625) - guests an interrupted recovery left moved or held: started or
+            // dismissed in the HA settings of the other layouts, this one only says so
+            const left = [...new Set((Array.isArray(ha.interrupted_recoveries) ? ha.interrupted_recoveries : [])
+                .flatMap(r => [...(r.moved || []), ...(r.held || []), ...(r.guests_open || [])]))];
+            if (!outdated.length && !unsafe && !left.length) return null;
             const line = { display: 'flex', alignItems: 'center', gap: 8, fontSize: 13 };
             return (
                 <div className="cloud-card" data-ha-node-cloud
@@ -1990,6 +1994,13 @@
                             style={{ ...line, color: 'var(--cloud-warning, #e0a82e)', marginTop: unsafe ? 6 : 0 }}>
                             <span style={{ display: 'inline-flex' }}><Icons.AlertTriangle /></span>
                             <span><strong>{t('haNodeCloudOutdated')}</strong>: {outdated.join(', ')}</span>
+                        </div>
+                    )}
+                    {left.length > 0 && (
+                        <div data-ha-node-cloud-line="interrupted" title={t('haNodeIrCloudHint')}
+                            style={{ ...line, color: 'var(--cloud-warning, #e0a82e)', marginTop: unsafe || outdated.length ? 6 : 0 }}>
+                            <span style={{ display: 'inline-flex' }}><Icons.AlertTriangle /></span>
+                            <span><strong>{t('haNodeIrTitle')}</strong>: {left.join(', ')} - {t('haNodeIrCloudHint')}</span>
                         </div>
                     )}
                 </div>

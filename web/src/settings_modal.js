@@ -9763,6 +9763,8 @@
         //     The switch of v6 is gone; a member shows what the leader made it
         // v9: the config version in the head card, and the copies of what a sync replaced
         //     here: listed, downloaded after the password, dismissed for good
+        // v10: stage 2 - automatic failover (switch, checklist, lease), the witness and the
+        //     time zone of the group's schedules: HaAutoCard, HaWitnessCard, HaZoneCard below
         // ═══════════════════════════════════════════════
 
         // "3 minutes ago" in the UI language. Intl speaks all nine, so no keys for it.
@@ -9881,6 +9883,7 @@
             const [lastRemoval, setLastRemoval] = useState(null);       // {name, told} of the last removal
             const [copyAction, setCopyAction] = useState(null);         // {what: 'download' | 'dismiss', name}
             const [copyError, setCopyError] = useState(null);           // {text, code} for the open copy box
+            const [notShipped, setNotShipped] = useState(false);        // the server refused automatic failover as not in this release
 
             // Every status request gets a number. One that left before a code was made cannot
             // know about it, so only a later answer may say the code is gone.
@@ -10301,6 +10304,14 @@
             // the leader is always active; a member is what the leader made it, and "pending"
             // until it said it serves. One never reached yet shows what it was made too.
             const memberRole = (m) => m.role_seen === 'active' ? 'active' : m.serve === true ? 'standby' : m.role_seen;
+            // LW Oct 2026 (#625) - stage 2: auto is null on a release without automatic failover and
+            // missing on a server from before it. Once there, auto.members says what the voter
+            // config holds about each member and the witness, and the table gets those columns.
+            const auto = status?.auto && typeof status.auto === 'object' ? status.auto : null;
+            const autoRows = auto && Array.isArray(auto.members)
+                ? auto.members.filter(r => r && typeof r === 'object' && typeof r.instance_id === 'string') : null;
+            const autoOf = (m) => (autoRows || []).find(r => r.instance_id === m.instance_id && r.kind !== 'witness') || null;
+            const witnessRow = (autoRows || []).find(r => r.kind === 'witness') || null;
             const membersCard = (
                 <div className={card} data-ha-members={members.length}>
                     <div className="flex flex-wrap items-center justify-between gap-3">
@@ -10333,6 +10344,7 @@
                                         <th className={`${cell} font-medium whitespace-nowrap`}>{t('pgHaLastError')}</th>
                                         {canSetActive && <th className={`${cell} font-medium`} title={t('pgHaActiveHint')}>{t('pgHaRoleActive')}</th>}
                                         {canRemove && <th className="py-2" />}
+                                        {autoRows && <HaAutoMemberHead t={t} cell={cell} />}
                                     </tr>
                                 </thead>
                                 <tbody className="divide-y divide-proxmox-border">
@@ -10399,8 +10411,34 @@
                                                     </button>
                                                 </td>
                                             )}
+                                            {autoRows && <HaAutoMemberCells t={t} cell={cell} row={autoOf(m)} />}
                                         </tr>
                                     ))}
+                                    {/* the witness votes and holds nothing: no epoch, no sync, nothing to switch here */}
+                                    {witnessRow && (
+                                        <tr data-ha-member-witness={witnessRow.instance_id}>
+                                            <td className={`${cell} whitespace-nowrap`}>
+                                                <span className="font-mono text-xs text-gray-200" title={witnessRow.instance_id}>{witnessRow.instance_id.slice(0, 8)}</span>
+                                            </td>
+                                            <td className={`${cell} font-mono text-xs text-gray-200 whitespace-nowrap`}>{witnessRow.url || auto.witness?.url || '-'}</td>
+                                            <td className={`${cell} whitespace-nowrap`}>
+                                                <span data-ha-badge="witness" className={`px-2 py-0.5 rounded-full border text-xs font-medium ${HA_ROLE_STYLE.standalone}`}>
+                                                    {t('haAutoKindWitness')}
+                                                </span>
+                                            </td>
+                                            <td className={`${cell} text-gray-500`}>-</td>
+                                            <td className={`${cell} whitespace-nowrap`}>
+                                                {auto.witness?.key_fingerprint
+                                                    ? <span className="font-mono text-xs text-gray-200" title={auto.witness.key_fingerprint}>{auto.witness.key_fingerprint}</span>
+                                                    : <span className="text-gray-500">-</span>}
+                                            </td>
+                                            <td className={`${cell} text-gray-500`}>-</td>
+                                            <td className={`${cell} text-gray-500`}>-</td>
+                                            {canSetActive && <td className={cell} />}
+                                            {canRemove && <td className="py-2" />}
+                                            <HaAutoMemberCells t={t} cell={cell} row={witnessRow} />
+                                        </tr>
+                                    )}
                                 </tbody>
                             </table>
                         </div>
@@ -10869,6 +10907,34 @@
                 </div>
             );
 
+            // Automatic failover, the witness and the zone of the schedules: switched and set on the
+            // leader, read on a member. Each card only shows what its server reports: none of them
+            // on a server from before stage 2, and on a member nothing it has no data for.
+            const groupCards = (leader) => {
+                // auto is null while this release does not offer automatic failover: no switch
+                // and no witness form that could only be refused
+                const reported = status.auto != null;
+                const zoned = typeof status.timezone === 'string';
+                const shared = { t, status, auto, members, memberName, leader, getAuthHeaders, load, addToast, broken };
+                const witness = reported && (leader || auto?.witness) && (
+                    <HaWitnessCard {...shared} notShipped={notShipped} onNotShipped={() => setNotShipped(true)} />
+                );
+                const zone = zoned && <HaZoneCard {...shared} />;
+                return (
+                    <>
+                        {reported && (leader || auto) && (
+                            <HaAutoCard {...shared} notShipped={notShipped} onNotShipped={() => setNotShipped(true)} />
+                        )}
+                        {(witness || zone) && (
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                {witness}
+                                {zone}
+                            </div>
+                        )}
+                    </>
+                );
+            };
+
             if (!status) {
                 return (
                     <div className="space-y-4">
@@ -10999,6 +11065,7 @@
                         <>
                             {membersCard}
                             {confirmAction === 'remove' && typedBox}
+                            {groupCards(true)}
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 {pairingCard}
                                 {intervalCard}
@@ -11021,6 +11088,7 @@
                         <>
                             {restartNote}
                             {membersCard}
+                            {groupCards(false)}
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 <div className={card}>
                                     <h4 className="font-medium text-white flex items-center gap-2">
@@ -11074,6 +11142,802 @@
                             </div>
                             {typedBox}
                         </>
+                    )}
+                </div>
+            );
+        }
+
+        // ═══════════════════════════════════════════════
+        // LW Oct 2026 (#625) - stage 2 of the group, for HaPanel: automatic failover, its witness
+        // and the time zone the schedules run in. The leader switches and sets them, a member
+        // reads what its leader says. status.auto is null on a release that does not offer
+        // automatic failover yet; the switch and the witness code are refused there with 409
+        // HA_AUTO_NOT_SHIPPED, which is a note and no error.
+        // ═══════════════════════════════════════════════
+
+        // the precondition each finding code of the server belongs to, in the order of the list
+        const HA_AUTO_CHECKS = [
+            ['votes', ['TOO_FEW_VOTERS', 'EVEN_VOTERS']],
+            ['release', ['OLD_RELEASE', 'RELEASE_MISMATCH', 'DOWNGRADED', 'KEY_MISMATCH', 'NOT_IN_CONFIG']],
+            ['answer', ['VOTER_DOWN', 'MEMBER_MANUAL', 'MEMBER_AUTO', 'ACTIVE_WITHOUT_LEASE', 'QUARANTINED',
+                        'STATE_NOT_WRITTEN', 'NO_DIR_SYNC']],
+            ['witness', ['WITNESS_SAME_SITE']],
+            ['clock', ['CLOCK_SKEW']],
+            ['zone', ['ZONE_UNREADABLE', 'NO_GROUP_ZONE']],
+        ];
+        const HA_AUTO_CHECK_LABEL = {
+            votes: 'haAutoCheckVotes', release: 'haAutoCheckRelease', answer: 'haAutoCheckAnswer',
+            witness: 'haAutoCheckWitness', clock: 'haAutoCheckClock', zone: 'haAutoCheckZone', other: 'haAutoCheckOther',
+        };
+        const HA_AUTO_MODES = { manual: 'haAutoModeManual', auto_pending: 'haAutoModePending', auto: 'haAutoModeAuto' };
+        const HA_AUTO_MODE_STYLE = {
+            manual: 'bg-gray-500/20 text-gray-300 border-gray-500/30',
+            auto_pending: 'bg-blue-500/10 text-blue-300 border-blue-500/30 border-dashed',
+            auto: 'bg-green-500/20 text-green-300 border-green-500/30',
+        };
+        // what the mode route takes for the lease (ha_vote.LEASE_MIN/MAX/DEFAULT), and the clock
+        // skew automatic failover allows (ha_vote.SKEW_LIMIT)
+        const HA_LEASE = { min: 15, max: 120, def: 20 };
+        const HA_SKEW_LIMIT = 5;
+        // a witness that was removed and did not hear it lets go on its own host with this
+        const HA_WITNESS_LEAVE = 'pegaprox-witness leave --force';
+        const HA_GROUP_CARD = 'bg-proxmox-dark border border-proxmox-border rounded-xl p-4 space-y-3';
+        const HA_GROUP_FIELD = 'px-3 py-2 bg-proxmox-card border border-proxmox-border rounded text-sm text-white disabled:opacity-50';
+        const HA_GROUP_BTN = 'flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed';
+        const HA_GROUP_GHOST = 'flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white hover:border-gray-500';
+
+        // The findings grouped by precondition. One about the witness belongs to it whatever its
+        // code, and the witness item is there only in a group that has one. A code nobody knows
+        // here yet still shows, under "other". block keeps the switch off, warn wants a tick.
+        function haAutoChecklist(findings, witnessId) {
+            const items = HA_AUTO_CHECKS.filter(([key]) => key !== 'witness' || witnessId).map(([key]) => ({ key, findings: [] }));
+            const other = { key: 'other', findings: [] };
+            (Array.isArray(findings) ? findings : []).forEach(f => {
+                if (!f || typeof f !== 'object' || typeof f.code !== 'string') return;
+                const key = witnessId && f.member === witnessId ? 'witness'
+                    : (HA_AUTO_CHECKS.find(([, codes]) => codes.includes(f.code)) || ['other'])[0];
+                (items.find(i => i.key === key) || other).findings.push(f);
+            });
+            if (other.findings.length) items.push(other);
+            return items.map(i => ({
+                ...i,
+                level: i.findings.some(f => f.level === 'block') ? 'block' : i.findings.some(f => f.level === 'warn') ? 'warn' : 'ok',
+            }));
+        }
+
+        // how long a failover takes at a lease of `lease` seconds (design 9): the election timer
+        // of the others, the vote and the takeover wait, from the crash to the new leader acting
+        function haFailoverSeconds(lease) {
+            const take = 1.1 * (lease + 2) + Math.max(2, 0.05 * lease) + 5;
+            return [Math.round(1.1 * lease + 1 + take), Math.round(1.1 * lease + lease / 4 + 1 + take)];
+        }
+
+        function haSkewText(skew) {
+            return `${skew > 0 ? '+' : ''}${skew.toFixed(1)} s`;
+        }
+
+        // POST/PUT to /api/ha/*: the server's words and code on a refusal, and its body, which
+        // carries the findings of a refused switch
+        async function haGroupSend(getAuthHeaders, method, path, body, fallback) {
+            let r;
+            try {
+                r = await fetch(`${API_URL}/ha/${path}`, {
+                    method, credentials: 'include',
+                    headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body || {})
+                });
+            } catch (_) {
+                return { ok: false, code: '', error: fallback, data: null };
+            }
+            const data = await r.json().catch(() => null);
+            if (!r.ok) {
+                const said = typeof data?.error === 'string' ? data.error.trim() : '';
+                return { ok: false, code: data?.code || '', error: said || fallback, data };
+            }
+            return { ok: true, code: '', error: '', data: data || {} };
+        }
+
+        // the account password these actions want, and the server's word on it next to the field.
+        // An SSO account types none: the server goes by how fresh its sign-in is.
+        function HaGroupPassword({ t, id, sso, value, onChange, refused, logout }) {
+            const reauth = refused && (refused.code === 'HA_REAUTH' || refused.code === 'HA_REAUTH_RECENT') ? refused : null;
+            return (
+                <>
+                    {!sso && (
+                        <div>
+                            <label className="block text-xs text-gray-400 mb-1" htmlFor={id}>{t('pgHaPassword')}</label>
+                            <input id={id} type="password" autoComplete="current-password" data-lpignore="true" data-1p-ignore="true" data-bwignore="true"
+                                value={value} onChange={e => onChange(e.target.value)} aria-invalid={reauth ? 'true' : undefined}
+                                className={`w-full ${HA_GROUP_FIELD}`} />
+                        </div>
+                    )}
+                    {reauth && (
+                        <div data-ha-reauth={reauth.code} className="rounded-lg p-2 text-sm border bg-red-500/10 border-red-500/30 text-red-300 space-y-2">
+                            <div className="break-all">{reauth.error}</div>
+                            {reauth.code === 'HA_REAUTH_RECENT' && (
+                                <button type="button" onClick={() => logout()} className={HA_GROUP_GHOST}>
+                                    <Icons.LogOut />
+                                    {t('pgHaSignInAgain')}
+                                </button>
+                            )}
+                        </div>
+                    )}
+                </>
+            );
+        }
+
+        // the columns the voter config adds to the members table, and the cells of one row
+        function HaAutoMemberHead({ t, cell }) {
+            return (
+                <>
+                    <th className={`${cell} font-medium`}>{t('haAutoColSite')}</th>
+                    <th className={`${cell} font-medium`}>{t('haAutoColVote')}</th>
+                    <th className={`${cell} font-medium`}>{t('haAutoColSkew')}</th>
+                    <th className={`${cell} font-medium`} title={t('haAutoReachHint')}>{t('haAutoColReach')}</th>
+                    <th className={`${cell} font-medium`}>{t('haAutoColState')}</th>
+                </>
+            );
+        }
+
+        function HaAutoMemberCells({ t, cell, row }) {
+            const none = <span className="text-gray-500">-</span>;
+            if (!row) {
+                // a member the voter config does not name: it neither votes nor counts
+                return (
+                    <>
+                        <td className={cell}>{none}</td>
+                        <td className={cell}>{none}</td>
+                        <td className={cell}>{none}</td>
+                        <td className={cell}>{none}</td>
+                        <td className={`${cell} text-xs text-yellow-300 whitespace-nowrap`} data-ha-auto-state="none">{t('haAutoNotInConfig')}</td>
+                    </>
+                );
+            }
+            const yesNo = (v) => v === true ? t('yes') : v === false ? t('no') : none;
+            const skew = typeof row.skew === 'number' && isFinite(row.skew) ? row.skew : null;
+            const reach = row.reach && typeof row.reach === 'object' ? Object.values(row.reach) : null;
+            const reached = reach ? reach.filter(v => v === true).length : 0;
+            // the witness says when it acked a renewal last, a data member when it answered
+            const heard = typeof row.seen_ago === 'number' ? row.seen_ago : typeof row.last_heard === 'number' ? row.last_heard : null;
+            const states = [
+                row.quarantined === true && ['quarantined', 'bg-red-500/20 text-red-300 border-red-500/30', t('haAutoQuarantined')],
+                row.holds === true && ['holds', 'bg-green-500/20 text-green-300 border-green-500/30', t('haAutoHolds')],
+                row.mode === 'auto_pending' && ['pending', 'bg-blue-500/10 text-blue-300 border-blue-500/30', t('haAutoHoldsPending')],
+            ].filter(Boolean);
+            return (
+                <>
+                    <td className={`${cell} text-gray-200 whitespace-nowrap`} data-ha-auto-site>
+                        {typeof row.site === 'string' && row.site ? row.site : none}
+                    </td>
+                    <td className={`${cell} text-gray-200 whitespace-nowrap`} data-ha-auto-vote={row.voter === true ? 'yes' : 'no'}
+                        data-ha-auto-may-lead={row.may_lead === true ? 'yes' : 'no'}>
+                        {yesNo(row.voter)}
+                        {row.may_lead === true && <span className="text-gray-400"> · {t('haAutoColMayLead')}</span>}
+                    </td>
+                    <td className={`${cell} whitespace-nowrap`} data-ha-auto-skew>
+                        {skew === null ? none : <span className={Math.abs(skew) > HA_SKEW_LIMIT ? 'text-red-300' : 'text-gray-200'}>{haSkewText(skew)}</span>}
+                    </td>
+                    <td className={`${cell} whitespace-nowrap`} data-ha-auto-reach>
+                        {reach ? (
+                            <span title={t('haAutoReachHint')} className={reached < reach.length ? 'text-yellow-300' : 'text-gray-200'}>
+                                {t('haAutoReachOf').replace('{n}', reached).replace('{total}', reach.length)}
+                            </span>
+                        ) : none}
+                    </td>
+                    <td className={`${cell} text-xs`} data-ha-auto-state={states.map(s => s[0]).join(' ') || (heard === null ? 'unheard' : 'heard')}>
+                        <div className="flex flex-wrap items-center gap-1">
+                            {states.map(([key, tone, label]) => (
+                                <span key={key} className={`px-1.5 py-0.5 rounded-full border text-[11px] whitespace-nowrap ${tone}`}>{label}</span>
+                            ))}
+                            <span className={`whitespace-nowrap ${heard === null ? 'text-yellow-300' : 'text-gray-400'}`}>
+                                {heard === null ? t('haAutoNotHeard') : t('haAutoHeard').replace('{n}', Math.round(heard))}
+                            </span>
+                        </div>
+                    </td>
+                </>
+            );
+        }
+
+        // The switch, with what stands in the way as a checklist: a red item keeps it off, an amber
+        // one wants a tick. While the members take the voter config it names whom it waits for.
+        // The lease length and the quarantined voters are the leader's as well; a member reads.
+        function HaAutoCard({ t, status, auto, members, memberName, leader, getAuthHeaders, load, addToast, broken,
+                              notShipped, onNotShipped }) {
+            const { user, logout } = useAuth();
+            const sso = ['oidc', 'entra'].includes(user?.auth_source);
+            const [form, setForm] = useState(null);           // 'on' | 'off' | 'lease' | 'readmit' while its box is open
+            const [target, setTarget] = useState(null);       // the member a re-admit is about
+            const [lease, setLease] = useState('');
+            const [password, setPassword] = useState('');
+            const [ticked, setTicked] = useState([]);         // the amber items the admin ticked
+            const [answered, setAnswered] = useState(null);   // the findings a refused switch came back with
+            const [refused, setRefused] = useState(null);     // {code, error} of the last refusal
+            const [busy, setBusy] = useState(false);
+            const [offWaits, setOffWaits] = useState(false);  // switched off, and its majority is not there yet
+
+            const mode = HA_AUTO_MODES[auto?.mode] ? auto.mode : 'manual';
+            const on = mode !== 'manual';
+            const witnessId = typeof auto?.witness?.instance_id === 'string' ? auto.witness.instance_id : null;
+            const nameOf = (id) => id === status.instance_id ? t('haAutoThisInstance') : id === witnessId ? t('haAutoTheWitness')
+                : memberName(members.find(m => m.instance_id === id) || { instance_id: String(id || '') });
+            // where a sentence starts with it, the witness goes by its address
+            const labelOf = (id) => id === witnessId && auto.witness.url ? auto.witness.url : nameOf(id);
+            const findings = answered || (Array.isArray(auto?.findings) ? auto.findings : null);
+            const checks = leader && findings ? haAutoChecklist(findings, witnessId) : null;
+            const blocked = mode === 'manual' && !!checks && checks.some(c => c.level === 'block');
+            const amber = mode === 'manual' && checks ? checks.filter(c => c.level === 'warn') : [];
+            const accept = [...new Set(amber.filter(c => ticked.includes(c.key))
+                .flatMap(c => c.findings.filter(f => f.level === 'warn').map(f => f.code)))];
+            const leaseNow = Number.isInteger(auto?.lease_s) ? auto.lease_s : HA_LEASE.def;
+            const leaseText = String(lease).trim();
+            const leaseOk = /^\d+$/.test(leaseText) && Number(leaseText) >= HA_LEASE.min && Number(leaseText) <= HA_LEASE.max;
+            const leaseShown = leaseOk ? Number(leaseText) : leaseNow;
+            const [lo, hi] = haFailoverSeconds(leaseShown);
+            const quarantined = (Array.isArray(auto?.members) ? auto.members : [])
+                .filter(r => r && r.quarantined === true && typeof r.instance_id === 'string');
+            const holder = auto?.holds_lease === true ? status.instance_id : typeof auto?.holder === 'string' ? auto.holder : null;
+            const waiting = Array.isArray(auto?.switch_waiting) ? auto.switch_waiting.filter(id => typeof id === 'string') : null;
+            const pending = auto?.pending && typeof auto.pending === 'object' ? auto.pending : null;
+
+            // the note of a switch off that waits for its majority goes once the group is manual
+            useEffect(() => { if (mode === 'manual') setOffWaits(false); }, [mode]);
+
+            // null closes the box; nothing typed survives into the next one
+            const open = (what, member = null) => {
+                setForm(what);
+                setTarget(member);
+                setPassword('');
+                setRefused(null);
+                setLease(String(leaseNow));
+                if (!what) { setAnswered(null); setTicked([]); }
+            };
+
+            const submit = async () => {
+                const what = form;
+                const body = what === 'readmit' ? {}
+                    : what === 'off' ? { mode: 'manual' }
+                    : what === 'lease' ? { mode: 'auto', lease_s: Number(leaseText) }
+                    : { mode: 'auto', lease_s: Number(leaseText), accept };
+                const path = what === 'readmit' ? `members/${encodeURIComponent(target)}/readmit` : 'mode';
+                setBusy(true);
+                setRefused(null);
+                let res;
+                try {
+                    res = await haGroupSend(getAuthHeaders, what === 'readmit' ? 'POST' : 'PUT', path,
+                                            sso ? body : { ...body, user_password: password }, t('pgHaActionFailed'));
+                } finally {
+                    setBusy(false);
+                    // the password was for this one request, whatever came back
+                    setPassword('');
+                }
+                if (!res.ok) {
+                    if (res.code === 'HA_AUTO_NOT_SHIPPED') { open(null); onNotShipped(); return; }
+                    // what stands in the way right now, as the server just found it
+                    if (Array.isArray(res.data?.findings)) setAnswered(res.data.findings);
+                    setRefused({ code: res.code, error: res.error });
+                    return;
+                }
+                open(null);
+                if (what === 'off') {
+                    setOffWaits(res.data.result === 'off' && res.data.mode === 'auto');
+                    addToast?.(t(res.data.result === 'cancelled' ? 'haAutoTakenBack' : 'haAutoSwitchedOff'), 'success');
+                } else if (what === 'lease') {
+                    addToast?.(t(res.data.changed === false ? 'haAutoLeaseUnchanged' : 'haAutoLeaseSaved'), 'success');
+                } else if (what === 'readmit') {
+                    addToast?.(t('haAutoReadmitted'), 'success');
+                } else {
+                    addToast?.(t('haAutoSwitchStarted'), 'success');
+                }
+                load();
+            };
+
+            const reauth = refused && (refused.code === 'HA_REAUTH' || refused.code === 'HA_REAUTH_RECENT');
+            const ready = !busy && !broken && (sso || !!password)
+                && (form === 'off' || form === 'readmit' || leaseOk)
+                && (form !== 'on' || (!blocked && amber.every(c => ticked.includes(c.key))));
+            // in manual mode every precondition, met or not; once automatic only what to look at
+            const shownChecks = checks ? (mode === 'manual' ? checks : checks.filter(c => c.findings.length > 0)) : null;
+            const formText = form === 'readmit' ? t('haAutoReadmitDesc').replace('{name}', () => labelOf(target))
+                : t({ on: 'haAutoOnDesc', off: mode === 'auto_pending' ? 'haAutoTakeBackDesc' : 'haAutoOffDesc', lease: 'haAutoLeaseDesc' }[form] || 'haAutoOnDesc');
+            const formButton = { on: 'haAutoSwitchOn', off: mode === 'auto_pending' ? 'haAutoTakeBack' : 'haAutoSwitchOff',
+                                 lease: 'save', readmit: 'haAutoReadmit' }[form];
+
+            return (
+                <div className={HA_GROUP_CARD} data-ha-auto={auto ? mode : 'unknown'}>
+                    <div className="flex items-start justify-between gap-4">
+                        <div className="min-w-0">
+                            <h4 className="font-medium text-white flex flex-wrap items-center gap-2">
+                                <Icons.Shield />
+                                {leader ? <label htmlFor="pgha-auto">{t('haAutoTitle')}</label> : <span>{t('haAutoTitle')}</span>}
+                                {auto && (
+                                    <span data-ha-auto-mode={mode} className={`px-2 py-0.5 rounded-full border text-xs font-medium ${HA_AUTO_MODE_STYLE[mode]}`}>
+                                        {t(HA_AUTO_MODES[mode])}
+                                    </span>
+                                )}
+                            </h4>
+                            <p className="text-xs text-gray-500 mt-1">{t('haAutoHint')}</p>
+                        </div>
+                        {leader && (
+                            <button id="pgha-auto" type="button" role="switch" aria-checked={on}
+                                onClick={() => open(form === 'on' || form === 'off' ? null : on ? 'off' : 'on')}
+                                disabled={busy || broken || (!on && (notShipped || blocked))}
+                                className={`toggle-switch flex-shrink-0 disabled:opacity-50 disabled:cursor-not-allowed ${on ? 'active' : ''}`} />
+                        )}
+                    </div>
+                    {notShipped && !on && (
+                        <div className="rounded-lg p-3 text-sm border bg-blue-500/10 border-blue-500/30 text-blue-200 flex items-start gap-2" data-ha-auto-not-shipped>
+                            <span className="mt-0.5 flex-shrink-0"><Icons.Info /></span>
+                            <span>{t('haAutoNotShipped')}</span>
+                        </div>
+                    )}
+                    {auto && (
+                        <div className="flex flex-wrap items-center gap-x-6 gap-y-1 text-xs text-gray-400" data-ha-auto-status>
+                            {mode === 'auto' && (
+                                <span data-ha-auto-leader={holder ? (holder === status.instance_id ? 'self' : 'other') : 'none'}>
+                                    {holder
+                                        ? t('haAutoLeader').replace('{who}', () => nameOf(holder)).replace('{epoch}', () => auto.epoch ?? '-')
+                                        : <span className="text-yellow-300">{t('haAutoNoLeader')}</span>}
+                                    {holder && typeof auto.lease_left === 'number' && <> · {t('haAutoLeaseLeft').replace('{n}', Math.round(auto.lease_left))}</>}
+                                </span>
+                            )}
+                            {auto.voters > 0 && (
+                                <span data-ha-auto-majority>{t('haAutoMajority').replace('{m}', () => auto.majority).replace('{n}', () => auto.voters)}</span>
+                            )}
+                            {on && (
+                                <span data-ha-auto-lease={leaseNow}>
+                                    {t('haAutoLeaseIs').replace('{n}', leaseNow)}
+                                    {leader && mode === 'auto' && !form && (
+                                        <button type="button" onClick={() => open('lease')} disabled={busy || broken}
+                                            className="ml-2 text-proxmox-orange hover:text-orange-400 disabled:opacity-50">
+                                            {t('haAutoChange')}
+                                        </button>
+                                    )}
+                                </span>
+                            )}
+                            {typeof auto.acting_in === 'number' && (
+                                <span className="text-yellow-300" data-ha-auto-taking-over>
+                                    {t('haAutoTakingOver').replace('{n}', Math.ceil(auto.acting_in))}
+                                </span>
+                            )}
+                        </div>
+                    )}
+                    {mode === 'auto_pending' && (
+                        <div className="rounded-lg p-3 text-sm border bg-blue-500/10 border-blue-500/30 text-blue-200 space-y-1"
+                            data-ha-auto-pending={waiting ? waiting.length : 'member'}>
+                            <div style={{ overflowWrap: 'anywhere' }}>
+                                {waiting ? (waiting.length ? t('haAutoWaitingFor').replace('{names}', () => waiting.map(nameOf).join(', '))
+                                                           : t('haAutoWaitingNone'))
+                                    : pending?.own ? t('haAutoPendingOwn')
+                                    : pending && (pending.by_url || pending.by) ? t('haAutoPendingBy').replace('{who}', () => pending.by_url || String(pending.by).slice(0, 8))
+                                    : t('haAutoPendingGroup')}
+                            </div>
+                            {typeof pending?.since === 'string' && pending.since && (
+                                <div className="text-xs text-gray-400">{t('haAutoPendingSince').replace('{time}', () => fmtDate(pending.since))}</div>
+                            )}
+                        </div>
+                    )}
+                    {offWaits && mode === 'auto' && (
+                        <p className="text-xs text-yellow-300" data-ha-auto-off-waiting>{t('haAutoOffWaiting')}</p>
+                    )}
+                    {shownChecks && (
+                        <div className="space-y-2" data-ha-auto-checks={blocked ? 'block' : amber.length ? 'warn' : 'ok'}>
+                            <div className="text-xs font-medium text-gray-400">{t(mode === 'manual' ? 'haAutoChecksTitle' : 'haAutoLookAt')}</div>
+                            {shownChecks.length === 0 && <p className="text-xs text-gray-500" data-ha-auto-nothing>{t('haAutoNothing')}</p>}
+                            <ul className="space-y-2">
+                                {shownChecks.map(c => (
+                                    <li key={c.key} data-ha-auto-check={c.key} data-ha-auto-level={c.level} className="flex items-start gap-2 text-sm">
+                                        <span className={`mt-0.5 flex-shrink-0 ${c.level === 'block' ? 'text-red-400' : c.level === 'warn' ? 'text-yellow-400' : 'text-green-400'}`}>
+                                            {c.level === 'block' ? <Icons.XCircle /> : c.level === 'warn' ? <Icons.AlertTriangle /> : <Icons.CheckCircle />}
+                                        </span>
+                                        <div className="min-w-0 flex-1 space-y-1">
+                                            <div className={c.level === 'block' ? 'text-red-300' : c.level === 'warn' ? 'text-yellow-200' : 'text-gray-300'}>
+                                                {t(HA_AUTO_CHECK_LABEL[c.key])}
+                                            </div>
+                                            {/* the server's own sentence, with the member and the numbers in it */}
+                                            {c.findings.map((f, i) => (
+                                                <p key={i} data-ha-auto-finding={f.code} className="text-xs text-gray-400" style={{ overflowWrap: 'anywhere' }}>
+                                                    {typeof f.text === 'string' && f.text ? f.text : f.code}
+                                                </p>
+                                            ))}
+                                            {c.level === 'warn' && mode === 'manual' && (
+                                                <label className="flex items-start gap-2 text-xs text-gray-200 cursor-pointer">
+                                                    <input type="checkbox" checked={ticked.includes(c.key)} disabled={busy} className="mt-0.5"
+                                                        onChange={e => { const v = e.target.checked; setTicked(k => v ? [...k, c.key] : k.filter(x => x !== c.key)); }} />
+                                                    <span>{t('haAutoUnderstand')}</span>
+                                                </label>
+                                            )}
+                                        </div>
+                                    </li>
+                                ))}
+                            </ul>
+                            {blocked && <p className="text-xs text-red-300" data-ha-auto-blocked>{t('haAutoBlocked')}</p>}
+                        </div>
+                    )}
+                    {leader && mode === 'auto' && quarantined.length > 0 && (
+                        <div className="space-y-2" data-ha-auto-quarantined={quarantined.length}>
+                            {quarantined.map(r => (
+                                <div key={r.instance_id} data-ha-auto-quarantine={r.instance_id}
+                                    className="flex flex-wrap items-center justify-between gap-2 rounded-lg p-2 border bg-red-500/10 border-red-500/30">
+                                    <span className="text-sm text-red-300" style={{ overflowWrap: 'anywhere' }}>{labelOf(r.instance_id)}: {t('haAutoQuarantined')}</span>
+                                    <button type="button" onClick={() => open('readmit', r.instance_id)} disabled={busy || broken || !!form} className={HA_GROUP_GHOST}>
+                                        <Icons.RotateCcw />
+                                        {t('haAutoReadmit')}
+                                    </button>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                    {form && leader && (
+                        <div data-ha-auto-form={form}
+                            className={`rounded-lg p-3 space-y-3 border ${form === 'off' ? 'bg-red-500/10 border-red-500/30' : 'bg-proxmox-card border-proxmox-border'}`}>
+                            <p className={`text-sm ${form === 'off' ? 'text-red-300' : 'text-gray-300'}`} style={{ overflowWrap: 'anywhere' }}>{formText}</p>
+                            {(form === 'on' || form === 'lease') && (
+                                <div>
+                                    <label className="block text-xs text-gray-400 mb-1" htmlFor="pgha-lease">{t('haAutoLeaseLabel')}</label>
+                                    <input id="pgha-lease" type="number" min={HA_LEASE.min} max={HA_LEASE.max} step="1" value={lease}
+                                        onChange={e => setLease(e.target.value)} aria-invalid={leaseOk ? undefined : 'true'} className={`w-32 ${HA_GROUP_FIELD}`} />
+                                    <p className="text-xs text-gray-500 mt-1" data-ha-auto-lease-note>
+                                        {t('haAutoLeaseNote').replace('{lo}', lo).replace('{hi}', hi).replace('{l}', leaseShown)}
+                                    </p>
+                                    {!leaseOk && <p className="text-xs text-red-300" data-ha-auto-lease-range>{t('haAutoLeaseRange')}</p>}
+                                </div>
+                            )}
+                            {form === 'on' && amber.some(c => !ticked.includes(c.key)) && (
+                                <p className="text-xs text-yellow-300" data-ha-auto-needs-ticks>{t('haAutoConfirm')}</p>
+                            )}
+                            <div className="max-w-sm">
+                                <HaGroupPassword t={t} id="pgha-auto-password" sso={sso} value={password} onChange={setPassword} refused={refused} logout={logout} />
+                            </div>
+                            {refused && !reauth && (
+                                <div role="alert" data-ha-auto-refused={refused.code || 'error'} style={{ overflowWrap: 'anywhere' }}
+                                    className="rounded-lg p-2 text-sm border bg-red-500/10 border-red-500/30 text-red-300">
+                                    {refused.code === 'HA_AUTO_REFUSED' ? t('haAutoRefused') : refused.code === 'HA_AUTO_CONFIRM' ? t('haAutoConfirm') : refused.error}
+                                </div>
+                            )}
+                            <div className="flex flex-wrap items-center gap-2">
+                                <button type="button" onClick={submit} disabled={!ready}
+                                    className={`${HA_GROUP_BTN} text-white ${form === 'off' ? 'bg-red-600 hover:bg-red-700' : 'bg-proxmox-orange hover:bg-proxmox-orange/90'}`}>
+                                    {t(formButton)}
+                                </button>
+                                <button type="button" onClick={() => open(null)} className={HA_GROUP_GHOST}>{t('cancel')}</button>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // The third vote: added with a one-time code that the witness host takes, removed with the
+        // word and the password. A member sees the witness of its group, and nothing to change.
+        function HaWitnessCard({ t, status, auto, leader, getAuthHeaders, load, addToast, broken, notShipped, onNotShipped }) {
+            const { user, logout } = useAuth();
+            const sso = ['oidc', 'entra'].includes(user?.auth_source);
+            const witness = auto?.witness && typeof auto.witness === 'object' && typeof auto.witness.instance_id === 'string' ? auto.witness : null;
+            const [url, setUrl] = useState('');
+            const [site, setSite] = useState('');
+            const [password, setPassword] = useState('');
+            const [code, setCode] = useState(null);           // {code, expires_at, commands}, shown once
+            const [now, setNow] = useState(Date.now());
+            const [removing, setRemoving] = useState(false);
+            const [typed, setTyped] = useState('');
+            const [refused, setRefused] = useState(null);     // {code, error} of the last refusal
+            const [busy, setBusy] = useState(false);
+            const [gone, setGone] = useState(null);           // {told} of the last removal
+
+            // prefilled once, never over something typed
+            useEffect(() => { setUrl(v => v || status.suggested_url || ''); }, [status.suggested_url]);
+            const expired = !!code && code.expires_at * 1000 <= now;
+            // the code is spent once the witness shows up in the status
+            useEffect(() => {
+                if (!witness || !code) return;
+                setCode(null);
+                addToast?.(t('haWitnessJoined'), 'success');
+            }, [!!witness]);
+            // and until then the status is read every few seconds instead of every ten
+            useEffect(() => {
+                if (!code || witness || expired) return;
+                const tick = setInterval(() => setNow(Date.now()), 1000);
+                const poll = setInterval(load, 3000);
+                return () => { clearInterval(tick); clearInterval(poll); };
+            }, [code, !!witness, expired]);
+
+            const createCode = async () => {
+                const target = url.trim();
+                setRefused(null);
+                setGone(null);
+                if (!target.startsWith('https://')) { setRefused({ code: '', error: t('haWitnessUrlHttps') }); return; }
+                const body = { url: target, site: site.trim() };
+                setBusy(true);
+                let res;
+                try {
+                    res = await haGroupSend(getAuthHeaders, 'POST', 'witness/pairing-code', sso ? body : { ...body, user_password: password },
+                                            t('pgHaActionFailed'));
+                } finally {
+                    setBusy(false);
+                    setPassword('');
+                }
+                if (!res.ok) {
+                    if (res.code === 'HA_AUTO_NOT_SHIPPED') { onNotShipped(); return; }
+                    setRefused({ code: res.code, error: res.error });
+                    return;
+                }
+                setCode({ code: res.data.code, expires_at: res.data.expires_at,
+                          commands: res.data.commands && typeof res.data.commands === 'object' ? res.data.commands : {} });
+                setNow(Date.now());
+                load();
+            };
+
+            const remove = async () => {
+                setRefused(null);
+                const body = { confirm: 'REMOVE' };
+                setBusy(true);
+                let res;
+                try {
+                    res = await haGroupSend(getAuthHeaders, 'POST', 'witness/remove', sso ? body : { ...body, user_password: password },
+                                            t('pgHaActionFailed'));
+                } finally {
+                    setBusy(false);
+                    setPassword('');
+                }
+                if (!res.ok) {
+                    setRefused({ code: res.code, error: res.error });
+                    return;
+                }
+                setRemoving(false);
+                setTyped('');
+                setGone({ told: res.data.told === true });
+                addToast?.(t('haWitnessRemoved'), res.data.told === true ? 'success' : 'info');
+                load();
+            };
+
+            const reauth = refused && (refused.code === 'HA_REAUTH' || refused.code === 'HA_REAUTH_RECENT');
+            const refusal = refused && !reauth && (
+                <div role="alert" data-ha-witness-refused={refused.code || 'error'} style={{ overflowWrap: 'anywhere' }}
+                    className="rounded-lg p-2 text-sm border bg-red-500/10 border-red-500/30 text-red-300">
+                    {refused.error}
+                </div>
+            );
+            const left = code ? Math.max(0, Math.floor(code.expires_at - now / 1000)) : 0;
+            const commands = code ? code.commands : {};
+            const row = (label, value) => (
+                <div className="flex items-start justify-between gap-4 text-sm">
+                    <span className="text-gray-400 whitespace-nowrap">{label}</span>
+                    <span className="text-gray-200 text-right min-w-0 break-all">{value}</span>
+                </div>
+            );
+            // what to run on the witness host, as the server spells it out, each with a copy button
+            const command = (kind, label, value) => typeof value === 'string' && value !== '' && (
+                <div className="space-y-1" data-ha-witness-command={kind}>
+                    {label && <div className="text-xs text-gray-400">{label}</div>}
+                    <div className="flex items-start gap-2">
+                        <code className="flex-1 min-w-0 px-3 py-2 bg-black/40 rounded text-xs text-gray-200 break-all font-mono select-all">{value}</code>
+                        <span className="shrink-0 inline-flex">
+                            <CopyButton value={value} size="md" title={t('copy')} className="w-8 h-8 border border-proxmox-border hover:border-gray-500" />
+                        </span>
+                    </div>
+                </div>
+            );
+
+            return (
+                <div className={HA_GROUP_CARD} data-ha-witness={witness ? 'paired' : code && !expired ? 'waiting' : 'none'}>
+                    <h4 className="font-medium text-white flex items-center gap-2">
+                        <Icons.Scale />
+                        {t(witness || !leader ? 'haWitnessTitle' : 'haWitnessAddTitle')}
+                    </h4>
+                    <p className="text-sm text-gray-400">{t('haWitnessIntro')}</p>
+                    {witness ? (
+                        <>
+                            <div className="space-y-1.5">
+                                {row(t('pgHaPeerUrl'), <span className="font-mono text-xs" data-ha-witness-url>{witness.url || '-'}</span>)}
+                                {row(t('haAutoColSite'), <span data-ha-witness-site>{witness.site || '-'}</span>)}
+                                {witness.key_fingerprint && row(t('pgHaKey'), <span className="font-mono text-xs">{witness.key_fingerprint}</span>)}
+                                {row(t('haWitnessHeard'), typeof witness.last_heard === 'number'
+                                    ? <span data-ha-witness-heard={Math.round(witness.last_heard)}>{t('haWitnessHeardAgo').replace('{n}', Math.round(witness.last_heard))}</span>
+                                    : <span className="text-yellow-300" data-ha-witness-heard="never">{t('haAutoNotHeard')}</span>)}
+                                {typeof witness.skew === 'number' && row(t('haAutoColSkew'), (
+                                    <span className={Math.abs(witness.skew) > HA_SKEW_LIMIT ? 'text-red-300' : undefined} data-ha-witness-skew>{haSkewText(witness.skew)}</span>
+                                ))}
+                            </div>
+                            {witness.write_failed === true && (
+                                <div className="rounded-lg p-3 text-sm border bg-yellow-500/10 border-yellow-500/40 text-yellow-200 flex items-start gap-2" data-ha-witness-unwritten>
+                                    <span className="mt-0.5 flex-shrink-0"><Icons.AlertTriangle /></span>
+                                    <span>{t('haWitnessUnwritten')}</span>
+                                </div>
+                            )}
+                            {leader && !removing && (
+                                <button type="button" onClick={() => { setRemoving(true); setTyped(''); setPassword(''); setRefused(null); }}
+                                    disabled={busy || broken} className={HA_GROUP_GHOST}>
+                                    <Icons.UserX />
+                                    {t('haWitnessRemove')}
+                                </button>
+                            )}
+                            {leader && removing && (
+                                <div className="rounded-lg p-3 space-y-3 border bg-red-500/10 border-red-500/30" data-ha-witness-remove>
+                                    <p className="text-sm text-red-300">{t('haWitnessRemoveDesc')}</p>
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                        <div>
+                                            <label className="block text-xs text-gray-400 mb-1" htmlFor="pgha-witness-typed">
+                                                {t('pgHaTypeToConfirm').replace('{word}', 'REMOVE')}
+                                            </label>
+                                            <input id="pgha-witness-typed" value={typed} onChange={e => setTyped(e.target.value)} autoComplete="off"
+                                                spellCheck={false} placeholder="REMOVE" className={`w-full ${HA_GROUP_FIELD} font-mono`} />
+                                        </div>
+                                        <div className="space-y-2">
+                                            <HaGroupPassword t={t} id="pgha-witness-password" sso={sso} value={password} onChange={setPassword} refused={refused} logout={logout} />
+                                        </div>
+                                    </div>
+                                    {refusal}
+                                    <div className="flex flex-wrap items-center gap-2">
+                                        <button type="button" onClick={remove} disabled={typed !== 'REMOVE' || (!sso && !password) || busy || broken}
+                                            className={`${HA_GROUP_BTN} bg-red-600 hover:bg-red-700 text-white`}>
+                                            <Icons.UserX />
+                                            {t('haWitnessRemove')}
+                                        </button>
+                                        <button type="button" onClick={() => { setRemoving(false); setRefused(null); setPassword(''); }} className={HA_GROUP_GHOST}>
+                                            {t('cancel')}
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
+                        </>
+                    ) : (
+                        <>
+                            {gone && (
+                                <div data-ha-witness-gone={gone.told ? 'told' : 'not-reached'}
+                                    className={`rounded-lg p-3 text-sm border space-y-2 ${gone.told
+                                        ? 'bg-green-500/10 border-green-500/30 text-green-300'
+                                        : 'bg-yellow-500/10 border-yellow-500/40 text-yellow-200'}`}>
+                                    <p>{t(gone.told ? 'haWitnessRemovedTold' : 'haWitnessRemovedNotReached')}</p>
+                                    {!gone.told && command('leave', '', HA_WITNESS_LEAVE)}
+                                </div>
+                            )}
+                            {notShipped ? (
+                                <div className="rounded-lg p-3 text-sm border bg-blue-500/10 border-blue-500/30 text-blue-200 flex items-start gap-2" data-ha-witness-not-shipped>
+                                    <span className="mt-0.5 flex-shrink-0"><Icons.Info /></span>
+                                    <span>{t('haWitnessNotShipped')}</span>
+                                </div>
+                            ) : leader && (
+                                <>
+                                    <div>
+                                        <label className="block text-xs text-gray-400 mb-1" htmlFor="pgha-witness-url">{t('haWitnessUrl')}</label>
+                                        <input id="pgha-witness-url" value={url} onChange={e => setUrl(e.target.value)} spellCheck={false}
+                                            placeholder="https://pegaprox-a.example:5000" className={`w-full ${HA_GROUP_FIELD} font-mono`} />
+                                    </div>
+                                    <div>
+                                        <label className="block text-xs text-gray-400 mb-1" htmlFor="pgha-witness-site">{t('haWitnessSite')}</label>
+                                        <input id="pgha-witness-site" value={site} maxLength={64} onChange={e => setSite(e.target.value)}
+                                            className={`w-full ${HA_GROUP_FIELD}`} />
+                                        <div className="text-[11px] text-gray-500 mt-1">{t('haWitnessSiteHint')}</div>
+                                    </div>
+                                    <HaGroupPassword t={t} id="pgha-witness-password" sso={sso} value={password} onChange={setPassword} refused={refused} logout={logout} />
+                                    {refusal}
+                                    <button type="button" onClick={createCode} disabled={busy || broken || !url.trim() || (!sso && !password)}
+                                        className={`${HA_GROUP_BTN} bg-proxmox-orange hover:bg-proxmox-orange/90 text-white`}>
+                                        <Icons.Key />
+                                        {t('haWitnessCreate')}
+                                    </button>
+                                    {code && (
+                                        <div className="bg-yellow-500/10 border border-yellow-500/40 rounded-xl p-3 space-y-2" data-ha-witness-code>
+                                            <div className="text-xs font-medium text-yellow-200">{t('haWitnessCodeOnce')}</div>
+                                            {expired ? (
+                                                <p className="text-sm text-red-300" data-ha-witness-expired>{t('pgHaCodeExpired')}</p>
+                                            ) : (
+                                                <>
+                                                    {command('code', '', code.code)}
+                                                    <div className="flex items-center gap-2 text-xs text-gray-400">
+                                                        <Icons.Clock />
+                                                        <span>{t('pgHaCodeExpiresIn').replace('{time}', () => `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`)}</span>
+                                                    </div>
+                                                    <p className="text-xs text-gray-400">{t('haWitnessRunOne')}</p>
+                                                    {command('package', t('haWitnessPackage'), commands.package)}
+                                                    {command('docker', t('haWitnessDocker'), commands.docker)}
+                                                    <p className="text-xs text-gray-400 flex items-center gap-2" data-ha-witness-waiting>
+                                                        <span className="inline-flex animate-spin"><Icons.RefreshCw /></span>
+                                                        {t('haWitnessWaiting')}
+                                                    </p>
+                                                </>
+                                            )}
+                                        </div>
+                                    )}
+                                </>
+                            )}
+                        </>
+                    )}
+                </div>
+            );
+        }
+
+        // The zone the schedules of the group fire in, whichever member leads. Set on the leader,
+        // no password: it decides when a schedule fires, not which instance acts.
+        function HaZoneCard({ t, status, auto, members, memberName, leader, getAuthHeaders, load, addToast, broken }) {
+            const zone = typeof status.timezone === 'string' ? status.timezone : '';
+            const local = typeof status.timezone_local === 'string' ? status.timezone_local : '';
+            const unreadable = typeof status.timezone_unreadable === 'string' ? status.timezone_unreadable : '';
+            const [value, setValue] = useState('');
+            const [error, setError] = useState('');
+            const [busy, setBusy] = useState(false);
+            useEffect(() => { setValue(v => v || zone || local); }, [zone, local]);
+            // members in another zone than the group's: their schedules still go by the group's
+            const others = zone && Array.isArray(auto?.members)
+                ? auto.members.filter(r => r && r.kind !== 'witness' && typeof r.zone === 'string' && r.zone && r.zone !== zone) : [];
+            const nameOf = (r) => memberName(members.find(m => m.instance_id === r.instance_id) || { instance_id: String(r.instance_id || '') });
+            const choices = [...new Set([zone, local, ...TIMEZONES].filter(Boolean))];
+            const wanted = value.trim();
+
+            const save = async () => {
+                setBusy(true);
+                setError('');
+                let res;
+                try {
+                    res = await haGroupSend(getAuthHeaders, 'PUT', 'timezone', { timezone: wanted }, t('pgHaActionFailed'));
+                } finally {
+                    setBusy(false);
+                }
+                if (!res.ok) { setError(res.error); return; }
+                addToast?.(t(res.data.changed === false ? 'haZoneUnchanged' : 'haZoneSaved'), 'success');
+                load();
+            };
+
+            const row = (label, value) => (
+                <div className="flex items-start justify-between gap-4 text-sm">
+                    <span className="text-gray-400 whitespace-nowrap">{label}</span>
+                    <span className="text-gray-200 text-right min-w-0 break-all">{value}</span>
+                </div>
+            );
+            return (
+                <div className={HA_GROUP_CARD} data-ha-zone={zone || 'none'}>
+                    <h4 className="font-medium text-white flex items-center gap-2">
+                        <Icons.Globe />
+                        {t('haZoneTitle')}
+                    </h4>
+                    <p className="text-sm text-gray-400">{t('haZoneIntro')}</p>
+                    <div className="space-y-1.5">
+                        {row(t('haZoneGroup'), zone ? <span className="font-mono" data-ha-zone-group={zone}>{zone}</span>
+                            : <span className="text-gray-400" data-ha-zone-group="">{t('haZoneEach')}</span>)}
+                        {row(t('haZoneLocal'), local ? <span className="font-mono" data-ha-zone-local={local}>{local}</span>
+                            : <span className="text-yellow-300" data-ha-zone-local="">{t('haZoneLocalUnknown')}</span>)}
+                    </div>
+                    {unreadable && (
+                        <div className="rounded-lg p-3 text-sm border bg-yellow-500/10 border-yellow-500/40 text-yellow-200 flex items-start gap-2" data-ha-zone-unreadable>
+                            <span className="mt-0.5 flex-shrink-0"><Icons.AlertTriangle /></span>
+                            <span style={{ overflowWrap: 'anywhere' }}>{t('haZoneUnreadable').replace('{zone}', () => unreadable)}</span>
+                        </div>
+                    )}
+                    {!unreadable && zone && local && zone !== local && (
+                        <div className="rounded-lg p-3 text-sm border bg-blue-500/10 border-blue-500/30 text-blue-200 flex items-start gap-2" data-ha-zone-differs>
+                            <span className="mt-0.5 flex-shrink-0"><Icons.Info /></span>
+                            <span style={{ overflowWrap: 'anywhere' }}>{t('haZoneDiffers').replace('{local}', () => local).replace('{zone}', () => zone)}</span>
+                        </div>
+                    )}
+                    {!zone && !unreadable && <p className="text-xs text-gray-400" data-ha-zone-none>{t('haZoneNone')}</p>}
+                    {others.length > 0 && (
+                        <p className="text-xs text-gray-400" style={{ overflowWrap: 'anywhere' }} data-ha-zone-members={others.length}>
+                            {t('haZoneMembers').replace('{list}', () => others.map(r => `${nameOf(r)} (${r.zone})`).join(', '))}
+                        </p>
+                    )}
+                    {leader ? (
+                        <div className="space-y-2">
+                            <label className="block text-xs text-gray-400" htmlFor="pgha-zone">{t('haZoneSet')}</label>
+                            <div className="flex flex-wrap items-center gap-2">
+                                <input id="pgha-zone" list="pgha-zone-list" value={value} onChange={e => { setValue(e.target.value); setError(''); }}
+                                    spellCheck={false} autoComplete="off" placeholder="Europe/Vienna" className={`w-64 font-mono ${HA_GROUP_FIELD}`} />
+                                <datalist id="pgha-zone-list">
+                                    {choices.map(z => <option key={z} value={z} />)}
+                                </datalist>
+                                <button type="button" onClick={save} disabled={busy || broken || !wanted || wanted === zone} className={HA_GROUP_GHOST}>
+                                    {t('save')}
+                                </button>
+                            </div>
+                            <p className="text-xs text-gray-500">{t('haZoneSetHint')}</p>
+                            {error && (
+                                <p role="alert" className="text-sm text-red-300" style={{ overflowWrap: 'anywhere' }} data-ha-zone-error>{error}</p>
+                            )}
+                        </div>
+                    ) : (
+                        <p className="text-xs text-gray-500 flex items-start gap-2">
+                            <span className="flex-shrink-0"><Icons.Lock className="w-4 h-4" /></span>
+                            <span>{t('haZoneOnLeader')}</span>
+                        </p>
                     )}
                 </div>
             );
