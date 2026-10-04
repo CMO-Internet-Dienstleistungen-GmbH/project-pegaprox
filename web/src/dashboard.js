@@ -10002,6 +10002,11 @@
             const [escSteps, setEscSteps] = useState([]);  // NS #501 — escalation steps in the create modal
             const [alertMetricSel, setAlertMetricSel] = useState('cpu');  // #601 — drives the threshold unit (% vs °C)
             const [editingAlert, setEditingAlert] = useState(null);  // #618 — alert being edited (null = create)
+            // LW Oct 2026 - mutes of the cluster, and which mute menu is open ({ kind: 'rule'|'incident', id })
+            const [alertMutes, setAlertMutes] = useState([]);
+            const [muteMenu, setMuteMenu] = useState(null);
+            const [muteWholeObject, setMuteWholeObject] = useState(false);
+            const EVENT_ALERT_METRICS = ['task_failed', 'ceph_health', 'replication', 'snapshot_age'];
             const [sessionExpired, setSessionExpired] = useState(false);  // any 401 -> clear "session expired" overlay instead of silent failure
             const [clusterAffinityRules, setClusterAffinityRules] = useState([]);
             const [showAffinityModal, setShowAffinityModal] = useState(false);
@@ -11710,6 +11715,10 @@
                         setShowAlertModal(false);
                         loadClusterAlerts(selectedCluster.id);
                         addToast(t('alertCreated') || 'Alert created', 'success');
+                    } else if (response) {
+                        // the dialog stays open with what was typed; the server says what it refused
+                        const d = await response.json().catch(() => ({}));
+                        addToast(d.error || t('error') || 'Error', 'error');
                     }
                 } catch (err) {
                     console.error('Failed to create alert:', err);
@@ -11730,6 +11739,9 @@
                         setEditingAlert(null);
                         loadClusterAlerts(selectedCluster.id);
                         addToast(t('alertUpdated') || 'Alert updated', 'success');
+                    } else if (response) {
+                        const d = await response.json().catch(() => ({}));
+                        addToast(d.error || t('error') || 'Error', 'error');
                     }
                 } catch (err) {
                     console.error('Failed to update alert:', err);
@@ -11799,6 +11811,78 @@
                     const r = await authFetch(`${API_URL}/clusters/${selectedCluster.id}/active-alerts/${firedId}/ack`, { method: 'POST' });
                     if (r && r.ok) { addToast(t('alertAcked') || 'Alert acknowledged', 'success'); loadActiveAlerts(selectedCluster.id); }
                 } catch (e) { console.error('Failed to ack alert:', e); }
+            };
+
+            // LW Oct 2026 - mutes: a rule, an incident or everything about one guest or node, for a while
+            const loadAlertMutes = async (clusterId) => {
+                if (!clusterId) return;
+                try {
+                    const r = await authFetch(`${API_URL}/clusters/${clusterId}/alert-mutes`);
+                    if (r && r.ok) { const d = await r.json(); setAlertMutes(d.mutes || []); }
+                    else setAlertMutes([]);
+                } catch (e) { setAlertMutes([]); }
+            };
+            const muteAlert = async (body) => {
+                if (!selectedCluster?.id) return;
+                try {
+                    const r = await authFetch(`${API_URL}/clusters/${selectedCluster.id}/alert-mutes`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body)
+                    });
+                    setMuteMenu(null);
+                    if (r && r.ok) {
+                        addToast(t('alertMuteDone'), 'success');
+                        loadAlertMutes(selectedCluster.id);
+                        loadActiveAlerts(selectedCluster.id);
+                    } else if (r) {
+                        const d = await r.json().catch(() => ({}));
+                        addToast(d.error || t('error') || 'Error', 'error');
+                    }
+                } catch (e) { console.error('Failed to mute alert:', e); }
+            };
+            const unmuteAlert = async (muteId) => {
+                if (!selectedCluster?.id || !muteId) return;
+                try {
+                    const r = await authFetch(`${API_URL}/clusters/${selectedCluster.id}/alert-mutes/${encodeURIComponent(muteId)}`, { method: 'DELETE' });
+                    if (r && r.ok) {
+                        addToast(t('alertUnmuteDone'), 'success');
+                        setAlertMutes(prev => prev.filter(m => m.id !== muteId));
+                        loadActiveAlerts(selectedCluster.id);
+                    }
+                } catch (e) { console.error('Failed to lift mute:', e); }
+            };
+            const ruleMute = (ruleId) => alertMutes.find(m => m.rule_id === ruleId && !m.object_key);
+            // body() is read when a duration is picked, so the "every rule" box counts as it is then
+            const renderMuteChoices = (body, wholeName) => (
+                <div data-mute-menu className="mt-2 p-2 rounded-lg border border-proxmox-border bg-proxmox-darker space-y-2">
+                    <div className="text-xs text-gray-400">{t('alertMuteFor')}</div>
+                    <div className="flex flex-wrap gap-1">
+                        {[[60, 'alertMute1h'], [240, 'alertMute4h'], [1440, 'alertMute1d'], [10080, 'alertMute7d']].map(([minutes, key]) => (
+                            <button key={key} type="button" onClick={() => muteAlert({ ...body(), minutes })} className="px-2.5 py-1 text-xs bg-proxmox-dark hover:bg-proxmox-hover border border-proxmox-border rounded-lg">
+                                {t(key)}
+                            </button>
+                        ))}
+                    </div>
+                    {wholeName && (
+                        <label className="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+                            <input type="checkbox" checked={muteWholeObject} onChange={e => setMuteWholeObject(e.target.checked)} />
+                            {t('alertMuteWholeObject').replace('{name}', wholeName)}
+                        </label>
+                    )}
+                </div>
+            );
+            const fmtMuteUntil = (iso) => {
+                const d = new Date(iso);
+                return isNaN(d.getTime()) ? String(iso || '') : d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+            };
+            const alertRuleSummary = (alert) => {
+                const n = alert.threshold;
+                if (alert.metric === 'task_failed') return t('alertSummaryTask').replace('{type}', alert.task_type || 'vzdump') + (alert.task_status ? ` (${alert.task_status})` : '');
+                if (alert.metric === 'ceph_health') return `${t('alertMetricCeph')}: ${Number(n) >= 1 ? t('alertCephErrOnly') : t('alertCephWarnPlus')}`;
+                if (alert.metric === 'replication') return t('alertSummaryRepl').replace('{n}', n);
+                if (alert.metric === 'snapshot_age') return t('alertSummarySnap').replace('{n}', n);
+                return `${alert.metric?.toUpperCase()} ${alert.operator} ${alert.threshold}%`;
             };
 
             // ============================================
@@ -12109,6 +12193,7 @@
                     loadClusterTags(selectedCluster.id);
                     loadClusterAlerts(selectedCluster.id);
                     loadActiveAlerts(selectedCluster.id);  // NS #501
+                    loadAlertMutes(selectedCluster.id);
                     loadClusterAffinityRules(selectedCluster.id);
                     loadCustomScripts(selectedCluster.id);
                 }
@@ -18455,7 +18540,8 @@
                                                                     {t('activeAlerts') || 'Active Alerts'} <span className="text-xs text-gray-500">({activeAlerts.length})</span>
                                                                 </div>
                                                                 {activeAlerts.map(a => (
-                                                                    <div key={a.id} className={`flex items-center justify-between p-3 rounded-lg border ${a.acked_at ? 'bg-proxmox-darker border-proxmox-darker opacity-70' : 'bg-amber-500/10 border-amber-500/30'}`}>
+                                                                    <div key={a.id} data-active-alert={a.id} className={`p-3 rounded-lg border ${a.acked_at || a.muted_until ? 'bg-proxmox-darker border-proxmox-darker opacity-70' : 'bg-amber-500/10 border-amber-500/30'}`}>
+                                                                    <div className="flex items-center justify-between">
                                                                         <div className="flex items-center gap-3 min-w-0">
                                                                             <span className={`px-1.5 py-0.5 text-[10px] rounded uppercase font-mono shrink-0 ${
                                                                                 a.severity === 'critical' ? 'bg-red-500/20 text-red-400' :
@@ -18468,14 +18554,32 @@
                                                                                     {fmtDate ? fmtDate(a.triggered_at) : a.triggered_at}
                                                                                     {a.escalation_step > 0 && <span className="text-amber-400 ml-2">↑ {t('escStep') || 'esc'} {a.escalation_step}</span>}
                                                                                     {a.acked_at && <span className="text-green-400 ml-2">✓ {t('acked') || 'acked'}{a.acked_by ? ` (${a.acked_by})` : ''}</span>}
+                                                                                    {a.muted_until && <span data-alert-muted className="text-gray-400 ml-2 inline-flex items-center gap-1"><Icons.BellOff className="w-3 h-3" />{t('alertMuted').replace('{time}', fmtMuteUntil(a.muted_until))}</span>}
                                                                                 </div>
                                                                             </div>
                                                                         </div>
-                                                                        {!a.acked_at && !haReadOnly && (
-                                                                            <button onClick={() => ackAlert(a.id)} className="px-3 py-1.5 text-xs bg-proxmox-dark hover:bg-proxmox-hover border border-proxmox-border rounded-lg shrink-0">
-                                                                                {t('acknowledge') || 'Acknowledge'}
-                                                                            </button>
+                                                                        {!haReadOnly && (
+                                                                        <div className="flex items-center gap-1 shrink-0">
+                                                                            {!a.muted_until && (
+                                                                                <button
+                                                                                    onClick={() => { setMuteWholeObject(false); setMuteMenu(muteMenu && muteMenu.kind === 'incident' && muteMenu.id === a.id ? null : { kind: 'incident', id: a.id }); }}
+                                                                                    title={t('alertMute')}
+                                                                                    className="p-1.5 hover:bg-proxmox-hover rounded text-gray-500 hover:text-proxmox-orange"
+                                                                                >
+                                                                                    <Icons.BellOff className="w-4 h-4" />
+                                                                                </button>
+                                                                            )}
+                                                                            {!a.acked_at && (
+                                                                                <button onClick={() => ackAlert(a.id)} className="px-3 py-1.5 text-xs bg-proxmox-dark hover:bg-proxmox-hover border border-proxmox-border rounded-lg shrink-0">
+                                                                                    {t('acknowledge') || 'Acknowledge'}
+                                                                                </button>
+                                                                            )}
+                                                                        </div>
                                                                         )}
+                                                                    </div>
+                                                                    {muteMenu && muteMenu.kind === 'incident' && muteMenu.id === a.id && !haReadOnly && renderMuteChoices(
+                                                                        () => (muteWholeObject ? { active_alert_id: a.id, whole_object: true } : { active_alert_id: a.id }),
+                                                                        (a.target_type === 'vm' || a.target_type === 'node') && a.target_name ? a.target_name : null)}
                                                                     </div>
                                                                 ))}
                                                             </div>
@@ -18489,7 +18593,8 @@
                                                         ) : (
                                                             <div className="space-y-2">
                                                                 {clusterAlerts.map(alert => (
-                                                                    <div key={alert.id} className={`flex items-center justify-between p-3 rounded-lg border ${alert.enabled ? 'bg-proxmox-dark border-proxmox-border' : 'bg-proxmox-darker border-proxmox-darker opacity-60'}`}>
+                                                                    <div key={alert.id} data-alert-rule={alert.id} className={`p-3 rounded-lg border ${alert.enabled ? 'bg-proxmox-dark border-proxmox-border' : 'bg-proxmox-darker border-proxmox-darker opacity-60'}`}>
+                                                                    <div className="flex items-center justify-between">
                                                                         <div className="flex items-center gap-3">
                                                                             <button
                                                                                 onClick={() => toggleAlertEnabled(alert.id, !alert.enabled)}
@@ -18511,13 +18616,27 @@
                                                                                          t('cluster') || 'Cluster'}
                                                                                     </span>
                                                                                 </div>
-                                                                                <div className="text-xs text-gray-500">
-                                                                                    {alert.metric?.toUpperCase()} {alert.operator} {alert.threshold}%
+                                                                                <div className="text-xs text-gray-500 flex items-center gap-2 flex-wrap">
+                                                                                    <span>{alertRuleSummary(alert)}</span>
+                                                                                    {ruleMute(alert.id) && (
+                                                                                        <span data-rule-muted className="inline-flex items-center gap-1 text-gray-400">
+                                                                                            <Icons.BellOff className="w-3 h-3" />{t('alertMuted').replace('{time}', fmtMuteUntil(ruleMute(alert.id).until))}
+                                                                                        </span>
+                                                                                    )}
                                                                                 </div>
                                                                             </div>
                                                                         </div>
                                                                         {!haReadOnly && (
                                                                         <div className="flex items-center gap-1">
+                                                                            {ruleMute(alert.id) ? (
+                                                                                <button onClick={() => unmuteAlert(ruleMute(alert.id).id)} title={t('alertUnmute')} className="p-1.5 hover:bg-proxmox-hover rounded text-proxmox-orange">
+                                                                                    <Icons.BellOff className="w-4 h-4" />
+                                                                                </button>
+                                                                            ) : (
+                                                                                <button onClick={() => { setMuteWholeObject(false); setMuteMenu(muteMenu && muteMenu.kind === 'rule' && muteMenu.id === alert.id ? null : { kind: 'rule', id: alert.id }); }} title={t('alertMute')} className="p-1.5 hover:bg-proxmox-hover rounded text-gray-500 hover:text-proxmox-orange">
+                                                                                    <Icons.BellOff className="w-4 h-4" />
+                                                                                </button>
+                                                                            )}
                                                                             <button onClick={() => openEditAlert(alert)} title={t('editAlert') || 'Edit Alert'} className="p-1.5 hover:bg-proxmox-hover rounded text-gray-500 hover:text-proxmox-orange">
                                                                                 <Icons.Edit className="w-4 h-4" />
                                                                             </button>
@@ -18527,12 +18646,44 @@
                                                                         </div>
                                                                         )}
                                                                     </div>
+                                                                    {muteMenu && muteMenu.kind === 'rule' && muteMenu.id === alert.id && !haReadOnly && renderMuteChoices(() => ({ rule_id: alert.id }), null)}
+                                                                    </div>
                                                                 ))}
+                                                            </div>
+                                                        )}
+
+                                                        {/* LW Oct 2026 - what is muted right now; lifting one is an action, so not on a standby */}
+                                                        {alertMutes.length > 0 && (
+                                                            <div data-alert-mutes className="space-y-2">
+                                                                <div className="text-sm font-semibold text-gray-300 flex items-center gap-2">
+                                                                    <Icons.BellOff className="w-4 h-4 text-gray-400" />
+                                                                    {t('alertMutes')} <span className="text-xs text-gray-500">({alertMutes.length})</span>
+                                                                </div>
+                                                                {alertMutes.map(m => {
+                                                                    const rule = m.rule_id ? clusterAlerts.find(a => a.id === m.rule_id) : null;
+                                                                    const what = [m.rule_id ? (rule ? rule.name : m.rule_id) : t('alertMuteEveryRule'),
+                                                                                  m.object_key ? (m.object_label || m.object_key) : null].filter(Boolean).join(' / ');
+                                                                    return (
+                                                                        <div key={m.id} data-alert-mute={m.id} className="flex items-center justify-between p-3 rounded-lg border bg-proxmox-darker border-proxmox-border">
+                                                                            <div className="min-w-0">
+                                                                                <div className="text-sm truncate">{what}</div>
+                                                                                <div className="text-xs text-gray-500">
+                                                                                    {t('alertMuted').replace('{time}', fmtMuteUntil(m.until))}{m.created_by ? ` - ${m.created_by}` : ''}
+                                                                                </div>
+                                                                            </div>
+                                                                            {!haReadOnly && (
+                                                                                <button onClick={() => unmuteAlert(m.id)} className="px-3 py-1.5 text-xs bg-proxmox-dark hover:bg-proxmox-hover border border-proxmox-border rounded-lg shrink-0">
+                                                                                    {t('alertUnmute')}
+                                                                                </button>
+                                                                            )}
+                                                                        </div>
+                                                                    );
+                                                                })}
                                                             </div>
                                                         )}
                                                     </div>
                                                 )}
-                                                
+
                                                 {/* Affinity Sub-Tab */}
                                                 {automationSubTab === 'affinity' && (
                                                     <div className="space-y-4">
@@ -25948,18 +26099,27 @@
                                     const legacyAction = channels.length === 0 ? 'log'
                                         : (channels.length === 1 && channels[0] === 'email') ? 'email'
                                         : 'all';
+                                    const isEvent = EVENT_ALERT_METRICS.includes(alertMetricSel);
                                     const payload = {
                                         name: form.name.value,
-                                        target_type: form.target_type.value,
-                                        target_id: form.target_id.value || null,
+                                        target_type: form.target_type ? form.target_type.value : 'cluster',
+                                        target_id: (form.target_id && form.target_id.value) || null,
                                         metric: form.metric.value,
-                                        operator: alertMetricSel === 'rolling_update' ? 'event' : form.operator.value,
-                                        threshold: alertMetricSel === 'rolling_update' ? 1 : parseInt(form.threshold.value),
+                                        operator: (alertMetricSel === 'rolling_update' || isEvent) ? 'event' : form.operator.value,
+                                        threshold: (alertMetricSel === 'rolling_update' || !form.threshold) ? 1 : parseInt(form.threshold.value),
                                         channels,
                                         severity: form.severity.value,  // NS #501
                                         escalation: escSteps.filter(s => s.after_minutes > 0),  // NS #501
                                         action: legacyAction
                                     };
+                                    // LW Oct 2026 - the event rules' own fields; the server checks the patterns and the ranges
+                                    if (form.notify_resolved) payload.notify_resolved = form.notify_resolved.checked;
+                                    if (alertMetricSel === 'task_failed') {
+                                        payload.task_type = form.task_type.value.trim() || 'vzdump';
+                                        payload.task_status = form.task_status.value.trim();
+                                        payload.task_warnings = form.task_warnings.checked;
+                                    }
+                                    if (alertMetricSel === 'snapshot_age') payload.snapshot_ignore_policy = form.snapshot_ignore_policy.checked;
                                     if (editingAlert) {  // #618 — edit keeps the alert's current enabled state
                                         await updateClusterAlert(editingAlert.id, payload);
                                     } else {
@@ -25972,6 +26132,7 @@
                                     </div>
                                     
                                     {/* Target Type Selection */}
+                                    {alertMetricSel !== 'ceph_health' && (
                                     <div className="grid grid-cols-2 gap-3">
                                         <div>
                                             <label className="block text-sm text-gray-400 mb-1">{t('targetType') || 'Apply to'}</label>
@@ -25986,7 +26147,8 @@
                                             <input name="target_id" placeholder="node1 or VMID" defaultValue={editingAlert ? (editingAlert.target_id || '') : ''} className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg" />
                                         </div>
                                     </div>
-                                    
+                                    )}
+
                                     <div className="grid grid-cols-3 gap-3">
                                         <div>
                                             <label className="block text-sm text-gray-400 mb-1">{t('metric') || 'Metric'}</label>
@@ -25999,11 +26161,22 @@
                                                 <option value="hardware_health">{t('hardwareHealth') || 'Hardware health'}</option>
                                                 <option value="backup_sla_breached_pct">{t('backupSlaBreachedPct') || 'Backup SLA breached %'}</option>
                                                 <option value="backup_sla_compliance_pct">{t('backupSlaCompliancePct') || 'Backup SLA compliance %'}</option>
+                                                <option value="task_failed">{t('failedTasks')}</option>
+                                                <option value="ceph_health">{t('alertMetricCeph')}</option>
+                                                <option value="replication">{t('replication')}</option>
+                                                <option value="snapshot_age">{t('alertMetricSnapshots')}</option>
                                             </select>
                                         </div>
                                         {alertMetricSel === 'rolling_update' ? (
                                             <div className="col-span-2 rounded-lg border border-proxmox-border bg-proxmox-dark px-3 py-2 text-sm text-gray-400">
                                                 {t('rollingUpdateAlarmHelp') || 'Fires when a selected node is rebooted during a rolling update.'}
+                                            </div>
+                                        ) : EVENT_ALERT_METRICS.includes(alertMetricSel) ? (
+                                            <div data-event-help className="col-span-2 rounded-lg border border-proxmox-border bg-proxmox-dark px-3 py-2 text-xs text-gray-400">
+                                                {alertMetricSel === 'task_failed' ? t('alertTaskHelp')
+                                                    : alertMetricSel === 'ceph_health' ? t('alertCephHelp')
+                                                    : alertMetricSel === 'replication' ? t('alertReplHelp')
+                                                    : t('alertSnapHelp')}
                                             </div>
                                         ) : <>
                                         <div>
@@ -26027,6 +26200,70 @@
                                         </div>
                                         </>}
                                     </div>
+                                    {/* LW Oct 2026 - what an event rule watches, and whether the all-clear is sent too */}
+                                    {(() => {
+                                        const isEvent = EVENT_ALERT_METRICS.includes(alertMetricSel);
+                                        // the saved values only while the rule stays on the metric it was saved with
+                                        const saved = editingAlert && editingAlert.metric === alertMetricSel ? editingAlert : null;
+                                        const field = 'w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg';
+                                        return (<>
+                                            {alertMetricSel === 'task_failed' && (
+                                                <div data-event-fields="task_failed" className="space-y-3">
+                                                    <div className="grid grid-cols-2 gap-3">
+                                                        <div>
+                                                            <label className="block text-sm text-gray-400 mb-1">{t('alertTaskType')}</label>
+                                                            <input name="task_type" maxLength={120} defaultValue={saved ? (saved.task_type || 'vzdump') : 'vzdump'} className={`${field} font-mono text-sm`} />
+                                                        </div>
+                                                        <div>
+                                                            <label className="block text-sm text-gray-400 mb-1">{t('alertTaskStatus')}</label>
+                                                            <input name="task_status" maxLength={120} placeholder="job errors" defaultValue={saved ? (saved.task_status || '') : ''} className={`${field} font-mono text-sm`} />
+                                                        </div>
+                                                    </div>
+                                                    <p className="text-xs text-gray-500">{t('alertPatternHelp')}</p>
+                                                    <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                                                        <input type="checkbox" name="task_warnings" defaultChecked={saved ? !!saved.task_warnings : false} />
+                                                        {t('alertTaskWarnings')}
+                                                    </label>
+                                                </div>
+                                            )}
+                                            {alertMetricSel === 'ceph_health' && (
+                                                <div data-event-fields="ceph_health">
+                                                    <label className="block text-sm text-gray-400 mb-1">{t('alertCephLevel')}</label>
+                                                    <select name="threshold" defaultValue={saved ? String(saved.threshold) : '0'} className={field}>
+                                                        <option value="0">{t('alertCephWarnPlus')}</option>
+                                                        <option value="1">{t('alertCephErrOnly')}</option>
+                                                    </select>
+                                                </div>
+                                            )}
+                                            {alertMetricSel === 'replication' && (
+                                                <div data-event-fields="replication">
+                                                    <label className="block text-sm text-gray-400 mb-1">{t('alertReplLag')}</label>
+                                                    <input name="threshold" type="number" min="1" max="10080" required defaultValue={saved ? saved.threshold : 60} className={field} />
+                                                </div>
+                                            )}
+                                            {alertMetricSel === 'snapshot_age' && (
+                                                <div data-event-fields="snapshot_age" className="space-y-3">
+                                                    <div>
+                                                        <label className="block text-sm text-gray-400 mb-1">{t('alertSnapDays')}</label>
+                                                        <input name="threshold" type="number" min="1" max="3650" required defaultValue={saved ? saved.threshold : 14} className={field} />
+                                                    </div>
+                                                    <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                                                        <input type="checkbox" name="snapshot_ignore_policy" defaultChecked={saved ? saved.snapshot_ignore_policy !== false : true} />
+                                                        {t('alertSnapIgnorePolicy')}
+                                                    </label>
+                                                </div>
+                                            )}
+                                            {alertMetricSel !== 'rolling_update' && (
+                                                <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                                                    <input key={isEvent ? 'nr-event' : 'nr-metric'} type="checkbox" name="notify_resolved"
+                                                        defaultChecked={editingAlert && EVENT_ALERT_METRICS.includes(editingAlert.metric) === isEvent
+                                                            ? (isEvent ? editingAlert.notify_resolved !== false : !!editingAlert.notify_resolved)
+                                                            : isEvent} />
+                                                    {t('alertNotifyResolved')}
+                                                </label>
+                                            )}
+                                        </>);
+                                    })()}
                                     <div>
                                         <label className="block text-sm text-gray-400 mb-1">{t('notifyVia') || 'Notify via'}</label>
                                         <div className="space-y-1.5 bg-proxmox-dark border border-proxmox-border rounded-lg p-2 max-h-40 overflow-y-auto">
