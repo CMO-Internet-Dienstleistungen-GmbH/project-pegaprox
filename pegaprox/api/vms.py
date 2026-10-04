@@ -3719,6 +3719,182 @@ def vm_action_api(cluster_id, node, vm_type, vmid, action):
         return jsonify({'error': error_msg}), status_code
 
 
+# MK Oct 2026 - every guest of a node in one call: start them, shut them down or move
+# them away, through the node endpoints Proxmox has for that. Each guest is asked about
+# on its own as in vm_action_api above, and only those go into the list Proxmox gets, so
+# a caller confined to some guests of the node acts on those and on nothing else.
+_NODE_GUEST_ACTIONS = {
+    # action: (permission per guest, audit action, verb for the messages)
+    'startall': ('vm.start', 'node.guests_started', 'start'),
+    'stopall': ('vm.stop', 'node.guests_stopped', 'shut down'),
+    'migrateall': ('vm.migrate', 'node.guests_migrated', 'migrate'),
+}
+_NODE_GUESTS_MAX = 5000
+_VMID_TEXT_RE = re.compile(r'[0-9]{1,9}')
+
+
+def _vmid_list(value):
+    """The VMIDs of a body as ints, or None when one is no VMID"""
+    out = []
+    for v in value:
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, int):
+            n = v
+        elif isinstance(v, str) and _VMID_TEXT_RE.fullmatch(v):
+            n = int(v)
+        else:
+            return None
+        if not 1 <= n <= 999999999:
+            return None
+        out.append(n)
+    return out
+
+
+def _node_guest_skip(action, guest):
+    """Why a guest the caller named stays out of the action, None when it takes part"""
+    if action == 'startall':
+        if str(guest.get('template', '')).lower() in ('1', 'true'):
+            return 'template'
+        if guest.get('status') == 'running':
+            return 'already running'
+    elif action == 'stopall' and guest.get('status') != 'running':
+        return 'not running'
+    return None
+
+
+@bp.route('/api/clusters/<cluster_id>/nodes/<node_name>/guests/<action>', methods=['POST'])
+@require_auth()
+def node_guests_action_api(cluster_id, node_name, action):
+    """Start, shut down or migrate the guests of one node in one go
+
+    action is startall, stopall or migrateall. Body:
+    - vms: the VMIDs to act on. Without it, every guest of the node the caller may act on
+      that fits the action (the stopped ones for startall, the running ones for stopall)
+    - target: (migrateall, required) the node they move to
+    - maxworkers: (migrateall) migrations at the same time, 1-16, default 1
+    - with_local_disks: (migrateall) move local disks along
+
+    Answers {success, task, vms, skipped: [{vmid, reason}]}: skipped are guests named in
+    vms that do not fit the action. 403 when the caller may act on none of the guests,
+    400 when a VMID named is not on the node or out of the caller's reach.
+    """
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    if action not in _NODE_GUEST_ACTIONS:
+        return jsonify({'error': f"Invalid action. Valid actions: {', '.join(_NODE_GUEST_ACTIONS)}"}), 400
+    perm, audit_action, verb = _NODE_GUEST_ACTIONS[action]
+    mgr = cluster_managers[cluster_id]
+    if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
+        return jsonify({'error': 'Only Proxmox clusters act on all guests of a node'}), 400
+    from pegaprox.utils.sanitization import validate_hostname
+    if not validate_hostname(node_name):
+        return jsonify({'error': 'Invalid node name'}), 400
+
+    data = request.get_json(silent=True)
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return jsonify({'error': 'JSON object required'}), 400
+    wanted = data.get('vms')
+    if wanted is not None:
+        if not isinstance(wanted, list) or len(wanted) > _NODE_GUESTS_MAX:
+            return jsonify({'error': f'vms is a list of at most {_NODE_GUESTS_MAX} VMIDs'}), 400
+        wanted = _vmid_list(wanted)
+        if wanted is None:
+            return jsonify({'error': 'vms holds something that is no VMID'}), 400
+        wanted = set(wanted)
+
+    target, maxworkers, with_local_disks = None, 1, False
+    if action == 'migrateall':
+        target = data.get('target')
+        if not isinstance(target, str) or not validate_hostname(target):
+            return jsonify({'error': 'Target node is required'}), 400
+        if target == node_name:
+            return jsonify({'error': 'The target is the node itself'}), 400
+        maxworkers = data.get('maxworkers', 1)
+        if isinstance(maxworkers, bool) or not isinstance(maxworkers, int) or not 1 <= maxworkers <= 16:
+            return jsonify({'error': 'maxworkers is a number from 1 to 16'}), 400
+        with_local_disks = data.get('with_local_disks', False)
+        if not isinstance(with_local_disks, bool):
+            return jsonify({'error': 'with_local_disks is true or false'}), 400
+        nodes = mgr.get_node_status() or {}
+        if target not in nodes:
+            return jsonify({'error': f'{target} is no node of this cluster'}), 400
+        tinfo = nodes.get(target) or {}
+        if tinfo.get('offline') or tinfo.get('status', 'online') != 'online':
+            return jsonify({'error': f'{target} is not online'}), 400
+
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    on_node = {}
+    for g in (mgr.get_vm_resources(max_age=2) or []):
+        if g.get('node') != node_name or g.get('type') not in ('qemu', 'lxc'):
+            continue
+        try:
+            on_node[int(g.get('vmid'))] = g
+        except (TypeError, ValueError):
+            continue
+    allowed = {vmid: g for vmid, g in on_node.items()
+               if (wanted is None or vmid in wanted)
+               and user_can_access_vm(user, cluster_id, vmid, perm, g.get('type'))}
+    if not allowed:
+        return jsonify({'error': f'Permission denied: {perm}'}), 403
+    if wanted is not None:
+        # one answer for a guest elsewhere and one out of reach: which is which stays unsaid
+        refused = sorted(wanted - set(allowed))
+        if refused:
+            return jsonify({'error': f"Not on {node_name} or out of reach: "
+                                     f"{', '.join(str(v) for v in refused[:20])}"}), 400
+
+    act, skipped = [], []
+    for vmid in sorted(allowed):
+        why = _node_guest_skip(action, allowed[vmid])
+        if why is None:
+            act.append(vmid)
+        elif wanted is not None:
+            skipped.append({'vmid': vmid, 'reason': why})
+
+    if action == 'migrateall' and act:
+        # an enforced affinity rule holds a guest back, as in bulk_migrate_api. Only for
+        # the guests a rule names: each look reads the cluster's guest list again
+        from pegaprox.api.history import check_affinity_violation, load_affinity_rules
+        ruled = set()
+        for rule in (load_affinity_rules() or {}).get('rules', []):
+            if rule.get('cluster_id') == cluster_id and rule.get('enabled', True):
+                ruled.update(str(v) for v in (rule.get('vm_ids') or rule.get('vms') or []))
+        for vmid in [v for v in act if str(v) in ruled]:
+            aff = check_affinity_violation(cluster_id, vmid, target)
+            if aff.get('violation') and aff.get('enforce'):
+                act.remove(vmid)
+                skipped.append({'vmid': vmid, 'reason': f"affinity rule '{aff.get('rule')}'"})
+
+    if not act:
+        return jsonify({'error': f'No guest on {node_name} to {verb}', 'skipped': skipped}), 400
+
+    try:
+        result = mgr.node_guests_action(node_name, action, act, target=target,
+                                        maxworkers=maxworkers, with_local_disks=with_local_disks)
+    except Exception as e:
+        logging.error(f"[NODE-GUESTS] {action} on {node_name}: {e}", exc_info=True)
+        return jsonify({'error': f'{verb} failed'}), 500
+    if not result.get('success'):
+        return jsonify({'error': parse_pve_error(result.get('error'), f'{verb} failed')}), 500
+
+    usr = request.session.get('user', 'system')
+    ids = ', '.join(str(v) for v in act[:50]) + (' ...' if len(act) > 50 else '')
+    log_audit(usr, audit_action, f"Node {node_name}: {verb} {len(act)} guest(s)"
+              + (f" to {target}" if target else '') + f" ({ids})", cluster=mgr.config.name)
+    task = result.get('task')
+    if task:
+        register_task_user(task, usr, cluster_id)
+    broadcast_action(action, 'node', node_name, {'vms': act, 'target': target}, cluster_id, usr)
+    push_immediate_update(cluster_id, delay=1.0)
+    return jsonify({'success': True, 'task': task, 'vms': act, 'skipped': skipped})
+
+
 @bp.route('/api/clusters/<cluster_id>/nextid', methods=['GET'])
 @require_auth(perms=['vm.view'])
 def get_next_vmid_api(cluster_id):

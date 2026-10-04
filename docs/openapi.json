@@ -9735,6 +9735,72 @@
         ]
       }
     },
+    "/api/clusters/{cluster_id}/nodes/{node_name}/guests/{action}": {
+      "post": {
+        "operationId": "vms.node_guests_action_api_post",
+        "tags": [
+          "vms"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          }
+        },
+        "summary": "Start, shut down or migrate the guests of one node in one go",
+        "description": "action is startall, stopall or migrateall. Body:\n- vms: the VMIDs to act on. Without it, every guest of the node the caller may act on\n  that fits the action (the stopped ones for startall, the running ones for stopall)\n- target: (migrateall, required) the node they move to\n- maxworkers: (migrateall) migrations at the same time, 1-16, default 1\n- with_local_disks: (migrateall) move local disks along\n\nAnswers {success, task, vms, skipped: [{vmid, reason}]}: skipped are guests named in\nvms that do not fit the action. 403 when the caller may act on none of the guests,\n400 when a VMID named is not on the node or out of the caller's reach.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "node_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "action",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ]
+      }
+    },
     "/api/clusters/{cluster_id}/nextid": {
       "get": {
         "operationId": "vms.get_next_vmid_api_get",

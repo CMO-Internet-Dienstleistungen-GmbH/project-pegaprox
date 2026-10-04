@@ -12269,6 +12269,42 @@ echo "AGENT_INSTALLED_OK"
             self.logger.error(f"[ERROR] vm_action: {e}")
             return {'success': False, 'error': str(e)}
     
+    def node_guests_action(self, node: str, action: str, vmids: List[int], target: str = None,
+                           maxworkers: int = 1, with_local_disks: bool = False) -> Dict[str, Any]:
+        """startall / stopall / migrateall of one node, for the guests listed only.
+
+        MK Oct 2026 - always with an explicit vms list: without one Proxmox takes every
+        guest on the node, also those the caller may not touch. startall gets force=1 so
+        a guest without "start at boot" starts too, which is what the list asked for."""
+        if action not in ('startall', 'stopall', 'migrateall'):
+            return {'success': False, 'error': f'Invalid action: {action}'}
+        if not validate_hostname(node) or (action == 'migrateall' and not validate_hostname(target or '')):
+            return {'success': False, 'error': 'Invalid node name'}
+        if not vmids:
+            return {'success': False, 'error': 'No guests given'}
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {'success': False, 'error': 'Could not connect to Proxmox'}
+
+        data = {'vms': ','.join(str(int(v)) for v in vmids)}
+        if action == 'startall':
+            data['force'] = 1
+        elif action == 'migrateall':
+            data['target'] = target
+            data['maxworkers'] = int(maxworkers)
+            if with_local_disks:
+                data['with-local-disks'] = 1
+        url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/{action}"
+        try:
+            resp = self._api_post(url, data=data)
+        except Exception as e:
+            self.logger.error(f"[ERROR] {action} on {node}: {e}")
+            return {'success': False, 'error': str(e)}
+        if resp.status_code == 200:
+            self.logger.info(f"[OK] {action} on {node} for {len(vmids)} guest(s)")
+            return {'success': True, 'task': resp.json().get('data')}
+        self.logger.error(f"[ERROR] {action} on {node}: {resp.text}")
+        return {'success': False, 'error': resp.text}
+
     def clone_vm(self, node: str, vmid: int, vm_type: str, newid: int, name: str = None,
                  full: bool = True, target_node: str = None, target_storage: str = None,
                  description: str = None, snapname: str = None) -> Dict[str, Any]:
