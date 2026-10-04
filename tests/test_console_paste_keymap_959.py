@@ -6,6 +6,12 @@ That emulation is only correct while the datacenter runs a US keymap. With `keyb
 configured, qemu translates keysyms itself, so Shift+<the key left of 3> is the Spanish
 quote - the reporter typed '@' and got '"'.
 
+Dropping the US emulation was not enough: qemu never presses a modifier for a keysym, so
+a bare '@' reached a Spanish guest as a plain 2. Paste now types like a hand on the
+datacenter's keyboard - the physical key with Shift and/or AltGr held - for de, es, fr,
+it, pt, pl and en-gb, and the tests below pin those sequences. What the guest finally
+types needs a live VM and is not checked here.
+
 These tests run the SHIPPED function. The bundle is one concatenated React file, so the
 two pieces are sliced out of the source text and executed in node rather than re-typed
 here; a copy of the logic would pass against the broken code, which is the whole point of
@@ -68,37 +74,129 @@ def press():
         os.remove(harness)
 
 
+SHIFT = (SHIFT_L, 'ShiftLeft')
+ALTGR = (0xFE03, 'AltRight')   # ISO_Level3_Shift on the right Alt key, as noVNC sends AltGraph
+SPACE = [0x20, 'Space', None]
+
+
 def _shift_dance(keys):
     """True when the helper held Shift and tapped some other key underneath."""
     return len(keys) == 3 and keys[0][0] == SHIFT_L and keys[2][0] == SHIFT_L
 
 
+def _tap(keysym, code, *mods):
+    """What a hand does: modifiers down in order, the key, modifiers up in reverse."""
+    return ([[m[0], m[1], True] for m in mods] + [[keysym, code, None]]
+            + [[m[0], m[1], False] for m in reversed(mods)])
+
+
 # --- the bug -----------------------------------------------------------------
 
-def test_a_spanish_datacenter_does_not_get_the_us_shift_dance(press):
-    """The reported case. Shift + the US '2' key is '"' on a Spanish keyboard."""
-    keys = press({'at': ('@', 'es')})['at']
-    assert not _shift_dance(keys), (
-        "still emulating a US keyboard on a Spanish keymap - this is exactly what "
-        "turns the reporter's '@' into '\"'")
-    assert keys == [[0x40, None, None]], keys
+def test_the_reported_characters_hold_altgr_and_shift_on_spanish(press):
+    """The reported case: '@' and '#' are AltGr+2/3 on a Spanish keyboard, '"', '(' and
+    '_' are Shift+2, Shift+8 and Shift+<the key right of the full stop>."""
+    keys = press({'pw': ('@#"(_', 'es')})['pw']
+    assert keys == (_tap(0x40, 'Digit2', ALTGR) + _tap(0x23, 'Digit3', ALTGR)
+                    + _tap(0x22, 'Digit2', SHIFT) + _tap(0x28, 'Digit8', SHIFT)
+                    + _tap(0x5F, 'Slash', SHIFT)), keys
 
 
-def test_every_symbol_of_the_us_table_goes_over_plainly_on_a_foreign_keymap(press):
-    jobs = {ch: (ch, 'es') for ch in '!@#$%^&*()_+{}|:"<>?~'}
-    got = press(jobs)
-    offenders = [ch for ch, keys in got.items() if _shift_dance(keys)]
-    assert not offenders, f"still shift-emulated on keymap es: {''.join(sorted(offenders))}"
+def test_a_spanish_keymap_never_gets_the_us_shift_dance(press):
+    """Shift + a bare US base keysym is what turned '@' into '"' in the first place."""
+    got = press({ch: (ch, 'es') for ch in '!@#$%^&*()_+{}|:"<>?~'})
+    offenders = [ch for ch, keys in got.items()
+                 if any(k[1] is None for k in keys) and keys[0][0] == SHIFT_L]
+    assert not offenders, f"US shift emulation on keymap es: {''.join(sorted(offenders))}"
 
 
-def test_a_german_keymap_is_not_us_either(press):
-    """'{' is AltGr+7 on a German keyboard, nowhere near Shift+[."""
-    assert not _shift_dance(press({'brace': ('{', 'de')})['brace'])
+@pytest.mark.parametrize('keymap,ch,expected', [
+    # German: Y and Z swap, the braces and the @ live on AltGr
+    ('de', 'z', _tap(0x7A, 'KeyY')),
+    ('de', 'Z', _tap(0x5A, 'KeyY', SHIFT)),
+    ('de', '"', _tap(0x22, 'Digit2', SHIFT)),
+    ('de', '{', _tap(0x7B, 'Digit7', ALTGR)),
+    ('de', '@', _tap(0x40, 'KeyQ', ALTGR)),
+    ('de', '\\', _tap(0x5C, 'Minus', ALTGR)),
+    ('de', '|', _tap(0x7C, 'IntlBackslash', ALTGR)),
+    ('de', '€', _tap(0x10020AC, 'KeyE', ALTGR)),
+    # Spanish
+    ('es', '\\', _tap(0x5C, 'Backquote', ALTGR)),
+    ('es', '[', _tap(0x5B, 'BracketLeft', ALTGR)),
+    ('es', '}', _tap(0x7D, 'Backslash', ALTGR)),
+    ('es', 'ñ', _tap(0xF1, 'Semicolon')),
+    # French AZERTY: digits are shifted, letters move
+    ('fr', 'a', _tap(0x61, 'KeyQ')),
+    ('fr', 'm', _tap(0x6D, 'Semicolon')),
+    ('fr', '1', _tap(0x31, 'Digit1', SHIFT)),
+    ('fr', '!', _tap(0x21, 'Slash')),
+    ('fr', '@', _tap(0x40, 'Digit0', ALTGR)),
+    ('fr', '#', _tap(0x23, 'Digit3', ALTGR)),
+    # Italian: the braces need AltGr AND Shift
+    ('it', '@', _tap(0x40, 'Semicolon', ALTGR)),
+    ('it', '#', _tap(0x23, 'Quote', ALTGR)),
+    ('it', '[', _tap(0x5B, 'BracketLeft', ALTGR)),
+    ('it', '{', _tap(0x7B, 'BracketLeft', ALTGR, SHIFT)),
+    # Portuguese
+    ('pt', '@', _tap(0x40, 'Digit2', ALTGR)),
+    ('pt', '{', _tap(0x7B, 'Digit7', ALTGR)),
+    ('pt', '"', _tap(0x22, 'Digit2', SHIFT)),
+    # Polish programmer: US symbols, the national letters on AltGr with Latin-2 keysyms
+    ('pl', '@', _tap(0x40, 'Digit2', SHIFT)),
+    ('pl', 'ł', _tap(0x1B3, 'KeyL', ALTGR)),
+    ('pl', 'Ż', _tap(0x1AF, 'KeyZ', ALTGR, SHIFT)),
+    # UK: '"' and '@' trade places with the US, '#' and '\' have keys of their own
+    ('en-gb', '"', _tap(0x22, 'Digit2', SHIFT)),
+    ('en-gb', '@', _tap(0x40, 'Quote', SHIFT)),
+    ('en-gb', '#', _tap(0x23, 'Backslash')),
+    ('en-gb', '\\', _tap(0x5C, 'IntlBackslash')),
+    ('en-gb', '£', _tap(0xA3, 'Digit3', SHIFT)),
+])
+def test_each_layout_types_the_key_a_hand_would_press(press, keymap, ch, expected):
+    keys = press({'k': (ch, keymap)})['k']
+    assert keys == expected, (keymap, ch, keys)
 
 
-def test_en_gb_counts_as_foreign(press):
-    """Shift+2 is '"' on en-gb as well - only en-us has '@' there."""
-    assert not _shift_dance(press({'at': ('@', 'en-gb')})['at'])
+@pytest.mark.parametrize('keymap,ch,first', [
+    ('de', '^', [0xFE52, 'Backquote', None]),
+    ('de', '`', [0xFE50, 'Equal', None]),
+    ('es', '`', [0xFE50, 'BracketLeft', None]),
+    ('fr', '^', [0xFE52, 'BracketLeft', None]),
+    ('pt', '~', [0xFE53, 'Backslash', None]),
+])
+def test_a_dead_key_is_followed_by_a_space(press, keymap, ch, first):
+    """Dead key then Space is how a hand types the accent itself on these layouts."""
+    keys = press({'k': (ch, keymap)})['k']
+    assert first in keys and keys[-1] == SPACE, (keymap, ch, keys)
+    assert keys.index(first) < len(keys) - 1
+
+
+def test_a_key_that_is_only_dead_on_windows_gets_no_space(press):
+    """The Spanish '~' (AltGr+4) composes on Linux right away; a Space would be typed."""
+    assert press({'k': ('~', 'es')})['k'] == _tap(0x7E, 'Digit4', ALTGR)
+
+
+@pytest.mark.parametrize('keymap', ['de', 'es', 'fr', 'it', 'pt', 'pl', 'en-gb'])
+def test_no_modifier_is_left_held_after_any_character(press, keymap):
+    text = ''.join(chr(c) for c in range(0x21, 0x7F)) + 'äñçèł£€'
+    got = press({ch: (ch, keymap) for ch in text})
+    for ch, keys in got.items():
+        held = {}
+        for ks, code, down in keys:
+            if down is not None:
+                held[code] = held.get(code, 0) + (1 if down else -1)
+        assert all(v == 0 for v in held.values()), (keymap, ch, keys)
+
+
+def test_a_character_the_layout_cannot_type_goes_over_as_its_keysym(press):
+    """'é' has no key of its own on a German keyboard - the old Unicode keysym stays."""
+    assert press({'k': ('é', 'de')})['k'] == [[0x01000000 + 0xE9, None, None]]
+
+
+def test_a_keymap_without_a_table_keeps_the_plain_keysyms(press):
+    """Swiss German is not in the tables: 81028d2's behaviour, no US dance, no guessing."""
+    got = press({'at': ('@', 'de-ch'), 'brace': ('{', 'sv')})
+    assert got['at'] == [[0x40, None, None]]
+    assert got['brace'] == [[0x7B, None, None]]
 
 
 # --- what must not regress ---------------------------------------------------
@@ -118,23 +216,29 @@ def test_an_unconfigured_keymap_keeps_todays_behaviour(press):
         assert _shift_dance(keys), f"keymap {km!r} must stay on the US path"
 
 
-def test_letters_digits_and_control_keys_ignore_the_layout(press):
+def test_letters_digits_and_control_keys(press):
     got = press({
         'lower_us': ('a', 'en-us'), 'lower_es': ('a', 'es'),
         'upper_us': ('A', 'en-us'), 'upper_es': ('A', 'es'),
         'digit_us': ('5', 'en-us'), 'digit_es': ('5', 'es'),
         'enter_es': ('\n', 'es'), 'tab_es': ('\t', 'es'),
     })
-    assert got['lower_us'] == got['lower_es'] == [[0x61, None, None]]
-    assert got['upper_us'] == got['upper_es'] == [[0x41, None, None]]
-    assert got['digit_us'] == got['digit_es'] == [[0x35, None, None]]
+    assert got['lower_us'] == [[0x61, None, None]]
+    assert got['upper_us'] == [[0x41, None, None]]
+    assert got['digit_us'] == [[0x35, None, None]]
+    # on a mapped layout a capital is Shift + its key, like any other shifted character
+    assert got['lower_es'] == _tap(0x61, 'KeyA')
+    assert got['upper_es'] == _tap(0x41, 'KeyA', SHIFT)
+    assert got['digit_es'] == _tap(0x35, 'Digit5')
     assert got['enter_es'] == [[0xFF0D, None, None]]
     assert got['tab_es'] == [[0xFF09, None, None]]
 
 
 def test_a_whole_password_survives_a_spanish_keymap(press):
     keys = press({'pw': ('aB3$@_x', 'es')})['pw']
-    assert [k[0] for k in keys] == [0x61, 0x42, 0x33, 0x24, 0x40, 0x5F, 0x78], keys
+    assert keys == (_tap(0x61, 'KeyA') + _tap(0x42, 'KeyB', SHIFT) + _tap(0x33, 'Digit3')
+                    + _tap(0x24, 'Digit4', SHIFT) + _tap(0x40, 'Digit2', ALTGR)
+                    + _tap(0x5F, 'Slash', SHIFT) + _tap(0x78, 'KeyX')), keys
 
 
 # --- the wiring --------------------------------------------------------------

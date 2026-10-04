@@ -14428,7 +14428,9 @@ echo "AGENT_INSTALLED_OK"
         """
         pwd = getattr(self.config, 'pass_', None) or getattr(self.config, 'password', None)
         usr = getattr(self.config, 'user', None) or 'root@pam'
-        if not pwd:
+        # MK Oct 2026 (#955) - on an inline token cluster pass_ is the token SECRET, and
+        # posting it as a password only adds a failed login to the node's auth log
+        if not pwd or '!' in usr:
             return (None, None) if with_csrf else None
 
         # MK Sep 2026 — this used to hit auth_host and nothing else. auth_host is pinned to

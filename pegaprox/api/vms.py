@@ -66,6 +66,7 @@ VNC_PVE_CONNECT_TIMEOUT = int(os.environ.get('PEGAPROX_VNC_CONNECT_TIMEOUT', '15
 # through gevent once, process-wide; no-op when gevent isn't patched in (e.g. under pytest).
 from pegaprox.utils.concurrent import install_gevent_to_thread, gevent_listen_socket
 from pegaprox.utils.ssh import read_capped as _read_capped
+from pegaprox.utils.vnc_polling import clear_tls_errors_before_io, write_with_deadline
 install_gevent_to_thread()
 
 
@@ -113,6 +114,10 @@ def _apply_vnc_socket_options(sock):
             sock.setsockopt(_s.IPPROTO_TCP, _s.TCP_KEEPCNT, 3)
     except Exception as _e:
         logging.debug(f"[VNC] socket options not fully applied: {_e}")
+    # MK Oct 2026 (#713) - every leg calls this on its PVE socket right after connecting,
+    # so it is also where that socket starts emptying OpenSSL's error queue before each read
+    # and write. See vnc_polling.clear_tls_errors_before_io.
+    clear_tls_errors_before_io(sock)
 
 
 # =====================================================
@@ -4419,18 +4424,23 @@ def vnc_poll(cluster_id, node, vm_type, vmid):
             ssl_ctx.check_hostname = False
             ssl_ctx.verify_mode = _ssl.CERT_NONE
 
+        # #955 - a token cluster has no password to log in with, see _console_uses_token
+        _token_auth = _console_uses_token(mgr)
+        pve_ticket = csrf_token = None
+        _reuse_manager_auth = _token_auth
         try:
-            login_data = urllib.parse.urlencode({
-                'username': mgr.config.user,
-                'password': mgr.config.pass_,
-            }).encode('utf-8')
-            login_req = urllib.request.Request(
-                f"https://{mgr.auth_host}:{port}/api2/json/access/ticket", data=login_data, method='POST'
-            )
-            with urllib.request.urlopen(login_req, context=ssl_ctx, timeout=10) as r:
-                login_result = _json.loads(r.read().decode('utf-8'))
-            pve_ticket = login_result['data']['ticket']
-            csrf_token = login_result['data']['CSRFPreventionToken']
+            if not _token_auth:
+                login_data = urllib.parse.urlencode({
+                    'username': mgr.config.user,
+                    'password': mgr.config.pass_,
+                }).encode('utf-8')
+                login_req = urllib.request.Request(
+                    f"https://{mgr.auth_host}:{port}/api2/json/access/ticket", data=login_data, method='POST'
+                )
+                with urllib.request.urlopen(login_req, context=ssl_ctx, timeout=10) as r:
+                    login_result = _json.loads(r.read().decode('utf-8'))
+                pve_ticket = login_result['data']['ticket']
+                csrf_token = login_result['data']['CSRFPreventionToken']
 
             # MK Apr 2026 (#352 follow-up) — same single-vncproxy fix applies
             # to the polling endpoint. If JS provides pve_port + pve_ticket in
@@ -4441,6 +4451,9 @@ def vnc_poll(cluster_id, node, vm_type, vmid):
             if pve_port_q and pve_ticket_q and _ppt_ok:
                 vnc_ticket = pve_ticket_q
                 vnc_port = _ppt_port
+                _reuse_manager_auth = True
+            elif _token_auth:
+                vnc_ticket, vnc_port = _vncproxy_via_manager(mgr, node, vm_type, vmid)
             else:
                 vnc_url = f"https://{host}:{port}/api2/json/nodes/{node}/{vm_type}/{vmid}/vncproxy"
                 vnc_req = urllib.request.Request(vnc_url, data=urllib.parse.urlencode({'websocket': '1'}).encode('utf-8'), method='POST')
@@ -4486,7 +4499,8 @@ def vnc_poll(cluster_id, node, vm_type, vmid):
             pve_ws = ws_client.create_connection(
                 pve_ws_url,
                 sslopt=({} if _verify_tls else {"cert_reqs": _ssl.CERT_NONE}),
-                header={"Cookie": f"PVEAuthCookie={pve_ticket}", "Host": f"{host}:{port}"},
+                header=_pve_console_ws_auth(mgr, f"{host}:{port}", pve_ticket,
+                                            reuse_manager_auth=_reuse_manager_auth),
                 timeout=VNC_PVE_CONNECT_TIMEOUT,
             )
             _apply_vnc_socket_options(pve_ws.sock)
@@ -7122,6 +7136,29 @@ def _pve_console_ws_auth(manager, netloc, fresh_ticket=None, reuse_manager_auth=
     return headers
 
 
+def _console_uses_token(manager):
+    """True when the cluster talks to PVE with an API token.
+
+    config.user is then the token id and config.pass_ its secret, so the password
+    login the console handlers start with can only earn a 401 (#955). They skip it
+    and ask for the vncproxy through the manager's own session instead, which sends
+    the token, so the ticket is bound to the same identity the upgrade presents.
+    A token id in config.user counts even before the manager has connected.
+    MK Oct 2026
+    """
+    if getattr(manager, '_using_api_token', False) and getattr(manager, '_api_token', None):
+        return True
+    return '!' in str(getattr(getattr(manager, 'config', None), 'user', '') or '')
+
+
+def _vncproxy_via_manager(manager, node, vm_type, vmid):
+    """(ticket, port) of a vncproxy issued through the manager's own session."""
+    res = manager.get_vnc_ticket(node, vmid, 'qemu' if vm_type == 'qemu' else 'lxc') or {}
+    if not res.get('success'):
+        raise IOError(f"vncproxy refused: {res.get('error') or 'no answer'}")
+    return res['ticket'], res['port']
+
+
 def _resolve_vm_node(mgr, vmid, vm_type='qemu'):
     """Authoritatively locate which node a VMID lives on by probing each node's
     status endpoint directly. /cluster/resources is fed by pmxcfs and lags by
@@ -9035,24 +9072,27 @@ def handle_vnc_websocket(ws, cluster_id, node, vm_type, vmid):
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
         
-        # Step 1: Login
-        print(f"Step 1: Login...")
-        login_data = urlencode({
-            'username': manager.config.user,
-            'password': manager.config.pass_
-        }).encode('utf-8')
+        # Step 1: Login - not on a token cluster, there is no password (#955)
+        _token_auth = _console_uses_token(manager)
+        pve_ticket = csrf_token = None
+        if not _token_auth:
+            print(f"Step 1: Login...")
+            login_data = urlencode({
+                'username': manager.config.user,
+                'password': manager.config.pass_
+            }).encode('utf-8')
         
-        login_req = urllib.request.Request(
-            f"https://{manager.auth_host}:{port}/api2/json/access/ticket",
-            data=login_data, method='POST'
-        )
+            login_req = urllib.request.Request(
+                f"https://{manager.auth_host}:{port}/api2/json/access/ticket",
+                data=login_data, method='POST'
+            )
         
-        with urllib.request.urlopen(login_req, context=ssl_context, timeout=10) as response:
-            login_result = json.loads(response.read().decode('utf-8'))
+            with urllib.request.urlopen(login_req, context=ssl_context, timeout=10) as response:
+                login_result = json.loads(response.read().decode('utf-8'))
 
-        pve_ticket = login_result['data']['ticket']
-        csrf_token = login_result['data']['CSRFPreventionToken']
-        print(f"Got PVE ticket")
+            pve_ticket = login_result['data']['ticket']
+            csrf_token = login_result['data']['CSRFPreventionToken']
+            print(f"Got PVE ticket")
 
         # MK Apr 2026 (#352 follow-up) — single-vncproxy mode. If the JS
         # already got a vncproxy ticket+port via /console, reuse it so the VNC
@@ -9072,6 +9112,9 @@ def handle_vnc_websocket(ws, cluster_id, node, vm_type, vmid):
             vnc_port = _ppt_port
             _reuse_manager_auth = True
             print(f"Reusing JS-issued vncproxy ticket port={vnc_port}")
+        elif _token_auth:
+            vnc_ticket, vnc_port = _vncproxy_via_manager(manager, node, vm_type, vmid)
+            _reuse_manager_auth = True
         else:
             print(f"Step 2: Get VNC ticket...")
             if vm_type == 'qemu':
@@ -9116,6 +9159,8 @@ def handle_vnc_websocket(ws, cluster_id, node, vm_type, vmid):
 
         bytes_sent = 0
         bytes_received = 0
+        # #713 - why it ended, first one wins; printed at WARNING when it was an error
+        ended = []
 
         # Greenlet to read from Proxmox and send to client
         def proxmox_to_client():
@@ -9131,16 +9176,16 @@ def handle_vnc_websocket(ws, cluster_id, node, vm_type, vmid):
                     except websocket.WebSocketTimeoutException:
                         gsleep(0.01)
                     except websocket.WebSocketConnectionClosedException:
-                        print("Proxmox closed")
+                        ended.append(('PVE closed', False))
                         running = False
                         break
                     except Exception as e:
                         if running:
-                            print(f"PVE->Client error: {e}")
+                            ended.append((f'PVE->Client: {e}', True))
                         running = False
                         break
             except Exception as e:
-                print(f"proxmox_to_client crashed: {e}")
+                ended.append((f'PVE->Client crashed: {e}', True))
                 running = False
         
         # Start the proxmox reader greenlet
@@ -9153,25 +9198,33 @@ def handle_vnc_websocket(ws, cluster_id, node, vm_type, vmid):
             try:
                 data = ws.receive()
                 if data is None:
-                    print("Client disconnected")
+                    ended.append(('browser closed', False))
                     running = False
                     break
                 if data:
                     bytes_sent += len(data)
-                    with _pve_io_lock:
-                        pve_ws.send(data)
+                    try:
+                        with _pve_io_lock:
+                            write_with_deadline(pve_ws, pve_ws.send, data)
+                    except Exception as e:
+                        ended.append((f'Client->PVE: {e}', True))
+                        running = False
+                        break
             except Exception as e:
                 if running:
                     err_str = str(e)
-                    if 'closed' not in err_str.lower():
-                        print(f"Client->PVE error: {e}")
+                    ended.append(('browser closed', False) if 'closed' in err_str.lower()
+                                 else (f'browser: {e}', True))
                 running = False
                 break
         
         running = False
         pve_reader.kill()
         
-        print(f"Session ended: sent {bytes_sent}, received {bytes_received}")
+        _reason, _failed = ended[0] if ended else ('browser closed', False)
+        logging.log(logging.WARNING if _failed else logging.INFO,
+                    f"[VNC] session ended host={host} vm={vm_type}/{vmid} reason={_reason} "
+                    f"sent={bytes_sent}B recv={bytes_received}B")
         
     except Exception as e:
         logging.exception(f"VNC proxy error: {type(e).__name__}: {e}")
@@ -9413,28 +9466,32 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                 ssl_ctx.check_hostname = False
                 ssl_ctx.verify_mode = ssl.CERT_NONE
 
-            # Login to Proxmox to get auth ticket
-            login_data = urlencode({
-                'username': manager.config.user,
-                'password': manager.config.pass_
-            }).encode('utf-8')
-
-            login_req = urllib.request.Request(
-                f"https://{manager.auth_host}:{port}/api2/json/access/ticket",
-                data=login_data, method='POST'
-            )
-
             # MK Apr 2026 — wrap synchronous urllib.urlopen in asyncio.to_thread
             # so concurrent VNC handlers don't serialize on the TLS handshake.
             import asyncio as _aiowrap
             def _do_urlopen(req):
                 with urllib.request.urlopen(req, context=ssl_ctx, timeout=10) as r:
                     return r.read()
-            login_body = await _aiowrap.to_thread(_do_urlopen, login_req)
-            login_result = json.loads(login_body.decode('utf-8'))
 
-            pve_ticket = login_result['data']['ticket']
-            csrf_token = login_result['data']['CSRFPreventionToken']
+            # Login to Proxmox to get auth ticket. Not on a token cluster: config.user
+            # and pass_ are the token id and secret there, PVE answers 401 (#955).
+            _token_auth = _console_uses_token(manager)
+            pve_ticket = csrf_token = None
+            if not _token_auth:
+                login_data = urlencode({
+                    'username': manager.config.user,
+                    'password': manager.config.pass_
+                }).encode('utf-8')
+
+                login_req = urllib.request.Request(
+                    f"https://{manager.auth_host}:{port}/api2/json/access/ticket",
+                    data=login_data, method='POST'
+                )
+                login_body = await _aiowrap.to_thread(_do_urlopen, login_req)
+                login_result = json.loads(login_body.decode('utf-8'))
+
+                pve_ticket = login_result['data']['ticket']
+                csrf_token = login_result['data']['CSRFPreventionToken']
 
             # MK Apr 2026 — issue #352 follow-up. Single-vncproxy fast path.
             # If the JS already obtained a vncproxy ticket+port via /console
@@ -9458,6 +9515,9 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                 vnc_ticket = pve_ticket_q
                 vnc_port = _ppt_port
                 logging.info(f"[VNC] reusing JS-issued vncproxy ticket port={vnc_port} (single-call mode)")
+            elif _token_auth:
+                vnc_ticket, vnc_port = await _aiowrap.to_thread(
+                    _vncproxy_via_manager, manager, node, vm_type, vmid)
             else:
                 # Backwards-compat fallback: issue our own vncproxy. This still
                 # works on older PVE where two vncproxy calls produce matching
@@ -9548,7 +9608,7 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
             # stored auth instead. Backwards-compat path keeps the fresh login.
             ws_auth_header = _pve_console_ws_auth(
                 manager, f"{tunnel_target_host}:{tunnel_target_port}", pve_ticket,
-                reuse_manager_auth=bool(pve_port_q and pve_ticket_q))
+                reuse_manager_auth=bool(pve_port_q and pve_ticket_q) or _token_auth)
 
             # MK Apr 2026 — ws_client.create_connection is synchronous; offload to
             # a worker thread so concurrent VNC handlers don't serialize on the
@@ -9612,21 +9672,25 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
 
             # The only three call sites that touch the pve_ws SSL object — all funnelled through
             # the one lock. Blocking calls run in a worker thread via asyncio.to_thread.
+            # MK Oct 2026 (#713) - the writes with a deadline of their own, not the read slice
             def _pve_recv():
                 with _pve_io_lock:
                     return pve_ws.recv()
 
             def _pve_send(msg):
                 with _pve_io_lock:
-                    pve_ws.send(msg)
+                    write_with_deadline(pve_ws, pve_ws.send, msg)
 
             def _pve_send_binary(msg):
                 with _pve_io_lock:
-                    pve_ws.send_binary(msg)
+                    write_with_deadline(pve_ws, pve_ws.send_binary, msg)
 
             def _pve_ping():
                 with _pve_io_lock:
-                    pve_ws.ping()
+                    write_with_deadline(pve_ws, pve_ws.ping)
+
+            # why the session ended, first one wins - an error goes out at WARNING below
+            ended = []
 
             async def proxmox_to_client():
                 """Forward data from Proxmox to browser (blocking recv handled in thread).
@@ -9642,6 +9706,7 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                     try:
                         data = await asyncio.to_thread(_pve_recv)
                         if not data:
+                            ended.append(('PVE closed', False))
                             running = False
                             break
                         if _ttfb_ms is None:
@@ -9656,11 +9721,12 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                         # idle slice — no frame this tick; loop so the writers get the lock (#713)
                         continue
                     except ws_client.WebSocketConnectionClosedException:
+                        ended.append(('PVE closed', False))
                         running = False
                         break
                     except Exception as e:
                         if running:
-                            logging.debug(f"[VNC] PVE->Client: {e}")
+                            ended.append((f'PVE->Client: {e}', True))
                         running = False
                         break
                 stop_evt.set()
@@ -9692,16 +9758,24 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                                     f"(host={host} vm={vm_type}/{vmid}): {_crypto_err}. "
                                     "TLS-inspection / EDR is modifying packets mid-flight."
                                 )
+                                ended.append(('integrity check failed', True))
                                 running = False
                                 try:
                                     await websocket.close(4099, f"integrity_check_failed: {_crypto_err}")
                                 except Exception:
                                     pass
                                 break
-                        await asyncio.to_thread(_pve_send, message)
+                        try:
+                            await asyncio.to_thread(_pve_send, message)
+                        except Exception as e:
+                            ended.append((f'Client->PVE: {e}', True))
+                            break
+                    else:
+                        ended.append(('browser closed', False))
                 except Exception as e:
-                    if running and 'close' not in str(e).lower():
-                        logging.debug(f"[VNC] Client->PVE: {e}")
+                    if running:
+                        ended.append(('browser closed', False) if 'close' in str(e).lower()
+                                     else (f'browser: {e}', True))
                 finally:
                     running = False
                     stop_evt.set()
@@ -9743,7 +9817,9 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                     # WS-layer ping (cheap, keeps any websocket-aware intermediary happy)
                     try:
                         await asyncio.to_thread(_pve_ping)
-                    except Exception:
+                    except Exception as e:
+                        # this task ending ends the session too - it used to say nothing
+                        ended.append((f'keepalive ping to PVE: {e}', True))
                         break
                     # RFB-layer keepalive (keeps pveproxy/qemu from declaring the session idle)
                     now = _time.monotonic()
@@ -9752,7 +9828,7 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                             await asyncio.to_thread(_pve_send_binary, RFB_FB_UPDATE_REQUEST)
                             next_rfb_at = now + rfb_interval
                         except Exception as e:
-                            logging.debug(f"[VNC] RFB keepalive send failed: {e}")
+                            ended.append((f'RFB keepalive to PVE: {e}', True))
                             break
 
             task1 = asyncio.create_task(proxmox_to_client())
@@ -9779,10 +9855,12 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
             _duration_ms = int((_t_connect.monotonic() - _session_started) * 1000)
             _ttfb_str = f"{_ttfb_ms}ms" if _ttfb_ms is not None else "never"
             _short_session = _duration_ms < 5000 and bytes_received < 4096
-            _level = logging.WARNING if _short_session else logging.INFO
+            # #713 - the reason was a DEBUG line of its own, so a drop in the field said nothing
+            _reason, _failed = ended[0] if ended else ('unknown', False)
+            _level = logging.WARNING if (_short_session or _failed) else logging.INFO
             logging.log(
                 _level,
-                f"[VNC] session ended host={host} vm={vm_type}/{vmid} "
+                f"[VNC] session ended host={host} vm={vm_type}/{vmid} reason={_reason} "
                 f"connect={_connect_ms}ms ttfb={_ttfb_str} duration={_duration_ms}ms "
                 f"sent={bytes_sent}B recv={bytes_received}B "
                 f"{'SHORT_OR_EMPTY — middlebox/EDR may be interfering' if _short_session else ''}"
@@ -10043,24 +10121,27 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
         
-        # Step 1: Login
-        print(f"Step 1: Login...")
-        login_data = urlencode({
-            'username': manager.config.user,
-            'password': manager.config.pass_
-        }).encode('utf-8')
+        # Step 1: Login - not on a token cluster, there is no password (#955)
+        _token_auth = _console_uses_token(manager)
+        pve_ticket = csrf_token = None
+        if not _token_auth:
+            print(f"Step 1: Login...")
+            login_data = urlencode({
+                'username': manager.config.user,
+                'password': manager.config.pass_
+            }).encode('utf-8')
         
-        login_req = urllib.request.Request(
-            f"https://{manager.auth_host}:{port}/api2/json/access/ticket",
-            data=login_data, method='POST'
-        )
+            login_req = urllib.request.Request(
+                f"https://{manager.auth_host}:{port}/api2/json/access/ticket",
+                data=login_data, method='POST'
+            )
         
-        with urllib.request.urlopen(login_req, context=ssl_context, timeout=10) as response:
-            login_result = json.loads(response.read().decode('utf-8'))
+            with urllib.request.urlopen(login_req, context=ssl_context, timeout=10) as response:
+                login_result = json.loads(response.read().decode('utf-8'))
 
-        pve_ticket = login_result['data']['ticket']
-        csrf_token = login_result['data']['CSRFPreventionToken']
-        print(f"Got PVE ticket")
+            pve_ticket = login_result['data']['ticket']
+            csrf_token = login_result['data']['CSRFPreventionToken']
+            print(f"Got PVE ticket")
 
         # MK Apr 2026 (#352 follow-up) — single-vncproxy mode. If the JS
         # already got a vncproxy ticket+port via /console, reuse it so the VNC
@@ -10080,6 +10161,9 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
             vnc_port = _ppt_port
             _reuse_manager_auth = True
             print(f"Reusing JS-issued vncproxy ticket port={vnc_port}")
+        elif _token_auth:
+            vnc_ticket, vnc_port = _vncproxy_via_manager(manager, node, vm_type, vmid)
+            _reuse_manager_auth = True
         else:
             print(f"Step 2: Get VNC ticket...")
             if vm_type == 'qemu':
@@ -10124,6 +10208,8 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
 
         bytes_sent = 0
         bytes_received = 0
+        # #713 - why it ended, first one wins; printed at WARNING when it was an error
+        ended = []
 
         # Greenlet to read from Proxmox and send to client
         def proxmox_to_client():
@@ -10139,16 +10225,16 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
                     except websocket.WebSocketTimeoutException:
                         gsleep(0.01)
                     except websocket.WebSocketConnectionClosedException:
-                        print("Proxmox closed")
+                        ended.append(('PVE closed', False))
                         running = False
                         break
                     except Exception as e:
                         if running:
-                            print(f"PVE->Client error: {e}")
+                            ended.append((f'PVE->Client: {e}', True))
                         running = False
                         break
             except Exception as e:
-                print(f"proxmox_to_client crashed: {e}")
+                ended.append((f'PVE->Client crashed: {e}', True))
                 running = False
         
         # Start the proxmox reader greenlet
@@ -10170,18 +10256,27 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
                     if getattr(ws, 'connected', False):
                         gsleep(0.01)
                         continue
-                    print("Client disconnected")
+                    ended.append(('browser closed', False))
                     running = False
                     break
                 if data:
                     bytes_sent += len(data)
-                    with _pve_io_lock:
-                        pve_ws.send(data)
+                    # #713 - outside the timeout handling below: that one is for the
+                    # browser's read. A write to PVE that times out was swallowed by it,
+                    # and the next frame went out behind a partial one.
+                    try:
+                        with _pve_io_lock:
+                            write_with_deadline(pve_ws, pve_ws.send, data)
+                    except Exception as e:
+                        ended.append((f'Client->PVE: {e}', True))
+                        running = False
+                        break
             except TimeoutError:
                 gsleep(0.01)
             except Exception as e:
                 if "timed out" not in str(e).lower() and "timeout" not in str(e).lower():
-                    print(f"Client->PVE error: {e}")
+                    ended.append(('browser closed', False) if 'closed' in str(e).lower()
+                                 else (f'browser: {e}', True))
                     running = False
                     break
                 gsleep(0.01)
@@ -10189,7 +10284,10 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
         running = False
         pve_reader.kill()
         
-        print(f"Session ended: sent {bytes_sent}, received {bytes_received}")
+        _reason, _failed = ended[0] if ended else ('browser closed', False)
+        logging.log(logging.WARNING if _failed else logging.INFO,
+                    f"[VNC] session ended host={host} vm={vm_type}/{vmid} reason={_reason} "
+                    f"sent={bytes_sent}B recv={bytes_received}B")
         
     except Exception as e:
         logging.exception(f"SSH proxy error: {type(e).__name__}: {e}")
@@ -10250,7 +10348,8 @@ def get_termproxy_ticket_api(cluster_id, node, vm_type, vmid):
     mgr = cluster_managers[cluster_id]
     pve_pwd = getattr(mgr.config, 'pass_', None) or getattr(mgr.config, 'password', None)
     pve_usr = getattr(mgr.config, 'user', None) or 'root@pam'
-    if not pve_pwd:
+    # #955 - a token id with its secret is no password either; PVE would only answer 401
+    if not pve_pwd or '!' in pve_usr:
         return jsonify({'error': 'Cluster has no stored password — termproxy needs user/pass auth (API tokens cannot mint termproxy tickets).'}), 400
 
     import ssl as _ssl

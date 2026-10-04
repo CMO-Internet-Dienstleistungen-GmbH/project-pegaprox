@@ -252,3 +252,9 @@ def _bounded_float_env(name, default, lo, hi):
 
 HA_MIGRATE_SETTLE_SECONDS = _bounded_float_env('PEGAPROX_HA_MIGRATE_SETTLE', 90.0, 0.0, 3600.0)
 HA_MIGRATE_SETTLE_POLL = _bounded_float_env('PEGAPROX_HA_MIGRATE_SETTLE_POLL', 3.0, 0.5, 60.0)
+
+# MK Oct 2026 (#713) - a write to PVE on a console relay gets its own deadline. It used to
+# inherit VNC_PVE_RECV_SLICE above, so any write that could not drain within 10ms - a full
+# send buffer, or a hub busy elsewhere for that long - timed out halfway. What that does to
+# the stream is in vnc_polling.write_with_deadline.
+VNC_PVE_SEND_TIMEOUT = _bounded_float_env('PEGAPROX_VNC_SEND_TIMEOUT', 10.0, 1.0, 120.0)
