@@ -55,6 +55,8 @@ class UpdateTask:
         self.error = None
         self.packages_upgraded = 0
         self.completed_at = None
+        self.reboot_issued = False
+        self.back_online = False
 
     def add_output(self, line: str):
         self.output_lines.append({

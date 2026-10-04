@@ -191,6 +191,10 @@ class UpdateTask:
         self.error = None
         self.packages_upgraded = 0
         self.completed_at = None
+        # MK Oct 2026 (#953) - what the rolling update reads afterwards: a reboot went
+        # out, and the task already saw the node come back from it
+        self.reboot_issued = False
+        self.back_online = False
 
     def add_output(self, line: str):
         self.output_lines.append({
@@ -2933,12 +2937,14 @@ class PegaProxManager:
             self.logger.info(f"Selected for migration: {selected.get('name', 'unnamed')} ({vm_type} {selected.get('vmid')})")
         return selected
     
-    def get_best_target_node(self, exclude_nodes: List[str] = None, vmid: int = None) -> Optional[str]:
+    def get_best_target_node(self, exclude_nodes: List[str] = None, vmid: int = None,
+                             allowed_nodes=None) -> Optional[str]:
         """Find the best target node for migration
 
         LW: Now also excludes nodes configured in excluded_nodes (like ProxLB)
         MK Jul 2026 (#426): pass vmid to honour a ProxLB plb_pin_<node> tag when
         picking an evacuation/migration target for that specific guest.
+        allowed_nodes (#647): the only nodes this guest may land on, None = any.
         """
         if exclude_nodes is None:
             exclude_nodes = []
@@ -2988,10 +2994,105 @@ class PegaProxManager:
                     self.logger.warning(f"[PROXLB] VM {vmid} pinned to {sorted(_pin)} but none are available targets")
                     return None
 
+        if allowed_nodes is not None:
+            available_nodes = [(n, d) for (n, d) in available_nodes if n in allowed_nodes]
+            if not available_nodes:
+                self.logger.warning(f"[MAINT] VM {vmid} may only run on {sorted(allowed_nodes)} "
+                                    f"(HA rule / storage) and none of them is an available target")
+                return None
+
         # Sort by score (lowest first)
         available_nodes.sort(key=lambda x: x[1]['score'])
 
         return available_nodes[0][0]
+
+    _GUEST_VOLUME_KEY = re.compile(r'^(?:scsi|virtio|ide|sata|unused|mp)\d+$|^(?:efidisk0|tpmstate0|rootfs)$')
+
+    def _evacuation_placement(self):
+        """MK Oct 2026 (#647) - where HA and storage.cfg let guests go, read once per
+        evacuation. ha-manager refuses a target outside a strict node-affinity rule
+        (exit 2) and the CRM quietly drops a move to a node without the guest's storage,
+        and we used to pick such targets. Returns (vmid -> allowed nodes, storage ->
+        nodes it is limited to); a guest or storage missing from a map is unrestricted."""
+        def _on(v):
+            return str(v).strip().lower() in ('1', 'true', 'yes', 'on')
+
+        def _nodes(spec):
+            # 'pve1:2,pve2' -> {'pve1', 'pve2'}, priorities dropped
+            return {p.split(':')[0].strip() for p in str(spec or '').split(',') if p.strip()}
+
+        ha_nodes, storage_nodes = {}, {}
+
+        def _restrict(sid, nodes):
+            try:
+                vmid = int(str(sid).strip().split(':')[-1])
+            except ValueError:
+                return
+            ha_nodes[vmid] = ha_nodes[vmid] & nodes if vmid in ha_nodes else set(nodes)
+
+        try:
+            base = f"https://{self.host}:{self.api_port}/api2/json"
+        except Exception:
+            return ha_nodes, storage_nodes
+
+        def _data(path):
+            try:
+                r = self._api_get(f"{base}{path}")
+                return (r.json().get('data') or []) if r.status_code == 200 else []
+            except Exception as e:
+                self.logger.debug(f"[MAINT] {path} unreadable for placement: {e}")
+                return []
+
+        # PVE 9 node-affinity rules; only strict ones forbid, the rest are preferences
+        for rule in _data('/cluster/ha/rules'):
+            if (str(rule.get('type') or '').lower() == 'node-affinity'
+                    and _on(rule.get('strict')) and not _on(rule.get('disable'))):
+                for sid in str(rule.get('resources') or '').split(','):
+                    if sid.strip():
+                        _restrict(sid, _nodes(rule.get('nodes')))
+        # PVE 8 restricted groups (and a 9.0 cluster that has not migrated them yet)
+        groups = {g.get('group'): _nodes(g.get('nodes'))
+                  for g in _data('/cluster/ha/groups') if _on(g.get('restricted'))}
+        if groups:
+            for res in _data('/cluster/ha/resources'):
+                if res.get('group') in groups:
+                    _restrict(res.get('sid'), groups[res['group']])
+
+        for s in _data('/storage'):
+            if s.get('nodes'):
+                storage_nodes[s.get('storage')] = _nodes(s['nodes'])
+        return ha_nodes, storage_nodes
+
+    def _evacuation_allowed_nodes(self, vm, placement):
+        """Nodes this guest may move to under its HA rule and the storages it uses,
+        None when nothing limits it (#647)."""
+        ha_nodes, storage_nodes = placement
+        try:
+            vmid = int(vm.get('vmid'))
+        except (TypeError, ValueError):
+            return None
+        allowed = set(ha_nodes[vmid]) if vmid in ha_nodes else None
+        if not storage_nodes:
+            return allowed
+        kind = 'qemu' if vm.get('type') == 'qemu' else 'lxc'
+        try:
+            r = self._api_get(f"https://{self.host}:{self.api_port}/api2/json/nodes/{vm.get('node')}/{kind}/{vmid}/config")
+            config = (r.json().get('data') or {}) if r.status_code == 200 else {}
+        except Exception as e:
+            self.logger.debug(f"[MAINT] config of {vmid} unreadable for placement: {e}")
+            config = {}
+        for key, value in config.items():
+            if not isinstance(value, str) or not self._GUEST_VOLUME_KEY.match(key):
+                continue
+            volume = value.split(',')[0]
+            if volume.startswith('file='):
+                volume = volume[5:]
+            if ':' not in volume or volume.startswith('/'):
+                continue   # passthrough device, bind mount, empty drive
+            limit = storage_nodes.get(volume.split(':', 1)[0])
+            if limit is not None:
+                allowed = set(limit) if allowed is None else allowed & limit
+        return allowed
 
     def maintenance_capacity_preview(self, node_name, threshold=90.0):
         """#611 — read-only pre-flight: would evacuating node_name push any
@@ -4002,6 +4103,7 @@ class PegaProxManager:
 
             # Sort VMs by memory (smallest first for faster evacuation)
             node_vms.sort(key=lambda x: x.get('mem', 0))
+            placement = self._evacuation_placement()
 
             for vm in node_vms:
                 vm_name = vm.get('name', 'unnamed')
@@ -4025,12 +4127,16 @@ class PegaProxManager:
                 except:
                     pass  # if check fails, try migrating anyway
 
-                # Find best target node (#426: honour a plb_pin tag for this guest)
-                target_node = self.get_best_target_node(exclude_nodes=[node_name], vmid=vmid)
+                # Find best target node (#426: honour a plb_pin tag for this guest,
+                # #647: and only nodes its HA rule and its storages allow)
+                allowed = self._evacuation_allowed_nodes(vm, placement)
+                target_node = self.get_best_target_node(exclude_nodes=[node_name], vmid=vmid,
+                                                        allowed_nodes=allowed)
 
                 if not target_node:
                     self.logger.error(f"[ERROR] No available target node for {vm_name}")
-                    task.failed_vms.append({'vmid': vmid, 'name': vm_name, 'error': 'No target node available'})
+                    task.failed_vms.append({'vmid': vmid, 'name': vm_name, 'error': 'No target node available'
+                                            if allowed is None else 'No target node its HA rule and storage allow'})
                     task.pending_vms = [v for v in task.pending_vms if v.get('vmid') != vmid]
                     continue
 
@@ -4091,6 +4197,21 @@ class PegaProxManager:
                     self.logger.warning(f"[WARN] {remaining} VMs still on {node_name} after post-evacuation wait")
                 elif remaining < 0:
                     self.logger.warning(f"[WARN] could not verify VM count on {node_name} - API unreachable")
+
+            # #647 - the CRM can still finish a move we counted as failed; a guest that
+            # has left the node by now is no reason to pause the rolling update
+            if task.failed_vms:
+                try:
+                    where = {v.get('vmid'): v.get('node') for v in self.get_vm_resources()}
+                    moved = [f for f in task.failed_vms if where.get(f.get('vmid')) not in (None, node_name)]
+                    for f in moved:
+                        self.logger.info(f"[OK] {f.get('name')} ({f.get('vmid')}) left {node_name} after all, "
+                                         f"now on {where[f['vmid']]}")
+                    if moved:
+                        task.failed_vms = [f for f in task.failed_vms if f not in moved]
+                        task.migrated_vms += len(moved)
+                except Exception as e:
+                    self.logger.debug(f"[MAINT] recheck of failed evacuations skipped: {e}")
 
             if len(task.failed_vms) == 0:
                 task.status = 'completed'
@@ -12120,6 +12241,7 @@ echo "AGENT_INSTALLED_OK"
                 
                 if self._wait_for_node_online(node_name):
                     task.add_output(f"[OK] {node_name} is back online / ist wieder online!")
+                    task.back_online = True
                 else:
                     task.add_output(f"[ERROR] Timeout waiting for / beim Warten auf {node_name}")
                     task.error = "Node did not come back online in time"
@@ -18594,28 +18716,31 @@ echo "AGENT_INSTALLED_OK"
                     result['cve_truncated'] = True
                 elif line.startswith('CVE-'):
                     result['debsecan_available'] = True
-                    # default format: "CVE-2024-1234 package urgency (status info)"
-                    # e.g. "CVE-2023-31484 perl low (LTS: 5.36.0-7+deb12u2)"
-                    cve_parts = line.split()
-                    if len(cve_parts) >= 3:
+                    # MK Oct 2026 (#827) - debsecan's summary format is "CVE pkg" or
+                    # "CVE pkg (fixed, remotely exploitable, high urgency, obsolete)", every
+                    # note optional. There is no bare urgency column, so the old 3-field read
+                    # dropped note-less lines and called everything else medium.
+                    head, _, notes = line.partition('(')
+                    cve_parts = head.split()
+                    if len(cve_parts) >= 2:
                         cve_id = cve_parts[0]
                         pkg_name = cve_parts[1]
-                        urgency_raw = cve_parts[2].lower()
-                        # rest is status info in parens
-                        status = ' '.join(cve_parts[3:]).strip('()')
-
-                        urgency = 'medium'
-                        if urgency_raw in ('high', 'medium**'):
-                            urgency = 'high'
-                        elif urgency_raw in ('low', 'unimportant'):
-                            urgency = 'low'
+                        flags = [n.strip().lower() for n in notes.rstrip(')').split(',') if n.strip()]
+                        urgency = 'unknown'
+                        for n in flags:
+                            if n.endswith(' urgency'):
+                                urgency = n[:-len(' urgency')].strip() or 'unknown'
+                        flags = [n for n in flags if not n.endswith(' urgency')]
 
                         if not any(c['cve'] == cve_id and c['package'] == pkg_name for c in result['cves']):
                             result['cves'].append({
                                 'cve': cve_id,
                                 'package': pkg_name,
                                 'urgency': urgency,
-                                'status': status,
+                                'status': ', '.join(flags),
+                                'fixed': 'fixed' in flags,
+                                'remote': 'remotely exploitable' in flags,
+                                'obsolete': 'obsolete' in flags,
                             })
             elif section == 'UPDATES' and line.startswith('Inst '):
                 parts = line.split(' ', 2)
@@ -18652,7 +18777,7 @@ echo "AGENT_INSTALLED_OK"
             available_updates = {p['name'] for p in result['packages']}
             active_cve_ids = set()
             for cve in result['cves']:
-                db.upsert_cve(self.id, node_name, cve['cve'], cve.get('package', ''), cve.get('urgency', 'medium'))
+                db.upsert_cve(self.id, node_name, cve['cve'], cve.get('package', ''), cve.get('urgency', 'unknown'))
                 active_cve_ids.add(cve['cve'])
                 first_seen = db.get_cve_first_seen(self.id, node_name, cve['cve'])
                 cve['first_seen'] = first_seen

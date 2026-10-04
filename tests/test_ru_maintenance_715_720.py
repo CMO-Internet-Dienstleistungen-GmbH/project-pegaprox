@@ -91,8 +91,9 @@ def test_715_reboot_wait_gated_on_reboot_issued():
     did_reboot = _Task(); did_reboot.reboot_issued = True
     assert (include_reboot and getattr(did_reboot, 'reboot_issued', True))      # -> wait
 
-    # attribute never set (reboot block not reached) -> safe default is to wait
-    assert (include_reboot and getattr(_Task(), 'reboot_issued', True))
+    # reboot block never reached -> no reboot went out, nothing to wait for (#953)
+    from pegaprox.core.manager import UpdateTask
+    assert not (include_reboot and UpdateTask('n1').reboot_issued)
 
     # global toggle off -> never wait regardless
     assert not (False and getattr(did_reboot, 'reboot_issued', True))
