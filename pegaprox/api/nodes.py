@@ -1408,7 +1408,8 @@ def log_message(message):
     """write to log file, nothing fancy"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_entry = f"[{{timestamp}}] {{message}}"
-    print(log_entry)
+    # line by line under systemd, not in blocks minutes later
+    print(log_entry, flush=True)
     try:
         with open(LOG_FILE, 'a') as f:
             f.write(log_entry + "\\n")
@@ -1484,7 +1485,8 @@ def parse_smbios_string(smbios_str):
     return params
 
 def needs_smbios_update(vmid):
-    """Check if VM needs SMBIOS configuration"""
+    """Check if VM needs SMBIOS configuration. Logs nothing: the re-create check runs it
+    for every configured VM on every cycle"""
     smbios_str = get_current_smbios(vmid)
     if not smbios_str:
         return True
@@ -1497,7 +1499,6 @@ def needs_smbios_update(vmid):
     
     if ('manufacturer' in params or 'product' in params or 
         'version' in params or 'serial' in params or 'family' in params):
-        log_message(f"VM {{vmid}} already has SMBIOS configuration")
         return False
     
     return True
