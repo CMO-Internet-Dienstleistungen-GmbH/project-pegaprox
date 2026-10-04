@@ -14,6 +14,7 @@ from pegaprox.models.permissions import *
 from pegaprox.models.tasks import PegaProxConfig
 from pegaprox.core.db import get_db
 from pegaprox.core import ha
+from pegaprox.core.cache import StorageDataCache
 
 from pegaprox.utils.auth import require_auth, load_users, build_authz_user
 from pegaprox.utils.audit import log_audit
@@ -1032,6 +1033,49 @@ def get_cluster_metrics(cluster_id):
     return jsonify({'error': 'Connection temporarily unavailable', 'offline': True}), 503
 
 
+# MK Oct 2026 (#946) - the health pill polls from every open tab, so the storage part of the
+# score is shared per cluster for a short while instead of being fetched per request.
+_HEALTH_STORAGE_TTL = 30
+_health_storage_cache = StorageDataCache()
+
+
+def _health_storage_rows(mgr, ns):
+    """(node, storage, used, total) for every active storage, or None when the lookup failed
+    (not cached, so the next poll tries again)."""
+    if getattr(mgr, 'cluster_type', 'proxmox') == 'proxmox':
+        # /nodes/<n>/storage builds live status for every storage one after another, a login
+        # per PBS datastore, seconds per node. /cluster/resources is served from pvestatd's cache
+        # and covers all nodes in one call. Storages of offline nodes come back 'unknown'.
+        url = f"https://{mgr.host}:{mgr.api_port}/api2/json/cluster/resources?type=storage"
+        r = mgr._api_get(url, timeout=8)
+        if r is None or r.status_code != 200:
+            return None
+        return [(s.get('node') or '?', s.get('storage') or '?', s.get('disk') or 0, s.get('maxdisk') or 0)
+                for s in (r.json().get('data') or [])
+                if s.get('status') == 'available']
+
+    # XCP-ng has no cluster-wide storage view, keep the per-node listing.
+    # MK 2026-05-31 (F1a) - parallel fanout, ONLINE nodes only: a dead node's
+    # storage call would otherwise park the whole batch at the gevent-pool
+    # timeout. (D2) node names are checked before they go into a URL.
+    from pegaprox.utils.concurrent import run_concurrent_dict
+    _SAFE_NODE = re.compile(r'^[a-zA-Z][a-zA-Z0-9.\-]{0,62}$')
+    online_node_names = [
+        name for name, d in ns.items()
+        if (d.get('status') in ('online', 'running') or not d.get('offline'))
+        and name and _SAFE_NODE.match(name)
+    ]
+    if not online_node_names:
+        return []
+    tasks = {n: (lambda nn=n: mgr.get_storage_list(nn) or []) for n in online_node_names}
+    rows = []
+    for node_name, stors in run_concurrent_dict(tasks, timeout=8).items():
+        for s in (stors or []):
+            if s.get('active'):
+                rows.append((node_name, s.get('storage', '?'), s.get('used') or 0, s.get('total') or 0))
+    return rows
+
+
 # NS May 2026 — single-number cluster health score (0-100). Inputs are cheap-to-compute
 # stuff we already pull elsewhere: node status, per-node storages, replication, backup-SLA.
 # The drill-down list lets the user see what dragged the score down.
@@ -1081,49 +1125,21 @@ def get_cluster_health(cluster_id):
             issues.append(f'{offline} node(s) offline: {", ".join(offline_names) or "?"}')
 
     # 2) Storage pressure — worst-offender across all nodes
-    # MK 2026-05-31 (F1a) — parallelise the per-node get_storage_list fanout.
-    # Was sequential: N nodes × ~200ms = up to 1.2s for a 6-node cluster, and
-    # one slow node could push past 5s. /health is dashboard-polled every
-    # ~10-20s, so this used to chew gevent workers. run_concurrent_dict skips
-    # the broken `if GEVENT_POOL` truthy check in the older inline callsites.
     worst_pct = 0.0
     worst_label = None
     try:
-        from pegaprox.utils.concurrent import run_concurrent_dict
-        # Only scan ONLINE nodes — a dead node's storage call would otherwise
-        # park the whole parallel batch at the 10s gevent-pool timeout (we'd
-        # be waiting for joinall to finish). Sequential code masked this
-        # because the connection failed fast, but parallel waits the full
-        # timeout. Net: post-parallelise /health was SLOWER on degraded
-        # clusters until this filter went in.
-        # MK 2026-05-31 (D2) — also drop any node-name that doesn't pass the
-        # RFC-1035-ish check. PVE controls these but if PVE itself were ever
-        # compromised, a crafted name like `../foo` would be interpolated
-        # into the storage-list URL. Belt-and-suspenders.
-        import re as _re
-        _SAFE_NODE = _re.compile(r'^[a-zA-Z][a-zA-Z0-9.\-]{0,62}$')
-        online_node_names = [
-            name for name, d in ns.items()
-            if (d.get('status') in ('online', 'running') or not d.get('offline'))
-            and name and _SAFE_NODE.match(name)
-        ]
-        if online_node_names:
-            tasks = {n: (lambda nn=n: mgr.get_storage_list(nn) or []) for n in online_node_names}
-            per_node_stors = run_concurrent_dict(tasks, timeout=8)
-        else:
-            per_node_stors = {}
-        for node_name, stors in per_node_stors.items():
-            for s in (stors or []):
-                if not s.get('active'):
-                    continue
-                total = s.get('total') or 0
-                used = s.get('used') or 0
-                if total <= 0:
-                    continue
-                pct = (used / total) * 100.0
-                if pct > worst_pct:
-                    worst_pct = pct
-                    worst_label = f"{s.get('storage', '?')} @ {node_name}"
+        rows, hit = _health_storage_cache.get(cluster_id, 'storage')
+        if not hit:
+            rows = _health_storage_rows(mgr, ns)
+            if rows is not None:
+                _health_storage_cache.set(cluster_id, 'storage', rows, ttl_seconds=_HEALTH_STORAGE_TTL)
+        for node_name, stor_name, used, total in (rows or []):
+            if total <= 0:
+                continue
+            pct = (used / total) * 100.0
+            if pct > worst_pct:
+                worst_pct = pct
+                worst_label = f"{stor_name} @ {node_name}"
     except Exception as e:
         logging.debug(f"[health] storage scan failed: {e}")
     if worst_label is not None:
