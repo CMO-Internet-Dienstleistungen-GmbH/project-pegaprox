@@ -47,6 +47,13 @@ def sidebar(dash):
     return dash[start:end]
 
 
+@pytest.fixture(scope='module')
+def tools(dash):
+    """Corporate lists the global views in a Tools section of its own, at the top of the sidebar."""
+    start = dash.index('{isCorporate && clusters.length > 0 && (() => {')
+    return dash[start:dash.index('})()}', start)]
+
+
 def _sidebar_handlers(src):
     # the global entries all use a one-line arrow handler
     return re.findall(r'onClick=\{\(\) => \{ ([^}]*setSidebar[^}]*) \}\}', src)
@@ -73,9 +80,17 @@ def test_picking_a_cluster_clears_every_global_view(dash):
         assert f'setSidebar{flag}(false)' in m.group(1), f'{flag} survives a cluster pick'
 
 
-def test_every_sibling_entry_clears_the_others(sidebar):
-    handlers = _sidebar_handlers(sidebar)
-    # All Clusters, Topology, World Map, XHM, EVPN - the new entry goes through openAutoInstall
+def test_every_sibling_entry_clears_the_others(dash, sidebar, tools):
+    # All Clusters has its handler inline; Topology, World Map, XHM and EVPN have a named
+    # one, shared by the Modern rows and the corporate Tools section. The new entry goes
+    # through openAutoInstall
+    named = dict(re.findall(r'const open(Topology|Worldmap|Xhm|MultiSdn) = \(\) => \{ ([^}]*) \};', dash))
+    assert sorted(named) == ['MultiSdn', 'Topology', 'Worldmap', 'Xhm'], sorted(named)
+    for fn in ('openWorldmap', 'openXhm', 'openMultiSdn'):
+        assert f'onClick={{{fn}}}' in sidebar, fn
+    for fn in ('openTopology', 'openWorldmap', 'openXhm', 'openMultiSdn'):
+        assert f'onClick: {fn},' in tools, fn
+    handlers = _sidebar_handlers(sidebar) + list(named.values())
     assert len(handlers) >= 5, handlers
 
     for body in handlers:
@@ -123,7 +138,7 @@ def test_all_clusters_is_not_lit_next_to_another_global_view(dash, sidebar):
     assert 'sidebarTopology || sidebarXHM' not in all_clusters
 
 
-def test_the_entry_sits_right_after_world_map(sidebar):
+def test_the_entry_sits_right_after_world_map(sidebar, tools):
     world = sidebar.index('Worldmap sidebar entry')
     # the empty-sidebar card further up uses the same gate, so look after World Map;
     # a standby installs nothing and shows neither (#625)
@@ -134,7 +149,10 @@ def test_the_entry_sits_right_after_world_map(sidebar):
     button = sidebar[entry:sidebar.index('</button>', entry)]
     assert 'onClick={() => openAutoInstall()}' in button
     assert "t('autoInstall')" in button and "t('autoInstallHint')" in button
-    assert 'isCorporate' in button, 'no Corporate row style'
+    # corporate: the same place in its Tools section, the same gate and handler
+    assert re.findall(r"\{ id: '(\w+)', show: ", tools) == ['topology', 'worldmap', 'autoinstall', 'xhm', 'mcevpn']
+    assert "{ id: 'autoinstall', show: canAutoInstall && !haStandby," in tools
+    assert 'onClick: () => openAutoInstall(),' in tools
 
 
 def test_the_zero_cluster_card_is_the_way_in_before_any_cluster_exists(sidebar):
@@ -143,7 +161,7 @@ def test_the_zero_cluster_card_is_the_way_in_before_any_cluster_exists(sidebar):
     first hosts install. A manager lands in the wizard, as the label promises."""
     # up to the cluster list; the card has a ternary of its own now (#625: a standby
     # says why the list is empty instead)
-    card = sidebar[:sidebar.index('<div className="space-y-3">')]
+    card = sidebar[:sidebar.index("<div className={isCorporate ? 'space-y-0' : 'space-y-3'}>")]
     assert '{canAutoInstall && !haStandby && (' in card
     assert "openAutoInstall(user?.autoinstall_access === 'manage' ? { wizard: true } : null)" in card
     assert "t('autoInstallFirstHost')" in card and "t('autoInstall')" in card
@@ -215,6 +233,7 @@ def test_every_layout_keeps_the_entry_off_every_standby(dash):
         assert gate not in dash, gate
         assert gate not in _read(VM_MODALS), gate
     assert dash.count('{canAutoInstall && !haStandby && (') == 2
+    assert dash.count('show: canAutoInstall && !haStandby,') == 1   # the corporate Tools section
     assert ("const { user, sessionId, logout, getAuthHeaders, isAdmin, passwordExpiry, updatePreferences, "
             "ha, haReadOnly, haStandby, haConsolesElsewhere, haServing, refreshHa } = useAuth();") in dash
 

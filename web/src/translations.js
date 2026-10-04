@@ -3945,6 +3945,7 @@
                 // MK May 2026 — worldmap (offline cluster geo-view)
                 worldMap: 'Weltkarte',
                 worldMapHint: 'Cluster-Standorte',
+                sidebarToolsSection: 'Werkzeuge',
                 zoomIn: 'Hineinzoomen',
                 zoomOut: 'Herauszoomen',
                 resetZoom: 'Zoom zurücksetzen',
@@ -9524,6 +9525,7 @@
                 // MK May 2026 — worldmap (offline cluster geo-view)
                 worldMap: 'World Map',
                 worldMapHint: 'Cluster locations',
+                sidebarToolsSection: 'Tools',
                 zoomIn: 'Zoom in',
                 zoomOut: 'Zoom out',
                 resetZoom: 'Reset zoom',
@@ -14379,6 +14381,7 @@
                 topologyView: '拓扑结构',
                 worldMap: '世界地图',
                 worldMapHint: '集群位置',
+                sidebarToolsSection: '工具',
                 zoomIn: '放大',
                 zoomOut: '缩小',
                 resetZoom: '重置缩放',
@@ -19156,6 +19159,7 @@
                 topologyView: 'Topologia',
                 worldMap: 'Mapa świata',
                 worldMapHint: 'Lokalizacje klastrów',
+                sidebarToolsSection: 'Narzędzia',
                 zoomIn: 'Powiększ',
                 zoomOut: 'Pomniejsz',
                 resetZoom: 'Resetuj powiększenie',
@@ -21750,6 +21754,7 @@
                 // MK May 2026 — worldmap (offline cluster geo-view)
                 worldMap: 'Carte du Monde',
                 worldMapHint: 'Emplacements des clusters',
+                sidebarToolsSection: 'Outils',
                 worldMapLoading: 'Chargement de la carte…',
                 worldMapLoadFailed: 'Échec du chargement de la carte',
                 worldMapNoneSet: 'Aucun cluster placé sur la carte.',
@@ -28746,6 +28751,7 @@
                 // MK May 2026 — worldmap (offline cluster geo-view)
                 worldMap: 'Mapa Mundial',
                 worldMapHint: 'Ubicaciones de clústeres',
+                sidebarToolsSection: 'Herramientas',
                 worldMapLoading: 'Cargando mapa…',
                 worldMapLoadFailed: 'Error al cargar el mapa',
                 worldMapNoneSet: 'Aún no hay clústeres en el mapa.',
@@ -33961,6 +33967,7 @@
                 // MK May 2026 — worldmap (offline cluster geo-view)
                 worldMap: 'Mapa Mundial',
                 worldMapHint: 'Localizações dos clusters',
+                sidebarToolsSection: 'Ferramentas',
                 worldMapLoading: 'Carregando mapa…',
                 worldMapLoadFailed: 'Falha ao carregar o mapa',
                 worldMapNoneSet: 'Nenhum cluster no mapa ainda.',
@@ -39025,6 +39032,7 @@
                 // MK May 2026 — worldmap (offline cluster geo-view)
                 worldMap: '세계 지도',
                 worldMapHint: '클러스터 위치',
+                sidebarToolsSection: '도구',
                 worldMapLoading: '지도 로드 중…',
                 worldMapLoadFailed: '지도를 불러올 수 없습니다',
                 worldMapNoneSet: '아직 지도에 클러스터가 없습니다.',
@@ -44225,6 +44233,7 @@
                 // MK May 2026 — worldmap (offline cluster geo-view)
                 worldMap: 'Mappa del Mondo',
                 worldMapHint: 'Posizioni dei cluster',
+                sidebarToolsSection: 'Strumenti',
                 worldMapLoading: 'Caricamento mappa…',
                 worldMapLoadFailed: 'Caricamento mappa fallito',
                 worldMapNoneSet: 'Nessun cluster sulla mappa.',
