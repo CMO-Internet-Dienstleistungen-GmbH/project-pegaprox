@@ -2601,6 +2601,10 @@
                             onOpenSettings && onOpenSettings();
                             window.dispatchEvent(new CustomEvent('pegaprox-navigate-ha'));
                         }} />
+                        <HaLeaderBanner cloud onOpenHa={() => {
+                            onOpenSettings && onOpenSettings();
+                            window.dispatchEvent(new CustomEvent('pegaprox-navigate-ha'));
+                        }} />
                         <div className="cloud-content-scroll">
                             {body}
                             <CloudSponsorFooter t={T} />

@@ -895,6 +895,85 @@
             );
         }
 
+        // LW Oct 2026 (#625) - a group that fails over automatically tells every signed-in user
+        // when it has no leader (changes and automation wait, consoles go on), when a new one is
+        // taking over and, for ten minutes, that the leader changed. The first two stay while
+        // they hold; the change can be closed, and a later change shows again. Admins get a way
+        // to the HA tab. Every value is an address the server sends, put in as it is.
+        function HaLeaderBanner({ onOpenHa, cloud = false }) {
+            const { t } = useTranslation();
+            const { ha, isAdmin } = useAuth();
+            const [closed, setClosed] = useState('');          // the change of the leader the user closed
+            const [, setTick] = useState(0);
+            const automatic = ha?.automatic === true;
+            const takeover = automatic && ha.takeover && typeof ha.takeover === 'object' ? ha.takeover : null;
+            const changed = automatic && ha.leader_changed && typeof ha.leader_changed === 'object' && ha.leader_changed.to
+                ? ha.leader_changed : null;
+            const noLeader = automatic && ha.no_leader === true;
+            // resume_in counts from the answer that brought it, and on between two polls
+            const heardAt = useMemo(() => Date.now(), [takeover?.resume_in, takeover?.leader]);
+            useEffect(() => {
+                if (!takeover) return;
+                const h = setInterval(() => setTick(n => n + 1), 1000);
+                return () => clearInterval(h);
+            }, [!!takeover]);
+            const changeKey = changed ? `${changed.epoch ?? ''}|${changed.at || ''}` : '';
+            const lines = [];
+            if (noLeader) {
+                lines.push({ kind: 'no-leader', tone: 'red', icon: <Icons.AlertTriangle />, text: t('haNoLeader') });
+            } else if (takeover) {
+                const left = Math.max(1, Math.round((Number(takeover.resume_in) || 0) - (Date.now() - heardAt) / 1000));
+                lines.push({ kind: 'takeover', tone: 'blue', icon: <Icons.RefreshCw />,
+                             text: t('haTakeover').replace('{leader}', () => takeover.leader || '-').replace('{n}', left) });
+            }
+            if (changed && closed !== changeKey) {
+                lines.push({ kind: 'leader-changed', tone: 'blue', icon: <Icons.Info />, close: true,
+                             text: t('haLeaderChanged').replace('{to}', () => changed.to).replace('{time}', () => fmtTime(changed.at) || '-') });
+            }
+            if (!lines.length) return null;
+
+            return lines.map(line => {
+                const tone = HA_BANNER_TONE[line.tone];
+                const button = isAdmin && onOpenHa && line.kind !== 'leader-changed' && (
+                    <button onClick={onOpenHa}
+                        className={cloud ? 'cloud-btn cloud-btn-sm' : `px-3 py-1 rounded-lg text-xs font-medium text-white whitespace-nowrap ${tone.button}`}
+                        style={cloud ? { whiteSpace: 'nowrap' } : undefined}>
+                        {t('pgHaTab')}
+                    </button>
+                );
+                const close = line.close && (
+                    <button onClick={() => setClosed(changeKey)} title={t('close')} aria-label={t('close')}
+                        className={cloud ? 'cloud-btn cloud-btn-sm' : 'flex-shrink-0 p-1 rounded text-gray-400 hover:text-white'}
+                        style={cloud ? { whiteSpace: 'nowrap' } : undefined}>
+                        <Icons.X />
+                    </button>
+                );
+                if (cloud) {
+                    return (
+                        <div key={line.kind} data-ha-lease-banner={line.kind} data-ha-lease-banner-layout="cloud" role="status"
+                            style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 16px', fontSize: 13,
+                                     background: tone.cloud[0], borderBottom: `1px solid ${tone.cloud[1]}`, color: tone.cloud[2] }}>
+                            <span style={{ display: 'inline-flex', flexShrink: 0 }}>{line.icon}</span>
+                            <span style={{ flex: '1 1 auto', minWidth: 0, overflowWrap: 'anywhere' }}>{line.text}</span>
+                            {button}
+                            {close}
+                        </div>
+                    );
+                }
+                return (
+                    <div key={line.kind} data-ha-lease-banner={line.kind} data-ha-lease-banner-layout="classic" role="status"
+                        className={`px-4 py-2 border-b ${tone.box}`}>
+                        <div className="flex items-center gap-3 text-sm">
+                            <span className={`flex-shrink-0 ${tone.icon}`}>{line.icon}</span>
+                            <span className={`flex-1 min-w-0 ${tone.text}`} style={{ overflowWrap: 'anywhere' }}>{line.text}</span>
+                            {button}
+                            {close}
+                        </div>
+                    </div>
+                );
+            });
+        }
+
         // Cluster Sidebar Item Component - NS Jan 2026
         function ClusterSidebarItem({ cluster, idx, selectedCluster, setSelectedCluster, nodeAlerts, clusterGroups, isAdmin, handleDeleteCluster, setShowAssignGroup, setRenamingCluster, setRenameValue, setReconfigureCluster, t, getAuthHeaders, fetchClusters, addToast, isCorporate, expandedSidebarClusters, toggleSidebarCluster, onContextMenu, hwHealth }) {
             const offlineNodesCount = Object.values(nodeAlerts || {})
@@ -15291,7 +15370,8 @@
                     <PasswordExpiryBanner onChangePassword={() => setShowProfile(true)} />
                     <HaStandbyBanner onOpenHa={openHaSettings} />
                     <HaCopiesBanner onOpenHa={openHaSettings} />
-                    
+                    <HaLeaderBanner onOpenHa={openHaSettings} />
+
                     {/* Node Offline Alert Banner */}
                     <NodeAlertBanner 
                         alerts={nodeAlerts} 

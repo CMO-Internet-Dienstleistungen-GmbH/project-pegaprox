@@ -36,8 +36,8 @@ NOT_SHIPPED_NOTE = ('Automatic failover is not available in this release yet. Un
 WITNESS_CODE = 'pgxwt1_' + 'W' * 80
 ZONES = ('Europe/Vienna', 'America/New_York', 'Asia/Tokyo', 'UTC')
 EM_DASH = chr(0x2014)
-# the routes these cards send to, and nothing else (Make leader, Force leader, transfer and the
-# planned restart are slice S7's)
+# the routes these cards send to (Make leader, Force leader and the settings of a member came with
+# slices S7 and S8, tests/test_ha_lead_ui.py)
 ROUTES = {"'mode'", '`members/${encodeURIComponent(target)}/readmit`', "'witness/pairing-code'", "'witness/remove'",
           "'timezone'"}
 
@@ -280,8 +280,10 @@ def test_the_panel_mounts_them_on_the_leader_and_a_member_only(panel):
     assert 'const zone = zoned && <HaZoneCard {...shared} />;' in cards
     # the columns of the voter config only with data behind them
     assert ("const auto = status?.auto && typeof status.auto === 'object' ? status.auto : null;" in panel)
-    assert '{autoRows && <HaAutoMemberHead t={t} cell={cell} />}' in panel
-    assert '{autoRows && <HaAutoMemberCells t={t} cell={cell} row={autoOf(m)} />}' in panel
+    assert '{autoRows && <HaAutoMemberHead t={t} cell={cell} ctl={memberCtl} />}' in panel
+    assert '{autoRows && <HaAutoMemberCells t={t} cell={cell} row={autoOf(m)} ctl={memberCtl} nameOf={nameOf} />}' in panel
+    # the leader's controls in those columns only on the leader, and not with an unreadable state file
+    assert "const memberCtl = role === 'active' && autoRows && !broken ? {" in panel
 
 
 def test_the_requests_are_what_the_routes_read(stage2):
@@ -323,14 +325,14 @@ def test_the_requests_are_what_the_routes_read(stage2):
     assert "name = _str(_body().get('timezone'), 100)" in zone and '_refuse_without_reauth' not in zone
 
 
-def test_nothing_of_slice_s7_and_no_other_route(stage2):
-    """Make leader, Force leader, transfer and planned restarts get their routes in S7: no button
-    for them here, and every request goes to one of the routes this slice was built against."""
+def test_every_request_goes_to_a_route_the_cards_were_built_against(stage2):
+    """The mode, witness and zone routes, and since slices S7 and S8 Make leader, Force leader and
+    the site and vote of a member (tests/test_ha_lead_ui.py pins those): nothing else."""
     paths = set(re.findall(r"haGroupSend\(getAuthHeaders, [^,]+, ([^,]+),", stage2))
-    assert paths == {'path', "'witness/pairing-code'", "'witness/remove'", "'timezone'"}, paths
+    assert paths == {'path', "'witness/pairing-code'", "'witness/remove'", "'timezone'", "'force-leader'"}, paths
     assert "const path = what === 'readmit' ? `members/${encodeURIComponent(target)}/readmit` : 'mode';" in stage2
-    for word in ('Make leader', 'makeLeader', 'Force leader', 'forceLeader', 'transfer', 'planned', 'break-glass'):
-        assert word.lower() not in stage2.lower(), word
+    assert ("const path = what === 'site' ? `members/${encodeURIComponent(id)}/site`\n"
+            "                    : leader ? 'make-leader' : `members/${encodeURIComponent(id)}/vote`;") in stage2
 
 
 def test_the_checklist_knows_every_code_the_server_sends(stage2):
@@ -612,17 +614,18 @@ def test_runtime_the_witness_code_is_refused_the_same_way(open_app):
 
 
 CHECKS = {
-    'clean': ([], None, {'votes': 'ok', 'release': 'ok', 'answer': 'ok', 'clock': 'ok', 'zone': 'ok'}),
+    'clean': ([], None, {'votes': 'ok', 'release': 'ok', 'answer': 'ok', 'clock': 'ok', 'zone': 'ok', 'sites': 'ok'}),
     'warn': ([_finding('EVEN_VOTERS', 'warn', '4 votes survive the loss of 1, the same as 3 would.')], None,
-             {'votes': 'warn', 'release': 'ok', 'answer': 'ok', 'clock': 'ok', 'zone': 'ok'}),
+             {'votes': 'warn', 'release': 'ok', 'answer': 'ok', 'clock': 'ok', 'zone': 'ok', 'sites': 'ok'}),
     'block': ([_finding('TOO_FEW_VOTERS', 'block', 'Automatic failover needs at least 3 votes, this group has 2.'),
                _finding('CLOCK_SKEW', 'block', f'The clock of {B_URL} is 9 s off.', B)], None,
-              {'votes': 'block', 'release': 'ok', 'answer': 'ok', 'clock': 'block', 'zone': 'ok'}),
+              {'votes': 'block', 'release': 'ok', 'answer': 'ok', 'clock': 'block', 'zone': 'ok', 'sites': 'ok'}),
     'witness': ([_finding('VOTER_DOWN', 'block', f'The witness {W_URL} has not answered within the last 2 minutes.', W),
                  _finding('WITNESS_SAME_SITE', 'warn', 'The witness shares site dc1 with data members.', W)], _witness(),
-                {'votes': 'ok', 'release': 'ok', 'answer': 'ok', 'witness': 'block', 'clock': 'ok', 'zone': 'ok'}),
+                {'votes': 'ok', 'release': 'ok', 'answer': 'ok', 'witness': 'block', 'clock': 'ok', 'zone': 'ok',
+                 'sites': 'ok'}),
     'other': ([_finding('SOMETHING_NEW', 'warn', 'A check of a later release.')], None,
-              {'votes': 'ok', 'release': 'ok', 'answer': 'ok', 'clock': 'ok', 'zone': 'ok', 'other': 'warn'}),
+              {'votes': 'ok', 'release': 'ok', 'answer': 'ok', 'clock': 'ok', 'zone': 'ok', 'sites': 'ok', 'other': 'warn'}),
 }
 
 
@@ -764,24 +767,29 @@ def test_runtime_automatic_mode_status_line_and_member_columns(open_app):
     assert checks.locator('input[type="checkbox"]').count() == 0
 
     heads = panel.locator('[data-ha-members] thead th').evaluate_all('r => r.map(x => x.innerText.trim())')
-    for column in ('Site', 'Vote', 'Clock', 'Reach', 'State'):
+    for column in ('Site', 'Vote', 'May lead', 'Clock', 'Reach', 'State'):
         assert column in heads, column
-    # no type column (the witness row carries its badge), vote and may lead share one, and
-    # the member's own controls come before the columns of the voter config
-    assert 'Type' not in heads and 'May lead' not in heads
-    assert heads.index('Active') < heads.index('Site')
+    # no type column (the witness row carries its badge); on the leader vote and may lead are a
+    # switch each (tests/test_ha_lead_ui.py), and the member's own controls come before the
+    # columns of the voter config
+    assert 'Type' not in heads
+    assert heads.index('Active') < heads.index('Site') < heads.index('Vote') < heads.index('May lead')
     b = panel.locator(f'[data-ha-member="{B}"]')
     assert b.locator('[data-ha-auto-site]').inner_text().strip() == 'dc1'
-    assert b.locator('[data-ha-auto-vote]').inner_text().strip() == 'Yes · May lead'
-    assert b.locator('[data-ha-auto-vote]').get_attribute('data-ha-auto-may-lead') == 'yes'
+    assert b.locator('[data-ha-auto-vote]').get_attribute('data-ha-auto-vote') == 'yes'
+    assert b.get_by_role('switch', name=f'Vote: {B_URL}').get_attribute('aria-checked') == 'true'
+    assert b.locator('[data-ha-auto-may-lead]').get_attribute('data-ha-auto-may-lead') == 'yes'
+    assert b.get_by_role('switch', name=f'May lead: {B_URL}').get_attribute('aria-checked') == 'true'
     assert b.locator('[data-ha-auto-skew]').inner_text().strip() == '+0.4 s'
     reach = b.locator('[data-ha-auto-reach] span')
     assert reach.inner_text().strip() == '1 of 2' and 'text-yellow-300' in reach.get_attribute('class')
     assert reach.get_attribute('title') == 'Clusters with node HA whose API this member reaches'
     assert b.locator('[data-ha-auto-state]').inner_text().strip() == 'heard 3 s ago'
     c = panel.locator(f'[data-ha-member="{C}"]')
-    assert c.locator('[data-ha-auto-vote]').inner_text().strip() == 'No'
-    assert c.locator('[data-ha-auto-vote]').get_attribute('data-ha-auto-may-lead') == 'no'
+    assert c.get_by_role('switch', name=f'Vote: {C_URL}').get_attribute('aria-checked') == 'false'
+    assert c.locator('[data-ha-auto-may-lead]').get_attribute('data-ha-auto-may-lead') == 'no'
+    # a member without a vote does not lead
+    assert c.get_by_role('switch', name=f'May lead: {C_URL}').is_disabled()
     skew = c.locator('[data-ha-auto-skew] span')
     assert skew.inner_text().strip() == '-7.2 s' and 'text-red-300' in skew.get_attribute('class')
     assert c.locator('[data-ha-auto-state]').get_attribute('data-ha-auto-state') == 'quarantined'
@@ -791,10 +799,12 @@ def test_runtime_automatic_mode_status_line_and_member_columns(open_app):
     assert w.locator('[data-ha-badge="witness"]').inner_text().strip() == 'Witness'
     assert w.locator('[data-ha-auto-site]').inner_text().strip() == 'dc3'
     assert w.locator('[data-ha-auto-vote]').inner_text().strip() == 'Yes'
-    assert w.locator('[data-ha-auto-vote]').get_attribute('data-ha-auto-may-lead') == 'no'
+    assert w.locator('[data-ha-auto-may-lead]').get_attribute('data-ha-auto-may-lead') == 'no'
     assert w.locator('[data-ha-auto-reach]').inner_text().strip() == '-'
-    # nothing to switch or remove on the witness row: the witness card does that
-    assert w.locator('button, [role="switch"]').count() == 0
+    # nothing to switch or remove on the witness row, the witness card does that; only its site
+    # is set here, as every member's is
+    assert w.locator('[role="switch"]').count() == 0
+    assert w.locator('button').count() == 1 and w.get_by_role('button', name=f'Site of {W_URL}').count() == 1
     witness = panel.locator('[data-ha-witness="paired"]')
     assert witness.locator('h4').inner_text().strip() == 'Witness'
     assert witness.locator('[data-ha-witness-url]').inner_text().strip() == W_URL

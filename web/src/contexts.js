@@ -223,6 +223,14 @@
                 const h = setInterval(refreshHa, 30000);
                 return () => clearInterval(h);
             }, [isAuthenticated, ha.role, refreshHa]);
+
+            // LW Oct 2026 (#625) - in a group that fails over automatically every role hears when
+            // the leader is gone or a new one takes over, within seconds rather than at login
+            useEffect(() => {
+                if (!isAuthenticated || ha.automatic !== true) return;
+                const h = setInterval(refreshHa, 10000);
+                return () => clearInterval(h);
+            }, [isAuthenticated, ha.automatic, refreshHa]);
             
             // check if session still valid (cookie is sent automatically)
             const checkSession = async () => {

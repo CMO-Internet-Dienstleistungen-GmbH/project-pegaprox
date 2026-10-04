@@ -2562,7 +2562,7 @@ def test_the_members_table_shows_what_the_contract_carries(panel):
     # Remove only on the active, one per row
     assert "const canRemove = role === 'active';" in body
     remove_at = card.index("openConfirm('remove', m)")
-    assert card.rindex('{canRemove && (', 0, remove_at) > card.index('{members.map(m => (')
+    assert card.rindex('{canRemove && (', 0, remove_at) > card.index('{members.flatMap(m => [(')
     assert card.count("openConfirm('remove'") == 1
 
 
@@ -5036,7 +5036,7 @@ def test_the_leader_sets_who_is_active(panel):
     at = card.index('onClick={() => setMemberServe(m, m.serve !== true)}')
     gate = card.rindex('{canSetActive && (', 0, at)
     toggle = card[gate:card.index('</td>', at)]
-    assert card.index('{members.map(m => (') < gate
+    assert card.index('{members.flatMap(m => [(') < gate
     assert 'role="switch" aria-checked={m.serve === true}' in toggle
     assert 'disabled={!!busy || broken || (activesFull && m.serve !== true)}' in toggle
     assert card.count('setMemberServe(') == 1
