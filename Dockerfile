@@ -42,6 +42,15 @@ COPY --chown=pegaprox:pegaprox plugins/ plugins/
 COPY --chown=pegaprox:pegaprox version.json .
 COPY --chown=pegaprox:pegaprox requirements.txt .
 COPY --chown=pegaprox:pegaprox update.sh .
+# the witness installer: "Add witness" checks the download against this copy's SHA-256,
+# and serves it to a witness host without internet; the unit goes into the witness code
+# bundle this instance serves (#625)
+COPY --chown=pegaprox:pegaprox packaging/witness/install.sh packaging/witness/install.sh
+COPY --chown=pegaprox:pegaprox systemd/pegaprox-witness.service systemd/pegaprox-witness.service
+# the branch this image is built from (docker-testing.yml passes Testing): "Add witness"
+# names the image of that branch for the witness, and update.sh follows it (#625)
+ARG PEGAPROX_BRANCH=main
+ENV PEGAPROX_BRANCH=${PEGAPROX_BRANCH}
 
 # Create runtime directories
 # /app/witness: the state of the witness, for the command `witness` (#625)
@@ -73,8 +82,11 @@ EXPOSE 5005
 # interval — harmless to health (we fell back to HTTP) but it spammed
 # "Invalid HTTP method '\x16\x03\x01...'" into the logs. Now the FIRST attempt
 # matches the served protocol; the opposite scheme is only a misconfig fallback.
+# MK Oct 2026 (#625): a container that runs the witness (its state file in /app/witness)
+# has no app on 5000 - it is healthy when `witness health` says so, and only then.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=5 \
-    CMD python3 -c "import os,urllib.request,ssl; s=('http' if os.environ.get('PEGAPROX_BEHIND_PROXY','').lower() in ('1','true','yes') else 'https'); urllib.request.urlopen(s+'://127.0.0.1:5000/api/health', context=(ssl._create_unverified_context() if s=='https' else None), timeout=4)" 2>/dev/null \
+    CMD if [ -f /app/witness/ha_witness.json ]; then exec python3 pegaprox_multi_cluster.py witness health; fi; \
+        python3 -c "import os,urllib.request,ssl; s=('http' if os.environ.get('PEGAPROX_BEHIND_PROXY','').lower() in ('1','true','yes') else 'https'); urllib.request.urlopen(s+'://127.0.0.1:5000/api/health', context=(ssl._create_unverified_context() if s=='https' else None), timeout=4)" 2>/dev/null \
         || python3 -c "import os,urllib.request,ssl; s=('https' if os.environ.get('PEGAPROX_BEHIND_PROXY','').lower() in ('1','true','yes') else 'http'); urllib.request.urlopen(s+'://127.0.0.1:5000/api/health', context=(ssl._create_unverified_context() if s=='https' else None), timeout=4)" \
         || exit 1
 

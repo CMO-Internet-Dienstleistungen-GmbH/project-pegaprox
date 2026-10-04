@@ -171,6 +171,16 @@ main() {
             [ -f "$SCRIPT_DIR/requirements.txt" ] && cp "$SCRIPT_DIR/requirements.txt" "$INSTALL_DIR/"
             [ -f "$SCRIPT_DIR/update.sh" ] && cp "$SCRIPT_DIR/update.sh" "$INSTALL_DIR/"
             [ -f "$SCRIPT_DIR/deploy.sh" ] && cp "$SCRIPT_DIR/deploy.sh" "$INSTALL_DIR/"
+            # NS Oct 2026 (#625): "Add witness" serves the witness installer and puts the
+            # witness unit into the code it hands the witness host
+            if [ -f "$SCRIPT_DIR/packaging/witness/install.sh" ]; then
+                mkdir -p "$INSTALL_DIR/packaging/witness"
+                cp "$SCRIPT_DIR/packaging/witness/install.sh" "$INSTALL_DIR/packaging/witness/"
+            fi
+            if [ -f "$SCRIPT_DIR/systemd/pegaprox-witness.service" ]; then
+                mkdir -p "$INSTALL_DIR/systemd"
+                cp "$SCRIPT_DIR/systemd/pegaprox-witness.service" "$INSTALL_DIR/systemd/"
+            fi
         fi
 
         print_success "Files copied from local checkout"
@@ -190,6 +200,14 @@ main() {
 
             # Remove git folder
             rm -rf "$INSTALL_DIR/.git" 2>/dev/null || true
+
+            # NS Oct 2026 (#625): the branch this install follows, for what the app says
+            # about itself ("Add witness" names the Docker image of that branch)
+            if [ "$GITHUB_BRANCH" = main ]; then
+                rm -f "$INSTALL_DIR/.pegaprox-branch"
+            else
+                printf '%s\n' "$GITHUB_BRANCH" > "$INSTALL_DIR/.pegaprox-branch"
+            fi
 
             print_success "All files copied to $INSTALL_DIR"
         else

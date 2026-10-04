@@ -70,3 +70,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           no-cache: true
+          # NS Oct 2026 (#625): the image says it follows Testing - "Add witness" on an
+          # instance of it names this image for the witness (the release images have none
+          # before the release after 1.2.0)
+          build-args: |
+            PEGAPROX_BRANCH=Testing
