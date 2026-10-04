@@ -130,12 +130,9 @@ def _refuse_confined_admin():
     The second half is not implied by the first: an admin mapped down to viewer in the
     default tenant still "sees every cluster", because an empty cluster list there
     means all of them."""
-    from pegaprox.api.auto_install import _sees_every_cluster
-    from pegaprox.utils.rbac import _admin_is_capped_in_own_tenant
     try:
         session = getattr(request, 'session', None) or {}
-        user = build_authz_user(session.get('user', ''), session)
-        unconfined = not _admin_is_capped_in_own_tenant(user) and _sees_every_cluster(user)
+        unconfined = _unconfined(build_authz_user(session.get('user', ''), session))
     except Exception as e:
         logging.warning(f"[HA] could not resolve the caller's cluster scope: {e}")
         unconfined = False
@@ -143,6 +140,24 @@ def _refuse_confined_admin():
         return jsonify({'error': 'Instance pairing is only available to administrators '
                                  'who are not limited to a tenant or to specific clusters'}), 403
     return None
+
+
+def _unconfined(user):
+    from pegaprox.api.auto_install import _sees_every_cluster
+    from pegaprox.utils.rbac import _admin_is_capped_in_own_tenant
+    return not _admin_is_capped_in_own_tenant(user) and _sees_every_cluster(user)
+
+
+def unconfined_admin(username, session):
+    """MK Oct 2026 (#625) - whether `username` (signed in with `session`) is an admin the
+    HA routes are open to: the role, and the bar of _refuse_confined_admin. The lease
+    banner names instances only to them. Fails closed."""
+    try:
+        user = build_authz_user(username or '', session or {})
+        return user.get('role') == ROLE_ADMIN and _unconfined(user)
+    except Exception as e:
+        logging.warning(f"[HA] could not resolve a cluster scope for the banner: {e}")
+        return False
 
 
 def _refuse_without_reauth(what):
@@ -1136,7 +1151,9 @@ def set_member_agent_vmid(instance_id):
     if refused:
         return refused
     from pegaprox.globals import cluster_managers
-    if cluster_id not in cluster_managers:
+    # forgetting a VM needs no cluster this instance still manages: one deleted since
+    # would keep its entry for good
+    if vmid is not None and cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     try:
         changed = ha.set_agent_vmid(instance_id, cluster_id, vmid)

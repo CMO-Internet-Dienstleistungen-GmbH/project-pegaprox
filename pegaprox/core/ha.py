@@ -2317,7 +2317,8 @@ def _member_list(st):
                         fingerprint=st.get('own_fingerprint') or ''))
         if st.get('agent_vmid'):
             out[-1]['agent_vmid'] = st['agent_vmid']
-        out[-1].update(_member_marks(st))
+        # the active keeps its vote: a member promoted after its vote was taken says so
+        out[-1].update({k: v for k, v in _member_marks(st).items() if k != 'voter'})
     for mid, rec in (st.get('members') or {}).items():
         out.append(dict(_credentials(rec), instance_id=mid, url=rec.get('url') or '',
                         fingerprint=rec.get('fingerprint') or '', serve=rec.get('serve') is True))
@@ -4057,8 +4058,9 @@ def _adopt_group(snap):
                     new['agent_vmid'] = own['agent_vmid']
                 else:
                     new.pop('agent_vmid', None)
-                # its site and may lead as well, the leader's word like the rest
-                for key in ('site', 'may_lead'):
+                # its site, vote and may lead as well, the leader's word like the rest: a
+                # member whose vote was taken counts the votes as the leader does
+                for key in _MEMBER_MARKS:
                     if key in own:
                         new[key] = own[key]
                     else:
@@ -7487,8 +7489,10 @@ def unpair_needs_leader(st=None):
             and not st.get('broken') and unpair_refusal(st) == AUTO_UNPAIR_ERROR):
         return False
     lease = _lease(st)
-    voters = ha_vote.voter_ids(lease['cfg']['body']) if lease is not None else []
-    return st['instance_id'] not in voters or len(voters) - 1 >= ha_vote.MIN_VOTERS
+    me = st['instance_id']
+    if lease is None or me not in ha_vote.voter_ids(lease['cfg']['body']):
+        return True
+    return not _too_few_without(lease['cfg']['body'], me)
 
 
 def unpair_check():
@@ -7517,8 +7521,15 @@ def _takes_a_vote_too_many(st, member_id):
     lease = _lease(st)
     if lease is None or not _lease_mode(st):
         return False
-    voters = ha_vote.voter_ids(lease['cfg']['body'])
-    return member_id in voters and len(voters) - 1 < ha_vote.MIN_VOTERS
+    return member_id in ha_vote.voter_ids(lease['cfg']['body']) and _too_few_without(lease['cfg']['body'], member_id)
+
+
+def _too_few_without(body, member_id):
+    """Whether the voter config `body` without `member_id` holds fewer than MIN_VOTERS
+    votes, or fewer than that which count (a quarantined member votes on paper only)."""
+    voters = [v for v in ha_vote.voter_ids(body) if v != member_id]
+    quarantined = set(body.get('quarantined') or ())
+    return len(voters) < ha_vote.MIN_VOTERS or len([v for v in voters if v not in quarantined]) < ha_vote.MIN_VOTERS
 
 
 def _lease_drop(instance):
@@ -9081,8 +9092,10 @@ def _voter_body(st, lease_s, quarantined=()):
     """The body of a voter config in manual mode for the group as the member list has it
     now: this instance, every member (voter, may_lead and site as their records say,
     a vote and the lead for each unless an admin took them) and the witness."""
-    # the leader keeps its vote whatever its record says (set_member_vote)
-    voters = [{'id': st['instance_id'], 'public_key': own_public_key(), 'voter': True,
+    # the leader keeps its vote whatever its record says (set_member_vote); a member goes
+    # by the leader's word on its own vote, as it came with the member list (_adopt_group)
+    own_vote = st['role'] == ROLE_ACTIVE or st.get('voter') is not False
+    voters = [{'id': st['instance_id'], 'public_key': own_public_key(), 'voter': own_vote,
                'may_lead': st.get('may_lead') is not False, 'site': _clean_site(st.get('site')) or ''}]
     for mid, rec in (st.get('members') or {}).items():
         voters.append({'id': mid, 'public_key': rec.get('public_key') or '',
@@ -9264,8 +9277,10 @@ def _group_checks(st=None, lease_s=ha_vote.LEASE_DEFAULT):
                                     'active and holds no lease: an instance made active by hand '
                                     'acts next to the leader the group elects. The leader tells '
                                     'it to step down.', mid))
+        # a sentence that starts with the address (or the short id) keeps it as it is
         for f in out[start:]:
-            f['text'] = f['text'][:1].upper() + f['text'][1:]
+            if not f['text'].startswith(rec.get('url') or mid[:8]):
+                f['text'] = f['text'][:1].upper() + f['text'][1:]
     if running:
         # a voter that left by hand, or was never a member of this instance's list: its
         # vote stands in the config and never answers
@@ -9290,9 +9305,9 @@ def _group_checks(st=None, lease_s=ha_vote.LEASE_DEFAULT):
                                  'data members: losing that site may stop automation. It belongs at a '
                                  'third site.', w.get('id')), site=wsite))
     if n >= ha_vote.MIN_VOTERS and n % 2 == 0:
-        lost = n - ha_vote.majority(n)
+        lost = max(0, len(layout['counting']) - ha_vote.majority(n))
         out.append(_finding('EVEN_VOTERS', 'warn',
-                            f'{n} votes survive the loss of {lost}, the same as {n - 1} would: the '
+                            f"{n} votes survive the loss of {lost or 'no member'}, the same as {n - 1} would: the "
                             f'extra vote adds no tolerance, and a split into two halves of {n // 2} '
                             'leaves no leader on either side. Make one member a non-voter or add '
                             'a witness.'))
@@ -9356,14 +9371,16 @@ def _site_of(st, iid, body=None):
 def _site_layout(st, body):
     """The voters of `body` by site: {sites: [{site, voters, votes, candidates, members,
     witness, survives_loss}], unlabeled: [voter ids], candidates: [ids], data: [data
-    voter ids], of: {id: site}, n, m}. A candidate leads on its own (a data voter with
-    may lead that is not quarantined); members lists every instance with that label,
-    voters or not. survives_loss: the group elects a leader on its own once that site
-    is gone (3.4: the others hold a majority and a candidate among them)."""
+    voter ids], counting: [voter ids], of: {id: site}, n, m}. A candidate leads on its
+    own (a data voter with may lead that is not quarantined); members lists every
+    instance with that label, voters or not. survives_loss: the group elects a leader on
+    its own once that site is gone (3.4: the votes that count elsewhere make a majority,
+    and a candidate is among them). A quarantined vote is in n and m and counts nowhere."""
     voters = ha_vote.voter_ids(body)
     n = len(voters)
     m = ha_vote.majority(n) if n else 0
     quarantined = set(body.get('quarantined') or ())
+    counting = [v for v in voters if v not in quarantined]
     wid = (body.get('witness') or {}).get('id')
     records = {r['id']: r for r in body.get('voters') or ()}
     data = [v for v in voters if v != wid]
@@ -9386,10 +9403,15 @@ def _site_layout(st, body):
                 entry['candidates'].append(v)
     for entry in sites.values():
         entry['votes'] = len(entry['voters'])
-        entry['survives_loss'] = bool(n and n - entry['votes'] >= m
+        entry['survives_loss'] = bool(n and _counting_outside(counting, entry) >= m
                                       and any(c not in entry['candidates'] for c in candidates))
     return {'sites': [sites[s] for s in sorted(sites)], 'unlabeled': [v for v in voters if not of[v]],
-            'candidates': candidates, 'data': data, 'of': of, 'n': n, 'm': m}
+            'candidates': candidates, 'data': data, 'counting': counting, 'of': of, 'n': n, 'm': m}
+
+
+def _counting_outside(counting, entry):
+    """The votes that count and are not at the site of `entry` (_site_layout)."""
+    return sum(1 for v in counting if v not in entry['voters'])
 
 
 def _names(st, ids):
@@ -9427,13 +9449,14 @@ def _site_findings(st, layout, n):
     if n < ha_vote.MIN_VOTERS or not sites:
         # TOO_FEW_VOTERS says what there is to say
         return out
+    counting = layout['counting']
     if len(sites) == 1:
-        k = n - m
-        out.append(dict(_finding('ALL_ONE_SITE', 'info', f"Survives the loss of any {k} "
-                                 f"member{'' if k == 1 else 's'}. A site outage stops PegaProx "
-                                 'automation until the site is back.'), site=sites[0]['site']))
+        k = max(0, len(counting) - m)
+        lost = 'no member' if not k else f"any {k} member{'' if k == 1 else 's'}"
+        out.append(dict(_finding('ALL_ONE_SITE', 'info', f'Survives the loss of {lost}. A site outage '
+                                 'stops PegaProx automation until the site is back.'), site=sites[0]['site']))
         return out
-    fatal = [e for e in sites if n - e['votes'] < m]
+    fatal = [e for e in sites if _counting_outside(counting, e) < m]
     if len(sites) == 2 and len(fatal) == 2:
         out.append(_finding('TWO_SITES_NO_THIRD_VOTE', 'warn', 'Two sites need a third vote at a third '
                             'location, or a WAN cut stops automation in both.'))
@@ -9595,17 +9618,27 @@ def split_safety(st=None, checks=None):
     """public_status.split_safety, once this release offers automatic failover, on an
     instance of a group: {voters, majority, tolerates, level, sites, unlabeled,
     clusters, findings}. findings is auto_findings, the list the switch goes by; level
-    is the worst of them ('ok' for none). None on an instance of its own and while
-    automatic failover is not offered."""
+    is the worst of them as the switch takes them (_gate: a block about one cluster is a
+    warn there), 'ok' for none. tolerates: how many of the votes that count may go (a
+    quarantined one does not count). None on an instance of its own and while automatic
+    failover is not offered."""
     st = st or _load()
     if not ha_vote.AUTO_MODE_SHIPPED or st['role'] == ROLE_STANDALONE:
         return None
     checks = checks or _group_checks(st)
     layout, findings = checks['layout'], checks['findings']
-    worst = max((LEVELS.index(f['level']) for f in findings if f.get('level') in LEVELS), default=0)
-    return {'voters': layout['n'], 'majority': layout['m'], 'tolerates': max(0, layout['n'] - layout['m']),
+    worst = max((LEVELS.index(_gate(f)) for f in findings if _gate(f) in LEVELS), default=0)
+    return {'voters': layout['n'], 'majority': layout['m'],
+            'tolerates': max(0, len(layout['counting']) - layout['m']),
             'level': LEVELS[worst], 'sites': layout['sites'], 'unlabeled': layout['unlabeled'],
             'clusters': checks['clusters'], 'findings': findings}
+
+
+def _gate(finding):
+    """What a finding does to the switch (switch_auto_on): a block about one cluster
+    stops nothing but that cluster, so it wants a tick like a warn."""
+    level = finding.get('level')
+    return 'warn' if level == 'block' and finding.get('cluster') else level
 
 
 def _lease_found(st, lease_s):
@@ -9695,11 +9728,11 @@ def switch_auto_on(lease_s=ha_vote.LEASE_DEFAULT, accept=()):
                 raise HaError('Automatic failover is switched on on the leader of a group')
             findings = auto_findings(st, lease_s)
             # a block about one cluster stops nothing but that cluster: it wants a tick
-            blocks = [f for f in findings if f['level'] == 'block' and not f.get('cluster')]
+            # (_gate, which the split-safety panel's level goes by as well)
+            blocks = [f for f in findings if _gate(f) == 'block']
             if blocks:
                 raise AutoRefused(blocks[0]['text'], findings)
-            open_ = [f for f in findings if (f['level'] == 'warn' or (f['level'] == 'block' and f.get('cluster')))
-                     and f['code'] not in accept]
+            open_ = [f for f in findings if _gate(f) == 'warn' and f['code'] not in accept]
             if open_:
                 raise AutoRefused(open_[0]['text'], findings, confirm=True)
             if _zone(st.get('timezone')) is None and local_timezone():
@@ -10142,25 +10175,26 @@ def _leader_change(st):
             'to': seen['id'], 'to_url': _who(st, seen['id']), 'epoch': seen['epoch'], 'at': seen['since']}
 
 
-def lease_banner(st=None):
+def lease_banner(st=None, names=False):
     """What every signed-in user is told about an automatic group, {} anywhere else (a
     manual group, an instance of its own). automatic: true, and at most one of
     no_leader (true: changes and automation are paused, consoles keep working) and
-    takeover ({leader, resume_in}: the leader acts in about that many seconds), and
-    leader_changed ({to, from, at, epoch}) for LEADER_CHANGED_SHOWN after a change.
-    Names are addresses, as the standby banner shows the one it follows."""
+    takeover ({resume_in}: the leader acts in about that many seconds), and
+    leader_changed ({at}) for LEADER_CHANGED_SHOWN after a change. With `names`, for
+    an admin the HA tab is open to, the addresses as well: takeover.leader and
+    leader_changed.to and .from. No epoch of the lease for anyone."""
     st = st or _load()
     if not ha_vote.AUTO_MODE_SHIPPED or not _lease_mode(st):
         return {}
     out = {'automatic': True}
     node = _lease_live(st)
     clock = ha_clock()
+    taker = None
     if st.get('leader') and st['role'] == ROLE_ACTIVE:
         if node is not None and node.is_active():
             pass
         elif node is not None and node.holds_lease() and node.acting_from < float('inf'):
-            out['takeover'] = {'leader': _who(st, st['instance_id']),
-                               'resume_in': max(1, int(node.acting_from - clock) + 1)}
+            taker, out['takeover'] = st['instance_id'], {'resume_in': max(1, int(node.acting_from - clock) + 1)}
         else:
             out['no_leader'] = True
     elif node is not None:
@@ -10168,9 +10202,11 @@ def lease_banner(st=None):
             rt = _rt()
             take = rt.takeover
             if take is not None and take[0] == node.promise_to and clock < take[1]:
-                out['takeover'] = {'leader': _who(st, take[0]), 'resume_in': max(1, int(take[1] - clock) + 1)}
+                taker, out['takeover'] = take[0], {'resume_in': max(1, int(take[1] - clock) + 1)}
         else:
             out['no_leader'] = True
+    if taker is not None and names:
+        out['takeover']['leader'] = _who(st, taker)
     change = _leader_change(st)
     if change is not None:
         try:
@@ -10178,8 +10214,9 @@ def lease_banner(st=None):
         except ValueError:
             ago = None
         if ago is not None and ago <= LEADER_CHANGED_SHOWN:
-            out['leader_changed'] = {'to': change['to_url'], 'from': change['from_url'] or None,
-                                     'at': change['at'], 'epoch': change['epoch']}
+            out['leader_changed'] = {'at': change['at']}
+            if names:
+                out['leader_changed'].update(to=change['to_url'], **{'from': change['from_url'] or None})
     return out
 
 
@@ -10823,6 +10860,9 @@ TRANSFER_ERROR = ('The leader is handing its role to another member - changes re
 AUTO_REMOVE_FEW_ERROR = (f'Without this member the group would have fewer than '
                          f'{ha_vote.MIN_VOTERS} votes, too few for automatic failover. Switch '
                          'automatic failover off first, or add a member or a witness')
+AUTO_REMOVE_FEW_COUNTING_ERROR = (f'Without this member fewer than {ha_vote.MIN_VOTERS} votes of the group '
+                                  'would count (a quarantined member votes on paper only), too few for '
+                                  'automatic failover. Re-admit the quarantined member first')
 AUTO_REMOVE_SELF_ERROR = 'The leader does not remove itself - make another member leader first'
 AUTO_LEAVE_LEADER_ERROR = ('This instance leads a group that fails over automatically - make '
                            'another member leader first, then unpair it there')
@@ -11578,6 +11618,9 @@ def _remove_voter(member_id):
         left = [v for v in node.view.voters if v != member_id]
         if member_id in node.view.voters and len(left) < ha_vote.MIN_VOTERS:
             raise AutoMode(AUTO_REMOVE_FEW_ERROR)
+        # a quarantined member votes on paper only: what is left has to count
+        if member_id in node.view.voters and len(node.view.counting - {member_id}) < ha_vote.MIN_VOTERS:
+            raise AutoMode(AUTO_REMOVE_FEW_COUNTING_ERROR)
 
         def drop(body):
             return dict(body, voters=[rec for rec in body['voters'] if rec['id'] != member_id],
@@ -11842,6 +11885,9 @@ VOTE_OWN_ERROR = 'The leader keeps its own vote - make another member leader fir
 VOTE_WITNESS_ERROR = 'The witness always votes and never leads - remove it to take its vote'
 VOTE_FEW_ERROR = (f'Without this vote the group would have fewer than {ha_vote.MIN_VOTERS} votes, too '
                   'few for automatic failover. Add a member or a witness first')
+VOTE_FEW_COUNTING_ERROR = (f'Without this vote fewer than {ha_vote.MIN_VOTERS} votes of the group would count '
+                           '(a quarantined member votes on paper only), too few for automatic failover. '
+                           'Re-admit the quarantined member first')
 VOTE_BUSY_ERROR = 'A change of the voter config is on its way - try again in a moment'
 VOTE_MAJORITY_ERROR = ('After this change the members that answer would not make a majority of the '
                        'votes, and the leader would lose its lease. Bring the members that do not '
@@ -11903,13 +11949,14 @@ def set_member_vote(member_id, voter=None, may_lead=None):
     """Leader: whether the data member `member_id` (this instance included) votes and may
     lead on its own. In an automatic group a change of the voter config (4.12): under a
     confirm round, one change at a time (refused while one waits or is on its way),
-    never below MIN_VOTERS votes, never the vote of the leader itself, never a vote for a
-    member that does not answer the renewals, and never one after which the members that
-    answer would not make a majority. Back once the change is on disk, in force once a
-    majority holds it; the member record follows. In a manual group the member records,
-    which the next switch takes into the voter config (_voter_body); the leader keeps
-    its vote there too. Returns True when something changed. Raises VoteRefused, NoLease,
-    AutoMode or HaError, and then nothing changed."""
+    never below MIN_VOTERS votes that count (a quarantined one does not), never the vote
+    of the leader itself, never a vote for a member that does not answer the renewals,
+    and never one after which the members that answer would not make a majority. Back
+    once the change is on disk, in force once a majority holds it; the member record
+    follows. In a manual group the member records, which the next switch takes into the
+    voter config (_voter_body); the leader keeps its vote there too, and a member counts
+    its own as the leader's member list says. Returns True when something changed.
+    Raises VoteRefused, NoLease, AutoMode or HaError, and then nothing changed."""
     if not ha_vote.AUTO_MODE_SHIPPED:
         raise HaError(ha_vote.NOT_SHIPPED_ERROR)
     asked = {k: v for k, v in (('voter', voter), ('may_lead', may_lead)) if v is not None}
@@ -11927,7 +11974,8 @@ def set_member_vote(member_id, voter=None, may_lead=None):
         raise HaError(NOT_A_MEMBER_ERROR)
     if member_id == me and asked.get('voter') is False:
         raise VoteRefused(VOTE_OWN_ERROR)
-    if _lease_mode(st):
+    automatic = _lease_mode(st)
+    if automatic:
         changed = _vote_in_config(member_id, asked)
     else:
         with _lock:
@@ -11940,7 +11988,16 @@ def set_member_vote(member_id, voter=None, may_lead=None):
                 raise VoteRefused(VOTE_FEW_ERROR)
             changed = any(rec[k] != v for k, v in asked.items())
     if changed:
-        _vote_marks(member_id, asked)
+        try:
+            _vote_marks(member_id, asked)
+        except Exception as e:
+            if not automatic:
+                # in a manual group the record is the change itself: nothing changed
+                raise
+            # the voter config holds the change already and decides; the record that a
+            # later switch reads is what failed
+            logging.warning(f"[HA] the vote of {member_id} changed in the voter config, but its "
+                            f"member record could not be written: {e}")
     return changed
 
 
@@ -11999,6 +12056,9 @@ def _vote_in_config(member_id, asked):
         after = ha_vote.CfgView({'id': list(node.view.id), 'body': change(node.view.cfg['body'])})
         if asked.get('voter') is False and rec.get('voter') and after.n < ha_vote.MIN_VOTERS:
             raise VoteRefused(VOTE_FEW_ERROR)
+        # a quarantined vote stands in n and answers nothing: the floor is three that count
+        if asked.get('voter') is False and rec.get('voter') and len(after.counting) < ha_vote.MIN_VOTERS:
+            raise VoteRefused(VOTE_FEW_COUNTING_ERROR)
         t = node.t
         window = 2 * (t.R + t.renew_timeout)
         # this leader, and every voter that acked one of its last rounds

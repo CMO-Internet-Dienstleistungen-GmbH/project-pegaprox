@@ -634,7 +634,7 @@ def _idp_agrees_with_synced_row(would_be, row):
     return isinstance(would_be, dict) and _same_access(would_be, row)
 
 
-def _ha_banner():
+def _ha_banner(username='', session=None):
     """ha.banner(), and on a standby whether it shows the clusters live. With the live
     view off its cluster list is empty on purpose, and the UI has to say so. forwarding
     says whether a change made here goes to the active right now or is refused, serving
@@ -643,10 +643,12 @@ def _ha_banner():
 
     MK Oct 2026 (#625) - in a group that fails over automatically, for every signed-in
     user: automatic, and no_leader (changes and automation paused, consoles keep
-    working), takeover {leader, resume_in} and leader_changed {to, from, at, epoch} for
-    ten minutes after a change (ha.lease_banner). Nothing of it in a manual group or on
-    an instance of its own."""
+    working), takeover {resume_in} and leader_changed {at} for ten minutes after a
+    change (ha.lease_banner). The addresses in them (takeover.leader, leader_changed.to
+    and .from) only for an admin the HA tab is open to. Nothing of it in a manual group
+    or on an instance of its own."""
     from pegaprox.core import ha
+    from pegaprox.api.ha import unconfined_admin
     out = ha.banner()
     if out.get('role') == ha.ROLE_STANDBY:
         out['live_view'] = bool(ha.live_view())
@@ -654,7 +656,9 @@ def _ha_banner():
         out['serving'] = bool(ha.serving())
         out['leader_reachable'] = bool(ha.leader_reachable())
     try:
-        out.update(ha.lease_banner())
+        # whom the addresses go to is only asked where the group is automatic
+        named = ha.lease_in_force() and unconfined_admin(username, session)
+        out.update(ha.lease_banner(names=named))
     except Exception as e:
         # the sign-in and the session check answer whatever the lease state says
         logging.warning(f"[HA] no lease banner: {e}")
@@ -1110,7 +1114,7 @@ def auth_login():
         # NS: Security warning if using default password
         'security_warning': 'DEFAULT_PASSWORD' if (user['role'] == ROLE_ADMIN and password == 'admin') else None,
         'requires_password_change': bool(user.get('force_password_change')),
-        'ha': _ha_banner(),  # MK Sep 2026 (#625) - role, and on a standby where it follows
+        'ha': _ha_banner(username, active_sessions.get(session_id)),  # MK Sep 2026 (#625) - role, and on a standby where it follows
     })
     
     # Set session cookie with security flags
@@ -1382,7 +1386,7 @@ def auth_check():
         'reverse_proxy_enabled': effective_reverse_proxy(settings),
         'air_gap_mode': settings.get('air_gap_mode', False),
         'default_theme': default_theme,
-        'ha': _ha_banner(),
+        'ha': _ha_banner(session['user'], session),
     })
 
 

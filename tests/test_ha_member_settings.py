@@ -291,6 +291,29 @@ def test_in_a_manual_group_the_vote_is_noted_for_the_next_switch(auto, seed):
     assert auto.file('b')['members'][IDS['d']]['voter'] is False
 
 
+def test_a_member_whose_vote_was_taken_counts_the_votes_as_the_leader_does(auto, seed):
+    """d holds the leader's word on its own vote with the member list: every member counts
+    three votes, d too, and four again once the vote is back."""
+    auto.pair(seed, 'bcd')
+    assert _vote(auto, 'a', 'd', voter=False).status_code == 200
+    for n in 'bcd':
+        assert _sync(auto.g, auto.admin, n) == 'applied'
+
+    seen = {n: (_status(auto, n)['split_safety']['voters'], _status(auto, n)['auto']['voters']) for n in 'abcd'}
+
+    assert set(seen.values()) == {(3, 3)}, seen
+    assert auto.file('d')['voter'] is False
+    assert _vote(auto, 'a', 'd', voter=True).status_code == 200
+    assert _sync(auto.g, auto.admin, 'd') == 'applied'
+    assert 'voter' not in auto.file('d') and _status(auto, 'd')['auto']['voters'] == 4
+    # made active by hand with the mark still on it, it leads with its vote, and the
+    # member list it hands out says the same
+    with auto.at('d') as ha:
+        st = dict(ha._load(), role='active', voter=False)
+        assert next(v for v in ha._voter_body(st, 20)['voters'] if v['id'] == IDS['d'])['voter'] is True
+        assert 'voter' not in next(e for e in ha._member_list(st) if e['instance_id'] == IDS['d'])
+
+
 def test_in_a_manual_group_the_rules_hold_as_well(auto, seed):
     auto.pair(seed)
     r = _vote(auto, 'a', 'a', voter=False)
@@ -389,6 +412,35 @@ def test_never_below_three_votes_and_never_the_vote_of_the_leader(auto, seed):
     r = _vote(auto, 'a', 'a', voter=False)
     assert r.status_code == 409 and r.get_json()['error'] == 'The leader keeps its own vote - make another member leader first'
     assert auto.node('a').view.n == 3 and not _audit('ha.member_vote_changed')
+
+
+def _quarantined_d(auto, seed):
+    """Four votes, d quarantined: a, b and c count, and three of the four are needed."""
+    _formed(auto, seed, 'bcd', accept=['EVEN_VOTERS'])
+    with auto.rt('a').lock:
+        auto.node('a').change_cfg(lambda body: dict(body, quarantined=[IDS['d']]))
+    auto.run(3 * T.R, dt=0.5)
+    view = auto.node('a').view
+    assert (view.n, view.m, len(view.counting)) == (4, 3, 3)
+
+
+def test_the_three_votes_are_three_that_count(auto, seed):
+    """Without b three votes stand on paper and two count (a and c): the next failure would
+    stop automation. The quarantined vote itself may go, three that count are left."""
+    _quarantined_d(auto, seed)
+
+    r = _vote(auto, 'a', 'b', voter=False)
+
+    assert r.status_code == 409 and r.get_json()['code'] == 'HA_VOTE_REFUSED', r.data
+    assert r.get_json()['error'] == ('Without this vote fewer than 3 votes of the group would count (a quarantined '
+                                     'member votes on paper only), too few for automatic failover. Re-admit the '
+                                     'quarantined member first')
+    assert auto.node('a').view.n == 4 and not _audit('ha.member_vote_changed')
+    assert 'voter' not in auto.file('a')['members'][IDS['b']]
+    r = _vote(auto, 'a', 'd', voter=False)
+    assert r.status_code == 200, r.data
+    view = auto.node('a').view
+    assert (view.n, len(view.counting)) == (3, 3) and IDS['d'] not in view.voters
 
 
 def test_no_vote_for_a_member_that_does_not_answer(auto, seed):
@@ -735,6 +787,65 @@ def test_the_findings_of_a_group_that_runs_reach_the_panel(auto, seed):
     assert [s['candidates'] for s in _status(auto)['split_safety']['sites'] if s['site'] == 'dc-b'] == [[]]
 
 
+def test_a_quarantined_vote_counts_for_no_loss_the_group_survives(auto, seed):
+    """Four votes, three needed, d quarantined: a, b and c are all needed. Losing any of
+    their sites stops automation, losing d's does not."""
+    _quarantined_d(auto, seed)
+
+    split = _status(auto)['split_safety']
+
+    assert (split['voters'], split['majority'], split['tolerates']) == (4, 3, 0)
+    assert {s['site']: s['survives_loss'] for s in split['sites']} == {
+        'dc-a': False, 'dc-b': False, 'dc-c': False, 'dc-d': True}
+    assert sorted(f['site'] for f in split['findings'] if f['code'] == 'SITE_HOLDS_MAJORITY') == ['dc-a', 'dc-b', 'dc-c']
+    # all at one site, the loss of no member is survived
+    with auto.at('a') as ha:
+        for n in 'abcd':
+            ha.set_member_site(IDS[n], 'dc1')
+    found = {f['code']: f for f in _status(auto)['split_safety']['findings']}
+    assert found['ALL_ONE_SITE']['text'] == ('Survives the loss of no member. A site outage stops PegaProx '
+                                             'automation until the site is back.')
+
+
+def test_the_level_of_the_panel_is_the_one_the_switch_goes_by(auto, seed, monkeypatch):
+    """A claim of another instance on one cluster is a block of that cluster: the switch
+    wants a tick for it, and the panel says warnings, not blocked."""
+    auto.pair(seed)
+    _clusters(monkeypatch, c1=_Pve(fence_agent_versions=V2, claim_enabled=True,
+                                   claim_state={'state': 'same', 'instance': W_ID, 'epoch': 1}))
+
+    split = _status(auto)['split_safety']
+
+    assert [f['level'] for f in split['findings'] if f['code'] == 'FOREIGN_CLAIM'] == ['block']
+    assert split['level'] == 'warn', split['findings']
+    assert auto.switch_on(accept=['FOREIGN_CLAIM']).status_code == 200
+    # a block that names no cluster is one for both (too_few, test_the_findings_before_the_switch_reach_the_panel)
+    with auto.at('a') as ha:
+        assert ha._gate({'level': 'block'}) == 'block' and ha._gate({'level': 'block', 'cluster': 'c1'}) == 'warn'
+
+
+def test_a_finding_that_starts_with_an_address_keeps_it_as_it_is(auto, seed):
+    """The server's words go into the panel as they are: an address or a short id that
+    starts a sentence is not capitalised; the witness is "The witness ..."."""
+    import time as _time
+    auto.pair(seed)
+    with auto.at('a') as ha:
+        st = ha._load()
+        ha._commit_locked(dict(st, witness={'instance_id': W_ID, 'url': W_URL, 'fingerprint': '',
+                                            'public_key': _key(), 'site': 'dc-w'},
+                               members=dict(st['members'], **{IDS['c']: dict(st['members'][IDS['c']], url='')})))
+    rt = auto.rt('a')
+    old = _time.monotonic() - auto.ha.LEASE_SEEN_FRESH - 1
+    for n in 'bc':
+        rt.seen[IDS[n]] = dict(rt.seen[IDS[n]], at=old)
+
+    texts = {f['member']: f['text'] for f in _status(auto)['split_safety']['findings'] if f['code'] == 'VOTER_DOWN'}
+
+    assert texts[IDS['b']].startswith(f"{URLS['b']} has not answered within the last"), texts[IDS['b']]
+    assert texts[IDS['c']].startswith(f"{IDS['c'][:8]} has not answered"), texts[IDS['c']]
+    assert texts[W_ID].startswith(f'The witness {W_URL} has not answered'), texts[W_ID]
+
+
 @pytest.mark.parametrize('case', ['too_few', 'old_release', 'zone'])
 def test_the_findings_before_the_switch_reach_the_panel(auto, seed, case):
     if case == 'too_few':
@@ -833,13 +944,17 @@ def test_a_takeover_and_the_change_of_the_leader_reach_every_user(auto, seed):
     assert 'b' in auto.holders() and auto.leader() != 'b'          # it holds, and waits to act
 
     seen = {n: _banner(auto, n, viewer) for n in 'bc'}
+    named = {n: _banner(auto, n, auto.admin) for n in 'bc'}
 
     for n in 'bc':
-        assert seen[n]['takeover']['leader'] == URLS['b'], (n, seen[n])
+        # every user hears when changes resume and when the leader changed; the addresses
+        # go to an admin the HA tab is open to, the epoch of the lease to nobody
+        assert set(seen[n]['takeover']) == {'resume_in'}, (n, seen[n])
         assert 1 <= seen[n]['takeover']['resume_in'] <= T.W_take + 1, (n, seen[n])
         assert 'no_leader' not in seen[n]
-        assert seen[n]['leader_changed'] == dict(seen[n]['leader_changed'], to=URLS['b'], **{'from': URLS['a']},
-                                                 epoch=epoch + 1)
+        assert set(seen[n]['leader_changed']) == {'at'}, (n, seen[n])
+        assert named[n]['takeover']['leader'] == URLS['b'] and set(named[n]['takeover']) == {'leader', 'resume_in'}
+        assert named[n]['leader_changed'] == {'to': URLS['b'], 'from': URLS['a'], 'at': seen[n]['leader_changed']['at']}
     at = seen['b']['leader_changed']['at']
     # the moment the leader sent along: one for every member
     assert seen['c']['leader_changed']['at'] == at
@@ -856,6 +971,30 @@ def test_a_takeover_and_the_change_of_the_leader_reach_every_user(auto, seed):
         st = ha.lease_status()
     assert st['leader_change'] == {'from': IDS['a'], 'from_url': URLS['a'], 'to': IDS['b'], 'to_url': URLS['b'],
                                    'epoch': epoch + 1, 'at': at}
+
+
+@pytest.mark.parametrize('kind', ['capped_admin', 'tenant_admin', 'capped_default_admin', 'user_with_ha'])
+def test_the_addresses_go_to_no_account_the_ha_tab_is_closed_to(auto, seed, kind):
+    """The accounts the HA routes refuse (test_below_an_unconfined_admin_the_member_routes_change_nothing)."""
+    _handed_to_b(auto, seed)
+    api = auto.g.api
+    if kind == 'capped_admin':
+        seed.tenant('globex', ['cluster_globex'])
+        c = api.as_user(seed.user('gx', role='admin', tenant_id='globex', tenant_permissions={'globex': {'role': 'user'}}))
+    elif kind == 'tenant_admin':
+        seed.tenant('initech', ['cluster_initech'])
+        c = _admin(api, seed, 'ini', role='user', tenant_id='initech', tenant_permissions={'initech': {'role': 'admin'}})
+    elif kind == 'capped_default_admin':
+        c = _admin(api, seed, 'lowered', tenant_id='default', tenant_permissions={'default': {'role': 'viewer'}})
+    else:
+        c = api.as_user(seed.user('ops', role='user', permissions=['ha.view', 'ha.config', 'admin.settings']))
+    auto.run(T.W_take + 10, until=lambda: 'b' in auto.holders())
+
+    got = _banner(auto, 'c', c)
+
+    assert got['automatic'] is True and set(got['takeover']) == {'resume_in'}, got
+    assert set(got['leader_changed']) == {'at'}, got
+    assert set(_banner(auto, 'c', auto.admin)['leader_changed']) == {'to', 'from', 'at'}
 
 
 def test_the_change_of_the_leader_shows_for_ten_minutes(auto, seed):
@@ -969,3 +1108,91 @@ def test_the_agent_check_keeps_who_each_node_could_not_reach(monkeypatch):
     assert report['nodes']['pve1']['members_unreachable'] == [URLS['b']]
     seen = m.ha_config['agent_unreachable']
     assert seen['nodes'] == {'pve1': [URLS['b']]} and datetime.fromisoformat(seen['at'])
+
+
+# --- votes that count: a quarantined member votes on paper only ---------------------------------
+
+def _quarantined_d(auto, seed):
+    _formed(auto, seed, 'bcd', accept=['EVEN_VOTERS'])
+    auto.watch('a')
+    with auto.rt('a').lock:
+        auto.node('a').change_cfg(lambda body: dict(body, quarantined=[IDS['d']]))
+    auto.run(3 * T.R, dt=0.5)
+    view = auto.node('a').view
+    assert view.n == 4 and view.m == 3 and len(view.counting) == 3
+
+
+def test_neither_a_removal_nor_a_leave_takes_the_votes_that_count_below_three(auto, seed):
+    """Four voters, d quarantined: a, b and c count. Taking b out, or c leaving through the
+    leader, would leave two votes that count - refused as the vote switch refuses it."""
+    _quarantined_d(auto, seed)
+
+    r = auto.post('a', f"/api/ha/members/{IDS['b']}/remove", {'confirm': 'REMOVE', 'user_password': ADMIN_PW})
+
+    assert r.status_code == 409 and 'quarantined' in r.get_json()['error'], r.data
+    assert len(auto.node('a').view.counting) == 3
+
+    r = auto.post('c', '/api/ha/unpair', {'confirm': 'UNPAIR', 'user_password': ADMIN_PW})
+
+    assert r.status_code == 409, r.data
+    assert auto.state('c')['role'] == 'standby' and len(auto.node('a').view.counting) == 3
+
+
+def test_the_quarantined_member_itself_may_still_go(auto, seed):
+    _quarantined_d(auto, seed)
+
+    r = auto.post('a', f"/api/ha/members/{IDS['d']}/remove", {'confirm': 'REMOVE', 'user_password': ADMIN_PW})
+
+    assert r.status_code == 200, r.data
+    auto.run(3 * T.R, dt=0.5)
+    assert auto.node('a').view.n == 3 and len(auto.node('a').view.counting) == 3
+
+
+def test_the_even_voters_text_goes_by_the_votes_that_count(auto, seed):
+    """The panel's header says what the group survives with d quarantined; the finding
+    under it says the same."""
+    _quarantined_d(auto, seed)
+    split = _status(auto)['split_safety']
+    even = next(f for f in split['findings'] if f['code'] == 'EVEN_VOTERS')
+    assert split['tolerates'] == 0 and 'survive the loss of no member,' in even['text'], even['text']
+
+
+def test_a_vote_change_whose_member_record_failed_is_done_and_audited(auto, seed, monkeypatch):
+    """The voter config took the change; writing the member record after it failed. The
+    change is in force, so the answer says so and the audit row is written."""
+    _formed(auto, seed, 'bcd', accept=['EVEN_VOTERS'])
+
+    def full(member_id, asked):
+        raise OSError('No space left on device')
+    monkeypatch.setattr(auto.ha, '_vote_marks', full)
+
+    r = _vote(auto, 'a', 'd', voter=False)
+
+    assert r.status_code == 200 and r.get_json()['changed'] is True, r.data
+    assert auto.node('a').view.n == 3
+    assert any(IDS['d'][:8] in (row['details'] or '') or 'vote off' in (row['details'] or '')
+               for row in _audit('ha.member_vote_changed'))
+
+
+def test_a_vm_id_for_a_cluster_no_longer_managed_can_be_removed(auto, seed, monkeypatch):
+    """The cluster was deleted from PegaProx since: forgetting the VM there needs no
+    managed cluster, setting one does."""
+    from pegaprox import globals as g
+    import pegaprox.api.ha as ha_api
+    from test_ha_members import _fresh_windows
+    _formed(auto, seed)
+    _clusters(monkeypatch, c1=_Pve(name='lab', fence_agent_versions=V2))
+    _fresh_windows(ha_api)
+    with auto.at('a'):
+        r = auto.admin.put(f"/api/ha/members/{IDS['b']}/agent-vmid", json={'cluster_id': 'c1', 'vmid': 104})
+    assert r.status_code == 200, r.data
+    monkeypatch.delitem(g.cluster_managers, 'c1')
+    _fresh_windows(ha_api)
+    with auto.at('a'):
+        again = auto.admin.put(f"/api/ha/members/{IDS['b']}/agent-vmid", json={'cluster_id': 'c1', 'vmid': 105})
+        r = auto.admin.put(f"/api/ha/members/{IDS['b']}/agent-vmid", json={'cluster_id': 'c1', 'vmid': None})
+
+    assert again.status_code == 404
+    assert r.status_code == 200, r.data
+    held = next(m for m in _status(auto)['auto']['members'] if m['instance_id'] == IDS['b'])['agent_vmid']
+    assert held == {}
