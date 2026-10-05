@@ -11,6 +11,7 @@ permissions:
 jobs:
   build-package-debian:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Check out Testing
@@ -23,8 +24,13 @@ jobs:
         env:
           COMMIT_SHA: ${{ github.sha }}
         run: |
+          # NS Oct 2026 - the snapshot carries the time of its commit in UTC, not the time
+          # of the build, so a re-run of the same push builds the same version. Read here
+          # from the checkout, which holds that commit; the container has no git
+          SNAPSHOT_TIME=$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y%m%d%H%M "${COMMIT_SHA}")
           docker run --rm -i \
             -e COMMIT_SHA="${COMMIT_SHA}" \
+            -e SNAPSHOT_TIME="${SNAPSHOT_TIME}" \
             -v "$PWD:/workspace" \
             -w /workspace \
             debian:trixie \
@@ -50,7 +56,12 @@ jobs:
               echo "Base version: ${BASE_VERSION}"
               echo "Commit: ${COMMIT_SHA}"
 
-              TIMESTAMP=$(date -u +%Y%m%d%H%M)
+              if [[ ! "${SNAPSHOT_TIME}" =~ ^[0-9]{12}$ ]]; then
+                echo "Error: no commit time for ${COMMIT_SHA}"
+                exit 1
+              fi
+
+              TIMESTAMP="${SNAPSHOT_TIME}"
               SHORT_SHA="${COMMIT_SHA:0:8}"
 
               FULL_VERSION="${BASE_VERSION}~snapshot.${TIMESTAMP}.${SHORT_SHA}"
@@ -80,3 +91,4 @@ jobs:
           name: debian-package-${{ github.sha }}
           path: package/*.deb
           if-no-files-found: error
+          retention-days: 14
