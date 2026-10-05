@@ -1770,7 +1770,8 @@
         // Headers stay English so a script reading the file does not break on the language.
         function inventoryCsvColumns(clusterLabel) {
             const mib = (b) => b != null ? Math.round(b / 1048576) : '';
-            const gib = (b) => b ? (b / 1073741824).toFixed(1) : '';
+            // 0 is a size too: an empty disk reads 0.0, not a blank cell
+            const gib = (b) => b != null ? (b / 1073741824).toFixed(1) : '';
             return [
                 { key: 'cluster', label: 'Cluster', map: clusterLabel },
                 { key: 'vmid', label: 'VMID' },

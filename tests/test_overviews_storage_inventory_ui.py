@@ -195,7 +195,7 @@ INVENTORY = {
            ip_addresses=['10.0.0.11', 'fd00::11'], ha_state='started', pool='prod', tags=['prod', 'web']),
         # a name a spreadsheet would run as a formula
         _g('c1', 'Testi', 102, '=HYPERLINK("x")', 'lxc', 'pve2', 'stopped', template=True, cpu=0, mem=0,
-           disk_allocated=8 * GiB, disk_used=3 * GiB),
+           disk_allocated=8 * GiB, disk_used=0),
     ],
     'clusters': [
         {'cluster_id': 'c2', 'cluster_name': 'Branch', 'state': 'ok', 'count': 1},
@@ -401,7 +401,8 @@ def test_runtime_the_inventory_of_every_cluster_as_csv(open_app, layout):
                        '32.0', '12.0', '10.0.0.11 fd00::11', 'started', 'prod', 'prod;web']
     # a formula is written as text
     assert rows[3][:7] == ['Testi (Vienna)', '102', '\'=HYPERLINK("x")', 'lxc', 'pve2', 'stopped', 'yes']
-    assert rows[3][11:13] == ['8.0', '3.0'] and len(rows) == 4
+    # an empty disk is 0.0, not a blank cell
+    assert rows[3][11:13] == ['8.0', '0.0'] and len(rows) == 4
     assert [u for u in app.server.urls if '/api/inventory/guests' in u][-1].endswith('/api/inventory/guests')
     page.wait_for_timeout(300)
     toasts = _toasts(page)
