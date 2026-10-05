@@ -1765,6 +1765,72 @@
             window.PegaProxDownloadJson = downloadJson;
         } catch (_) {}
 
+        // LW Oct 2026 - the guest inventory as CSV, of one cluster or (no clusterId) of every
+        // cluster the user reaches. GET /inventory/guests leaves out each guest they may not see.
+        // Headers stay English so a script reading the file does not break on the language.
+        function inventoryCsvColumns(clusterLabel) {
+            const mib = (b) => b != null ? Math.round(b / 1048576) : '';
+            const gib = (b) => b ? (b / 1073741824).toFixed(1) : '';
+            return [
+                { key: 'cluster', label: 'Cluster', map: clusterLabel },
+                { key: 'vmid', label: 'VMID' },
+                { key: 'name', label: 'Name' },
+                { key: 'type', label: 'Type' },
+                { key: 'node', label: 'Node' },
+                { key: 'status', label: 'Status' },
+                { key: 'template', label: 'Template', map: g => g.template ? 'yes' : '' },
+                { key: 'vcpus', label: 'vCPU', map: g => g.vcpus || '' },
+                { key: 'cpu', label: 'CPU%', map: g => g.cpu != null ? Math.round(g.cpu * 100) : '' },
+                { key: 'mem', label: 'Mem (MiB)', map: g => mib(g.mem) },
+                { key: 'memory', label: 'MemMax (MiB)', map: g => mib(g.memory) },
+                { key: 'disk_allocated', label: 'Disk allocated (GiB)', map: g => gib(g.disk_allocated) },
+                { key: 'disk_used', label: 'Disk used (GiB)', map: g => gib(g.disk_used) },
+                { key: 'ip_addresses', label: 'IP addresses', map: g => (g.ip_addresses || []).join(' ') },
+                { key: 'ha_state', label: 'HA state' },
+                { key: 'pool', label: 'Pool' },
+                { key: 'tags', label: 'Tags', map: g => (g.tags || []).join(';') },
+            ];
+        }
+
+        function InventoryCsvButton({ clusterId, clusters, fileName, addToast, className, label }) {
+            const { t } = useTranslation();
+            const { getAuthHeaders } = useAuth();
+            const [busy, setBusy] = useState(false);
+            const run = async () => {
+                if (busy) return;
+                setBusy(true);
+                try {
+                    const q = clusterId ? `?cluster=${encodeURIComponent(clusterId)}` : '';
+                    const r = await fetch(`${API_URL}/inventory/guests${q}`, { headers: getAuthHeaders() });
+                    if (!r.ok) { addToast?.(t('inventoryCsvFailed'), 'error'); return; }
+                    const data = await r.json();
+                    const rows = data.guests || [];
+                    const clusterLabel = (g) => {
+                        const c = (clusters || []).find(x => x.id === g.cluster_id);
+                        return (c && (c.display_name || c.name)) || g.cluster_name;
+                    };
+                    const missing = (data.clusters || []).filter(c => c.state !== 'ok').map(clusterLabel);
+                    if (missing.length) addToast?.(t('inventoryCsvMissing').replace('{clusters}', missing.join(', ')), 'warning');
+                    if (!rows.length) { addToast?.(t('inventoryCsvEmpty'), 'info'); return; }
+                    const fname = fileName || `pegaprox-inventory-${new Date().toISOString().slice(0, 10)}.csv`;
+                    downloadCsv(fname, rows, inventoryCsvColumns(clusterLabel));
+                    addToast?.(t('inventoryCsvExported').replace('{n}', rows.length), 'success');
+                } catch (e) {
+                    console.error('inventory export:', e);
+                    addToast?.(t('inventoryCsvFailed'), 'error');
+                } finally {
+                    setBusy(false);
+                }
+            };
+            return (
+                <button type="button" data-inventory-csv={clusterId || 'all'} onClick={run} disabled={busy}
+                    className={className} title={t('inventoryCsvTitle')}>
+                    <span className={`inline-flex ${busy ? 'animate-pulse' : ''}`}><Icons.Download /></span>
+                    {label}
+                </button>
+            );
+        }
+
         // NS — opt-in pre-action snapshot pref. Stored in localStorage so it survives reload.
         // Read by destructive flows (delete VM, restore, change boot, migrate to other cluster).
         const AUTO_SNAPSHOT_KEY = 'pegaprox-auto-snapshot-before-destructive';

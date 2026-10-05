@@ -18287,35 +18287,18 @@
                                                                 {t('createContainer')}
                                                             </button>
                                                             </>)}
-                                                            {/* LW — quick CSV export of the current VM list */}
-                                                            <button
-                                                                onClick={() => {
-                                                                    const rows = (clusterResources || []).filter(r => r.type === 'qemu' || r.type === 'lxc');
-                                                                    if (!rows.length) { addToast?.(t('noResources') || 'No VMs to export', 'info'); return; }
-                                                                    const cols = [
-                                                                        { key: 'vmid', label: 'VMID' },
-                                                                        { key: 'name', label: 'Name' },
-                                                                        { key: 'type', label: 'Type' },
-                                                                        { key: 'node', label: 'Node' },
-                                                                        { key: 'status', label: 'Status' },
-                                                                        { key: 'cpu', label: 'CPU%', map: r => r.cpu != null ? Math.round(r.cpu * 100) : '' },
-                                                                        { key: 'mem', label: 'Mem (MiB)', map: r => r.mem != null ? Math.round(r.mem / 1048576) : '' },
-                                                                        { key: 'maxmem', label: 'MemMax (MiB)', map: r => r.maxmem != null ? Math.round(r.maxmem / 1048576) : '' },
-                                                                        { key: 'tags', label: 'Tags', map: r => Array.isArray(r.tags) ? r.tags.join(';') : (r.tags || '') },
-                                                                    ];
-                                                                    const fname = `pegaprox-${selectedCluster?.name || 'cluster'}-vms-${new Date().toISOString().slice(0,10)}.csv`;
-                                                                    window.PegaProxDownloadCsv?.(fname, rows, cols);
-                                                                    addToast?.(`Exported ${rows.length} rows`, 'success');
-                                                                }}
+                                                            {/* LW Oct 2026 - quick CSV export of the current VM list, with the inventory of each guest (ui.js) */}
+                                                            <InventoryCsvButton
+                                                                clusterId={selectedCluster.id}
+                                                                clusters={clusters}
+                                                                fileName={`pegaprox-${selectedCluster?.name || 'cluster'}-vms-${new Date().toISOString().slice(0,10)}.csv`}
+                                                                addToast={addToast}
                                                                 className={isCorporate
-                                                                    ? 'flex items-center gap-1.5 px-3 py-1.5 text-[13px] hover:bg-[#29414e] border border-[#485764]'
-                                                                    : 'flex items-center gap-2 px-4 py-2 bg-proxmox-darker rounded-lg text-gray-200 hover:bg-proxmox-card border border-proxmox-border transition-colors'
+                                                                    ? 'corp-vm-btn corp-vm-btn-ghost disabled:opacity-50'
+                                                                    : 'flex items-center gap-2 px-4 py-2 bg-proxmox-darker rounded-lg text-gray-200 hover:bg-proxmox-hover border border-proxmox-border transition-colors'
                                                                 }
-                                                                title={t('exportCsv') || 'Export CSV'}
-                                                            >
-                                                                <Icons.Download className={isCorporate ? 'w-3 h-3' : 'w-4 h-4'} />
-                                                                {t('exportCsv') || 'Export CSV'}
-                                                            </button>
+                                                                label={t('exportCsv') || 'Export CSV'}
+                                                            />
                                                         </div>
                                                     </div>
                                                 )}
@@ -25228,6 +25211,7 @@
                                         topGuests={topGuests}
                                         allClusterGuests={allClusterGuests}
                                         pbsServers={pbsServers}
+                                        addToast={addToast}
                                         onSelectCluster={setSelectedCluster}
                                         onSelectVm={(cluster, vmid, node, guest) => {
                                             setSelectedCluster(cluster);

@@ -5914,6 +5914,320 @@
             );
         }
 
+        // LW Oct 2026 - every storage of every cluster in one table, fullest first. The server reads
+        // each cluster once (GET /api/storage-overview, shared with the health check), and only
+        // while the panel is open. Nothing here acts, so a standby shows it as it is.
+        function StorageOverview({ clusters }) {
+            const { t } = useTranslation();
+            const { getAuthHeaders, user, isAdmin, haReadOnly } = useAuth();
+            const { isCorporate } = useLayout();
+            const ROWS = 50;
+            const store = (key, value) => { try { localStorage.setItem(key, value); } catch (e) {} };
+            const recall = (key, fallback) => { try { const v = localStorage.getItem(key); return v === null ? fallback : v; } catch (e) { return fallback; } };
+            const [data, setData] = useState(null);
+            const [loading, setLoading] = useState(false);
+            const [query, setQuery] = useState('');
+            const [limit, setLimit] = useState(() => recall('pegaprox-storage-overview-threshold', '85'));
+            const [overOnly, setOverOnly] = useState(false);
+            const [open, setOpen] = useState(() => recall('pegaprox-storage-overview-open', '1') !== '0');
+            const [showAll, setShowAll] = useState(false);
+            const [sort, setSort] = useState({ by: 'percent', dir: 'desc' });
+            const seq = useRef(0);
+            const allowed = (!haReadOnly || haReadPermission('storage.view')) &&
+                (isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes('storage.view')));
+            const clusterKey = clusters.map(c => c.id).join(',');
+
+            const load = async () => {
+                const mine = ++seq.current;
+                setLoading(true);
+                try {
+                    const r = await fetch(`${API_URL}/storage-overview`, { headers: getAuthHeaders() });
+                    if (mine !== seq.current) return;  // a newer read is on its way
+                    if (r.ok) setData(await r.json());
+                    else if (r.status === 403) setData({ denied: true });
+                    else setData(prev => prev || { failed: true });  // what was read stays shown
+                } catch (e) {
+                    console.error('storage overview:', e);
+                    if (mine === seq.current) setData(prev => prev || { failed: true });
+                } finally {
+                    if (mine === seq.current) setLoading(false);
+                }
+            };
+            useEffect(() => {
+                if (!allowed || !clusterKey || !open) return;
+                load();
+                // the server keeps a read for 30 s; a page left open looks again now and then
+                const timer = setInterval(load, 120000);
+                return () => clearInterval(timer);
+            }, [allowed, clusterKey, open]);
+
+            if (!allowed || !clusterKey || (data && data.denied)) return null;
+
+            const parsed = parseInt(limit, 10);
+            const threshold = parsed >= 1 && parsed <= 100 ? parsed : 85;
+            const label = (s) => {
+                const c = clusters.find(x => x.id === s.cluster_id);
+                return (c && (c.display_name || c.name)) || s.cluster_name;
+            };
+            const all = (data && data.storages) || [];
+            const isOver = (s) => s.active && s.percent != null && s.percent >= threshold;
+            const over = all.filter(isOver).length;
+            const q = query.trim().toLowerCase();
+            const rows = all.filter(s => !overOnly || isOver(s))
+                .filter(s => !q || `${label(s)} ${s.node} ${s.storage} ${s.type} ${s.content}`.toLowerCase().includes(q));
+            const keyOf = {
+                cluster: s => label(s).toLowerCase(), node: s => (s.shared ? '' : s.node || '').toLowerCase(),
+                storage: s => (s.storage || '').toLowerCase(), type: s => s.type || '', shared: s => s.shared ? 1 : 0,
+                used: s => s.used ?? -1, total: s => s.total ?? -1, percent: s => s.percent ?? -1, status: s => s.active ? 1 : 0,
+            };
+            const pick = keyOf[sort.by] || keyOf.percent;
+            const sorted = [...rows].sort((a, b) => {
+                const x = pick(a), y = pick(b);
+                const c = typeof x === 'string' ? x.localeCompare(y) : x - y;
+                return (sort.dir === 'asc' ? c : -c) || label(a).localeCompare(label(b)) || (a.storage || '').localeCompare(b.storage || '');
+            });
+            const shown = showAll ? sorted : sorted.slice(0, ROWS);
+            const unlisted = ((data && data.clusters) || []).filter(c => c.state !== 'ok');
+            const stateText = { offline: t('allStorageOffline'), unreadable: t('allStorageUnreadable'), confined: t('allStorageConfined') };
+            const toggle = () => { store('pegaprox-storage-overview-open', open ? '0' : '1'); setOpen(!open); };
+            // text sorts A to Z first, figures the largest first
+            const sortOn = (by) => setSort(s => s.by === by
+                ? { by, dir: s.dir === 'asc' ? 'desc' : 'asc' }
+                : { by, dir: ['cluster', 'node', 'storage', 'type'].includes(by) ? 'asc' : 'desc' });
+            const level = (s) => !s.active || s.percent == null ? 'none' : s.percent >= threshold ? 'over' : s.percent >= threshold - 10 ? 'near' : 'ok';
+            const columns = [
+                { by: 'cluster', label: t('cluster') }, { by: 'node', label: t('node') },
+                { by: 'storage', label: t('storage') }, { by: 'type', label: t('type') },
+                { by: 'shared', label: t('allStorageShared') }, { by: 'used', label: t('allStorageUsed') },
+                { by: 'total', label: t('allStorageTotal') }, { by: 'percent', label: t('allStorageUsage') },
+                { by: 'status', label: t('status') },
+            ];
+            const rowKey = (s) => `${s.cluster_id}:${s.shared ? '*' : s.node}:${s.storage}`;
+            const nodeText = (s) => s.shared
+                ? (s.nodes ? t('allStorageNodes').replace('{n}', s.nodes) : t('allStorageShared'))
+                : (s.node || '-');
+            const size = (b) => b == null ? '-' : formatBytes(b);
+            const statusText = (s) => s.active ? t('active') : t('allStorageInactive');
+            const partly = (s) => s.active && s.inactive_on && s.inactive_on.length > 0
+                ? t('allStorageInactiveOn').replace('{nodes}', s.inactive_on.join(', ')) : '';
+
+            const filters = (
+                <div className="flex items-center gap-3 flex-wrap">
+                    <div className="relative">
+                        <Icons.Search className="w-3.5 h-3.5 absolute left-2 top-1/2 -translate-y-1/2 text-gray-500" />
+                        <input data-storage-overview-search value={query} onChange={e => setQuery(e.target.value)} placeholder={t('search')}
+                            style={{ paddingLeft: '1.75rem' }} className="pr-2 py-1 text-xs bg-proxmox-dark border border-proxmox-border rounded-lg w-48" />
+                    </div>
+                    <label className="flex items-center gap-1.5 text-xs text-gray-400">
+                        {t('allStorageThreshold')}
+                        <input data-storage-overview-threshold type="number" min="1" max="100" value={limit}
+                            onChange={e => { setLimit(e.target.value); store('pegaprox-storage-overview-threshold', e.target.value); }}
+                            className="px-2 py-1 text-xs bg-proxmox-dark border border-proxmox-border rounded-lg w-16" />
+                        %
+                    </label>
+                    <label className="flex items-center gap-1.5 text-xs text-gray-400">
+                        <input data-storage-overview-over type="checkbox" checked={overOnly} onChange={e => setOverOnly(e.target.checked)} />
+                        {t('allStorageOverOnly')}
+                    </label>
+                </div>
+            );
+            const footer = (
+                <div className="flex items-center justify-between gap-3 flex-wrap text-xs text-gray-500">
+                    <div className="flex items-center gap-3 flex-wrap">
+                        {unlisted.length > 0 && (
+                            <span data-storage-overview-unlisted className="text-amber-400">
+                                {t('allStorageNotListed')} {unlisted.map(c => `${label(c)} (${stateText[c.state] || c.state})`).join(', ')}
+                            </span>
+                        )}
+                    </div>
+                    {rows.length > ROWS && (
+                        <button type="button" data-storage-overview-more onClick={() => setShowAll(!showAll)} className="text-proxmox-orange hover:underline">
+                            {showAll ? t('showLess') : t('allStorageShowAll').replace('{n}', rows.length)}
+                        </button>
+                    )}
+                </div>
+            );
+            const pending = !data && (
+                <div className="text-sm text-gray-500">{t('loading') || 'Loading...'}</div>
+            );
+            const empty = data && (data.failed ? (
+                <div data-storage-overview-failed className="text-sm text-amber-400">{t('allStorageFailed')}</div>
+            ) : rows.length === 0 && (
+                <div data-storage-overview-empty className="text-sm text-gray-400">
+                    {all.length === 0 ? t('allStorageEmpty') : t('allStorageNoMatch')}
+                </div>
+            ));
+            const refreshButton = (
+                <button type="button" onClick={() => load()} title={t('refresh')} disabled={loading}
+                    className="p-1.5 rounded text-gray-500 hover:text-proxmox-orange hover:bg-proxmox-hover disabled:opacity-50">
+                    <span className={`inline-flex ${loading ? 'animate-spin' : ''}`}><Icons.RefreshCw /></span>
+                </button>
+            );
+            const chevron = (
+                <button type="button" onClick={toggle} title={open ? t('collapse') : t('allStorageExpand')} className="p-1.5 rounded text-gray-500 hover:text-white hover:bg-proxmox-hover">
+                    <span className="inline-flex" style={{ transform: open ? 'none' : 'rotate(-90deg)' }}><Icons.ChevronDown /></span>
+                </button>
+            );
+            const aboveText = data && over > 0 ? t('allStorageAbove').replace('{n}', over).replace('{p}', threshold) : '';
+
+            if (isCorporate) {
+                const corpColor = { over: '#f54f47', near: '#efc006', ok: '#60b515', none: '#728b9a' };
+                return (
+                    <div data-storage-overview>
+                        <div className="flex items-center gap-2 py-1.5" style={{borderBottom: '1px solid var(--corp-border-subtle)'}}>
+                            <Icons.HardDrive className="w-3.5 h-3.5" style={{color: '#49afd9'}} />
+                            <button type="button" data-storage-overview-fold onClick={toggle} className="text-[13px] font-semibold" style={{color: '#adbbc4'}}>{t('allStorageTitle')}</button>
+                            {data && !data.failed && <span data-storage-overview-count className="text-[11px]" style={{color: '#728b9a'}}>{all.length}</span>}
+                            {aboveText && <span data-storage-overview-above className="text-[11px]" style={{color: '#f54f47'}}>{aboveText}</span>}
+                            <span className="flex-1" />
+                            {open && refreshButton}
+                            {chevron}
+                        </div>
+                        {open && (
+                            <div className="space-y-2 pt-2">
+                                {filters}
+                                {pending}
+                                {empty}
+                                {rows.length > 0 && (
+                                    <table className="corp-datagrid corp-datagrid-striped">
+                                        <thead>
+                                            <tr>
+                                                {columns.map(col => (
+                                                    <th key={col.by} data-storage-overview-sort={col.by} className="cursor-pointer" style={{textAlign: 'left'}} onClick={() => sortOn(col.by)}>
+                                                        {col.label} {sort.by === col.by && <span className="sort-indicator">{sort.dir === 'asc' ? '▲' : '▼'}</span>}
+                                                    </th>
+                                                ))}
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {shown.map(s => {
+                                                const color = corpColor[level(s)];
+                                                // on the cells: the striped rows paint theirs over a row background
+                                                const hot = isOver(s) ? {background: 'rgba(245,79,71,0.08)'} : {};
+                                                return (
+                                                    <tr key={rowKey(s)} data-storage-overview-row={rowKey(s)} data-over={isOver(s) ? '1' : undefined}>
+                                                        <td style={{fontWeight: 500, ...hot, ...(isOver(s) ? {boxShadow: 'inset 3px 0 0 #f54f47'} : {})}}>{label(s)}</td>
+                                                        <td style={{color: '#adbbc4', ...hot}}>{nodeText(s)}</td>
+                                                        <td style={hot}>{s.storage}</td>
+                                                        <td style={{color: '#adbbc4', ...hot}}>{s.type || '-'}</td>
+                                                        <td style={hot}>{s.shared ? t('yes') : t('no')}</td>
+                                                        <td style={hot}>{size(s.used)}</td>
+                                                        <td style={hot}>{size(s.total)}</td>
+                                                        <td style={hot}>
+                                                            {s.percent == null ? '-' : (
+                                                                <div className="flex items-center gap-1.5">
+                                                                    <span style={{color, minWidth: '40px'}}>{s.percent.toFixed(1)}%</span>
+                                                                    <span className="inline-block" style={{width: '60px', height: '3px', background: 'var(--corp-divider)', position: 'relative'}}>
+                                                                        <span style={{position: 'absolute', left: 0, top: 0, height: '3px', width: `${Math.min(s.percent, 100)}%`, background: color}} />
+                                                                    </span>
+                                                                </div>
+                                                            )}
+                                                        </td>
+                                                        <td style={hot}>
+                                                            <span className="inline-flex items-center gap-1">
+                                                                <span className="w-1.5 h-1.5 rounded-full inline-block" style={{background: s.active ? '#60b515' : '#728b9a'}} />
+                                                                <span style={{color: s.active ? '#60b515' : '#728b9a', fontSize: '12px'}}>{statusText(s)}</span>
+                                                            </span>
+                                                            {partly(s) && <span className="ml-2 text-[11px]" style={{color: '#efc006'}}>{partly(s)}</span>}
+                                                        </td>
+                                                    </tr>
+                                                );
+                                            })}
+                                        </tbody>
+                                    </table>
+                                )}
+                                {footer}
+                            </div>
+                        )}
+                    </div>
+                );
+            }
+
+            const modernColor = {
+                over: ['bg-red-500', 'text-red-400'], near: ['bg-yellow-500', 'text-yellow-400'],
+                ok: ['bg-green-500', 'text-green-400'], none: ['bg-gray-500', 'text-gray-500'],
+            };
+            return (
+                <div data-storage-overview className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
+                    <div className="p-4 border-b border-proxmox-border flex items-center justify-between gap-3 flex-wrap">
+                        <button type="button" data-storage-overview-fold onClick={toggle} className="flex items-center gap-3 text-left">
+                            <div className="w-10 h-10 rounded-lg bg-blue-500/20 flex items-center justify-center text-blue-400">
+                                <Icons.HardDrive className="w-5 h-5" />
+                            </div>
+                            <div>
+                                <h3 className="font-semibold text-white">
+                                    {t('allStorageTitle')} {data && !data.failed && <span data-storage-overview-count className="text-sm font-normal text-gray-500">({all.length})</span>}
+                                </h3>
+                                <p className="text-xs text-gray-500">{t('allStorageDesc')}</p>
+                            </div>
+                        </button>
+                        <div className="flex items-center gap-2">
+                            {aboveText && <span data-storage-overview-above className="text-xs font-medium text-red-400">{aboveText}</span>}
+                            {open && refreshButton}
+                            {chevron}
+                        </div>
+                    </div>
+                    {open && (
+                        <div className="p-4 space-y-3">
+                            {filters}
+                            {pending}
+                            {empty}
+                            {rows.length > 0 && (
+                                <div className="overflow-x-auto">
+                                    <table className="w-full">
+                                        <thead className="bg-proxmox-dark/50">
+                                            <tr className="text-left text-xs text-gray-400">
+                                                {columns.map(col => (
+                                                    <th key={col.by} data-storage-overview-sort={col.by} className="px-4 py-3 font-medium cursor-pointer hover:text-white" onClick={() => sortOn(col.by)}>
+                                                        {col.label}{sort.by === col.by && <span className="ml-1">{sort.dir === 'asc' ? '▲' : '▼'}</span>}
+                                                    </th>
+                                                ))}
+                                            </tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-proxmox-border/50">
+                                            {shown.map(s => {
+                                                const [bar, text] = modernColor[level(s)];
+                                                return (
+                                                    <tr key={rowKey(s)} data-storage-overview-row={rowKey(s)} data-over={isOver(s) ? '1' : undefined}
+                                                        className={`${isOver(s) ? 'bg-red-500/10' : ''} hover:bg-proxmox-hover/50 transition-colors`}>
+                                                        <td className="px-4 py-2 text-sm text-gray-300">{label(s)}</td>
+                                                        <td className="px-4 py-2 text-sm text-gray-400">{nodeText(s)}</td>
+                                                        <td className="px-4 py-2 text-sm font-medium text-white">{s.storage}</td>
+                                                        <td className="px-4 py-2 text-xs text-gray-400">{s.type || '-'}</td>
+                                                        <td className="px-4 py-2 text-xs text-gray-400">{s.shared ? t('yes') : t('no')}</td>
+                                                        <td className="px-4 py-2 text-sm text-gray-300">{size(s.used)}</td>
+                                                        <td className="px-4 py-2 text-sm text-gray-300">{size(s.total)}</td>
+                                                        <td className="px-4 py-2">
+                                                            {s.percent == null ? <span className="text-gray-500">-</span> : (
+                                                                <div className="flex items-center gap-2">
+                                                                    <div className="w-16 h-2 bg-proxmox-dark rounded-full overflow-hidden">
+                                                                        <div className={`h-full rounded-full ${bar}`} style={{ width: `${Math.min(s.percent, 100)}%` }} />
+                                                                    </div>
+                                                                    <span className={`text-xs font-medium ${text}`}>{s.percent.toFixed(1)}%</span>
+                                                                </div>
+                                                            )}
+                                                        </td>
+                                                        <td className="px-4 py-2">
+                                                            <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium ${s.active ? 'bg-green-500/20 text-green-400' : 'bg-gray-500/20 text-gray-400'}`}>
+                                                                <span className={`w-1.5 h-1.5 rounded-full ${s.active ? 'bg-green-400' : 'bg-gray-400'}`} />
+                                                                {statusText(s)}
+                                                            </span>
+                                                            {partly(s) && <div className="text-[11px] text-amber-400 mt-0.5">{partly(s)}</div>}
+                                                        </td>
+                                                    </tr>
+                                                );
+                                            })}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            )}
+                            {footer}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
         // LW Oct 2026 - the guests no backup job covers, every cluster in one list. One read per
         // cluster on the server (GET /api/backup-coverage), shared with the alert of the same name.
         // Only reads and links to the guest, so a standby shows it as it is.
@@ -6158,7 +6472,7 @@
 
         // LW: All Clusters Overview - GitHub Feature Request #16
         // added a bunch of stuff here - storage, sparklines, sorting etc
-        function AllClustersOverview({ clusters, allMetrics, clusterGroups = [], topGuests = [], allClusterGuests = {}, pbsServers = [], onSelectCluster, onSelectVm, topologyOnly = false, onAutoInstall }) {
+        function AllClustersOverview({ clusters, allMetrics, clusterGroups = [], topGuests = [], allClusterGuests = {}, pbsServers = [], onSelectCluster, onSelectVm, topologyOnly = false, onAutoInstall, addToast }) {
             // #625: an empty list on a standby is no reason to offer adding a cluster there -
             // say why it is empty instead: no sync yet, or its live view is off
             const haInfo = (useAuth() || {}).ha || {};
@@ -6498,6 +6812,10 @@
                                         <Icons.AlertTriangle className="w-3.5 h-3.5" /> {totals.totalAlerts} {t('alerts') || 'alerts'}
                                     </span>
                                 )}
+                                {!topologyOnly && clusters.length > 0 && (
+                                    <InventoryCsvButton clusters={clusters} addToast={addToast} label={t('inventoryCsv')}
+                                        className="corp-vm-btn corp-vm-btn-ghost disabled:opacity-50" />
+                                )}
                             </div>
                         </div>
 
@@ -6665,6 +6983,8 @@
                         )}
 
                         {!topologyOnly && clusters.length > 0 && <GuestsWithoutBackup clusters={clusters} onSelectVm={onSelectVm} />}
+
+                        {!topologyOnly && clusters.length > 0 && <StorageOverview clusters={clusters} />}
 
                         {/* NS: Mar 2026 - Multi-cluster topology redesign (#142) */}
                         {clusters.filter(c => c.connected).length > 0 && (() => {
@@ -6890,6 +7210,11 @@
                             </div>
 
                             <div className="flex items-center gap-3">
+                                {clusters.length > 0 && (
+                                    <InventoryCsvButton clusters={clusters} addToast={addToast} label={t('inventoryCsv')}
+                                        className="flex items-center gap-2 px-3 py-1.5 bg-proxmox-darker rounded-lg text-sm text-gray-200 hover:bg-proxmox-hover border border-proxmox-border transition-colors disabled:opacity-50" />
+                                )}
+
                                 {/* alerts */}
                                 {totals.totalAlerts > 0 && (
                                     <div className="flex items-center gap-2 px-3 py-1.5 bg-red-500/10 border border-red-500/30 rounded-lg">
@@ -7100,6 +7425,8 @@
                     )}
 
                     {clusters.length > 0 && <GuestsWithoutBackup clusters={clusters} onSelectVm={onSelectVm} />}
+
+                    {clusters.length > 0 && <StorageOverview clusters={clusters} />}
 
                     {/* Empty State */}
                     {clusters.length === 0 && (
