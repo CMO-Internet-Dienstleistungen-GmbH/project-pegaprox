@@ -658,15 +658,30 @@ class PegaProxDB:
         # MK Oct 2026 (#954) - the Proxmox HA rules a rolling update switched off for its run.
         # Written before the first one is touched: after a restart nothing else knows them
         # (a disabled rule looks like any other), and they have to be switched on again.
+        # owner: who holds it off - 'rolling', or 'maintenance:<node>' for the maintenance of
+        # one node. One rule can be held by several; it goes back on when the last one lets go.
+        # A table from before the owner was keyed on (cluster_id, rule): it is moved aside,
+        # built again with the new key, and its rows (all a rolling update's) copied over.
+        cursor.execute("PRAGMA table_info(suspended_ha_rules)")
+        _sh_cols = {col[1] for col in cursor.fetchall()}
+        _sh_keyed = bool(_sh_cols) and 'owner' not in _sh_cols
+        if _sh_keyed:
+            cursor.execute('DROP TABLE IF EXISTS suspended_ha_rules_keyed')
+            cursor.execute('ALTER TABLE suspended_ha_rules RENAME TO suspended_ha_rules_keyed')
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS suspended_ha_rules (
                 cluster_id TEXT NOT NULL,
                 rule TEXT NOT NULL,
                 rule_type TEXT NOT NULL,
                 suspended_at TEXT NOT NULL,
-                PRIMARY KEY (cluster_id, rule)
+                owner TEXT NOT NULL DEFAULT 'rolling',
+                PRIMARY KEY (cluster_id, rule, owner)
             )
         ''')
+        if _sh_keyed:
+            cursor.execute("INSERT OR IGNORE INTO suspended_ha_rules (cluster_id, rule, rule_type, suspended_at, owner) "
+                           "SELECT cluster_id, rule, rule_type, suspended_at, 'rolling' FROM suspended_ha_rules_keyed")
+            cursor.execute('DROP TABLE suspended_ha_rules_keyed')
 
         # Server settings table
         cursor.execute('''
@@ -769,7 +784,9 @@ class PegaProxDB:
                 next_run TEXT,
                 created_by TEXT,
                 created_at TEXT,
-                updated_at TEXT
+                updated_at TEXT,
+                migrate_templates INTEGER DEFAULT 0,
+                relax_anti_affinity INTEGER DEFAULT 0
             )
         ''')
         # MK #630 — backfill reboot_timeout on schedule tables created before the column existed.
@@ -778,6 +795,10 @@ class PegaProxDB:
             _us_cols = {r[1] for r in cursor.fetchall()}
             if 'reboot_timeout' not in _us_cols:
                 cursor.execute("ALTER TABLE update_schedules ADD COLUMN reboot_timeout INTEGER DEFAULT 600")
+            # MK Oct 2026 (#763, #954) - the two evacuation options; off on an older schedule
+            for _col in ('migrate_templates', 'relax_anti_affinity'):
+                if _col not in _us_cols:
+                    cursor.execute(f"ALTER TABLE update_schedules ADD COLUMN {_col} INTEGER DEFAULT 0")
         except Exception as _e:
             logging.warning(f"update_schedules reboot_timeout migration skipped: {_e}")
 
@@ -1435,7 +1456,9 @@ class PegaProxDB:
                     next_run TEXT,
                     created_by TEXT,
                     created_at TEXT,
-                    updated_at TEXT
+                    updated_at TEXT,
+                    migrate_templates INTEGER DEFAULT 0,
+                    relax_anti_affinity INTEGER DEFAULT 0
                 )
             ''')
             try:
@@ -1443,6 +1466,9 @@ class PegaProxDB:
                 _us_cols2 = {r[1] for r in cursor.fetchall()}
                 if 'reboot_timeout' not in _us_cols2:
                     cursor.execute("ALTER TABLE update_schedules ADD COLUMN reboot_timeout INTEGER DEFAULT 600")
+                for _col in ('migrate_templates', 'relax_anti_affinity'):   # #763, #954
+                    if _col not in _us_cols2:
+                        cursor.execute(f"ALTER TABLE update_schedules ADD COLUMN {_col} INTEGER DEFAULT 0")
             except Exception as _e2:
                 logging.warning(f"update_schedules reboot_timeout migration skipped: {_e2}")
             logging.info("Ensured update_schedules table exists")
@@ -4951,27 +4977,35 @@ class PegaProxDB:
                        (cluster_id,))
         return [(r['node'], r['entered_at'], bool(r['native_ha'])) for r in cursor.fetchall()]
 
-    def save_suspended_ha_rules(self, cluster_id: str, rules: list, rule_type: str = 'resource-affinity'):
-        """#954 - remember HA rules before they are switched off. A rule already listed keeps
-        its first timestamp."""
+    def save_suspended_ha_rules(self, cluster_id: str, rules: list, rule_type: str = 'resource-affinity',
+                                owner: str = 'rolling'):
+        """#954 - remember HA rules before they are switched off, for `owner` (a rolling update,
+        or 'maintenance:<node>'). A rule this owner already holds keeps its first timestamp."""
         cursor = self.conn.cursor()
         now = datetime.now().isoformat()
         for rule in rules:
-            cursor.execute('INSERT OR IGNORE INTO suspended_ha_rules (cluster_id, rule, rule_type, suspended_at) '
-                           'VALUES (?, ?, ?, ?)', (cluster_id, rule, rule_type, now))
+            cursor.execute('INSERT OR IGNORE INTO suspended_ha_rules (cluster_id, rule, rule_type, suspended_at, owner) '
+                           'VALUES (?, ?, ?, ?, ?)', (cluster_id, rule, rule_type, now, owner))
         self.conn.commit()
 
-    def remove_suspended_ha_rule(self, cluster_id: str, rule: str):
+    def remove_suspended_ha_rule(self, cluster_id: str, rule: str, owners=None):
+        """The rows of `rule`: of every owner, or only of those in `owners`."""
         cursor = self.conn.cursor()
-        cursor.execute('DELETE FROM suspended_ha_rules WHERE cluster_id=? AND rule=?', (cluster_id, rule))
+        if owners is None:
+            cursor.execute('DELETE FROM suspended_ha_rules WHERE cluster_id=? AND rule=?', (cluster_id, rule))
+        else:
+            for owner in ([owners] if isinstance(owners, str) else owners):
+                cursor.execute('DELETE FROM suspended_ha_rules WHERE cluster_id=? AND rule=? AND owner=?',
+                               (cluster_id, rule, owner))
         self.conn.commit()
 
     def get_suspended_ha_rules(self, cluster_id: str) -> list:
-        """#954 - [(rule, rule_type, suspended_at), ...] still waiting to be switched on again."""
+        """#954 - [(rule, rule_type, suspended_at, owner), ...] still waiting to be switched on
+        again; a rule held by two owners comes twice."""
         cursor = self.conn.cursor()
-        cursor.execute('SELECT rule, rule_type, suspended_at FROM suspended_ha_rules WHERE cluster_id=? '
-                       'ORDER BY rule', (cluster_id,))
-        return [(r['rule'], r['rule_type'], r['suspended_at']) for r in cursor.fetchall()]
+        cursor.execute('SELECT rule, rule_type, suspended_at, owner FROM suspended_ha_rules WHERE cluster_id=? '
+                       'ORDER BY rule, owner', (cluster_id,))
+        return [(r['rule'], r['rule_type'], r['suspended_at'], r['owner']) for r in cursor.fetchall()]
 
     def get_affinity_rules(self, cluster_id: str = None) -> dict:
         """Get affinity rules"""

@@ -677,6 +677,125 @@ def parse_pve_error(response_text, fallback='Proxmox API error'):
     return html.escape(text) if text else fallback
 
 
+# MK Oct 2026 (#763, #954) - the two evacuation options of a rolling update. The run started
+# by hand (settings.py) and the scheduled one (schedules.py) are two copies of the loop; what
+# the options do in either of them is written down once, here. Each reads its flags from the
+# state of the run, mgr._rolling_update.
+
+def evacuation_options(mgr, data):
+    """(migrate_templates, relax_anti_affinity) from a request body or a stored schedule: off
+    unless set to a real true, and off on XCP-ng, which has neither the templates nor the HA
+    rules meant here. Also for a node's maintenance."""
+    data = data or {}
+    is_pve = getattr(mgr, 'cluster_type', 'proxmox') == 'proxmox'
+    return (is_pve and data.get('migrate_templates') is True,
+            is_pve and data.get('relax_anti_affinity') is True)
+
+
+def evacuation_options_said(migrate_templates, relax_anti_affinity):
+    """': what the options change' for an audit line, '' with both off."""
+    said = [o for o, on in (('templates move with the evacuation', migrate_templates),
+                            ('negative affinity rules give way until it ends', relax_anti_affinity)) if on]
+    return f": {'; '.join(said)}" if said else ''
+
+
+def rolling_log(mgr, msg):
+    """One line with its time in the log of the rolling update that runs."""
+    try:
+        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+    except Exception:
+        pass
+
+
+def rolling_options_intro(mgr):
+    """What the options mean for this run, said once when it starts."""
+    state = mgr._rolling_update or {}
+    if state.get('skip_evacuation'):
+        return
+    if state.get('migrate_templates'):
+        rolling_log(mgr, "Templates: moved offline with each node's evacuation, only to a node that has every "
+                         "storage they use. One that cannot move stays where it is and does not pause the run")
+    if state.get('relax_anti_affinity'):
+        rolling_log(mgr, "Negative affinity: guests that must run apart may share a node until the run ends. "
+                         "Proxmox HA rules are switched off before the first evacuation and back on at the end; "
+                         "PegaProx's own rules are enforced again by the balancer after the run")
+
+
+def rolling_node_templates(mgr, vms_here):
+    """#763 - said either way: without the option a template goes down with its node."""
+    tpls = [v for v in vms_here if v.get('template')]
+    if tpls:
+        names = ', '.join(f"{v.get('name') or v.get('vmid')} ({v.get('vmid')})" for v in tpls[:8])
+        more = f" and {len(tpls) - 8} more" if len(tpls) > 8 else ''
+        moving = (mgr._rolling_update or {}).get('migrate_templates')
+        rolling_log(mgr, f"  → template(s) {'to move' if moving else 'staying here'}: {names}{more}")
+
+
+def rolling_moved_templates(mgr, task):
+    """#763 - what the evacuation of a node did with its templates."""
+    for t in getattr(task, 'templates_moved', None) or []:
+        rolling_log(mgr, f"  ✓ Template {t.get('name')} ({t.get('vmid')}) moved to {t.get('to')}")
+    for t in getattr(task, 'templates_left', None) or []:
+        rolling_log(mgr, f"  ⚠ Template {t.get('name')} ({t.get('vmid')}) stays on the node: {t.get('reason')}")
+
+
+def rolling_rules_give_way(mgr, who):
+    """#954 - the negative affinity rules off, once, before the first evacuation of a run that
+    lets them give way. From here the daemon loop keeps its hands off them."""
+    state = mgr._rolling_update
+    if not state.get('relax_anti_affinity') or state.get('ha_rules_held') is not None:
+        return
+    state['ha_rules_held'] = True
+    try:
+        off, failed = mgr.suspend_negative_ha_rules(who=who)
+    except Exception as e:
+        off, failed = [], []
+        rolling_log(mgr, f"⚠ Negative affinity rules could not be switched off ({e}) - evacuating with them on")
+    if off:
+        rolling_log(mgr, f"Negative affinity: {len(off)} Proxmox HA rule(s) switched off until the run ends: "
+                         f"{', '.join(off)}")
+    elif not failed:
+        rolling_log(mgr, "Negative affinity: no enabled negative Proxmox HA rule to switch off")
+    if failed:
+        rolling_log(mgr, f"⚠ Proxmox kept these rules on, their guests may still not move: {', '.join(failed)}")
+    state['ha_rules_off'] = list(off)
+    state['ha_rules_held'] = bool(off)
+
+
+def rolling_rules_back_on(mgr, who):
+    """#954 - on again when the run ends, however it ends. A rule a node's maintenance still
+    holds stays off until that node leaves it."""
+    state = mgr._rolling_update or {}
+    if not state.get('ha_rules_held'):
+        return
+    try:
+        on, left = mgr.restore_suspended_ha_rules(who=who)
+        if on:
+            rolling_log(mgr, f"✓ Negative affinity rules switched back on: {', '.join(on)} - Proxmox HA moves their "
+                             f"guests apart again where a node is free")
+        if left:
+            rolling_log(mgr, f"✗ Still off: {', '.join(left)} - PegaProx keeps retrying; or run "
+                             f"`ha-manager rules set resource-affinity <rule> --disable 0`")
+    except Exception as e:
+        left = None
+        rolling_log(mgr, f"✗ Switching the negative affinity rules back on failed: {e} - PegaProx keeps retrying")
+    finally:
+        state['ha_rules_held'] = False
+    if left is None:
+        return
+    try:
+        held = mgr.held_ha_rules()
+    except Exception:
+        held = None
+    if not isinstance(held, dict):
+        return
+    for rule in sorted(r for r in (state.get('ha_rules_off') or []) if r not in left and r in held):
+        nodes = sorted(str(o).split(':', 1)[1] for o in held[rule] if str(o).startswith('maintenance:'))
+        if nodes:
+            rolling_log(mgr, f"Negative affinity: {rule} stays off while {', '.join(nodes)} "
+                             f"{'is' if len(nodes) == 1 else 'are'} in maintenance")
+
+
 # NS 2026-06-04 — shared metrics_history loader for insights/cost/power.
 # The expensive part of these three endpoints isn't the SQL fetch, it's
 # json.loads()'ing every snapshot blob (8.6k rows over 30d). Tier-1 moved the

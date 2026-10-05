@@ -9028,6 +9028,59 @@
         ]
       }
     },
+    "/api/clusters/{cluster_id}/nodes/{node_name}/maintenance-plan": {
+      "get": {
+        "operationId": "vms.maintenance_evacuation_plan_get",
+        "tags": [
+          "vms"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "MK Oct 2026 (#763, #954) - what moving the templates and letting negative affinity rules give way would change for this node's maintenance, for the dialog before it starts. Reads only. Templates and HA rules span the cluster: confined callers get nothing, as for the maintenance itself.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "node_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "node.maintenance"
+        ]
+      }
+    },
     "/api/clusters/{cluster_id}/nodes/{node_name}/maintenance": {
       "put": {
         "operationId": "vms.set_maintenance_mode_put",

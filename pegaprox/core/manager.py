@@ -264,6 +264,29 @@ def _pve_message(text, max_chars=200):
     return ' '.join(msg.split())[:max_chars] or 'no reason given'
 
 
+# MK Oct 2026 (#954) - who holds a Proxmox HA rule off: the rolling update, or the
+# maintenance of one node. A rule held by both, or by two maintenances, goes back on when
+# the last of them lets go; one lock per cluster keeps a hold and a release from crossing.
+HA_RULES_ROLLING = 'rolling'
+_ha_rule_locks = {}
+_ha_rule_locks_guard = threading.Lock()
+
+
+def maintenance_ha_owner(node_name):
+    return f'maintenance:{node_name}'
+
+
+def _ha_holder_text(owner):
+    if str(owner).startswith('maintenance:'):
+        return f"the maintenance of {str(owner).split(':', 1)[1]}"
+    return 'a rolling update'
+
+
+def _ha_rule_lock(cluster_id):
+    with _ha_rule_locks_guard:
+        return _ha_rule_locks.setdefault(cluster_id, threading.RLock())
+
+
 def _ssh_stderr_excerpt(stderr, max_chars=240):
     """Last meaningful line of SSH stderr, capped.
 
@@ -3251,10 +3274,11 @@ class PegaProxManager:
     # Proxmox rule ids are config ids; anything else never goes into a URL
     _HA_RULE_ID = re.compile(r'^[A-Za-z][A-Za-z0-9_.-]{0,127}$')
 
-    def negative_ha_rules(self):
+    def negative_ha_rules(self, with_off=False):
         """MK Oct 2026 (#954) - the enabled negative resource-affinity rules of Proxmox HA:
         [{'rule', 'resources': [sid, ...]}]. [] on a cluster without HA rules (PVE 8 has
-        groups only), None when /cluster/ha/rules could not be read."""
+        groups only), None when /cluster/ha/rules could not be read. with_off: the disabled
+        ones too, each row with 'off'."""
         try:
             r = self._api_get(f"https://{self.host}:{self.api_port}/api2/json/cluster/ha/rules")
         except Exception as e:
@@ -3269,88 +3293,148 @@ class PegaProxManager:
         out = []
         for rule in r.json().get('data') or []:
             if (str(rule.get('type') or '').lower() != 'resource-affinity'
-                    or str(rule.get('affinity') or '').lower() != 'negative'
-                    or str(rule.get('disable') or '').strip().lower() in ('1', 'true', 'yes', 'on')):
+                    or str(rule.get('affinity') or '').lower() != 'negative'):
+                continue
+            off = str(rule.get('disable') or '').strip().lower() in ('1', 'true', 'yes', 'on')
+            if off and not with_off:
                 continue
             rid = str(rule.get('rule') or '')
             if self._HA_RULE_ID.match(rid):
-                out.append({'rule': rid, 'resources': [s.strip() for s in str(rule.get('resources') or '').split(',')
-                                                       if s.strip()]})
+                row = {'rule': rid, 'resources': [s.strip() for s in str(rule.get('resources') or '').split(',')
+                                                  if s.strip()]}
+                if with_off:
+                    row['off'] = off
+                out.append(row)
         return out
 
-    def suspend_negative_ha_rules(self, who='system'):
+    def _node_guest_sids(self, node_name, vms=None):
+        """The HA ids (vm:100, ct:101) of the guests on a node, templates aside."""
+        if vms is None:
+            vms = self.get_vm_resources() or []
+        return {f"{'ct' if v.get('type') == 'lxc' else 'vm'}:{v.get('vmid')}" for v in vms
+                if v.get('node') == node_name and v.get('type') in ('qemu', 'lxc') and not v.get('template')}
+
+    def held_ha_rules(self):
+        """#954 - {rule: [owner, ...]} of the Proxmox HA rules PegaProx holds off."""
+        held = {}
+        for rule, _t, _at, owner in get_db().get_suspended_ha_rules(self.id):
+            held.setdefault(rule, []).append(owner)
+        return held
+
+    def _ha_rule_owners_live(self):
+        """#954 - the owners whose rules stay off: a rolling update that switched rules off
+        and has not switched them on again, and each node in maintenance. A row of anybody
+        else was left behind."""
+        live = set()
+        if (getattr(self, '_rolling_update', None) or {}).get('ha_rules_held'):
+            live.add(HA_RULES_ROLLING)
+        live.update(maintenance_ha_owner(n) for n in list(getattr(self, 'nodes_in_maintenance', None) or {}))
+        return live
+
+    def suspend_negative_ha_rules(self, who='system', owner=HA_RULES_ROLLING, node=None):
         """MK Oct 2026 (#954) - switch the negative resource-affinity rules of Proxmox HA off,
         so guests that must run apart may share a node while a rolling update has one out
         (ha-manager refuses the migration otherwise, with as many such guests as nodes).
         The list is in the database before the first rule is touched; a restart cannot lose
         it, and restore_suspended_ha_rules() switches them on again.
 
-        Returns (switched off, could not be switched off)."""
-        rules = self.negative_ha_rules()
+        owner holds them; with node it is that node's maintenance, and only the rules over a
+        guest of the node count. A rule PegaProx holds off for somebody else already is held
+        for this owner as well, so it stays off until the last of them lets go.
+
+        Returns (held off, could not be switched off)."""
+        rules = self.negative_ha_rules(with_off=True)
         if not rules:
             return [], []
-        if not ha.confirm_step('switching off the negative affinity rules'):
-            return [], [r['rule'] for r in rules]
-        db = get_db()
-        db.save_suspended_ha_rules(self.id, [r['rule'] for r in rules])
-        off, failed = [], []
-        for r in rules:
-            try:
-                resp = self._api_put(f"https://{self.host}:{self.api_port}/api2/json/cluster/ha/rules/{r['rule']}",
-                                     data={'type': 'resource-affinity', 'disable': 1})
-            except Exception as e:
-                # it may have landed; it stays listed, switching on an enabled rule changes nothing
-                self.logger.warning(f"[MAINT] switching off HA rule {r['rule']}: {e}")
-                failed.append(r['rule'])
-                continue
-            if resp is not None and resp.status_code == 200:
-                off.append(r['rule'])
-            else:
-                self.logger.warning(f"[MAINT] Proxmox kept HA rule {r['rule']} on: "
-                                    f"{_pve_message(getattr(resp, 'text', ''))}")
-                failed.append(r['rule'])
-                db.remove_suspended_ha_rule(self.id, r['rule'])
+        if node is not None:
+            here = self._node_guest_sids(node)
+            rules = [r for r in rules if here & set(r['resources'])]
+        with _ha_rule_lock(self.id):
+            db = get_db()
+            held = self.held_ha_rules()
+            joined = [r['rule'] for r in rules if r['off'] and r['rule'] in held]
+            rules = [r for r in rules if not r['off']]
+            if not rules and not joined:
+                return [], []
+            if not ha.confirm_step('switching off the negative affinity rules'):
+                return [], [r['rule'] for r in rules]
+            db.save_suspended_ha_rules(self.id, joined + [r['rule'] for r in rules], owner=owner)
+            off, failed = [], []
+            for r in rules:
+                try:
+                    resp = self._api_put(f"https://{self.host}:{self.api_port}/api2/json/cluster/ha/rules/{r['rule']}",
+                                         data={'type': 'resource-affinity', 'disable': 1})
+                except Exception as e:
+                    # it may have landed; it stays listed, switching on an enabled rule changes nothing
+                    self.logger.warning(f"[MAINT] switching off HA rule {r['rule']}: {e}")
+                    failed.append(r['rule'])
+                    continue
+                if resp is not None and resp.status_code == 200:
+                    off.append(r['rule'])
+                else:
+                    self.logger.warning(f"[MAINT] Proxmox kept HA rule {r['rule']} on: "
+                                        f"{_pve_message(getattr(resp, 'text', ''))}")
+                    failed.append(r['rule'])
+                    db.remove_suspended_ha_rule(self.id, r['rule'], owners=owner)
+        holder = _ha_holder_text(owner)
+        if joined:
+            self.logger.info(f"[MAINT] Negative affinity rules already off stay off for {holder} too: "
+                             f"{', '.join(joined)}")
         if off:
-            self.logger.warning(f"[MAINT] Negative affinity rules switched off for a rolling update: {', '.join(off)}")
+            self.logger.warning(f"[MAINT] Negative affinity rules switched off for {holder}: {', '.join(off)}")
             from pegaprox.utils.audit import log_audit
             log_audit(who, 'ha.rules_suspended',
-                      f"Cluster {self.config.name}: negative affinity rules switched off for a rolling update: "
+                      f"Cluster {self.config.name}: negative affinity rules switched off for {holder}: "
                       f"{', '.join(off)}", cluster=self.config.name)
-        return off, failed
+        return joined + off, failed
 
-    def restore_suspended_ha_rules(self, who='system'):
-        """MK Oct 2026 (#954) - switch on what suspend_negative_ha_rules() switched off. Proxmox
-        HA then moves the guests apart again where a node is free. A rule deleted in the
-        meantime leaves the list; one that cannot be switched on stays for the next try.
+    def restore_suspended_ha_rules(self, who='system', owner=HA_RULES_ROLLING):
+        """MK Oct 2026 (#954) - switch on what suspend_negative_ha_rules() switched off for
+        owner (one, or a list of them). Proxmox HA then moves the guests apart again where a
+        node is free. A rule another owner still holds stays off and only stops being this
+        owner's; a rule deleted in the meantime leaves the list; one that cannot be switched
+        on stays for the next try.
 
         Returns (switched on, still off)."""
+        owners = {owner} if isinstance(owner, str) else set(owner)
         db = get_db()
-        rows = db.get_suspended_ha_rules(self.id)
-        if not rows:
-            return [], []
-        if not ha.confirm_step('switching the negative affinity rules back on'):
-            return [], [rule for rule, _t, _at in rows]
-        on, left = [], []
-        for rule, rule_type, _at in rows:
-            if not self._HA_RULE_ID.match(rule or ''):
-                db.remove_suspended_ha_rule(self.id, rule)
-                continue
-            try:
-                resp = self._api_put(f"https://{self.host}:{self.api_port}/api2/json/cluster/ha/rules/{rule}",
-                                     data={'type': rule_type, 'delete': 'disable'})
-            except Exception as e:
-                self.logger.warning(f"[MAINT] switching HA rule {rule} back on: {e}")
-                left.append(rule)
-                continue
-            text = (getattr(resp, 'text', '') or '').lower()
-            if resp is not None and resp.status_code == 200:
-                db.remove_suspended_ha_rule(self.id, rule)
-                on.append(rule)
-            elif resp is not None and (resp.status_code == 404 or 'no such' in text):
-                db.remove_suspended_ha_rule(self.id, rule)
-                self.logger.info(f"[MAINT] HA rule {rule} was deleted meanwhile, nothing to switch on")
-            else:
-                left.append(rule)
+        with _ha_rule_lock(self.id):
+            mine, others = {}, {}
+            for rule, rule_type, _at, row_owner in db.get_suspended_ha_rules(self.id):
+                if row_owner in owners:
+                    mine.setdefault(rule, rule_type)
+                else:
+                    others.setdefault(rule, []).append(row_owner)
+            for rule in [rule for rule in mine if rule in others]:
+                db.remove_suspended_ha_rule(self.id, rule, owners=owners)
+                self.logger.info(f"[MAINT] HA rule {rule} stays off, "
+                                 f"{' and '.join(_ha_holder_text(o) for o in others[rule])} still holds it")
+            rows = [(rule, rule_type) for rule, rule_type in mine.items() if rule not in others]
+            if not rows:
+                return [], []
+            if not ha.confirm_step('switching the negative affinity rules back on'):
+                return [], [rule for rule, _t in rows]
+            on, left = [], []
+            for rule, rule_type in rows:
+                if not self._HA_RULE_ID.match(rule or ''):
+                    db.remove_suspended_ha_rule(self.id, rule, owners=owners)
+                    continue
+                try:
+                    resp = self._api_put(f"https://{self.host}:{self.api_port}/api2/json/cluster/ha/rules/{rule}",
+                                         data={'type': rule_type, 'delete': 'disable'})
+                except Exception as e:
+                    self.logger.warning(f"[MAINT] switching HA rule {rule} back on: {e}")
+                    left.append(rule)
+                    continue
+                text = (getattr(resp, 'text', '') or '').lower()
+                if resp is not None and resp.status_code == 200:
+                    db.remove_suspended_ha_rule(self.id, rule, owners=owners)
+                    on.append(rule)
+                elif resp is not None and (resp.status_code == 404 or 'no such' in text):
+                    db.remove_suspended_ha_rule(self.id, rule, owners=owners)
+                    self.logger.info(f"[MAINT] HA rule {rule} was deleted meanwhile, nothing to switch on")
+                else:
+                    left.append(rule)
         if on:
             self.logger.info(f"[MAINT] Negative affinity rules switched back on: {', '.join(on)}")
             from pegaprox.utils.audit import log_audit
@@ -3363,40 +3447,48 @@ class PegaProxManager:
         return on, left
 
     def _restore_suspended_ha_rules_if_due(self):
-        """#954 - rules a rolling update switched off and did not switch on again: the process
-        ended during the run, or Proxmox did not answer at its end. Looked at every cycle of
-        the daemon loop; rules a run still holds are left to it."""
+        """#954 - rules left off: the process ended during a rolling update, a node left a
+        maintenance that held some and Proxmox did not answer then, or a takeover came in
+        between. Looked at every cycle of the daemon loop; what a running update or a node
+        still in maintenance holds stays off."""
         if not ha.is_active():
             return
-        if (getattr(self, '_rolling_update', None) or {}).get('ha_rules_held'):
-            return
         try:
-            if not get_db().get_suspended_ha_rules(self.id):
-                return
+            rows = get_db().get_suspended_ha_rules(self.id)
         except Exception:
             return
-        on, _left = self.restore_suspended_ha_rules()
+        live = self._ha_rule_owners_live()
+        stale = sorted({owner for _r, _t, _at, owner in rows if owner not in live})
+        if not stale:
+            return
+        on, _left = self.restore_suspended_ha_rules(owner=stale)
         if on:
-            self.logger.warning(f"[MAINT] Switched on negative affinity rules a rolling update had left off: "
-                                f"{', '.join(on)}")
+            self.logger.warning(f"[MAINT] Switched on negative affinity rules "
+                                f"{' and '.join(_ha_holder_text(o) for o in stale)} had left off: {', '.join(on)}")
 
     def _anti_affinity_held(self):
         """#954 - a rolling update runs that lets negative affinity rules give way."""
         ru = getattr(self, '_rolling_update', None) or {}
         return bool(ru.get('relax_anti_affinity')) and ru.get('status') in ('running', 'paused')
 
-    def rolling_update_plan(self):
-        """MK Oct 2026 (#763, #954) - what the two evacuation options of a rolling update
-        change, read before it starts: the templates and where each could go, the negative
-        affinity rules of Proxmox HA and of PegaProx. Reads only - the guest list, one
-        storage list, the config of each template and the HA rules."""
+    def evacuation_plan(self, node=None):
+        """MK Oct 2026 (#763, #954) - what the two evacuation options change, read before a
+        rolling update starts or, with node, before that node goes into maintenance: the
+        templates and where each could go, the negative affinity rules of Proxmox HA and of
+        PegaProx. A node's plan has its own templates and the rules over a guest of it. Reads
+        only - the guest list, one storage list, the config of each template and the HA rules."""
         vms = self.get_vm_resources(max_age=15) or []
-        templates = [v for v in vms if v.get('template') and v.get('type') in ('qemu', 'lxc')]
+        templates = [v for v in vms if v.get('template') and v.get('type') in ('qemu', 'lxc')
+                     and (node is None or v.get('node') == node)]
         try:
             online = sorted(n for n, d in (self.get_node_status() or {}).items() if d.get('status') == 'online')
         except Exception:
             online = []
-        rules = self.negative_ha_rules()
+        rules = self.negative_ha_rules(with_off=True)
+        here = None
+        if node is not None:
+            here = self._node_guest_sids(node, vms)
+            rules = None if rules is None else [r for r in rules if here & set(r['resources'])]
         own = []
         try:
             stored = get_db().get_affinity_rules(self.id).get(self.id, [])
@@ -3406,25 +3498,41 @@ class PegaProxManager:
             stored = list(stored) + self._derive_proxlb_tag_rules(vms)['rules']
         except Exception:
             pass
+        vmids_here = None if here is None else {s.split(':', 1)[1] for s in here}
         for rule in stored:
             if rule.get('enabled', True) and rule.get('enforce', False) and rule.get('type') == 'separate':
-                own.append({'name': rule.get('name') or 'Anti-Affinity Rule',
-                            'guests': len(rule.get('vm_ids') or rule.get('vms') or [])})
+                ids = rule.get('vm_ids') or rule.get('vms') or []
+                if vmids_here is not None and not {str(i) for i in ids} & vmids_here:
+                    continue
+                own.append({'name': rule.get('name') or 'Anti-Affinity Rule', 'guests': len(ids)})
         try:
-            leftover = [rule for rule, _t, _at in get_db().get_suspended_ha_rules(self.id)]
+            held = self.held_ha_rules()
         except Exception:
-            leftover = []
+            held = {}
+        if node is not None:
+            ours = {r['rule'] for r in rules or []}
+            held = {rule: owners for rule, owners in held.items() if rule in ours}
+        live = self._ha_rule_owners_live()
+        held_now = []
+        for rule, owners in sorted(held.items()):
+            holding = set(owners) & live
+            if holding:
+                held_now.append({'rule': rule, 'rolling': HA_RULES_ROLLING in holding,
+                                 'nodes': sorted(o.split(':', 1)[1] for o in holding if o != HA_RULES_ROLLING)})
         return {
             'supported': True,
             'templates': self.template_placement(templates) if templates else [],
             # with one node out, a rule over as many guests as online nodes has no room left
             'negative_rules': None if rules is None else [
-                dict(r, blocks=bool(online) and len(r['resources']) >= len(online)) for r in rules],
+                {'rule': r['rule'], 'resources': r['resources'],
+                 'blocks': bool(online) and len(r['resources']) >= len(online)} for r in rules if not r['off']],
             'online_nodes': len(online),
             'own_rules': own,
             'balancer_separates': bool(getattr(self.config, 'auto_migrate', False))
                                   and not bool(getattr(self.config, 'dry_run', False)),
-            'still_off': leftover,
+            # left behind (the daemon loop switches them on), and held off right now
+            'still_off': sorted(rule for rule, owners in held.items() if not set(owners) & live),
+            'held': held_now,
         }
 
     def maintenance_capacity_preview(self, node_name, threshold=90.0):
@@ -3970,7 +4078,7 @@ class PegaProxManager:
         return None
 
     def enter_maintenance_mode(self, node_name, skip_evacuation=False, allow_local_disks=False,
-                               migrate_templates=False):
+                               migrate_templates=False, relax_anti_affinity=False, who='system'):
         # NS: tries native HA first, falls back to our own evacuation logic
         # NS Apr 2026 (#330): allow_local_disks opts the evacuator into
         # --with-local-disks migration for local-storage VMs. Off by default
@@ -3983,6 +4091,7 @@ class PegaProxManager:
             task = MaintenanceTask(node_name)
             task.allow_local_disks = bool(allow_local_disks)
             task.migrate_templates = bool(migrate_templates)   # #763
+            task.relax_anti_affinity = bool(relax_anti_affinity) and not skip_evacuation   # #954
             self.nodes_in_maintenance[node_name] = task
 
         self.logger.info(f"[MAINT] Entering maintenance mode for node: {node_name}"
@@ -4003,6 +4112,14 @@ class PegaProxManager:
             # but PVE HA only migrates HA-managed resources and gives no feedback. So we do both:
             # 1) tell PVE we're going into maintenance (so it doesn't fence us)
             # 2) actively evacuate all VMs ourselves (HA-managed or not)
+            # MK Oct 2026 (#954) - the rules over a guest of this node go off before both: PVE
+            # starts moving its HA guests the moment the flag is set
+            if task.relax_anti_affinity:
+                try:
+                    task.ha_rules_off, task.ha_rules_kept_on = self.suspend_negative_ha_rules(
+                        who=who, owner=maintenance_ha_owner(node_name), node=node_name)
+                except Exception as e:
+                    self.logger.warning(f"[MAINT] negative affinity rules for {node_name} stay on: {e}")
             if self._try_native_ha_maintenance(node_name, task):
                 self.logger.info(f"[MAINT] HA flag set for {node_name}, now evacuating VMs ourselves")
             # always run our own evacuation
@@ -4592,7 +4709,7 @@ class PegaProxManager:
         except:
             return -1
 
-    def exit_maintenance_mode(self, node_name):
+    def exit_maintenance_mode(self, node_name, who='system'):
         # NS May 2026 — clear native HA flag *before* clearing the internal state.
         # Old order: del state -> ssh call. If ssh failed (e.g. node still booting
         # ha-services), PVE stayed in maintenance with no PegaProx-side trace.
@@ -4638,6 +4755,16 @@ class PegaProxManager:
             except Exception:
                 pass
         self.logger.info(f"[OK] Exited maintenance mode for {node_name}")
+
+        # #954 - the negative affinity rules this maintenance switched off go
+        # back on, unless a rolling update or another node's maintenance still holds them.
+        # One that does not come back on now is the daemon loop's: this owner is gone.
+        try:
+            owner = maintenance_ha_owner(node_name)
+            if any(row[3] == owner for row in get_db().get_suspended_ha_rules(self.id)):
+                self.restore_suspended_ha_rules(who=who, owner=owner)
+        except Exception as e:
+            self.logger.error(f"[MAINT] switching the negative affinity rules of {node_name} back on: {e}")
 
         # unset ceph flags after maintenance (#141)
         self._unset_ceph_maintenance_flags(node_name)

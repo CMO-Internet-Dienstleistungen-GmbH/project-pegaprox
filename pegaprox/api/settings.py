@@ -30,6 +30,8 @@ from pegaprox.api.helpers import (
     load_server_settings, save_server_settings, check_cluster_access,
     get_login_settings, get_session_timeout, safe_error,
     acme_dns_config_from_settings, require_unconfined,
+    evacuation_options, evacuation_options_said, rolling_options_intro, rolling_node_templates,
+    rolling_moved_templates, rolling_rules_give_way, rolling_rules_back_on,
 )
 from pegaprox.app import get_allowed_origins, add_allowed_origin
 from pegaprox.globals import _cors_origins_env, _auto_allowed_origins
@@ -4517,9 +4519,7 @@ def start_rolling_update(cluster_id):
     # templates of a node with its evacuation (offline). #954: let negative affinity rules
     # give way for the run, so guests that must run apart may share a node until it ends.
     # Proxmox only - XCP-ng has neither the templates nor the HA rules meant here.
-    is_pve = getattr(mgr, 'cluster_type', 'proxmox') == 'proxmox'
-    migrate_templates = is_pve and data.get('migrate_templates') is True
-    relax_anti_affinity = is_pve and data.get('relax_anti_affinity') is True
+    migrate_templates, relax_anti_affinity = evacuation_options(mgr, data)
 
     # MK: Configurable timeouts (GitHub Issue fix)
     evacuation_timeout = data.get('evacuation_timeout', 1800)  # 30 minutes default (was 5 min!)
@@ -4586,10 +4586,9 @@ def start_rolling_update(cluster_id):
     }
     
     usr = request.session.get('user', 'system')
-    _opts = [o for o, on in (('templates move with the evacuation', migrate_templates),
-                             ('negative affinity rules give way until it ends', relax_anti_affinity)) if on]
     log_audit(usr, 'node.rolling_update_started',
-              f"Rolling update of {len(nodes_to_update)} node(s) started" + (f": {'; '.join(_opts)}" if _opts else ''),
+              f"Rolling update of {len(nodes_to_update)} node(s) started"
+              + evacuation_options_said(migrate_templates, relax_anti_affinity),
               cluster=mgr.config.name)
 
     # helper: one-line log with a timestamp prefix
@@ -4599,48 +4598,16 @@ def start_rolling_update(cluster_id):
         except Exception:
             pass
 
+    # #763, #954 - shared with the scheduled run (api/helpers.py): off before the first
+    # evacuation, on again when the run ends however it ends
     def _log_templates(task):
-        # #763 - what the evacuation did with the templates of the node
-        for t in getattr(task, 'templates_moved', None) or []:
-            _log(f"  ✓ Template {t.get('name')} ({t.get('vmid')}) moved to {t.get('to')}")
-        for t in getattr(task, 'templates_left', None) or []:
-            _log(f"  ⚠ Template {t.get('name')} ({t.get('vmid')}) stays on the node: {t.get('reason')}")
+        rolling_moved_templates(mgr, task)
 
-    # #954 - switched off before the first evacuation, on again when the run ends however it ends
     def _rules_give_way():
-        state = mgr._rolling_update
-        if not relax_anti_affinity or state.get('ha_rules_held') is not None:
-            return
-        state['ha_rules_held'] = True   # the daemon loop keeps its hands off from here
-        try:
-            off, failed = mgr.suspend_negative_ha_rules(who=usr)
-        except Exception as e:
-            off, failed = [], []
-            _log(f"⚠ Negative affinity rules could not be switched off ({e}) - evacuating with them on")
-        if off:
-            _log(f"Negative affinity: {len(off)} Proxmox HA rule(s) switched off until the run ends: {', '.join(off)}")
-        elif not failed:
-            _log("Negative affinity: no enabled negative Proxmox HA rule to switch off")
-        if failed:
-            _log(f"⚠ Proxmox kept these rules on, their guests may still not move: {', '.join(failed)}")
-        state['ha_rules_held'] = bool(off)
+        rolling_rules_give_way(mgr, usr)
 
     def _rules_back_on():
-        state = mgr._rolling_update or {}
-        if not state.get('ha_rules_held'):
-            return
-        try:
-            on, left = mgr.restore_suspended_ha_rules(who=usr)
-            if on:
-                _log(f"✓ Negative affinity rules switched back on: {', '.join(on)} - Proxmox HA moves their "
-                     f"guests apart again where a node is free")
-            if left:
-                _log(f"✗ Still off: {', '.join(left)} - PegaProx keeps retrying; or run "
-                     f"`ha-manager rules set resource-affinity <rule> --disable 0`")
-        except Exception as e:
-            _log(f"✗ Switching the negative affinity rules back on failed: {e} - PegaProx keeps retrying")
-        finally:
-            state['ha_rules_held'] = False
+        rolling_rules_back_on(mgr, usr)
 
     # Start the rolling update in a background thread
     def run_rolling_update():
@@ -4658,13 +4625,7 @@ def start_rolling_update(cluster_id):
 
             if skip_evacuation:
                 _log("⚠️ WARNING: VM evacuation disabled - VMs may be affected if update fails!")
-            elif migrate_templates:
-                _log("Templates: moved offline with each node's evacuation, only to a node that has every "
-                     "storage they use. One that cannot move stays where it is and does not pause the run")
-            if relax_anti_affinity and not skip_evacuation:
-                _log("Negative affinity: guests that must run apart may share a node until the run ends. "
-                     "Proxmox HA rules are switched off before the first evacuation and back on at the end; "
-                     "PegaProx's own rules are enforced again by the balancer after the run")
+            rolling_options_intro(mgr)   # #763, #954
 
             # MK #181 — pre-flight summary so admins see cluster-wide safety state up front,
             # not just per-node ticks.
@@ -4760,12 +4721,7 @@ def start_rolling_update(cluster_id):
                             _log(f"  → will evacuate: {label} (VMID {vm.get('vmid','?')}, {vm.get('type','?')})")
                         if len(running) > 8:
                             _log(f"  → …and {len(running) - 8} more")
-                        # #763 - said either way: without the option a template goes down with the node
-                        tpls = [v for v in vms_here if v.get('template')]
-                        if tpls:
-                            names = ', '.join(f"{v.get('name') or v.get('vmid')} ({v.get('vmid')})" for v in tpls[:8])
-                            more = f" and {len(tpls) - 8} more" if len(tpls) > 8 else ''
-                            _log(f"  → template(s) {'to move' if migrate_templates else 'staying here'}: {names}{more}")
+                        rolling_node_templates(mgr, vms_here)   # #763
 
                     # Step 1: Enable maintenance mode (evacuate VMs unless skip_evacuation is set)
                     # enter_maintenance_mode() internally calls _set_ceph_maintenance_flags()
@@ -5297,7 +5253,7 @@ def get_rolling_update_plan(cluster_id):
     if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
         return jsonify({'supported': False})
     try:
-        return jsonify(mgr.rolling_update_plan())
+        return jsonify(mgr.evacuation_plan())
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to read the rolling update plan')}), 500
 

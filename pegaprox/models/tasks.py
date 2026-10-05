@@ -27,6 +27,10 @@ class MaintenanceTask:
         self.migrate_templates = False
         self.templates_moved = []
         self.templates_left = []
+        # #954 - negative affinity rules this maintenance holds off, and the ones Proxmox kept on
+        self.relax_anti_affinity = False
+        self.ha_rules_off = []
+        self.ha_rules_kept_on = []
 
     def to_dict(self):
         return {
@@ -45,6 +49,8 @@ class MaintenanceTask:
             'note': self.note,
             'templates_moved': self.templates_moved,
             'templates_left': self.templates_left,
+            'ha_rules_off': self.ha_rules_off,
+            'ha_rules_kept_on': self.ha_rules_kept_on,
         }
 
 

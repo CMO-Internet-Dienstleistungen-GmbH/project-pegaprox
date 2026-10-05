@@ -41,10 +41,19 @@ def _component():
     return src[start:src.index('\n        function ', start + 10)]
 
 
+def _shared():
+    """The options and their plan, shared with the schedule and the maintenance dialog of a
+    node since they came there too (useEvacPlan, EvacOptions, MaintenanceEvacOptions)."""
+    src = _read('web', 'src', 'security.js')
+    return src[src.index('// LW Oct 2026 (#763, #954) - the two evacuation options and what'):
+               src.index('// update Manager Section Component (for Settings tab)')]
+
+
 def _new_code():
     comp = _component()
     parts = [comp[comp.index('// LW Oct 2026 (#763, #954) - what moving the templates'):comp.index('// Cancel rolling update')],
-             comp[comp.index('{/* LW Oct 2026 (#763, #954) - two evacuation options'):comp.index('{/* NS: Advanced options toggle */}')]]
+             comp[comp.index('{/* LW Oct 2026 (#763, #954) - two evacuation options'):comp.index('{/* NS: Advanced options toggle */}')],
+             _shared()]
     return parts
 
 
@@ -112,10 +121,15 @@ def test_no_icon_is_used_that_does_not_exist():
 
 
 def test_the_plan_is_read_once_per_opening_and_never_per_guest():
+    shared = _shared()
+    effect = shared[shared.index('function useEvacPlan('):shared.index('function EvacOptions(')]
+    assert effect.count('fetch(') == 1
+    assert 'if (!open) return undefined;' in effect and '}, [open, url]);' in effect
+    assert 'fetch(' not in shared[shared.index('function EvacOptions('):]
     comp = _component()
-    effect = comp[comp.index('// LW Oct 2026 (#763, #954) - what moving the templates'):comp.index('const templateWhy')]
-    assert effect.count('fetch(') == 1 and '/updates/rolling/plan' in effect
-    assert 'if (!showConfirm) return undefined;' in effect and '}, [showConfirm, clusterId]);' in effect
+    reads = comp[comp.index('// LW Oct 2026 (#763, #954) - what moving the templates'):comp.index('// Cancel rolling update')]
+    assert 'const rollingPlanUrl = `${API_URL}/clusters/${clusterId}/updates/rolling/plan`;' in reads
+    assert 'const rollingPlan = useEvacPlan(rollingPlanUrl, showConfirm);' in reads
 
 
 def test_the_options_go_out_with_the_start_and_only_with_an_evacuation():
@@ -127,7 +141,8 @@ def test_the_options_go_out_with_the_start_and_only_with_an_evacuation():
 
 def test_the_bundle_was_rebuilt():
     bundle = _read('web', 'index.html')
-    for needle in ('rolling-move-templates', 'rolling-relax-affinity', 'rolling-plan-rules', '/updates/rolling/plan'):
+    for needle in ('-move-templates', '-relax-affinity', '-plan-rules', '/updates/rolling/plan',
+                   'function EvacOptions(', 'createElement(EvacOptions,{kind:"rolling"'):
         assert needle in bundle, needle
     for key in _used_keys():
         assert key in bundle, key

@@ -18,7 +18,10 @@ from pegaprox.core import ha
 from pegaprox.utils.auth import require_auth, load_users, build_authz_user
 from pegaprox.utils.rbac import has_permission
 from pegaprox.utils.audit import log_audit
-from pegaprox.api.helpers import check_cluster_access, safe_error, require_unconfined
+from pegaprox.api.helpers import (check_cluster_access, safe_error, require_unconfined, evacuation_options,
+                                  evacuation_options_said, rolling_log, rolling_options_intro,
+                                  rolling_node_templates, rolling_moved_templates, rolling_rules_give_way,
+                                  rolling_rules_back_on)
 from pegaprox.api.nodes import cleanup_deleted_scripts, cleanup_orphaned_excluded_vms
 
 bp = Blueprint('schedules', __name__)
@@ -427,7 +430,10 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
         except (TypeError, ValueError):
             reboot_timeout = 600
         wait_for_reboot = config.get('wait_for_reboot', True)
-        
+        # MK Oct 2026 (#763, #954) - the two evacuation options of the schedule, off on one
+        # saved before they existed and on XCP-ng, as for a run started by hand
+        migrate_templates, relax_anti_affinity = evacuation_options(mgr, config)
+
         logging.info(f"[SCHEDULER] Starting scheduled rolling update for cluster {cluster_id}")
         logging.info(f"[SCHEDULER] Config: reboot={include_reboot}, skip_evacuation={skip_evacuation}")
         
@@ -450,14 +456,23 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
             'include_reboot': include_reboot, 'skip_up_to_date': skip_up_to_date,
             'skip_evacuation': skip_evacuation, 'wait_for_reboot': wait_for_reboot,
             'pause_on_evacuation_error': False, 'force_all': False,
+            'migrate_templates': migrate_templates, 'relax_anti_affinity': relax_anti_affinity,
             'evacuation_timeout': evacuation_timeout, 'update_timeout': 900, 'reboot_timeout': reboot_timeout,
             'nodes': nodes_to_update, 'current_index': 0, 'current_node': nodes_to_update[0],
             'current_step': 'starting', 'completed_nodes': [], 'skipped_nodes': [],
             'failed_nodes': [], 'rebooting_nodes': [], 'paused_reason': None, 'paused_details': None,
             'logs': [f"[{time.strftime('%H:%M:%S')}] Scheduled rolling update started"], 'scheduled': True
         }
-        
+        log_audit('scheduler', 'node.rolling_update_started',
+                  f"Scheduled rolling update of {len(nodes_to_update)} node(s) started"
+                  + evacuation_options_said(migrate_templates, relax_anti_affinity),
+                  cluster=getattr(mgr.config, 'name', cluster_id))
+
         def run_scheduled_update():
+            rolling_log(mgr, f"Settings: skip_up_to_date={skip_up_to_date}, skip_evacuation={skip_evacuation}, "
+                             f"evacuation_timeout={evacuation_timeout}s, reboot_timeout={reboot_timeout}s, "
+                             f"migrate_templates={migrate_templates}, relax_anti_affinity={relax_anti_affinity}")
+            rolling_options_intro(mgr)
             try:
                 for idx, node_name in enumerate(nodes_to_update):
                     if not hasattr(mgr, '_rolling_update') or mgr._rolling_update.get('status') != 'running':
@@ -479,12 +494,21 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
                     # local-disk VM couldn't live-migrate is the worst possible outcome for an
                     # automatic update. On shared-storage clusters it's a no-op anyway. Honour a
                     # per-schedule override if one is ever stored, else evacuate everything.
+                    if not skip_evacuation:
+                        try:
+                            rolling_node_templates(mgr, [r for r in (mgr.get_vm_resources() or [])
+                                                         if r.get('node') == node_name
+                                                         and r.get('type') in ('qemu', 'lxc')])
+                        except Exception:
+                            pass
+                        rolling_rules_give_way(mgr, 'scheduler')   # #954, once, before the first evacuation
                     # before each node's evacuation and its update (design 5.2)
                     if not ha.confirm_step(f'rolling update of {node_name}'):
                         mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] stopped: this instance does not hold the lease")
                         break
                     mgr.enter_maintenance_mode(node_name, skip_evacuation=skip_evacuation,
-                                               allow_local_disks=action.get('allow_local_disks', True))
+                                               allow_local_disks=action.get('allow_local_disks', True),
+                                               **({'migrate_templates': True} if migrate_templates else {}))  # #763
                     if not skip_evacuation:
                         mgr._rolling_update['current_step'] = 'evacuating'
                         waited = 0; evacuation_ok = False
@@ -492,8 +516,10 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
                             if node_name in mgr.nodes_in_maintenance:
                                 task = mgr.nodes_in_maintenance[node_name]
                                 if task.status == 'completed':
+                                    rolling_moved_templates(mgr, task)
                                     evacuation_ok = True; break
                                 elif task.status == 'completed_with_errors':
+                                    rolling_moved_templates(mgr, task)
                                     fv = getattr(task, 'failed_vms', [])
                                     mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⚠️ Evacuation: {getattr(task,'migrated_vms',0)}/{getattr(task,'total_vms',0)} migrated, {len(fv)} failed - continuing")
                                     evacuation_ok = True; break
@@ -579,6 +605,8 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
                             mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✗ {nn} STILL in maintenance — manual intervention needed")
                             mgr._rolling_update['failed_nodes'].append({'node': nn, 'error': 'Stuck in maintenance after rolling update'})
 
+                rolling_rules_back_on(mgr, 'scheduler')   # #954, every node is out of maintenance by now
+
                 # Finished
                 mgr._rolling_update['status'] = 'completed'
                 mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Scheduled rolling update completed")
@@ -591,6 +619,7 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
                 
             except Exception as e:
                 logging.error(f"[SCHEDULER] Rolling update error: {e}")
+                rolling_rules_back_on(mgr, 'scheduler')   # #954, before the status says the run is over
                 if hasattr(mgr, '_rolling_update'):
                     mgr._rolling_update['status'] = 'failed'
                     mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ERROR: {e}")
@@ -950,13 +979,15 @@ def load_update_schedule(cluster_id: str) -> dict:
         'skip_evacuation': False,
         'skip_up_to_date': True,
         'evacuation_timeout': 1800,
+        'migrate_templates': False,
+        'relax_anti_affinity': False,
         'last_run': None,
         'next_run': None
     }
     try:
         db = get_db()
         cursor = db.conn.cursor()
-        
+
         # MK: Ensure table exists (migration for existing databases)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS update_schedules (
@@ -974,7 +1005,9 @@ def load_update_schedule(cluster_id: str) -> dict:
                 next_run TEXT,
                 created_by TEXT,
                 created_at TEXT,
-                updated_at TEXT
+                updated_at TEXT,
+                migrate_templates INTEGER DEFAULT 0,
+                relax_anti_affinity INTEGER DEFAULT 0
             )
         ''')
         # MK #630 — older schedule tables predate the reboot_timeout column; add it in place
@@ -984,28 +1017,40 @@ def load_update_schedule(cluster_id: str) -> dict:
             _cols = {r[1] for r in cursor.fetchall()}
             if 'reboot_timeout' not in _cols:
                 cursor.execute("ALTER TABLE update_schedules ADD COLUMN reboot_timeout INTEGER DEFAULT 600")
+            for _col in ('migrate_templates', 'relax_anti_affinity'):   # #763, #954
+                if _col not in _cols:
+                    cursor.execute(f"ALTER TABLE update_schedules ADD COLUMN {_col} INTEGER DEFAULT 0")
         except Exception as _mig_e:
             logging.warning(f"update_schedules reboot_timeout migration skipped: {_mig_e}")
 
         cursor.execute('SELECT * FROM update_schedules WHERE cluster_id = ?', (cluster_id,))
         row = cursor.fetchone()
         if row:
-            return {
-                'enabled': bool(row['enabled']),
-                'schedule_type': row['schedule_type'] or 'recurring',
-                'day': row['day'] or 'sunday',
-                'time': row['time'] or '03:00',
-                'include_reboot': bool(row['include_reboot']),
-                'skip_evacuation': bool(row['skip_evacuation']),
-                'skip_up_to_date': bool(row['skip_up_to_date']),
-                'evacuation_timeout': row['evacuation_timeout'] or 1800,
-                'reboot_timeout': (row['reboot_timeout'] if 'reboot_timeout' in row.keys() else 600) or 600,
-                'last_run': row['last_run'],
-                'next_run': row['next_run']
-            }
+            return _update_schedule_row(row)
     except Exception as e:
         logging.error(f"Error loading update schedule: {e}")
     return default
+
+
+def _update_schedule_row(row):
+    """A row of update_schedules as the routes and the scheduler read it."""
+    keys = row.keys()
+    return {
+        'enabled': bool(row['enabled']),
+        'schedule_type': row['schedule_type'] or 'recurring',
+        'day': row['day'] or 'sunday',
+        'time': row['time'] or '03:00',
+        'include_reboot': bool(row['include_reboot']),
+        'skip_evacuation': bool(row['skip_evacuation']),
+        'skip_up_to_date': bool(row['skip_up_to_date']),
+        'evacuation_timeout': row['evacuation_timeout'] or 1800,
+        'reboot_timeout': (row['reboot_timeout'] if 'reboot_timeout' in keys else 600) or 600,
+        # #763, #954 - off on a schedule saved before they existed
+        'migrate_templates': bool(row['migrate_templates']) if 'migrate_templates' in keys else False,
+        'relax_anti_affinity': bool(row['relax_anti_affinity']) if 'relax_anti_affinity' in keys else False,
+        'last_run': row['last_run'],
+        'next_run': row['next_run']
+    }
 
 
 def save_update_schedule(cluster_id: str, schedule: dict, user: str = 'system'):
@@ -1017,10 +1062,11 @@ def save_update_schedule(cluster_id: str, schedule: dict, user: str = 'system'):
         
         # MK: Use INSERT OR REPLACE for older SQLite compatibility
         cursor.execute('''
-            INSERT OR REPLACE INTO update_schedules 
+            INSERT OR REPLACE INTO update_schedules
             (cluster_id, enabled, schedule_type, day, time, include_reboot, skip_evacuation,
-             skip_up_to_date, evacuation_timeout, reboot_timeout, last_run, next_run, created_by, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             skip_up_to_date, evacuation_timeout, reboot_timeout, migrate_templates, relax_anti_affinity,
+             last_run, next_run, created_by, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             cluster_id,
             1 if schedule.get('enabled') else 0,
@@ -1032,6 +1078,8 @@ def save_update_schedule(cluster_id: str, schedule: dict, user: str = 'system'):
             1 if schedule.get('skip_up_to_date', True) else 0,
             schedule.get('evacuation_timeout', 1800),
             schedule.get('reboot_timeout', 600),
+            1 if schedule.get('migrate_templates') else 0,   # #763
+            1 if schedule.get('relax_anti_affinity') else 0,   # #954
             schedule.get('last_run'),
             schedule.get('next_run'),
             user,
@@ -1065,19 +1113,7 @@ def load_all_update_schedules() -> dict:
         cursor = db.conn.cursor()
         cursor.execute('SELECT * FROM update_schedules WHERE enabled = 1')
         for row in cursor.fetchall():
-            schedules[row['cluster_id']] = {
-                'enabled': bool(row['enabled']),
-                'schedule_type': row['schedule_type'] or 'recurring',
-                'day': row['day'] or 'sunday',
-                'time': row['time'] or '03:00',
-                'include_reboot': bool(row['include_reboot']),
-                'skip_evacuation': bool(row['skip_evacuation']),
-                'skip_up_to_date': bool(row['skip_up_to_date']),
-                'evacuation_timeout': row['evacuation_timeout'] or 1800,
-                'reboot_timeout': (row['reboot_timeout'] if 'reboot_timeout' in row.keys() else 600) or 600,
-                'last_run': row['last_run'],
-                'next_run': row['next_run']
-            }
+            schedules[row['cluster_id']] = _update_schedule_row(row)
     except Exception as e:
         logging.error(f"Error loading all update schedules: {e}")
     return schedules
@@ -1126,6 +1162,10 @@ def set_update_schedule(cluster_id):
             return jsonify({'error': 'Scheduling a node reboot needs the node.reboot '
                                      'permission'}), 403
 
+    mgr = cluster_managers[cluster_id]
+    # MK Oct 2026 (#763, #954) - the two evacuation options go with the schedule, both off
+    # unless asked for, and off on XCP-ng as for a run started by hand
+    migrate_templates, relax_anti_affinity = evacuation_options(mgr, data)
     schedule = {
         'enabled': data.get('enabled', False),
         'schedule_type': data.get('schedule_type', 'recurring'),
@@ -1137,19 +1177,22 @@ def set_update_schedule(cluster_id):
         'evacuation_timeout': data.get('evacuation_timeout', 1800),
         'reboot_timeout': data.get('reboot_timeout', 600),
         'wait_for_reboot': data.get('wait_for_reboot', True),
+        'migrate_templates': migrate_templates,
+        'relax_anti_affinity': relax_anti_affinity,
         'last_run': None,
         'next_run': None
     }
-    
+
     # Calculate next run time
     if schedule['enabled']:
         schedule['next_run'] = calculate_next_update_run(schedule['day'], schedule['time'])
-    
+
     save_update_schedule(cluster_id, schedule, usr)
-    
+
     # Log audit
-    mgr = cluster_managers[cluster_id]
-    log_audit(usr, 'update.schedule', f"Update schedule {'enabled' if schedule['enabled'] else 'disabled'} for {mgr.config.name}", cluster=mgr.config.name)
+    log_audit(usr, 'update.schedule', f"Update schedule {'enabled' if schedule['enabled'] else 'disabled'} for {mgr.config.name}"
+              + (evacuation_options_said(migrate_templates, relax_anti_affinity) if schedule['enabled'] else ''),
+              cluster=mgr.config.name)
     
     return jsonify({'success': True, 'schedule': schedule})
 
@@ -1292,7 +1335,9 @@ def check_scheduled_updates():
                         'evacuation_timeout': schedule.get('evacuation_timeout', 1800),
                         # MK #630 — forward the per-schedule reboot timeout to the runner; without this
                         # the runner falls back to 600s and the saved value never takes effect.
-                        'reboot_timeout': schedule.get('reboot_timeout', 600)
+                        'reboot_timeout': schedule.get('reboot_timeout', 600),
+                        'migrate_templates': schedule.get('migrate_templates') is True,   # #763
+                        'relax_anti_affinity': schedule.get('relax_anti_affinity') is True,   # #954
                     }
                 }
                 

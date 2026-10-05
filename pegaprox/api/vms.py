@@ -42,6 +42,7 @@ def _require_vm_access(cluster_id, vmid, perm, vm_type=None):
 from pegaprox.utils.realtime import broadcast_sse, broadcast_action, push_immediate_update
 from pegaprox.core.config import save_config
 from pegaprox.api.helpers import get_connected_manager, check_cluster_access, register_task_user, safe_error, parse_pve_error, scope_vm_rows, require_unconfined, caller_is_scoped
+from pegaprox.api.helpers import evacuation_options, evacuation_options_said
 from pegaprox.api.ha import standby_console_refusal, STANDBY_CONSOLE_ERROR
 from pegaprox.core import ha, ha_transport
 from pegaprox.utils.ssh import get_paramiko
@@ -2523,6 +2524,36 @@ def maintenance_capacity_preview_api(cluster_id, node_name):
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to compute maintenance preview')}), 500
 
+
+@bp.route('/api/clusters/<cluster_id>/nodes/<node_name>/maintenance-plan', methods=['GET'])
+@require_auth(perms=['node.maintenance'])
+def maintenance_evacuation_plan(cluster_id, node_name):
+    """MK Oct 2026 (#763, #954) - what moving the templates and letting negative affinity
+    rules give way would change for this node's maintenance, for the dialog before it starts.
+    Reads only. Templates and HA rules span the cluster: confined callers get nothing, as for
+    the maintenance itself."""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    mgr = cluster_managers[cluster_id]
+    if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
+        return jsonify({'supported': False})
+    try:
+        return jsonify(mgr.evacuation_plan(node=node_name))
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Failed to read the maintenance plan')}), 500
+
+
+def _maintenance_extras(mgr, **kw):
+    """#763, #954 - what only the Proxmox manager takes; the XCP-ng one has neither."""
+    return kw if getattr(mgr, 'cluster_type', 'proxmox') == 'proxmox' else {}
+
+
 @bp.route('/api/clusters/<cluster_id>/nodes/<node_name>/maintenance', methods=['PUT'])
 @require_auth(perms=['node.maintenance'])
 def set_maintenance_mode(cluster_id, node_name):
@@ -2531,31 +2562,40 @@ def set_maintenance_mode(cluster_id, node_name):
     _cerr = require_unconfined(cluster_id)
     if _cerr:
         return _cerr
-    
+
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
-    
+
     mgr = cluster_managers[cluster_id]
     data = request.json or {}
     enable = data.get('enable', True)
     skip_evacuation = data.get('skip_evacuation', False)  # MK: for non-reboot updates
     usr = getattr(request, 'session', {}).get('user', 'system')
-    
+
     if enable:
+        # #763, #954 - the evacuation options of the rolling update, for this
+        # node: its templates move with it, and the negative affinity rules over its guests
+        # are off until it leaves maintenance. Both off unless asked for, Proxmox only.
+        migrate_templates, relax_anti_affinity = evacuation_options(mgr, data)
+        if skip_evacuation:
+            migrate_templates = relax_anti_affinity = False
         # MK Aug 2026 (#629): thread the cluster's local-disk-balance flag through so a
         # maintenance evacuation migrates local-disk VMs with --with-local-disks too,
         # like the balancer/anti-affinity path does (same config flag). Off by default,
         # so behaviour is unchanged unless "Balance VMs with Local Disks" is enabled.
         task = mgr.enter_maintenance_mode(node_name, skip_evacuation=skip_evacuation,
-                                          allow_local_disks=getattr(mgr.config, 'balance_local_disks', False))
-        
+                                          allow_local_disks=getattr(mgr.config, 'balance_local_disks', False),
+                                          **_maintenance_extras(mgr, migrate_templates=migrate_templates,
+                                                                relax_anti_affinity=relax_anti_affinity, who=usr))
+
         if skip_evacuation:
             log_audit(usr, 'node.maintenance_entered', f"Node {node_name} entered maintenance mode (skip_evacuation=True)", cluster=mgr.config.name)
             broadcast_action('maintenance_enter', 'node', node_name, {'status': 'completed', 'skip_evacuation': True}, cluster_id, usr)
         else:
-            log_audit(usr, 'node.maintenance_entered', f"Node {node_name} entered maintenance mode", cluster=mgr.config.name)
+            log_audit(usr, 'node.maintenance_entered', f"Node {node_name} entered maintenance mode"
+                      + evacuation_options_said(migrate_templates, relax_anti_affinity), cluster=mgr.config.name)
             broadcast_action('maintenance_enter', 'node', node_name, {'status': 'evacuating'}, cluster_id, usr)
-        
+
         return jsonify({
             'message': f'Entering maintenance mode for {node_name}',
             'skip_evacuation': skip_evacuation,
@@ -2563,7 +2603,7 @@ def set_maintenance_mode(cluster_id, node_name):
             'task': task.to_dict()
         })
     else:
-        success = mgr.exit_maintenance_mode(node_name)
+        success = mgr.exit_maintenance_mode(node_name, **_maintenance_extras(mgr, who=usr))
         if success:
             log_audit(usr, 'node.maintenance_exited', f"Node {node_name} exited maintenance mode", cluster=mgr.config.name)
             broadcast_action('maintenance_exit', 'node', node_name, {}, cluster_id, usr)
@@ -2600,9 +2640,9 @@ def exit_maintenance_mode_api(cluster_id, node_name):
         return jsonify({'error': 'Cluster not found'}), 404
     
     mgr = cluster_managers[cluster_id]
-    success = mgr.exit_maintenance_mode(node_name)
     usr = getattr(request, 'session', {}).get('user', 'system')
-    
+    success = mgr.exit_maintenance_mode(node_name, **_maintenance_extras(mgr, who=usr))
+
     if success:
         log_audit(usr, 'node.maintenance_exited', f"Node {node_name} exited maintenance mode", cluster=mgr.config.name)
         broadcast_action('maintenance_exit', 'node', node_name, {}, cluster_id, usr)
