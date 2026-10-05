@@ -142,7 +142,21 @@ def _node_hw_summary_redfish(mgr, cluster_id, node):
 _WINDOW_ROW_CAP = 4000
 
 
-def load_metrics_history(days=None):
+# MK Oct 2026 - a windowed read is cached per window and stays in memory until the
+# next read of that window replaces it. At 10k guests one parsed snapshot is ~5 MB,
+# nearly all of it the per-guest map, so a cached week held a few GB for figures the
+# reports never look at. Trimmed row by row, so the parse never holds them all either.
+def _cluster_totals_only(snap):
+    """Keep each cluster's name and totals, drop the guest, node and storage maps."""
+    clusters = snap.get('clusters')
+    if isinstance(clusters, dict):
+        # only keys that are there, so a reader's .get(key, default) still sees a gap as one
+        snap['clusters'] = {cid: {k: c[k] for k in ('name', 'totals') if k in c}
+                            for cid, c in clusters.items() if isinstance(c, dict)}
+    return snap
+
+
+def load_metrics_history(days=None, totals_only=False):
     """Load historical metrics from SQLite database.
 
     NS 2026-06-05 (#528 scaling): this SELECTed up to 1000 snapshot rows and
@@ -158,6 +172,9 @@ def load_metrics_history(days=None):
     "Last 24h" and "Last Week". Callers that know their window pass it, and the
     windowed read comes back oldest-first, which is the order a timeline wants.
     days=None keeps the old row-capped (newest-first) behaviour.
+
+    totals_only=True hands back each cluster's name and totals and nothing else,
+    which is all the report endpoints read (see _cluster_totals_only).
     """
     try:
         from datetime import timedelta
@@ -169,11 +186,12 @@ def load_metrics_history(days=None):
                 try:
                     data = json.loads(row['data'])
                     data['timestamp'] = row['timestamp']
-                    out.append(data)
+                    out.append(_cluster_totals_only(data) if totals_only else data)
                 except Exception:
                     pass
             return out
 
+        key_tail = '_totals' if totals_only else ''
         if days:
             # One decimation policy for every history consumer rather than a
             # second copy of it here. A week of 5-min rows is ~2000 blobs to
@@ -205,11 +223,11 @@ def load_metrics_history(days=None):
                    f'{where} ORDER BY timestamp DESC LIMIT {_WINDOW_ROW_CAP}'
                    ') ORDER BY timestamp ASC')
             snapshots = run_heavy_read(
-                sql, params, cache_key=f'mh_reports_d{days}', transform=_parse)
+                sql, params, cache_key=f'mh_reports_d{days}{key_tail}', transform=_parse)
         else:
             snapshots = run_heavy_read(
                 'SELECT timestamp, data FROM metrics_history ORDER BY timestamp DESC LIMIT 1000',
-                cache_key='mh_reports_1000', transform=_parse)
+                cache_key=f'mh_reports_1000{key_tail}', transform=_parse)
         return {'snapshots': snapshots, 'last_cleanup': None}
     except Exception as e:
         logging.error(f"Error loading metrics history from database: {e}")

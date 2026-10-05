@@ -34,6 +34,8 @@ bp = Blueprint('reports', __name__)
 # ~3.5 days, and less whenever rows land more often, so "Last Week" quietly ended
 # wherever those rows ended and looked identical to "Last 24h". Load the window
 # the caller actually asked for instead.
+# All three read a cluster's name and totals and nothing else, so they ask the
+# loader for just that (totals_only): the cached window stays small at 10k guests.
 def _period_cutoff(period):
     """(window_days, cutoff_datetime) for a period param. hour shares the 1-day
     window with day so the two views hit the same cached read."""
@@ -197,7 +199,7 @@ def get_reports_summary():
     accessible_clusters = get_user_clusters(user_data)  # None = admin (all clusters)
 
     window_days, cutoff = _period_cutoff(period)
-    history = load_metrics_history(days=window_days)
+    history = load_metrics_history(days=window_days, totals_only=True)
     snapshots = history.get('snapshots', [])
 
     if not snapshots:
@@ -486,7 +488,7 @@ def get_reports_timeline():
     accessible_clusters = get_user_clusters(user_data)  # None = admin (all clusters)
 
     window_days, cutoff = _period_cutoff(period)
-    history = load_metrics_history(days=window_days)
+    history = load_metrics_history(days=window_days, totals_only=True)
     snapshots = history.get('snapshots', [])
 
     if not snapshots:
@@ -1074,7 +1076,7 @@ def get_cluster_report_summary(cluster_id):
     # Load historical metrics for the requested window (oldest first, so the
     # chart below runs left-to-right and 'current' really is the newest sample)
     window_days, cutoff = _period_cutoff(period)
-    history = load_metrics_history(days=window_days)
+    history = load_metrics_history(days=window_days, totals_only=True)
     snapshots = history.get('snapshots', [])
 
     cutoff_str = cutoff.isoformat()

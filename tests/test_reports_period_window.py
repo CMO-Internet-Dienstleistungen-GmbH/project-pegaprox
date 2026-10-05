@@ -183,3 +183,87 @@ def test_the_week_read_uses_the_shared_decimation_policy(history):
     snaps = load_metrics_history(days=7)['snapshots']
     in_window = min(history.rows, 7 * 24 * 60 // CADENCE_MIN)
     assert len(snaps) == pytest.approx(in_window / _history_stride(7), rel=0.05)
+
+
+# --- what a cached window holds (#963 follow-up) --------------------------------
+
+@pytest.fixture
+def fleet_history(monkeypatch):
+    """Snapshots the way the collector writes them: totals plus a node, guest and
+    storage map per cluster, and one cluster that carries no name. Records what each
+    read hands back, which is what run_heavy_read keeps in its cache."""
+    conn = sqlite3.connect(':memory:')
+    conn.row_factory = sqlite3.Row
+    conn.execute('CREATE TABLE metrics_history ('
+                 'id INTEGER PRIMARY KEY AUTOINCREMENT, '
+                 'timestamp TEXT NOT NULL, data TEXT NOT NULL)')
+    now = datetime.now()
+    totals = {'cpu_total': 100, 'cpu_used': 25, 'mem_total': 1000, 'mem_used': 500,
+              'vms_running': 2, 'cts_running': 1}
+    for i in range(3, 0, -1):
+        blob = {'clusters': {
+            CLUSTER: {'name': 'Cluster One', 'totals': totals,
+                      'nodes': {'pve1': {'cpu': 25.0, 'temp': 51}},
+                      'vms': {str(100 + n): {'t': 'qemu', 'r': True, 'cpu': 1.0, 'mem': 2.0,
+                                             'maxmem': 1, 'maxcpu': 1} for n in range(50)},
+                      'storage': {'local': {'used': 1, 'total': 2, 'pct': 50.0}}},
+            'cluster_2': {'totals': totals},
+        }}
+        conn.execute('INSERT INTO metrics_history (timestamp, data) VALUES (?, ?)',
+                     ((now - timedelta(minutes=CADENCE_MIN * i)).isoformat(), json.dumps(blob)))
+    conn.commit()
+    reads = []
+
+    def fake_run_heavy_read(sql, params=(), cache_key=None, ttl=None, transform=None):
+        got = conn.execute(sql, params).fetchall()
+        out = transform(got) if transform else got
+        reads.append((cache_key, out))
+        return out
+
+    import pegaprox.core.dbcrypto as dbcrypto
+    monkeypatch.setattr(dbcrypto, 'run_heavy_read', fake_run_heavy_read)
+    yield reads
+    conn.close()
+
+
+def test_a_report_read_keeps_only_names_and_totals(api, seed, fleet_history):
+    """A cached window stays in memory until the next read of it replaces it, and at
+    10k guests nearly all of a parsed snapshot is the guest map. The reports read a
+    cluster's name and totals, so that is all their read may keep."""
+    admin = seed.user('root', role='admin')
+    _cluster(api)
+    for url in (f'/api/clusters/{CLUSTER}/reports/summary?period=week',
+                '/api/reports/summary?period=day', '/api/reports/timeline?period=hour'):
+        r = api.as_user(admin).get(url)
+        assert r.status_code == 200, (url, r.get_json())
+    assert fleet_history, 'no history read happened'
+    for key, snaps in fleet_history:
+        assert snaps, key
+        for snap in snaps:
+            for cid, cluster in snap['clusters'].items():
+                assert set(cluster) <= {'name', 'totals'}, (key, cid, sorted(cluster))
+
+
+def test_the_trimmed_read_still_answers_the_same(api, seed, fleet_history):
+    admin = seed.user('root', role='admin')
+    _cluster(api)
+    one = api.as_user(admin).get(f'/api/clusters/{CLUSTER}/reports/summary?period=day').get_json()
+    assert one['data_points'] == 3
+    assert one['cpu']['current'] == 25.0 and one['memory']['current'] == 50.0
+    assert one['vms_running']['current'] == 3
+    every = api.as_user(admin).get('/api/reports/summary?period=day').get_json()
+    assert every['clusters'][CLUSTER]['name'] == 'Cluster One'
+    # a cluster without a name still falls back to its id, as before the trim
+    assert every['clusters']['cluster_2']['name'] == 'cluster_2'
+
+
+def test_a_full_read_and_a_trimmed_one_never_share_a_cache_entry(fleet_history):
+    """The node temperature history reads the nodes map: a trimmed window served to it
+    from the same cache entry would come back empty."""
+    from pegaprox.background.metrics import load_metrics_history
+    full = load_metrics_history(days=1)['snapshots']
+    trimmed = load_metrics_history(days=1, totals_only=True)['snapshots']
+    assert full[-1]['clusters'][CLUSTER]['nodes']['pve1']['temp'] == 51
+    assert 'nodes' not in trimmed[-1]['clusters'][CLUSTER]
+    keys = [key for key, _ in fleet_history]
+    assert len(set(keys)) == 2, keys
