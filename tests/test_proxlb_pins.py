@@ -756,5 +756,62 @@ def test_the_pin_routes_answer_for_an_xcpng_pool(api, seed):
     r = admin.get(VIOLATIONS_ROUTE)
     assert r.status_code == 200, r.get_data(as_text=True)
     assert r.get_json()['violations'] == [] and r.get_json()['enabled'] is False
+    assert r.get_json()['can_reconcile'] is False
     r = admin.post(RECONCILE_ROUTE, json={'force': True})
     assert r.status_code == 400 and r.get_json()['code'] == 'PVE_ONLY'
+
+
+# --------------------------------------------------------------------------
+# can_reconcile: the "move back now" button of the cluster settings asks the
+# reconcile route's own question. vm.migrate alone is not the answer, a pool
+# or VM-ACL scoped caller holds it and is still turned away there.
+# --------------------------------------------------------------------------
+
+def _told(api, user, cluster_id='cluster_1'):
+    _api_manager(api, get_pin_violations=[], get_unresolved_pins=[])
+    resp = api.as_user(user).get(f'/api/clusters/{cluster_id}/proxlb-pins/violations')
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    return resp.get_json()['can_reconcile']
+
+
+def _reconcile_status(api, user):
+    outcome = {'violations': [], 'migrated': [], 'failed': [], 'deferred': [], 'auto_migrate': True}
+    _api_manager(api, reconcile_proxlb_pins=outcome)
+    return api.as_user(user).post(RECONCILE_ROUTE, json={'force': True}).status_code
+
+
+def test_an_admin_is_told_he_may_move_the_guests_back(api, seed):
+    root = seed.user('root', role='admin', tenant_id='default')
+    assert _told(api, root) is True
+    assert _reconcile_status(api, root) == 200
+
+
+def test_a_viewer_is_told_he_may_not(api, seed):
+    vicky = seed.user('vicky', role='viewer', tenant_id='default')
+    assert _told(api, vicky) is False
+    assert _reconcile_status(api, vicky) == 403
+
+
+def test_an_operator_of_the_owning_tenant_is_told_he_may(api, seed):
+    seed.tenant('acme', clusters=['cluster_1'])
+    bob = seed.user('bob', role='user', tenant_id='acme')
+    assert _told(api, bob) is True
+    assert _reconcile_status(api, bob) == 200
+
+
+def test_a_pool_scoped_operator_holds_vm_migrate_and_is_still_told_no(db, api, seed):
+    seed.tenant('acme', clusters=['cluster_1'])
+    mallory = seed.user('mallory', role='user', tenant_id='acme')
+    seed.pool('cluster_1', 'pool_1', 'mallory', ['pool.view', 'vm.view', 'vm.migrate'])
+    _seed_pool_membership('cluster_1', {100: ('qemu', 'pool_1')})
+    assert _told(api, mallory) is False
+    # what the route answers, so the flag and the route cannot drift apart
+    assert _reconcile_status(api, mallory) == 403
+
+
+def test_an_acl_scoped_operator_is_told_no(api, seed):
+    seed.tenant('tenant_b', clusters=['cluster_other'])
+    bob = seed.user('bob', role='user', tenant_id='tenant_b')
+    seed.vm_acl('cluster_1', 100, users=['bob'])
+    assert _told(api, bob) is False
+    assert _reconcile_status(api, bob) == 403

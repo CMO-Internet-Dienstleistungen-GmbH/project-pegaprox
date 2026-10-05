@@ -3697,11 +3697,19 @@ def get_proxlb_pin_violations(cluster_id):
     mgr = cluster_managers[cluster_id]
     # MK Oct 2026 - plb_ tags are PVE tags; an XCP-ng pool or ESXi host has none to report
     if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
-        return jsonify({'enabled': False, 'auto_migrate': False, 'violations': [], 'unresolved': []})
+        return jsonify({'enabled': False, 'auto_migrate': False, 'violations': [], 'unresolved': [],
+                        'can_reconcile': False})
+    # the "move back now" button asks what the reconcile route asks: vm.migrate AND
+    # the whole cluster. The permission list in the browser only knows the first half,
+    # a pool or VM-ACL scoped caller holds vm.migrate and is still turned away there.
+    from pegaprox.api.helpers import caller_is_scoped
+    _user = build_authz_user(request.session.get('user', ''), request.session)
+    can_reconcile = has_permission(_user, 'vm.migrate') and not caller_is_scoped(_user, cluster_id)
     try:
         return jsonify({
             'enabled': bool(getattr(mgr.config, 'proxlb_tags_enabled', False)),
             'auto_migrate': bool(getattr(mgr.config, 'proxlb_pins_auto_migrate', False)),
+            'can_reconcile': bool(can_reconcile),
             # Both lists are per-VM rows (vmid / name / node / pinned nodes) for
             # every guest on the cluster, and check_cluster_access only gates
             # cluster REACHABILITY - its pool/ACL fallbacks admit a caller who may
