@@ -422,6 +422,8 @@
                     { id: 'clusters', label: 'Clusters', icon: 'Cloud' },
                     { id: 'nodes', label: 'Hosts', icon: 'Cpu' },
                     ...(canAutoInstall ? [{ id: 'autoinstall', label: 'Automated Installs', icon: 'Disc' }] : []),
+                    // LW Oct 2026 - directory, PCI and USB mappings of the selected cluster
+                    { id: 'mappings', label: t('rmTitle'), icon: 'Link' },
                     { id: 'ha', label: 'High Availability', icon: 'Shield' },
                     { id: 'updates', label: 'Update Manager', icon: 'Download' },
                 ] },
@@ -2405,6 +2407,7 @@
                 networks: T('cloud.networks') || 'Networks',
                 clusters: T('cloud.clustersTitle') || 'Clusters',
                 nodes: T('cloud.hosts') || 'Hosts',
+                mappings: T('rmTitle') || 'Resource Mappings',
                 ha: T('cloud.ha') || 'High Availability',
                 storage: T('cloud.storageConfig') || 'Storage',
                 ceph: T('cloud.ceph') || 'Ceph',
@@ -2488,6 +2491,9 @@
                         break;
                     case 'storage':
                         body = <div className="cloud-mounted"><DatastoreTab clusterId={cid} addToast={addToast} sharedDatastoreData={clusterDatastores} /></div>;
+                        break;
+                    case 'mappings':
+                        body = <div className="cloud-mounted">{cid && <ResourceMappingsSection clusterId={cid} addToast={addToast} />}</div>;
                         break;
                     case 'ceph':
                         body = <CloudCeph clusterId={cid} t={T} />;

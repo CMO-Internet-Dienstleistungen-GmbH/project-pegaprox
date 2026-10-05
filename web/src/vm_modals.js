@@ -2877,6 +2877,10 @@
             const [hasCdDvd, setHasCdDvd] = useState(false);
             const [detectedIsos, setDetectedIsos] = useState([]);
             const [bootOrderIssues, setBootOrderIssues] = useState([]);
+            // LW Oct 2026 - virtiofs shares ([{ key, dirid }]) and the cluster's directory mappings,
+            // null until read or when this account may not read them
+            const [virtiofs, setVirtiofs] = useState([]);
+            const [dirMappings, setDirMappings] = useState(null);
 
             const availableNodes = nodes.filter(n => n !== vm.node);
             const isContainer = vm.type === 'lxc';
@@ -2941,6 +2945,11 @@
                         }
                     });
                     setBootOrderIssues(issues);
+
+                    // a VM with virtiofs does not migrate live (qemu-server check_local_resources), and
+                    // offline only to a node its directory mappings cover
+                    setVirtiofs(Object.keys(config).filter(k => /^virtiofs[0-9]$/.test(k) && config[k]).sort()
+                        .map(k => ({ key: k, dirid: parseVirtiofs(config[k]).dirid })));
                 };
                 
                 const checkVmConfig = async () => {
@@ -2972,6 +2981,26 @@
                 window.addEventListener('pegaprox-vm-config', handleVmConfigUpdate);
                 return () => window.removeEventListener('pegaprox-vm-config', handleVmConfigUpdate);
             }, [vm, clusterId]);
+
+            useEffect(() => {
+                if (!virtiofs.length || !clusterId) return;
+                let gone = false;
+                (async () => {
+                    try {
+                        const r = await fetch(`${API_URL}/clusters/${clusterId}/datacenter/mapping/dir`, { credentials: 'include', headers: getAuthHeaders() });
+                        const d = r && r.ok ? await r.json() : null;
+                        if (!gone) setDirMappings(d && d.supported !== false ? (d.mappings || []) : null);
+                    } catch (e) {
+                        if (!gone) setDirMappings(null);
+                    }
+                })();
+                return () => { gone = true; };
+            }, [virtiofs.length, clusterId]);
+
+            const vfsRunning = virtiofs.length > 0 && vm.status === 'running';
+            const vfsMissing = targetNode && dirMappings
+                ? virtiofs.filter(v => !dirMappings.some(m => m.id === v.dirid && m.nodes.includes(targetNode)))
+                : [];
 
             // Fetch storages when target node changes
             useEffect(() => {
@@ -3034,6 +3063,28 @@
                             </div>
                             
                             {/* Migration Warnings */}
+                            {virtiofs.length > 0 && (
+                                <div className={`p-3 rounded-lg border ${vfsRunning ? 'bg-red-500/10 border-red-500/30' : 'bg-yellow-500/10 border-yellow-500/30'}`}
+                                    data-mig-vfs={vfsRunning ? 'running' : 'stopped'}>
+                                    <div className="flex items-start gap-2">
+                                        <Icons.AlertTriangle />
+                                        <div className="flex-1 min-w-0">
+                                            <p className={`font-medium text-sm ${vfsRunning ? 'text-red-400' : 'text-yellow-400'}`}>{t('migVfsTitle')}</p>
+                                            <p className="text-xs text-gray-300 mt-1">{t(vfsRunning ? 'migVfsLive' : 'migVfsOffline')}</p>
+                                            <div className="mt-2 flex flex-wrap gap-2 text-xs">
+                                                {virtiofs.map(v => (
+                                                    <code key={v.key} className="bg-proxmox-dark px-1 rounded text-gray-300">{v.key}: {v.dirid}</code>
+                                                ))}
+                                            </div>
+                                            {vfsMissing.length > 0 && (
+                                                <p className="text-xs text-red-400 mt-2" data-mig-vfs-missing>
+                                                    {t('migVfsMissing').replace(/\{node\}/g, () => targetNode).replace(/\{ids\}/g, () => vfsMissing.map(v => v.dirid).join(', '))}
+                                                </p>
+                                            )}
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
                             {(hasCdDvd || bootOrderIssues.length > 0) && (
                                 <div className="space-y-2">
                                     {hasCdDvd && (
@@ -3174,7 +3225,7 @@
                             <button onClick={onClose} className="px-4 py-2 text-gray-300 hover:text-white">{t('cancel')}</button>
                             <button
                                 onClick={handleMigrate}
-                                disabled={!targetNode || loading}
+                                disabled={!targetNode || loading || vfsRunning || vfsMissing.length > 0}
                                 className="flex items-center gap-2 px-4 py-2 bg-blue-600 rounded-lg text-white hover:bg-blue-700 disabled:opacity-50"
                             >
                                 {loading && <Icons.RotateCw />}

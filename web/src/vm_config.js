@@ -552,6 +552,248 @@
             );
         }
 
+        // LW Oct 2026 - virtiofs, a directory of the host shared with the VM (PVE 8.4+). PVE keeps
+        // it as virtiofs0..9 = "[dirid=]<mapping>[,cache=..][,direct-io=1][,expose-acl=1][,expose-xattr=1]",
+        // the directory itself is a directory mapping of the cluster (Datacenter, Resource Mappings).
+        // The server checks the same rules before PVE sees the value.
+        const VFS_SLOTS = 10;
+        const VFS_CACHE = ['auto', 'always', 'metadata', 'never'];
+        const VFS_FLAGS = ['direct-io', 'expose-xattr', 'expose-acl'];
+        const VFS_FLAG_LABELS = { 'direct-io': 'vfsDirectIo', 'expose-xattr': 'vfsXattr', 'expose-acl': 'vfsAcl' };
+        const vfsOn = (v) => /^(1|on|yes|true)$/i.test(String(v ?? ''));
+        const vfsWindows = (ostype) => /^(wxp|w2k|w2k3|w2k8|wvista|win[0-9]+)$/.test(String(ostype || ''));
+
+        function parseVirtiofs(value) {
+            const out = { dirid: '', cache: '', 'direct-io': false, 'expose-xattr': false, 'expose-acl': false };
+            String(value || '').split(',').forEach(part => {
+                if (!part.trim()) return;
+                const eq = part.indexOf('=');
+                if (eq < 0) { out.dirid = part; return; }
+                const key = part.slice(0, eq), val = part.slice(eq + 1);
+                if (key === 'dirid') out.dirid = val;
+                else if (key === 'cache') out.cache = val;
+                else if (VFS_FLAGS.includes(key)) out[key] = vfsOn(val);
+            });
+            return out;
+        }
+
+        // the virtiofs keys a raw config holds, in slot order
+        const vfsKeys = (raw) => Array.from({ length: VFS_SLOTS }, (_, i) => `virtiofs${i}`).filter(k => raw && raw[k]);
+
+        // auto is PVE's default and the flags default to off, so neither is written out; the
+        // order is the one the server sends on
+        function virtiofsValue(form) {
+            const parts = [form.dirid];
+            if (form.cache && form.cache !== 'auto') parts.push(`cache=${form.cache}`);
+            ['direct-io', 'expose-acl', 'expose-xattr'].forEach(f => { if (form[f]) parts.push(`${f}=1`); });
+            return parts.join(',');
+        }
+
+        // '' when the form is fine, else the key of what is wrong with it
+        function vfsProblem(form, ostype) {
+            if (!/^[A-Za-z][A-Za-z0-9_-]{1,63}$/.test(form.dirid || '')) return 'vfsPickMapping';
+            if (form.cache && !VFS_CACHE.includes(form.cache)) return 'vfsBadCache';
+            if (form['expose-acl'] && vfsWindows(ostype)) return 'vfsAclWindows';
+            return '';
+        }
+
+        function vfsOptionsText(p) {
+            return [`cache=${p.cache || 'auto'}`, ...VFS_FLAGS.filter(f => p[f])].join(', ');
+        }
+
+        function VirtiofsCard({ raw, running, info, node, onAdd, onEdit, onRemove, t }) {
+            const keys = vfsKeys(raw);
+            const loaded = info && !info.loading && !info.error && info.supported !== false;
+            const mappings = (info && info.mappings) || [];
+            return (
+                <div className="mt-6 pt-6 border-t border-proxmox-border" data-vfs-card>
+                    <h3 className="text-white font-medium mb-4 flex items-center gap-2">
+                        <span className="text-emerald-400"><Icons.FolderOpen /></span>
+                        {t('vfsTitle')}
+                        {running && (
+                            <span className="text-xs text-yellow-400 bg-yellow-500/10 px-2 py-0.5 rounded">{t('changesAfterRestart')}</span>
+                        )}
+                        <button onClick={onAdd} data-vfs-add disabled={keys.length >= VFS_SLOTS}
+                            title={keys.length >= VFS_SLOTS ? t('vfsAllSlots') : undefined}
+                            className="ml-auto shrink-0 text-xs px-3 py-1.5 bg-emerald-500/20 text-emerald-400 rounded hover:bg-emerald-500/30 flex items-center gap-1 disabled:opacity-50">
+                            <Icons.Plus className="w-3 h-3" />
+                            {t('vfsAdd')}
+                        </button>
+                    </h3>
+                    {keys.length ? (
+                        <div className="space-y-2">
+                            {keys.map(key => {
+                                const p = parseVirtiofs(raw[key]);
+                                const m = mappings.find(x => x.id === p.dirid);
+                                const here = m ? m.entries.filter(e => e.node === node) : [];
+                                return (
+                                    <div key={key} className="p-3 bg-proxmox-dark rounded-lg" data-vfs-device={key}>
+                                        <div className="flex items-center justify-between gap-4">
+                                            <div className="flex items-center gap-2 min-w-0">
+                                                <span className="text-xs text-gray-500 font-mono">{key}</span>
+                                                <span className="text-sm font-mono text-gray-300 truncate" data-vfs-shown-dirid>{p.dirid || raw[key]}</span>
+                                                <span className="text-xs text-gray-500 truncate" data-vfs-shown-options>{vfsOptionsText(p)}</span>
+                                            </div>
+                                            <div className="flex items-center gap-1 shrink-0">
+                                                <button onClick={() => onEdit(key)} data-vfs-edit={key} title={t('edit')}
+                                                    className="text-xs px-2 py-1 text-gray-400 hover:text-white hover:bg-proxmox-hover rounded">
+                                                    <Icons.Edit />
+                                                </button>
+                                                <button onClick={() => onRemove(key, p.dirid)} data-vfs-remove={key} title={t('remove')}
+                                                    className="text-xs px-2 py-1 text-red-400 hover:bg-red-500/20 rounded">
+                                                    <Icons.Trash className="w-3.5 h-3.5" />
+                                                </button>
+                                            </div>
+                                        </div>
+                                        {here.map((e, i) => (
+                                            <div key={i} className="text-xs text-gray-500 mt-1" data-vfs-shown-path>{e.node}: <span className="font-mono text-gray-300">{e.path}</span></div>
+                                        ))}
+                                        {loaded && !m && (
+                                            <div className="text-xs text-yellow-400 mt-1" data-vfs-gone>{t('vfsGone').replace(/\{id\}/g, () => p.dirid)}</div>
+                                        )}
+                                        {m && !here.length && (
+                                            <div className="text-xs text-yellow-400 mt-1" data-vfs-off-node>{t('vfsNotHere').replace(/\{node\}/g, () => node)}</div>
+                                        )}
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    ) : (
+                        <div className="p-3 bg-proxmox-dark rounded-lg border border-dashed border-proxmox-border">
+                            <span className="text-sm text-gray-500">{t('vfsNone')}</span>
+                        </div>
+                    )}
+                    <ul className="text-xs text-gray-500 mt-2 space-y-1" data-vfs-hints>
+                        <li>{t('vfsHintDriver')}</li>
+                        <li>{t('vfsHintMigration')}</li>
+                    </ul>
+                </div>
+            );
+        }
+
+        function VirtiofsDialog({ slot, value, info, node, ostype, others, onSave, onClose, t }) {
+            const [form, setForm] = useState(() => {
+                const p = parseVirtiofs(value);
+                return { ...p, cache: p.cache || 'auto' };
+            });
+            const [busy, setBusy] = useState(false);
+            const loading = !info || info.loading;
+            const unsupported = info && info.supported === false;
+            const list = (info && info.mappings) || [];
+            const picked = list.find(m => m.id === form.dirid);
+            const here = picked ? picked.entries.filter(e => e.node === node) : [];
+            const problem = unsupported ? 'vfsUnsupported' : vfsProblem(form, ostype);
+            const twice = Object.entries(others || {}).find(([k, v]) => k !== slot && parseVirtiofs(v).dirid === form.dirid);
+            const flip = (flag) => (e) => {
+                const on = e.target.checked;
+                // ACLs need the extended attributes, virtiofsd turns them on with them
+                setForm(prev => ({ ...prev, [flag]: on, ...(flag === 'expose-acl' && on ? { 'expose-xattr': true } : {}) }));
+            };
+            const save = async () => {
+                if (problem || busy || loading) return;
+                setBusy(true);
+                if (!(await onSave(slot, virtiofsValue(form)))) setBusy(false);
+            };
+            return (
+                <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60" data-vfs-dialog={value ? 'edit' : 'add'}>
+                    <div className="w-full max-w-lg bg-proxmox-card border border-proxmox-border rounded-xl p-6 max-h-[90vh] overflow-y-auto">
+                        <h3 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+                            <span className="text-emerald-400"><Icons.FolderOpen /></span>
+                            {value ? t('vfsEdit') : t('vfsAdd')}
+                            <span className="text-xs text-gray-500 font-mono">{slot}</span>
+                        </h3>
+                        <div className="space-y-4">
+                            <div>
+                                <label className="block text-xs text-gray-400 mb-1">{t('vfsMapping')}</label>
+                                {loading ? (
+                                    <div className="flex justify-center py-3">
+                                        <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-proxmox-orange"></div>
+                                    </div>
+                                ) : info.error ? (
+                                    <div className="text-xs text-red-400">{info.error}</div>
+                                ) : unsupported ? (
+                                    <div className="text-xs text-yellow-400" data-vfs-unsupported>{t('vfsUnsupported')}</div>
+                                ) : (
+                                    <>
+                                        {list.length || form.dirid ? (
+                                            <select value={form.dirid} onChange={e => setForm(prev => ({ ...prev, dirid: e.target.value }))} data-vfs-mapping
+                                                className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white">
+                                                <option value="">-- {t('vfsPickMapping')} --</option>
+                                                {form.dirid && !picked && <option value={form.dirid}>{form.dirid}</option>}
+                                                {list.map(m => (
+                                                    <option key={m.id} value={m.id}>
+                                                        {m.id}{m.description ? ` - ${m.description}` : ''}{m.on_node === false ? ` (${t('ptNotOnThisNode')})` : ''}
+                                                    </option>
+                                                ))}
+                                            </select>
+                                        ) : null}
+                                        {!list.length && info.may_add !== false && (
+                                            <div className="text-xs text-gray-500 mt-2" data-vfs-no-mappings>{t('vfsNoMappings')}</div>
+                                        )}
+                                        {info.may_add === false && (
+                                            <div className="text-xs text-yellow-400 mt-2 flex items-start gap-1" data-vfs-confined>
+                                                <span className="shrink-0 mt-0.5"><Icons.Lock className="w-3.5 h-3.5" /></span>
+                                                <span>{t('vfsConfined')}</span>
+                                            </div>
+                                        )}
+                                        {picked && (
+                                            <div className="mt-2 p-3 bg-proxmox-dark rounded text-sm space-y-1" data-vfs-mapping-detail={picked.id}>
+                                                <div className="text-gray-400">{t('ptMappingNodes')}: <span className="text-white">{picked.nodes.length ? picked.nodes.join(', ') : '-'}</span></div>
+                                                {here.map((e, i) => (
+                                                    <div key={i} className="text-gray-400">{node}: <span className="font-mono text-white break-all">{e.path}</span></div>
+                                                ))}
+                                                {!here.length && (
+                                                    <div className="text-xs text-yellow-400" data-vfs-off-node>{t('vfsNotHere').replace(/\{node\}/g, () => node)}</div>
+                                                )}
+                                                {(picked.checks || []).filter(c => here.length || c.severity === 'error').map((c, i) => (
+                                                    <div key={i} className={`text-xs ${c.severity === 'error' ? 'text-red-400' : 'text-yellow-400'}`} data-vfs-check={c.severity}>{c.message}</div>
+                                                ))}
+                                            </div>
+                                        )}
+                                        {twice && (
+                                            <p className="text-xs text-yellow-400 mt-2" data-vfs-warning="twice">{t('vfsSameTwice').replace(/\{key\}/g, () => twice[0])}</p>
+                                        )}
+                                    </>
+                                )}
+                            </div>
+                            <div>
+                                <label className="block text-xs text-gray-400 mb-1">{t('vfsCache')}</label>
+                                <select value={form.cache} onChange={e => setForm(prev => ({ ...prev, cache: e.target.value }))} data-vfs-cache
+                                    className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white">
+                                    {!VFS_CACHE.includes(form.cache) && <option value={form.cache}>{form.cache}</option>}
+                                    {VFS_CACHE.map(c => <option key={c} value={c}>{c === 'auto' ? t('vfsCacheAuto') : c}</option>)}
+                                </select>
+                                <p className="text-xs text-gray-500 mt-1">{t('vfsCacheHint')}</p>
+                            </div>
+                            <div className="space-y-2">
+                                {VFS_FLAGS.map(flag => {
+                                    const implied = flag === 'expose-xattr' && form['expose-acl'];
+                                    return (
+                                        <label key={flag} className="flex items-start gap-2 text-sm text-gray-300 cursor-pointer" data-vfs-flag={flag}>
+                                            <input type="checkbox" className="mt-1" checked={!!form[flag] || implied} disabled={implied} onChange={flip(flag)} />
+                                            <span>
+                                                <span className="font-mono text-white">{flag}</span> <span className="text-gray-400">{t(VFS_FLAG_LABELS[flag])}</span>
+                                                {flag === 'direct-io' && <span className="block text-xs text-gray-500">{t('vfsDirectIoHint')}</span>}
+                                                {implied && <span className="block text-xs text-gray-500" data-vfs-implied>{t('vfsAclHint')}</span>}
+                                            </span>
+                                        </label>
+                                    );
+                                })}
+                            </div>
+                            {problem && !loading && <p className="text-xs text-red-400" data-vfs-problem={problem}>{t(problem)}</p>}
+                            <div className="flex gap-2 justify-end pt-4">
+                                <button onClick={onClose} className="px-4 py-2 bg-proxmox-dark hover:bg-proxmox-hover rounded">{t('cancel')}</button>
+                                <button onClick={save} disabled={!!problem || busy || loading} data-vfs-save
+                                    className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 rounded disabled:opacity-50">
+                                    {busy ? t('saving') : (value ? t('save') : t('add'))}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
         function ConfigModal({ vm, clusterId, allClusters = [], dashboardAuthFetch, onClose, addToast, isCorporate = false }) {
             const { t } = useTranslation();
             const { getAuthHeaders, haReadOnly, haStandby } = useAuth();
@@ -667,6 +909,7 @@
             const [cloudInitBus, setCloudInitBus] = useState('ide');
             const [cloudInitDevice, setCloudInitDevice] = useState('2');
             const [showRngDialog, setShowRngDialog] = useState(false);
+            const [vfsDialog, setVfsDialog] = useState(null);   // { slot, value } of the virtiofs dialog
             const [selectedPciDevice, setSelectedPciDevice] = useState(null);
             const [selectedUsbDevice, setSelectedUsbDevice] = useState(null);
             const [pciOptions, setPciOptions] = useState({ pcie: true, rombar: true });
@@ -830,8 +1073,8 @@
                 }
             };
 
-            // rng0 set ({rng0: value}) or removed ({delete: 'rng0'}); true when it went through
-            const putRng = async (body, okKey, failKey) => {
+            // one hardware key set ({rng0: value}) or removed ({delete: 'rng0'}); true when it went through
+            const putHwConfig = async (body, okKey, failKey) => {
                 try {
                     const res = await authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/qemu/${vm.vmid}/config`, {
                         method: 'PUT',
@@ -852,15 +1095,41 @@
             };
 
             const saveRng = async (value) => {
-                const ok = await putRng({ rng0: value }, 'rngSaved', 'rngSaveFailed');
+                const ok = await putHwConfig({ rng0: value }, 'rngSaved', 'rngSaveFailed');
                 if (ok) setShowRngDialog(false);
                 return ok;
             };
 
             const removeRng = () => {
                 if (!confirm(t('rngRemoveConfirm'))) return;
-                putRng({ delete: 'rng0' }, 'rngRemoved', 'rngRemoveFailed');
+                putHwConfig({ delete: 'rng0' }, 'rngRemoved', 'rngRemoveFailed');
             };
+
+            // virtiofsN of the dialog: slot is the key, a new share takes the first free one
+            const openVirtiofs = (slot) => {
+                const raw = config?.raw || {};
+                const key = slot || Array.from({ length: VFS_SLOTS }, (_, i) => `virtiofs${i}`).find(k => !raw[k]);
+                if (!key) return;
+                setVfsDialog({ slot: key, value: slot ? raw[slot] : '' });
+                if (!ptMappings.dir || ptMappings.dir.error) loadPtMappings('dir');
+            };
+
+            const saveVirtiofs = async (slot, value) => {
+                const ok = await putHwConfig({ [slot]: value }, 'vfsSaved', 'vfsSaveFailed');
+                if (ok) setVfsDialog(null);
+                return ok;
+            };
+
+            const removeVirtiofs = (slot, dirid) => {
+                if (!confirm(t('vfsRemoveConfirm').replace(/\{id\}/g, () => dirid || slot).replace(/\{key\}/g, () => slot))) return;
+                putHwConfig({ delete: slot }, 'vfsRemoved', 'vfsRemoveFailed');
+            };
+
+            // the card names the path of each share on this node: one read when the VM has any
+            useEffect(() => {
+                if (vm.type === 'qemu' && (activeTab === 'hardware' || activeTab === 'resources')
+                    && vfsKeys(config?.raw).length && !ptMappings.dir) loadPtMappings('dir');
+            }, [activeTab, config]);
 
             const loadPtMappings = async (kind) => {
                 setPtMappings(prev => ({ ...prev, [kind]: { ...(prev[kind] || {}), loading: true, error: '' } }));
@@ -868,7 +1137,8 @@
                     const r = await authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/qemu/${vm.vmid}/passthrough/mappings?kind=${kind}`);
                     const d = r ? await r.json().catch(() => ({})) : {};
                     if (r && r.ok) {
-                        setPtMappings(prev => ({ ...prev, [kind]: { loading: false, error: '', mappings: d.mappings || [], access: d.access || null } }));
+                        setPtMappings(prev => ({ ...prev, [kind]: { loading: false, error: '', mappings: d.mappings || [], access: d.access || null,
+                                                                    supported: d.supported, may_add: d.may_add } }));
                         return d;
                     }
                     setPtMappings(prev => ({ ...prev, [kind]: { loading: false, error: d.error || t('operationFailed'), mappings: [], access: null } }));
@@ -2982,6 +3252,19 @@
                                                             onAdd={() => setShowRngDialog(true)}
                                                             onEdit={() => setShowRngDialog(true)}
                                                             onRemove={removeRng}
+                                                            t={t}
+                                                        />
+                                                    )}
+
+                                                    {!['xcpng', 'esxi'].includes(allClusters.find(c => c.id === clusterId)?.cluster_type) && (
+                                                        <VirtiofsCard
+                                                            raw={config?.raw}
+                                                            running={vm.status === 'running'}
+                                                            info={ptMappings.dir}
+                                                            node={vm.node}
+                                                            onAdd={() => openVirtiofs(null)}
+                                                            onEdit={openVirtiofs}
+                                                            onRemove={removeVirtiofs}
                                                             t={t}
                                                         />
                                                     )}
@@ -6628,6 +6911,13 @@
                     
                     {showRngDialog && !haReadOnly && (
                         <VirtioRngDialog value={config?.raw?.rng0} onSave={saveRng} onClose={() => setShowRngDialog(false)} t={t} />
+                    )}
+
+                    {vfsDialog && !haReadOnly && (
+                        <VirtiofsDialog slot={vfsDialog.slot} value={vfsDialog.value} info={ptMappings.dir} node={vm.node}
+                            ostype={config?.raw?.ostype}
+                            others={Object.fromEntries(vfsKeys(config?.raw).map(k => [k, config.raw[k]]))}
+                            onSave={saveVirtiofs} onClose={() => setVfsDialog(null)} t={t} />
                     )}
 
                     {/* MK: Add TPM Modal */}
