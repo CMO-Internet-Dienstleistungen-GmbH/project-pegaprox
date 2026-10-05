@@ -1690,6 +1690,322 @@
             );
         }
 
+        // LW Oct 2026 - API reference from the user menu. Renders the OpenAPI document the
+        // server builds from its own route table (GET /api/pegaprox/openapi.json). Read-only
+        // on purpose: nothing in here sends a request to the routes it lists.
+        const API_REF_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
+        const API_REF_METHOD_CLS = {
+            GET: 'text-blue-400 border-blue-500/50',
+            POST: 'text-green-400 border-green-500/50',
+            PUT: 'text-yellow-400 border-yellow-500/50',
+            PATCH: 'text-purple-400 border-purple-500/50',
+            DELETE: 'text-red-400 border-red-500/50',
+        };
+        // fetched once per page load, an update reloads the page anyway
+        let apiRefDoc = null;
+
+        function apiRefOperations(doc) {
+            const out = [];
+            Object.entries((doc && doc.paths) || {}).forEach(([path, methods]) => {
+                Object.entries(methods || {}).forEach(([method, op]) => {
+                    if (!op || typeof op !== 'object') return;
+                    const m = method.toUpperCase();
+                    const tag = (op.tags && op.tags[0]) || '';
+                    const perms = op['x-pegaprox-permissions'] || [];
+                    const roles = op['x-pegaprox-roles'] || [];
+                    // a URL pasted from the browser finds its route: {cluster_id} stands for one segment
+                    const shape = new RegExp('^' + path.replace(/[.*+?^$()|[\]\\]/g, '\\$&').replace(/\{[^}/]+\}/g, '[^/]+') + '/?$', 'i');
+                    out.push({
+                        key: `${m} ${path}`, method: m, path, tag, shape, perms, roles,
+                        summary: op.summary || '', description: op.description || '',
+                        auth: op['x-pegaprox-auth'] || '', security: op.security,
+                        params: op.parameters || [], body: !!op.requestBody,
+                        responses: Object.keys(op.responses || {}), operationId: op.operationId || '',
+                        shadowed: op['x-pegaprox-shadowed-by'] || [],
+                        text: [m, path, op.summary, op.description, tag, op.operationId, ...perms, ...roles].join(' ').toLowerCase(),
+                    });
+                });
+            });
+            const rank = (m) => { const i = API_REF_METHODS.indexOf(m); return i < 0 ? 99 : i; };
+            out.sort((a, b) => a.tag.localeCompare(b.tag) || a.path.localeCompare(b.path) || rank(a.method) - rank(b.method));
+            return out;
+        }
+
+        // Words match anywhere. A word starting with / is a path (a full URL works too), and
+        // next to one a method name is the method: "POST /api/clusters/c1/updates/rolling"
+        // as a log line has it. A path that names a route exactly shows that route only.
+        function apiRefMatcher(query) {
+            const words = String(query || '').trim().split(/\s+/).filter(Boolean).map(w => {
+                const url = w.match(/^https?:\/\/[^/]+(\/.*)?$/i);
+                return url ? (url[1] || '/') : w;
+            });
+            if (!words.length) return null;
+            const paths = words.filter(w => w.startsWith('/')).map(w => w.split(/[?#]/)[0].toLowerCase());
+            const methods = paths.length ? words.map(w => w.toUpperCase()).filter(w => API_REF_METHODS.includes(w)) : [];
+            const rest = words.filter(w => !w.startsWith('/') && !methods.includes(w.toUpperCase())).map(w => w.toLowerCase());
+            const base = (op) => (!methods.length || methods.includes(op.method)) && rest.every(w => op.text.includes(w));
+            return {
+                paths: paths.length > 0,
+                exact: (op) => base(op) && paths.every(p => op.shape.test(p)),
+                loose: (op) => base(op) && paths.every(p => op.shape.test(p) || op.path.toLowerCase().includes(p)),
+            };
+        }
+
+        function ApiReferenceModal({ onClose }) {
+            const { t } = useTranslation();
+            const { getAuthHeaders } = useAuth();
+            const { isCorporate } = useLayout();
+            const [doc, setDoc] = useState(apiRefDoc);
+            const [failed, setFailed] = useState(false);
+            const [query, setQuery] = useState('');
+            const [method, setMethod] = useState('');
+            const [area, setArea] = useState('');
+            const [open, setOpen] = useState({});
+            const searchRef = useRef(null);
+
+            const load = useCallback(async () => {
+                setFailed(false);
+                try {
+                    const r = await fetch(`${API_URL}/pegaprox/openapi.json`, { credentials: 'include', headers: getAuthHeaders() });
+                    if (!r.ok) throw new Error(String(r.status));
+                    const body = await r.json();
+                    if (!body || typeof body.paths !== 'object') throw new Error('no paths');
+                    apiRefDoc = body;
+                    setDoc(body);
+                } catch (e) {
+                    setFailed(true);
+                }
+            }, [getAuthHeaders]);
+
+            useEffect(() => { if (!apiRefDoc) load(); }, [load]);
+            useEffect(() => {
+                // capture: "/" is the search of the page behind otherwise
+                const onKey = (e) => {
+                    if (e.key === 'Escape') { e.preventDefault(); onClose(); return; }
+                    const el = e.target;
+                    const typing = el && (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) || el.isContentEditable);
+                    if (e.key === '/' && !typing && searchRef.current) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        searchRef.current.focus();
+                    }
+                };
+                window.addEventListener('keydown', onKey, true);
+                return () => window.removeEventListener('keydown', onKey, true);
+            }, [onClose]);
+            useEffect(() => { if (doc && searchRef.current) searchRef.current.focus(); }, [doc]);
+
+            const ops = useMemo(() => apiRefOperations(doc), [doc]);
+            // the field keeps up with the keyboard, the 900-odd rows follow when React has time
+            const typed = React.useDeferredValue(query);
+            // search and method first: the area list counts what they leave
+            const hits = useMemo(() => {
+                const match = apiRefMatcher(typed);
+                const pool = method ? ops.filter(op => op.method === method) : ops;
+                if (!match) return pool;
+                const exact = match.paths ? pool.filter(match.exact) : [];
+                return exact.length ? exact : pool.filter(match.loose);
+            }, [ops, typed, method]);
+            const areas = useMemo(() => {
+                const all = {}, hit = {};
+                ops.forEach(op => { all[op.tag] = 0; });
+                hits.forEach(op => { hit[op.tag] = (hit[op.tag] || 0) + 1; });
+                return Object.keys(all).sort().map(tag => [tag, hit[tag] || 0]);
+            }, [ops, hits]);
+            const shown = area ? hits.filter(op => op.tag === area) : hits;
+
+            const toggle = (key) => setOpen(o => ({ ...o, [key]: !o[key] }));
+            const chip = 'text-[11px] px-1.5 py-0.5 rounded border';
+
+            const who = (op) => {
+                const needs = [
+                    ...op.roles.map(r => <span key={`role:${r}`} className={`${chip} bg-proxmox-dark border-proxmox-border text-gray-300`}>{t('apiRefRole').replace('{role}', r)}</span>),
+                    ...op.perms.map(p => <span key={p} className={`${chip} font-mono bg-proxmox-dark border-proxmox-border text-gray-300`}>{p}</span>),
+                ];
+                if (needs.length) return needs;
+                if (op.auth === 'public') return <span className={`${chip} text-green-400 border-green-500/50`}>{t('apiRefPublic')}</span>;
+                if (op.auth === 'inline') return <span className={`${chip} text-gray-400 border-proxmox-border`}>{t('apiRefOwnAuth')}</span>;
+                return <span className={`${chip} text-gray-400 border-proxmox-border`}>{t('apiRefSignedIn')}</span>;
+            };
+
+            // the securitySchemes of gen_openapi.py
+            const scheme = (name) => {
+                switch (name) {
+                    case 'apiToken': return t('apiRefSchemeApi');
+                    case 'sessionId': return t('apiRefSchemeSession');
+                    case 'installToken': return t('apiRefSchemeInstall');
+                    case 'haPeer': return t('apiRefSchemePeer');
+                    default: return name;
+                }
+            };
+            const schemes = (op) => {
+                if (!Array.isArray(op.security)) return t('apiRefPublic');
+                if (!op.security.length) return t('apiRefSchemeCode');
+                return op.security.map(req => {
+                    const names = Object.keys(req || {});
+                    return names.length ? names.map(scheme).join(' + ') : t('apiRefSchemeCode');
+                }).join(' / ');
+            };
+
+            const detail = (op) => (
+                <div data-api-detail={op.key} className="px-4 pb-4 pt-1 space-y-3 text-sm">
+                    {op.summary && <div className="font-medium">{op.summary}</div>}
+                    {op.description
+                        ? <div className="text-xs text-gray-400 whitespace-pre-wrap">{op.description}</div>
+                        : !op.summary && <div className="text-xs text-gray-500">{t('apiRefNoDescription')}</div>}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        <div>
+                            <div className="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-1">{t('apiRefAuth')}</div>
+                            <div className="text-xs text-gray-300">{schemes(op)}</div>
+                            <div className="flex flex-wrap gap-1 mt-1.5">{who(op)}</div>
+                        </div>
+                        <div>
+                            <div className="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-1">{t('apiRefResponses')}</div>
+                            <div className="flex flex-wrap gap-1">
+                                {op.responses.map(code => <span key={code} className={`${chip} font-mono bg-proxmox-dark border-proxmox-border text-gray-300`}>{code}</span>)}
+                            </div>
+                        </div>
+                    </div>
+                    {op.params.length > 0 && (
+                        <div>
+                            <div className="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-1">{t('apiRefParameters')}</div>
+                            <div className="space-y-1">
+                                {op.params.map(p => (
+                                    <div key={`${p.in}:${p.name}`} className="flex flex-wrap items-center gap-2 text-xs">
+                                        <span className="font-mono text-gray-200">{p.name}</span>
+                                        <span className="text-gray-500">{p.in}</span>
+                                        <span className="font-mono text-gray-400">{[p.schema && p.schema.type, p.schema && p.schema.format].filter(Boolean).join(' / ')}</span>
+                                        {p.required && <span className="text-yellow-400">{t('apiRefRequired')}</span>}
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+                    {op.body && <div className="text-xs text-gray-400">{t('apiRefBody')}</div>}
+                    {op.shadowed.length > 0 && (
+                        <div className="text-xs text-yellow-400">{t('apiRefShadowed').replace('{endpoints}', op.shadowed.join(', '))}</div>
+                    )}
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-gray-500">
+                        <span>{t('apiRefOperationId')}:</span>
+                        <span className="font-mono text-gray-400 break-all">{op.operationId}</span>
+                        <CopyButton value={op.path} title={t('apiRefCopyPath')} />
+                    </div>
+                </div>
+            );
+
+            const rows = [];
+            shown.forEach((op, i) => {
+                if (!area && (i === 0 || shown[i - 1].tag !== op.tag)) {
+                    rows.push(
+                        <div key={`area:${op.tag}`} data-api-area={op.tag} className="px-4 pt-4 pb-1 text-xs font-semibold uppercase tracking-wider text-gray-500">{op.tag}</div>
+                    );
+                }
+                const isOpen = !!open[op.key];
+                rows.push(
+                    <div key={op.key} data-api-op={op.key} className="border-t border-proxmox-border">
+                        <button type="button" onClick={() => toggle(op.key)} aria-expanded={isOpen}
+                            className={`w-full flex items-center gap-3 px-4 ${isCorporate ? 'py-1.5' : 'py-2'} text-left hover:bg-proxmox-hover transition-colors`}>
+                            <Icons.ChevronRight className={`w-3 h-3 flex-shrink-0 text-gray-500 transition-transform ${isOpen ? 'rotate-90' : ''}`} />
+                            <span className={`w-16 flex-shrink-0 text-center text-[11px] font-bold font-mono py-0.5 rounded border ${API_REF_METHOD_CLS[op.method] || 'text-gray-400 border-proxmox-border'}`}>{op.method}</span>
+                            <span className="font-mono text-sm break-all">{op.path}</span>
+                            <span className="flex-1 min-w-0 truncate text-xs text-gray-400">{op.summary}</span>
+                            <span className="ml-auto flex flex-wrap justify-end gap-1 flex-shrink-0">{who(op)}</span>
+                        </button>
+                        {isOpen && detail(op)}
+                    </div>
+                );
+            });
+
+            const version = doc && doc.info && doc.info.version;
+            // no bg-proxmox-orange on a button here: Corporate paints those as primary buttons
+            const areaBtn = (active) => `w-full flex items-center justify-between gap-2 px-3 py-1.5 text-left text-xs rounded transition-colors ${active ? 'bg-proxmox-dark text-proxmox-orange font-medium' : 'text-gray-300 hover:bg-proxmox-hover'}`;
+            return (
+                <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
+                    <div data-api-reference="" className="bg-proxmox-card border border-proxmox-border rounded-xl w-full max-w-6xl shadow-2xl flex flex-col" style={{ height: '88vh', color: 'var(--color-text, #e9ecef)' }} onClick={e => e.stopPropagation()}>
+                        <div className="flex items-center justify-between gap-3 px-6 py-4 border-b border-proxmox-border">
+                            <div className="flex items-center gap-2 min-w-0">
+                                <span className="text-proxmox-orange flex-shrink-0"><Icons.Book /></span>
+                                <h3 className="text-lg font-semibold truncate">{t('apiRefTitle')}</h3>
+                                {version && <span className="text-xs font-mono px-2 py-0.5 rounded bg-proxmox-dark border border-proxmox-border text-gray-400">v{version}</span>}
+                            </div>
+                            <div className="flex items-center gap-2">
+                                {doc && (
+                                    <button type="button" onClick={() => downloadJson(`pegaprox-openapi-${version || 'current'}.json`, doc)}
+                                        className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm bg-proxmox-dark border border-proxmox-border hover:border-proxmox-orange/50 transition-colors">
+                                        <Icons.Download />
+                                        <span className="hidden sm:inline">{t('apiRefDownload')}</span>
+                                    </button>
+                                )}
+                                <button type="button" onClick={onClose} className="text-gray-400 hover:text-white p-1" title={t('close')}><Icons.X /></button>
+                            </div>
+                        </div>
+                        {!doc ? (
+                            <div className="flex-1 flex flex-col items-center justify-center gap-3 text-sm text-gray-400">
+                                {failed ? (
+                                    <>
+                                        <span className="text-red-400">{t('apiRefLoadFailed')}</span>
+                                        <button type="button" onClick={load} className="px-4 py-2 rounded-lg text-sm font-medium bg-proxmox-orange hover:bg-orange-600 text-white">{t('apiRefRetry')}</button>
+                                    </>
+                                ) : (
+                                    <span className="flex items-center gap-2"><span className="animate-spin inline-flex"><Icons.Loader /></span>{t('apiRefLoading')}</span>
+                                )}
+                            </div>
+                        ) : (
+                            <>
+                                <div className="px-6 py-3 space-y-3 border-b border-proxmox-border">
+                                    <p className="text-xs text-gray-400">{t('apiRefIntro')}</p>
+                                    <div className="flex flex-wrap items-center gap-3">
+                                        <div className="flex items-center gap-2 flex-1 min-w-0" style={{ minWidth: '16rem' }}>
+                                            <Icons.Search className="w-4 h-4 text-gray-500 flex-shrink-0" />
+                                            <input ref={searchRef} type="search" value={query} onChange={e => setQuery(e.target.value)}
+                                                placeholder={t('apiRefSearch')} aria-label={t('apiRefSearch')}
+                                                className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-sm focus:outline-none focus:border-proxmox-orange" />
+                                        </div>
+                                        <div className="flex items-center gap-1">
+                                            {['', ...API_REF_METHODS].map(m => (
+                                                <button key={m || 'all'} type="button" onClick={() => setMethod(m)} data-api-method={m || 'all'}
+                                                    className={`px-2 py-1 rounded text-xs font-mono border transition-colors ${method === m ? 'border-proxmox-orange text-proxmox-orange' : 'border-proxmox-border text-gray-400 hover:text-white'}`}>
+                                                    {m || t('apiRefAllMethods')}
+                                                </button>
+                                            ))}
+                                        </div>
+                                        <span data-api-count="" className="text-xs text-gray-500 whitespace-nowrap">
+                                            {t('apiRefCount').replace('{shown}', String(shown.length)).replace('{total}', String(ops.length))}
+                                        </span>
+                                    </div>
+                                </div>
+                                <div className="flex flex-1" style={{ minHeight: 0 }}>
+                                    {/* sm:inline on a flex item still lays out as a block */}
+                                    <div className="hidden sm:inline w-56 flex-shrink-0 overflow-y-auto border-r border-proxmox-border p-2 space-y-0.5">
+                                        <button type="button" onClick={() => setArea('')} className={areaBtn(!area)}>
+                                            <span>{t('apiRefAllAreas')}</span><span className="text-gray-500">{hits.length}</span>
+                                        </button>
+                                        {areas.map(([tag, n]) => (
+                                            <button key={tag} type="button" data-api-area-pick={tag} onClick={() => setArea(area === tag ? '' : tag)}
+                                                className={`${areaBtn(area === tag)} ${n ? '' : 'opacity-50'}`}>
+                                                <span className="font-mono truncate">{tag}</span><span className="text-gray-500">{n}</span>
+                                            </button>
+                                        ))}
+                                    </div>
+                                    <div className="flex-1 min-w-0 overflow-y-auto pb-4">
+                                        {/* on a phone a select takes the place of the area list */}
+                                        <div className="sm:hidden px-4 pt-3">
+                                            <select value={area} onChange={e => setArea(e.target.value)} aria-label={t('apiRefAllAreas')}
+                                                className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-sm">
+                                                <option value="">{t('apiRefAllAreas')}</option>
+                                                {areas.map(([tag, n]) => <option key={tag} value={tag}>{tag} ({n})</option>)}
+                                            </select>
+                                        </div>
+                                        {rows.length ? rows : <div className="px-4 py-12 text-center text-sm text-gray-500">{t('apiRefNoMatch')}</div>}
+                                    </div>
+                                </div>
+                            </>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
         // NS — sticky banner at top while WS is dropped. Auto-shows after 4s of disconnect
         // so a quick reconnect-blip doesn't flash a scary banner. Passive: gets state via prop.
         function ConnectionLostBanner({ connected, reconnectingMs }) {

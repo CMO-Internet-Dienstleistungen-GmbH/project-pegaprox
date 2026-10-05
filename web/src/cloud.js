@@ -499,7 +499,7 @@
         }
 
         // ── top bar (masthead) ─────────────────────────────────────
-        function CloudTopbar({ crumbs, clusters, selectedCluster, setSelectedCluster, theme, onToggleTheme, onRefresh, onExitCloud, onOpenSettings, onOpenProfile, onLogout, isAdmin, currentUser, t }) {
+        function CloudTopbar({ crumbs, clusters, selectedCluster, setSelectedCluster, theme, onToggleTheme, onRefresh, onExitCloud, onOpenSettings, onOpenProfile, onOpenApiReference, onLogout, isAdmin, currentUser, t }) {
             const safe = Array.isArray(clusters) ? clusters : [];
             const selId = selectedCluster && (selectedCluster.id != null ? selectedCluster.id : selectedCluster.name);
             const onChange = (e) => {
@@ -512,6 +512,7 @@
             const userMenu = [
                 { label: t('cloud.profile') || 'Profile & preferences', icon: 'User', onClick: () => onOpenProfile && onOpenProfile() },
                 isAdmin && { label: t('cloud.settings') || 'Settings', icon: 'Settings', onClick: () => onOpenSettings && onOpenSettings() },
+                (typeof onOpenApiReference === 'function') && { label: t('apiRefTitle'), icon: 'Book', onClick: onOpenApiReference },
                 { divider: true },
                 (typeof onExitCloud === 'function') && { label: t('cloud.exit') || 'Exit Cloud (Modern view)', icon: 'Grid', onClick: onExitCloud },
                 (typeof onLogout === 'function') && { label: t('logout') || 'Sign out', icon: 'LogOut', danger: true, onClick: onLogout },
@@ -2303,7 +2304,7 @@
             );
         }
 
-        function CloudShell({ clusters, selectedCluster, setSelectedCluster, clusterResources, clusterMetrics, allClusterMetrics, clusterDatastores, clusterNetworks, clusterPools, tasks, knownNodes, actions, isAdmin, currentUser, t, authFetch, addToast, onExitCloud, onOpenSettings, onOpenProfile, onLogout }) {
+        function CloudShell({ clusters, selectedCluster, setSelectedCluster, clusterResources, clusterMetrics, allClusterMetrics, clusterDatastores, clusterNetworks, clusterPools, tasks, knownNodes, actions, isAdmin, currentUser, t, authFetch, addToast, onExitCloud, onOpenSettings, onOpenProfile, onOpenApiReference, onLogout }) {
             const [section, setSection] = React.useState('overview');
             const [detailRes, setDetailRes] = React.useState(null);
             const [collapsed, setCollapsed] = React.useState(false);
@@ -2619,6 +2620,7 @@
                             onExitCloud={onExitCloud}
                             onOpenSettings={onOpenSettings}
                             onOpenProfile={onOpenProfile}
+                            onOpenApiReference={onOpenApiReference}
                             onLogout={onLogout}
                             isAdmin={isAdmin}
                             currentUser={currentUser}

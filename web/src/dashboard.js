@@ -9991,6 +9991,8 @@
             const [showCommandPalette, setShowCommandPalette] = useState(false);
             // MK May 2026 — shortcuts overlay (`?`)
             const [showShortcutsModal, setShowShortcutsModal] = useState(false);
+            // LW Oct 2026 - the API reference from the user menu
+            const [showApiReference, setShowApiReference] = useState(false);
             // NS May 2026 — bulk-action selection state for VM list
             const [bulkSelection, setBulkSelection] = useState({});  // { 'clusterId:vmid': true }
             // LW May 2026 — VM quick filter chips
@@ -16413,6 +16415,7 @@
                             onExitCloud={() => updatePreferences({ ui_layout: 'modern', theme: 'proxmoxDark' })}
                             onOpenSettings={() => setShowSettings(true)}
                             onOpenProfile={() => setShowProfile(true)}
+                            onOpenApiReference={() => setShowApiReference(true)}
                             onLogout={logout}
                         />
                         {/* Resource-action modals — shared dashboard state, mounted here too so
@@ -16467,6 +16470,7 @@
                             (they self-gate on isOpen + pull all context from the app providers). */}
                         <UserProfileModal isOpen={showProfile} onClose={() => setShowProfile(false)} addToast={addToast} />
                         <PegaProxSettingsModal isOpen={showSettings} onClose={() => setShowSettings(false)} addToast={addToast} onGroupsChanged={fetchClusterGroups} />
+                        {showApiReference && <ApiReferenceModal onClose={() => setShowApiReference(false)} />}
                         {toastPortal}
                     </div>
                 );
@@ -16884,6 +16888,7 @@
                                     <div className="relative z-50">
                                         <button
                                             onClick={() => setShowUserMenu(!showUserMenu)}
+                                            data-user-menu=""
                                             className={`flex items-center gap-2 ${isCorporate ? 'px-2 py-1' : 'px-3 py-2'} bg-proxmox-dark border border-proxmox-border rounded-lg hover:border-proxmox-orange/50 transition-colors`}
                                         >
                                             <UserAvatar
@@ -16934,6 +16939,13 @@
                                                             <Icons.Keyboard />
                                                             <span className="flex-1">{t('keyboardShortcuts') || 'Keyboard shortcuts'}</span>
                                                             <kbd className="text-[10px] opacity-60 px-1 rounded" style={{ border: '1px solid #485764' }}>?</kbd>
+                                                        </button>
+                                                        <button
+                                                            onClick={() => { setShowUserMenu(false); setShowApiReference(true); }}
+                                                            className="w-full px-4 py-2 text-left text-gray-300 hover:bg-proxmox-hover transition-colors flex items-center gap-2"
+                                                        >
+                                                            <Icons.Book />
+                                                            {t('apiRefTitle')}
                                                         </button>
                                                         <button
                                                             onClick={() => {
@@ -27345,6 +27357,7 @@
                         open={showShortcutsModal}
                         onClose={() => setShowShortcutsModal(false)}
                     />
+                    {showApiReference && <ApiReferenceModal onClose={() => setShowApiReference(false)} />}
 
                     {/* NS — connection-loss banner only after WS is dropped >4s */}
                     <div style={{ position: 'fixed', top: 0, left: 0, right: 0, zIndex: 95, pointerEvents: 'none' }}>
