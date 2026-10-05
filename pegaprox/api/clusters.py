@@ -1043,20 +1043,34 @@ _HEALTH_STORAGE_TTL = 30
 _health_storage_cache = StorageDataCache()
 
 
-def _health_storage_rows(mgr, ns):
+def cluster_storage_resources(cluster_id, mgr):
+    """Every storage on every node of a Proxmox cluster as /cluster/resources?type=storage
+    lists it, or None when the read failed (not cached, so the next caller tries again).
+    The health check and the storage overview share one read per cluster for the TTL."""
+    rows, hit = _health_storage_cache.get(cluster_id, 'resources')
+    if hit:
+        return rows
+    # /nodes/<n>/storage builds live status for every storage one after another, a login
+    # per PBS datastore, seconds per node. /cluster/resources is served from pvestatd's cache
+    # and covers all nodes in one call. Storages of offline nodes come back 'unknown'.
+    url = f"https://{mgr.host}:{mgr.api_port}/api2/json/cluster/resources?type=storage"
+    r = mgr._api_get(url, timeout=8)
+    if r is None or r.status_code != 200:
+        return None
+    rows = [s for s in (r.json().get('data') or []) if isinstance(s, dict)]
+    _health_storage_cache.set(cluster_id, 'resources', rows, ttl_seconds=_HEALTH_STORAGE_TTL)
+    return rows
+
+
+def _health_storage_rows(cluster_id, mgr, ns):
     """(node, storage, used, total) for every active storage, or None when the lookup failed
     (not cached, so the next poll tries again)."""
     if getattr(mgr, 'cluster_type', 'proxmox') == 'proxmox':
-        # /nodes/<n>/storage builds live status for every storage one after another, a login
-        # per PBS datastore, seconds per node. /cluster/resources is served from pvestatd's cache
-        # and covers all nodes in one call. Storages of offline nodes come back 'unknown'.
-        url = f"https://{mgr.host}:{mgr.api_port}/api2/json/cluster/resources?type=storage"
-        r = mgr._api_get(url, timeout=8)
-        if r is None or r.status_code != 200:
+        rows = cluster_storage_resources(cluster_id, mgr)
+        if rows is None:
             return None
         return [(s.get('node') or '?', s.get('storage') or '?', s.get('disk') or 0, s.get('maxdisk') or 0)
-                for s in (r.json().get('data') or [])
-                if s.get('status') == 'available']
+                for s in rows if s.get('status') == 'available']
 
     # XCP-ng has no cluster-wide storage view, keep the per-node listing.
     # MK 2026-05-31 (F1a) - parallel fanout, ONLINE nodes only: a dead node's
@@ -1134,7 +1148,7 @@ def get_cluster_health(cluster_id):
     try:
         rows, hit = _health_storage_cache.get(cluster_id, 'storage')
         if not hit:
-            rows = _health_storage_rows(mgr, ns)
+            rows = _health_storage_rows(cluster_id, mgr, ns)
             if rows is not None:
                 _health_storage_cache.set(cluster_id, 'storage', rows, ttl_seconds=_HEALTH_STORAGE_TTL)
         for node_name, stor_name, used, total in (rows or []):
@@ -2270,6 +2284,217 @@ def get_backup_coverage():
         found = scope_vm_rows(cid, found)
         entry['count'] = len(found)
         guests += found
+    guests.sort(key=lambda g: (g['cluster_name'].lower(), g['vmid']))
+    return jsonify({'guests': guests, 'clusters': out_clusters})
+
+
+def _overview_name(cid, mgr):
+    name = getattr(getattr(mgr, 'config', None), 'name', None)
+    return name if isinstance(name, str) and name else cid
+
+
+def _overview_reach(only=None):
+    """(cluster_id, manager, entry) of every Proxmox and XCP-ng cluster the caller reaches, by
+    name, and the entries to answer with (state 'ok' until a read says otherwise)."""
+    out = []
+    for cid, mgr in sorted(list(cluster_managers.items()), key=lambda kv: _overview_name(*kv).lower()):
+        if only is not None and cid != only:
+            continue
+        if getattr(mgr, 'cluster_type', 'proxmox') not in ('proxmox', 'xcpng'):
+            continue
+        ok, _err = check_cluster_access(cid)
+        if ok:
+            out.append((cid, mgr, {'cluster_id': cid, 'cluster_name': _overview_name(cid, mgr),
+                                   'state': 'ok', 'count': 0}))
+    return out
+
+
+def _storage_overview_rows(resources):
+    """Rows of the storage overview from /cluster/resources?type=storage: one per node and
+    storage, and one per shared storage, which Proxmox lists once for every node. Figures
+    of a storage that is not active there are pvestatd's last ones, so they are left out."""
+    def _row(s, node, shared):
+        return {'node': node, 'storage': s.get('storage'), 'type': s.get('plugintype') or '',
+                'content': s.get('content') or '', 'shared': shared, 'used': None, 'total': None,
+                'percent': None, 'active': False, 'nodes': 0, 'inactive_on': []}
+
+    def _figures(row, s):
+        used, total = int(s.get('disk') or 0), int(s.get('maxdisk') or 0)
+        # a node that has not mounted it yet says 0: the largest figure counts
+        if row['total'] is None or total > row['total']:
+            row['used'], row['total'] = used, total
+            row['percent'] = round(used * 100.0 / total, 1) if total > 0 else None
+
+    rows, shared = [], {}
+    for s in resources:
+        if not s.get('storage'):
+            continue
+        up = s.get('status') == 'available'
+        node = s.get('node') or ''
+        if s.get('shared'):
+            row = shared.get(s['storage'])
+            if row is None:
+                row = shared[s['storage']] = _row(s, '', True)
+                rows.append(row)
+            row['nodes'] += 1
+            if not up:
+                row['inactive_on'].append(node)
+                continue
+        else:
+            row = _row(s, node, False)
+            row['nodes'] = 1
+            rows.append(row)
+            if not up:
+                continue
+        row['active'] = True
+        _figures(row, s)
+    for row in shared.values():
+        row['inactive_on'].sort()
+    rows.sort(key=lambda r: (not r['shared'], r['node'], r['storage']))
+    return rows
+
+
+def _xcpng_storage_rows(cid, mgr):
+    """The storage repositories of an XCP-ng pool as overview rows. XAPI does not say which
+    host a local repository belongs to here, so node stays empty."""
+    srs, hit = _health_storage_cache.get(cid, 'srs')
+    if not hit:
+        srs = [s for s in (mgr.get_storages() or []) if isinstance(s, dict)]
+        _health_storage_cache.set(cid, 'srs', srs, ttl_seconds=_HEALTH_STORAGE_TTL)
+    rows = []
+    for s in srs:
+        used, total = int(s.get('used') or 0), int(s.get('total') or 0)
+        rows.append({'node': '', 'storage': s.get('storage') or '?', 'type': s.get('type') or '',
+                     'content': s.get('content') or '', 'shared': bool(s.get('shared')),
+                     'used': used, 'total': total,
+                     'percent': round(used * 100.0 / total, 1) if total > 0 else None,
+                     'active': s.get('status', 'available') == 'available', 'nodes': 0, 'inactive_on': []})
+    rows.sort(key=lambda r: (not r['shared'], r['storage']))
+    return rows
+
+
+# MK Oct 2026 - every storage of every cluster the caller reaches, in one table: Proxmox in
+# one read per cluster from pvestatd's cache (the read the health check makes, shared with
+# it), XCP-ng from its SR list. No node is asked on its own.
+@bp.route('/api/storage-overview', methods=['GET'])
+@require_auth(perms=['storage.view'])
+def get_storage_overview():
+    from pegaprox.api.helpers import caller_is_scoped
+    from pegaprox.utils.concurrent import run_concurrent
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    reach, out_clusters = [], []
+    for cid, mgr, entry in _overview_reach():
+        out_clusters.append(entry)
+        # a pool or a guest grant is a claim on guests, not on the storage of the cluster
+        if caller_is_scoped(user, cid):
+            entry['state'] = 'confined'
+        elif not mgr.is_connected:
+            entry['state'] = 'offline'
+        else:
+            reach.append((cid, mgr, entry))
+
+    def _read(cid, mgr):
+        if getattr(mgr, 'cluster_type', 'proxmox') == 'xcpng':
+            return _xcpng_storage_rows(cid, mgr)
+        rows = cluster_storage_resources(cid, mgr)
+        return None if rows is None else _storage_overview_rows(rows)
+
+    results = run_concurrent([lambda c=cid, m=mgr: _read(c, m) for cid, mgr, _ in reach], timeout=20)
+    storages = []
+    for (cid, _mgr, entry), rows in zip(reach, results):
+        if rows is None:
+            entry['state'] = 'unreadable'
+            continue
+        for row in rows:
+            row['cluster_id'], row['cluster_name'] = cid, entry['cluster_name']
+        entry['count'] = len(rows)
+        storages += rows
+    return jsonify({'storages': storages, 'clusters': out_clusters})
+
+
+def _agent_cache(mgr, name):
+    """A copy of one of the guest agent caches of a Proxmox manager, {(node, vmid): ...}."""
+    cache = getattr(mgr, name, None)
+    if not isinstance(cache, dict):
+        return {}
+    lock = getattr(mgr, name + '_lock', None)
+    if lock is None:
+        return dict(cache)
+    with lock:
+        return dict(cache)
+
+
+def _inventory_guests(mgr):
+    """The guests of one cluster for the inventory, None when they could not be read."""
+    if getattr(mgr, 'cluster_type', 'proxmox') == 'proxmox':
+        # not get_vm_resources: that puts the agent's filesystem figures over maxdisk, and the
+        # inventory wants the size Proxmox has allocated
+        url = f"https://{mgr.host}:{mgr.api_port}/api2/json/cluster/resources?type=vm"
+        r = mgr._api_get(url, timeout=15)
+        if r is None or r.status_code != 200:
+            return None
+        rows = r.json().get('data') or []
+    else:
+        rows = mgr.get_vm_resources(max_age=60) or []
+    return [g for g in rows if isinstance(g, dict) and g.get('type') in ('qemu', 'lxc')
+            and str(g.get('vmid', '')).isdigit()]
+
+
+# MK Oct 2026 - the guest inventory behind the CSV export, of one cluster (?cluster=) or of
+# all the caller reaches, guest by guest as far as they may see it. One read per cluster;
+# addresses and the used disk come from the guest agent sweep where it has them.
+@bp.route('/api/inventory/guests', methods=['GET'])
+@require_auth()
+def get_guest_inventory():
+    from pegaprox.background import alert_events
+    from pegaprox.utils.concurrent import run_concurrent
+    only = request.args.get('cluster') or None
+    if only is not None:
+        ok, err = check_cluster_access(only)
+        if not ok:
+            return err
+        if only not in cluster_managers:
+            return jsonify({'error': 'Cluster not found'}), 404
+
+    reach, out_clusters = [], []
+    for cid, mgr, entry in _overview_reach(only):
+        out_clusters.append(entry)
+        if mgr.is_connected:
+            reach.append((cid, mgr, entry))
+        else:
+            entry['state'] = 'offline'
+
+    results = run_concurrent([lambda m=mgr: _inventory_guests(m) for _, mgr, _ in reach], timeout=30)
+    guests = []
+    for (cid, mgr, entry), rows in zip(reach, results):
+        if rows is None:
+            entry['state'] = 'unreadable'
+            continue
+        # per guest: a pool or ACL grant sees its own guests, another tenant none (#773)
+        rows = scope_vm_rows(cid, rows)
+        ips, disks = _agent_cache(mgr, '_ip_cache'), _agent_cache(mgr, '_disk_cache')
+        tags = alert_events.guest_tags(cid, rows)
+        for g in rows:
+            vmid, node = int(g['vmid']), g.get('node') or ''
+            running = g.get('status') == 'running'
+            # the agent caches keep a guest that has stopped since
+            agent_ips = ips.get((node, vmid)) if running else None
+            if g.get('type') == 'lxc':
+                used = int(g.get('disk') or 0) or None
+            else:
+                used = ((disks.get((node, vmid)) if running else None) or {}).get('used') or None
+            guests.append({
+                'cluster_id': cid, 'cluster_name': entry['cluster_name'], 'vmid': vmid,
+                'name': g.get('name') or '', 'type': g['type'], 'node': node,
+                'status': g.get('status') or 'unknown', 'template': bool(g.get('template')),
+                'vcpus': int(g.get('maxcpu') or 0), 'cpu': float(g.get('cpu') or 0),
+                'mem': int(g.get('mem') or 0), 'memory': int(g.get('maxmem') or 0),
+                'disk_allocated': int(g.get('maxdisk') or 0), 'disk_used': used,
+                'ip_addresses': list(agent_ips or g.get('ip_addresses') or []),
+                'ha_state': g.get('hastate') or '', 'pool': g.get('pool') or '',
+                'tags': sorted(tags.get(vmid, ())),
+            })
+        entry['count'] = len(rows)
     guests.sort(key=lambda g: (g['cluster_name'].lower(), g['vmid']))
     return jsonify({'guests': guests, 'clusters': out_clusters})
 

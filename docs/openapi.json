@@ -4799,6 +4799,68 @@
         ]
       }
     },
+    "/api/storage-overview": {
+      "get": {
+        "operationId": "clusters.get_storage_overview_get",
+        "tags": [
+          "clusters"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "storage.view"
+        ]
+      }
+    },
+    "/api/inventory/guests": {
+      "get": {
+        "operationId": "clusters.get_guest_inventory_get",
+        "tags": [
+          "clusters"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ]
+      }
+    },
     "/api/clusters/{cluster_id}/nodes/{node}/tasks/{upid}": {
       "delete": {
         "operationId": "clusters.cancel_task_delete",
