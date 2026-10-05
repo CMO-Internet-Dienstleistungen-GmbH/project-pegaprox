@@ -647,6 +647,30 @@ def create_app():
                           mark.get('via') if isinstance(mark, dict) else '')
         ha.nudge_members()
 
+    # MK Oct 2026 (#625) - a write the exit refused in an automatic group (ha.guard: the
+    # lease ran out, or no majority confirmed it) reaches most routes as a failed cluster
+    # call, and they answered 400 or 500 with the guard's own words. The caller hears what
+    # the write gate says instead: 503 HA_NO_LEASE, try again. A 2xx for what did go out
+    # and a 503 of the route's own stay as they are.
+    @app.after_request
+    def say_no_lease_after_a_refused_write(response):
+        if 400 <= response.status_code < 600 and response.status_code != 503:
+            from pegaprox.core import ha
+            if request.environ.get(ha.GUARD_REFUSED_ENVIRON):
+                from pegaprox.api.ha import guard_refusal
+                resp, status = guard_refusal()
+                resp.status_code = status
+                return resp
+        return response
+
+    # and the same for a refusal that no route caught on its way up
+    from pegaprox.core.ha import NoLease
+
+    @app.errorhandler(NoLease)
+    def refused_at_the_exit(e):
+        from pegaprox.api.ha import guard_refusal
+        return guard_refusal()
+
     # the lease calls of automatic failover, answered before Flask where Flask would
     # answer them with 200 anyway (_LeaseFastPath). It takes the hooks as they are now,
     # before any plugin is loaded: one that hooks into requests turns it off
@@ -681,12 +705,13 @@ _LEASE_ROUTES = {'/api/ha/peer/renew': 'renew', '/api/ha/peer/vote': 'vote'}
 _LENGTH_RE = re.compile(r'[0-9]{1,9}')
 # the hooks the fast path stands in for, by name: what each does for these two routes is
 # done above or cannot apply (refuse_writes_on_standby lets /api/ha/ through,
-# count_around_a_read and tell_the_members_about_a_write look at other methods and paths)
+# count_around_a_read and tell_the_members_about_a_write look at other methods and paths,
+# say_no_lease_after_a_refused_write at a refusal of an exit, and these send through none)
 _STOOD_IN_FOR = {
     'before': ('validate_request', 'check_ip_whitelist', 'refuse_writes_on_standby',
                'count_around_a_read'),
     'after': ('after_request', 'add_security_headers', 'tell_the_members_about_a_write',
-              '_say_we_hold_the_key'),
+              'say_no_lease_after_a_refused_write', '_say_we_hold_the_key'),
 }
 
 

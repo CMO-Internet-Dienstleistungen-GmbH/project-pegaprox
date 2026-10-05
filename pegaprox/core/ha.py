@@ -12492,11 +12492,14 @@ class _Token:
 
 
 # per thread, a greenlet under gevent: token (a _Token), reading (depth of reading()
-# blocks), job (what as_job runs) and request (the method of the request a fan-out
-# started from)
+# blocks), job (what as_job runs), request (the method of the request a fan-out
+# started from) and refused (where that request notes a refusal, _refusals)
 _guard_tls = threading.local()
 _guard_said = set()
 _READ_METHODS = frozenset(('GET', 'HEAD'))
+# the refusals at the exits during a request, in its WSGI environ: most routes take the
+# GuardRefused for a failed cluster call, and app.py answers 503 HA_NO_LEASE for them
+GUARD_REFUSED_ENVIRON = 'pegaprox.ha_guard_refused'
 
 
 def guard_on():
@@ -12518,6 +12521,21 @@ def _request_method():
 
 def _in_request():
     return bool(_request_method())
+
+
+def _refusals():
+    """The list a refusal at an exit goes into for the request this thread serves: the
+    one carry() handed a fan-out of it, or the request's own. None outside a request."""
+    said = getattr(_guard_tls, 'refused', None)
+    if said is not None:
+        return said
+    try:
+        from flask import has_request_context, request
+        if has_request_context():
+            return request.environ.setdefault(GUARD_REFUSED_ENVIRON, [])
+    except Exception:
+        pass
+    return None
 
 
 def _token_fits(st, tok, need=None):
@@ -12544,6 +12562,9 @@ def _clock_look(rt):
 
 
 def _guard_refuse(action, why):
+    said = _refusals()
+    if said is not None:
+        said.append(why)
     if (action, why) not in _guard_said:
         # each exit once: a loop that keeps trying must not fill the log
         if len(_guard_said) > 512:
@@ -12611,18 +12632,20 @@ def reading():
         _guard_tls.reading -= 1
 
 
-_CARRIED = (('request', ''), ('token', None), ('reading', 0), ('job', None))
+_CARRIED = (('request', ''), ('token', None), ('reading', 0), ('job', None), ('refused', None))
 
 
 def carry(fn):
     """fn as it runs in another thread or greenlet, with what this one may send: its
     token, its reads, the request it serves and the job it runs. A fan-out carries it,
     or the calls of a confirmed step it spreads out go out unconfirmed and are refused.
-    Once fn is done the worker has what it had before, so nothing fn confirmed serves
-    its next task. fn itself where the lease is not in force."""
+    A refusal in fn is noted for that request too. Once fn is done the worker has what
+    it had before, so nothing fn confirmed serves its next task. fn itself where the
+    lease is not in force."""
     if not guard_on():
         return fn
-    ctx = [_request_method()] + [getattr(_guard_tls, k, d) for k, d in _CARRIED[1:]]
+    ctx = ([_request_method()] + [getattr(_guard_tls, k, d) for k, d in _CARRIED[1:-1]]
+           + [_refusals()])
 
     @functools.wraps(fn)
     def run(*args, **kwargs):

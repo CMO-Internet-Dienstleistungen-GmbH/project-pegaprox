@@ -425,9 +425,8 @@ EXITS = {
     # this host
     ('pegaprox/api/settings.py', '_detect_install_method', 'subprocess'): (1, 'local'),
     ('pegaprox/api/settings.py', 'perform_pegaprox_update', 'subprocess'): (7, 'local'),
-    ('pegaprox/api/settings.py', 'perform_pegaprox_update.restart_server', 'subprocess'): (3, 'local'),
-    ('pegaprox/api/settings.py', 'rollback_pegaprox_update.restart_server', 'subprocess'): (3, 'local'),
-    ('pegaprox/api/settings.py', 'restart_server.do_restart', 'subprocess'): (3, 'local'),
+    # systemctl for the update, the rollback and the restart button
+    ('pegaprox/api/settings.py', '_restart_through_systemd', 'subprocess'): (3, 'local'),
     ('pegaprox/api/settings.py', 'generate_support_bundle', 'subprocess'): (1, 'local'),
     ('plugins/client_portal/__init__.py', '_vm_snapshots', 'subprocess'): (1, 'local'),
     ('pegaprox/core/manager.py', 'PegaProxManager._get_pegaprox_server_ip', 'socket'): (1, 'local'),
@@ -503,12 +502,12 @@ def test_the_inventory_counts_what_the_report_says():
     by = Counter()
     for (_f, _q, kind), (n, verdict) in EXITS.items():
         by[verdict] += n
-    # S4 with the witness and the lease link, and the connection check: 266 calls out of
-    # this process, 156 (function, kind) pairs in 141 functions; 46 of them guarded at the
-    # exit and 84 execs on a client from a guarded factory. No route relies on the write
-    # gate alone any more
-    assert sum(n for n, _v in EXITS.values()) == 266 and len(EXITS) == 156
-    assert len({(f, q) for f, q, _k in EXITS}) == 141
+    # S4 with the witness and the lease link, and the connection check, the three restarts
+    # asking systemctl in one helper: 260 calls out of this process, 154 (function, kind)
+    # pairs in 139 functions; 46 of them guarded at the exit and 84 execs on a client from
+    # a guarded factory. No route relies on the write gate alone any more
+    assert sum(n for n, _v in EXITS.values()) == 260 and len(EXITS) == 154
+    assert len({(f, q) for f, q, _k in EXITS}) == 139
     assert by['guard'] == 46 and by['client'] == 84
 
 

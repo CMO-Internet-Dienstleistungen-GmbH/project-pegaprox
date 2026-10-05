@@ -299,6 +299,23 @@ def write_gate_refusal():
     return refused
 
 
+def guard_refusal():
+    """What a request answers once the exit refused one of its writes (ha.guard): this
+    leader lost its lease, or no majority confirmed it for that call, and the call did
+    not go out. The route behind it took that for a failed cluster call; the caller
+    hears what the write gate says instead, with a signed-in user as the one who is
+    told who leads (write_gate_refusal)."""
+    known = (request.environ.get(ha.FORWARD_ENVIRON) is not None
+             or bool((getattr(request, 'session', None) or {}).get('user')))
+    refused = no_lease_refusal(known)
+    if refused is None:
+        resp = jsonify({'code': 'HA_NO_LEASE',
+                        'error': ha.NO_LEASE_ERROR if known else ha.NO_LEASE_ANON_ERROR})
+        resp.headers['Retry-After'] = '10'
+        refused = (resp, 503)
+    return refused
+
+
 def transfer_refusal():
     """503 HA_TRANSFER: the leader hands its lead to another member right now and takes
     no change until that went through or failed (design 7.1). For the write gate in

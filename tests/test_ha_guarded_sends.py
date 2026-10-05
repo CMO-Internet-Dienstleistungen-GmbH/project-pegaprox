@@ -93,7 +93,9 @@ def test_a_former_leader_does_not_remove_a_node(auto, seed, monkeypatch):
         said = {why for _a, why in ha._guard_said}
     assert sent == [], (r.status_code, r.data[:300])
     assert asked, 'no round was asked'
-    assert r.status_code == 500 and _ha.GUARD_UNCONFIRMED in said
+    # what the caller hears is the write gate's answer (tests/test_ha_guard_answers.py)
+    assert r.status_code == 503 and r.get_json()['code'] == 'HA_NO_LEASE'
+    assert _ha.GUARD_UNCONFIRMED in said
     with auto.at(other) as ha:
         assert ha.is_active()
 
@@ -229,7 +231,8 @@ def test_the_reboot_of_a_node_asks_before_its_shutdown_goes_out(auto, seed, monk
         r = auto.admin.post('/api/clusters/c1/nodes/pve1/action/reboot')
         said = {why for _a, why in ha._guard_said}
     assert sent == ['id -u'], (sent, r.data[:300])
-    assert r.status_code == 500 and _ha.GUARD_NO_LEASE in said
+    assert r.status_code == 503 and r.get_json()['code'] == 'HA_NO_LEASE'
+    assert _ha.GUARD_NO_LEASE in said
 
 
 def test_in_a_manual_group_the_reboot_goes_out_as_before(api, seed, monkeypatch):

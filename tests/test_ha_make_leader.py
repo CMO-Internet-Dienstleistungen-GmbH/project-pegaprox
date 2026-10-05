@@ -325,16 +325,18 @@ def test_every_restart_an_admin_asks_for_holds_the_lease_first():
     path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         'pegaprox', 'api', 'settings.py')
     tree = ast.parse(open(path, encoding='utf-8').read())
+    # systemctl is asked in _restart_through_systemd, the way in place is ha.leave_process
+    enders = ('os._exit', 'os.execv', 'subprocess.run', '_restart_through_systemd', 'ha.leave_process')
     found = 0
     for fn in ast.walk(tree):
         if not (isinstance(fn, ast.FunctionDef) and fn.name in ('restart_server', 'do_restart')):
             continue
         calls = [c for c in ast.walk(fn) if isinstance(c, ast.Call)]
         names = [ast.unparse(c.func) for c in calls]
-        if not any(n in ('os._exit', 'os.execv', 'subprocess.run') for n in names):
+        if not any(n in enders for n in names):
             continue
         found += 1
         held = min(c.lineno for c in calls if ast.unparse(c.func) == 'ha.planned_restart')
-        ends = [c.lineno for c in calls if ast.unparse(c.func) in ('os._exit', 'os.execv', 'subprocess.run')]
+        ends = [c.lineno for c in calls if ast.unparse(c.func) in enders]
         assert held < min(ends), fn.name
     assert found >= 3

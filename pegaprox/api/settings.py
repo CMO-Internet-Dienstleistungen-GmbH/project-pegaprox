@@ -343,6 +343,55 @@ def _managed_update_command(method):
     }.get(method, '')
 
 
+# MK Oct 2026 - the update, the rollback and the restart button hand the restart to
+# `systemctl restart pegaprox` only when this process runs in that unit. A second
+# PegaProx on the host (a test instance started by hand, one in a unit of another name)
+# restarted the other one that way and went on as it was.
+_SERVICE_UNIT = 'pegaprox.service'
+_CGROUP_FILE = '/proc/self/cgroup'
+
+
+def _in_service_unit():
+    """Whether the kernel lists this process in the cgroup of pegaprox.service, in the
+    hierarchy systemd keeps its units in (cgroup v2, or name=systemd under v1). False
+    where that cannot be read."""
+    try:
+        with open(_CGROUP_FILE, encoding='utf-8') as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        parts = line.split(':', 2)
+        if len(parts) == 3 and parts[1] in ('', 'name=systemd') and _SERVICE_UNIT in parts[2].split('/'):
+            return True
+    return False
+
+
+def _restart_through_systemd():
+    """True once systemctl restarted the unit, False where the caller restarts in place
+    (ha.leave_process): not this process's unit, not active, or no root and no
+    password-less sudo (the unit of the .deb runs with NoNewPrivileges)."""
+    if not _in_service_unit():
+        logging.info(f"This process does not run in {_SERVICE_UNIT}, so that unit is left alone")
+        return False
+    is_root = os.geteuid() == 0 if hasattr(os, 'geteuid') else False
+    has_sudo = shutil.which('sudo') is not None
+    try:
+        result = subprocess.run(['systemctl', 'is-active', 'pegaprox'],
+                                capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            if is_root:
+                subprocess.run(['systemctl', 'restart', 'pegaprox'], capture_output=True, timeout=30)
+                return True
+            if has_sudo:
+                result = subprocess.run(['sudo', '-n', 'systemctl', 'restart', 'pegaprox'],
+                                        capture_output=True, text=True, timeout=30)
+                return result.returncode == 0
+    except Exception:
+        pass
+    return False
+
+
 @bp.route('/api/pegaprox/check-update', methods=['GET'])
 @require_auth(perms=['update.manage'])
 def check_pegaprox_update():
@@ -922,30 +971,13 @@ def perform_pegaprox_update():
             logging.info("Restarting PegaProx server...")
             # the leader of an automatic group: the members hold its lease meanwhile (#625)
             ha.planned_restart(f'update to {new_version}')
+            if _restart_through_systemd():
+                return
 
-            is_root = os.geteuid() == 0 if hasattr(os, 'geteuid') else False
-            has_sudo = shutil.which('sudo') is not None
-
-            try:
-                result = subprocess.run(['systemctl', 'is-active', 'pegaprox'],
-                                       capture_output=True, text=True, timeout=5)
-                if result.returncode == 0:
-                    if is_root:
-                        subprocess.run(['systemctl', 'restart', 'pegaprox'], timeout=30)
-                        return
-                    elif has_sudo:
-                        result = subprocess.run(
-                            ['sudo', '-n', 'systemctl', 'restart', 'pegaprox'],
-                            capture_output=True, text=True, timeout=30)
-                        if result.returncode == 0:
-                            return
-
-            except:
-                pass
-
-            # systemctl could not do it (no root, no sudo - the unit of the .deb runs with
-            # NoNewPrivileges): the process restarts itself (ha.leave_process), it never
-            # just exits 0, which a unit with Restart=on-failure leaves stopped
+            # systemctl could not do it (not our unit, no root, no sudo - the unit of the
+            # .deb runs with NoNewPrivileges): the process restarts itself
+            # (ha.leave_process), it never just exits 0, which a unit with
+            # Restart=on-failure leaves stopped
             logging.info("Restarting in place...")
             ha.leave_process()
 
@@ -1096,25 +1128,8 @@ def rollback_pegaprox_update():
         def restart_server():
             time.sleep(3)
             ha.planned_restart(f'rollback to {backup_name}')
-            is_root = os.geteuid() == 0 if hasattr(os, 'geteuid') else False
-            has_sudo = shutil.which('sudo') is not None
-            
-            try:
-                result = subprocess.run(['systemctl', 'is-active', 'pegaprox'], 
-                                       capture_output=True, text=True, timeout=5)
-                if result.returncode == 0:
-                    if is_root:
-                        subprocess.run(['systemctl', 'restart', 'pegaprox'], timeout=30)
-                        return
-                    elif has_sudo:
-                        result = subprocess.run(
-                            ['sudo', '-n', 'systemctl', 'restart', 'pegaprox'],
-                            capture_output=True, text=True, timeout=30
-                        )
-                        if result.returncode == 0:
-                            return
-            except:
-                pass
+            if _restart_through_systemd():
+                return
             # as after an update: never a plain exit 0
             logging.info("Restarting in place...")
             ha.leave_process()
@@ -2007,28 +2022,9 @@ def restart_server():
             time.sleep(1)  # Give time for response to be sent
             logging.info("Server restart initiated by admin")
             ha.planned_restart(f'restart asked for by {user}')
-            
-            is_root = os.geteuid() == 0 if hasattr(os, 'geteuid') else False
-            has_sudo = shutil.which('sudo') is not None
-            
-            try:
-                result = subprocess.run(['systemctl', 'is-active', 'pegaprox'],
-                                       capture_output=True, text=True, timeout=5)
-                if result.returncode == 0:
-                    if is_root:
-                        subprocess.run(['systemctl', 'restart', 'pegaprox'], 
-                                      capture_output=True, timeout=30)
-                        return
-                    elif has_sudo:
-                        result = subprocess.run(
-                            ['sudo', '-n', 'systemctl', 'restart', 'pegaprox'],
-                            capture_output=True, text=True, timeout=30
-                        )
-                        if result.returncode == 0:
-                            return
-            except Exception:
-                pass
-            
+            if _restart_through_systemd():
+                return
+
             # systemctl could not do it: restart in place (never a plain exit 0, which a
             # unit with Restart=on-failure leaves stopped)
             logging.info("Restarting in place...")
