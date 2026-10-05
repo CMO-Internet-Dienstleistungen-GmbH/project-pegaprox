@@ -14,7 +14,7 @@ jobs:
 
     steps:
       - name: Check out Testing
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
@@ -57,10 +57,13 @@ jobs:
 
               echo "Snapshot version: ${FULL_VERSION}"
 
+              # NS Oct 2026 - without DEBEMAIL dch warns and reads a line from stdin,
+              # and stdin is the rest of this script: bash stopped after dch with
+              # exit 0 and the upload found no .deb (#973).
               dch \
                 --force-bad-version \
                 --newversion "${FULL_VERSION}" \
-                "Automated snapshot build for commit ${COMMIT_SHA}."
+                "Automated snapshot build for commit ${COMMIT_SHA}." </dev/null
 
               dpkg-buildpackage -us -uc
 
@@ -72,7 +75,7 @@ jobs:
           EOF
 
       - name: Upload Debian snapshot package
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: debian-package-${{ github.sha }}
           path: package/*.deb
