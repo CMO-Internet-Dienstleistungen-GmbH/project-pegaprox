@@ -8139,6 +8139,118 @@
             );
         }
 
+        // jsPDF's Helvetica has no glyph for these, so an evidence PDF gets plain ones
+        function pdfSafeText(s) {
+            return String(s ?? '')
+                .replace(/[≥]/g, '>=').replace(/[≤]/g, '<=')
+                .replace(/[→]/g, '->').replace(/[·]/g, '*')
+                .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, '');
+        }
+
+        function fillText(s, vals) {
+            return Object.entries(vals).reduce((out, [k, v]) => out.split(`{${k}}`).join(String(v)), s);
+        }
+
+        // LW Oct 2026 - one boot screenshot of a test failover. The picture has a route of its
+        // own that asks vm.console like the console tile does, so one the viewer may not see
+        // (or one no longer kept) says why instead of showing nothing
+        function SrBootShot({ planId, eventId, row, authFetch, t }) {
+            const [src, setSrc] = useState(null);
+            const [why, setWhy] = useState('');
+            useEffect(() => {
+                let gone = false, url = null;
+                (async () => {
+                    try {
+                        const r = await authFetch(`${API_URL}/site-recovery/plans/${planId}/events/${eventId}/screenshots/${row.vmid}`);
+                        if (gone) return;
+                        if (r && r.ok) {
+                            const blob = await r.blob();
+                            if (gone) return;
+                            url = URL.createObjectURL(blob);
+                            setSrc(url);
+                        } else {
+                            setWhy(r?.status === 403 ? t('srShotsNoPermission') : r?.status === 404 ? t('srShotsGone') : t('srShotsLoadFailed'));
+                        }
+                    } catch (e) {
+                        if (!gone) setWhy(t('srShotsLoadFailed'));
+                    }
+                })();
+                return () => { gone = true; if (url) URL.revokeObjectURL(url); };
+            }, [planId, eventId, row.vmid]);
+            return (
+                <figure className="bg-proxmox-dark border border-proxmox-border rounded-lg overflow-hidden" data-sr-shot={row.vmid}>
+                    <div className="bg-black flex items-center justify-center h-40">
+                        {src ? <img src={src} alt={`${row.vmid} ${row.vm_name || ''}`} className="max-w-full max-h-40 object-contain" />
+                            : why ? <span className="text-xs text-gray-500 px-3 text-center" data-sr-shot-why="">{why}</span>
+                            : <span className="w-4 h-4 border-2 border-gray-500/30 border-t-transparent rounded-full animate-spin"></span>}
+                    </div>
+                    <figcaption className="px-2 py-1.5 text-xs space-y-0.5">
+                        <div className="flex items-center gap-2 min-w-0">
+                            <span className="font-mono text-gray-400">{row.vmid}</span>
+                            <span className="text-gray-300 truncate">{row.vm_name || '-'}</span>
+                            <span className="ml-auto font-mono text-gray-500" title={t('srTestVmid')}>{row.test_vmid}</span>
+                        </div>
+                        <div className="text-gray-500">{fillText(t('srShotsTiming'), { s: row.after_boot_s ?? '-', ms: row.ms ?? '-' })}</div>
+                    </figcaption>
+                </figure>
+            );
+        }
+
+        // the boot screenshots of one test failover event, what was taken and why the rest was not
+        function SrBootShots({ planId, ev, authFetch, t, onPdf }) {
+            const shots = ev.details?.screenshots;
+            if (!shots) return null;
+            const rows = shots.guests || [];
+            const taken = rows.filter(r => r.status === 'ok');
+            const missed = rows.filter(r => r.status !== 'ok');
+            return (
+                <div className="border-t border-proxmox-border p-3 space-y-3" data-sr-shots={ev.id} data-sr-shots-state={shots.state}>
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                        <div className="flex items-center gap-2 text-sm text-gray-300 flex-wrap">
+                            <span className="text-gray-400"><Icons.Camera /></span>
+                            <span className="font-medium">{t('srShotsTitle')}</span>
+                            {shots.state === 'done' && (
+                                <span className="text-xs text-gray-500" data-sr-shots-summary="">
+                                    {fillText(t('srShotsSummary'), { taken: shots.taken ?? 0, failed: shots.failed ?? 0,
+                                        skipped: shots.skipped ?? 0, s: Math.round((shots.total_ms || 0) / 1000) })}
+                                </span>
+                            )}
+                        </div>
+                        {shots.state !== 'capturing' && onPdf && (
+                            <button onClick={onPdf} data-sr-shots-pdf=""
+                                className="px-3 py-1.5 text-xs rounded-lg bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white flex items-center gap-1.5">
+                                <Icons.Download />{t('drDrillExportPdf')}
+                            </button>
+                        )}
+                    </div>
+                    {shots.state === 'capturing' && (
+                        <div className="flex items-center gap-2 text-xs text-blue-300">
+                            <span className="w-3 h-3 border-2 border-blue-500/40 border-t-transparent rounded-full animate-spin"></span>
+                            {t('srShotsCapturing')}
+                        </div>
+                    )}
+                    {shots.state === 'interrupted' && <p className="text-xs text-yellow-400">{t('srShotsInterrupted')}</p>}
+                    {taken.length > 0 && (
+                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                            {taken.map(r => <SrBootShot key={r.vmid} planId={planId} eventId={ev.id} row={r} authFetch={authFetch} t={t} />)}
+                        </div>
+                    )}
+                    {missed.length > 0 && (
+                        <ul className="space-y-1 text-xs">
+                            {missed.map(r => (
+                                <li key={r.vmid} className="flex items-start gap-2" data-sr-shot-missed={r.vmid}>
+                                    <span className={r.status === 'failed' ? 'text-red-400' : 'text-gray-500'}>{r.status === 'failed' ? t('failed') : t('skipped')}</span>
+                                    <span className="font-mono text-gray-400">{r.vmid}</span>
+                                    <span className="text-gray-300">{r.vm_name || '-'}</span>
+                                    <span className="text-gray-500 break-all">{r.reason}</span>
+                                </li>
+                            ))}
+                        </ul>
+                    )}
+                </div>
+            );
+        }
+
         // NS: Mar 2026 - Site Recovery tab component (#150)
         function SiteRecoveryTab({ clusters, selectedCluster, authFetch, addToast, t, isCorporate, srProgress, user }) {
             // like can(): a standby reads the plans and changes none of them (#625)
@@ -8201,6 +8313,14 @@
             useEffect(() => { fetchPlans(); }, []);
             useEffect(() => { if (selectedPlan) { fetchPlanDetail(selectedPlan); setSrSubTab('overview'); } else setPlanDetail(null); }, [selectedPlan]);
             useEffect(() => { if (selectedPlan && srSubTab === 'events') fetchEvents(selectedPlan); }, [srSubTab, selectedPlan]);
+            // a test's boot screenshots arrive after its event completed: while one of the
+            // listed tests still takes them, read the list again every few seconds
+            const shotsPending = srSubTab === 'events' && events.some(ev => ev.details?.screenshots?.state === 'capturing');
+            useEffect(() => {
+                if (!shotsPending || !selectedPlan) return;
+                const timer = setTimeout(() => fetchEvents(selectedPlan), 5000);
+                return () => clearTimeout(timer);
+            }, [shotsPending, events, selectedPlan]);
 
             // LW: fetch source VMs + replication jobs when VMs tab opens
             useEffect(() => {
@@ -8365,10 +8485,7 @@
                     addToast('PDF library not loaded', 'error');
                     return;
                 }
-                const safe = (s) => String(s ?? '')
-                    .replace(/[≥]/g, '>=').replace(/[≤]/g, '<=')
-                    .replace(/[→]/g, '->').replace(/[·]/g, '*')
-                    .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, '');
+                const safe = pdfSafeText;
                 const verdict = (s) => ({pass: 'PASS', warn: 'WARN', fail: 'FAIL'}[s] || s);
                 const blocks = [];
                 blocks.push({
@@ -8430,6 +8547,99 @@
                 } catch (e) {
                     console.error('[DR Drill PDF]', e);
                     addToast('PDF export failed', 'error');
+                }
+            };
+            // LW Oct 2026 - the evidence of one test failover: which guests came up on the target,
+            // and the boot screenshot of each with the time it took (background/sr_boot_shots.py)
+            const shotForPdf = async (planId, eventId, vmid) => {
+                const r = await authFetch(`${API_URL}/site-recovery/plans/${planId}/events/${eventId}/screenshots/${vmid}`);
+                if (!(r && r.ok)) {
+                    return { why: r?.status === 403 ? t('srShotsNoPermission') : r?.status === 404 ? t('srShotsGone') : t('srShotsLoadFailed') };
+                }
+                const blob = await r.blob();
+                const dataUrl = await new Promise((resolve, reject) => {
+                    const fr = new FileReader();
+                    fr.onload = () => resolve(fr.result);
+                    fr.onerror = reject;
+                    fr.readAsDataURL(blob);
+                });
+                const size = await new Promise(resolve => {
+                    const img = new Image();
+                    img.onload = () => resolve({ w: img.naturalWidth || 4, h: img.naturalHeight || 3 });
+                    img.onerror = () => resolve({ w: 4, h: 3 });
+                    img.src = dataUrl;
+                });
+                return { dataUrl, ...size };
+            };
+            const exportTestPdf = async (ev) => {
+                if (typeof generatePegaProxPDF !== 'function') { addToast(t('srTestPdfFailed'), 'error'); return; }
+                const pd = planDetail || {};
+                const safe = pdfSafeText;
+                const shots = ev.details?.screenshots || {};
+                const rows = shots.guests || [];
+                const results = ev.details?.results || {};
+                const counts = ev.details?.counts || {};
+                const nameOf = (vmid) => rows.find(r => String(r.vmid) === String(vmid))?.vm_name
+                    || (pd.vms || []).find(v => String(v.vmid) === String(vmid))?.vm_name || '-';
+                const timing = (r) => fillText(t('srShotsTiming'), { s: r.after_boot_s ?? '-', ms: r.ms ?? '-' });
+                const summary = fillText(t('srShotsSummary'), { taken: shots.taken ?? 0, failed: shots.failed ?? 0,
+                    skipped: shots.skipped ?? 0, s: Math.round((shots.total_ms || 0) / 1000) });
+                const blocks = [
+                    { type: 'stats', data: [
+                        { value: `${counts.ok ?? 0}/${counts.total ?? 0}`, label: safe(t('srTestPdfStarted')), color: '#16a34a' },
+                        { value: String(shots.taken ?? 0), label: safe(t('srShotsTitle')), color: '#3b82f6' },
+                        { value: String(shots.failed ?? 0), label: safe(t('failed')), color: '#dc2626' },
+                        { value: String(shots.skipped ?? 0), label: safe(t('skipped')), color: '#6b7280' },
+                    ] },
+                    { type: 'spacer', height: 4 },
+                    { type: 'text', value: safe([
+                        `${t('planName')}: ${pd.name || ''}`,
+                        `${t('sourceCluster')}: ${getClusterName(pd.source_cluster)}`,
+                        `${t('targetCluster')}: ${getClusterName(pd.target_cluster)}`,
+                        `${t('startTime')}: ${ev.started_at || ''}`,
+                        `${t('endTime')}: ${ev.completed_at || ''}`,
+                        `${t('status')}: ${(ev.status || '').toUpperCase()}`,
+                        `${t('srShotsTitle')}: ${summary}`,
+                    ].join('\n')) },
+                    { type: 'spacer', height: 4 },
+                    { type: 'table', title: safe(t('srTestPdfResults')),
+                      columns: [t('vmid'), t('name'), t('srTestVmid'), t('status'), t('error')].map(safe),
+                      rows: Object.entries(results).map(([vmid, r]) => [vmid, safe(nameOf(vmid)), String(r.test_vmid ?? '-'),
+                          r.success ? 'OK' : safe(t('failed')), safe(r.error || '-')]) },
+                ];
+                if (rows.length) {
+                    blocks.push({ type: 'table', title: safe(t('srShotsTitle')),
+                        columns: [t('vmid'), t('name'), t('srTestVmid'), t('status'), t('srShotsAfterStart'),
+                                  t('srShotsGrabTime'), t('size'), t('details')].map(safe),
+                        rows: rows.map(r => [String(r.vmid), safe(r.vm_name || '-'), String(r.test_vmid ?? '-'),
+                            r.status === 'ok' ? 'OK' : safe(r.status === 'failed' ? t('failed') : t('skipped')),
+                            r.after_boot_s != null ? `${r.after_boot_s} s` : '-', r.ms != null ? `${r.ms} ms` : '-',
+                            r.bytes ? `${Math.round(r.bytes / 1024)} KB` : '-', safe(r.reason || '-')]) });
+                }
+                // one after another: at most the cap of a test, and each is a few hundred KB
+                for (const r of rows.filter(x => x.status === 'ok')) {
+                    let shot;
+                    try { shot = await shotForPdf(pd.id, ev.id, r.vmid); } catch (e) { shot = { why: t('srShotsLoadFailed') }; }
+                    const caption = `${r.vmid} ${r.vm_name || ''} -> ${r.test_vmid}: ${timing(r)}`;
+                    blocks.push({ type: 'spacer', height: 4 });
+                    if (shot.dataUrl) {
+                        blocks.push({ type: 'image', dataUrl: shot.dataUrl, caption: safe(caption), width: 120, height: 120 * shot.h / shot.w });
+                    } else {
+                        blocks.push({ type: 'text', value: safe(`${caption}\n${shot.why}`) });
+                    }
+                }
+                try {
+                    await generatePegaProxPDF({
+                        title: safe(t('srTestPdfTitle')),
+                        subtitle: safe(`${pd.name || ''} - ${ev.status || ''}`),
+                        clusterName: '',
+                        filename: `pegaprox-dr-test-${pd.id || 'plan'}-${String(ev.started_at || '').slice(0, 10)}.pdf`,
+                        content: blocks,
+                        orientation: 'portrait',
+                    });
+                } catch (e) {
+                    console.error('[DR Test PDF]', e);
+                    addToast(t('srTestPdfFailed'), 'error');
                 }
             };
             // add VM
@@ -8631,6 +8841,9 @@
                                                     <span className={`px-2 py-0.5 rounded text-xs ${statusColors[ev.status] || ''}`}>{ev.status}</span>
                                                     <span className="text-xs text-gray-500">{fmtDate(ev.started_at)}</span>
                                                     {dur !== null && <span className="text-xs text-gray-600">{dur < 60 ? `${dur}s` : `${Math.floor(dur/60)}m ${dur%60}s`}</span>}
+                                                    {ev.details?.screenshots?.taken > 0 && (
+                                                        <span className="text-xs text-gray-500" data-sr-shots-badge={ev.id}>{t('srShotsTitle')}: {ev.details.screenshots.taken}</span>
+                                                    )}
                                                 </div>
                                                 <span className="text-xs text-gray-500">{ev.triggered_by}</span>
                                             </div>
@@ -8647,6 +8860,9 @@
                                                         ))}</tbody>
                                                     </table>
                                                 </div>
+                                            )}
+                                            {expandedEvent === ev.id && (
+                                                <SrBootShots planId={pd.id} ev={ev} authFetch={authFetch} t={t} onPdf={() => exportTestPdf(ev)} />
                                             )}
                                         </div>
                                     );

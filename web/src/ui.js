@@ -166,7 +166,16 @@
                     const imgW = Math.min(block.width || contentW, contentW);
                     const ratio = (block.height || 100) / (block.width || contentW);
                     const imgH = imgW * ratio;
-                    addPageIfNeeded(imgH + 4);
+                    // LW Oct 2026 - a caption goes on the page of its picture, above it
+                    const capLines = block.caption ? doc.splitTextToSize(block.caption, contentW) : [];
+                    addPageIfNeeded(imgH + 4 + capLines.length * 4);
+                    if (capLines.length) {
+                        doc.setFont('helvetica', 'normal');
+                        doc.setFontSize(9);
+                        doc.setTextColor(60, 60, 60);
+                        doc.text(capLines, margin, y + 4);
+                        y += capLines.length * 4 + 2;
+                    }
                     try { doc.addImage(block.dataUrl, 'JPEG', margin, y, imgW, imgH); } catch(e) {}
                     y += imgH + 4;
                 }
