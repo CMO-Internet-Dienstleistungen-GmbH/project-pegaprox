@@ -545,15 +545,53 @@
             );
         }
 
+        // LW Oct 2026 - the field of a guest a search hit came from, when it is not the name
+        const SEARCH_INDEX_FIELDS = ['ip', 'mac', 'notes'];
+        function searchMatchLabel(t, field) {
+            if (field === 'mac') return t('searchMatchMac');
+            if (field === 'ip') return t('searchMatchIp');
+            if (field === 'notes') return t('searchMatchNotes');
+            return field;
+        }
+
         // LW Apr 2026 — Global command palette. Opens on Ctrl/Cmd+K.
         // Indexes: clusters, VMs, storage (from resources), and a curated action list.
         // Keyboard-first: ↑/↓ to move, enter to pick, esc to close.
         function CommandPalette({ t, clusters, clusterResources, clusterMetrics, selectedCluster,
-                                   onClose, onPickCluster, onPickVm, onAction }) {
+                                   onClose, onPickCluster, onPickVm, onAction, authFetch, onPickHit }) {
             const [query, setQuery] = useState('');
             const [highlight, setHighlight] = useState(0);
             const inputRef = useRef(null);
             useEffect(() => { inputRef.current?.focus(); }, []);
+
+            // LW Oct 2026 - MAC addresses, IPs and notes are not in the loaded resources: the
+            // server's search index has them, for every cluster the user may see. Asked once
+            // the typing pauses; an answer to an older query is dropped
+            const [remote, setRemote] = useState({ q: '', hits: [] });
+            const [remoteLoading, setRemoteLoading] = useState(false);
+            useEffect(() => {
+                const q = query.trim();
+                if (q.length < 2 || !authFetch) {
+                    setRemote({ q: '', hits: [] });
+                    setRemoteLoading(false);
+                    return;
+                }
+                const ctrl = new AbortController();
+                setRemoteLoading(true);
+                const timer = setTimeout(async () => {
+                    const res = await authFetch(`${API_URL}/global/search?q=${encodeURIComponent(q)}&type=all`, { signal: ctrl.signal });
+                    if (ctrl.signal.aborted) return;
+                    let hits = [];
+                    if (res && res.ok) {
+                        const data = await res.json().catch(() => null);
+                        hits = ((data && data.results) || []).filter(h => h.vmid != null && SEARCH_INDEX_FIELDS.includes(h.match_field));
+                    }
+                    if (ctrl.signal.aborted) return;
+                    setRemote({ q, hits });
+                    setRemoteLoading(false);
+                }, 250);
+                return () => { clearTimeout(timer); ctrl.abort(); };
+            }, [query, authFetch]);
 
             // Base catalog — regenerated whenever inputs change
             const catalog = React.useMemo(() => {
@@ -631,9 +669,26 @@
                     if (tokens.length > 1 && tokens.every(tok => (t1 + ' ' + t2).includes(tok))) s += 30;
                     if (s > 0) scored.push({...item, score: s});
                 }
+                // the server's hits by MAC, IP or notes, after the name hits; a guest of the
+                // open cluster that already matched here is not listed twice
+                if (remote.q === query.trim()) {
+                    const here = new Set(scored.filter(i => i.kind === 'vm').map(i => i.id));
+                    remote.hits.forEach(h => {
+                        if (h.cluster_id === selectedCluster?.id && here.has(`vm-${h.vmid}`)) return;
+                        scored.push({
+                            kind: 'vm', id: `hit-${h.cluster_id}-${h.vmid}`,
+                            title: h.name || `${h.type === 'ct' ? 'CT' : 'VM'} ${h.vmid}`,
+                            subtitle: [`VMID ${h.vmid}`, h.node, h.cluster_name || h.cluster_id].filter(Boolean).join(' · '),
+                            icon: h.type === 'ct' ? 'Container' : 'VM',
+                            score: 20,
+                            match: { field: h.match_field, value: h.match_value || '', net: h.match_net || '' },
+                            pick: () => onPickHit && onPickHit(h),
+                        });
+                    });
+                }
                 scored.sort((a, b) => b.score - a.score);
                 return scored.slice(0, 50);
-            }, [query, catalog]);
+            }, [query, catalog, remote, selectedCluster, onPickHit]);
 
             // reset highlight on query change
             useEffect(() => { setHighlight(0); }, [query]);
@@ -697,6 +752,16 @@
                                         <div className="flex-1 min-w-0">
                                             <div className="text-sm text-white truncate">{r.title}</div>
                                             <div className="text-xs text-gray-500 truncate">{r.subtitle}</div>
+                                            {r.match && (
+                                                <div className="flex items-center gap-1.5 mt-0.5 min-w-0" data-cmdpal-match={r.match.field}>
+                                                    <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-400 flex-shrink-0">
+                                                        {searchMatchLabel(t, r.match.field)}
+                                                    </span>
+                                                    <span className={`text-xs text-gray-300 truncate ${r.match.field === 'notes' ? '' : 'font-mono'}`}>
+                                                        {r.match.value}{r.match.net ? ` (${r.match.net})` : ''}
+                                                    </span>
+                                                </div>
+                                            )}
                                         </div>
                                         <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded"
                                               style={{color: kindColor, background: `${kindColor}15`}}>{r.kind}</span>
@@ -707,6 +772,11 @@
                         <div className="border-t border-proxmox-border px-3 py-1.5 text-[11px] text-gray-500 flex items-center gap-4">
                             <span><kbd className="px-1.5 py-0.5 rounded bg-proxmox-dark border border-proxmox-border">↑</kbd> <kbd className="px-1.5 py-0.5 rounded bg-proxmox-dark border border-proxmox-border">↓</kbd> {t('navigate') || 'navigate'}</span>
                             <span><kbd className="px-1.5 py-0.5 rounded bg-proxmox-dark border border-proxmox-border">↵</kbd> {t('select') || 'select'}</span>
+                            {remoteLoading ? (
+                                <span data-cmdpal-searching>{t('cmdPalSearchingIndex')}</span>
+                            ) : !query.trim() && (
+                                <span>{t('cmdPalIndexHint')}</span>
+                            )}
                             <span className="ml-auto">{results.length} {t('results') || 'results'}</span>
                         </div>
                     </div>
@@ -16900,6 +16970,12 @@
                                                                             {result.match_field === 'tag' && (
                                                                                 <span className="px-1.5 py-0.5 text-xs rounded bg-purple-500/20 text-purple-400">Tag-Match</span>
                                                                             )}
+                                                                            {/* LW Oct 2026 - a hit by MAC, notes or an address other than the one shown below */}
+                                                                            {SEARCH_INDEX_FIELDS.includes(result.match_field) && result.match_value && result.match_value !== result.ip && (
+                                                                                <span className="px-1.5 py-0.5 text-xs rounded bg-purple-500/20 text-purple-400 truncate max-w-full" data-search-match={result.match_field}>
+                                                                                    {searchMatchLabel(t, result.match_field)}: {result.match_value}{result.match_net ? ` (${result.match_net})` : ''}
+                                                                                </span>
+                                                                            )}
                                                                         </div>
                                                                         <div className="text-xs text-gray-500 flex items-center gap-2 mt-0.5">
                                                                             <span>{result.cluster_name}</span>
@@ -27555,6 +27631,8 @@
                             clusterMetrics={clusterMetrics}
                             selectedCluster={selectedCluster}
                             onClose={() => setShowCommandPalette(false)}
+                            authFetch={authFetch}
+                            onPickHit={(hit) => { setShowCommandPalette(false); navigateToResult(hit); }}
                             onPickCluster={(c) => { setSelectedCluster(c); setActiveTab('overview'); setShowCommandPalette(false); }}
                             onPickVm={(vm) => {
                                 const c = clusters.find(cl => cl.id === vm._clusterId);
