@@ -30993,6 +30993,36 @@
         ]
       }
     },
+    "/api/pegaprox/openapi.json": {
+      "get": {
+        "operationId": "settings.get_openapi_description_get",
+        "tags": [
+          "settings"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          }
+        },
+        "summary": "The OpenAPI 3.1 description of this instance's API",
+        "description": "Generated from the live route table: every path and method, its parameters and the\npermission it demands. The same document as docs/openapi.json, for this version.",
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ]
+      }
+    },
     "/api/pegaprox/security/status": {
       "get": {
         "operationId": "settings.get_security_status_get",

@@ -25,6 +25,19 @@ application, so it cannot quietly disagree with the code:
 | `x-pegaprox-permissions`, `x-pegaprox-roles` | the `require_auth` decorator |
 | `x-pegaprox-auth` | see below |
 
+Every instance also serves it, built from its own route table, to anyone signed
+in (a session or an API token):
+
+```
+GET /api/pegaprox/openapi.json
+```
+
+The web UI renders that document under user menu > API reference: every route by
+area with its method, path, permission, parameters and description, with a search
+that also takes a URL copied from the browser (`/api/clusters/c1/vms` finds
+`/api/clusters/{cluster_id}/vms`). It only reads; nothing there sends a request to
+the routes it lists.
+
 `tests/test_openapi_matches_the_routes.py` regenerates the description and
 compares it to the committed file, including the permissions. Add a route, remove
 one, or change what a route demands, and that test goes red until the file is

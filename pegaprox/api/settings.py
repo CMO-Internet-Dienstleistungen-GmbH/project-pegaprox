@@ -109,6 +109,35 @@ def get_pegaprox_version():
     })
 
 
+# MK Oct 2026 - the API reference in the user menu reads this. Built from the route
+# table of the running app (cli/gen_openapi.py) instead of docs/openapi.json: the
+# Docker image has no docs/, and this way it is exactly what this instance answers.
+# The table is fixed once the app is up, so the document is built once per process.
+_openapi_doc = {}
+
+
+def _openapi_json(app):
+    key = (id(app), PEGAPROX_VERSION, sum(1 for _ in app.url_map.iter_rules()))
+    body = _openapi_doc.get(key)
+    if body is None:
+        from pegaprox.cli.gen_openapi import spec
+        body = json.dumps(spec(app, PEGAPROX_VERSION), ensure_ascii=False, separators=(',', ':'))
+        _openapi_doc.clear()
+        _openapi_doc[key] = body
+    return body
+
+
+@bp.route('/api/pegaprox/openapi.json', methods=['GET'])
+@require_auth()
+def get_openapi_description():
+    """The OpenAPI 3.1 description of this instance's API
+
+    Generated from the live route table: every path and method, its parameters and the
+    permission it demands. The same document as docs/openapi.json, for this version."""
+    from flask import current_app
+    return Response(_openapi_json(current_app._get_current_object()), mimetype='application/json')
+
+
 # NS: Military Grade Encryption Status & Migration - Jan 2026
 @bp.route('/api/pegaprox/security/status', methods=['GET'])
 @require_auth(perms=['security.settings.manage'])
