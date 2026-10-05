@@ -263,6 +263,9 @@ FORWARDED_READS = LEADER_ONLY_READS | XCPNG_TASK_READS | frozenset((
     '/api/site-recovery/plans/<plan_id>/drills',
     '/api/site-recovery/plans/<plan_id>/events',
     '/api/clusters/<cluster_id>/snapshot-policies/<pid>/runs',
+    # a bulk migration runs in the process of the instance that started it (#952)
+    '/api/bulk-migrations',
+    '/api/bulk-migrations/<run_id>',
 ))
 # The one rule every plugin route is served behind (api/plugins.py plugin_proxy). A
 # plugin handler serves every method from one function and most never look at which

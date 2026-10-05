@@ -14298,10 +14298,149 @@
             "description": "Insufficient permissions"
           }
         },
-        "summary": "Migrate multiple VMs at once",
+        "summary": "Migrate several guests to one node",
+        "description": "Body: vms (a list of {vmid, node, type}), target, online (default true).\n\nWith mode the migrations run on the server as a bulk run (#952) and the answer is the\nrun (202, {run}), to follow with GET /api/bulk-migrations/<run_id>:\n- mode: sequential (one guest after another: the next starts when the migration\n  task before it has ended), parallel (`parallel` at a time, 2-5) or all (every\n  migration starts at once and nobody waits for them)\n- with_local_disks: (VMs) move local disks along\nA guest that is not on the cluster or out of the caller's reach refuses the request\n(400); one an enforced affinity rule keeps off the target, one already there and one\nanother running run still moves are listed as skipped.\n\nWithout mode every migration starts at once, and the answer lists what Proxmox said\nto each start.",
         "parameters": [
           {
             "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "vm.migrate"
+        ]
+      }
+    },
+    "/api/bulk-migrations": {
+      "get": {
+        "operationId": "vms.list_bulk_migrations_get",
+        "tags": [
+          "vms"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Bulk migrations of the last hour",
+        "description": "The runs on the clusters the caller reaches, newest first, with their counts and\nwithout the guests. A run counts only the guests the caller may see. They run in the\nprocess of the active instance: a restart ends them.",
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "vm.view"
+        ]
+      }
+    },
+    "/api/bulk-migrations/{run_id}": {
+      "get": {
+        "operationId": "vms.get_bulk_migration_get",
+        "tags": [
+          "vms"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "One bulk migration, a line per guest",
+        "description": "Each guest with its state (wait, migrating, done, started, failed, skipped, cancelled,\nunknown), a note, its task and the node it went to; may_cancel says whether the\ncaller may cancel the rest.",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "vm.view"
+        ]
+      }
+    },
+    "/api/bulk-migrations/{run_id}/cancel": {
+      "post": {
+        "operationId": "vms.cancel_bulk_migration_post",
+        "tags": [
+          "vms"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Cancel the rest of a bulk migration",
+        "description": "No further guest starts. What is migrating finishes in Proxmox; the guests not\nstarted stay where they are.",
+        "parameters": [
+          {
+            "name": "run_id",
             "in": "path",
             "required": true,
             "schema": {

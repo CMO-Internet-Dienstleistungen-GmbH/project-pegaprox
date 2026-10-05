@@ -3575,6 +3575,20 @@ class PegaProxManager:
         self.logger.error(f"Task {task_id} timed out after {timeout} seconds")
         return False
 
+    def get_task_status(self, node: str, upid: str):
+        """One read of a task's status as Proxmox has it ({status, exitstatus, type, ...}),
+        None when it cannot be read. The bulk migrations follow their tasks with it (#952)."""
+        if not validate_hostname(node or '') or not re.fullmatch(r'UPID:[^/?#%\s]{1,400}', upid or ''):
+            return None
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/tasks/{upid}/status"
+            response = self._api_get(url)
+            if response is not None and response.status_code == 200:
+                return response.json().get('data') or None
+        except Exception as e:
+            self.logger.debug(f"task status of {upid} unreadable: {e}")
+        return None
+
     def _vm_has_migrate_lock(self, node, vmid, vm_type):
         """#647: best-effort check whether a guest still holds a 'migrate' lock on
         `node`. On any error we assume it might still be locked (return True) so the

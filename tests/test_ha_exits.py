@@ -755,6 +755,8 @@ AUTOMATIONS = {
     ('pegaprox/background/syslog_server.py', 'start_syslog_server'): (1, 'local'),
     ('pegaprox/core/backup_verify.py', 'start_verification.run'): (1, 'read'),
     ('pegaprox/core/backup_verify.py', 'start_verification'): (1, 'job'),
+    # a bulk migration of a user, one guest after another (#952)
+    ('pegaprox/core/bulk_migrate.py', 'launch'): (1, 'job'),
     ('pegaprox/core/ha.py', '_later'): (1, 'lease'),
     ('pegaprox/core/ha.py', 'restart_process'): (1, 'lease'),
     ('pegaprox/core/ha.py', '_fan_out'): (1, 'peer'),

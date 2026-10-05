@@ -3756,6 +3756,22 @@ def _vmid_list(value):
     return out
 
 
+def _affinity_held(cluster_id, vmids, target):
+    """{vmid: rule name} of the guests an enforced affinity rule keeps off `target`. Only
+    the guests a rule names are looked at: each look reads the cluster's guest list again"""
+    from pegaprox.api.history import check_affinity_violation, load_affinity_rules
+    ruled = set()
+    for rule in (load_affinity_rules() or {}).get('rules', []):
+        if rule.get('cluster_id') == cluster_id and rule.get('enabled', True):
+            ruled.update(str(v) for v in (rule.get('vm_ids') or rule.get('vms') or []))
+    held = {}
+    for vmid in [v for v in vmids if str(v) in ruled]:
+        aff = check_affinity_violation(cluster_id, vmid, target)
+        if aff.get('violation') and aff.get('enforce'):
+            held[vmid] = aff.get('rule')
+    return held
+
+
 def _node_guest_skip(action, guest):
     """Why a guest the caller named stays out of the action, None when it takes part"""
     if action == 'startall':
@@ -3863,18 +3879,10 @@ def node_guests_action_api(cluster_id, node_name, action):
             skipped.append({'vmid': vmid, 'reason': why})
 
     if action == 'migrateall' and act:
-        # an enforced affinity rule holds a guest back, as in bulk_migrate_api. Only for
-        # the guests a rule names: each look reads the cluster's guest list again
-        from pegaprox.api.history import check_affinity_violation, load_affinity_rules
-        ruled = set()
-        for rule in (load_affinity_rules() or {}).get('rules', []):
-            if rule.get('cluster_id') == cluster_id and rule.get('enabled', True):
-                ruled.update(str(v) for v in (rule.get('vm_ids') or rule.get('vms') or []))
-        for vmid in [v for v in act if str(v) in ruled]:
-            aff = check_affinity_violation(cluster_id, vmid, target)
-            if aff.get('violation') and aff.get('enforce'):
-                act.remove(vmid)
-                skipped.append({'vmid': vmid, 'reason': f"affinity rule '{aff.get('rule')}'"})
+        # an enforced affinity rule holds a guest back, as in bulk_migrate_api
+        for vmid, rule in _affinity_held(cluster_id, act, target).items():
+            act.remove(vmid)
+            skipped.append({'vmid': vmid, 'reason': f"affinity rule '{rule}'"})
 
     if not act:
         return jsonify({'error': f'No guest on {node_name} to {verb}', 'skipped': skipped}), 400
@@ -11686,7 +11694,23 @@ def delete_vm_api(cluster_id, node, vm_type, vmid):
 @bp.route('/api/clusters/<cluster_id>/vms/bulk-migrate', methods=['POST'])
 @require_auth(perms=['vm.migrate'])
 def bulk_migrate_api(cluster_id):
-    """Migrate multiple VMs at once"""
+    """Migrate several guests to one node
+
+    Body: vms (a list of {vmid, node, type}), target, online (default true).
+
+    With mode the migrations run on the server as a bulk run (#952) and the answer is the
+    run (202, {run}), to follow with GET /api/bulk-migrations/<run_id>:
+    - mode: sequential (one guest after another: the next starts when the migration
+      task before it has ended), parallel (`parallel` at a time, 2-5) or all (every
+      migration starts at once and nobody waits for them)
+    - with_local_disks: (VMs) move local disks along
+    A guest that is not on the cluster or out of the caller's reach refuses the request
+    (400); one an enforced affinity rule keeps off the target, one already there and one
+    another running run still moves are listed as skipped.
+
+    Without mode every migration starts at once, and the answer lists what Proxmox said
+    to each start.
+    """
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
     
@@ -11694,7 +11718,11 @@ def bulk_migrate_api(cluster_id):
         return jsonify({'error': 'Cluster not found'}), 404
     
     mgr = cluster_managers[cluster_id]
-    data = request.json or {}
+    data = request.get_json(silent=True)
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return jsonify({'error': 'JSON object required'}), 400
     vms = data.get('vms', [])  # List of {node, vmid, type}
     # NS Jul 2026 (pentest DoS) — cap the batch so one request can't fan out unbounded
     # per-VM cluster-walk + SQLCipher work (a 10 MB body could carry tens of thousands
@@ -11710,6 +11738,15 @@ def bulk_migrate_api(cluster_id):
     if not vms:
         return jsonify({'error': 'No VMs specified'}), 400
     
+    # the single-guest route asks this of an XCP-ng pool, the bulk one never did
+    if getattr(mgr, 'cluster_type', 'proxmox') == 'xcpng':
+        from pegaprox.utils.rbac import has_permission
+        if not has_permission(build_authz_user(request.session.get('user', ''), request.session), 'xapi.vm.migrate'):
+            return jsonify({'error': 'Permission denied: xapi.vm.migrate'}), 403
+
+    if data.get('mode') is not None:
+        return _start_bulk_run(cluster_id, mgr, data)
+
     user = getattr(request, 'session', {}).get('user', 'system')
     log_audit(user, 'vm.bulk_migrated', f"Bulk migration of {len(vms)} VMs to {target_node}", cluster=mgr.config.name)
 
@@ -11764,6 +11801,178 @@ def bulk_migrate_api(cluster_id):
         'total': len(vms),
         'successful': sum(1 for r in results if r['success'])
     })
+
+
+# MK Oct 2026 (#952) - a bulk migration as a run on the server: one guest after another,
+# a few at a time or all at once, followed per guest (core/bulk_migrate.py). The checks are
+# those of the call above and of the node route, made before anything starts; the run
+# asks again before each guest whether its starter may still move it.
+_BULK_HOW = {'sequential': 'one at a time', 'parallel': '{n} at a time', 'all': 'all at once'}
+
+
+def _start_bulk_run(cluster_id, mgr, data):
+    from pegaprox.core import bulk_migrate as bulk
+    from pegaprox.utils.sanitization import validate_hostname
+    mode = data.get('mode')
+    if mode not in bulk.MODES:
+        return jsonify({'error': 'mode is sequential, parallel or all'}), 400
+    parallel = 1
+    if mode == 'parallel':
+        parallel = data.get('parallel', 2)
+        if isinstance(parallel, bool) or not isinstance(parallel, int) or not 2 <= parallel <= bulk.PARALLEL_MAX:
+            return jsonify({'error': f'parallel is a number from 2 to {bulk.PARALLEL_MAX}'}), 400
+    online, local = data.get('online', True), data.get('with_local_disks', False)
+    if not isinstance(online, bool) or not isinstance(local, bool):
+        return jsonify({'error': 'online and with_local_disks are true or false'}), 400
+    target = data.get('target')
+    if not isinstance(target, str) or not validate_hostname(target):
+        return jsonify({'error': 'Target node is required'}), 400
+    if getattr(mgr, 'cluster_type', 'proxmox') == 'proxmox':
+        nodes = mgr.get_node_status() or {}
+        if target not in nodes:
+            return jsonify({'error': f'{target} is no node of this cluster'}), 400
+        tinfo = nodes.get(target) or {}
+        if tinfo.get('offline') or tinfo.get('status', 'online') != 'online':
+            return jsonify({'error': f'{target} is not online'}), 400
+
+    wanted = _vmid_list([v.get('vmid') if isinstance(v, dict) else v for v in data.get('vms')]) \
+        if isinstance(data.get('vms'), list) else None
+    if wanted is None:
+        return jsonify({'error': 'vms holds something that is no VMID'}), 400
+    wanted = list(dict.fromkeys(wanted))
+
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    guests = {}
+    for g in (mgr.get_vm_resources(max_age=2) or []):
+        if g.get('type') in ('qemu', 'lxc'):
+            try:
+                guests[int(g.get('vmid'))] = g
+            except (TypeError, ValueError):
+                continue
+    # one answer for a guest elsewhere and one out of reach: which is which stays unsaid
+    refused = [v for v in wanted if v not in guests
+               or not user_can_access_vm(user, cluster_id, v, 'vm.migrate', guests[v].get('type'))]
+    if refused:
+        return jsonify({'error': f"Not on this cluster or out of reach: "
+                                 f"{', '.join(str(v) for v in refused[:20])}"}), 400
+
+    held = _affinity_held(cluster_id, wanted, target)
+    busy = bulk.busy_vmids(cluster_id)
+    rows = []
+    for vmid in wanted:
+        g = guests[vmid]
+        if vmid in held:
+            rows.append(bulk.new_row(g, 'skipped', f"Affinity rule '{held[vmid]}' keeps it off {target}"))
+        elif g.get('node') == target:
+            rows.append(bulk.new_row(g, 'skipped', f'Already on {target}'))
+        elif vmid in busy:
+            rows.append(bulk.new_row(g, 'skipped', 'Another bulk migration moves it already'))
+        else:
+            rows.append(bulk.new_row(g))
+    if not any(r['state'] == bulk.WAITING for r in rows):
+        return jsonify({'error': 'None of these guests is left to migrate',
+                        'skipped': [{'vmid': r['vmid'], 'reason': r['note']} for r in rows]}), 400
+
+    usr = request.session.get('user', 'system')
+    from pegaprox.utils.audit import get_client_ip
+    run = bulk.BulkRun(cluster_id, mgr.config.name, usr, request.session, get_client_ip(), target, mode,
+                       parallel, online, local, rows)
+    try:
+        bulk.register(run)
+    except bulk.TooMany as e:
+        return jsonify({'error': str(e)}), 409
+    moving = [str(r['vmid']) for r in rows if r['state'] == bulk.WAITING]
+    log_audit(usr, 'vm.bulk_migrated',
+              f"Bulk migration {run.id} of {len(moving)} guest(s) to {target}, "
+              f"{_BULK_HOW[mode].format(n=parallel)} ({', '.join(moving[:50])}{' ...' if len(moving) > 50 else ''})",
+              cluster=mgr.config.name)
+    bulk.launch(run)
+    return jsonify({'run': run.view(run.rows_copy(), me=usr)}), 202
+
+
+def _bulk_view(run, with_rows=True):
+    """The run as the caller may see it, None when they may see none of it: the cluster out
+    of their reach, or not one of its guests theirs to see"""
+    if run is None:
+        return None
+    ok, _err = check_cluster_access(run.cluster_id)
+    if not ok:
+        return None
+    rows = scope_vm_rows(run.cluster_id, run.rows_copy())
+    if not rows:
+        return None
+    return run.view(rows, with_rows=with_rows, me=request.session.get('user', ''))
+
+
+def _may_cancel(run):
+    """Who started it, or a caller with vm.migrate on the whole cluster (an admin, an
+    operator of the tenant that owns it): not one confined to some of its guests"""
+    if request.session.get('user') == run.user:
+        return True
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    from pegaprox.utils.rbac import has_permission
+    return has_permission(user, 'vm.migrate') and not caller_is_scoped(user, run.cluster_id)
+
+
+@bp.route('/api/bulk-migrations', methods=['GET'])
+@require_auth(perms=['vm.view'])
+def list_bulk_migrations():
+    """Bulk migrations of the last hour
+
+    The runs on the clusters the caller reaches, newest first, with their counts and
+    without the guests. A run counts only the guests the caller may see. They run in the
+    process of the active instance: a restart ends them."""
+    from pegaprox.core import bulk_migrate as bulk
+    out = []
+    for run in bulk.runs():
+        view = _bulk_view(run, with_rows=False)
+        if view:
+            out.append(view)
+    return jsonify({'runs': out})
+
+
+@bp.route('/api/bulk-migrations/<run_id>', methods=['GET'])
+@require_auth(perms=['vm.view'])
+def get_bulk_migration(run_id):
+    """One bulk migration, a line per guest
+
+    Each guest with its state (wait, migrating, done, started, failed, skipped, cancelled,
+    unknown), a note, its task and the node it went to; may_cancel says whether the
+    caller may cancel the rest."""
+    from pegaprox.core import bulk_migrate as bulk
+    run = bulk.get(run_id)
+    view = _bulk_view(run)
+    if not view:
+        return jsonify({'error': 'Bulk migration not found'}), 404
+    view['may_cancel'] = view['state'] == 'running' and not view['cancelled_by'] and _may_cancel(run)
+    return jsonify({'run': view})
+
+
+@bp.route('/api/bulk-migrations/<run_id>/cancel', methods=['POST'])
+@require_auth(perms=['vm.migrate'])
+def cancel_bulk_migration(run_id):
+    """Cancel the rest of a bulk migration
+
+    No further guest starts. What is migrating finishes in Proxmox; the guests not
+    started stay where they are."""
+    from pegaprox.core import bulk_migrate as bulk
+    run = bulk.get(run_id)
+    if not _bulk_view(run, with_rows=False):
+        return jsonify({'error': 'Bulk migration not found'}), 404
+    if not _may_cancel(run):
+        return jsonify({'error': 'Only who started it, or someone who migrates on the whole '
+                                 'cluster, cancels a bulk migration'}), 403
+    usr = request.session.get('user', 'system')
+    if not bulk.cancel(run, usr):
+        return jsonify({'error': 'This bulk migration is over'}), 409
+    waiting = sum(1 for r in run.rows_copy() if r['state'] == bulk.WAITING)
+    log_audit(usr, 'vm.bulk_migrate_cancelled',
+              f"Bulk migration {run.id} to {run.target} (started by {run.user}): {waiting} guest(s) "
+              f"not started", cluster=run.cluster_name)
+    # the answer of the detail route: the rest is cancelled, there is nothing left to cancel
+    view = _bulk_view(run) or {}
+    view['may_cancel'] = False
+    return jsonify({'run': view})
 
 
 @bp.route('/api/clusters/<cluster_id>/fingerprint', methods=['GET'])
