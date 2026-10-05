@@ -456,11 +456,27 @@ def _read_replication(cid, mgr, now):
     if now < st['next_at']:
         return None
     st['next_at'] = now + REPLICATION_EVERY
-    status, jobs = _get(mgr, '/cluster/replication')
-    if status != 200 or not isinstance(jobs, list):
+    status, data = read_replication(mgr)
+    if data is None:
         st['next_at'] = now + 60
         _note(cid, 'replication', False, f'job list unreadable (HTTP {status})')
         return None
+    failed = data['failed']
+    _note(cid, 'replication', not failed,
+          f"{len(data['jobs'])} job(s), {len(data['sources'])} source node(s)"
+          + (f", unread: {sorted(failed)}" if failed else ''))
+    return data
+
+
+def read_replication(mgr):
+    """(HTTP status of the job list, {'jobs', 'status': {job_id: entry}, 'failed': {node},
+    'sources': {node}}), the dict None when the job list could not be read. A job's state
+    comes from its source node; the jobs of a node that did not answer have no entry, which
+    is unknown, not fine. The alert tick reads it at its pace, the Prometheus exporter at
+    its own (api/metrics_exporter.py). MK Oct 2026"""
+    status, jobs = _get(mgr, '/cluster/replication')
+    if status != 200 or not isinstance(jobs, list):
+        return status, None
     sources = {str(j.get('source')) for j in jobs if j.get('source')}
     if any(not j.get('source') for j in jobs):
         # PVE fills `source` once a job has run; until then ask every online node
@@ -489,9 +505,7 @@ def _read_replication(cid, mgr, now):
             prev = by_id.get(jid)
             if prev is None or _num(e.get('last_sync')) >= _num(prev.get('last_sync')):
                 by_id[jid] = e
-    _note(cid, 'replication', not failed,
-          f"{len(jobs)} job(s), {len(sources)} source node(s)" + (f", unread: {sorted(failed)}" if failed else ''))
-    return {'jobs': jobs, 'status': by_id, 'failed': failed}
+    return status, {'jobs': jobs, 'status': by_id, 'failed': failed, 'sources': sources}
 
 
 def not_backed_up(cid, mgr, max_age=0, now=None):

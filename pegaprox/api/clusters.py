@@ -2368,7 +2368,9 @@ def _xcpng_storage_rows(cid, mgr):
                      'content': s.get('content') or '', 'shared': bool(s.get('shared')),
                      'used': used, 'total': total,
                      'percent': round(used * 100.0 / total, 1) if total > 0 else None,
-                     'active': s.get('status', 'available') == 'available', 'nodes': 0, 'inactive_on': []})
+                     'active': s.get('status', 'available') == 'available', 'nodes': 0, 'inactive_on': [],
+                     # every host's local SR is called "Local storage": the uuid tells them apart
+                     'uuid': str(s.get('uuid') or '')})
     rows.sort(key=lambda r: (not r['shared'], r['storage']))
     return rows
 

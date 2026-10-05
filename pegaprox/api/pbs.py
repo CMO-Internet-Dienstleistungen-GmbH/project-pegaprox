@@ -3134,6 +3134,25 @@ def get_vms_backup_status(cluster_id):
     _bc = _backup_status_cache.get(cluster_id)
     if _bc and (now - _bc[0]) < _bc[2]:
         return jsonify(_scope_backup_out(_bc[1]))
+    return jsonify(_scope_backup_out(scan_backup_status(cluster_id, cm)))
+
+
+def backup_status_entry(cluster_id):
+    """(read at, rows, complete) of the last scan of a cluster, or None. A partial scan is
+    the one cached with the short TTL. MK Oct 2026"""
+    hit = _backup_status_cache.get(cluster_id)
+    if not hit:
+        return None
+    return hit[0], hit[1], hit[2] >= _BACKUP_STATUS_TTL
+
+
+def scan_backup_status(cluster_id, cm):
+    """Read the newest backup of every guest of a cluster from the snapshot lists of the
+    PBS servers linked to it and the vzdump files on its backup storages, cache the
+    cluster-global list and return it. Unscoped: callers filter. The VM list pill and the
+    Prometheus exporter share it."""
+    import time as _t
+    now = _t.time()
     cutoff_30d = now - (30 * 86400)
 
     # Aggregate snapshots across all PBS servers linked to this cluster + the
@@ -3310,6 +3329,7 @@ def get_vms_backup_status(cluster_id):
             status = 'stale'
         out.append({
             'vmid': rec['vmid'],
+            'last_backup_ts': int(rec['last_backup_ts'] or 0),
             'last_backup_age_hours': round(last_age_h, 1) if last_age_h is not None else None,
             'count_30d': rec['count_30d'],
             'encrypted': rec['encrypted'],
@@ -3320,7 +3340,7 @@ def get_vms_backup_status(cluster_id):
     # cache the UNFILTERED cluster-global list; scope per-request at return time
     _backup_status_cache[cluster_id] = (
         now, out, _BACKUP_STATUS_TTL if _scan_complete else _BACKUP_STATUS_TTL_PARTIAL)
-    return jsonify(_scope_backup_out(out))
+    return out
 
 
 @bp.route('/api/clusters/<cluster_id>/datacenter/backup/<job_id>/run', methods=['POST'])
