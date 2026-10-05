@@ -5391,10 +5391,13 @@
                 'cluster_options': t('driftKindCluster') || 'Cluster Options',
             }[k] || k);
 
+            // LW Oct 2026 - 'unknown' is a scope on a node that did not answer (#968):
+            // not checked, so the old value is not struck through
             const opLabel = (op) => ({
                 'added': t('driftOpAdded') || 'added',
                 'removed': t('driftOpRemoved') || 'removed',
                 'changed': t('driftOpChanged') || 'changed',
+                'unknown': t('nodeOffline') || 'Node offline',
             }[op] || op);
 
             const fmtVal = (v) => {
@@ -5522,9 +5525,9 @@
                                             <div className="mt-2 pl-3 border-l-2 border-proxmox-border space-y-1 text-[11px]">
                                                 {(ev.diff || []).map((d, i) => (
                                                     <div key={i} className="grid grid-cols-12 gap-2">
-                                                        <div className="col-span-3 text-gray-400 font-mono">{d.path}</div>
+                                                        <div className="col-span-3 text-gray-400 font-mono">{d.op === 'unknown' && d['node-offline'] ? d['node-offline'] : d.path}</div>
                                                         <div className="col-span-1 text-gray-500">{opLabel(d.op)}</div>
-                                                        <div className="col-span-4 text-red-400 font-mono break-all line-through opacity-60">{fmtVal(d.before)}</div>
+                                                        <div className={`col-span-4 font-mono break-all ${d.op === 'unknown' ? 'text-gray-400' : 'text-red-400 line-through opacity-60'}`}>{fmtVal(d.before)}</div>
                                                         <div className="col-span-4 text-green-400 font-mono break-all">{fmtVal(d.after)}</div>
                                                     </div>
                                                 ))}
