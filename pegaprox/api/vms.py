@@ -12397,9 +12397,15 @@ def get_templates_api(cluster_id, node):
         if not has_permission(u, 'xapi.template.view'):
             return jsonify({'error': 'Permission denied: xapi.template.view'}), 403
 
-    templates = manager.get_templates(node)
-    # sec (audit): template rows carry a vmid — twin of the scoped templates/existing route
-    return jsonify(scope_vm_rows(cluster_id, templates or []))
+    templates = manager.get_templates(node) or []
+    # sec (audit): VM template rows carry a vmid and are scoped per guest, twin of the scoped
+    # templates/existing route. Container templates are storage content (a volid, no vmid) and
+    # XCP-ng templates carry a uuid: scope_vm_rows drops a row without a vmid, which took every
+    # container template away from everyone - they stay, as ISO and vztmpl rows of the storage
+    # routes do (MK Oct 2026)
+    guests = [t for t in templates if t.get('vmid') is not None]
+    content = [t for t in templates if t.get('vmid') is None]
+    return jsonify(scope_vm_rows(cluster_id, guests) + content)
 
 
 @bp.route('/api/clusters/<cluster_id>/xcp/os-types', methods=['GET'])
