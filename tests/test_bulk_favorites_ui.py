@@ -66,7 +66,8 @@ def _used_keys():
 
 def test_the_new_strings_are_their_own_keys():
     keys = _used_keys()
-    assert len(keys) == 41, keys
+    # nodeGuestsParallel went with #952: migrating a node's guests asks the bulk run's question
+    assert len(keys) == 40, keys
     assert {'favoritesGroup', 'favAdd', 'favRemove', 'nodeGuestsTitleMigrate', 'guestBulkSummary'} <= set(keys)
 
 
@@ -575,7 +576,16 @@ def test_runtime_shut_down_all_guests_of_a_node_from_the_corporate_tree(real_app
 
 
 def test_runtime_migrate_all_guests_of_a_node_from_the_modern_card(real_app):
-    app = real_app(layout='modern')
+    """#952: the guests of a node move as a bulk run of the server, which follows each
+    migration (tests/test_bulk_migrate_ui_952.py drives the run itself); the answers of the
+    run routes here are canned."""
+    run = {'id': 'feedc0de00000001', 'cluster_id': 'c1', 'target': 'pve3', 'mode': 'parallel', 'parallel': 2,
+           'state': 'running', 'mine': True, 'total': 4, 'counts': {'wait': 4}, 'current': [], 'rows': [],
+           'cancelled_by': '', 'reason': '', 'may_cancel': True}
+    app = real_app(layout='modern', extra={
+        ('POST', '/api/clusters/c1/vms/bulk-migrate'): (202, {'run': run}),
+        ('GET', '/api/bulk-migrations'): (200, {'runs': [run]}),
+        ('GET', f"/api/bulk-migrations/{run['id']}"): (200, {'run': run})})
     page = app.page
     page.get_by_text('Testi').first.click()
     page.locator('button[data-node-guests="pve1"]').wait_for(timeout=5000)
@@ -593,15 +603,21 @@ def test_runtime_migrate_all_guests_of_a_node_from_the_modern_card(real_app):
     target = modal.locator('[data-testid="node-guests-target"]')
     assert target.evaluate('s => Array.from(s.options).map(o => o.value)') == ['pve2', 'pve3']
     target.select_option('pve3')
-    modal.locator('[data-testid="node-guests-workers"]').fill('2')
+    # four guests: one at a time unless picked otherwise
+    assert modal.locator('[data-mig-mode="sequential"] input').is_checked()
+    modal.locator('[data-mig-mode="parallel"] input[type="radio"]').check()
+    modal.locator('[data-testid="mig-run-parallel"]').fill('2')
     modal.locator('label', has_text='Move local disks along').locator('input').check()
     _shot(app, 'node-migrate-all-modern')
     modal.locator('[data-testid="node-guests-run"]').click()
-    modal.locator('[data-testid="node-guests-result"]').wait_for(timeout=5000)
-    assert [c for c in app.server.sent if '/guests/' in c[1]] == [
-        ('POST', '/api/clusters/c1/nodes/pve1/guests/migrateall',
-         {'vms': [100, 101, 102, 201], 'target': 'pve3', 'maxworkers': 2, 'with_local_disks': True})]
-    assert app.pve.of('node') == [('pve1', 'migrateall', [100, 101, 102, 201], 'pve3', 2, True)]
+    page.locator('[data-testid="mig-run-modal"]').wait_for(timeout=5000)
+    assert page.locator('[data-testid="node-guests-modal"]').count() == 0
+    assert app.server.bodies['/api/clusters/c1/vms/bulk-migrate'] == [{
+        'vms': [{'vmid': 100, 'node': 'pve1', 'type': 'qemu'}, {'vmid': 101, 'node': 'pve1', 'type': 'qemu'},
+                {'vmid': 102, 'node': 'pve1', 'type': 'qemu'}, {'vmid': 201, 'node': 'pve1', 'type': 'lxc'}],
+        'target': 'pve3', 'online': True, 'with_local_disks': True, 'mode': 'parallel', 'parallel': 2}]
+    # the node endpoint of Proxmox is not asked for it any more
+    assert [c for c in app.server.sent if '/guests/' in c[1]] == [] and app.pve.of('node') == []
     assert not app.errors, app.errors
 
 

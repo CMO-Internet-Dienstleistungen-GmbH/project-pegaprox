@@ -11312,6 +11312,11 @@
             const [nodeGuests, setNodeGuests] = useState(null);
             // the bulk dialog of the Cloud list ({action, guests}); the table has its own
             const [cloudBulk, setCloudBulk] = useState(null);
+            // #952: the bulk migration whose progress is open, a bump to read the runs again
+            // after one started, and the guests the Cloud list hands to the migrate dialog
+            const [bulkRunOpen, setBulkRunOpen] = useState(null);
+            const [bulkRunsTick, setBulkRunsTick] = useState(0);
+            const [cloudBulkMigrate, setCloudBulkMigrate] = useState(null);
             
             // NS: Load datacenter summary
             const loadDatacenterSummary = async () => {
@@ -15132,35 +15137,33 @@
                 }
             };
 
-            const handleBulkMigrate = async (vms, targetNode, online) => {
-                if (!selectedCluster) return;
-                // #147
-                if (!confirm(`${t('startingBulkMigration') || 'Bulk migrate'} ${vms.length} VMs → ${targetNode}?`)) return;
-
+            // LW Oct 2026 (#952) - a bulk migration is a run on the server: this starts it and
+            // opens its progress. The dialog it comes from is the confirmation (#147), and
+            // its answer is {ok} or {error} for that dialog to show
+            const handleBulkMigrate = async ({ clusterId, vms, target, online, withLocalDisks, mode, parallel }) => {
+                const cid = clusterId || selectedCluster?.id;
+                if (!cid) return { error: t('bulkMigrationFailed') };
                 try {
-                    addToast(`${t('startingBulkMigration')} ${vms.length} VMs...`);
-                    const response = await authFetch(
-                        `${API_URL}/clusters/${selectedCluster.id}/vms/bulk-migrate`,
-                        {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ vms, target: targetNode, online })
-                        }
-                    );
-                    
+                    const body = { vms: vms.map(v => ({ vmid: v.vmid, node: v.node, type: v.type })), target,
+                        online: online !== false, with_local_disks: !!withLocalDisks, mode };
+                    if (mode === 'parallel') body.parallel = parallel;
+                    const response = await authFetch(`${API_URL}/clusters/${encodeURIComponent(cid)}/vms/bulk-migrate`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+                    });
                     if (response && response.ok) {
-                        const result = await response.json();
-                        addToast(`${result.successful}/${result.total} ${t('migrationsStarted') || 'migrations started'}`);
-                        setTimeout(() => fetchClusterResources(selectedCluster.id), 3000);
-                    } else if (response) {
-                        const err = await response.json();
-                        addToast(err.error || t('bulkMigrationFailed'), 'error');
-                    } else {
-                        addToast(t('connectionError'), 'error');
+                        const data = await response.json().catch(() => ({}));
+                        setBulkRunsTick(n => n + 1);
+                        if (data.run) setBulkRunOpen(data.run.id);
+                        return { ok: true };
                     }
+                    return { error: response ? await PegaProxApiErrors.message(response, t('bulkMigrationFailed')) : t('connectionError') };
                 } catch (error) {
-                    addToast(t('connectionError'), 'error');
+                    return { error: t('connectionError') };
                 }
+            };
+            const bulkRunSettled = (cid) => {
+                if (selectedCluster?.id === cid) fetchClusterResources(cid);
+                else fetchSidebarClusterData(cid);
             };
 
             const handleCreateVm = async (vmType, node, config) => {
@@ -15767,10 +15770,14 @@
             // One toast stack for every layout. Cloud returns early below and never reached the
             // one in the main return, so whatever it reported through addToast stayed invisible.
             // A portal to document.body keeps it clear of the corporate z-index/overflow rules.
+            // The bulk migrations (#952) sit on top of the stack: from every page of every
+            // layout, and clear of the toasts below them
             const toastPortal = ReactDOM.createPortal(
                 React.createElement('div', {
                     style: { position: 'fixed', bottom: isCorporate ? 64 : 24, right: 24, zIndex: 99999, display: 'flex', flexDirection: 'column', gap: 8 }
                 },
+                    React.createElement(BulkMigrateRuns, { key: 'bulk-runs', authFetch, openId: bulkRunOpen, onOpen: setBulkRunOpen,
+                        tick: bulkRunsTick, canAct: !haReadOnly, onSettled: bulkRunSettled }),
                     toasts.map(toast =>
                         React.createElement(Toast, { key: toast.id, message: toast.message, type: toast.type, onClose: () => removeToast(toast.id) })
                     )
@@ -15799,6 +15806,7 @@
                     crossMigrate: (vm) => setDashCrossClusterVm(vm),
                     snapshot: (vm) => setDashSnapshotVm(vm),
                     bulkGuests: (rows, action) => setCloudBulk({ action, guests: rows.map(r => ({ ...r, _clusterId: r._clusterId || selectedCluster?.id })) }),
+                    bulkMigrate: (rows) => setCloudBulkMigrate(rows.map(r => ({ vmid: r.vmid, node: r.node, type: r.type, name: r.name }))),
                     createVm: (type) => setShowCreateVm(type || 'qemu'),
                     nodeAction: handleNodeAction,                     // (nodeName, 'reboot'|'shutdown')
                     maintenanceToggle: handleMaintenanceToggle,       // (nodeName, enable)
@@ -15824,7 +15832,7 @@
                     ['openConsole', 'openSpice', 'openLxcShell'].forEach(k => { delete cloudActions[k]; });
                 }
                 if (haReadOnly) {
-                    ['vmAction', 'forceStop', 'migrate', 'clone', 'del', 'bulkGuests',
+                    ['vmAction', 'forceStop', 'migrate', 'clone', 'del', 'bulkGuests', 'bulkMigrate',
                      'crossMigrate', 'snapshot', 'createVm', 'nodeAction', 'maintenanceToggle', 'startUpdate']
                         .forEach(k => { delete cloudActions[k]; });
                 }
@@ -15866,6 +15874,10 @@
                             <GuestBulkActionModal action={cloudBulk.action} guests={cloudBulk.guests} authFetch={authFetch}
                                 onFinished={() => { const cid = selectedCluster?.id; if (cid) setTimeout(() => fetchClusterResources(cid), 1500); }}
                                 onClose={() => setCloudBulk(null)} />
+                        )}
+                        {cloudBulkMigrate && selectedCluster && (
+                            <BulkMigrateModal vms={cloudBulkMigrate} nodes={Object.keys(clusterMetrics)} clusterId={selectedCluster.id}
+                                onMigrate={handleBulkMigrate} onClose={() => setCloudBulkMigrate(null)} />
                         )}
                         {configNode && selectedCluster && (
                             <NodeModal node={configNode} clusterId={selectedCluster.id} clusterType={selectedCluster.cluster_type || 'proxmox'} onClose={() => setConfigNode(null)} addToast={addToast} />
@@ -25268,6 +25280,7 @@
                                 nodes={Object.entries(met).filter(([n, m]) => n !== 'error' && n !== 'offline' && m)
                                     .map(([n, m]) => ({ name: n, online: m.status !== 'offline' && !m.offline }))}
                                 authFetch={authFetch}
+                                onBulkMigrate={handleBulkMigrate}
                                 onClose={() => setNodeGuests(null)}
                                 onDone={() => setTimeout(() => { if (selectedCluster?.id === cid) fetchClusterResources(cid); else fetchSidebarClusterData(cid); }, 1500)}
                             />

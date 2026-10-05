@@ -749,6 +749,10 @@
                                             <button type="button" className="cloud-btn cloud-btn-sm" onClick={() => bulk('snapshot')}><Icons.Camera /> {t('snapshot')}</button>
                                             <button type="button" className="cloud-btn cloud-btn-sm" onClick={() => bulk('tags')}><Icons.Tag /> {t('tags')}</button>
                                         </>)}
+                                        {/* LW Oct 2026 (#952) - one dialog, one at a time unless picked otherwise */}
+                                        {act.has('bulkMigrate') && (
+                                            <button type="button" className="cloud-btn cloud-btn-sm" data-bulk="migrate" onClick={() => act.bulkMigrate(selectedRows)}><Icons.ArrowRight /> {t('migrate')}</button>
+                                        )}
                                         <button type="button" className="cloud-sel-clear" onClick={() => setChecked({})}>{t('cloud.clear') || 'Clear'}</button>
                                     </div>
                                 ) : (
@@ -2360,6 +2364,7 @@
                 crossMigrate: (r) => actions?.crossMigrate?.(stamp(r)),
                 snapshot: (r) => actions?.snapshot?.(stamp(r)),
                 bulkGuests: (rows, a) => actions?.bulkGuests?.(rows.map(stamp), a),
+                bulkMigrate: (rows) => actions?.bulkMigrate?.(rows.map(stamp)),
                 createVm: (type) => actions?.createVm?.(type),
                 nodeAction: (n, a) => actions?.nodeAction?.(n, a),
                 maintenanceToggle: (n, e) => actions?.maintenanceToggle?.(n, e),

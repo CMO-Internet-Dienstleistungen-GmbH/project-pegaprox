@@ -3188,81 +3188,122 @@
 
         // Bulk Migrate Modal Component
         // NS: For evacuating nodes before maintenance
-        // Migrations run sequentially to avoid overloading the network
+        // LW Oct 2026 (#952) - the migrations run on the server as a bulk run now: one at a
+        // time from a few guests on, a few at a time or all at once as picked here. The
+        // dialog only asks where to and how, the progress shows in BulkMigrateRuns
+        const MIG_RUN_PARALLEL_MAX = 5;
+        const migRunDefaultPlan = (count) => ({ mode: count > 3 ? 'sequential' : 'all', parallel: 2 });
+
+        function MigRunPlan({ plan, onChange }) {
+            const { t } = useTranslation();
+            const { isCorporate } = useLayout();
+            const option = (mode, label, hint, extra) => (
+                <label key={mode} className="flex items-start gap-2 text-sm cursor-pointer" data-mig-mode={mode}>
+                    <input type="radio" name="mig-run-mode" checked={plan.mode === mode} className="mt-1"
+                        onChange={() => onChange({ ...plan, mode })} />
+                    <span className="flex-1 min-w-0">
+                        <span className="flex items-center gap-2 text-white">{label}{extra}</span>
+                        <span className="block text-xs text-gray-400">{hint}</span>
+                    </span>
+                </label>
+            );
+            return (
+                <div className="space-y-2" data-testid="mig-run-plan">
+                    <div className={isCorporate ? 'corp-vm-section-title' : 'block text-sm text-gray-400 mb-1'}>{t('migRunHow')}</div>
+                    {option('sequential', t('migRunOne'), t('migRunOneHint'))}
+                    {option('parallel', t('migRunSome'), guestBulkFill(t('migRunSomeHint'), { max: MIG_RUN_PARALLEL_MAX }),
+                        <input type="number" min="2" max={MIG_RUN_PARALLEL_MAX} value={plan.parallel} data-testid="mig-run-parallel"
+                            onChange={e => onChange({ mode: 'parallel', parallel: Math.max(2, Math.min(MIG_RUN_PARALLEL_MAX, parseInt(e.target.value, 10) || 2)) })}
+                            className={isCorporate ? '' : 'w-16 px-2 py-0.5 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm'}
+                            style={isCorporate ? { width: '64px' } : undefined} />)}
+                    {option('all', t('migRunAll'), t('migRunAllHint'))}
+                </div>
+            );
+        }
+
         function BulkMigrateModal({ vms, nodes, clusterId, onMigrate, onClose }) {
             const { t } = useTranslation();  // MK: Fix missing translation hook
+            const { isCorporate } = useLayout();
             const [targetNode, setTargetNode] = useState('');
             const [online, setOnline] = useState(true);
-            const [loading, setLoading] = useState(false);
+            const [localDisks, setLocalDisks] = useState(false);
+            const [plan, setPlan] = useState(() => migRunDefaultPlan(vms.length));
+            const [busy, setBusy] = useState(false);
+            const [error, setError] = useState('');
 
             // Get all unique current nodes
             const currentNodes = [...new Set(vms.map(v => v.node))];
-            const availableNodes = nodes.filter(n => !currentNodes.includes(n) || currentNodes.length > 1);
+            const availableNodes = (nodes || []).filter(n => n !== 'error' && n !== 'offline')
+                .filter(n => !currentNodes.includes(n) || currentNodes.length > 1);
 
             const handleMigrate = async () => {
-                if(!targetNode) return;
-                setLoading(true);
-                await onMigrate(vms, targetNode, online);
-                setLoading(false);
-                onClose();
+                if (!targetNode || busy) return;
+                setBusy(true);
+                setError('');
+                const res = await onMigrate({ clusterId, vms, target: targetNode, online, withLocalDisks: localDisks, ...plan });
+                setBusy(false);
+                if (res && res.ok) onClose();
+                else setError((res && res.error) || t('bulkMigrationFailed'));
             };
 
-            return(
-                <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80">
-                    <div className="w-full max-w-lg bg-proxmox-card border border-proxmox-border rounded-xl p-6 animate-scale-in">
-                        <h3 className="text-lg font-semibold text-white mb-4">{t('bulkMigration')}</h3>
-                        <div className="space-y-4">
-                            <div className="p-3 bg-proxmox-dark rounded-lg max-h-48 overflow-y-auto">
-                                <div className="text-sm text-gray-400 mb-2">{vms.length} {t('vmsSelected')}:</div>
-                                <div className="space-y-1">
-                                    {vms.map(vm => (
-                                        <div key={vm.vmid} className="flex items-center gap-2 text-sm">
-                                            <span className="text-proxmox-orange font-mono">{vm.vmid}</span>
-                                            <span className="text-white">{vm.name || '-'}</span>
-                                            <span className="text-gray-500">({vm.node})</span>
-                                        </div>
-                                    ))}
+            const inputCls = isCorporate ? '' : 'w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm';
+            const labelCls = isCorporate ? 'corp-vm-section-title' : 'block text-sm text-gray-400 mb-1';
+            const boxCls = isCorporate ? 'p-2 space-y-1 overflow-y-auto' : 'p-3 bg-proxmox-dark rounded-lg space-y-1 overflow-y-auto';
+            const boxStyle = isCorporate ? { maxHeight: '180px', background: 'var(--corp-surface-2)', border: '1px solid var(--corp-border-medium)' } : { maxHeight: '180px' };
+
+            const footer = (<>
+                <button onClick={onClose} disabled={busy} className={guestBulkButton(isCorporate, 'ghost')}>{t('cancel')}</button>
+                <button onClick={handleMigrate} disabled={!targetNode || busy} data-testid="bulk-migrate-run"
+                    className={guestBulkButton(isCorporate, 'primary')}>
+                    {busy && <span className="flex animate-spin"><Icons.RotateCw /></span>}
+                    {guestBulkFill(t('migRunGo'), { count: vms.length })}
+                </button>
+            </>);
+
+            return (
+                <GuestBulkFrame testId="bulk-migrate-modal" icon={<Icons.ArrowRight />} closable={!busy} onClose={onClose}
+                    title={t('bulkMigration')} meta={`${vms.length} ${t('vmsSelected')}`} footer={footer}>
+                    <div className="space-y-4">
+                        <div className={boxCls} style={boxStyle}>
+                            {vms.map(vm => (
+                                <div key={vm.vmid} className="flex items-center gap-2 text-sm" data-guest={vm.vmid}>
+                                    <span className="font-mono text-xs text-gray-400">{vm.vmid}</span>
+                                    <span className="truncate flex-1 text-white">{vm.name || '-'}</span>
+                                    <span className="text-xs text-gray-500">{vm.node}</span>
                                 </div>
-                            </div>
-                            <div>
-                                <label className="block text-sm text-gray-400 mb-2">{t('targetNode')}</label>
-                                <select
-                                    value={targetNode}
-                                    onChange={(e) => setTargetNode(e.target.value)}
-                                    className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white"
-                                >
-                                    <option value="">{t('selectNode')}</option>
-                                    {availableNodes.map(node => (
-                                        <option key={node} value={node}>{node}</option>
-                                    ))}
-                                </select>
-                            </div>
-                            <label className="flex items-center gap-3 text-sm text-gray-300">
-                                <input
-                                    type="checkbox"
-                                    checked={online}
-                                    onChange={(e) => setOnline(e.target.checked)}
-                                    className="w-4 h-4 rounded"
-                                />
-                                {t('liveMigration')}
-                            </label>
-                            <div className="p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg text-sm text-yellow-400">
-                                {t('bulkMigrationNote') || 'Migrations will be performed sequentially. This may take some time.'}
-                            </div>
+                            ))}
                         </div>
-                        <div className="flex justify-end gap-3 mt-6">
-                            <button onClick={onClose} className="px-4 py-2 text-gray-300 hover:text-white">{t('cancel')}</button>
-                            <button
-                                onClick={handleMigrate}
-                                disabled={!targetNode || loading}
-                                className="flex items-center gap-2 px-4 py-2 bg-blue-600 rounded-lg text-white hover:bg-blue-700 disabled:opacity-50"
-                            >
-                                {loading && <Icons.RotateCw />}
-                                {vms.length} {t('migrateVms')}
-                            </button>
+                        <div>
+                            <div className={labelCls}>{t('targetNode')}</div>
+                            <select value={targetNode} onChange={(e) => setTargetNode(e.target.value)} className={inputCls} data-testid="bulk-migrate-target"
+                                style={isCorporate ? { width: '100%' } : undefined}>
+                                <option value="">{t('selectNode')}</option>
+                                {availableNodes.map(node => (
+                                    <option key={node} value={node}>{node}</option>
+                                ))}
+                            </select>
                         </div>
+                        <label className="flex items-center gap-2 text-sm text-gray-300">
+                            <input type="checkbox" checked={online} onChange={(e) => setOnline(e.target.checked)} />
+                            {t('liveMigration')}
+                        </label>
+                        <label className="flex items-center gap-2 text-sm text-gray-300">
+                            <input type="checkbox" checked={localDisks} onChange={(e) => setLocalDisks(e.target.checked)} data-testid="bulk-migrate-local" />
+                            {t('nodeGuestsLocalDisks')}
+                        </label>
+                        <MigRunPlan plan={plan} onChange={setPlan} />
+                        <div className="text-xs text-gray-400 flex items-start gap-2" data-testid="mig-run-server-note">
+                            <Icons.Info />
+                            <span>{t('migRunServerNote')}</span>
+                        </div>
+                        {error && (
+                            <div className="text-sm text-red-400 flex items-start gap-2" data-testid="bulk-migrate-error">
+                                <Icons.AlertTriangle />
+                                <span className="break-all">{error}</span>
+                            </div>
+                        )}
                     </div>
-                </div>
+                </GuestBulkFrame>
             );
         }
 
@@ -3546,9 +3587,11 @@
             );
         }
 
-        // start, shut down or migrate all guests of one node, through the node endpoints
-        // of Proxmox (one task there instead of one request per guest here)
-        function NodeGuestsModal({ action, clusterId, node, guests, nodes, authFetch, onClose, onDone }) {
+        // start or shut down all guests of one node, through the node endpoints of Proxmox
+        // (one task there instead of one request per guest here). Migrating them all is a
+        // bulk run on the server like the one of the table (#952): one guest after another
+        // and followed per guest, where Proxmox' migrateall hands an HA guest on and goes on
+        function NodeGuestsModal({ action, clusterId, node, guests, nodes, authFetch, onClose, onDone, onBulkMigrate }) {
             const { t } = useTranslation();
             const { isCorporate } = useLayout();
             const fits = (g) => action === 'startall' ? (!isGuestTemplate(g) && g.status !== 'running')
@@ -3557,7 +3600,7 @@
             const targets = (nodes || []).filter(n => n.name !== node && n.online);
             const [picked, setPicked] = useState(() => new Set(eligible.map(g => g.vmid)));
             const [target, setTarget] = useState(targets[0] ? targets[0].name : '');
-            const [maxworkers, setMaxworkers] = useState(1);
+            const [plan, setPlan] = useState(() => migRunDefaultPlan(eligible.length));
             const [localDisks, setLocalDisks] = useState(false);
             const [busy, setBusy] = useState(false);
             const [error, setError] = useState('');
@@ -3572,8 +3615,15 @@
             const run = async () => {
                 setBusy(true);
                 setError('');
+                if (action === 'migrateall') {
+                    const res = await onBulkMigrate({ clusterId, vms: eligible.filter(g => picked.has(g.vmid)), target,
+                        online: true, withLocalDisks: localDisks, ...plan });
+                    setBusy(false);
+                    if (res && res.ok) onClose();
+                    else setError((res && res.error) || t('actionFailed'));
+                    return;
+                }
                 const body = { vms: chosen };
-                if (action === 'migrateall') Object.assign(body, { target, maxworkers, with_local_disks: localDisks });
                 const res = await authFetch(`${API_URL}/clusters/${encodeURIComponent(clusterId)}/nodes/${encodeURIComponent(node)}/guests/${action}`,
                     { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
                 setBusy(false);
@@ -3638,17 +3688,15 @@
                                         {targets.map(n => <option key={n.name} value={n.name}>{n.name}</option>)}
                                     </select>
                                 </div>
-                                <div className="flex items-center gap-3">
-                                    <label className="text-sm text-gray-300 flex-1">{t('nodeGuestsParallel')}</label>
-                                    <input type="number" min="1" max="16" value={maxworkers} data-testid="node-guests-workers"
-                                        onChange={e => setMaxworkers(Math.max(1, Math.min(16, parseInt(e.target.value, 10) || 1)))}
-                                        className={isCorporate ? '' : 'w-20 px-2 py-1 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm'}
-                                        style={isCorporate ? { width: '80px' } : undefined} />
-                                </div>
                                 <label className="flex items-center gap-2 text-sm text-gray-300">
                                     <input type="checkbox" checked={localDisks} onChange={e => setLocalDisks(e.target.checked)} />
                                     {t('nodeGuestsLocalDisks')}
                                 </label>
+                                <MigRunPlan plan={plan} onChange={setPlan} />
+                                <div className="text-xs text-gray-400 flex items-start gap-2">
+                                    <Icons.Info />
+                                    <span>{t('migRunServerNote')}</span>
+                                </div>
                             </>)}
                             {eligible.length === 0 ? (
                                 <div className="text-sm text-gray-400">{t('nodeGuestsNone')}</div>
@@ -3681,6 +3729,245 @@
                     )}
                 </GuestBulkFrame>
             );
+        }
+
+        // LW Oct 2026 (#952) - the bulk migrations of the signed-in user, wherever they are
+        // in the app: a card per run in the stack of the toasts and its progress on a
+        // click. A run is the server's, so the list is back after a reload; it is read a
+        // few seconds apart while one of them runs and not at all otherwise
+        const MIG_RUN_LIST_MS = 4000;
+        const MIG_RUN_DETAIL_MS = 2500;
+        const MIG_RUN_DISMISSED = 'pegaprox-bulk-runs-dismissed';
+        const MIG_RUN_BADGE = { ...GUEST_BULK_BADGE, migrating: 'text-blue-400', cancelled: 'text-gray-400', unknown: 'text-yellow-400' };
+
+        const migRunCounts = (r) => {
+            const c = r.counts || {};
+            const open = (c.wait || 0) + (c.migrating || 0);
+            return { ok: (c.done || 0) + (c.started || 0), failed: c.failed || 0, total: r.total || 0, over: (r.total || 0) - open };
+        };
+
+        function BulkMigrateProgress({ runId, authFetch, canAct, onClose, onChanged }) {
+            const { t } = useTranslation();
+            const { isCorporate } = useLayout();
+            const [run, setRun] = useState(null);
+            const [gone, setGone] = useState(false);
+            const [asking, setAsking] = useState(false);
+            const [busy, setBusy] = useState(false);
+            const [error, setError] = useState('');
+
+            // an answer for the run shown before (another card clicked meanwhile) is dropped
+            const shown = useRef(runId);
+            shown.current = runId;
+
+            const load = useCallback(async () => {
+                try {
+                    const res = await authFetch(`${API_URL}/bulk-migrations/${encodeURIComponent(runId)}`);
+                    if (shown.current !== runId) return;
+                    if (res && res.status === 404) { setGone(true); return; }
+                    if (res && res.ok) {
+                        const data = await res.json();
+                        if (shown.current !== runId) return;
+                        setRun(data.run);
+                        setGone(false);
+                    }
+                } catch (e) { /* the next look tries again */ }
+            }, [authFetch, runId]);
+
+            useEffect(() => { setRun(null); setGone(false); setAsking(false); load(); }, [load]);
+            const running = !!run && run.state === 'running';
+            useEffect(() => {
+                if (!running) return undefined;
+                const id = setInterval(load, MIG_RUN_DETAIL_MS);
+                return () => clearInterval(id);
+            }, [running, load]);
+
+            const cancel = async () => {
+                setBusy(true);
+                setError('');
+                const res = await authFetch(`${API_URL}/bulk-migrations/${encodeURIComponent(runId)}/cancel`, { method: 'POST' });
+                setBusy(false);
+                setAsking(false);
+                if (res && res.ok) {
+                    const data = await res.json().catch(() => ({}));
+                    if (data.run && shown.current === runId) setRun(data.run);
+                    if (onChanged) onChanged();
+                } else {
+                    setError(res ? await PegaProxApiErrors.message(res, t('actionFailed')) : t('connectionError'));
+                }
+            };
+
+            const stateText = (s) => ({
+                wait: t('guestBulkWaiting'), migrating: t('migRunMoving'), done: t('guestBulkDone'),
+                started: t('guestBulkStarted'), failed: t('failed'), skipped: t('guestBulkLeftOut'),
+                cancelled: t('migRunNotStarted'), unknown: t('migRunUnknown'),
+            })[s] || s;
+            const runText = (s) => ({ running: t('migRunStateRunning'), done: t('migRunStateDone'),
+                cancelled: t('migRunStateCancelled'), stopped: t('migRunStateStopped') })[s] || s;
+            const how = !run ? '' : run.mode === 'sequential' ? t('migRunOne')
+                : run.mode === 'parallel' ? `${t('migRunSome')} (${run.parallel})` : t('migRunAll');
+            const n = run ? migRunCounts(run) : null;
+            const boxCls = isCorporate ? 'p-2 space-y-1 overflow-y-auto' : 'p-3 bg-proxmox-dark rounded-lg space-y-1 overflow-y-auto';
+            const boxStyle = isCorporate ? { maxHeight: '360px', background: 'var(--corp-surface-2)', border: '1px solid var(--corp-border-medium)' } : { maxHeight: '360px' };
+
+            const footer = (<>
+                {running && run.may_cancel && canAct && (asking ? (<>
+                    <button onClick={() => setAsking(false)} disabled={busy} className={guestBulkButton(isCorporate, 'ghost')}>{t('migRunKeep')}</button>
+                    <button onClick={cancel} disabled={busy} data-testid="mig-run-cancel-yes" className={guestBulkButton(isCorporate, 'danger')}>
+                        {busy && <span className="flex animate-spin"><Icons.RotateCw /></span>}
+                        {t('migRunCancelYes')}
+                    </button>
+                </>) : (
+                    <button onClick={() => setAsking(true)} data-testid="mig-run-cancel" className={guestBulkButton(isCorporate, 'danger')}>{t('migRunCancel')}</button>
+                ))}
+                <button onClick={onClose} data-testid="mig-run-close" className={guestBulkButton(isCorporate, 'ghost')}>{t('close')}</button>
+            </>);
+
+            return (
+                <GuestBulkFrame testId="mig-run-modal" icon={<Icons.ArrowRight />} closable onClose={onClose} footer={footer}
+                    title={run ? guestBulkFill(t('migRunTitle'), { target: run.target }) : t('bulkMigration')}
+                    meta={run ? `${runText(run.state)} - ${how} - ${guestBulkFill(t('guestBulkSummary'), n)}` : null}>
+                    <div className="space-y-4">
+                        {gone && (
+                            <div className="text-sm text-yellow-400 flex items-start gap-2" data-testid="mig-run-gone">
+                                <Icons.AlertTriangle />
+                                <span>{t('migRunGone')}</span>
+                            </div>
+                        )}
+                        {run && (<>
+                            {running && (
+                                <div className="h-1.5 rounded-full bg-proxmox-dark overflow-hidden">
+                                    <div className="h-full bg-blue-500" style={{ width: `${n.total ? Math.round(n.over * 100 / n.total) : 0}%` }} />
+                                </div>
+                            )}
+                            {asking && <div className="text-sm text-yellow-400" data-testid="mig-run-cancel-ask">{t('migRunCancelAsk')}</div>}
+                            {run.cancelled_by && <div className="text-sm text-gray-400">{guestBulkFill(t('migRunCancelledBy'), { user: run.cancelled_by })}</div>}
+                            {run.state === 'stopped' && run.reason && (
+                                <div className="text-sm text-yellow-400 flex items-start gap-2"><Icons.AlertTriangle /><span>{run.reason}</span></div>
+                            )}
+                            <div className={boxCls} style={boxStyle} data-testid="mig-run-rows">
+                                {(run.rows || []).map(r => (
+                                    <div key={r.vmid} className="text-sm" data-guest={r.vmid}>
+                                        <div className="flex items-center gap-2">
+                                            <span className="font-mono text-xs text-gray-400">{r.vmid}</span>
+                                            <span className="truncate flex-1 text-white">{r.name || '-'}</span>
+                                            <span className="text-xs text-gray-500 truncate">{r.node}{r.to && r.to !== r.node ? ` > ${r.to}` : ''}</span>
+                                            <span className={`text-xs ${MIG_RUN_BADGE[r.state] || ''}`} data-state={r.state}>
+                                                {r.state === 'migrating' && <span className="inline-flex animate-spin mr-1"><Icons.RotateCw /></span>}
+                                                {stateText(r.state)}
+                                            </span>
+                                        </div>
+                                        {r.note && <div className={`text-xs pl-10 break-all ${r.state === 'failed' ? 'text-red-400' : 'text-gray-500'}`}>{r.note}</div>}
+                                    </div>
+                                ))}
+                            </div>
+                            {run.mode === 'all' && <div className="text-xs text-gray-400">{t('migRunAllHint')}</div>}
+                        </>)}
+                        {!run && !gone && <div className="text-sm text-gray-400">{t('loading')}</div>}
+                        <div className="text-xs text-gray-400 flex items-start gap-2" data-testid="mig-run-server-note">
+                            <Icons.Info />
+                            <span>{t('migRunServerNote')}</span>
+                        </div>
+                        {error && (
+                            <div className="text-sm text-red-400 flex items-start gap-2" data-testid="mig-run-error">
+                                <Icons.AlertTriangle />
+                                <span className="break-all">{error}</span>
+                            </div>
+                        )}
+                    </div>
+                </GuestBulkFrame>
+            );
+        }
+
+        function BulkMigrateRuns({ authFetch, openId, onOpen, tick, canAct, onSettled }) {
+            const { t } = useTranslation();
+            const { isCorporate } = useLayout();
+            const [runs, setRuns] = useState([]);
+            const [lost, setLost] = useState({});
+            const [dismissed, setDismissed] = useState(() => {
+                try { return JSON.parse(localStorage.getItem(MIG_RUN_DISMISSED) || '[]') || []; } catch (e) { return []; }
+            });
+            const known = useRef({});
+            // the dashboard hands a new function every render; the list is read on its own beat
+            const settled = useRef(onSettled);
+            settled.current = onSettled;
+            // a look that was asked before the one already shown answers late: it would not
+            // know a run started in between and call it gone
+            const asked = useRef(0);
+            const shownLook = useRef(0);
+
+            const load = useCallback(async () => {
+                const look = ++asked.current;
+                try {
+                    const res = await authFetch(`${API_URL}/bulk-migrations`);
+                    if (!res || !res.ok) return;
+                    const data = await res.json();
+                    if (look < shownLook.current) return;
+                    shownLook.current = look;
+                    const mine = (data.runs || []).filter(r => r.mine);
+                    const ids = new Set(mine.map(r => r.id));
+                    // running at the last look and not listed now: gone with the process that ran it
+                    const gone = Object.values(known.current).filter(r => r.state === 'running' && !ids.has(r.id));
+                    if (gone.length) setLost(prev => { const next = { ...prev }; gone.forEach(r => { next[r.id] = { ...r, state: 'lost' }; }); return next; });
+                    mine.forEach(r => {
+                        const was = known.current[r.id];
+                        if (was && was.state === 'running' && r.state !== 'running' && settled.current) settled.current(r.cluster_id);
+                    });
+                    known.current = Object.fromEntries(mine.map(r => [r.id, r]));
+                    setRuns(mine);
+                } catch (e) { /* the next look tries again */ }
+            }, [authFetch]);
+
+            useEffect(() => { load(); }, [load, tick]);
+            const anyRunning = runs.some(r => r.state === 'running');
+            useEffect(() => {
+                if (!anyRunning) return undefined;
+                const id = setInterval(load, MIG_RUN_LIST_MS);
+                return () => clearInterval(id);
+            }, [anyRunning, load]);
+
+            const dismiss = (id) => {
+                const next = dismissed.filter(x => x !== id).concat(id).slice(-100);
+                setDismissed(next);
+                setLost(prev => { const n = { ...prev }; delete n[id]; return n; });
+                try { localStorage.setItem(MIG_RUN_DISMISSED, JSON.stringify(next)); } catch (e) { /* only this view forgets it */ }
+            };
+
+            const cards = runs.concat(Object.values(lost)).filter(r => r.state === 'running' || !dismissed.includes(r.id));
+            const cardStyle = isCorporate ? { width: '300px', background: 'var(--corp-surface, #1c2733)', border: '1px solid var(--corp-border, #29414e)', color: 'var(--corp-text, #e9ecef)' } : { width: '300px' };
+
+            return (<>
+                {cards.map(r => {
+                    const n = migRunCounts(r);
+                    const title = r.state === 'running' ? t('migRunTray') : r.state === 'lost' ? t('migRunTrayLost') : t('migRunTrayDone');
+                    return (
+                        <div key={r.id} role="button" tabIndex={0} data-testid="mig-run-card" data-run={r.id} data-state={r.state}
+                            onClick={() => onOpen(r.id)} onKeyDown={e => { if (e.key === 'Enter') onOpen(r.id); }}
+                            className={`flex items-start gap-3 px-4 py-3 rounded-lg border shadow-lg cursor-pointer ${isCorporate ? '' : 'bg-proxmox-card border-proxmox-border'}`}
+                            style={cardStyle}>
+                            <span className={`flex flex-shrink-0 mt-0.5 ${r.state === 'running' ? 'animate-spin text-blue-400' : n.failed || r.state === 'lost' ? 'text-yellow-400' : 'text-green-400'}`}>
+                                {r.state === 'running' ? <Icons.RotateCw /> : n.failed || r.state === 'lost' ? <Icons.AlertTriangle /> : <Icons.CheckCircle />}
+                            </span>
+                            <div className="min-w-0 flex-1">
+                                <div className="text-sm font-medium text-white">{guestBulkFill(title, { target: r.target })}</div>
+                                <div className="text-xs text-gray-400">{guestBulkFill(t('guestBulkSummary'), n)}</div>
+                                {r.state === 'running' && (
+                                    <div className="h-1 mt-2 rounded-full bg-proxmox-dark overflow-hidden">
+                                        <div className="h-full bg-blue-500" style={{ width: `${n.total ? Math.round(n.over * 100 / n.total) : 0}%` }} />
+                                    </div>
+                                )}
+                            </div>
+                            {r.state !== 'running' && (
+                                <button onClick={e => { e.stopPropagation(); dismiss(r.id); }} title={t('migRunDismiss')} data-testid="mig-run-dismiss"
+                                    className="p-1 text-gray-400 hover:text-white rounded flex-shrink-0"><Icons.X /></button>
+                            )}
+                        </div>
+                    );
+                })}
+                {openId && (
+                    <BulkMigrateProgress runId={openId} authFetch={authFetch} canAct={canAct}
+                        onClose={() => onOpen(null)} onChanged={load} />
+                )}
+            </>);
         }
 
         // Cross-Cluster Migration Modal

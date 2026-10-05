@@ -4264,6 +4264,8 @@
                     'vm.cloned': t('vmCloned'),
                     'vm.migrated': t('vmMigrated'),
                     'vm.bulk_migrated': t('vmBulkMigrated'),
+                    'vm.bulk_migrate_cancelled': t('migRunAuditCancelled'),
+                    'vm.bulk_migrate_finished': t('migRunAuditFinished'),
                     'vm.config_changed': t('vmConfigChanged'),
                     'vm.suspended': t('vmSuspended'),
                     'vm.resumed': t('vmResumed'),
