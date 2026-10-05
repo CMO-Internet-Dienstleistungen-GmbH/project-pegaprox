@@ -2504,6 +2504,277 @@ def get_usb_mappings(cluster_id):
         return jsonify({'error': safe_error(e, 'Failed to get USB mappings')}), 500
 
 
+# MK Oct 2026 - directory mappings (PVE 8.4+): a directory of the host per node, under the
+# id a VM's virtiofsN names. A mapping hands that directory to every guest given it, the
+# way the node's root sees it, so it is changed with cluster.config and by nobody confined
+# to some guests of the cluster; its host paths are not theirs to read either. PVE checks a
+# path only on the node that answers the request (assert_valid_map_list), so its rules for
+# the path are held here for every node, and a node the cluster does not have is refused
+# before PVE stores it.
+_PVE_NODE_NAME_RE = re.compile(r'[a-zA-Z0-9](?:[a-zA-Z0-9\-]*[a-zA-Z0-9])?')
+_DIR_MAPPING_FIELDS = ('id', 'description', 'map', 'digest')
+
+
+def _dir_path_problem(path):
+    """'' for a path PVE takes in a directory mapping (pve-storage-path-in-property-string),
+    else why not"""
+    if not isinstance(path, str) or not path:
+        return 'a path is required'
+    if not path.startswith('/'):
+        return f'{path[:80]!r} is not an absolute path'
+    if not path.strip('/'):
+        return 'the root directory would share the whole file system of the node'
+    if len(path) > 4096:
+        return 'the path is longer than 4096 characters'
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in path):
+        return 'a path cannot hold control characters'
+    bad = sorted({ch for ch in path if ch in ';,=()'})
+    if bad:
+        return 'a path cannot hold ' + ' '.join(bad)
+    if path != path.rstrip():
+        return 'a path cannot end with a space'
+    if '..' in path.split('/'):
+        return 'write the path without ".." in it'
+    return ''
+
+
+def _dir_mapping_fields(data, mapping_id=None):
+    """({id?, description?, map?, digest?}, None) from a request body, or (None, why not).
+    Creating (mapping_id None) wants an id and a map; a change wants a map, a description
+    or both."""
+    if not isinstance(data, dict):
+        return None, 'JSON object expected'
+    extra = [str(k)[:40] for k in data if k not in _DIR_MAPPING_FIELDS]
+    if extra:
+        return None, f'Unknown field: {extra[0]}'
+    out = {}
+    if mapping_id is None:
+        mid = data.get('id')
+        if not isinstance(mid, str) or not _MAPPING_ID_RE.fullmatch(mid):
+            return None, 'The id is 2 to 64 letters, digits, - and _, and starts with a letter'
+        out['id'] = mid
+    elif 'id' in data and data['id'] != mapping_id:
+        return None, 'The id of a mapping cannot change'
+    if data.get('description') is not None:
+        desc = data['description']
+        if not isinstance(desc, str) or len(desc) > 4096 or any(ord(ch) < 32 or ord(ch) == 127 for ch in desc):
+            return None, 'The description is one line of at most 4096 characters'
+        out['description'] = desc.strip()
+    if mapping_id is None or 'map' in data:
+        entries = data.get('map')
+        if not isinstance(entries, list) or not entries:
+            return None, 'map lists at least one node with its path'
+        pairs = []
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) - {'node', 'path'}:
+                return None, 'Each map entry is {node, path}'
+            node, path = entry.get('node'), entry.get('path')
+            if not isinstance(node, str) or not _PVE_NODE_NAME_RE.fullmatch(node):
+                return None, f'{str(node)[:64]!r} is not a node name'
+            if any(node == n for n, _p in pairs):
+                return None, f'Node {node} is listed twice'
+            why = _dir_path_problem(path)
+            if why:
+                return None, f'{node}: {why}'
+            pairs.append((node, path))
+        out['map'] = pairs
+    elif 'description' not in out:
+        return None, 'Nothing to change: send map, description or both'
+    if data.get('digest') is not None:
+        if not isinstance(data['digest'], str) or not re.fullmatch(r'[0-9a-fA-F]{1,64}', data['digest']):
+            return None, 'Invalid digest'
+        out['digest'] = data['digest']
+    return out, None
+
+
+def _cluster_node_names(manager):
+    """The names of the cluster's nodes, online or not (GET /nodes), None when unreadable"""
+    try:
+        r = manager._create_session().get(f"https://{manager.host}:{manager.api_port}/api2/json/nodes", timeout=10)
+    except Exception:
+        return None
+    if r.status_code != 200:
+        return None
+    return sorted({str(n['node']) for n in (r.json().get('data') or []) if isinstance(n, dict) and n.get('node')})
+
+
+def _dir_mapping_manager(cluster_id):
+    """(manager, None), or (None, response) for a caller or a cluster the directory
+    mappings are not open to"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return None, err
+    denied = require_unconfined(cluster_id)
+    if denied:
+        return None, denied
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return None, error
+    if getattr(manager, 'cluster_type', 'proxmox') != 'proxmox':
+        return None, (jsonify({'error': 'Directory mappings are a Proxmox VE feature'}), 400)
+    return manager, None
+
+
+def _dir_mapping_nodes_refusal(manager, pairs):
+    """None when every node of `pairs` is one of the cluster's, else the response"""
+    nodes = _cluster_node_names(manager)
+    if nodes is None:
+        return jsonify({'error': 'Could not read the nodes of this cluster'}), 502
+    unknown = [n for n, _p in pairs if n not in nodes]
+    if unknown:
+        return jsonify({'error': f'{unknown[0]} is not a node of this cluster'}), 400
+    return None
+
+
+def _pve_dir_mapping_refusal(resp, what):
+    msg = parse_pve_error(resp.text, f'Proxmox refused to {what} the directory mapping')
+    low = msg.lower()
+    if 'already defined' in low or 'modified configuration' in low or 'digest' in low:
+        return jsonify({'error': msg}), 409
+    # the node that answered checks its own path, and dies (500) on one it does not have
+    if resp.status_code in (400, 403) or 'does not exist' in low or 'not a directory' in low:
+        return jsonify({'error': msg}), 403 if resp.status_code == 403 else 400
+    return jsonify({'error': msg}), 502
+
+
+def _dir_map_text(pairs):
+    return ', '.join(f'{n}={p}' for n, p in pairs)[:400]
+
+
+@bp.route('/api/clusters/<cluster_id>/datacenter/mapping/dir', methods=['GET'])
+@require_auth(perms=['cluster.view'])
+def get_dir_mappings(cluster_id):
+    """The directory mappings of a Proxmox VE cluster (8.4 or newer), each with its path per node, and the nodes of the cluster"""
+    manager, err = _dir_mapping_manager(cluster_id)
+    if err:
+        return err
+    try:
+        if _dir_mappings_missing(manager):
+            return jsonify({'supported': False, 'min_version': '8.4', 'mappings': [], 'nodes': [], 'digest': ''})
+        mappings, read_err = _read_mappings(manager, 'dir')
+        if mappings is None:
+            return jsonify({'error': read_err}), 502
+        rows = [{'id': m['id'], 'description': m['description'], 'nodes': m['nodes'],
+                 'entries': [{'node': e['node'], 'path': e['path']} for e in m['entries']]}
+                for m in mappings]
+        digest = next((m['digest'] for m in mappings if m['digest']), '')
+        return jsonify({'supported': True, 'mappings': rows, 'nodes': _cluster_node_names(manager) or [],
+                        'digest': digest})
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Failed to read the directory mappings')}), 500
+
+
+@bp.route('/api/clusters/<cluster_id>/datacenter/mapping/dir', methods=['POST'])
+@require_auth(perms=['cluster.config'])
+def create_dir_mapping(cluster_id):
+    """Create a directory mapping: {id, description, map: [{node, path}]}, an absolute path per node that VMs share through virtiofs"""
+    manager, err = _dir_mapping_manager(cluster_id)
+    if err:
+        return err
+    fields, why = _dir_mapping_fields(request.get_json(silent=True))
+    if why:
+        return jsonify({'error': why}), 400
+    try:
+        if _dir_mappings_missing(manager):
+            return jsonify({'error': 'Directory mappings need Proxmox VE 8.4 or newer'}), 400
+        refused = _dir_mapping_nodes_refusal(manager, fields['map'])
+        if refused:
+            return refused
+        body = {'id': fields['id'], 'map': [f'node={n},path={p}' for n, p in fields['map']]}
+        if fields.get('description'):
+            body['description'] = fields['description']
+        url = f"https://{manager.host}:{manager.api_port}/api2/json/cluster/mapping/dir"
+        resp = manager._create_session().post(url, data=body, timeout=15)
+        if resp.status_code != 200:
+            return _pve_dir_mapping_refusal(resp, 'create')
+        user = getattr(request, 'session', {}).get('user', 'system')
+        log_audit(user, 'mapping.dir_created', f"Directory mapping {fields['id']}: {_dir_map_text(fields['map'])}",
+                  cluster=manager.config.name)
+        return jsonify({'success': True, 'id': fields['id']})
+    except Exception as e:
+        logging.error(f"Error creating a directory mapping: {e}")
+        return jsonify({'error': safe_error(e, 'Failed to create the directory mapping')}), 500
+
+
+@bp.route('/api/clusters/<cluster_id>/datacenter/mapping/dir/<mapping_id>', methods=['PUT'])
+@require_auth(perms=['cluster.config'])
+def update_dir_mapping(cluster_id, mapping_id):
+    """Change a directory mapping: {map: [{node, path}], description, digest}, map and description each optional. The map replaces the one before."""
+    manager, err = _dir_mapping_manager(cluster_id)
+    if err:
+        return err
+    if not _MAPPING_ID_RE.fullmatch(mapping_id or ''):
+        return jsonify({'error': 'Invalid mapping id'}), 400
+    fields, why = _dir_mapping_fields(request.get_json(silent=True), mapping_id)
+    if why:
+        return jsonify({'error': why}), 400
+    try:
+        if _dir_mappings_missing(manager):
+            return jsonify({'error': 'Directory mappings need Proxmox VE 8.4 or newer'}), 400
+        known, read_err = _read_mappings(manager, 'dir')
+        if known is None:
+            return jsonify({'error': read_err}), 502
+        before = next((m for m in known if m['id'] == mapping_id), None)
+        if before is None:
+            return jsonify({'error': f'No directory mapping "{mapping_id}" in this cluster'}), 404
+        if 'map' in fields:
+            refused = _dir_mapping_nodes_refusal(manager, fields['map'])
+            if refused:
+                return refused
+        body = {}
+        if 'map' in fields:
+            body['map'] = [f'node={n},path={p}' for n, p in fields['map']]
+        if 'description' in fields:
+            if fields['description']:
+                body['description'] = fields['description']
+            else:
+                body['delete'] = 'description'
+        if fields.get('digest'):
+            body['digest'] = fields['digest']
+        url = f"https://{manager.host}:{manager.api_port}/api2/json/cluster/mapping/dir/{mapping_id}"
+        resp = manager._create_session().put(url, data=body, timeout=15)
+        if resp.status_code != 200:
+            return _pve_dir_mapping_refusal(resp, 'change')
+        user = getattr(request, 'session', {}).get('user', 'system')
+        old = _dir_map_text([(e['node'], e['path']) for e in before['entries']])
+        what = f"'{old}' -> '{_dir_map_text(fields['map'])}'" if 'map' in fields else 'description'
+        log_audit(user, 'mapping.dir_updated', f"Directory mapping {mapping_id}: {what}", cluster=manager.config.name)
+        return jsonify({'success': True, 'id': mapping_id})
+    except Exception as e:
+        logging.error(f"Error changing a directory mapping: {e}")
+        return jsonify({'error': safe_error(e, 'Failed to change the directory mapping')}), 500
+
+
+@bp.route('/api/clusters/<cluster_id>/datacenter/mapping/dir/<mapping_id>', methods=['DELETE'])
+@require_auth(perms=['cluster.config'])
+def delete_dir_mapping(cluster_id, mapping_id):
+    """Remove a directory mapping. A VM whose virtiofs device names it does not start until the device is removed or the mapping is back."""
+    manager, err = _dir_mapping_manager(cluster_id)
+    if err:
+        return err
+    if not _MAPPING_ID_RE.fullmatch(mapping_id or ''):
+        return jsonify({'error': 'Invalid mapping id'}), 400
+    try:
+        known, read_err = _read_mappings(manager, 'dir')
+        if known is None:
+            return jsonify({'error': read_err}), 502
+        before = next((m for m in known if m['id'] == mapping_id), None)
+        if before is None:
+            return jsonify({'error': f'No directory mapping "{mapping_id}" in this cluster'}), 404
+        url = f"https://{manager.host}:{manager.api_port}/api2/json/cluster/mapping/dir/{mapping_id}"
+        resp = manager._create_session().delete(url, timeout=15)
+        if resp.status_code != 200:
+            return _pve_dir_mapping_refusal(resp, 'remove')
+        user = getattr(request, 'session', {}).get('user', 'system')
+        old = _dir_map_text([(e['node'], e['path']) for e in before['entries']])
+        log_audit(user, 'mapping.dir_deleted', f"Directory mapping {mapping_id} removed (was {old})",
+                  cluster=manager.config.name)
+        return jsonify({'success': True})
+    except Exception as e:
+        logging.error(f"Error removing a directory mapping: {e}")
+        return jsonify({'error': safe_error(e, 'Failed to remove the directory mapping')}), 500
+
+
 # Maintenance Mode API Routes
 @bp.route('/api/clusters/<cluster_id>/nodes/<node_name>/maintenance-preview', methods=['GET'])
 @require_auth(perms=['node.maintenance'])
@@ -5228,6 +5499,10 @@ def update_vm_config_api(cluster_id, node, vm_type, vmid):
                 return jsonify({'error': f'Invalid VirtIO RNG: {why}'}), 400
             config_updates[key] = value
 
+    refused = _virtiofs_refusal(manager, cluster_id, node, vmid, vm_type, config_updates)
+    if refused:
+        return refused
+
     result = manager.update_vm_config(node, vmid, vm_type, config_updates)
 
     if result['success']:
@@ -5885,10 +6160,10 @@ def _property_fields(text):
 
 
 def _read_mappings(manager, kind, check_node=None):
-    """The cluster's PCI or USB resource mappings, as ([...], None) or (None, error).
+    """The cluster's PCI, USB or directory resource mappings, as ([...], None) or (None, error).
 
-    Each with the nodes it has a device on: a guest that uses it starts and migrates
-    there only. check_node asks PVE to check that node's devices against the mapping
+    Each with the nodes it has a device (a directory) on: a guest that uses it starts and
+    migrates there only. check_node asks PVE to check that node's devices against the mapping
     (it answers from that node); a node that does not answer gets the plain list. One
     request, two when the node is down - on opening the dialog, never in a loop."""
     base = f"https://{manager.host}:{manager.api_port}/api2/json/cluster/mapping/{kind}"
@@ -5904,7 +6179,8 @@ def _read_mappings(manager, kind, check_node=None):
     if resp is None:
         resp = session.get(base, timeout=10)
     if resp.status_code != 200:
-        return None, f'Could not read the {kind.upper()} resource mappings: {parse_pve_error(resp.text)}'
+        what = 'directory' if kind == 'dir' else kind.upper()
+        return None, f'Could not read the {what} resource mappings: {parse_pve_error(resp.text)}'
     out = []
     for row in resp.json().get('data') or []:
         if not isinstance(row, dict) or not row.get('id'):
@@ -5922,7 +6198,7 @@ def _read_mappings(manager, kind, check_node=None):
                     'on_node': (check_node in nodes) if check_node else None,
                     'mdev': bool(row.get('mdev')),
                     'live_migration': bool(row.get('live-migration-capable')),
-                    'checks': checks})
+                    'checks': checks, 'digest': str(row.get('digest') or '')})
     out.sort(key=lambda m: m['id'].lower())
     return out, None
 
@@ -5930,14 +6206,14 @@ def _read_mappings(manager, kind, check_node=None):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/qemu/<int:vmid>/passthrough/mappings', methods=['GET'])
 @require_auth(perms=['vm.config'])
 def get_vm_passthrough_mappings(cluster_id, node, vmid):
-    """The PCI or USB resource mappings a VM can be given (?kind=pci|usb), the nodes each covers, and whether this connection may attach raw devices"""
+    """The PCI, USB or directory mappings a VM can be given (?kind=pci|usb|dir), the nodes each covers, and whether this connection may attach raw devices (pci, usb) or share another directory (dir)"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
     denied = _require_vm_access(cluster_id, vmid, 'vm.config', 'qemu')
     if denied: return denied
     kind = request.args.get('kind', 'pci')
-    if kind not in ('pci', 'usb'):
-        return jsonify({'error': 'kind is pci or usb'}), 400
+    if kind not in ('pci', 'usb', 'dir'):
+        return jsonify({'error': 'kind is pci, usb or dir'}), 400
     if not _PVE_NODE_RE.fullmatch(node or ''):
         return jsonify({'error': 'Invalid node name'}), 400
     manager, error = get_connected_manager(cluster_id)
@@ -5946,6 +6222,8 @@ def get_vm_passthrough_mappings(cluster_id, node, vmid):
     if getattr(manager, 'cluster_type', 'proxmox') != 'proxmox':
         return jsonify({'error': 'Resource mappings are a Proxmox VE feature'}), 400
     try:
+        if kind == 'dir':
+            return _vm_dir_mappings(manager, cluster_id, node, vmid)
         mappings, read_err = _read_mappings(manager, kind, check_node=node)
         if mappings is None:
             return jsonify({'error': read_err}), 502
@@ -5954,6 +6232,189 @@ def get_vm_passthrough_mappings(cluster_id, node, vmid):
                         'raw_allowed': access['root'], 'access': access})
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to read resource mappings')}), 500
+
+
+# MK Oct 2026 - virtiofs, a directory of the host shared with a VM (PVE 8.4+). virtiofsN
+# names a cluster directory mapping and is a property string PVE parses as pve-qm-virtiofs
+# (qemu-server PVE/QemuServer/Virtiofs.pm):
+#     [dirid=]<mapping-id>[,cache=<auto|always|metadata|never>][,direct-io=<1|0>]
+#     [,expose-acl=<1|0>][,expose-xattr=<1|0>]
+# PVE checks the format and Mapping.Use, which the connection here holds for every id. A
+# mapping that does not exist and ACLs on a Windows guest are stored all the same, and the
+# VM then does not start; both stop here with the reason.
+_VIRTIOFS_KEY_RE = re.compile(r'virtiofs[0-9]')
+_VIRTIOFS_CACHE = ('auto', 'always', 'metadata', 'never')
+_VIRTIOFS_FLAGS = ('direct-io', 'expose-acl', 'expose-xattr')
+_DIR_MAPPING_MIN_PVE = (8, 4)
+
+
+def _pve_bool(text):
+    """'1' or '0' for what PVE::JSONSchema::parse_boolean reads, else None"""
+    if not text.isascii():
+        return None
+    low = text.lower()
+    if low in ('1', 'on', 'yes', 'true'):
+        return '1'
+    if low in ('0', 'off', 'no', 'false'):
+        return '0'
+    return None
+
+
+def _virtiofs_value(value):
+    """'[dirid=]<id>[,cache=..][,direct-io=..][,expose-acl=..][,expose-xattr=..]' -> (the
+    value to send, {dirid, options}, None) or (None, None, why not). Parsed the way PVE
+    parses it (empty parts skipped, the bare value is the mapping id, each key once) and
+    sent back in one spelling: the id first, the options as given, booleans as 1 or 0."""
+    if not isinstance(value, str):
+        return None, None, 'must be a string'
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        return None, None, 'must be one line without control characters'
+    found = {}
+    for part in value.split(','):
+        if not part.strip():
+            continue
+        key, sep, val = part.partition('=')
+        if not sep:
+            key, val = 'dirid', part
+        elif not key or not val:
+            return None, None, f'has a part without a key or a value: {part[:40]!r}'
+        if key not in ('dirid', 'cache') + _VIRTIOFS_FLAGS:
+            return None, None, f'has no option {key[:40]!r}'
+        if key in found:
+            return None, None, f'sets {key} twice'
+        found[key] = val
+    dirid = found.get('dirid')
+    if not dirid:
+        return None, None, 'needs a directory mapping'
+    if not _MAPPING_ID_RE.fullmatch(dirid):
+        return None, None, f'names no valid mapping id: {dirid[:70]!r}'
+    out = [dirid]
+    if 'cache' in found:
+        if found['cache'] not in _VIRTIOFS_CACHE:
+            return None, None, 'cache is one of ' + ', '.join(_VIRTIOFS_CACHE)
+        out.append(f"cache={found['cache']}")
+    for flag in _VIRTIOFS_FLAGS:
+        if flag in found:
+            on = _pve_bool(found[flag])
+            if on is None:
+                return None, None, f'{flag} is 1 or 0'
+            found[flag] = on
+            out.append(f'{flag}={on}')
+    return ','.join(out), found, None
+
+
+def _virtiofs_dirid(value):
+    """The mapping id of a stored virtiofsN value, '' when it has none"""
+    for part in str(value or '').split(','):
+        key, sep, val = part.partition('=')
+        if not sep and part.strip():
+            return part
+        if sep and key == 'dirid':
+            return val
+    return ''
+
+
+def _pve_windows(ostype):
+    """qemu-server's windows_version(): whether PVE treats the guest as Windows"""
+    ostype = str(ostype or '')
+    return ostype in ('wxp', 'w2k', 'w2k3', 'w2k8', 'wvista') or bool(re.fullmatch(r'win[0-9]+', ostype))
+
+
+def _dir_mappings_missing(manager):
+    """True when the cluster runs a Proxmox VE older than 8.4, which has no directory
+    mappings and no virtiofs. An unknown version is tried."""
+    ver = manager.get_pve_version_tuple()
+    return isinstance(ver, tuple) and ver < _DIR_MAPPING_MIN_PVE
+
+
+def _vm_raw_config(manager, node, vmid):
+    res = manager.get_vm_config(node, vmid, 'qemu')
+    if isinstance(res, dict) and res.get('success'):
+        raw = (res.get('config') or {}).get('raw')
+        if isinstance(raw, dict):
+            return raw
+    return None
+
+
+def _vm_virtiofs_dirids(raw):
+    return {_virtiofs_dirid(v) for k, v in raw.items() if _VIRTIOFS_KEY_RE.fullmatch(str(k))} - {''}
+
+
+def _vm_dir_mappings(manager, cluster_id, node, vmid):
+    """The directory mappings for a virtiofs device of a VM, checked on its node. A caller
+    confined to some guests of the cluster gets only those the VM already has: a mapping
+    reaches a directory of the host, and which one a guest gets is a call for the whole
+    cluster (the config route holds the same line)."""
+    if _dir_mappings_missing(manager):
+        return jsonify({'kind': 'dir', 'node': node, 'supported': False, 'min_version': '8.4',
+                        'mappings': [], 'may_add': False})
+    mappings, read_err = _read_mappings(manager, 'dir', check_node=node)
+    if mappings is None:
+        return jsonify({'error': read_err}), 502
+    confined = caller_is_scoped(build_authz_user(request.session.get('user', ''), request.session), cluster_id)
+    if confined:
+        raw = _vm_raw_config(manager, node, vmid)
+        if raw is None:
+            return jsonify({'error': 'Could not read the VM config'}), 502
+        mine = _vm_virtiofs_dirids(raw)
+        mappings = [m for m in mappings if m['id'] in mine]
+    for m in mappings:
+        m.pop('digest', None)
+    return jsonify({'kind': 'dir', 'node': node, 'supported': True, 'mappings': mappings,
+                    'may_add': not confined})
+
+
+def _virtiofs_refusal(manager, cluster_id, node, vmid, vm_type, config_updates):
+    """None when every virtiofsN of a config change may go to PVE (each is rewritten in
+    one spelling then), else the response that says why not."""
+    keys = [k for k in config_updates if str(k).startswith('virtiofs')]
+    if not keys:
+        return None
+    if getattr(manager, 'cluster_type', 'proxmox') != 'proxmox':
+        return jsonify({'error': 'virtiofs is a Proxmox VE feature'}), 400
+    if vm_type != 'qemu':
+        return jsonify({'error': 'A container has no virtiofs - a mount point shares a host directory with it'}), 400
+    parsed = {}
+    for key in keys:
+        if not _VIRTIOFS_KEY_RE.fullmatch(str(key)):
+            return jsonify({'error': f'Proxmox has virtiofs0 to virtiofs9, not {str(key)[:40]}'}), 400
+        value, opts, why = _virtiofs_value(config_updates[key])
+        if why:
+            return jsonify({'error': f'Invalid virtiofs: {key} {why}'}), 400
+        parsed[key] = (value, opts)
+    if _dir_mappings_missing(manager):
+        return jsonify({'error': 'virtiofs needs Proxmox VE 8.4 or newer'}), 400
+
+    acl = any(opts.get('expose-acl') == '1' for _v, opts in parsed.values())
+    confined = caller_is_scoped(build_authz_user(request.session.get('user', ''), request.session), cluster_id)
+    raw = None
+    if confined or (acl and 'ostype' not in config_updates):
+        raw = _vm_raw_config(manager, node, vmid)
+        if raw is None:
+            return jsonify({'error': 'Could not read the VM config to check the virtiofs device'}), 502
+    if confined:
+        mine = _vm_virtiofs_dirids(raw)
+        if any(opts['dirid'] not in mine for _v, opts in parsed.values()):
+            return jsonify({'error': 'Sharing another host directory with a VM is a change for the whole '
+                                     'cluster, which this account cannot make',
+                            'code': 'VIRTIOFS_CLUSTER_WIDE'}), 403
+
+    known, read_err = _read_mappings(manager, 'dir')
+    if known is None:
+        return jsonify({'error': read_err}), 502
+    ids = {m['id'] for m in known}
+    for key, (_v, opts) in parsed.items():
+        if opts['dirid'] not in ids:
+            return jsonify({'error': f"Invalid virtiofs: {key} names no directory mapping of this "
+                                     f"cluster ({opts['dirid']})"}), 400
+    if acl:
+        ostype = config_updates['ostype'] if 'ostype' in config_updates else raw.get('ostype')
+        if _pve_windows(ostype):
+            return jsonify({'error': 'Invalid virtiofs: a Windows VM cannot mount the share with '
+                                     'expose-acl, switch ACLs off'}), 400
+    for key, (value, _o) in parsed.items():
+        config_updates[key] = value
+    return None
 
 
 # MK Oct 2026 - LXC feature flags after creation. pve-container keeps every flag of a
