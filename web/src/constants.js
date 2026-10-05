@@ -34,7 +34,9 @@
             if (!f) {
                 const base = kind === 'T'
                     ? { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: h12 }
-                    : { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: h12 };
+                    : kind === 'M'
+                        ? { hour: '2-digit', minute: '2-digit', hour12: h12 }
+                        : { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: h12 };
                 try { f = new Intl.DateTimeFormat(undefined, { ...base, ...(opts || {}) }); }
                 catch (_) { f = new Intl.DateTimeFormat(); }
                 _dtfCache[key] = f;
@@ -54,6 +56,15 @@
             if (isNaN(dt)) return '';
             const h12 = localStorage.getItem('pegaprox-time-format') === '12h';
             return _dtf('T', h12, null).format(dt);
+        }
+        // LW Oct 2026 - hour and minute in browser time on the same 12h/24h setting, for
+        // chart axes where seconds are noise; opts add parts (month, day, second)
+        function fmtClock(d, opts) {
+            if (!d) return '';
+            const dt = d instanceof Date ? d : new Date(typeof d === 'number' && d < 1e12 ? d * 1000 : d);
+            if (isNaN(dt)) return '';
+            const h12 = localStorage.getItem('pegaprox-time-format') === '12h';
+            return _dtf('M', h12, opts || null).format(dt);
         }
 
         // NS: timezone list for node time config (matches backend get_timezones)

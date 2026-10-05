@@ -482,14 +482,16 @@
                     const span = timestamps[timestamps.length - 1] - timestamps[0];
                     const useDateOnly = span > 86400 * 14;  // > 2 weeks
                     const useDate = span > 86400 * 2;        // > 2 days
+                    // LW Oct 2026 - the time through fmtClock: browser time, and the 12h/24h
+                    // setting the rest of the UI keeps (the locale's default ignored it)
                     for (let i = 0; i < timestamps.length; i++) {
                         const d = new Date(timestamps[i] * 1000);
                         if (useDateOnly) {
                             rawLabels.push(d.toLocaleDateString([], { month: 'short', day: 'numeric' }));
                         } else if (useDate) {
-                            rawLabels.push(d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+                            rawLabels.push(d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + fmtClock(d));
                         } else {
-                            rawLabels.push(d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+                            rawLabels.push(fmtClock(d));
                         }
                     }
                 } else {

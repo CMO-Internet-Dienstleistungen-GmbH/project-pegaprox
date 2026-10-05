@@ -5343,6 +5343,11 @@
                             ? `${t('driftSeeded') || 'baseline seeded'}: ${j.seeded_baselines}`
                             : `${j.events_count || 0} ${t('driftEvents') || 'events'}`;
                         addToast(`${t('driftScanned') || 'Scan complete'} — ${m}`, 'success');
+                        // LW Oct 2026 - a read that failed kept its baselines, so "0 events"
+                        // is not all clear for it: say which kinds
+                        if (Array.isArray(j.unread) && j.unread.length) {
+                            addToast(`${t('driftNotRead') || 'Not read this time, baselines kept'}: ${j.unread.map(kindLabel).join(', ')}`, 'warning');
+                        }
                         await refresh();
                     } else {
                         addToast(t('driftScanFailed') || 'Scan failed', 'error');
@@ -19146,7 +19151,7 @@
                                                                                 return (
                                                                                     <tr key={event.id} className={`hover:bg-white/5 transition-colors align-top ${rowBg}`}>
                                                                                         <td className="px-4 py-2.5 text-gray-400 whitespace-nowrap text-xs font-mono">
-                                                                                            {event.timestamp ? new Date(event.timestamp).toLocaleString([], {month:'short',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '-'}
+                                                                                            {event.timestamp ? fmtClock(event.timestamp, { month: 'short', day: '2-digit', second: '2-digit' }) || '-' : '-'}
                                                                                         </td>
                                                                                         <td className="px-3 py-2.5">
                                                                                             <span className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs font-medium border ${badgeBg}`}>
@@ -20909,7 +20914,7 @@
                                                                                     <div className="px-4 py-2 bg-proxmox-dark/50 flex gap-6 text-xs text-gray-500">
                                                                                         {node.os && <span>OS: {node.os}</span>}
                                                                                         {node.kernel && <span>Kernel: {node.kernel}</span>}
-                                                                                        {node.timestamp && <span>{t('scannedAt') || 'Scanned at'}: {new Date(node.timestamp).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: localStorage.getItem('pegaprox-time-format') === '12h' })}</span>}
+                                                                                        {node.timestamp && <span>{t('scannedAt') || 'Scanned at'}: {fmtTime(node.timestamp)}</span>}
                                                                                     </div>
 
                                                                                     {/* CVE table from debsecan */}
