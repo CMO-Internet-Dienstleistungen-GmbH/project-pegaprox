@@ -465,6 +465,11 @@ def create_app():
         ('POST', '/api/hardware-monitoring/redfish-consent'),
         ('POST', '/api/config/restore'),
         ('POST', '/api/security/cors'),
+        # MK Oct 2026 - the broadcast banners, stored with the settings: a standby shows
+        # them and leaves them to the settings page of the active
+        ('POST', '/api/settings/banners'),
+        ('PUT', '/api/settings/banners/<banner_id>'),
+        ('DELETE', '/api/settings/banners/<banner_id>'),
         # the code and the loaded plugins of a process: an update or a plugin switched
         # on would happen to the active and not here
         ('POST', '/api/pegaprox/update'),

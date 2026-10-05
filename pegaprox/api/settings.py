@@ -1346,6 +1346,10 @@ def get_server_settings():
         settings['acme_dns_rfc2136_secret'] = '********'
     if settings.get('acme_dns_cloudflare_token'):
         settings['acme_dns_cloudflare_token'] = '********'
+    # MK Oct 2026 - the banners have routes of their own, which keep them from an admin
+    # limited to a tenant (api/banners.py)
+    from pegaprox.api.banners import BANNERS_KEY
+    settings.pop(BANNERS_KEY, None)
     return jsonify(settings)
 
 

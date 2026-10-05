@@ -46193,6 +46193,214 @@
         ]
       }
     },
+    "/api/banners": {
+      "get": {
+        "operationId": "banners.list_my_banners_get",
+        "tags": [
+          "banners"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          }
+        },
+        "summary": "The broadcast banners meant for the caller that are still running.",
+        "description": "Critical first, the newest first within a severity. Each carries rev, which goes up\nwhen the text changes: a banner closed at one revision shows again at the next.\nexpires_in is the seconds left, null for a banner without an expiry.",
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ]
+      }
+    },
+    "/api/settings/banners": {
+      "get": {
+        "operationId": "banners.list_banners_get",
+        "tags": [
+          "banners"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Every broadcast banner with its scope, for the settings page.",
+        "description": "Also the tenants and roles a banner can name. Only for administrators who are not\nlimited to a tenant or to specific clusters.",
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "admin.settings"
+        ]
+      },
+      "post": {
+        "operationId": "banners.create_banner_post",
+        "tags": [
+          "banners"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Add a broadcast banner.",
+        "description": "Body: text (plain text, at most 500 characters), severity (info, warning, critical),\nexpires_at (ISO 8601 with a timezone, or empty for none), scope (everyone, tenants,\nroles) with tenants or roles, the ids it goes to.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "admin.settings"
+        ]
+      }
+    },
+    "/api/settings/banners/{banner_id}": {
+      "put": {
+        "operationId": "banners.update_banner_put",
+        "tags": [
+          "banners"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Change a broadcast banner. The fields the body leaves out stay as they are; a changed text raises rev, so users who closed the banner see it again.",
+        "parameters": [
+          {
+            "name": "banner_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "admin.settings"
+        ]
+      },
+      "delete": {
+        "operationId": "banners.delete_banner_delete",
+        "tags": [
+          "banners"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Remove a broadcast banner.",
+        "parameters": [
+          {
+            "name": "banner_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "admin.settings"
+        ]
+      }
+    },
     "/api/clusters/{cluster_id}/nodes/{node}/shellws": {
       "get": {
         "operationId": "__flask_sock.node_shell_websocket_proxy_get",

@@ -60,6 +60,7 @@
     "pegaprox/api/audit_search.py",
     "pegaprox/api/auto_install.py",
     "pegaprox/api/auth.py",
+    "pegaprox/api/banners.py",
     "pegaprox/api/ceph.py",
     "pegaprox/api/clusters.py",
     "pegaprox/api/costs.py",

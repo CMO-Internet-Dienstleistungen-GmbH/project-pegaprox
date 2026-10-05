@@ -253,7 +253,11 @@ def save_server_settings(settings):
         # MK Oct 2026 (#625) - the zone the schedule stamps are in is written with the
         # stamps only. A caller read every setting before a change of the group zone, and
         # writing that value back would make the next look move stamps that are in place
-        settings = {k: v for k, v in settings.items() if k != STAMPS_ZONE_SETTING}
+        # MK Oct 2026 - nor the broadcast banners, which api/banners.py writes on its own:
+        # the ACME request saves back what it read 30 s earlier, and a banner added in
+        # between would be gone again
+        from pegaprox.api.banners import BANNERS_KEY
+        settings = {k: v for k, v in settings.items() if k not in (STAMPS_ZONE_SETTING, BANNERS_KEY)}
         db = get_db()
         db.save_server_settings(settings)
         return True
