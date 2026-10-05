@@ -2624,6 +2624,7 @@
                             currentUser={currentUser}
                             t={T}
                         />
+                        <BroadcastBanners cloud />
                         {/* #625 - same banner as the classic layouts, in the shell's colours */}
                         <HaStandbyBanner cloud onOpenHa={() => {
                             onOpenSettings && onOpenSettings();

@@ -776,6 +776,131 @@
             );
         }
 
+        // LW Oct 2026 - the broadcast banners an admin writes under Settings > Banners. The server
+        // sends the ones meant for this user that still run. Each can be closed, for this user in
+        // this browser, until the admin changes its text (rev goes up). The text goes in as a text
+        // node, never as markup. Read once a minute while the page is shown, again when it comes
+        // back, when one runs out, and when the settings page saved a change.
+        const BROADCAST_TONE = { info: 'blue', warning: 'yellow', critical: 'red' };
+        const BROADCAST_CLOSED_MAX = 100;
+
+        function broadcastClosedKey(username) {
+            return 'pegaprox-banners-closed:' + username;
+        }
+
+        function readBroadcastClosed(username) {
+            try {
+                const v = JSON.parse(localStorage.getItem(broadcastClosedKey(username)) || '{}');
+                return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
+            } catch (_) {
+                return {};
+            }
+        }
+
+        function BroadcastBanners({ cloud = false }) {
+            const { t } = useTranslation();
+            const { user, isAuthenticated } = useAuth();
+            const username = typeof user?.username === 'string' ? user.username : '';
+            const [items, setItems] = useState([]);
+            const [closed, setClosed] = useState(() => readBroadcastClosed(username));
+
+            useEffect(() => { setClosed(readBroadcastClosed(username)); }, [username]);
+
+            useEffect(() => {
+                setItems([]);
+                if (!isAuthenticated || !username) return;
+                let alive = true, timer = null, seq = 0;
+                const load = async () => {
+                    const mine = ++seq;
+                    clearTimeout(timer);
+                    let next = 60000;
+                    let list = null;
+                    try {
+                        const r = await fetch(`${API_URL}/banners`, { credentials: 'include' });
+                        if (r.ok) {
+                            const d = await r.json();
+                            list = (Array.isArray(d?.banners) ? d.banners : []).filter(b =>
+                                b && typeof b.id === 'string' && typeof b.text === 'string' && b.text);
+                        }
+                    } catch (_) {}
+                    if (!alive || mine !== seq) return;
+                    if (list) {
+                        const now = Date.now();
+                        setItems(list.map(b => {
+                            const left = typeof b.expires_in === 'number' ? Math.max(0, b.expires_in) : null;
+                            if (left !== null) next = Math.min(next, left * 1000 + 500);
+                            return { ...b, endsAt: left !== null ? now + left * 1000 : null };
+                        }));
+                    }
+                    if (!document.hidden) timer = setTimeout(load, next);
+                };
+                const onShow = () => { if (!document.hidden) load(); };
+                load();
+                document.addEventListener('visibilitychange', onShow);
+                window.addEventListener('pegaprox-banners-changed', load);
+                return () => {
+                    alive = false;
+                    clearTimeout(timer);
+                    document.removeEventListener('visibilitychange', onShow);
+                    window.removeEventListener('pegaprox-banners-changed', load);
+                };
+            }, [isAuthenticated, username]);
+
+            const close = (b) => {
+                setClosed(prev => {
+                    const next = { ...prev };
+                    delete next[b.id];
+                    next[b.id] = b.rev;
+                    const keys = Object.keys(next);
+                    keys.slice(0, Math.max(0, keys.length - BROADCAST_CLOSED_MAX)).forEach(k => { delete next[k]; });
+                    try { localStorage.setItem(broadcastClosedKey(username), JSON.stringify(next)); } catch (_) {}
+                    return next;
+                });
+            };
+
+            const now = Date.now();
+            const shown = items.filter(b => closed[b.id] !== b.rev && (b.endsAt === null || b.endsAt > now));
+            if (!shown.length) return null;
+
+            return shown.map(b => {
+                const severity = BROADCAST_TONE[b.severity] ? b.severity : 'info';
+                const tone = HA_BANNER_TONE[BROADCAST_TONE[severity]];
+                const icon = severity === 'critical' ? <Icons.AlertCircle /> : severity === 'warning' ? <Icons.AlertTriangle /> : <Icons.Info />;
+                const data = {
+                    'data-broadcast-banner': b.id, 'data-broadcast-severity': severity,
+                    'data-broadcast-layout': cloud ? 'cloud' : 'classic',
+                    role: severity === 'critical' ? 'alert' : 'status',
+                };
+                const closeButton = (
+                    <button onClick={() => close(b)} title={t('close')} aria-label={t('close')}
+                        className={cloud ? 'cloud-btn cloud-btn-sm' : 'flex-shrink-0 p-1 rounded text-gray-400 hover:text-white'}
+                        style={cloud ? { whiteSpace: 'nowrap' } : undefined}>
+                        <Icons.X />
+                    </button>
+                );
+                if (cloud) {
+                    return (
+                        <div key={b.id} {...data}
+                            style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 16px', fontSize: 13,
+                                     background: tone.cloud[0], borderBottom: `1px solid ${tone.cloud[1]}`, color: tone.cloud[2] }}>
+                            <span style={{ display: 'inline-flex', flexShrink: 0 }}>{icon}</span>
+                            <span style={{ flex: '1 1 auto', minWidth: 0, overflowWrap: 'anywhere' }}>{b.text}</span>
+                            {closeButton}
+                        </div>
+                    );
+                }
+                return (
+                    <div key={b.id} {...data} className={`px-4 py-2 border-b ${tone.box}`}>
+                        <div className="flex items-center gap-3 text-sm">
+                            <span className={`flex-shrink-0 ${tone.icon}`}>{icon}</span>
+                            <span className={`flex-1 min-w-0 ${tone.text}`} style={{ overflowWrap: 'anywhere' }}>{b.text}</span>
+                            {closeButton}
+                        </div>
+                    </div>
+                );
+            });
+        }
+
         // LW Sep 2026 (#625) - on a standby every page says where its configuration comes
         // from and that changes belong on the active one. Admins get a way to the HA tab.
         // Cloud passes cloud so it picks up the shell's own tokens.
@@ -16347,6 +16472,7 @@
             // visible so the page still scrolls vertically and fixed-position modals are unaffected.
             return (
                 <div className={`min-h-screen bg-proxmox-darker text-white ${isCorporate ? 'pb-7' : ''}`} style={{ overflowX: 'clip' }}>
+                    <BroadcastBanners />
                     {/* LW: Password Expiry Warning */}
                     <PasswordExpiryBanner onChangePassword={() => setShowProfile(true)} />
                     <HaStandbyBanner onOpenHa={openHaSettings} />

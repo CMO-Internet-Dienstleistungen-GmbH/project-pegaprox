@@ -2457,6 +2457,238 @@
             );
         }
 
+        // LW Oct 2026 - Settings > Banners: the broadcast banners signed-in users see at the top of
+        // the page (BroadcastBanners in dashboard.js). An admin limited to a tenant gets the
+        // server's 403 text instead of the list. A standby lists them and leaves every change to
+        // the active instance (#625), so its buttons give way to the note.
+        const BANNER_SEVERITY_KEYS = { info: 'bcastSevInfo', warning: 'bcastSevWarning', critical: 'bcastSevCritical' };
+        const BANNER_SEVERITY_BADGE = {
+            info: 'bg-blue-500/10 text-blue-400 border-blue-500/30',
+            warning: 'bg-yellow-500/10 text-yellow-400 border-yellow-500/30',
+            critical: 'bg-red-500/10 text-red-400 border-red-500/30',
+        };
+
+        function BroadcastBannerSettings({ t, addToast, getAuthHeaders }) {
+            const { haStandby } = useAuth();
+            const [data, setData] = useState(null);
+            const [refused, setRefused] = useState('');
+            const [editing, setEditing] = useState(null);
+            const [saving, setSaving] = useState(false);
+
+            const load = useCallback(async () => {
+                try {
+                    const r = await fetch(`${API_URL}/settings/banners`, { credentials: 'include', headers: getAuthHeaders() });
+                    const d = await r.json().catch(() => ({}));
+                    if (r.ok) {
+                        setData(d);
+                        setRefused('');
+                    } else {
+                        setRefused(typeof d.error === 'string' && d.error ? d.error : t('bcastLoadFailed'));
+                    }
+                } catch (_) {
+                    setRefused(t('bcastLoadFailed'));
+                }
+            }, [getAuthHeaders, t]);
+            useEffect(() => { load(); }, [load]);
+
+            const limits = data?.limits || { text: 500, count: 20 };
+            const tenantChoices = Array.isArray(data?.choices?.tenants) ? data.choices.tenants : [];
+            const roleChoices = Array.isArray(data?.choices?.roles) ? data.choices.roles : [];
+            const list = Array.isArray(data?.banners) ? data.banners : [];
+            const tenantName = (id) => (tenantChoices.find(x => x.id === id) || {}).name || id;
+            const roleName = (id) => (roleChoices.find(x => x.id === id) || {}).name || id;
+            const full = list.length >= limits.count;
+
+            const startNew = () => setEditing({ id: null, text: '', severity: 'info', expires: '', expiresWas: '',
+                                                scope: 'everyone', tenants: [], roles: [] });
+            const startEdit = (b) => {
+                const expires = utcToLocalInput(b.expires_at);
+                setEditing({ id: b.id, text: b.text, severity: b.severity, expires, expiresWas: expires,
+                             scope: b.scope, tenants: b.tenants || [], roles: b.roles || [] });
+            };
+            const toggle = (key, id) => setEditing(e => ({ ...e,
+                [key]: e[key].includes(id) ? e[key].filter(x => x !== id) : e[key].concat(id) }));
+
+            const changed = () => window.dispatchEvent(new CustomEvent('pegaprox-banners-changed'));
+
+            const save = async () => {
+                if (!editing || saving) return;
+                const body = { text: editing.text, severity: editing.severity, scope: editing.scope,
+                               tenants: editing.scope === 'tenants' ? editing.tenants : [],
+                               roles: editing.scope === 'roles' ? editing.roles : [] };
+                // an expiry left as it was is not sent: one that has passed would be refused
+                if (!editing.id || editing.expires !== editing.expiresWas) body.expires_at = localInputToUtc(editing.expires);
+                setSaving(true);
+                try {
+                    const r = await fetch(editing.id ? `${API_URL}/settings/banners/${encodeURIComponent(editing.id)}` : `${API_URL}/settings/banners`, {
+                        method: editing.id ? 'PUT' : 'POST', credentials: 'include',
+                        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body),
+                    });
+                    const d = await r.json().catch(() => ({}));
+                    if (r.ok) {
+                        addToast(t('bcastSaved'), 'success');
+                        setEditing(null);
+                        load();
+                        changed();
+                    } else {
+                        addToast(typeof d.error === 'string' && d.error ? d.error : t('bcastSaveFailed'), 'error');
+                    }
+                } catch (_) {
+                    addToast(t('bcastSaveFailed'), 'error');
+                }
+                setSaving(false);
+            };
+
+            const remove = async (b) => {
+                if (!window.confirm(t('bcastDeleteAsk'))) return;
+                try {
+                    const r = await fetch(`${API_URL}/settings/banners/${encodeURIComponent(b.id)}`, {
+                        method: 'DELETE', credentials: 'include', headers: getAuthHeaders(),
+                    });
+                    const d = await r.json().catch(() => ({}));
+                    if (r.ok) {
+                        addToast(t('bcastDeleted'), 'success');
+                        if (editing && editing.id === b.id) setEditing(null);
+                        load();
+                        changed();
+                    } else {
+                        addToast(typeof d.error === 'string' && d.error ? d.error : t('bcastSaveFailed'), 'error');
+                    }
+                } catch (_) {
+                    addToast(t('bcastSaveFailed'), 'error');
+                }
+            };
+
+            const scopeText = (b) => b.scope === 'tenants' ? `${t('bcastScopeTenants')}: ${(b.tenants || []).map(tenantName).join(', ')}`
+                : b.scope === 'roles' ? `${t('bcastScopeRoles')}: ${(b.roles || []).map(roleName).join(', ')}`
+                : t('bcastScopeEveryone');
+            const expiryText = (b) => !b.expires_at ? t('bcastNoExpiry')
+                : b.expired ? t('bcastExpired') : t('bcastUntil').replace('{time}', () => fmtDate(b.expires_at));
+            const canSave = editing && editing.text.trim() && !saving
+                && (editing.scope !== 'tenants' || editing.tenants.length > 0)
+                && (editing.scope !== 'roles' || editing.roles.length > 0);
+            const input = 'w-full px-3 py-2 bg-proxmox-darker border border-proxmox-border rounded-lg text-white text-sm';
+
+            const picker = (key, choices) => (
+                <div className="flex flex-wrap gap-2" data-banner-picker={key}>
+                    {choices.map(c => (
+                        <label key={c.id} className="flex items-center gap-2 px-2 py-1 rounded-lg border border-proxmox-border text-sm text-gray-300 cursor-pointer">
+                            <input type="checkbox" checked={editing[key].includes(c.id)} onChange={() => toggle(key, c.id)} className="w-4 h-4" />
+                            <span>{c.name || c.id}</span>
+                        </label>
+                    ))}
+                </div>
+            );
+
+            const form = editing && (
+                <div className="p-4 bg-proxmox-darker border border-proxmox-border rounded-lg space-y-3" data-banner-form={editing.id ? 'edit' : 'new'}>
+                    <div>
+                        <label htmlFor="bcast-text" className="block text-xs text-gray-400 mb-1">{t('bcastText')}</label>
+                        <textarea id="bcast-text" rows={2} maxLength={limits.text} value={editing.text}
+                            onChange={e => setEditing({ ...editing, text: e.target.value })} className={input} />
+                        <div className="flex justify-between gap-3 text-xs text-gray-500 mt-1">
+                            <span>{t('bcastTextHint')}</span>
+                            <span>{editing.text.length}/{limits.text}</span>
+                        </div>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        <div>
+                            <label htmlFor="bcast-severity" className="block text-xs text-gray-400 mb-1">{t('bcastSeverity')}</label>
+                            <select id="bcast-severity" value={editing.severity}
+                                onChange={e => setEditing({ ...editing, severity: e.target.value })} className={input}>
+                                {Object.keys(BANNER_SEVERITY_KEYS).map(s => <option key={s} value={s}>{t(BANNER_SEVERITY_KEYS[s])}</option>)}
+                            </select>
+                        </div>
+                        <div>
+                            <label htmlFor="bcast-expires" className="block text-xs text-gray-400 mb-1">{t('bcastExpires')}</label>
+                            <input id="bcast-expires" type="datetime-local" value={editing.expires}
+                                onChange={e => setEditing({ ...editing, expires: e.target.value })} className={input} />
+                            <div className="text-xs text-gray-500 mt-1">{t('bcastExpiresHint')}</div>
+                        </div>
+                    </div>
+                    <div>
+                        <div className="block text-xs text-gray-400 mb-1">{t('bcastScope')}</div>
+                        <div className="flex flex-wrap gap-4 mb-2">
+                            {[['everyone', 'bcastScopeEveryone'], ['tenants', 'bcastScopeTenants'], ['roles', 'bcastScopeRoles']].map(([s, key]) => (
+                                <label key={s} className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                                    <input type="radio" name="bcast-scope" value={s} checked={editing.scope === s}
+                                        onChange={() => setEditing({ ...editing, scope: s })} className="w-4 h-4" />
+                                    <span>{t(key)}</span>
+                                </label>
+                            ))}
+                        </div>
+                        {editing.scope === 'tenants' && picker('tenants', tenantChoices)}
+                        {editing.scope === 'roles' && picker('roles', roleChoices)}
+                    </div>
+                    <div className="flex justify-end gap-2">
+                        <button onClick={() => setEditing(null)} className="px-3 py-1.5 text-sm text-gray-300 hover:text-white">
+                            {t('cancel')}
+                        </button>
+                        <button onClick={save} disabled={!canSave}
+                            className="flex items-center gap-2 px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm text-white disabled:opacity-50">
+                            {saving && <Icons.RotateCw className="w-4 h-4 animate-spin" />}
+                            {t('save')}
+                        </button>
+                    </div>
+                </div>
+            );
+
+            return (
+                <div className="space-y-4" data-banner-settings>
+                    <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-4 space-y-3">
+                        <div className="flex items-center justify-between gap-3">
+                            <h4 className="font-medium text-white flex items-center gap-2">
+                                <Icons.MessageSquare />
+                                {t('bcastTitle')}
+                                {data && <span className="text-xs text-gray-500 ml-1">({list.length}/{limits.count})</span>}
+                            </h4>
+                            {data && !haStandby && !editing && (
+                                <button onClick={startNew} disabled={full}
+                                    className="flex items-center gap-1 px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm text-white disabled:opacity-50">
+                                    <Icons.Plus /> {t('bcastAdd')}
+                                </button>
+                            )}
+                        </div>
+                        <p className="text-xs text-gray-500">{t('bcastDesc')}</p>
+                        {refused && <div className="px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/30 text-sm text-red-400" data-banner-refused>{refused}</div>}
+                        {data && haStandby && <HaSettingsOnActive />}
+                        {data && !haStandby && full && !editing && <p className="text-xs text-yellow-400">{t('bcastFull').replace('{n}', limits.count)}</p>}
+                        {!haStandby && form}
+                        {data && list.length === 0 && !editing && <p className="text-sm text-gray-500 text-center py-3">{t('bcastNone')}</p>}
+                        {list.length > 0 && (
+                            <div className="space-y-2">
+                                {list.map(b => (
+                                    <div key={b.id} data-banner-row={b.id}
+                                        className={`flex items-start gap-3 p-3 rounded-lg border border-proxmox-border bg-proxmox-darker ${b.expired ? 'opacity-60' : ''}`}>
+                                        <span className={`px-2 py-0.5 rounded border text-xs whitespace-nowrap ${BANNER_SEVERITY_BADGE[b.severity] || BANNER_SEVERITY_BADGE.info}`}>
+                                            {t(BANNER_SEVERITY_KEYS[b.severity] || 'bcastSevInfo')}
+                                        </span>
+                                        <div className="flex-1 min-w-0">
+                                            <div className="text-sm text-white" style={{ overflowWrap: 'anywhere' }}>{b.text}</div>
+                                            <div className="text-xs text-gray-500 mt-1">{scopeText(b)} · {expiryText(b)}</div>
+                                        </div>
+                                        {!haStandby && (
+                                            <div className="flex items-center gap-1">
+                                                <button onClick={() => startEdit(b)} title={t('edit')} aria-label={t('edit')}
+                                                    className="p-1.5 rounded text-gray-400 hover:text-white hover:bg-proxmox-dark">
+                                                    <Icons.Edit />
+                                                </button>
+                                                <button onClick={() => remove(b)} title={t('delete')} aria-label={t('delete')}
+                                                    className="p-1.5 rounded text-red-400 hover:bg-red-500/10">
+                                                    <Icons.Trash />
+                                                </button>
+                                            </div>
+                                        )}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
         // ═══════════════════════════════════════════════
         // PegaProx - Settings Modal
         // PegaProxSettingsModal (Server, SSL, SMTP, RBAC, Audit, Tenants)
@@ -4473,6 +4705,19 @@
                                 <Icons.Server className="w-4 h-4" />
                                 <span>{t('server') || 'Server'}</span>
                             </button>
+                            {isAdmin && (
+                            <button
+                                onClick={() => setActiveTab('banners')}
+                                className={`flex items-center gap-2 ${isCorporate ? 'px-3 py-1.5 text-[13px]' : 'px-4 py-2.5 text-sm'} font-medium transition-colors whitespace-nowrap ${
+                                    activeTab === 'banners'
+                                        ? (isCorporate ? 'text-white border-b-2 border-[#49afd9] font-medium' : 'text-proxmox-orange border-b-2 border-proxmox-orange bg-proxmox-dark/50')
+                                        : 'text-gray-400 hover:text-white hover:bg-proxmox-dark/30'
+                                }`}
+                            >
+                                <Icons.MessageSquare className="w-4 h-4" />
+                                <span>{t('bcastTab')}</span>
+                            </button>
+                            )}
                             {isAdmin && (
                             <button
                                 onClick={() => setActiveTab('ha')}
@@ -9022,6 +9267,10 @@
                                         </div>
                                     )}
                                 </div>
+                            )}
+
+                            {activeTab === 'banners' && isAdmin && (
+                                <BroadcastBannerSettings t={t} addToast={addToast} getAuthHeaders={getAuthHeaders} />
                             )}
 
                             {/* LW Sep 2026 (#625) - warm standby for PegaProx itself */}
