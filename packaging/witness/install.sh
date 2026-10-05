@@ -114,7 +114,8 @@ case $URL in
 esac
 case $PORT in
     '') ;;
-    *[!0-9]*) die "--port takes a number" ;;
+    *[!0-9]*|0*) die "--port takes a number from 1 to 65535" ;;
+    *) { [ ${#PORT} -le 5 ] && [ "$PORT" -le 65535 ]; } || die "--port takes a number from 1 to 65535" ;;
 esac
 case $ALLOW in
     *[!0-9A-Fa-f.:/,]*) die "--allow takes networks like 192.0.2.0/24 or 2001:db8::/48" ;;
