@@ -2197,6 +2197,79 @@ def set_backup_sla_config(cluster_id):
     return jsonify({'ok': True, 'max_age_hours': v})
 
 
+# MK Oct 2026 - the guests no backup job covers, on every cluster the caller reaches.
+# Proxmox answers it in one call per cluster (/cluster/backup-info/not-backed-up); the
+# read is shared with the backup_coverage alert (background/alert_events.py), so a page
+# that stays open and the alert tick ask a cluster once between them.
+COVERAGE_MAX_AGE = 120
+COVERAGE_REFRESH_AGE = 10
+
+
+@bp.route('/api/backup-coverage', methods=['GET'])
+@require_auth(perms=['backup.view'])
+def get_backup_coverage():
+    import time
+    from pegaprox.background import alert_events
+    from pegaprox.utils.concurrent import run_concurrent
+    max_age = COVERAGE_REFRESH_AGE if request.args.get('refresh') in ('1', 'true') else COVERAGE_MAX_AGE
+
+    def _name(cid, mgr):
+        name = getattr(getattr(mgr, 'config', None), 'name', None)
+        return name if isinstance(name, str) and name else cid
+
+    reach, out_clusters = [], []
+    for cid, mgr in sorted(list(cluster_managers.items()), key=lambda kv: _name(*kv).lower()):
+        if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
+            continue
+        ok, _err = check_cluster_access(cid)
+        if not ok:
+            continue
+        entry = {'cluster_id': cid, 'cluster_name': _name(cid, mgr),
+                 'state': 'ok', 'count': 0, 'checked_at': None}
+        out_clusters.append(entry)
+        if not mgr.is_connected:
+            entry['state'] = 'offline'
+            continue
+        reach.append((cid, mgr, entry))
+
+    def _read(cid, mgr):
+        status, rows, at = alert_events.not_backed_up(cid, mgr, max_age=max_age)
+        resources = []
+        if rows:
+            resources = mgr.get_vm_resources(max_age=60) or []
+        return status, rows, at, resources
+
+    results = run_concurrent([lambda c=cid, m=mgr: _read(c, m) for cid, mgr, _ in reach],
+                             timeout=alert_events.BACKUP_TIMEOUT + 10)
+    guests = []
+    for (cid, mgr, entry), res in zip(reach, results):
+        status, rows, at, resources = res if res else (0, None, None, [])
+        if rows is None:
+            entry['state'] = 'denied' if status == 403 else 'unreadable'
+            continue
+        entry['checked_at'] = int(at or time.time())
+        by_id = {}
+        for r in resources:
+            if r.get('type') in ('qemu', 'lxc') and str(r.get('vmid', '')).isdigit():
+                by_id[int(r['vmid'])] = r
+        tags = alert_events.guest_tags(cid, resources) if rows else {}
+        found = []
+        for g in rows:
+            r = by_id.get(g['vmid']) or {}
+            found.append({
+                'cluster_id': cid, 'cluster_name': entry['cluster_name'], 'vmid': g['vmid'],
+                'name': r.get('name') or g['name'], 'type': r.get('type') or g['type'],
+                'node': r.get('node') or '', 'status': r.get('status') or 'unknown',
+                'template': bool(r.get('template')), 'tags': sorted(tags.get(g['vmid'], ())),
+            })
+        # per guest: a pool or ACL grant sees its own guests, another tenant none (#773)
+        found = scope_vm_rows(cid, found)
+        entry['count'] = len(found)
+        guests += found
+    guests.sort(key=lambda g: (g['cluster_name'].lower(), g['vmid']))
+    return jsonify({'guests': guests, 'clusters': out_clusters})
+
+
 @bp.route('/api/clusters/<cluster_id>/nodes/<node>/tasks/<path:upid>', methods=['DELETE'])
 @require_auth(perms=['vm.stop'])  # cancelling task is like stopping
 def cancel_task(cluster_id, node, upid):

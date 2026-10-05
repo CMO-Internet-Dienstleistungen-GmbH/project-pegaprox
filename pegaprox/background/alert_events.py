@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 PegaProx Event Alerts - Layer 7
-Failed Proxmox tasks, Ceph health, replication and stale snapshots.
+Failed Proxmox tasks, Ceph health, replication, stale snapshots and guests without a
+backup job.
 
 The metric rules in alerts.py compare a number on every tick and send again after each
 cooldown for as long as it stays over the line. The rules here watch a condition: one
@@ -16,6 +17,8 @@ What it reads, per cluster that has such a rule:
   - /cluster/replication plus one status read per source node every REPLICATION_EVERY
   - the snapshot list of each guest once after a start, SNAPSHOT_READS_PER_TICK per tick,
     then only for a guest whose snapshot task shows up in the task list
+  - /cluster/backup-info/not-backed-up every BACKUP_EVERY, shared with the overview of
+    guests without a backup job (api/clusters.py), whichever asked last
 Nothing here asks a cluster per guest on every tick. Only the active instance runs any
 of it (alerts.alert_check_loop, #625); active_alerts is a table of its own, so after a
 takeover a condition that still holds is said once more by the new active.
@@ -25,6 +28,7 @@ MK Oct 2026
 import html as html_lib
 import logging
 import re
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -40,11 +44,11 @@ except ImportError:  # python < 3.11
     import sre_parse as _re_parser
 
 
-EVENT_METRICS = ('task_failed', 'ceph_health', 'replication', 'snapshot_age')
+EVENT_METRICS = ('task_failed', 'ceph_health', 'replication', 'snapshot_age', 'backup_coverage')
 
 # the fields a matching decision rests on; a rule whose one of these changed starts over
 MATCH_FIELDS = ('metric', 'target_type', 'target_id', 'threshold', 'task_type', 'task_status',
-                'task_warnings', 'snapshot_ignore_policy')
+                'task_warnings', 'snapshot_ignore_policy', 'backup_exclude_tags')
 
 TASK_LOOKBACK = 24 * 3600     # how far back a rule looks the first time it reads a cluster
 TASK_OVERLAP = 300            # pmxcfs hands on the tasks of other nodes late: read behind the cursor
@@ -62,6 +66,12 @@ PATTERN_MAX = 120
 PATTERN_REPEATS = 2
 SUBJECT_MAX = 200
 POLICY_PREFIX = 'pegaprox-'   # snapshot policies name their snapshots like this (api/snapshots.py)
+BACKUP_EVERY = 300            # which jobs cover which guest changes seldom
+BACKUP_FRESH = 60             # a read the overview made this recently serves the tick too
+BACKUP_TIMEOUT = 20           # pveproxy opens the config of every guest it lists
+EXCLUDE_TAGS_DEFAULT = ('no-backup',)
+EXCLUDE_TAGS_MAX = 20
+_TAG_RE = re.compile(r'^[\w.+-]{1,64}$')
 
 _THRESHOLDS = {
     # metric: (default, lowest, highest)
@@ -69,6 +79,7 @@ _THRESHOLDS = {
     'ceph_health': (0, 0, 1),           # 0: HEALTH_WARN or worse, 1: HEALTH_ERR only
     'replication': (60, 1, 10080),      # minutes since the last sync
     'snapshot_age': (14, 1, 3650),      # days
+    'backup_coverage': (1, 0, 720),     # hours a guest may be in no backup job before it counts
 }
 _SNAPSHOT_TASKS = frozenset(('qmsnapshot', 'qmdelsnapshot', 'qmrollback',
                              'vzsnapshot', 'vzdelsnapshot', 'vzrollback'))
@@ -85,6 +96,10 @@ _tasks = {}       # cid -> {'cursor': epoch, 'seen': {upid: endtime}}
 _ceph = {}        # cid -> {'absent_until': epoch, 'node': str|None}
 _repl = {}        # cid -> {'next_at': epoch}
 _snaps = {}       # cid -> {'guests': {vmid: [(name, ts)]}, 'tried': {vmid: epoch}, 'dirty': set(), 'next_eval': epoch}
+_backup = {}      # cid -> {'next_at': epoch, 'since': {vmid: epoch first seen in no job}}
+_coverage = {}    # cid -> (epoch, status, rows or None): the last not-backed-up read, any caller
+_coverage_locks = {}
+_coverage_guard = threading.Lock()
 _status = {}      # cid -> {source: {'at': epoch, 'ok': bool, 'note': str}} for the diagnostics
 
 
@@ -157,6 +172,32 @@ def _int_in(value, lo, hi):
     return n if lo <= n <= hi else None
 
 
+def tag_list(value):
+    """(tags, None) from a list or a comma/space separated text, or (None, error text).
+    Duplicates go regardless of case; the order stays as written."""
+    if value is None:
+        return [], None
+    if isinstance(value, str):
+        parts = re.split(r'[\s,;]+', value)
+    elif isinstance(value, (list, tuple)) and all(isinstance(v, str) for v in value):
+        parts = list(value)
+    else:
+        return None, 'the tags are a list of words'
+    out, seen = [], set()
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        if not _TAG_RE.match(p):
+            return None, f"'{p[:70]}' is no tag (letters, digits, - _ . + and at most 64 of them)"
+        if p.lower() not in seen:
+            seen.add(p.lower())
+            out.append(p)
+    if len(out) > EXCLUDE_TAGS_MAX:
+        return None, f'at most {EXCLUDE_TAGS_MAX} tags'
+    return out, None
+
+
 def normalize_rule(rule, data, prev_metric=None):
     """Bring the event fields of `rule` in shape, from the request body `data`.
 
@@ -166,6 +207,8 @@ def normalize_rule(rule, data, prev_metric=None):
     metric = rule.get('metric')
     if 'notify_resolved' in data:
         rule['notify_resolved'] = bool(data.get('notify_resolved'))
+    if metric != 'backup_coverage':
+        rule.pop('backup_exclude_tags', None)
     if metric not in EVENT_METRICS:
         for k in ('task_type', 'task_status', 'task_warnings', 'snapshot_ignore_policy'):
             rule.pop(k, None)
@@ -198,6 +241,14 @@ def normalize_rule(rule, data, prev_metric=None):
     if metric == 'snapshot_age':
         rule['snapshot_ignore_policy'] = bool(
             data.get('snapshot_ignore_policy', rule.get('snapshot_ignore_policy', True)))
+    if metric == 'backup_coverage':
+        # a guest tagged like this is left out on purpose: no alert, and an open one closes
+        raw = data['backup_exclude_tags'] if 'backup_exclude_tags' in data \
+            else rule.get('backup_exclude_tags', list(EXCLUDE_TAGS_DEFAULT))
+        tags, bad = tag_list(raw)
+        if bad:
+            return f'excluded tags: {bad}'
+        rule['backup_exclude_tags'] = tags
 
     if metric == 'ceph_health':
         rule['target_type'], rule['target_id'] = 'cluster', None
@@ -440,6 +491,94 @@ def _read_replication(cid, mgr, now):
     return {'jobs': jobs, 'status': by_id, 'failed': failed}
 
 
+def not_backed_up(cid, mgr, max_age=0, now=None):
+    """(status, rows, read at) of /cluster/backup-info/not-backed-up: the guests no backup
+    job of the cluster covers, as [{'vmid', 'type', 'name'}]; rows is None when it was not
+    read.
+
+    Proxmox counts every vzdump job, a disabled one too, and lists templates as well. A
+    read younger than max_age is handed out again, so the alert tick and the overview of
+    every cluster ask once between them. MK Oct 2026
+    """
+    clock = now is None
+
+    def fresh(at):
+        hit = _coverage.get(cid)
+        if hit and max_age and 0 <= at - hit[0] < max_age:
+            return hit
+        return None
+
+    hit = fresh(now or time.time())
+    if hit:
+        return hit[1], hit[2], hit[0]
+    with _coverage_guard:
+        lock = _coverage_locks.setdefault(cid, threading.Lock())
+    # one read per cluster at a time: an overview opened by many at once, or next to the
+    # tick, waits for the read under way and takes its answer instead of asking again
+    with lock:
+        now = time.time() if clock else now
+        hit = fresh(now)
+        if hit:
+            return hit[1], hit[2], hit[0]
+        status, data = _get(mgr, '/cluster/backup-info/not-backed-up', timeout=BACKUP_TIMEOUT)
+        rows = None
+        if status == 200 and isinstance(data, list):
+            rows = []
+            for g in data:
+                vmid = (g or {}).get('vmid')
+                if isinstance(vmid, bool) or not str(vmid).isdigit():
+                    continue
+                rows.append({'vmid': int(vmid), 'type': str(g.get('type') or ''),
+                             'name': str(g.get('name') or '')})
+        elif status == 200:
+            status = 0
+        _coverage[cid] = (now, status, rows)
+    return status, rows, now
+
+
+def guest_tags(cid, resources):
+    """{vmid: {tag, ...}} in lower case: the Proxmox tags of each guest and the ones set in
+    PegaProx (vm_tags), as the tag views merge them (api/search.py)."""
+    out = {}
+    for r in resources or ():
+        raw = r.get('tags')
+        if not raw or not str(r.get('vmid', '')).isdigit():
+            continue
+        parts = raw if isinstance(raw, list) else re.split(r'[;,\s]+', str(raw))
+        out.setdefault(int(r['vmid']), set()).update(str(p).strip().lower() for p in parts if str(p).strip())
+    try:
+        rows = get_db().conn.execute('SELECT vmid, tag_name FROM vm_tags WHERE cluster_id = ?', (cid,)).fetchall()
+    except Exception as e:
+        logging.debug(f"[AlertEvents] stored tags of {cid} unreadable: {e}")
+        rows = []
+    for vmid, name in rows:
+        if str(vmid).isdigit() and name:
+            out.setdefault(int(vmid), set()).add(str(name).strip().lower())
+    return out
+
+
+def _read_coverage(cid, mgr, now):
+    """{vmid: row} of the guests in no backup job, or None when not due or not read."""
+    st = _backup.setdefault(cid, {'since': {}})
+    if now < st.get('next_at', 0):
+        return None
+    status, rows, _at = not_backed_up(cid, mgr, max_age=BACKUP_FRESH, now=now)
+    if rows is None:
+        st['next_at'] = now + 60
+        why = 'the API user needs Sys.Audit on /' if status == 403 else f'HTTP {status}'
+        _note(cid, 'backup', False, f'not-backed-up list unreadable ({why})')
+        return None
+    st['next_at'] = now + BACKUP_EVERY
+    uncovered = {r['vmid']: r for r in rows}
+    since = st['since']
+    for vmid in [v for v in since if v not in uncovered]:
+        since.pop(vmid)
+    for vmid in uncovered:
+        since.setdefault(vmid, now)
+    _note(cid, 'backup', True, f'{len(uncovered)} guest(s) in no backup job')
+    return uncovered
+
+
 def _guests(resources):
     out = {}
     for r in resources or ():
@@ -509,7 +648,7 @@ def _read_cluster(cid, mgr, kinds, now):
             _note(cid, 'tasks', True, f"{len(tasks)} listed, {len(seen['tasks'])} in the window")
         else:
             _note(cid, 'tasks', False, f'task list unreadable (HTTP {status})')
-    if kinds & {'task_failed', 'snapshot_age', 'replication'}:
+    if kinds & {'task_failed', 'snapshot_age', 'replication', 'backup_coverage'}:
         try:
             seen['resources'] = mgr.get_vm_resources(max_age=60) or []
         except Exception:
@@ -526,6 +665,8 @@ def _read_cluster(cid, mgr, kinds, now):
             _note(cid, 'ceph', True, str((seen['ceph'].get('health') or {}).get('status', '')))
     if 'replication' in kinds:
         seen['replication'] = _read_replication(cid, mgr, now)
+    if 'backup_coverage' in kinds:
+        seen['backup'] = _read_coverage(cid, mgr, now)
     return seen
 
 
@@ -749,6 +890,41 @@ def _eval_snapshots(rule, seen, cname, cid, now):
     return p
 
 
+def _eval_backup(rule, seen, cname, cid, now):
+    uncovered = seen.get('backup')
+    guests = seen.get('guests')
+    if uncovered is None or not guests:
+        return None                       # an empty guest list may be a read that failed
+    grace = int(rule.get('threshold') or 0) * 3600
+    skip = {t.lower() for t in (rule.get('backup_exclude_tags') or ())}
+    tags = seen.get('tags') or {}
+    since = (_backup.get(cid) or {}).get('since') or {}
+    p = _Pass(guests)
+    # what the rule watches; an open incident of a guest outside it (a template now, tagged
+    # to be left out, on another node) closes without a word
+    p.known = set()
+    for vmid, r in guests.items():
+        if not _target_ok(rule, r.get('node') or '', vmid) or (skip & tags.get(vmid, set())):
+            continue
+        obj = f"vm:{vmid}"
+        p.known.add(obj)
+        who = _guest_label(guests, vmid)
+        if vmid not in uncovered:
+            p.fine[obj] = (f"Resolved: {who} has a backup job", f"A backup job of {cname} covers {who} now.")
+            continue
+        if now - since.get(vmid, now) < grace:
+            continue                      # new to the list: a job may still be on its way
+        node, state = r.get('node') or '?', r.get('status') or 'unknown'
+        p.firing[obj] = {
+            'object': obj, 'target_type': 'vm', 'target_id': str(vmid), 'target_name': who,
+            'target_key': obj, 'name': f"No backup job covers {who}",
+            'message': f"{who} on node {node} ({state}) is in no backup job of {cname}",
+            'value': 1.0, 'display': 'no backup job', 'severity': 'warning',
+            'details': [('Node', node), ('Status', state)],
+        }
+    return p
+
+
 # ---------------------------------------------------------------------------
 # incidents and notices
 # ---------------------------------------------------------------------------
@@ -940,6 +1116,7 @@ def rule_changed(cluster_id, rule_id):
     except Exception as e:
         logging.debug(f"[AlertEvents] reset of {rule_id} failed: {e}")
     _snaps.get(cluster_id, {}).pop('next_eval', None)
+    _backup.get(cluster_id, {}).pop('next_at', None)
 
 
 def _evaluate(A, rule, cid, seen, mutes, settings, now):
@@ -952,6 +1129,8 @@ def _evaluate(A, rule, cid, seen, mutes, settings, now):
             p = _eval_ceph(rule, seen, cname)
         elif metric == 'replication':
             p = _eval_replication(rule, seen, cname, now)
+        elif metric == 'backup_coverage':
+            p = _eval_backup(rule, seen, cname, cid, now)
         else:
             p = _eval_snapshots(rule, seen, cname, cid, now)
     except ValueError as e:
@@ -1024,6 +1203,9 @@ def check_event_alerts(now=None):
             guests = seen.get('guests') or {}
             done = sum(1 for v in guests if v in st.get('guests', {}))
             _note(cid, 'snapshots', True, f"snapshot lists read for {done} of {len(guests)} guests")
+        if seen.get('backup') is not None and any(r.get('metric') == 'backup_coverage'
+                                                  and r.get('backup_exclude_tags') for r in crules):
+            seen['tags'] = guest_tags(cid, seen.get('resources'))
         for rule in crules:
             if rule.get('metric') == 'snapshot_age' and not snap_due:
                 continue

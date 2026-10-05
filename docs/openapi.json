@@ -4765,6 +4765,40 @@
         ]
       }
     },
+    "/api/backup-coverage": {
+      "get": {
+        "operationId": "clusters.get_backup_coverage_get",
+        "tags": [
+          "clusters"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "backup.view"
+        ]
+      }
+    },
     "/api/clusters/{cluster_id}/nodes/{node}/tasks/{upid}": {
       "delete": {
         "operationId": "clusters.cancel_task_delete",
