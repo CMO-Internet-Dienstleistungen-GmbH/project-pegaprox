@@ -108,6 +108,7 @@
     "pegaprox/background/password_expiry.py",
     "pegaprox/background/scheduler.py",
     "pegaprox/background/site_recovery.py",
+    "pegaprox/background/sr_boot_shots.py",
     "pegaprox/background/syslog_server.py",
     "pegaprox/cli/__init__.py",
     "pegaprox/cli/gen_openapi.py",

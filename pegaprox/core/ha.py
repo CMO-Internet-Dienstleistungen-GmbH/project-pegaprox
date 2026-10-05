@@ -263,6 +263,8 @@ FORWARDED_READS = LEADER_ONLY_READS | XCPNG_TASK_READS | frozenset((
     '/api/dr-drills/<drill_id>',
     '/api/site-recovery/plans/<plan_id>/drills',
     '/api/site-recovery/plans/<plan_id>/events',
+    # the boot screenshots of a test failover, in the same instance's tables as its event
+    '/api/site-recovery/plans/<plan_id>/events/<event_id>/screenshots/<int:vmid>',
     '/api/clusters/<cluster_id>/snapshot-policies/<pid>/runs',
     # a bulk migration runs in the process of the instance that started it (#952)
     '/api/bulk-migrations',
@@ -316,6 +318,8 @@ LOCAL_TABLES = (
     'sessions', 'audit_log', 'task_users', 'migration_history', 'metrics_history',
     'active_alerts', 'site_recovery_events', 'cve_history', 'backup_verifications',
     'status_uptime', 'cloud_init_deployments', 'dr_drills', 'dr_drill_checks',
+    # the boot screenshots of a test failover, beside the event they belong to
+    'site_recovery_screenshots',
     'snapshot_runs', 'drift_events', 'auto_install_runs', 'push_inbox',
     'balance_recommendations', 'logs', 'logs_fts',
     # who wrote what on the active, and the change counter behind cv_tick

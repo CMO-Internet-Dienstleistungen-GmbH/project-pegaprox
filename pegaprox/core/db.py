@@ -1686,6 +1686,23 @@ class PegaProxDB:
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_sr_vms_plan ON site_recovery_vms(plan_id, vmid)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_sr_events_plan ON site_recovery_events(plan_id, started_at)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_sr_plans_status ON site_recovery_plans(status)')
+            # MK Oct 2026 - one console frame per guest a test failover booted, the evidence
+            # that it came up. The event's details say what was taken and how long it took;
+            # the pictures live here so the event list stays small. Size-capped and pruned in
+            # background/sr_boot_shots.py
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS site_recovery_screenshots (
+                    event_id TEXT NOT NULL,
+                    plan_id TEXT NOT NULL,
+                    vmid INTEGER NOT NULL,
+                    test_vmid INTEGER,
+                    captured_at TEXT,
+                    duration_ms INTEGER DEFAULT 0,
+                    image BLOB NOT NULL,
+                    PRIMARY KEY (event_id, vmid)
+                )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_sr_shots_plan ON site_recovery_screenshots(plan_id)')
             # MK Jul 2026 (#413) — per-plan option: bring Test-Failover clones up with
             # NICs disconnected (link_down) so a DR test can't collide with production
             # IPs on the network. Migrate existing DBs that predate the column.

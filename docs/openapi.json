@@ -39877,6 +39877,68 @@
         ]
       }
     },
+    "/api/site-recovery/plans/{plan_id}/events/{event_id}/screenshots/{vmid}": {
+      "get": {
+        "operationId": "site_recovery.get_event_screenshot_get",
+        "tags": [
+          "site_recovery"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "The boot screenshot a test failover took of one guest, as image/png.",
+        "description": "It is a picture of a console, so on top of what the event list asks the caller has\nto pass what the screenshot route asks: vm.console on the guest it shows, the plan's\nguest on the source and its test clone on the target.",
+        "parameters": [
+          {
+            "name": "plan_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "event_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "vmid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "site_recovery.view"
+        ]
+      }
+    },
     "/api/plugins/{plugin_id}/api/{subpath}": {
       "delete": {
         "operationId": "plugins.plugin_proxy_delete",

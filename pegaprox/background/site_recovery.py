@@ -10,6 +10,7 @@ from datetime import datetime
 
 from pegaprox.core.db import get_db
 from pegaprox.core import ha
+from pegaprox.background import sr_boot_shots
 from pegaprox.globals import cluster_managers
 from pegaprox.utils.audit import log_audit
 from pegaprox.utils.realtime import broadcast_sse
@@ -651,9 +652,13 @@ def execute_failover(plan_id, failover_type='planned', authorized_vmids=None):
     logger.info(f"[SR] Failover {final_status} for '{_sl(plan['name'])}': {sum(1 for r in results.values() if r['success'])}/{total_vms} succeeded")
 
 
-def execute_test_failover(plan_id):
+def execute_test_failover(plan_id, console_vmids=None):
     """Clone replicated VMs on target, start in test mode.
-    VMs stay running until user triggers cleanup."""
+    VMs stay running until user triggers cleanup.
+
+    console_vmids: the plan's guests the caller may see the console of. Each clone that
+    started gets a boot screenshot for the evidence if its guest is among them
+    (sr_boot_shots.py); None takes none."""
     plan = _get_plan(plan_id)
     if not plan:
         return
@@ -663,6 +668,7 @@ def execute_test_failover(plan_id):
     tgt_mgr = cluster_managers.get(plan['target_cluster'])
     results = {}
     test_vmids = []
+    booted = []
 
     logger.info(f"[SR] Test failover for '{_sl(plan['name'])}' ({len(vms)} VMs)")
     _broadcast_progress(plan_id, "Starting test failover...", 0)
@@ -773,6 +779,7 @@ def execute_test_failover(plan_id):
                                 start_res = tgt_mgr.vm_action(node_name, test_vmid, vtype, 'start')
                                 if start_res.get('success'):
                                     results[str(vmid)] = {'success': True, 'test_vmid': test_vmid}
+                                    booted.append(sr_boot_shots.booted(vm, test_vmid, vtype, node_name))
                                 else:
                                     results[str(vmid)] = {'success': False, 'test_vmid': test_vmid,
                                                           'error': f"cloned OK but start failed: {start_res.get('error', 'unknown')}"}
@@ -812,7 +819,15 @@ def execute_test_failover(plan_id):
         'test_vmids': test_vmids,
         'counts': {'ok': ok_count, 'failed': failed_count, 'total': total},
     }
+    # MK Oct 2026 - the event is complete before the boot screenshots: the outcome is
+    # decided without them, and a cleanup started while they are taken finds the clones
+    shots = sr_boot_shots.pending(booted)
+    if shots:
+        summary['screenshots'] = shots
     _complete_event(event_id, event_status, summary)
+    if shots:
+        _broadcast_progress(plan_id, f"Taking boot screenshots of {len(booted)} test VM(s)...", 95)
+        shots = sr_boot_shots.run(tgt_mgr, plan_id, event_id, booted, console_vmids)
 
     db = get_db()
     now = datetime.utcnow().isoformat()
@@ -829,7 +844,9 @@ def execute_test_failover(plan_id):
 
     ok = sum(1 for r in results.values() if r.get('success'))
     log_audit('system', 'site_recovery.test_complete',
-              f"Test failover for '{_sl(plan['name'])}': {ok}/{len(vms)} VMs cloned")
+              f"Test failover for '{_sl(plan['name'])}': {ok}/{len(vms)} VMs cloned"
+              + (f", boot screenshots: {shots['taken']} taken, {shots['failed']} failed, "
+                 f"{shots['skipped']} skipped" if shots else ''))
     logger.info(f"[SR] Test failover complete for '{_sl(plan['name'])}': {len(test_vmids)} clones created")
 
 
@@ -1129,6 +1146,11 @@ def recover_orphan_runs():
                 (now, row['id']),
             )
             reset_plans += 1
+        # a test whose boot screenshots the restart cut short: the test had finished
+        cut_short = sr_boot_shots.mark_interrupted()
+        if cut_short:
+            logger.warning(f"[SR] orphan-cleanup at boot: the boot screenshots of {cut_short} "
+                           f"test failover(s) were cut short by the restart")
     except Exception as e:
         logger.error(f"[SR] orphan-cleanup query failed: {e}")
         return

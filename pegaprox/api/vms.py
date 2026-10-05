@@ -4352,6 +4352,26 @@ def _screenshot_via_rfb(mgr, node, vm_type, vmid, max_width=480, timeout=10):
     return vnc_grab.to_png_thumbnail(img, max_width=max_width)
 
 
+def grab_vm_frame(mgr, node, vm_type, vmid, max_width=480):
+    """One PNG of a guest's display: screendump first, one RFB frame when that gives nothing.
+    Raises when neither does. The console tile and the boot screenshots of a DR test
+    failover (background/sr_boot_shots.py) both take theirs here. MK Oct 2026"""
+    from pegaprox.utils import vnc_grab
+    try:
+        return vnc_grab.screendump_to_png(mgr, node, vmid, max_width=max_width, timeout=20)
+    except Exception as e:
+        # screendump came back empty/blank, or can't run (API-token-only / no SSH).
+        # The common one is Windows on virtio-gpu/QXL - qm monitor screendump renders
+        # nothing there, so the tile only ever showed the icon. Fall back to a one-off
+        # RFB frame off the vncproxy (guest-GPU-independent) before giving up.
+        logging.info(f"[Screenshot] screendump failed {vm_type}/{vmid}@{node}: {e} - trying RFB")
+    try:
+        return _screenshot_via_rfb(mgr, node, vm_type, vmid, max_width=max_width, timeout=10)
+    except Exception as e2:
+        logging.info(f"[Screenshot] RFB fallback also failed {vm_type}/{vmid}@{node}: {e2}")
+        raise
+
+
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/screenshot', methods=['GET'])
 @require_auth()
 def get_vm_screenshot(cluster_id, node, vm_type, vmid):
@@ -4390,21 +4410,11 @@ def get_vm_screenshot(cluster_id, node, vm_type, vmid):
 
     # screendump via qm monitor — no vncproxy, so no "console opened" PVE task
     try:
-        from pegaprox.utils import vnc_grab
-        png = vnc_grab.screendump_to_png(mgr, node, vmid, max_width=480, timeout=20)
-    except Exception as e:
-        # screendump came back empty/blank, or can't run (API-token-only / no SSH).
-        # The common one is Windows on virtio-gpu/QXL — qm monitor screendump renders
-        # nothing there, so the tile only ever showed the icon. Fall back to a one-off
-        # RFB frame off the vncproxy (guest-GPU-independent) before giving up.
-        logging.info(f"[Screenshot] screendump failed {vm_type}/{vmid}@{node}: {e} — trying RFB")
-        try:
-            png = _screenshot_via_rfb(mgr, node, vm_type, vmid, max_width=480, timeout=10)
-        except Exception as e2:
-            logging.info(f"[Screenshot] RFB fallback also failed {vm_type}/{vmid}@{node}: {e2}")
-            with _vm_screenshot_lock:
-                _vm_screenshot_cache[cache_key] = (time.monotonic(), None)
-            return jsonify({'error': f'screenshot unavailable: {e2}'}), 502
+        png = grab_vm_frame(mgr, node, vm_type, vmid, max_width=480)
+    except Exception as e2:
+        with _vm_screenshot_lock:
+            _vm_screenshot_cache[cache_key] = (time.monotonic(), None)
+        return jsonify({'error': f'screenshot unavailable: {e2}'}), 502
 
     with _vm_screenshot_lock:
         _vm_screenshot_cache[cache_key] = (time.monotonic(), png)

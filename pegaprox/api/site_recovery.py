@@ -5,7 +5,7 @@ import uuid
 import logging
 import time
 from datetime import datetime
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, Response, jsonify, request
 
 from pegaprox.constants import *
 from pegaprox.globals import *
@@ -146,6 +146,24 @@ def _authz_plan_vms(plan, starts_vms=False):
         return False, (jsonify({'error': 'Access denied: you are not authorized to place '
                                          'workloads on the target cluster'}), 403)
     return True, None
+
+
+def _console_vmids(plan):
+    """The plan's guests the caller may open the console of, the question the screenshot
+    route asks (api/vms.py get_vm_screenshot). A test failover takes its boot screenshots
+    of those only: the job that takes them has no caller to ask. MK Oct 2026"""
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import user_can_access_vm
+    user = build_authz_user(request.session['user'], request.session)
+    out = []
+    for vm in _get_plan_vms(plan['id']):
+        try:
+            vmid = int(vm['vmid'])
+        except (ValueError, TypeError, KeyError):
+            continue
+        if user_can_access_vm(user, plan['source_cluster'], vmid, 'vm.console', vm.get('vm_type', 'qemu')):
+            out.append(vmid)
+    return out
 
 
 # ---- CRUD: Plans ----
@@ -351,6 +369,7 @@ def delete_plan(plan_id):
     db = get_db()
     db.execute('DELETE FROM site_recovery_vms WHERE plan_id = ?', (plan_id,))
     db.execute('DELETE FROM site_recovery_events WHERE plan_id = ?', (plan_id,))
+    db.execute('DELETE FROM site_recovery_screenshots WHERE plan_id = ?', (plan_id,))
     db.execute('DELETE FROM site_recovery_plans WHERE id = ?', (plan_id,))
 
     usr = getattr(request, 'session', {}).get('user', 'system')
@@ -778,7 +797,7 @@ def execute_test_failover(plan_id):
     db.execute("UPDATE site_recovery_plans SET status = 'testing', updated_at = ? WHERE id = ?", (now, plan_id))
 
     from pegaprox.background.site_recovery import execute_test_failover
-    _safe_spawn_failover(execute_test_failover, plan_id)
+    _safe_spawn_failover(execute_test_failover, plan_id, _console_vmids(plan))
 
     usr = getattr(request, 'session', {}).get('user', 'system')
     log_audit(usr, 'site_recovery.test', f"Test failover started: {plan['name']}")
@@ -924,3 +943,43 @@ def get_plan_events(plan_id):
             ev['details'] = {}
         events.append(ev)
     return jsonify(events)
+
+
+# MK Oct 2026 - the boot screenshots of a test failover (background/sr_boot_shots.py)
+@bp.route('/api/site-recovery/plans/<plan_id>/events/<event_id>/screenshots/<int:vmid>', methods=['GET'])
+@require_auth(perms=['site_recovery.view'])
+def get_event_screenshot(plan_id, event_id, vmid):
+    """The boot screenshot a test failover took of one guest, as image/png.
+
+    It is a picture of a console, so on top of what the event list asks the caller has
+    to pass what the screenshot route asks: vm.console on the guest it shows, the plan's
+    guest on the source and its test clone on the target."""
+    plan = _get_plan(plan_id)
+    if not plan:
+        return jsonify({'error': 'Plan not found'}), 404
+    ok, err = check_cluster_access(plan['source_cluster'])
+    if not ok:
+        return err
+    ok, err = check_cluster_access(plan['target_cluster'])
+    if not ok:
+        return err
+    ok, err = _authz_plan_vms(plan)
+    if not ok:
+        return err
+
+    from pegaprox.background import sr_boot_shots
+    ev = get_db().query_one('SELECT id FROM site_recovery_events WHERE id = ? AND plan_id = ?',
+                            (event_id, plan_id))
+    test_vmid, png = sr_boot_shots.load(event_id, vmid) if ev else (None, None)
+    if png is None:
+        return jsonify({'error': 'No screenshot of this guest in this event'}), 404
+
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import user_can_access_vm
+    user = build_authz_user(request.session['user'], request.session)
+    if not (user_can_access_vm(user, plan['source_cluster'], vmid, 'vm.console', 'qemu')
+            and user_can_access_vm(user, plan['target_cluster'], int(test_vmid or 0), 'vm.console', 'qemu')):
+        return jsonify({'error': 'Permission denied: vm.console'}), 403
+    resp = Response(png, mimetype='image/png')
+    resp.headers['Cache-Control'] = 'private, max-age=300'
+    return resp
