@@ -87,6 +87,7 @@
             });
             const [, forceUpdate] = useState(0);
             const [showMaintenanceConfirm, setShowMaintenanceConfirm] = useState(false);
+            const [maintOptions, setMaintOptions] = useState({});  // off on each opening (#763, #954)
             const [showUpdateConfirm, setShowUpdateConfirm] = useState(false);
             const [updateWithReboot, setUpdateWithReboot] = useState(true);
             const [showUpdateLog, setShowUpdateLog] = useState(false);
@@ -596,7 +597,7 @@
                             )}
                             {!haReadOnly && !isInMaintenance && !isUpdating && (
                                 <button
-                                    onClick={() => setShowMaintenanceConfirm(true)}
+                                    onClick={() => { setMaintOptions({}); setShowMaintenanceConfirm(true); }}
                                     className="p-2 rounded-lg bg-proxmox-dark hover:bg-yellow-500/20 text-gray-400 hover:text-yellow-400 transition-all"
                                     title={t('enterMaintenance')}
                                 >
@@ -774,8 +775,9 @@
                     {/* Maintenance Confirmation Modal */}
                     {showMaintenanceConfirm && (
                         <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60" onClick={() => setShowMaintenanceConfirm(false)}>
-                            <div 
-                                className="w-full max-w-md bg-proxmox-card border border-proxmox-border rounded-2xl shadow-2xl overflow-hidden"
+                            <div
+                                className="w-full max-w-md max-h-[90vh] overflow-y-auto bg-proxmox-card border border-proxmox-border rounded-2xl shadow-2xl"
+                                data-testid="maint-dialog"
                                 onClick={e => e.stopPropagation()}
                             >
                                 <div className="p-6 border-b border-proxmox-border">
@@ -795,9 +797,13 @@
                                             <strong>{t('warning')}:</strong> {t('maintenanceWarning').replace('Warning: ', '')}
                                         </p>
                                     </div>
-                                    <p className="text-sm text-gray-400 mb-6">
+                                    <p className="text-sm text-gray-400 mb-4">
                                         {t('maintenanceDesc')}
                                     </p>
+                                    {/* LW Oct 2026 (#763, #954) - the evacuation options of the rolling update, for this node */}
+                                    <div className="mb-6">
+                                        <MaintenanceEvacOptions clusterId={clusterId} node={name} value={maintOptions} onChange={setMaintOptions} />
+                                    </div>
                                     <div className="flex gap-3">
                                         <button
                                             onClick={() => setShowMaintenanceConfirm(false)}
@@ -808,7 +814,7 @@
                                         <button
                                             onClick={() => {
                                                 setShowMaintenanceConfirm(false);
-                                                onMaintenanceToggle(name, true);
+                                                onMaintenanceToggle(name, true, maintOptions);
                                             }}
                                             className="flex-1 px-4 py-2.5 bg-yellow-500 hover:bg-yellow-600 rounded-lg text-black font-medium transition-colors"
                                         >
@@ -1021,6 +1027,7 @@
             const { getAuthHeaders, haReadOnly } = useAuth();  // #625: read-only on a standby
             const [expanded, setExpanded] = useState(false);
             const [showMaintenanceConfirm, setShowMaintenanceConfirm] = useState(false);
+            const [maintOptions, setMaintOptions] = useState({});  // #763, #954
             const [showRebootConfirm, setShowRebootConfirm] = useState(false);
             const [showShutdownConfirm, setShowShutdownConfirm] = useState(false);
             const [showUpdateConfirm, setShowUpdateConfirm] = useState(false);
@@ -1249,7 +1256,7 @@
                         )}
                         {!haReadOnly && (<>
                         {!isInMaintenance ? (
-                            <button onClick={() => setShowMaintenanceConfirm(true)}>
+                            <button onClick={() => { setMaintOptions({}); setShowMaintenanceConfirm(true); }}>
                                 <Icons.Wrench className="w-3 h-3" style={{color: '#efc006'}} /> {t('enterMaintenance') || t('maintenance')}
                                     </button>
                                 ) : (
@@ -1284,12 +1291,16 @@
                     {/* Confirmation Modals */}
                     {showMaintenanceConfirm && (
                         <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60">
-                            <div className="w-full max-w-sm bg-proxmox-card border border-proxmox-border p-5">
+                            <div className="w-full max-w-sm max-h-[90vh] overflow-y-auto bg-proxmox-card border border-proxmox-border p-5" data-testid="maint-dialog">
                                 <h3 className="text-[14px] font-semibold mb-2" style={{color: '#e9ecef'}}>{t('enterMaintenance') || 'Enter Maintenance Mode'}</h3>
                                 <p className="text-[13px] mb-4" style={{color: '#adbbc4'}}>{t('maintenanceWarning') || `All VMs on ${name} will be migrated to other nodes.`}</p>
+                                {/* LW Oct 2026 (#763, #954) */}
+                                <div className="mb-4">
+                                    <MaintenanceEvacOptions clusterId={clusterId} node={name} value={maintOptions} onChange={setMaintOptions} />
+                                </div>
                                 <div className="flex justify-end gap-2">
                                     <button onClick={() => setShowMaintenanceConfirm(false)} className="px-3 py-1.5 text-[13px] border border-proxmox-border hover:text-white" style={{color: '#adbbc4'}}>{t('cancel')}</button>
-                                    <button onClick={() => { onMaintenanceToggle && onMaintenanceToggle(name, true); setShowMaintenanceConfirm(false); }} className="px-3 py-1.5 text-[13px] text-white" style={{background: '#efc006', border: '1px solid #d4a905'}}>{t('confirm') || 'Confirm'}</button>
+                                    <button onClick={() => { onMaintenanceToggle && onMaintenanceToggle(name, true, maintOptions); setShowMaintenanceConfirm(false); }} className="px-3 py-1.5 text-[13px] text-white" style={{background: '#efc006', border: '1px solid #d4a905'}}>{t('confirm') || 'Confirm'}</button>
                                 </div>
                             </div>
                         </div>

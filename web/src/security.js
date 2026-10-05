@@ -2088,6 +2088,179 @@
             );
         }
 
+        // LW Oct 2026 (#763, #954) - the two evacuation options and what ticking each would change,
+        // read from the plan. The rolling update dialog, its schedule and the maintenance dialog
+        // of a node use them; the plan is read once each time the dialog opens
+        function useEvacPlan(url, open) {
+            const { getAuthHeaders } = useAuth();
+            const [plan, setPlan] = useState(null);
+            useEffect(() => {
+                if (!open) return undefined;
+                let gone = false;
+                setPlan(null);
+                (async () => {
+                    try {
+                        const r = await fetch(url, { credentials: 'include', headers: getAuthHeaders() });
+                        const d = r.ok ? await r.json() : null;
+                        if (!gone) setPlan(d || { error: true });
+                    } catch (_) {
+                        if (!gone) setPlan({ error: true });
+                    }
+                })();
+                return () => { gone = true; };
+            }, [open, url]);
+            return plan;
+        }
+
+        // kind: 'rolling' and 'schedule' say it for the update, 'maint' for one node's maintenance
+        function EvacOptions({ kind, plan, skip, migrateTemplates, setMigrateTemplates, relaxAntiAffinity, setRelaxAntiAffinity }) {
+            const { t } = useTranslation();
+            const maint = kind === 'maint';
+            if (plan?.supported === false) return null;
+
+            const templateWhy = (tp) => {
+                const text = {
+                    storage_list: t('rollEvacWhyStorageList'), config: t('rollEvacWhyConfig'),
+                    local_image: t('rollEvacWhyLocalImage'), storage_missing: t('rollEvacWhyStorageMissing'),
+                    storage_split: t('rollEvacWhyStorageSplit'),
+                }[tp.code];
+                if (!text) return tp.reason;
+                const args = tp.args || {};
+                return text.replace('{drive}', () => args.drive || '').replace('{storage}', () => args.storage || '')
+                    .replace('{storages}', () => args.storages || '');
+            };
+
+            const planTemplates = () => {
+                if (!plan) return <span className="text-gray-500">{t('rollEvacPlanLoading')}</span>;
+                if (plan.error) return <span className="text-gray-500">{t('rollEvacPlanError')}</span>;
+                const all = plan.templates || [];
+                if (!all.length) return <span className="text-gray-500">{maint ? t('maintEvacNoTemplates') : t('rollEvacNoTemplates')}</span>;
+                if (!migrateTemplates) {
+                    return <span className="text-yellow-400">{(maint ? t('maintEvacTemplatesStay') : t('rollEvacTemplatesStay')).replace('{n}', () => all.length)}</span>;
+                }
+                return (
+                    <>
+                        {all.slice(0, 8).map(tp => (
+                            <div key={tp.vmid} data-template={tp.vmid} data-moves={tp.reason ? 'no' : 'yes'}
+                                className={tp.reason ? 'text-yellow-400' : 'text-gray-400'}>
+                                {tp.name} ({tp.vmid}, {tp.node}): {tp.reason ? templateWhy(tp)
+                                    : t('rollEvacTemplateMoves').replace('{nodes}', () => (tp.targets || []).join(', '))}
+                            </div>
+                        ))}
+                        {all.length > 8 && <div className="text-gray-500">{t('rollEvacMore').replace('{n}', () => all.length - 8)}</div>}
+                    </>
+                );
+            };
+
+            const planRules = () => {
+                if (!plan) return <span className="text-gray-500">{t('rollEvacPlanLoading')}</span>;
+                if (plan.error) return <span className="text-gray-500">{t('rollEvacPlanError')}</span>;
+                const rules = plan.negative_rules;
+                const own = plan.own_rules || [];
+                const stillOff = plan.still_off || [];
+                // off already for somebody else: kept off for this one too when it is ticked
+                const held = plan.held || [];
+                const byMaint = held.filter(h => (h.nodes || []).length);
+                const maintNodes = [...new Set(byMaint.flatMap(h => h.nodes))];
+                const byRolling = held.filter(h => h.rolling);
+                return (
+                    <>
+                        {rules == null ? <div className="text-yellow-400">{t('rollEvacRulesUnreadable')}</div>
+                            : !rules.length ? <div className="text-gray-500">{maint ? t('maintEvacNoRules') : t('rollEvacNoRules')}</div>
+                            : <>
+                                <div className="text-gray-400">{!relaxAntiAffinity ? t('rollEvacRulesOn')
+                                    : maint ? t('maintEvacRulesOff') : t('rollEvacRulesOff')}</div>
+                                {rules.slice(0, 8).map(r => (
+                                    <div key={r.rule} data-rule={r.rule} className="text-gray-400">
+                                        <span className="font-mono">{r.rule}</span>: {(r.resources || []).join(', ')}
+                                        {r.blocks && <span className={relaxAntiAffinity ? 'text-gray-500' : 'text-yellow-400'}> - {t('rollEvacRuleBlocks')}</span>}
+                                    </div>
+                                ))}
+                                {rules.length > 8 && <div className="text-gray-500">{t('rollEvacMore').replace('{n}', () => rules.length - 8)}</div>}
+                            </>}
+                        {byMaint.length > 0 && (
+                            <div className="text-gray-400" data-held="maintenance">
+                                {t('evacHeldMaintenance').replace('{nodes}', () => maintNodes.join(', '))
+                                    .replace('{rules}', () => byMaint.map(h => h.rule).join(', '))}
+                            </div>
+                        )}
+                        {byRolling.length > 0 && (
+                            <div className="text-gray-400" data-held="rolling">
+                                {t('evacHeldRolling').replace('{rules}', () => byRolling.map(h => h.rule).join(', '))}
+                            </div>
+                        )}
+                        {own.length > 0 && (
+                            <div className="text-gray-400" data-own-rules={own.length}>
+                                {(maint || !relaxAntiAffinity ? t('rollEvacOwnEnforced')
+                                    : plan.balancer_separates ? t('rollEvacOwnHeld') : t('rollEvacOwnHeldNoBalancer'))
+                                    .replace('{n}', () => own.length)}
+                            </div>
+                        )}
+                        {stillOff.length > 0 && (
+                            <div className="text-yellow-400">{t('rollEvacStillOff').replace('{rules}', () => stillOff.join(', '))}</div>
+                        )}
+                    </>
+                );
+            };
+
+            return (
+                <div className="space-y-2" data-testid={`${kind}-evac-options`}>
+                    {kind === 'schedule' && <p className="text-xs text-gray-500">{t('schedEvacPlanNow')}</p>}
+                    <label className="flex items-start gap-2 cursor-pointer">
+                        <input
+                            type="checkbox"
+                            data-testid={`${kind}-move-templates`}
+                            checked={migrateTemplates && !skip}
+                            disabled={skip}
+                            onChange={(e) => setMigrateTemplates(e.target.checked)}
+                            className="mt-0.5 w-4 h-4 flex-shrink-0 rounded border-proxmox-border bg-proxmox-dark text-proxmox-orange focus:ring-proxmox-orange"
+                        />
+                        <div>
+                            <span className="text-white text-sm">{t('rollEvacTemplates')}</span>
+                            <p className="text-xs text-gray-500">{maint ? t('maintEvacTemplatesHint') : t('rollEvacTemplatesHint')}</p>
+                        </div>
+                    </label>
+                    {!skip && (
+                        <div className="ml-6 text-xs space-y-0.5" data-testid={`${kind}-plan-templates`}>
+                            {planTemplates()}
+                        </div>
+                    )}
+                    <label className="flex items-start gap-2 cursor-pointer">
+                        <input
+                            type="checkbox"
+                            data-testid={`${kind}-relax-affinity`}
+                            checked={relaxAntiAffinity && !skip}
+                            disabled={skip}
+                            onChange={(e) => setRelaxAntiAffinity(e.target.checked)}
+                            className="mt-0.5 w-4 h-4 flex-shrink-0 rounded border-proxmox-border bg-proxmox-dark text-proxmox-orange focus:ring-proxmox-orange"
+                        />
+                        <div>
+                            <span className="text-white text-sm">{maint ? t('maintEvacRelax') : t('rollEvacRelax')}</span>
+                            <p className="text-xs text-gray-500">{maint ? t('maintEvacRelaxHint') : t('rollEvacRelaxHint')}</p>
+                        </div>
+                    </label>
+                    {!skip && (
+                        <div className="ml-6 text-xs space-y-0.5" data-testid={`${kind}-plan-rules`}>
+                            {planRules()}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // the maintenance dialog of a node: the plan of this node only, from the route the
+        // maintenance itself needs the permission of
+        function MaintenanceEvacOptions({ clusterId, node, value, onChange }) {
+            const plan = useEvacPlan(`${API_URL}/clusters/${clusterId}/nodes/${encodeURIComponent(node)}/maintenance-plan`, true);
+            return (
+                <EvacOptions kind="maint" plan={plan} skip={false}
+                    migrateTemplates={!!value.migrate_templates}
+                    setMigrateTemplates={(on) => onChange({ ...value, migrate_templates: on })}
+                    relaxAntiAffinity={!!value.relax_anti_affinity}
+                    setRelaxAntiAffinity={(on) => onChange({ ...value, relax_anti_affinity: on })} />
+            );
+        }
+
         // update Manager Section Component (for Settings tab)
         function UpdateManagerSection({ clusterId, addToast }) {
             const { t } = useTranslation();
@@ -2129,7 +2302,6 @@
             const [cephHealthGate, setCephHealthGate] = useState('off');  // NS #403 part 2 — 'off' | 'degraded' | 'strict'
             const [migrateTemplates, setMigrateTemplates] = useState(false);  // #763
             const [relaxAntiAffinity, setRelaxAntiAffinity] = useState(false);  // #954
-            const [rollingPlan, setRollingPlan] = useState(null);
             const [waitForReboot, setWaitForReboot] = useState(true);  // NS: GitHub #40 - wait for node online before next
             const [pauseOnEvacError, setPauseOnEvacError] = useState(true);  // NS: GitHub #40 - pause if VMs fail to migrate
             const [showAdvancedOptions, setShowAdvancedOptions] = useState(false);  // NS: Toggle for timeouts
@@ -2156,6 +2328,8 @@
             const [scheduleEvacTimeout, setScheduleEvacTimeout] = useState(1800);
             const [scheduleRebootTimeout, setScheduleRebootTimeout] = useState(600);  // MK #630
             const [scheduleWaitForReboot, setScheduleWaitForReboot] = useState(true);
+            const [scheduleMigrateTemplates, setScheduleMigrateTemplates] = useState(false);  // #763
+            const [scheduleRelaxAntiAffinity, setScheduleRelaxAntiAffinity] = useState(false);  // #954
             const [scheduleShowAdvanced, setScheduleShowAdvanced] = useState(false);
             const [scheduleSaving, setScheduleSaving] = useState(false);
 
@@ -2327,6 +2501,8 @@
                         setScheduleEvacTimeout(data.evacuation_timeout || 1800);
                         setScheduleRebootTimeout(data.reboot_timeout || 600);  // MK #630
                         setScheduleWaitForReboot(data.wait_for_reboot !== false);
+                        setScheduleMigrateTemplates(data.migrate_templates === true);  // #763
+                        setScheduleRelaxAntiAffinity(data.relax_anti_affinity === true);  // #954
                     }
                 } catch (e) {
                     console.error('Error loading update schedule:', e);
@@ -2351,7 +2527,9 @@
                             wait_for_reboot: scheduleWaitForReboot,
                             skip_up_to_date: true,
                             evacuation_timeout: scheduleEvacTimeout,
-                            reboot_timeout: scheduleRebootTimeout  // MK #630
+                            reboot_timeout: scheduleRebootTimeout,  // MK #630
+                            migrate_templates: scheduleMigrateTemplates && !scheduleSkipEvacuation,  // #763
+                            relax_anti_affinity: scheduleRelaxAntiAffinity && !scheduleSkipEvacuation,  // #954
                         })
                     });
                     if (res.ok) {
@@ -2459,91 +2637,11 @@
             };
 
             // LW Oct 2026 (#763, #954) - what moving the templates and letting negative affinity
-            // rules give way would change, read once each time the dialog opens
-            useEffect(() => {
-                if (!showConfirm) return undefined;
-                let gone = false;
-                setRollingPlan(null);
-                (async () => {
-                    try {
-                        const r = await fetch(`${API_URL}/clusters/${clusterId}/updates/rolling/plan`, {
-                            credentials: 'include', headers: getAuthHeaders() });
-                        const d = r.ok ? await r.json() : null;
-                        if (!gone) setRollingPlan(d || { error: true });
-                    } catch (_) {
-                        if (!gone) setRollingPlan({ error: true });
-                    }
-                })();
-                return () => { gone = true; };
-            }, [showConfirm, clusterId]);
-
-            const templateWhy = (tp) => {
-                const text = {
-                    storage_list: t('rollEvacWhyStorageList'), config: t('rollEvacWhyConfig'),
-                    local_image: t('rollEvacWhyLocalImage'), storage_missing: t('rollEvacWhyStorageMissing'),
-                    storage_split: t('rollEvacWhyStorageSplit'),
-                }[tp.code];
-                if (!text) return tp.reason;
-                const args = tp.args || {};
-                return text.replace('{drive}', () => args.drive || '').replace('{storage}', () => args.storage || '')
-                    .replace('{storages}', () => args.storages || '');
-            };
-
-            const rollingPlanTemplates = () => {
-                if (!rollingPlan) return <span className="text-gray-500">{t('rollEvacPlanLoading')}</span>;
-                if (rollingPlan.error) return <span className="text-gray-500">{t('rollEvacPlanError')}</span>;
-                const all = rollingPlan.templates || [];
-                if (!all.length) return <span className="text-gray-500">{t('rollEvacNoTemplates')}</span>;
-                if (!migrateTemplates) {
-                    return <span className="text-yellow-400">{t('rollEvacTemplatesStay').replace('{n}', () => all.length)}</span>;
-                }
-                return (
-                    <>
-                        {all.slice(0, 8).map(tp => (
-                            <div key={tp.vmid} data-template={tp.vmid} data-moves={tp.reason ? 'no' : 'yes'}
-                                className={tp.reason ? 'text-yellow-400' : 'text-gray-400'}>
-                                {tp.name} ({tp.vmid}, {tp.node}): {tp.reason ? templateWhy(tp)
-                                    : t('rollEvacTemplateMoves').replace('{nodes}', () => (tp.targets || []).join(', '))}
-                            </div>
-                        ))}
-                        {all.length > 8 && <div className="text-gray-500">{t('rollEvacMore').replace('{n}', () => all.length - 8)}</div>}
-                    </>
-                );
-            };
-
-            const rollingPlanRules = () => {
-                if (!rollingPlan) return <span className="text-gray-500">{t('rollEvacPlanLoading')}</span>;
-                if (rollingPlan.error) return <span className="text-gray-500">{t('rollEvacPlanError')}</span>;
-                const rules = rollingPlan.negative_rules;
-                const own = rollingPlan.own_rules || [];
-                const stillOff = rollingPlan.still_off || [];
-                return (
-                    <>
-                        {rules == null ? <div className="text-yellow-400">{t('rollEvacRulesUnreadable')}</div>
-                            : !rules.length ? <div className="text-gray-500">{t('rollEvacNoRules')}</div>
-                            : <>
-                                <div className="text-gray-400">{relaxAntiAffinity ? t('rollEvacRulesOff') : t('rollEvacRulesOn')}</div>
-                                {rules.slice(0, 8).map(r => (
-                                    <div key={r.rule} data-rule={r.rule} className="text-gray-400">
-                                        <span className="font-mono">{r.rule}</span>: {(r.resources || []).join(', ')}
-                                        {r.blocks && <span className={relaxAntiAffinity ? 'text-gray-500' : 'text-yellow-400'}> - {t('rollEvacRuleBlocks')}</span>}
-                                    </div>
-                                ))}
-                                {rules.length > 8 && <div className="text-gray-500">{t('rollEvacMore').replace('{n}', () => rules.length - 8)}</div>}
-                            </>}
-                        {own.length > 0 && (
-                            <div className="text-gray-400" data-own-rules={own.length}>
-                                {(!relaxAntiAffinity ? t('rollEvacOwnEnforced')
-                                    : rollingPlan.balancer_separates ? t('rollEvacOwnHeld') : t('rollEvacOwnHeldNoBalancer'))
-                                    .replace('{n}', () => own.length)}
-                            </div>
-                        )}
-                        {stillOff.length > 0 && (
-                            <div className="text-yellow-400">{t('rollEvacStillOff').replace('{rules}', () => stillOff.join(', '))}</div>
-                        )}
-                    </>
-                );
-            };
+            // rules give way would change, read once each time the dialog opens; the schedule
+            // dialog reads it for the cluster as it is now (EvacOptions says so)
+            const rollingPlanUrl = `${API_URL}/clusters/${clusterId}/updates/rolling/plan`;
+            const rollingPlan = useEvacPlan(rollingPlanUrl, showConfirm);
+            const schedulePlan = useEvacPlan(rollingPlanUrl, showScheduleModal);
 
             // Cancel rolling update
             const cancelRollingUpdate = async () => {
@@ -3485,48 +3583,9 @@
 
                                     {/* LW Oct 2026 (#763, #954) - two evacuation options, off as before; the plan
                                         under each says what ticking it changes. Proxmox clusters only */}
-                                    {rollingPlan?.supported !== false && (
-                                        <div className="space-y-2" data-testid="rolling-evac-options">
-                                            <label className="flex items-start gap-2 cursor-pointer">
-                                                <input
-                                                    type="checkbox"
-                                                    data-testid="rolling-move-templates"
-                                                    checked={migrateTemplates && !skipEvacuation}
-                                                    disabled={skipEvacuation}
-                                                    onChange={(e) => setMigrateTemplates(e.target.checked)}
-                                                    className="mt-0.5 w-4 h-4 flex-shrink-0 rounded border-proxmox-border bg-proxmox-dark text-proxmox-orange focus:ring-proxmox-orange"
-                                                />
-                                                <div>
-                                                    <span className="text-white text-sm">{t('rollEvacTemplates')}</span>
-                                                    <p className="text-xs text-gray-500">{t('rollEvacTemplatesHint')}</p>
-                                                </div>
-                                            </label>
-                                            {!skipEvacuation && (
-                                                <div className="ml-6 text-xs space-y-0.5" data-testid="rolling-plan-templates">
-                                                    {rollingPlanTemplates()}
-                                                </div>
-                                            )}
-                                            <label className="flex items-start gap-2 cursor-pointer">
-                                                <input
-                                                    type="checkbox"
-                                                    data-testid="rolling-relax-affinity"
-                                                    checked={relaxAntiAffinity && !skipEvacuation}
-                                                    disabled={skipEvacuation}
-                                                    onChange={(e) => setRelaxAntiAffinity(e.target.checked)}
-                                                    className="mt-0.5 w-4 h-4 flex-shrink-0 rounded border-proxmox-border bg-proxmox-dark text-proxmox-orange focus:ring-proxmox-orange"
-                                                />
-                                                <div>
-                                                    <span className="text-white text-sm">{t('rollEvacRelax')}</span>
-                                                    <p className="text-xs text-gray-500">{t('rollEvacRelaxHint')}</p>
-                                                </div>
-                                            </label>
-                                            {!skipEvacuation && (
-                                                <div className="ml-6 text-xs space-y-0.5" data-testid="rolling-plan-rules">
-                                                    {rollingPlanRules()}
-                                                </div>
-                                            )}
-                                        </div>
-                                    )}
+                                    <EvacOptions kind="rolling" plan={rollingPlan} skip={skipEvacuation}
+                                        migrateTemplates={migrateTemplates} setMigrateTemplates={setMigrateTemplates}
+                                        relaxAntiAffinity={relaxAntiAffinity} setRelaxAntiAffinity={setRelaxAntiAffinity} />
 
                                     {/* NS: Advanced options toggle */}
                                     <button
@@ -3717,7 +3776,7 @@
                     {/* MK: Schedule Modal */}
                     {showScheduleModal && (
                         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 modal-backdrop" onClick={() => setShowScheduleModal(false)}>
-                            <div className="bg-proxmox-card border border-proxmox-border rounded-2xl p-6 max-w-md w-full animate-scale-in" onClick={e => e.stopPropagation()}>
+                            <div className="bg-proxmox-card border border-proxmox-border rounded-2xl p-6 max-w-md w-full max-h-[90vh] overflow-y-auto animate-scale-in" data-testid="schedule-dialog" onClick={e => e.stopPropagation()}>
                                 <div className="flex items-center gap-3 mb-4">
                                     <div className="p-2 rounded-lg bg-blue-500/20">
                                         <Icons.Clock className="text-blue-400" />
@@ -3835,7 +3894,12 @@
                                                     <span className="text-red-400 text-sm">{t('skipEvacuation') || 'Skip VM evacuation'}</span>
                                                     <span className="text-xs bg-red-900/30 text-red-400 px-1.5 py-0.5 rounded">{t('notRecommended') || 'NOT RECOMMENDED'}</span>
                                                 </label>
-                                                
+
+                                                {/* LW Oct 2026 (#763, #954) - the same two options for the scheduled run */}
+                                                <EvacOptions kind="schedule" plan={schedulePlan} skip={scheduleSkipEvacuation}
+                                                    migrateTemplates={scheduleMigrateTemplates} setMigrateTemplates={setScheduleMigrateTemplates}
+                                                    relaxAntiAffinity={scheduleRelaxAntiAffinity} setRelaxAntiAffinity={setScheduleRelaxAntiAffinity} />
+
                                                 {/* NS: GitHub #40 - Advanced Options */}
                                                 <button
                                                     onClick={() => setScheduleShowAdvanced(!scheduleShowAdvanced)}

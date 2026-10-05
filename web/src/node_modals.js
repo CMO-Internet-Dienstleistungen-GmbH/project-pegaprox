@@ -4864,6 +4864,9 @@
             // to the shell on the active on every standby that does not serve users
             const [activeDetailTab, setActiveDetailTab] = useState('summary');
             const [showActionsMenu, setShowActionsMenu] = useState(false);
+            // LW Oct 2026 (#763, #954) - entering maintenance asks with the evacuation options
+            const [showMaintConfirm, setShowMaintConfirm] = useState(false);
+            const [maintOptions, setMaintOptions] = useState({});
             const [configSubTab, setConfigSubTab] = useState('network');
             const [monitorSubTab, setMonitorSubTab] = useState('performance');
             const [perfTimeframe, setPerfTimeframe] = useState('hour');
@@ -5145,7 +5148,7 @@
                                 {showActionsMenu && (
                                     <div className="corp-dropdown absolute right-0 top-full mt-1 w-52 z-50 py-1" onClick={(e) => e.stopPropagation()}>
                                         {!haReadOnly && (<>
-                                        <button onClick={() => { if(!confirm(`${isMaint ? 'Disable' : 'Enable'} maintenance mode on "${node}"?`)) return; onMaintenanceToggle(node, !isMaint); setShowActionsMenu(false); }} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: 'var(--corp-text-secondary)'}}>
+                                        <button onClick={() => { if (!isMaint) { setMaintOptions({}); setShowMaintConfirm(true); setShowActionsMenu(false); return; } if(!confirm(`${isMaint ? 'Disable' : 'Enable'} maintenance mode on "${node}"?`)) return; onMaintenanceToggle(node, !isMaint); setShowActionsMenu(false); }} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: 'var(--corp-text-secondary)'}}>
                                             <Icons.Wrench className="w-3.5 h-3.5" /> {isMaint ? t('disableMaintenance') || 'Disable Maintenance' : t('maintenance')}
                                         </button>
                                         <button onClick={() => { if(!confirm(`Reboot node "${node}"?`)) return; onNodeAction(node, 'reboot'); setShowActionsMenu(false); }} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: 'var(--corp-text-secondary)'}}>
@@ -6013,6 +6016,22 @@
                             </div>
                         )}
                     </div>
+
+                    {showMaintConfirm && !haReadOnly && (
+                        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60" onClick={() => setShowMaintConfirm(false)}>
+                            <div className="w-full max-w-sm max-h-[90vh] overflow-y-auto bg-proxmox-card border border-proxmox-border p-5" data-testid="maint-dialog" onClick={e => e.stopPropagation()}>
+                                <h3 className="text-[14px] font-semibold mb-2" style={{color: '#e9ecef'}}>{t('enterMaintenance') || 'Enter Maintenance Mode'}: {node}</h3>
+                                <p className="text-[13px] mb-4" style={{color: '#adbbc4'}}>{t('maintenanceWarning')}</p>
+                                <div className="mb-4">
+                                    <MaintenanceEvacOptions clusterId={clusterId} node={node} value={maintOptions} onChange={setMaintOptions} />
+                                </div>
+                                <div className="flex justify-end gap-2">
+                                    <button onClick={() => setShowMaintConfirm(false)} className="px-3 py-1.5 text-[13px] border border-proxmox-border hover:text-white" style={{color: '#adbbc4'}}>{t('cancel')}</button>
+                                    <button onClick={() => { setShowMaintConfirm(false); onMaintenanceToggle(node, true, maintOptions); }} className="px-3 py-1.5 text-[13px] text-white" style={{background: '#efc006', border: '1px solid #d4a905'}}>{t('startMaintenance')}</button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
                 </div>
             );
         }

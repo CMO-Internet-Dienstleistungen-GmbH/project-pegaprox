@@ -15463,7 +15463,9 @@
                 } catch (_) { return ''; }
             };
 
-            const handleMaintenanceToggle = async (nodeName, enable) => {
+            // LW Oct 2026 (#763, #954) - options: the evacuation options the maintenance dialog of a
+            // node was left with ({ migrate_templates, relax_anti_affinity }), sent as they are
+            const handleMaintenanceToggle = async (nodeName, enable, options) => {
                 if (!selectedCluster) return;
                 if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 // #147
@@ -15479,7 +15481,11 @@
                         const response = await authFetch(`${API_URL}/clusters/${selectedCluster.id}/nodes/${nodeName}/maintenance`, {
                             method: 'PUT',
                             headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ enable: true })
+                            body: JSON.stringify({
+                                enable: true,
+                                migrate_templates: options?.migrate_templates === true,
+                                relax_anti_affinity: options?.relax_anti_affinity === true,
+                            })
                         });
                         
                         if (response && response.ok) {

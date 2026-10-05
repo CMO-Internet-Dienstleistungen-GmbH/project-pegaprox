@@ -1747,7 +1747,7 @@ def test_the_node_handlers_refuse_on_a_standby(dash):
     """Anything left that still reaches them: refused with the toast, before a question
     is asked or a request goes out."""
     guard = 'if (haReadOnly) { haRefusedRef.current?.(); return; }'
-    for head in ('const handleMaintenanceToggle = async (nodeName, enable) => {',
+    for head in ('const handleMaintenanceToggle = async (nodeName, enable, options) => {',
                  'const handleStartUpdate = async (nodeName, reboot) => {',
                  'const handleNodeAction = async (nodeName, action) => {',
                  'const handleForceStop = async (resource) => {'):
