@@ -10007,7 +10007,7 @@
             const [alertMutes, setAlertMutes] = useState([]);
             const [muteMenu, setMuteMenu] = useState(null);
             const [muteWholeObject, setMuteWholeObject] = useState(false);
-            const EVENT_ALERT_METRICS = ['task_failed', 'ceph_health', 'replication', 'snapshot_age'];
+            const EVENT_ALERT_METRICS = ['task_failed', 'ceph_health', 'replication', 'snapshot_age', 'backup_coverage'];
             const [sessionExpired, setSessionExpired] = useState(false);  // any 401 -> clear "session expired" overlay instead of silent failure
             const [clusterAffinityRules, setClusterAffinityRules] = useState([]);
             const [showAffinityModal, setShowAffinityModal] = useState(false);
@@ -11908,6 +11908,10 @@
                 if (alert.metric === 'ceph_health') return `${t('alertMetricCeph')}: ${Number(n) >= 1 ? t('alertCephErrOnly') : t('alertCephWarnPlus')}`;
                 if (alert.metric === 'replication') return t('alertSummaryRepl').replace('{n}', n);
                 if (alert.metric === 'snapshot_age') return t('alertSummarySnap').replace('{n}', n);
+                if (alert.metric === 'backup_coverage') {
+                    const tags = alert.backup_exclude_tags || [];
+                    return t('backupCoverageSummary').replace('{n}', n) + (tags.length ? ` - ${t('backupCoverageExcept').replace('{tags}', tags.join(', '))}` : '');
+                }
                 return `${alert.metric?.toUpperCase()} ${alert.operator} ${alert.threshold}%`;
             };
 
@@ -26163,6 +26167,7 @@
                                         payload.task_warnings = form.task_warnings.checked;
                                     }
                                     if (alertMetricSel === 'snapshot_age') payload.snapshot_ignore_policy = form.snapshot_ignore_policy.checked;
+                                    if (alertMetricSel === 'backup_coverage') payload.backup_exclude_tags = form.backup_exclude_tags.value;
                                     if (editingAlert) {  // #618 — edit keeps the alert's current enabled state
                                         await updateClusterAlert(editingAlert.id, payload);
                                     } else {
@@ -26208,6 +26213,7 @@
                                                 <option value="ceph_health">{t('alertMetricCeph')}</option>
                                                 <option value="replication">{t('replication')}</option>
                                                 <option value="snapshot_age">{t('alertMetricSnapshots')}</option>
+                                                <option value="backup_coverage">{t('backupCoverageTitle')}</option>
                                             </select>
                                         </div>
                                         {alertMetricSel === 'rolling_update' ? (
@@ -26219,6 +26225,7 @@
                                                 {alertMetricSel === 'task_failed' ? t('alertTaskHelp')
                                                     : alertMetricSel === 'ceph_health' ? t('alertCephHelp')
                                                     : alertMetricSel === 'replication' ? t('alertReplHelp')
+                                                    : alertMetricSel === 'backup_coverage' ? t('backupCoverageHelp')
                                                     : t('alertSnapHelp')}
                                             </div>
                                         ) : <>
@@ -26294,6 +26301,22 @@
                                                         <input type="checkbox" name="snapshot_ignore_policy" defaultChecked={saved ? saved.snapshot_ignore_policy !== false : true} />
                                                         {t('alertSnapIgnorePolicy')}
                                                     </label>
+                                                </div>
+                                            )}
+                                            {/* LW Oct 2026 - a guest tagged like this is left out on purpose; the server splits the list */}
+                                            {alertMetricSel === 'backup_coverage' && (
+                                                <div data-event-fields="backup_coverage" className="space-y-3">
+                                                    <div className="grid grid-cols-2 gap-3">
+                                                        <div>
+                                                            <label className="block text-sm text-gray-400 mb-1">{t('backupCoverageGrace')}</label>
+                                                            <input name="threshold" type="number" min="0" max="720" required defaultValue={saved ? saved.threshold : 1} className={field} />
+                                                        </div>
+                                                        <div>
+                                                            <label className="block text-sm text-gray-400 mb-1">{t('backupCoverageExcludeTags')}</label>
+                                                            <input name="backup_exclude_tags" maxLength={500} placeholder="no-backup" defaultValue={saved ? (saved.backup_exclude_tags || []).join(', ') : 'no-backup'} className={`${field} font-mono text-sm`} />
+                                                        </div>
+                                                    </div>
+                                                    <p className="text-xs text-gray-500">{t('backupCoverageTagsHint')}</p>
                                                 </div>
                                             )}
                                             {alertMetricSel !== 'rolling_update' && (

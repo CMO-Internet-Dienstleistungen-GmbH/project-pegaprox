@@ -5914,6 +5914,248 @@
             );
         }
 
+        // LW Oct 2026 - the guests no backup job covers, every cluster in one list. One read per
+        // cluster on the server (GET /api/backup-coverage), shared with the alert of the same name.
+        // Only reads and links to the guest, so a standby shows it as it is.
+        function GuestsWithoutBackup({ clusters, onSelectVm }) {
+            const { t } = useTranslation();
+            const { getAuthHeaders, user, isAdmin, haReadOnly } = useAuth();
+            const { isCorporate } = useLayout();
+            const ROWS = 50;
+            const store = (key, value) => { try { localStorage.setItem(key, value); } catch (e) {} };
+            const recall = (key, fallback) => { try { const v = localStorage.getItem(key); return v === null ? fallback : v; } catch (e) { return fallback; } };
+            const [data, setData] = useState(null);
+            const [loading, setLoading] = useState(false);
+            const [query, setQuery] = useState('');
+            const [hideTags, setHideTags] = useState(() => recall('pegaprox-nobackup-hide', 'no-backup'));
+            const [open, setOpen] = useState(() => recall('pegaprox-nobackup-open', '1') !== '0');
+            const [showAll, setShowAll] = useState(false);
+            const seq = useRef(0);
+            const allowed = (!haReadOnly || haReadPermission('backup.view')) &&
+                (isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes('backup.view')));
+            const clusterKey = clusters.map(c => c.id).join(',');
+
+            const load = async (refresh) => {
+                const mine = ++seq.current;
+                setLoading(true);
+                try {
+                    const r = await fetch(`${API_URL}/backup-coverage${refresh ? '?refresh=1' : ''}`, { headers: getAuthHeaders() });
+                    if (mine !== seq.current) return;  // a newer read is on its way
+                    if (r.ok) setData(await r.json());
+                    else if (r.status === 403) setData({ denied: true });
+                } catch (e) {
+                    console.error('backup coverage:', e);
+                } finally {
+                    if (mine === seq.current) setLoading(false);
+                }
+            };
+            useEffect(() => {
+                if (!allowed || !clusterKey) return;
+                load(false);
+                // a page left open sees a new job or a new guest within a few minutes
+                const timer = setInterval(() => load(false), 300000);
+                return () => clearInterval(timer);
+            }, [allowed, clusterKey]);
+
+            if (!allowed || !clusterKey || (data && data.denied)) return null;
+
+            const hidden = new Set(hideTags.split(/[\s,;]+/).map(s => s.trim().toLowerCase()).filter(Boolean));
+            const all = (data && data.guests) || [];
+            const isHidden = (g) => (g.tags || []).some(x => hidden.has(x));
+            const tagged = all.filter(isHidden).length;
+            const q = query.trim().toLowerCase();
+            const rows = all.filter(g => !isHidden(g))
+                .filter(g => !q || `${g.name} ${g.vmid} ${g.node} ${g.cluster_name}`.toLowerCase().includes(q));
+            const shown = showAll ? rows : rows.slice(0, ROWS);
+            const notChecked = ((data && data.clusters) || []).filter(c => c.state !== 'ok');
+            const stateText = { offline: t('backupCoverageOffline'), denied: t('backupCoverageDenied'), unreadable: t('backupCoverageUnreadable') };
+            const toggle = () => { store('pegaprox-nobackup-open', open ? '0' : '1'); setOpen(!open); };
+            const openGuest = (g) => {
+                const cl = clusters.find(c => c.id === g.cluster_id);
+                if (cl && onSelectVm) onSelectVm(cl, g.vmid, g.node, { vmid: g.vmid, node: g.node, type: g.type, name: g.name, status: g.status });
+            };
+            const isRunning = (g) => g.status === 'running';
+
+            const filters = (
+                <div className="flex items-center gap-2 flex-wrap">
+                    <div className="relative">
+                        <Icons.Search className="w-3.5 h-3.5 absolute left-2 top-1/2 -translate-y-1/2 text-gray-500" />
+                        <input data-backup-coverage-search value={query} onChange={e => setQuery(e.target.value)} placeholder={t('search')}
+                            style={{ paddingLeft: '1.75rem' }} className="pr-2 py-1 text-xs bg-proxmox-dark border border-proxmox-border rounded-lg w-48" />
+                    </div>
+                    <label className="flex items-center gap-1.5 text-xs text-gray-400">
+                        {t('backupCoverageHideTagged')}
+                        <input data-backup-coverage-hide value={hideTags} onChange={e => { setHideTags(e.target.value); store('pegaprox-nobackup-hide', e.target.value); }}
+                            placeholder="no-backup" className="px-2 py-1 text-xs font-mono bg-proxmox-dark border border-proxmox-border rounded-lg w-32" />
+                    </label>
+                </div>
+            );
+            const footer = (
+                <div className="flex items-center justify-between gap-3 flex-wrap text-xs text-gray-500">
+                    <div className="flex items-center gap-3 flex-wrap">
+                        {tagged > 0 && <span data-backup-coverage-tagged>{t('backupCoverageHidden').replace('{n}', tagged)}</span>}
+                        {notChecked.length > 0 && (
+                            <span data-backup-coverage-unchecked className="text-amber-400">
+                                {t('backupCoverageNotChecked')} {notChecked.map(c => `${c.cluster_name} (${stateText[c.state] || c.state})`).join(', ')}
+                            </span>
+                        )}
+                    </div>
+                    {rows.length > ROWS && (
+                        <button type="button" onClick={() => setShowAll(!showAll)} className="text-proxmox-orange hover:underline">
+                            {showAll ? t('showLess') : t('backupCoverageShowAll').replace('{n}', rows.length)}
+                        </button>
+                    )}
+                </div>
+            );
+            const empty = data && rows.length === 0 && (
+                <div data-backup-coverage-empty className="text-sm text-gray-400 flex items-center gap-2">
+                    <Icons.CheckCircle className="w-4 h-4 text-green-400" />
+                    {all.length === 0 ? t('backupCoverageAllCovered') : t('backupCoverageNoMatch')}
+                </div>
+            );
+            const refreshButton = (
+                <button type="button" onClick={() => load(true)} title={t('refresh')} disabled={loading}
+                    className="p-1.5 rounded text-gray-500 hover:text-proxmox-orange hover:bg-proxmox-hover disabled:opacity-50">
+                    <span className={`inline-flex ${loading ? 'animate-spin' : ''}`}><Icons.RefreshCw /></span>
+                </button>
+            );
+            const chevron = (
+                <button type="button" onClick={toggle} title={open ? t('collapse') : t('backupCoverageExpand')} className="p-1.5 rounded text-gray-500 hover:text-white hover:bg-proxmox-hover">
+                    <span className="inline-flex" style={{ transform: open ? 'none' : 'rotate(-90deg)' }}><Icons.ChevronDown /></span>
+                </button>
+            );
+
+            if (isCorporate) {
+                return (
+                    <div data-backup-coverage>
+                        <div className="flex items-center gap-2 py-1.5" style={{borderBottom: '1px solid var(--corp-border-subtle)'}}>
+                            <Icons.ArchiveX className="w-3.5 h-3.5" style={{color: '#efc006'}} />
+                            <button type="button" data-backup-coverage-fold onClick={toggle} className="text-[13px] font-semibold" style={{color: '#adbbc4'}}>{t('backupCoverageTitle')}</button>
+                            <span data-backup-coverage-count className="text-[11px]" style={{color: '#728b9a'}}>{data ? all.length - tagged : '...'}</span>
+                            <span className="flex-1" />
+                            {refreshButton}
+                            {chevron}
+                        </div>
+                        {open && (
+                            <div className="space-y-2 pt-2">
+                                {filters}
+                                {empty}
+                                {rows.length > 0 && (
+                                    <table className="corp-datagrid corp-datagrid-striped">
+                                        <thead>
+                                            <tr>
+                                                <th style={{width: '24px'}}></th>
+                                                <th style={{textAlign: 'left'}}>{t('name')}</th>
+                                                <th style={{textAlign: 'left'}}>{t('cluster')}</th>
+                                                <th style={{textAlign: 'left'}}>{t('node')}</th>
+                                                <th style={{textAlign: 'left'}}>{t('status')}</th>
+                                                <th style={{textAlign: 'left'}}>{t('tags')}</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {shown.map(g => (
+                                                <tr key={`${g.cluster_id}-${g.vmid}`} data-backup-coverage-row={`${g.cluster_id}:${g.vmid}`} className="table-row-hover cursor-pointer" onClick={() => openGuest(g)}>
+                                                    <td><Icons.Monitor className="w-3.5 h-3.5" style={{color: g.type === 'qemu' ? '#49afd9' : '#a178d9'}} /></td>
+                                                    <td>
+                                                        <span style={{fontWeight: 500}}>{g.name || `${g.type === 'lxc' ? 'CT' : 'VM'} ${g.vmid}`}</span>
+                                                        <span style={{color: '#728b9a', fontSize: '11px', marginLeft: '6px'}}>#{g.vmid}</span>
+                                                        {g.template && <span className="ml-2 text-[10px] uppercase" style={{color: '#728b9a'}}>{t('template')}</span>}
+                                                    </td>
+                                                    <td>{g.cluster_name}</td>
+                                                    <td style={{color: '#adbbc4'}}>{g.node || '-'}</td>
+                                                    <td>
+                                                        <span className="inline-flex items-center gap-1">
+                                                            <span className="w-1.5 h-1.5 rounded-full inline-block" style={{background: isRunning(g) ? '#60b515' : '#728b9a'}} />
+                                                            <span style={{color: isRunning(g) ? '#60b515' : '#728b9a', fontSize: '12px'}}>{isRunning(g) ? t('running') : t('stopped')}</span>
+                                                        </span>
+                                                    </td>
+                                                    <td style={{color: '#728b9a', fontSize: '12px'}}>{(g.tags || []).join(', ')}</td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                )}
+                                {footer}
+                            </div>
+                        )}
+                    </div>
+                );
+            }
+
+            return (
+                <div data-backup-coverage className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
+                    <div className="p-4 border-b border-proxmox-border flex items-center justify-between gap-3 flex-wrap">
+                        <button type="button" data-backup-coverage-fold onClick={toggle} className="flex items-center gap-3 text-left">
+                            <div className="w-10 h-10 rounded-lg bg-yellow-500/20 flex items-center justify-center text-yellow-400">
+                                <Icons.ArchiveX className="w-5 h-5" />
+                            </div>
+                            <div>
+                                <h3 className="font-semibold text-white">
+                                    {t('backupCoverageTitle')} <span data-backup-coverage-count className="text-sm font-normal text-gray-500">({data ? all.length - tagged : '...'})</span>
+                                </h3>
+                                <p className="text-xs text-gray-500">{t('backupCoverageDesc')}</p>
+                            </div>
+                        </button>
+                        <div className="flex items-center gap-1">
+                            {refreshButton}
+                            {chevron}
+                        </div>
+                    </div>
+                    {open && (
+                        <div className="p-4 space-y-3">
+                            {filters}
+                            {empty}
+                            {rows.length > 0 && (
+                                <div className="overflow-x-auto">
+                                    <table className="w-full">
+                                        <thead className="bg-proxmox-dark/50">
+                                            <tr className="text-left text-xs text-gray-400">
+                                                <th className="px-4 py-3 font-medium">{t('type')}</th>
+                                                <th className="px-4 py-3 font-medium">{t('name')}</th>
+                                                <th className="px-4 py-3 font-medium">{t('cluster')}</th>
+                                                <th className="px-4 py-3 font-medium">{t('node')}</th>
+                                                <th className="px-4 py-3 font-medium">{t('status')}</th>
+                                                <th className="px-4 py-3 font-medium">{t('tags')}</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-proxmox-border/50">
+                                            {shown.map(g => (
+                                                <tr key={`${g.cluster_id}-${g.vmid}`} data-backup-coverage-row={`${g.cluster_id}:${g.vmid}`}
+                                                    className="hover:bg-proxmox-hover/50 transition-colors cursor-pointer group" onClick={() => openGuest(g)}>
+                                                    <td className="px-4 py-2">
+                                                        <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${g.type === 'qemu' ? 'bg-blue-500/20 text-blue-400' : 'bg-purple-500/20 text-purple-400'}`}>
+                                                            {g.type === 'qemu' ? <Icons.Monitor /> : <Icons.Layers />}
+                                                        </div>
+                                                    </td>
+                                                    <td className="px-4 py-2">
+                                                        <div className="font-medium text-white group-hover:text-proxmox-orange transition-colors">
+                                                            {g.name || `${g.type === 'lxc' ? 'CT' : 'VM'} ${g.vmid}`}
+                                                            {g.template && <span className="ml-2 px-1.5 py-0.5 text-[10px] rounded bg-proxmox-dark text-gray-400 uppercase">{t('template')}</span>}
+                                                        </div>
+                                                        <div className="text-xs text-gray-500">ID: {g.vmid}</div>
+                                                    </td>
+                                                    <td className="px-4 py-2 text-sm text-gray-300">{g.cluster_name}</td>
+                                                    <td className="px-4 py-2 text-sm text-gray-400">{g.node || '-'}</td>
+                                                    <td className="px-4 py-2">
+                                                        <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium ${isRunning(g) ? 'bg-green-500/20 text-green-400' : 'bg-gray-500/20 text-gray-400'}`}>
+                                                            <span className={`w-1.5 h-1.5 rounded-full ${isRunning(g) ? 'bg-green-400' : 'bg-gray-400'}`} />
+                                                            {isRunning(g) ? t('running') : t('stopped')}
+                                                        </span>
+                                                    </td>
+                                                    <td className="px-4 py-2 text-xs text-gray-500">{(g.tags || []).join(', ')}</td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            )}
+                            {footer}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
         // LW: All Clusters Overview - GitHub Feature Request #16
         // added a bunch of stuff here - storage, sparklines, sorting etc
         function AllClustersOverview({ clusters, allMetrics, clusterGroups = [], topGuests = [], allClusterGuests = {}, pbsServers = [], onSelectCluster, onSelectVm, topologyOnly = false, onAutoInstall }) {
@@ -6422,6 +6664,8 @@
                             </div>
                         )}
 
+                        {!topologyOnly && clusters.length > 0 && <GuestsWithoutBackup clusters={clusters} onSelectVm={onSelectVm} />}
+
                         {/* NS: Mar 2026 - Multi-cluster topology redesign (#142) */}
                         {clusters.filter(c => c.connected).length > 0 && (() => {
                             const fmtMem = (b) => { if (!b) return '0'; const gb = b/(1024*1024*1024); return gb >= 1 ? `${gb.toFixed(1)}G` : `${(b/(1024*1024)).toFixed(0)}M`; };
@@ -6854,6 +7098,8 @@
                             </div>
                         </div>
                     )}
+
+                    {clusters.length > 0 && <GuestsWithoutBackup clusters={clusters} onSelectVm={onSelectVm} />}
 
                     {/* Empty State */}
                     {clusters.length === 0 && (
