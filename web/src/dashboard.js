@@ -27921,7 +27921,10 @@
             const pickLayout = async (layout) => {
                 setSaving(true);
                 try {
-                    await updatePreferences({ ui_layout: layout, layout_chosen: true });
+                    // Cloud brings its own theme, as when it is picked under My Profile
+                    await updatePreferences(layout === 'cloud'
+                        ? { ui_layout: 'cloud', theme: 'cloud', layout_chosen: true }
+                        : { ui_layout: layout, layout_chosen: true });
                 } catch(e) {
                     console.error('layout pick failed', e);
                 }
@@ -27930,7 +27933,7 @@
 
             return (
                 <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-[100] p-4">
-                    <div className="bg-proxmox-card border border-proxmox-border rounded-xl w-full max-w-lg shadow-2xl">
+                    <div className="bg-proxmox-card border border-proxmox-border rounded-xl w-full max-w-2xl shadow-2xl">
                         <div className="p-6">
                             <div className="flex items-center gap-3 mb-2">
                                 <div className="p-2 bg-proxmox-orange/20 rounded-lg">
@@ -27944,7 +27947,7 @@
                                 {t('layoutSelectionDesc') || 'Choose your preferred interface style. You can change this anytime under My Profile \u2192 Layout Style.'}
                             </p>
 
-                            <div className="grid grid-cols-2 gap-4 mb-4">
+                            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4">
                                 {/* Modern */}
                                 <button
                                     onClick={() => pickLayout('modern')}
@@ -28002,6 +28005,32 @@
                                     <div className="text-center">
                                         <span className="text-sm font-medium text-white">{t('layoutCorporate') || 'Corporate'}</span>
                                         <p className="text-xs text-gray-500 mt-0.5">{t('layoutCorporateDesc') || 'Enterprise style, dense'}</p>
+                                    </div>
+                                </button>
+                                {/* LW Oct 2026 - Cloud, offered from the first login on as under My Profile */}
+                                <button
+                                    onClick={() => pickLayout('cloud')}
+                                    disabled={saving}
+                                    data-layout-pick="cloud"
+                                    className={`p-4 rounded-xl border-2 transition-all hover:scale-[1.03] text-left ${
+                                        user?.ui_layout === 'cloud'
+                                            ? 'border-proxmox-orange ring-2 ring-proxmox-orange/30'
+                                            : 'border-proxmox-border hover:border-gray-500'
+                                    } disabled:opacity-60`}
+                                >
+                                    <div className="h-20 rounded-lg mb-3 relative overflow-hidden border" style={{ background: '#0a1628', borderColor: '#1e3a52' }}>
+                                        <div className="absolute inset-1.5 grid grid-cols-2 gap-1">
+                                            <div className="rounded" style={{ background: '#16304a', border: '1px solid #1e3a52' }} />
+                                            <div className="rounded" style={{ background: '#16304a', border: '1px solid #1e3a52' }} />
+                                            <div className="rounded" style={{ background: '#16304a', border: '1px solid #1e3a52' }} />
+                                            <div className="rounded flex items-center justify-center" style={{ background: '#16304a', border: '1px solid #22d3ee' }}>
+                                                <div className="w-3 h-0.5 rounded-full" style={{ background: '#22d3ee' }} />
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div className="text-center">
+                                        <span className="text-sm font-medium text-white inline-flex items-center justify-center gap-1">Cloud <span className="text-[8px] px-1 rounded" style={{ background: 'rgba(34,211,238,0.15)', color: '#22d3ee' }}>PREVIEW</span></span>
+                                        <p className="text-xs text-gray-500 mt-0.5">{t('layoutCloudDesc') || 'Airy card grid, teal'}</p>
                                     </div>
                                 </button>
                             </div>
