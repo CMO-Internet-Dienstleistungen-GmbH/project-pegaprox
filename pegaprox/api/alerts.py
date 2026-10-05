@@ -435,8 +435,9 @@ def get_active_alerts(cluster_id):
         incidents = [dict(zip(_q, r)) for r in rows]
         _ok = _alert_scoper(cluster_id)
         if _ok is not None:
-            incidents = [i for i in incidents
-                         if i.get('target_type') != 'vm' or _ok(i.get('target_id'))]
+            # MK Oct 2026 - a ZFS pool is storage of a node, which a pool or guest grant does not reach
+            incidents = [i for i in incidents if i.get('metric') != 'zfs_health'
+                         and (i.get('target_type') != 'vm' or _ok(i.get('target_id')))]
         mutes = alert_events.active_mutes(cluster_id)
         out = []
         for i in incidents:
@@ -510,6 +511,8 @@ def list_alert_mutes(cluster_id):
                     if a.get('target_type') == 'vm'}
 
         def _visible(m):
+            if str(m.get('object_key') or '').startswith('zfs:'):
+                return False
             vmid = alert_events.object_vmid(m.get('object_key'))
             if vmid is not None and not _ok(vmid):
                 return False

@@ -18596,6 +18596,25 @@ echo "AGENT_INSTALLED_OK"
             self.logger.error(f"Error getting ZFS: {e}")
             return []
     
+    def get_node_zfs_detail(self, node: str, name: str):
+        """(status, data) of one ZFS pool: `zpool status` as Proxmox parses it, the vdev
+        tree with its error counts, the scan line, the data errors. status is 0 when
+        nothing came back. MK Oct 2026"""
+        from urllib.parse import quote
+        if not self.is_connected:
+            if not self.connect_to_proxmox():
+                return 0, None
+        try:
+            url = (f"https://{self.host}:{self.api_port}/api2/json/nodes/{quote(node, safe='')}"
+                   f"/disks/zfs/{quote(name, safe='')}")
+            response = self._api_get(url, timeout=15)
+            if response.status_code == 200:
+                return 200, response.json().get('data')
+            return response.status_code, None
+        except Exception as e:
+            self.logger.error(f"Error getting ZFS pool {name} on {node}: {e}")
+            return 0, None
+
     def create_node_zfs(self, node: str, name: str, devices: list, raidlevel: str = 'single', 
                          compression: str = 'on', ashift: int = 12, add_storage: bool = True) -> Dict[str, Any]:
         """create ZFS pool on node. NS Dec 2025: added compression + ashift support"""

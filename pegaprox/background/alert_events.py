@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 PegaProx Event Alerts - Layer 7
-Failed Proxmox tasks, Ceph health, replication, stale snapshots and guests without a
-backup job.
+Failed Proxmox tasks, Ceph health, replication, stale snapshots, guests without a
+backup job and ZFS pools in trouble.
 
 The metric rules in alerts.py compare a number on every tick and send again after each
 cooldown for as long as it stays over the line. The rules here watch a condition: one
@@ -19,6 +19,9 @@ What it reads, per cluster that has such a rule:
     then only for a guest whose snapshot task shows up in the task list
   - /cluster/backup-info/not-backed-up every BACKUP_EVERY, shared with the overview of
     guests without a backup job (api/clusters.py), whichever asked last
+  - the ZFS pool list of every online node every ZFS_EVERY, and `zpool status` of a pool
+    (/nodes/<n>/disks/zfs/<pool>) while it is not ONLINE or shows errors, else every
+    ZFS_DETAIL_EVERY, at most ZFS_DETAILS_PER_PASS per cluster and pass
 Nothing here asks a cluster per guest on every tick. Only the active instance runs any
 of it (alerts.alert_check_loop, #625); active_alerts is a table of its own, so after a
 takeover a condition that still holds is said once more by the new active.
@@ -36,7 +39,8 @@ from urllib.parse import quote
 
 from pegaprox.globals import cluster_managers
 from pegaprox.core.db import get_db
-from pegaprox.utils.concurrent import run_concurrent
+from pegaprox.utils.concurrent import run_concurrent, run_per_node
+from pegaprox.utils import zpool
 
 try:
     import re._parser as _re_parser
@@ -44,7 +48,8 @@ except ImportError:  # python < 3.11
     import sre_parse as _re_parser
 
 
-EVENT_METRICS = ('task_failed', 'ceph_health', 'replication', 'snapshot_age', 'backup_coverage')
+EVENT_METRICS = ('task_failed', 'ceph_health', 'replication', 'snapshot_age', 'backup_coverage',
+                 'zfs_health')
 
 # the fields a matching decision rests on; a rule whose one of these changed starts over
 MATCH_FIELDS = ('metric', 'target_type', 'target_id', 'threshold', 'task_type', 'task_status',
@@ -72,6 +77,11 @@ BACKUP_TIMEOUT = 20           # pveproxy opens the config of every guest it list
 EXCLUDE_TAGS_DEFAULT = ('no-backup',)
 EXCLUDE_TAGS_MAX = 20
 _TAG_RE = re.compile(r'^[\w.+-]{1,64}$')
+ZFS_EVERY = 300               # the pool list of each node; a pool changes state seldom
+ZFS_DETAIL_EVERY = 1800       # zpool status of a pool that looks fine, for its error counts
+ZFS_DETAILS_PER_PASS = 40     # per cluster and pass, the pools in trouble first
+ZFS_PARALLEL = 8              # reads at a time against one cluster
+ZFS_BUDGET = 30               # seconds for the lists of one cluster, the same again for the pools
 
 _THRESHOLDS = {
     # metric: (default, lowest, highest)
@@ -80,6 +90,7 @@ _THRESHOLDS = {
     'replication': (60, 1, 10080),      # minutes since the last sync
     'snapshot_age': (14, 1, 3650),      # days
     'backup_coverage': (1, 0, 720),     # hours a guest may be in no backup job before it counts
+    'zfs_health': (0, 0, 1),            # 0: not ONLINE or with errors, 1: not ONLINE only
 }
 _SNAPSHOT_TASKS = frozenset(('qmsnapshot', 'qmdelsnapshot', 'qmrollback',
                              'vzsnapshot', 'vzdelsnapshot', 'vzrollback'))
@@ -97,6 +108,7 @@ _ceph = {}        # cid -> {'absent_until': epoch, 'node': str|None}
 _repl = {}        # cid -> {'next_at': epoch}
 _snaps = {}       # cid -> {'guests': {vmid: [(name, ts)]}, 'tried': {vmid: epoch}, 'dirty': set(), 'next_eval': epoch}
 _backup = {}      # cid -> {'next_at': epoch, 'since': {vmid: epoch first seen in no job}}
+_zfs = {}         # cid -> {'next_at': epoch, 'pools': {node: {pool: health}}, 'detail': {(node, pool): (epoch, detail)}}
 _coverage = {}    # cid -> (epoch, status, rows or None): the last not-backed-up read, any caller
 _coverage_locks = {}
 _coverage_guard = threading.Lock()
@@ -259,6 +271,8 @@ def normalize_rule(rule, data, prev_metric=None):
     tid = rule.get('target_id')
     if ttype not in ('cluster', 'node', 'vm'):
         return 'target_type must be cluster, node or vm'
+    if ttype == 'vm' and metric == 'zfs_health':
+        return 'a ZFS rule watches the pools of the cluster or of one node'
     if ttype == 'vm' and not str(tid or '').isdigit():
         return 'a VM target needs its numeric ID'
     if ttype == 'node' and not (isinstance(tid, str) and tid.strip()):
@@ -596,6 +610,104 @@ def _read_coverage(cid, mgr, now):
     return uncovered
 
 
+def _plan_zfs(cid, mgr, now):
+    """The online nodes whose pool list to read this tick, or None when it is not due.
+    A node that left the cluster takes its pools along; an offline one keeps them, so
+    what was wrong there stays open until the node answers again."""
+    st = _zfs.setdefault(cid, {'pools': {}, 'detail': {}})
+    if now < st.get('next_at', 0):
+        return None
+    try:
+        nodes = mgr.get_node_status() or {}
+    except Exception:
+        nodes = {}
+    if not nodes:
+        st['next_at'] = now + 60
+        _note(cid, 'zfs', False, 'node list unreadable')
+        return None
+    st['next_at'] = now + ZFS_EVERY
+    for gone in [n for n in st['pools'] if n not in nodes]:
+        st['pools'].pop(gone)
+    st['detail'] = {k: v for k, v in st['detail'].items() if k[0] in nodes}
+    return sorted(n for n, info in nodes.items() if (info or {}).get('status') == 'online')
+
+
+def _zfs_wants_errors(rules):
+    return any(r.get('metric') == 'zfs_health' and _int_in(r.get('threshold'), 0, 1) != 1
+               for r in rules if r.get('enabled', True))
+
+
+def _read_zfs(cid, mgr, nodes, want_errors, now):
+    """The pool list of each node in `nodes`, then `zpool status` of the pools that need
+    it: one not ONLINE on every pass (what is wrong with it), one that showed errors on
+    every pass (whether they were cleared), any other every ZFS_DETAIL_EVERY when a rule
+    asks about errors. Returns {'read': the nodes whose list came back}; a node that did
+    not answer keeps what was known of it."""
+    st = _zfs.setdefault(cid, {'pools': {}, 'detail': {}})
+    lists = run_per_node(
+        {n: (lambda node: _get(mgr, f"/nodes/{quote(node, safe='')}/disks/zfs", timeout=8)) for n in nodes},
+        max_concurrent=ZFS_PARALLEL, timeout=ZFS_BUDGET) or {}
+    read, unread = set(), []
+    for node in nodes:
+        status, rows = lists.get(node) or (0, None)
+        if status != 200 or not isinstance(rows, list):
+            unread.append(node)
+            continue
+        read.add(node)
+        st['pools'][node] = {str(r['name']): str(r.get('health') or '').upper()
+                             for r in rows if isinstance(r, dict) and r.get('name')}
+    listed = {(n, name) for n in read for name in st['pools'][n]}
+    st['detail'] = {k: v for k, v in st['detail'].items() if k[0] not in read or k in listed}
+
+    due = []
+    for node, name in listed:
+        if not zpool.valid_pool_name(name):
+            continue                      # Proxmox takes no other name for the detail call
+        at, detail = st['detail'].get((node, name), (0, None))
+        if st['pools'][node][name] != zpool.HEALTHY:
+            due.append((0, at, node, name))
+        elif want_errors and detail is not None and detail['has_errors']:
+            due.append((1, at, node, name))
+        elif want_errors and now - at >= ZFS_DETAIL_EVERY:
+            due.append((2, at, node, name))
+    due = sorted(due)[:ZFS_DETAILS_PER_PASS]
+    done = 0
+    if due:
+        got = run_per_node(
+            {f"{node}/{name}": (lambda _key, n=node, p=name: _get(
+                mgr, f"/nodes/{quote(n, safe='')}/disks/zfs/{quote(p, safe='')}", timeout=10))
+             for _, _, node, name in due},
+            max_concurrent=ZFS_PARALLEL, timeout=ZFS_BUDGET) or {}
+        for _, _, node, name in due:
+            status, data = got.get(f"{node}/{name}") or (0, None)
+            if status == 200 and isinstance(data, dict):
+                d = zpool.pool_detail(data)
+                # what the alert says, not the whole tree
+                st['detail'][(node, name)] = (now, {k: d[k] for k in ('state', 'devices', 'data_errors',
+                                                                      'has_errors', 'scan')})
+                done += 1
+    _note(cid, 'zfs', not unread,
+          f"{len(listed)} pool(s) on {len(read)} of {len(nodes)} online node(s), {done} of {len(due)} "
+          f"pool status read(s)" + (f", unread: {sorted(unread)[:10]}" if unread else ''))
+    return {'read': read}
+
+
+def _run_zfs_reads(order, results, now):
+    """The pool reads of every cluster that is due: all clusters at once, ZFS_PARALLEL at a
+    time against any one of them. After the cluster reads, like the snapshot lists, so
+    their time does not count against those."""
+    due = [(cid, mgr, crules, seen) for (cid, mgr, crules), seen in zip(order, results)
+           if seen is not None and seen.get('zfs_nodes') is not None]
+    if not due:
+        return
+    got = run_concurrent(
+        [lambda c=cid, m=mgr, rs=crules, s=seen: _read_zfs(c, m, s['zfs_nodes'], _zfs_wants_errors(rs), now)
+         for cid, mgr, crules, seen in due],
+        timeout=2 * ZFS_BUDGET + 10)
+    for (_cid, _mgr, _rules, seen), z in zip(due, got):
+        seen['zfs'] = z
+
+
 def _guests(resources):
     out = {}
     for r in resources or ():
@@ -684,6 +796,8 @@ def _read_cluster(cid, mgr, kinds, now):
         seen['replication'] = _read_replication(cid, mgr, now)
     if 'backup_coverage' in kinds:
         seen['backup'] = _read_coverage(cid, mgr, now)
+    if 'zfs_health' in kinds:
+        seen['zfs_nodes'] = _plan_zfs(cid, mgr, now)
     return seen
 
 
@@ -942,6 +1056,61 @@ def _eval_backup(rule, seen, cname, cid, now):
     return p
 
 
+def _eval_zfs(rule, seen, cname, cid):
+    z = seen.get('zfs')
+    st = _zfs.get(cid)
+    if not z or st is None:
+        return None
+    errors_too = _int_in(rule.get('threshold'), 0, 1) != 1
+    p = _Pass()
+    # what the cluster still has: an incident of a pool its node no longer lists, or of
+    # a node that left, closes without a word
+    p.known = {f"zfs:{node}:{name}" for node, pools in st['pools'].items() for name in pools}
+    for node in sorted(z['read']):
+        if not _target_ok(rule, node, None):
+            continue
+        for name, health in sorted(st['pools'].get(node, {}).items()):
+            obj = f"zfs:{node}:{name}"
+            _at, detail = st['detail'].get((node, name), (0, None))
+            has_errors = bool(detail and detail['has_errors'])
+            if health == zpool.HEALTHY and not (errors_too and has_errors):
+                if errors_too and detail is None:
+                    continue              # its error counts not read yet: unknown, not fine
+                p.fine[obj] = (f"Resolved: ZFS pool {name} on {node}",
+                               f"ZFS pool {name} on node {node} is ONLINE"
+                               + (" with no errors" if errors_too else '') + " again.")
+                continue
+            lvl = zpool.level(health, has_errors)
+            devices = (detail or {}).get('devices') or []
+            notes = [zpool.device_note(d)[:SUBJECT_MAX] for d in devices[:5]]
+            if len(devices) > 5:
+                notes.append(f"{len(devices) - 5} more")
+            if detail and detail['data_errors']:
+                notes.append(detail['data_errors'][:SUBJECT_MAX])
+            if health == zpool.HEALTHY:
+                name_of, display = f"ZFS pool {name} on {node} has errors", 'errors'
+                changed = f"ZFS pool {name} on {node} is ONLINE again, with errors"
+            else:
+                display = health or 'UNKNOWN'
+                name_of = f"ZFS pool {name} on {node} is {display}"
+                changed = f"ZFS pool {name} on {node} is now {display}"
+            rows = [('Node', node), ('Pool', name), ('State', display)]
+            scan = (detail or {}).get('scan') or {}
+            if scan.get('text'):
+                rows.append(('Last scan', scan['text']))
+            p.firing[obj] = {
+                'object': obj, 'target_type': 'node', 'target_id': node, 'target_name': node,
+                'target_key': f"node:{node}", 'name': name_of,
+                'message': f"ZFS pool {name} on node {node} is {health or 'UNKNOWN'}"
+                           + (' with errors' if health == zpool.HEALTHY else '')
+                           + (f": {'; '.join(notes)}" if notes else ''),
+                'value': float(lvl), 'display': display,
+                'severity': 'critical' if lvl >= 3 or (detail and detail['data_errors']) else 'warning',
+                'changed_name': changed, 'details': rows,
+            }
+    return p
+
+
 # ---------------------------------------------------------------------------
 # incidents and notices
 # ---------------------------------------------------------------------------
@@ -1026,7 +1195,7 @@ def _target_key_of(obj):
     vmid = object_vmid(obj)
     if vmid is not None:
         return f"vm:{vmid}"
-    if obj.startswith('task:'):
+    if obj.startswith('task:') or obj.startswith('zfs:'):
         return f"node:{obj.split(':')[1]}"
     return ''
 
@@ -1134,6 +1303,7 @@ def rule_changed(cluster_id, rule_id):
         logging.debug(f"[AlertEvents] reset of {rule_id} failed: {e}")
     _snaps.get(cluster_id, {}).pop('next_eval', None)
     _backup.get(cluster_id, {}).pop('next_at', None)
+    _zfs.get(cluster_id, {}).pop('next_at', None)
 
 
 def _evaluate(A, rule, cid, seen, mutes, settings, now):
@@ -1148,6 +1318,8 @@ def _evaluate(A, rule, cid, seen, mutes, settings, now):
             p = _eval_replication(rule, seen, cname, now)
         elif metric == 'backup_coverage':
             p = _eval_backup(rule, seen, cname, cid, now)
+        elif metric == 'zfs_health':
+            p = _eval_zfs(rule, seen, cname, cid)
         else:
             p = _eval_snapshots(rule, seen, cname, cid, now)
     except ValueError as e:
@@ -1206,6 +1378,7 @@ def check_event_alerts(now=None):
     plans = [(cid, mgr, (seen or {}).get('snapshot_plan') or [])
              for (cid, mgr, _), seen in zip(order, results)]
     read_now = _run_snapshot_reads([p for p in plans if p[2]], now)
+    _run_zfs_reads(order, results, now)
 
     for (cid, mgr, crules), seen in zip(order, results):
         if seen is None:

@@ -2270,6 +2270,40 @@ def get_node_zfs_api(cluster_id, node):
     return jsonify(manager.get_node_zfs(node))
 
 
+# MK Oct 2026 - one pool in full: the vdev tree with state and error counts, the last
+# scrub and the data errors (utils/zpool.py). A pool or guest grant is a claim on guests,
+# not on the disks of a node, so a confined caller gets none of it
+@bp.route('/api/clusters/<cluster_id>/nodes/<node>/disks/zfs/<name>', methods=['GET'])
+@require_auth(perms=['node.view'])
+def get_node_zfs_pool_api(cluster_id, node, name):
+    """Get the status of one ZFS pool on a node"""
+    from pegaprox.utils import zpool
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
+
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    manager = cluster_managers[cluster_id]
+    if getattr(manager, 'cluster_type', 'proxmox') != 'proxmox':
+        return jsonify({'error': 'ZFS pools are read from Proxmox VE nodes only'}), 400
+    if not zpool.valid_node_name(node):
+        return jsonify({'error': 'Invalid node name'}), 400
+    if not zpool.valid_pool_name(name):
+        return jsonify({'error': 'Invalid pool name'}), 400
+
+    status, data = manager.get_node_zfs_detail(node, name)
+    if status == 0:
+        return jsonify({'error': f'Node {node} did not answer'}), 503
+    if status != 200 or not isinstance(data, dict):
+        # zpool status fails for a pool the node does not have, and Proxmox answers 500
+        why = 'the API user needs Sys.Audit on /' if status == 403 else f'HTTP {status}'
+        return jsonify({'error': f'Pool {name} could not be read on node {node} ({why})'}), 502
+    return jsonify(dict(zpool.pool_detail(data), node=node))
+
+
 @bp.route('/api/clusters/<cluster_id>/nodes/<node>/disks/zfs', methods=['POST'])
 @require_auth(perms=['storage.config'])
 def create_node_zfs_api(cluster_id, node):

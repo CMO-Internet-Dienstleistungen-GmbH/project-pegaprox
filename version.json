@@ -167,6 +167,7 @@
     "pegaprox/utils/webhooks.py",
     "pegaprox/utils/ws_sendall.py",
     "pegaprox/utils/ws_lenient.py",
+    "pegaprox/utils/zpool.py",
     "pegaprox/witness.py",
     "pegaprox/witness_boot.py",
     "pegaprox_multi_cluster.py",
