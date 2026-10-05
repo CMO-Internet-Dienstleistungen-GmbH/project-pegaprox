@@ -506,6 +506,15 @@ def _filtered_tasks_frame(tasks, cluster_id, username, timestamp, effective_role
     return _serialize_sse_message('tasks', allowed, cluster_id, timestamp)
 
 
+def _sse_user_sees_maintenance(username, cluster_id, effective_role=None):
+    """MK Oct 2026 - the 'metrics' frame carries every node's maintenance task, guests and
+    all; the REST twin cuts them for a confined caller (helpers.sees_whole_maintenance).
+    Same question here, the stream's role carried. Unknown user: no."""
+    from pegaprox.api.helpers import sees_whole_maintenance
+    user = _sse_stored_user(username, effective_role)
+    return bool(user) and sees_whole_maintenance(user, cluster_id)
+
+
 def broadcast_sse(update_type: str, data: dict, cluster_id: str = None, target_clusters=None):
     """Broadcast update to SSE clients
 
@@ -563,6 +572,13 @@ def broadcast_sse(update_type: str, data: dict, cluster_id: str = None, target_c
         _vmw_vms_frame_cache = {} # uname -> per-VM-filtered ESXi inventory frame (audit)
         _vmw_detail_cache = {}    # uname -> bool: may see THIS watched ESXi guest's detail (audit)
         _obj_frame_cache = {}     # uname -> bool: may see THIS migration/DR-plan frame (audit)
+        _maint_seen_cache = {}    # uname -> bool: gets the guests of a maintenance in this cluster
+        _metrics_cut = []         # the 'metrics' frame less those guests, made once
+        # only while a node of the cluster is in maintenance, so a quiet cluster costs nothing
+        _metrics_maint = False
+        if update_type == 'metrics' and cluster_id is not None:
+            from pegaprox.api.helpers import nodes_in_maintenance_view
+            _metrics_maint = nodes_in_maintenance_view(data)
         # sec/scale (audit): the per-client filtering below does uncached DB work — a single
         # user fetch plus the VM-ACL and pool lookups inside user_can_access_vm — and this loop
         # runs about once a second. Holding the GLOBAL sse_clients lock across that serialises
@@ -632,6 +648,20 @@ def broadcast_sse(update_type: str, data: dict, cluster_id: str = None, target_c
                             client_message = _filtered_tasks_frame(data, cluster_id, uname,
                                                                    timestamp, _eff)
                             _tasks_frame_cache[uname, _eff] = client_message
+                    elif _metrics_maint:
+                        # asked of admins as well: is_admin does not know the tenant override
+                        # that lowers an admin where they live (sees_whole_maintenance does)
+                        uname, _eff = client_info.get('user'), client_info.get('effective_role')
+                        _ok_maint = _maint_seen_cache.get((uname, _eff), _SSE_FILTER_MISSING)
+                        if _ok_maint is _SSE_FILTER_MISSING:
+                            _ok_maint = _sse_user_sees_maintenance(uname, cluster_id, _eff)
+                            _maint_seen_cache[uname, _eff] = _ok_maint
+                        if not _ok_maint:
+                            if not _metrics_cut:
+                                from pegaprox.api.helpers import nodes_without_maintenance_guests
+                                _metrics_cut.append(_serialize_sse_message(
+                                    'metrics', nodes_without_maintenance_guests(data), cluster_id, timestamp))
+                            client_message = _metrics_cut[0]
                     elif update_type == 'vmware_vms' and not client_info.get('is_admin', False):
                         # audit — the ESXi twin of the 'resources' filter above. The perm gate
                         # below still decides whether this client hears about ESXi at all; what

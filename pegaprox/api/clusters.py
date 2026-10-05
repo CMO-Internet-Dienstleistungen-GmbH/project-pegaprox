@@ -31,7 +31,7 @@ from pegaprox.core.xcpng import XcpngManager, XENAPI_AVAILABLE
 from pegaprox.utils.sanitization import bounded_list
 from pegaprox.api.helpers import (load_server_settings, get_connected_manager, check_cluster_access,
                                   safe_error, scope_vm_rows, require_unconfined, parse_pve_error,
-                                  bounded_limit)
+                                  bounded_limit, node_maintenance_for_caller)
 
 # MK: this used to be 200 lines down in the monolith, good luck finding anything there
 bp = Blueprint('clusters', __name__)
@@ -1016,13 +1016,14 @@ def get_cluster_metrics(cluster_id):
             if metrics:
                 # Cache the metrics
                 mgr._cached_metrics = metrics
-                return jsonify(metrics)
+                # MK Oct 2026 - a node in maintenance names its guests: not to a confined caller
+                return jsonify(node_maintenance_for_caller(cluster_id, metrics))
         except Exception as e:
             logging.debug(f"Error getting metrics for {cluster_id}: {e}")
     
     # If live data failed, try cached data
     if hasattr(mgr, '_cached_metrics') and mgr._cached_metrics:
-        return jsonify(mgr._cached_metrics)
+        return jsonify(node_maintenance_for_caller(cluster_id, mgr._cached_metrics))
     
     # If HA is tracking nodes, build metrics from HA data
     if mgr.ha_node_status:

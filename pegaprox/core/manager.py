@@ -5045,8 +5045,8 @@ class PegaProxManager:
 
             if task.off_pin_vms:
                 _names = ', '.join(f"{o['name']} ({o['vmid']})" for o in task.off_pin_vms)
-                # MK Oct 2026 - the names stay in off_pin_vms, which a confined caller does not
-                # get (api/vms.py _GUEST_FIELDS); and only promise the way back where it runs
+                # MK Oct 2026 - the names stay in off_pin_vms, which a confined caller does not get
+                # (api/helpers.py MAINTENANCE_GUEST_FIELDS); and only promise the way back where it runs
                 _back = (getattr(self.config, 'proxlb_pins_auto_migrate', False)
                          and getattr(self.config, 'auto_migrate', False)
                          and not getattr(self.config, 'dry_run', False))

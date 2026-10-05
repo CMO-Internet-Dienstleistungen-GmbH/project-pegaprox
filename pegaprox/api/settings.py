@@ -4381,9 +4381,10 @@ def get_cluster_update_status(cluster_id):
     # A confined caller gets the progress but not the per-guest lines.
     if rolling_update:
         from pegaprox.utils.auth import build_authz_user
-        from pegaprox.api.helpers import caller_is_scoped
-        if caller_is_scoped(build_authz_user(request.session.get('user', ''), request.session),
-                            cluster_id):
+        from pegaprox.api.helpers import sees_whole_maintenance
+        # the rule of /metrics and /node-progress, a lowered admin included
+        if not sees_whole_maintenance(build_authz_user(request.session.get('user', ''), request.session),
+                                      cluster_id):
             rolling_update = {k: v for k, v in rolling_update.items()
                               if k not in ('logs', 'paused_details')}
 

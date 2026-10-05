@@ -481,6 +481,67 @@ def caller_is_scoped(user, cluster_id):
     return False
 
 
+# MK Oct 2026 - what a confined caller does not get of a node's maintenance: the guests in it
+# (moving, pending, failed, placed off their pin, the templates moved or left behind) and the
+# HA rules held off over them, which the maintenance plan does not show such a caller either.
+# Status, counts and the note stay; the note names no guest.
+MAINTENANCE_GUEST_FIELDS = ('failed_vms', 'pending_vms', 'current_vm', 'off_pin_vms',
+                            'templates_moved', 'templates_left', 'ha_rules_off', 'ha_rules_kept_on')
+
+
+def sees_whole_maintenance(user, cluster_id):
+    """Whether `user` gets the guests of a maintenance in `cluster_id`: when caller_is_scoped
+    says no. An admin a tenant override lowers where they live is asked as that role - the
+    admin shortcut in caller_is_scoped does not look at the override, and such an admin
+    reaches a foreign cluster through the ACL and pool fallbacks like anybody. Fails closed."""
+    from pegaprox.models.permissions import ROLE_ADMIN
+    from pegaprox.utils.rbac import _admin_is_capped_in_own_tenant, get_user_effective_role
+    try:
+        if (user and user.get('effective_role', user.get('role')) == ROLE_ADMIN
+                and _admin_is_capped_in_own_tenant(user)):
+            lowered = get_user_effective_role(user)
+            user = dict(user, role=lowered, effective_role=lowered)
+        return not caller_is_scoped(user, cluster_id)
+    except Exception as e:
+        logging.warning(f"[MAINT] scope on {cluster_id} unknown, maintenance guests left out: {e}")
+        return False
+
+
+def maintenance_without_guests(task):
+    """A maintenance task as to_dict() gives it, less MAINTENANCE_GUEST_FIELDS. A new dict."""
+    if not isinstance(task, dict):
+        return task
+    return {k: v for k, v in task.items() if k not in MAINTENANCE_GUEST_FIELDS}
+
+
+def nodes_in_maintenance_view(nodes):
+    """Whether a node map of get_node_status() (or of /node-progress) has a maintenance on it."""
+    return isinstance(nodes, dict) and any(
+        isinstance(n, dict) and n.get('maintenance_task') for n in nodes.values())
+
+
+def nodes_without_maintenance_guests(nodes):
+    """The node map with every maintenance_task less its guests. get_node_status() answers
+    from the manager's cache, which the broadcast loop shares: the nodes that change are
+    copies, the map is never written to."""
+    return {name: (dict(n, maintenance_task=maintenance_without_guests(n['maintenance_task']))
+                   if isinstance(n, dict) and isinstance(n.get('maintenance_task'), dict) else n)
+            for name, n in nodes.items()}
+
+
+def node_maintenance_for_caller(cluster_id, nodes):
+    """The node map as the caller of this request may see it. The caller is only looked up
+    when a node is in maintenance: /metrics is polled from every open tab."""
+    if not nodes_in_maintenance_view(nodes):
+        return nodes
+    from flask import request
+    from pegaprox.utils.auth import build_authz_user
+    if sees_whole_maintenance(build_authz_user(request.session.get('user', ''), request.session),
+                              cluster_id):
+        return nodes
+    return nodes_without_maintenance_guests(nodes)
+
+
 def scope_vm_rows(cluster_id, rows, *, vmid_key='vmid', type_key='type'):
     """Filter a list of per-VM row dicts to the VMs the current caller may actually see.
 

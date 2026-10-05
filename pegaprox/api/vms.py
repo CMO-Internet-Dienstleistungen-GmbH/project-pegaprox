@@ -43,6 +43,8 @@ from pegaprox.utils.realtime import broadcast_sse, broadcast_action, push_immedi
 from pegaprox.core.config import save_config
 from pegaprox.api.helpers import get_connected_manager, check_cluster_access, register_task_user, safe_error, parse_pve_error, scope_vm_rows, require_unconfined, caller_is_scoped
 from pegaprox.api.helpers import evacuation_options, evacuation_options_said
+from pegaprox.api.helpers import (sees_whole_maintenance, maintenance_without_guests,
+                                  node_maintenance_for_caller)
 from pegaprox.api.ha import standby_console_refusal, STANDBY_CONSOLE_ERROR
 from pegaprox.core import ha, ha_transport
 from pegaprox.background import guest_index
@@ -2896,8 +2898,13 @@ def get_maintenance_status(cluster_id, node_name):
     # NS: force-refresh from PVE so we don't return stale data (#141)
     mgr.refresh_maintenance_status()
     status = mgr.get_maintenance_status(node_name)
-
-    return jsonify(status if status else {'maintenance_mode': False})
+    if not status:
+        return jsonify({'maintenance_mode': False})
+    # node.view reaches a confined caller too: the progress, as from /node-progress
+    if not sees_whole_maintenance(build_authz_user(request.session.get('user', ''), request.session),
+                                  cluster_id):
+        status = maintenance_without_guests(status)
+    return jsonify(status)
 
 @bp.route('/api/clusters/<cluster_id>/nodes/<node_name>/maintenance', methods=['DELETE'])
 @require_auth(perms=['node.maintenance'])
@@ -3889,11 +3896,6 @@ def get_update_status(cluster_id, node_name):
     return jsonify(status if status else {'is_updating': False})
 
 
-# MK Oct 2026 (#625) - what a confined caller does not get of a maintenance, as from
-# updates/status: the guests in it
-_GUEST_FIELDS = ('failed_vms', 'pending_vms', 'current_vm', 'off_pin_vms')
-
-
 @bp.route('/api/clusters/<cluster_id>/node-progress', methods=['GET'])
 @require_auth(perms=['cluster.view'])
 def get_node_progress(cluster_id):
@@ -3921,13 +3923,8 @@ def get_node_progress(cluster_id):
         entry = nodes.setdefault(name, {'maintenance_mode': False, 'maintenance_task': None,
                                         'maintenance_acknowledged': False})
         entry.update(is_updating=True, update_task=task.to_dict())
-    if any(e['maintenance_task'] for e in nodes.values()) and caller_is_scoped(
-            build_authz_user(request.session.get('user', ''), request.session), cluster_id):
-        for e in nodes.values():
-            if e['maintenance_task']:
-                e['maintenance_task'] = {k: v for k, v in e['maintenance_task'].items()
-                                         if k not in _GUEST_FIELDS}
-    return jsonify({'nodes': nodes})
+    # a confined caller gets the progress, not which guests are in it (helpers)
+    return jsonify({'nodes': node_maintenance_for_caller(cluster_id, nodes)})
 
 
 @bp.route('/api/clusters/<cluster_id>/nodes/<node_name>/update', methods=['DELETE'])
