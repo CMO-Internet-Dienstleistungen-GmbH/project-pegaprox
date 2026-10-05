@@ -5138,6 +5138,44 @@ def get_vm_rrd_api(cluster_id, node, vm_type, vmid, timeframe):
         return jsonify({'error': result['error']}), 500
 
 
+# MK Oct 2026 - rng0 is a property string PVE parses as pve-qm-rng: the source is one of
+# three host files, max_bytes and period are any integer to PVE. QEMU then refuses to start
+# the VM on a negative limit or a period of 0, so both are held to what QEMU takes here.
+_RNG_SOURCES = ('/dev/urandom', '/dev/random', '/dev/hwrng')
+_RNG_LIMITS = {'max_bytes': (0, 2 ** 63 - 1), 'period': (1, 2 ** 32 - 1)}
+_RNG_NUMBER_RE = re.compile(r'[0-9]{1,20}')
+
+
+def _rng_value(value):
+    """'[source=]<file>[,max_bytes=N][,period=N]' -> (the value to send, None) or
+    (None, why not). Parsed the way PVE parses it (empty parts skipped, the bare value is
+    the source, each key once), sent back in one spelling."""
+    if not isinstance(value, str):
+        return None, 'rng0 must be a string'
+    found = {}
+    for part in value.split(','):
+        if not part.strip():
+            continue
+        key, sep, val = part.partition('=')
+        if not sep:
+            key, val = 'source', part
+        if key != 'source' and key not in _RNG_LIMITS:
+            return None, f'rng0 has no option {key!r}'
+        if key in found:
+            return None, f'rng0 sets {key} twice'
+        found[key] = val
+    if found.get('source') not in _RNG_SOURCES:
+        return None, 'rng0 needs a source: ' + ', '.join(_RNG_SOURCES)
+    out = ['source=' + found['source']]
+    for key, (low, high) in _RNG_LIMITS.items():
+        if key not in found:
+            continue
+        if not _RNG_NUMBER_RE.fullmatch(found[key]) or not low <= int(found[key]) <= high:
+            return None, f'rng0 {key} must be a whole number from {low} to {high}'
+        out.append(f'{key}={int(found[key])}')
+    return ','.join(out), None
+
+
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/config', methods=['PUT'])
 @require_auth(perms=['vm.config'])
 def update_vm_config_api(cluster_id, node, vm_type, vmid):
@@ -5162,6 +5200,19 @@ def update_vm_config_api(cluster_id, node, vm_type, vmid):
             return jsonify({'error': 'Permission denied: vm.config'}), 403
 
     config_updates = request.json or {}
+    if not isinstance(config_updates, dict):
+        return jsonify({'error': 'Expected an object of config keys'}), 400
+
+    if getattr(manager, 'cluster_type', 'proxmox') != 'xcpng':
+        for key in [k for k in config_updates if re.fullmatch(r'rng[0-9]+', str(k))]:
+            if vm_type != 'qemu':
+                return jsonify({'error': 'A container has no VirtIO RNG'}), 400
+            if key != 'rng0':
+                return jsonify({'error': 'Proxmox has one VirtIO RNG per VM, rng0'}), 400
+            value, why = _rng_value(config_updates[key])
+            if why:
+                return jsonify({'error': f'Invalid VirtIO RNG: {why}'}), 400
+            config_updates[key] = value
 
     result = manager.update_vm_config(node, vmid, vm_type, config_updates)
 
