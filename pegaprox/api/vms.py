@@ -45,6 +45,7 @@ from pegaprox.api.helpers import get_connected_manager, check_cluster_access, re
 from pegaprox.api.helpers import evacuation_options, evacuation_options_said
 from pegaprox.api.ha import standby_console_refusal, STANDBY_CONSOLE_ERROR
 from pegaprox.core import ha, ha_transport
+from pegaprox.background import guest_index
 from pegaprox.utils.ssh import get_paramiko
 from pegaprox.utils.sanitization import sanitize_int, validate_snapshot_name
 from urllib.parse import urlencode, quote as url_quote
@@ -4675,6 +4676,9 @@ def _get_vm_config_response(cluster_id, node, vm_type, vmid):
 
     if result['success']:
         config = result['config']
+        if isinstance(config, dict) and getattr(mgr, 'cluster_type', 'proxmox') == 'proxmox':
+            # MK Oct 2026 - a config opened here is a fresh entry for the search index
+            guest_index.ingest(cluster_id, vm_type, vmid, config.get('raw'))
         if isinstance(config, dict) and not config.get('tags') and not config.get('tag'):
             raw = config.get('raw') if isinstance(config.get('raw'), dict) else {}
             general = config.get('general') if isinstance(config.get('general'), dict) else {}

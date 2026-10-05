@@ -1580,6 +1580,12 @@ def main(debug_mode=False):
     start_cross_cluster_replication_thread()
     print("Started cross-cluster replication scheduler thread")
 
+    # MAC addresses, notes and configured IPs for the search; the loop itself only reads
+    # where users are served
+    from pegaprox.background.guest_index import start_guest_index_thread
+    start_guest_index_thread()
+    print("Started guest search index thread")
+
     try:
         start_syslog_server()
         print("Started integrated syslog server")

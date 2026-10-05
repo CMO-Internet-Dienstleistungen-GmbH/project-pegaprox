@@ -104,6 +104,7 @@
     "pegaprox/background/broadcast.py",
     "pegaprox/background/cross_cluster_lb.py",
     "pegaprox/background/cross_cluster_replication.py",
+    "pegaprox/background/guest_index.py",
     "pegaprox/background/metrics.py",
     "pegaprox/background/password_expiry.py",
     "pegaprox/background/scheduler.py",

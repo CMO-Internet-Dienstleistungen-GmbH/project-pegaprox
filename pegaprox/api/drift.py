@@ -38,6 +38,7 @@ from pegaprox.utils.auth import require_auth
 from pegaprox.api.helpers import check_cluster_access, require_unconfined
 from pegaprox.core.db import get_db
 from pegaprox.core import ha
+from pegaprox.background import guest_index
 from pegaprox.models.permissions import ROLE_ADMIN
 
 bp = Blueprint('drift', __name__)
@@ -154,6 +155,8 @@ def _fetch_state(mgr, cluster_id):
                 if resp is None or getattr(resp, 'status_code', 0) != 200:
                     continue
                 cfg = resp.json().get('data') or {}
+                # the search index takes the same read (MAC, notes, configured IPs)
+                guest_index.ingest(cluster_id, t, vmid, cfg)
                 clean = _strip_volatile(cfg, _VM_VOLATILE_KEYS)
                 out.append(('vm_config', f"{t}/{vmid}", clean))
             except Exception:

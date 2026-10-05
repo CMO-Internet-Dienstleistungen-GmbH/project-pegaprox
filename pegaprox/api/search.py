@@ -21,6 +21,7 @@ from pegaprox.utils.rbac import (
     get_user_clusters,
 )
 from pegaprox.api.helpers import get_connected_manager, safe_error, check_cluster_access, scope_vm_rows
+from pegaprox.background import guest_index
 
 bp = Blueprint('search', __name__)
 
@@ -156,11 +157,19 @@ def global_search():
     """Search across all clusters for VMs, containers, and nodes
     
     Query params:
-    - q: search query (name, vmid, ip, node name, tags)
+    - q: search query (name, vmid, ip, node name, tags, MAC address, notes)
     - type: filter by type (vm, ct, node, all) - default: all
     
-    Also supports prefix filters like tag:web, node:pve1, ip:192.168, status:running
+    Also supports prefix filters like tag:web, node:pve1, ip:192.168, status:running,
+    mac:bc:24:11, notes:backup
     You can combine tags with comma: tag:web,production (AND logic)
+    
+    A MAC address matches without regard to separators and case (bc2411aabbcc finds
+    BC:24:11:AA:BB:CC). ip: looks at every address the guest agent reports and the static
+    ones in the guest config. MAC addresses, notes and configured IPs come from the guest
+    search index, which reads guest configs in the background: a new guest is found by
+    them once its config was read. A hit on one of these carries match_value (the
+    address, or the part of the notes around the hit) and match_net (the NIC) where known.
     
     LW: This is one of the most used features - people love being able
     to find a VM without knowing which cluster its on.
@@ -176,9 +185,9 @@ def global_search():
     # MK: prefix filters - type tag:xxx to search only tags, node:xxx for nodes etc
     prefix_filter = None
     query = raw_query.lower()
-    for prefix in ['tag:', 'node:', 'ip:', 'status:']:
+    for prefix in ['tag:', 'node:', 'ip:', 'status:', 'mac:', 'notes:']:
         if query.startswith(prefix):
-            prefix_filter = prefix[:-1]  # 'tag', 'node', 'ip', 'status'
+            prefix_filter = prefix[:-1]  # 'tag', 'node', 'ip', 'status', 'mac', 'notes'
             query = query[len(prefix):].strip()
             break
     
@@ -218,7 +227,10 @@ def global_search():
                 # the whole cluster, so global search enumerated every VM (name/vmid/node/ip/tags) and
                 # every tag for autocomplete regardless of grant. Confine to the caller's VMs, same
                 # per-VM check as get_cluster_tags / scope_vm_rows. Admins/plain operators keep all.
-                resources = scope_vm_rows(cluster_id, mgr.get_vm_resources())
+                # MK Oct 2026 - max_age: the command palette asks while the user types, a
+                # few seconds old is plenty for a search and spares PVE the walk per keystroke
+                resources = scope_vm_rows(cluster_id, mgr.get_vm_resources(max_age=6))
+                indexed = guest_index.snapshot(cluster_id)
                 for r in resources:
                     name = (r.get('name') or '').lower()
                     vmid = str(r.get('vmid', ''))
@@ -235,6 +247,11 @@ def global_search():
                     # Match based on prefix filter or global search
                     matched = False
                     match_field = None
+                    # what the guest search index knows of this guest: MACs, notes, the
+                    # static IPs of its config. A hit there says which value it was
+                    hit = None
+                    entry = indexed.get((r.get('type'), int(vmid))) if vmid.isdigit() else None
+                    live_ips = r.get('ip_addresses') or ([r['ip']] if r.get('ip') else [])
                     
                     if prefix_filter == 'tag':
                         # All tag queries must match (AND logic for multi-tag)
@@ -245,10 +262,8 @@ def global_search():
                         matched = query in node
                         if matched:
                             match_field = 'node'
-                    elif prefix_filter == 'ip':
-                        matched = query in ip
-                        if matched:
-                            match_field = 'ip'
+                    elif prefix_filter in ('ip', 'mac', 'notes'):
+                        hit = guest_index.find(entry, live_ips, query, fields=(prefix_filter,), prefixed=True)
                     elif prefix_filter == 'status':
                         matched = status.startswith(query)
                         if matched:
@@ -265,6 +280,10 @@ def global_search():
                             matched, match_field = True, 'ip'
                         elif any(query in tag for tag in tags_list):
                             matched, match_field = True, 'tag'
+                        else:
+                            hit = guest_index.find(entry, live_ips, query)
+                    if hit:
+                        matched, match_field = True, hit[0]
                     
                     if not matched:
                         continue
@@ -276,7 +295,7 @@ def global_search():
                     if search_type == 'ct' and vm_type != 'lxc':
                         continue
                     
-                    results.append({
+                    row = {
                         'type': 'vm' if vm_type == 'qemu' else 'ct',
                         'cluster_id': cluster_id,
                         'cluster_name': cluster_name,
@@ -290,7 +309,14 @@ def global_search():
                         'mem': r.get('mem'),
                         'maxmem': r.get('maxmem'),
                         'match_field': match_field,
-                    })
+                    }
+                    if hit:
+                        row['match_value'] = hit[1]
+                        if hit[2]:
+                            row['match_net'] = hit[2]
+                    elif match_field == 'ip':
+                        row['match_value'] = r.get('ip')
+                    results.append(row)
             except Exception as e:
                 logging.debug(f"Error searching cluster {cluster_id}: {e}")
         

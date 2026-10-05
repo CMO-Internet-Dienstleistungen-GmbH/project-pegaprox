@@ -219,6 +219,16 @@ def _reset_api_rate_window():
         pass
 
 
+def _reset_guest_index():
+    """The guest search index keeps what every config read handed it, by cluster id, and
+    the next test's cluster_1 is another cluster."""
+    try:
+        from pegaprox.background import guest_index
+        guest_index.clear()
+    except Exception:
+        pass
+
+
 def _reset_rbac_caches():
     """rbac.py caches tenants / custom-roles / VM-ACLs / pool-membership at module
     scope (lazy-loaded and pinned). Without resetting them, the first test to touch
@@ -419,6 +429,7 @@ def api(_integration_app, db):
     # (run 35697303667) while the same tree was green on a slower machine here. reset() is
     # already the method the unlock endpoints use.
     _reset_api_rate_window()
+    _reset_guest_index()
 
     client = _integration_app.test_client()
 
@@ -450,6 +461,7 @@ def api(_integration_app, db):
         for _registry in ('pbs_managers', 'vmware_managers'):
             getattr(ppglobals, _registry, {}).clear()
         _reset_api_rate_window()
+        _reset_guest_index()
 
 
 @pytest.fixture
