@@ -2419,7 +2419,10 @@ class XcpngManager:
     # Maintenance mode - MK Mar 2026
     # ──────────────────────────────────────────
 
-    def enter_maintenance_mode(self, node_name, skip_evacuation=False):
+    def enter_maintenance_mode(self, node_name, skip_evacuation=False, allow_local_disks=False):
+        # MK Oct 2026 - the rolling update passes allow_local_disks (#330) to every manager;
+        # without it here each evacuating rolling update on XCP-ng stopped with a TypeError.
+        # host.evacuate decides about local disks itself, so it is taken and not used
         """Disable host and optionally evacuate VMs.
         XCP-ng host.disable() prevents new VMs from starting.
         host.evacuate() live-migrates all running VMs away.
