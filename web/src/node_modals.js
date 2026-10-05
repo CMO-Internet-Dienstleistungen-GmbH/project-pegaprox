@@ -1048,6 +1048,203 @@
             );
         }
 
+        // LW Oct 2026 - one ZFS pool in full, from GET .../disks/zfs/<pool>: the devices with
+        // their state and error counts, the last scrub and the data errors. Modern opens it as
+        // a dialog over the node, Corporate as a panel under its pool table
+        function zfsTone(state) {
+            const s = String(state || '').toUpperCase();
+            if (s === 'ONLINE') return 'ok';
+            if (s === 'AVAIL' || s === 'INUSE') return 'idle';
+            if (s === 'DEGRADED') return 'warn';
+            return s ? 'bad' : 'none';
+        }
+
+        function ZfsPoolDetail({ clusterId, node, pool, corporate = false, onClose }) {
+            const { t } = useTranslation();
+            const { getAuthHeaders } = useAuth();
+            const key = `${clusterId}/${node}/${pool}`;
+            const [view, setView] = useState({ key, loading: true, data: null, error: null });
+            const [reloads, setReloads] = useState(0);
+
+            useEffect(() => {
+                // an answer belongs to the pool it was asked for; a refresh keeps the last one up
+                let current = true;
+                setView(v => ({ key, loading: true, data: v.key === key ? v.data : null, error: null }));
+                const url = `${API_URL}/clusters/${encodeURIComponent(clusterId)}/nodes/${encodeURIComponent(node)}/disks/zfs/${encodeURIComponent(pool)}`;
+                fetch(url, { credentials: 'include', headers: getAuthHeaders() })
+                    .then(async res => {
+                        const body = await res.json().catch(() => ({}));
+                        if (!current) return;
+                        if (res.ok) setView({ key, loading: false, data: body, error: null });
+                        else setView({ key, loading: false, data: null, error: body.error || `HTTP ${res.status}` });
+                    })
+                    .catch(e => { if (current) setView({ key, loading: false, data: null, error: e.message || String(e) }); });
+                return () => { current = false; };
+            }, [key, reloads]);
+
+            const d = view.key === key ? view.data : null;
+            const tones = corporate
+                ? { ok: 'corp-badge corp-badge-online', warn: 'corp-badge corp-badge-maintenance', bad: 'corp-badge corp-badge-offline', idle: 'corp-badge corp-badge-stopped', none: '' }
+                : { ok: 'bg-green-500/20 text-green-400', warn: 'bg-yellow-500/20 text-yellow-400', bad: 'bg-red-500/20 text-red-400', idle: 'bg-gray-500/20 text-gray-400', none: '' };
+            const badge = (s) => s
+                ? <span data-zfs-state={s} className={corporate ? tones[zfsTone(s)] : `px-2 py-0.5 rounded text-xs font-medium ${tones[zfsTone(s)]}`}>{s}</span>
+                : null;
+            const red = corporate ? '#f54f47' : '#f87171';
+            const label = corporate ? 'text-[11px] mb-1' : 'text-xs text-gray-400 mb-1';
+            const labelStyle = corporate ? { color: 'var(--corp-text-secondary)' } : undefined;
+            const count = (n) => (n === null || n === undefined) ? '' : <span style={n > 0 ? { color: red, fontWeight: 600 } : undefined}>{n}</span>;
+
+            const scan = d ? d.scan || {} : {};
+            const scanKind = scan.kind === 'resilver' ? t('zfsResilver') : t('zfsScrub');
+            const scanSays = {
+                finished: 'zfsScanFinished', running: 'zfsScanRunning', paused: 'zfsScanPaused', canceled: 'zfsScanCanceled',
+            }[scan.state];
+            const scanLine = !scan.state || scan.state === 'none' ? t('zfsScanNone')
+                : scanSays ? t(scanSays).replace('{kind}', scanKind).replace('{when}', scan.when || '?')
+                : (scan.text || '-');
+
+            const rows = [];
+            const walk = (list, depth) => (list || []).forEach(v => { rows.push({ v, depth }); walk(v.children, depth + 1); });
+            if (d) walk(d.vdevs, 0);
+            const cell = corporate ? '' : 'p-2';
+
+            const body = (
+                <div className={corporate ? 'space-y-3 text-[12px]' : 'space-y-4 text-sm'} data-zfs-pool={pool}>
+                    {view.loading && !d && (
+                        <div className="flex items-center justify-center h-24 gap-2" style={labelStyle}>
+                            <Icons.RotateCw /> {t('loading')}
+                        </div>
+                    )}
+                    {view.error && (
+                        <div data-zfs-error className={corporate ? 'p-2' : 'bg-red-500/10 border border-red-500/30 rounded p-3 text-red-300'}
+                            style={corporate ? { color: red, border: '1px solid rgba(245,79,71,0.3)' } : undefined}>
+                            {t('zfsPoolUnreadable')}: {view.error}
+                        </div>
+                    )}
+                    {d && (
+                        <>
+                            <div className="flex items-center gap-3 flex-wrap">
+                                {badge(d.state)}
+                                {(d.devices || []).length > 0 && (
+                                    <span data-zfs-problems style={{ color: red }}>{t('zfsProblemDevices').replace('{n}', d.devices.length)}</span>
+                                )}
+                            </div>
+                            {d.status && (
+                                <div>
+                                    <div className={label} style={labelStyle}>{t('status')}</div>
+                                    <div data-zfs-status>{d.status}</div>
+                                </div>
+                            )}
+                            {d.action && (
+                                <div>
+                                    <div className={label} style={labelStyle}>{t('zfsPoolAction')}</div>
+                                    <div>{d.action}</div>
+                                </div>
+                            )}
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <div data-zfs-scan>
+                                    <div className={label} style={labelStyle}>{t('zfsLastScan')}</div>
+                                    <div title={scan.text || ''}>{scanLine}</div>
+                                    {scan.state === 'finished' && (
+                                        <div className={corporate ? 'mt-1' : 'mt-1 text-xs text-gray-400'} style={scan.errors > 0 ? { color: red } : labelStyle}>
+                                            {t('zfsScanResult').replace('{repaired}', scan.repaired || '0B').replace('{errors}', scan.errors ?? 0).replace('{duration}', scan.duration || '?')}
+                                        </div>
+                                    )}
+                                    {scan.state === 'running' && typeof scan.progress === 'number' && (
+                                        <div className="mt-2 flex items-center gap-2">
+                                            <div className="flex-1 h-2 rounded-full overflow-hidden" style={{ background: corporate ? 'var(--corp-surface-2)' : 'rgba(255,255,255,0.08)' }}>
+                                                <div className="h-full rounded-full bg-blue-500" style={{ width: `${Math.max(0, Math.min(100, scan.progress))}%` }} />
+                                            </div>
+                                            <span className="text-xs" style={labelStyle}>{scan.progress}%</span>
+                                        </div>
+                                    )}
+                                </div>
+                                <div data-zfs-data-errors>
+                                    <div className={label} style={labelStyle}>{t('zfsDataErrors')}</div>
+                                    {d.data_errors
+                                        ? <div style={{ color: red }}>{d.data_errors}</div>
+                                        : <div style={{ color: corporate ? '#60b515' : '#4ade80' }}>{t('zfsNoDataErrors')}</div>}
+                                </div>
+                            </div>
+                            <div>
+                                <div className={label} style={labelStyle}>{t('zfsDevices')}</div>
+                                <div className="overflow-x-auto">
+                                    <table className={corporate ? 'corp-datagrid' : 'w-full text-sm'}>
+                                        <thead className={corporate ? '' : 'bg-proxmox-dark text-xs text-gray-400'}>
+                                            <tr>
+                                                <th className={corporate ? '' : 'text-left p-2'}>{t('name')}</th>
+                                                <th className={corporate ? '' : 'text-left p-2'}>{t('zfsColState')}</th>
+                                                <th className={corporate ? '' : 'text-right p-2'}>{t('zfsColRead')}</th>
+                                                <th className={corporate ? '' : 'text-right p-2'}>{t('zfsColWrite')}</th>
+                                                <th className={corporate ? '' : 'text-right p-2'}>{t('zfsColChecksum')}</th>
+                                                <th className={corporate ? '' : 'text-left p-2'}>{t('zfsColNote')}</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {rows.map(({ v, depth }, i) => (
+                                                <tr key={i} data-zfs-vdev={v.name} className={corporate ? '' : 'border-t border-proxmox-border'}>
+                                                    <td className={cell} style={{ paddingLeft: `${8 + depth * 16}px` }}>
+                                                        <span className="font-mono text-xs" style={!v.state ? labelStyle || { color: '#9ca3af' } : undefined}>{v.name}</span>
+                                                    </td>
+                                                    <td className={cell}>{badge(v.state)}</td>
+                                                    <td className={`${cell} text-right font-mono`}>{count(v.read)}</td>
+                                                    <td className={`${cell} text-right font-mono`}>{count(v.write)}</td>
+                                                    <td className={`${cell} text-right font-mono`}>{count(v.cksum)}</td>
+                                                    <td className={`${cell} text-xs`} style={labelStyle}>{v.msg}</td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                                {d.truncated && <div className="mt-2 text-xs" style={labelStyle}>{t('zfsTruncated')}</div>}
+                            </div>
+                        </>
+                    )}
+                </div>
+            );
+
+            if (corporate) return (
+                <div data-zfs-panel className="mt-3" style={{ background: 'var(--corp-surface-1)', border: '1px solid var(--corp-border-medium)' }}>
+                    <div className="flex items-center justify-between px-3 py-2" style={{ borderBottom: '1px solid var(--corp-border-medium)' }}>
+                        <span className="text-[13px] font-medium" style={{ color: 'var(--color-text)' }}>ZFS {pool} <span style={labelStyle}>({node})</span></span>
+                        <div className="flex items-center gap-2">
+                            <button onClick={() => setReloads(n => n + 1)} disabled={view.loading} title={t('refresh')}
+                                className="px-2 py-1 text-[11px] flex items-center gap-1 disabled:opacity-40" style={{ color: '#49afd9', border: '1px solid #485764' }}>
+                                <Icons.RefreshCw /> {t('refresh')}
+                            </button>
+                            <button onClick={onClose} title={t('close')} className="px-2 py-1 text-[11px]" style={{ color: 'var(--corp-text-secondary)', border: '1px solid #485764' }}>
+                                <Icons.X />
+                            </button>
+                        </div>
+                    </div>
+                    <div className="p-3">{body}</div>
+                </div>
+            );
+            return (
+                <div className="fixed inset-0 z-[60] bg-black/60 flex items-center justify-center p-4" onClick={onClose}>
+                    <div data-zfs-panel className="bg-proxmox-card border border-proxmox-border rounded-xl w-full max-w-4xl max-h-[85vh] overflow-hidden flex flex-col" onClick={e => e.stopPropagation()}>
+                        <div className="p-4 border-b border-proxmox-border flex items-center justify-between">
+                            <div>
+                                <h3 className="font-medium text-white flex items-center gap-2">
+                                    <Icons.Database />
+                                    ZFS {pool}
+                                </h3>
+                                <div className="text-xs text-gray-500 mt-1">{node}</div>
+                            </div>
+                            <div className="flex items-center gap-1">
+                                <button onClick={() => setReloads(n => n + 1)} disabled={view.loading} title={t('refresh')}
+                                    className="p-2 hover:bg-proxmox-hover rounded-lg text-gray-400 hover:text-white disabled:opacity-40">
+                                    <Icons.RefreshCw />
+                                </button>
+                                <button onClick={onClose} title={t('close')} className="p-2 hover:bg-proxmox-hover rounded-lg text-gray-400 hover:text-white"><Icons.X /></button>
+                            </div>
+                        </div>
+                        <div className="flex-1 overflow-y-auto p-4">{body}</div>
+                    </div>
+                </div>
+            );
+        }
+
         // Node Management Modal Component
         // NS: Full node management - shell, network, disks, etc.
         // Shell tab uses xterm.js (web terminal), pretty cool
@@ -1076,6 +1273,7 @@
             const [perfTimeframe, setPerfTimeframe] = useState('hour'); // NS: For performance metrics
             // LW May 2026 — SMART modal state (replaces ugly alert(JSON.stringify) call site)
             const [smartModal, setSmartModal] = useState(null); // { disk, loading, data, error }
+            const [zfsPool, setZfsPool] = useState(null);  // the ZFS pool shown in full
 
             const authHeaders = getAuthHeaders();  // NS: Get auth headers
 
@@ -2934,14 +3132,19 @@
                                                     ) : <div className="text-gray-500 text-sm text-center py-4">No LVM-Thin Pools</div>}
                                                 </div>
                                             </div>
+                                                </>
+                                            )}
+                                            </fieldset>
 
-                                            {/* ZFS Pools */}
+                                            {/* ZFS Pools - LW Oct 2026: outside the lock, the pool view only reads */}
+                                            {!isXcpng && (
                                             <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
                                                 <div className="p-4 border-b border-proxmox-border flex items-center justify-between">
                                                     <h3 className="font-medium text-white flex items-center gap-2">
                                                         <Icons.Database />
                                                         ZFS Pools
                                                     </h3>
+                                                    <fieldset {...haLock} className="contents">
                                                     <div className="flex gap-2">
                                                         <button
                                                             onClick={() => openDiskModal('directory')}
@@ -2956,6 +3159,7 @@
                                                             <Icons.Plus className="inline mr-1" /> Create ZFS
                                                         </button>
                                                     </div>
+                                                    </fieldset>
                                                 </div>
                                                 <div className="p-4">
                                                     {(data.zfs||[]).length > 0 ? (
@@ -2986,15 +3190,23 @@
                                                                             </div>
                                                                         </>
                                                                     )}
+                                                                    {z.name && (
+                                                                        <button
+                                                                            onClick={() => setZfsPool(z.name)}
+                                                                            data-zfs-open={z.name}
+                                                                            title={t('zfsPoolDetails')}
+                                                                            className="mt-3 px-2 py-1 text-xs bg-proxmox-darker hover:bg-proxmox-hover border border-proxmox-border rounded-lg flex items-center gap-1 text-gray-300"
+                                                                        >
+                                                                            <Icons.HardDrive className="w-3.5 h-3.5" /> {t('zfsPoolDetails')}
+                                                                        </button>
+                                                                    )}
                                                                 </div>
                                                             ))}
                                                         </div>
                                                     ) : <div className="text-gray-500 text-sm text-center py-4">No ZFS Pools</div>}
                                                 </div>
                                             </div>
-                                                </>
                                             )}
-                                            </fieldset>
                                         </div>
                                     )}
 
@@ -3607,6 +3819,9 @@
                     {/* LW May 2026 — SMART Modal (replaces the alert(JSON) call site) */}
                     {smartModal && (
                         <SmartModal modal={smartModal} onClose={() => setSmartModal(null)} formatBytes={formatBytes} />
+                    )}
+                    {zfsPool && (
+                        <ZfsPoolDetail clusterId={clusterId} node={node} pool={zfsPool} onClose={() => setZfsPool(null)} />
                     )}
                 </div>
             );
@@ -4868,6 +5083,7 @@
             const [showMaintConfirm, setShowMaintConfirm] = useState(false);
             const [maintOptions, setMaintOptions] = useState({});
             const [configSubTab, setConfigSubTab] = useState('network');
+            const [zfsPool, setZfsPool] = useState(null);  // the ZFS pool shown in full
             const [monitorSubTab, setMonitorSubTab] = useState('performance');
             const [perfTimeframe, setPerfTimeframe] = useState('hour');
             const [loading, setLoading] = useState(false);
@@ -5058,7 +5274,7 @@
 
             // LW: Feb 2026 - reset data and load summary when node changes
             useEffect(() => {
-                setData({}); setConfigSubTab('network'); setMonitorSubTab('performance'); setActiveDetailTab('summary'); loadTabData('summary');
+                setData({}); setConfigSubTab('network'); setZfsPool(null); setMonitorSubTab('performance'); setActiveDetailTab('summary'); loadTabData('summary');
                 return () => { navGenRef.current++; inflightRef.current = new Set(); };
             }, [clusterId, node]);
 
@@ -5793,20 +6009,6 @@
                                                     </table>
                                                 </div>
                                             )}
-                                            {configSubTab === 'zfs' && (
-                                                <div>
-                                                    <span className="text-[13px] font-medium mb-3 block" style={{color: '#e9ecef'}}>{t('zfsStorage')}</span>
-                                                    <table className="corp-datagrid">
-                                                        <thead><tr><th>{t('name')}</th><th>Size</th><th>Free</th><th>Health</th></tr></thead>
-                                                        <tbody>
-                                                            {(Array.isArray(data.zfs) ? data.zfs : []).map((pool, i) => (
-                                                                <tr key={i}><td>{pool.name || '-'}</td><td>{formatBytes(pool.size)}</td><td>{formatBytes(pool.free)}</td><td>{pool.health || '-'}</td></tr>
-                                                            ))}
-                                                            {(!data.zfs || data.zfs.length === 0) && <tr><td colSpan={4} className="text-center py-4" style={{color: '#728b9a'}}>No ZFS pools</td></tr>}
-                                                        </tbody>
-                                                    </table>
-                                                </div>
-                                            )}
                                             {configSubTab === 'repos' && (
                                                 <div>
                                                     <div className="flex items-center justify-between mb-3">
@@ -5862,6 +6064,32 @@
                                         </>
                                     )}
                                     </fieldset>
+                                    {/* LW Oct 2026 - the pools and the pool view only read: outside the standby lock */}
+                                    {configSubTab === 'zfs' && !(loading && !data.network && !data.dns && !data.disks) && (
+                                        <div>
+                                            <span className="text-[13px] font-medium mb-3 block" style={{color: '#e9ecef'}}>{t('zfsStorage')}</span>
+                                            <table className="corp-datagrid">
+                                                <thead><tr><th>{t('name')}</th><th>Size</th><th>Free</th><th>Health</th><th></th></tr></thead>
+                                                <tbody>
+                                                    {(Array.isArray(data.zfs) ? data.zfs : []).map((pool, i) => (
+                                                        <tr key={i} className={pool.name && zfsPool === pool.name ? 'corp-row-selected' : ''}>
+                                                            <td>{pool.name || '-'}</td><td>{formatBytes(pool.size)}</td><td>{formatBytes(pool.free)}</td>
+                                                            <td>{pool.health ? <span className={`corp-badge ${pool.health === 'ONLINE' ? 'corp-badge-online' : pool.health === 'DEGRADED' ? 'corp-badge-maintenance' : 'corp-badge-offline'}`}>{pool.health}</span> : '-'}</td>
+                                                            <td>{pool.name && (
+                                                                <button onClick={() => setZfsPool(zfsPool === pool.name ? null : pool.name)} data-zfs-open={pool.name} title={t('zfsPoolDetails')}
+                                                                    className="px-2 py-0.5 text-[11px]" style={{color: '#49afd9', border: '1px solid #485764'}}>{t('details')}</button>
+                                                            )}</td>
+                                                        </tr>
+                                                    ))}
+                                                    {(!data.zfs || data.zfs.length === 0) && <tr><td colSpan={5} className="text-center py-4" style={{color: '#728b9a'}}>No ZFS pools</td></tr>}
+                                                </tbody>
+                                            </table>
+                                            {/* the pool picked above, in full */}
+                                            {zfsPool && (
+                                                <ZfsPoolDetail corporate clusterId={clusterId} node={node} pool={zfsPool} onClose={() => setZfsPool(null)} />
+                                            )}
+                                        </div>
+                                    )}
                                 </div>
                             </div>
                         )}

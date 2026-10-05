@@ -10766,7 +10766,7 @@
             const [alertMutes, setAlertMutes] = useState([]);
             const [muteMenu, setMuteMenu] = useState(null);
             const [muteWholeObject, setMuteWholeObject] = useState(false);
-            const EVENT_ALERT_METRICS = ['task_failed', 'ceph_health', 'replication', 'snapshot_age', 'backup_coverage'];
+            const EVENT_ALERT_METRICS = ['task_failed', 'ceph_health', 'replication', 'snapshot_age', 'backup_coverage', 'zfs_health'];
             const [sessionExpired, setSessionExpired] = useState(false);  // any 401 -> clear "session expired" overlay instead of silent failure
             const [clusterAffinityRules, setClusterAffinityRules] = useState([]);
             const [showAffinityModal, setShowAffinityModal] = useState(false);
@@ -12671,6 +12671,7 @@
                     const tags = alert.backup_exclude_tags || [];
                     return t('backupCoverageSummary').replace('{n}', n) + (tags.length ? ` - ${t('backupCoverageExcept').replace('{tags}', tags.join(', '))}` : '');
                 }
+                if (alert.metric === 'zfs_health') return `${t('zfsAlertTitle')}: ${Number(n) >= 1 ? t('zfsAlertStateOnly') : t('zfsAlertAny')}`;
                 return `${alert.metric?.toUpperCase()} ${alert.operator} ${alert.threshold}%`;
             };
 
@@ -26958,7 +26959,7 @@
                                             <select name="target_type" defaultValue={editingAlert ? editingAlert.target_type : 'cluster'} className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg">
                                                 <option value="cluster">{t('entireCluster') || 'Entire Cluster'}</option>
                                                 <option value="node">{t('specificNode') || 'Specific Node'}</option>
-                                                <option value="vm">{t('specificVm') || 'Specific VM'}</option>
+                                                {alertMetricSel !== 'zfs_health' && <option value="vm">{t('specificVm') || 'Specific VM'}</option>}
                                             </select>
                                         </div>
                                         <div>
@@ -26985,6 +26986,7 @@
                                                 <option value="replication">{t('replication')}</option>
                                                 <option value="snapshot_age">{t('alertMetricSnapshots')}</option>
                                                 <option value="backup_coverage">{t('backupCoverageTitle')}</option>
+                                                <option value="zfs_health">{t('zfsAlertTitle')}</option>
                                             </select>
                                         </div>
                                         {alertMetricSel === 'rolling_update' ? (
@@ -26997,6 +26999,7 @@
                                                     : alertMetricSel === 'ceph_health' ? t('alertCephHelp')
                                                     : alertMetricSel === 'replication' ? t('alertReplHelp')
                                                     : alertMetricSel === 'backup_coverage' ? t('backupCoverageHelp')
+                                                    : alertMetricSel === 'zfs_health' ? t('zfsAlertHelp')
                                                     : t('alertSnapHelp')}
                                             </div>
                                         ) : <>
@@ -27088,6 +27091,15 @@
                                                         </div>
                                                     </div>
                                                     <p className="text-xs text-gray-500">{t('backupCoverageTagsHint')}</p>
+                                                </div>
+                                            )}
+                                            {alertMetricSel === 'zfs_health' && (
+                                                <div data-event-fields="zfs_health">
+                                                    <label className="block text-sm text-gray-400 mb-1">{t('zfsAlertLevel')}</label>
+                                                    <select name="threshold" defaultValue={saved ? String(saved.threshold) : '0'} className={field}>
+                                                        <option value="0">{t('zfsAlertAny')}</option>
+                                                        <option value="1">{t('zfsAlertStateOnly')}</option>
+                                                    </select>
                                                 </div>
                                             )}
                                             {alertMetricSel !== 'rolling_update' && (
