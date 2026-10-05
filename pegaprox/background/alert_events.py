@@ -165,9 +165,12 @@ def check_pattern(pattern):
 def _int_in(value, lo, hi):
     if isinstance(value, bool):
         return None
+    # a float only when it is whole: 59.9 is no whole number, and inf or nan never are
+    if isinstance(value, float) and not value.is_integer():
+        return None
     try:
         n = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return n if lo <= n <= hi else None
 

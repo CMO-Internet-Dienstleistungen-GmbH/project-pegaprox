@@ -530,7 +530,11 @@ def create_alert_mute(cluster_id):
     _cerr = require_unconfined(cluster_id)
     if _cerr:
         return _cerr
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return jsonify({'error': 'The request body must be a JSON object'}), 400
     minutes = data.get('minutes')
     if isinstance(minutes, bool) or not isinstance(minutes, int) \
             or not 1 <= minutes <= alert_events.MUTE_MAX_MINUTES:

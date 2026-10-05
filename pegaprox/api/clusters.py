@@ -594,7 +594,11 @@ def check_cluster_connection(cluster_id):
     if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
         return jsonify({'error': 'The connection check covers Proxmox VE clusters only',
                         'code': 'PVE_ONLY'}), 400
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return jsonify({'error': 'The request body must be a JSON object'}), 400
     with_ssh = data.get('ssh', True) is not False
     from pegaprox.core import conncheck
     try:

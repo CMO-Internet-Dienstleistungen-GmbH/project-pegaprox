@@ -3646,6 +3646,9 @@ class XcpngManager:
                 task.status = 'rebooting'
                 task.add_output(f"Rebooting {node_name}...")
                 ssh.exec_command("reboot", timeout=5)
+                # MK Oct 2026 - the rolling update waits for a node only when its task says it
+                # rebooted (#715); without these an XCP-ng host still booting was passed by
+                task.reboot_issued = True
                 if getattr(self, '_rolling_update', {}).get('status') == 'running':
                     try:
                         from pegaprox.background.alerts import emit_rolling_update_reboot_event
@@ -3664,6 +3667,7 @@ class XcpngManager:
                 task.status = 'waiting_online'
                 task.add_output("Waiting for node to come back online...")
                 online = self._wait_for_host_online(node_name, timeout=300)
+                task.back_online = bool(online)
                 if online:
                     task.add_output(f"{node_name} is back online")
                 else:
