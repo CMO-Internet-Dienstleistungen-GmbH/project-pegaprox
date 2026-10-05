@@ -655,6 +655,19 @@ class PegaProxDB:
             logging.error(f"node_maintenance native_ha migration failed: {e}")
             raise
 
+        # MK Oct 2026 (#954) - the Proxmox HA rules a rolling update switched off for its run.
+        # Written before the first one is touched: after a restart nothing else knows them
+        # (a disabled rule looks like any other), and they have to be switched on again.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS suspended_ha_rules (
+                cluster_id TEXT NOT NULL,
+                rule TEXT NOT NULL,
+                rule_type TEXT NOT NULL,
+                suspended_at TEXT NOT NULL,
+                PRIMARY KEY (cluster_id, rule)
+            )
+        ''')
+
         # Server settings table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS server_settings (
@@ -4937,6 +4950,28 @@ class PegaProxDB:
         cursor.execute('SELECT node, entered_at, native_ha FROM node_maintenance WHERE cluster_id=?',
                        (cluster_id,))
         return [(r['node'], r['entered_at'], bool(r['native_ha'])) for r in cursor.fetchall()]
+
+    def save_suspended_ha_rules(self, cluster_id: str, rules: list, rule_type: str = 'resource-affinity'):
+        """#954 - remember HA rules before they are switched off. A rule already listed keeps
+        its first timestamp."""
+        cursor = self.conn.cursor()
+        now = datetime.now().isoformat()
+        for rule in rules:
+            cursor.execute('INSERT OR IGNORE INTO suspended_ha_rules (cluster_id, rule, rule_type, suspended_at) '
+                           'VALUES (?, ?, ?, ?)', (cluster_id, rule, rule_type, now))
+        self.conn.commit()
+
+    def remove_suspended_ha_rule(self, cluster_id: str, rule: str):
+        cursor = self.conn.cursor()
+        cursor.execute('DELETE FROM suspended_ha_rules WHERE cluster_id=? AND rule=?', (cluster_id, rule))
+        self.conn.commit()
+
+    def get_suspended_ha_rules(self, cluster_id: str) -> list:
+        """#954 - [(rule, rule_type, suspended_at), ...] still waiting to be switched on again."""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT rule, rule_type, suspended_at FROM suspended_ha_rules WHERE cluster_id=? '
+                       'ORDER BY rule', (cluster_id,))
+        return [(r['rule'], r['rule_type'], r['suspended_at']) for r in cursor.fetchall()]
 
     def get_affinity_rules(self, cluster_id: str = None) -> dict:
         """Get affinity rules"""

@@ -32587,6 +32587,51 @@
         ]
       }
     },
+    "/api/clusters/{cluster_id}/updates/rolling/plan": {
+      "get": {
+        "operationId": "settings.get_rolling_update_plan_get",
+        "tags": [
+          "settings"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "MK Oct 2026 (#763, #954) - what moving the templates and letting negative affinity rules give way would change, for the dialog before a rolling update starts. Reads only. The whole cluster's templates and HA rules: confined callers get nothing, as for the run itself.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "node.update"
+        ]
+      }
+    },
     "/api/clusters/{cluster_id}/nodes/{node}/repos": {
       "get": {
         "operationId": "settings.get_node_repos_get",

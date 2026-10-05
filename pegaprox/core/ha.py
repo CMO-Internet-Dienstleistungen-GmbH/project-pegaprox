@@ -307,6 +307,8 @@ SYNC_TABLES = (
     'siem_targets', 'push_subscriptions', 'plugin_state', 'status_incidents',
     'custom_cloud_templates', 'power_rates', 'cost_rates', 'auto_install_profiles',
     'pegaprox_kv',
+    # Proxmox HA rules a rolling update switched off: whoever acts next switches them on (#954)
+    'suspended_ha_rules',
     # node recoveries an automatic leader left half done (5.6); made on its first write
     'ha_recovery_journal',
 )

@@ -4513,6 +4513,13 @@ def start_rolling_update(cluster_id):
     ceph_health_gate = str(data.get('ceph_health_gate', 'off')).lower()
     if ceph_health_gate not in ('off', 'degraded', 'strict'):
         ceph_health_gate = 'off'
+    # MK Oct 2026 - both off by default, which is how a run behaved before. #763: move the
+    # templates of a node with its evacuation (offline). #954: let negative affinity rules
+    # give way for the run, so guests that must run apart may share a node until it ends.
+    # Proxmox only - XCP-ng has neither the templates nor the HA rules meant here.
+    is_pve = getattr(mgr, 'cluster_type', 'proxmox') == 'proxmox'
+    migrate_templates = is_pve and data.get('migrate_templates') is True
+    relax_anti_affinity = is_pve and data.get('relax_anti_affinity') is True
 
     # MK: Configurable timeouts (GitHub Issue fix)
     evacuation_timeout = data.get('evacuation_timeout', 1800)  # 30 minutes default (was 5 min!)
@@ -4559,6 +4566,8 @@ def start_rolling_update(cluster_id):
         'pause_on_evacuation_error': pause_on_evacuation_error,  # NS: GitHub #40
         'allow_local_disks': allow_local_disks,  # NS #330
         'ceph_health_gate': ceph_health_gate,  # NS #403 part 2
+        'migrate_templates': migrate_templates,  # #763
+        'relax_anti_affinity': relax_anti_affinity,  # #954
         'force_all': force_all,
         'evacuation_timeout': evacuation_timeout,
         'update_timeout': update_timeout,
@@ -4576,12 +4585,62 @@ def start_rolling_update(cluster_id):
         'logs': []
     }
     
+    usr = request.session.get('user', 'system')
+    _opts = [o for o, on in (('templates move with the evacuation', migrate_templates),
+                             ('negative affinity rules give way until it ends', relax_anti_affinity)) if on]
+    log_audit(usr, 'node.rolling_update_started',
+              f"Rolling update of {len(nodes_to_update)} node(s) started" + (f": {'; '.join(_opts)}" if _opts else ''),
+              cluster=mgr.config.name)
+
     # helper: one-line log with a timestamp prefix
     def _log(msg):
         try:
             mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] {msg}")
         except Exception:
             pass
+
+    def _log_templates(task):
+        # #763 - what the evacuation did with the templates of the node
+        for t in getattr(task, 'templates_moved', None) or []:
+            _log(f"  ✓ Template {t.get('name')} ({t.get('vmid')}) moved to {t.get('to')}")
+        for t in getattr(task, 'templates_left', None) or []:
+            _log(f"  ⚠ Template {t.get('name')} ({t.get('vmid')}) stays on the node: {t.get('reason')}")
+
+    # #954 - switched off before the first evacuation, on again when the run ends however it ends
+    def _rules_give_way():
+        state = mgr._rolling_update
+        if not relax_anti_affinity or state.get('ha_rules_held') is not None:
+            return
+        state['ha_rules_held'] = True   # the daemon loop keeps its hands off from here
+        try:
+            off, failed = mgr.suspend_negative_ha_rules(who=usr)
+        except Exception as e:
+            off, failed = [], []
+            _log(f"⚠ Negative affinity rules could not be switched off ({e}) - evacuating with them on")
+        if off:
+            _log(f"Negative affinity: {len(off)} Proxmox HA rule(s) switched off until the run ends: {', '.join(off)}")
+        elif not failed:
+            _log("Negative affinity: no enabled negative Proxmox HA rule to switch off")
+        if failed:
+            _log(f"⚠ Proxmox kept these rules on, their guests may still not move: {', '.join(failed)}")
+        state['ha_rules_held'] = bool(off)
+
+    def _rules_back_on():
+        state = mgr._rolling_update or {}
+        if not state.get('ha_rules_held'):
+            return
+        try:
+            on, left = mgr.restore_suspended_ha_rules(who=usr)
+            if on:
+                _log(f"✓ Negative affinity rules switched back on: {', '.join(on)} - Proxmox HA moves their "
+                     f"guests apart again where a node is free")
+            if left:
+                _log(f"✗ Still off: {', '.join(left)} - PegaProx keeps retrying; or run "
+                     f"`ha-manager rules set resource-affinity <rule> --disable 0`")
+        except Exception as e:
+            _log(f"✗ Switching the negative affinity rules back on failed: {e} - PegaProx keeps retrying")
+        finally:
+            state['ha_rules_held'] = False
 
     # Start the rolling update in a background thread
     def run_rolling_update():
@@ -4595,10 +4654,17 @@ def start_rolling_update(cluster_id):
                              f"{len(nodes_to_update)} node(s) queued: {', '.join(nodes_to_update)}"
                              + (" · reboots included" if include_reboot else ""),
                              cluster_id=cluster_id, channel_ids=notify_channels)
-            _log(f"Settings: skip_up_to_date={skip_up_to_date}, skip_evacuation={skip_evacuation}, evacuation_timeout={evacuation_timeout}s, reboot_timeout={reboot_timeout}s, allow_local_disks={allow_local_disks}, ceph_health_gate={ceph_health_gate}")
+            _log(f"Settings: skip_up_to_date={skip_up_to_date}, skip_evacuation={skip_evacuation}, evacuation_timeout={evacuation_timeout}s, reboot_timeout={reboot_timeout}s, allow_local_disks={allow_local_disks}, ceph_health_gate={ceph_health_gate}, migrate_templates={migrate_templates}, relax_anti_affinity={relax_anti_affinity}")
 
             if skip_evacuation:
                 _log("⚠️ WARNING: VM evacuation disabled - VMs may be affected if update fails!")
+            elif migrate_templates:
+                _log("Templates: moved offline with each node's evacuation, only to a node that has every "
+                     "storage they use. One that cannot move stays where it is and does not pause the run")
+            if relax_anti_affinity and not skip_evacuation:
+                _log("Negative affinity: guests that must run apart may share a node until the run ends. "
+                     "Proxmox HA rules are switched off before the first evacuation and back on at the end; "
+                     "PegaProx's own rules are enforced again by the balancer after the run")
 
             # MK #181 — pre-flight summary so admins see cluster-wide safety state up front,
             # not just per-node ticks.
@@ -4680,14 +4746,13 @@ def start_rolling_update(cluster_id):
                     # MK #181 — list the VMs about to move. Nothing is more reassuring to an admin
                     # at 02:00 than seeing the names roll past before evacuation kicks off.
                     if not skip_evacuation:
+                        # MK Oct 2026 - no manager has get_node_vms or get_cluster_resources, so
+                        # this always read "0 guests present"
                         try:
-                            vms_here = mgr.get_node_vms(node_name) or []
+                            vms_here = [r for r in (mgr.get_vm_resources() or [])
+                                        if r.get('node') == node_name and r.get('type') in ('qemu', 'lxc')]
                         except Exception:
-                            try:
-                                all_r = mgr.get_cluster_resources() or []
-                                vms_here = [r for r in all_r if r.get('node') == node_name and r.get('type') in ('qemu', 'lxc')]
-                            except Exception:
-                                vms_here = []
+                            vms_here = []
                         running = [v for v in vms_here if (v.get('status') or '').lower() == 'running']
                         _log(f"{node_name}: {len(vms_here)} guests present ({len(running)} running, {len(vms_here) - len(running)} stopped)")
                         for vm in running[:8]:
@@ -4695,6 +4760,12 @@ def start_rolling_update(cluster_id):
                             _log(f"  → will evacuate: {label} (VMID {vm.get('vmid','?')}, {vm.get('type','?')})")
                         if len(running) > 8:
                             _log(f"  → …and {len(running) - 8} more")
+                        # #763 - said either way: without the option a template goes down with the node
+                        tpls = [v for v in vms_here if v.get('template')]
+                        if tpls:
+                            names = ', '.join(f"{v.get('name') or v.get('vmid')} ({v.get('vmid')})" for v in tpls[:8])
+                            more = f" and {len(tpls) - 8} more" if len(tpls) > 8 else ''
+                            _log(f"  → template(s) {'to move' if migrate_templates else 'staying here'}: {names}{more}")
 
                     # Step 1: Enable maintenance mode (evacuate VMs unless skip_evacuation is set)
                     # enter_maintenance_mode() internally calls _set_ceph_maintenance_flags()
@@ -4708,6 +4779,8 @@ def start_rolling_update(cluster_id):
                         _log(f"  → Ceph (if present): noout + norebalance will be set on {node_name} to prevent rebalancing")
                         logging.info(f"[RollingUpdate] Enabling maintenance mode on {node_name}")
                     
+                    if not skip_evacuation:
+                        _rules_give_way()   # #954, once, before the first evacuation
                     # before each node's evacuation and its update (design 5.2, #625)
                     if not ha.confirm_step(f'rolling update of {node_name}'):
                         raise Exception('this instance does not hold the lease of its group')
@@ -4715,6 +4788,7 @@ def start_rolling_update(cluster_id):
                         node_name,
                         skip_evacuation=skip_evacuation,
                         allow_local_disks=allow_local_disks,  # NS #330
+                        **({'migrate_templates': True} if migrate_templates else {}),  # #763
                     )
                     
                     if not maintenance_task:
@@ -4740,9 +4814,11 @@ def start_rolling_update(cluster_id):
                                 maintenance_task = mgr.nodes_in_maintenance[node_name]
                                 if maintenance_task.status == 'completed':
                                     mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✓ Evacuation completed - all VMs migrated")
+                                    _log_templates(maintenance_task)
                                     evacuation_completed = True
                                     break
                                 elif maintenance_task.status == 'completed_with_errors':
+                                    _log_templates(maintenance_task)
                                     failed_vm_list = getattr(maintenance_task, 'failed_vms', [])
                                     failed_names = [f"{v.get('name', 'VM')} (VMID: {v.get('vmid', '?')})" for v in failed_vm_list]
                                     migrated = getattr(maintenance_task, 'migrated_vms', 0)
@@ -5065,6 +5141,8 @@ def start_rolling_update(cluster_id):
                         mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✗ {nn} STILL stuck — run `ha-manager crm-command node-maintenance disable {nn}` manually")
                         mgr._rolling_update['failed_nodes'].append({'node': nn, 'error': 'Stuck in maintenance after rolling update'})
 
+            _rules_back_on()   # #954, every node is out of maintenance by now
+
             # Final summary
             completed = len(mgr._rolling_update['completed_nodes'])
             skipped = len(mgr._rolling_update['skipped_nodes'])
@@ -5085,6 +5163,7 @@ def start_rolling_update(cluster_id):
 
         except Exception as e:
             logging.error(f"[RollingUpdate] Rolling update failed with exception: {e}")
+            _rules_back_on()   # #954, before the status says the run is over
             mgr._rolling_update['status'] = 'failed'
             mgr._rolling_update['completed_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
             mgr._rolling_update['error'] = str(e)
@@ -5197,6 +5276,30 @@ def clear_rolling_update_status(cluster_id):
             return jsonify({'error': 'Cannot clear running update'}), 400
     
     return jsonify({'success': True, 'message': 'Nothing to clear'})
+
+
+@bp.route('/api/clusters/<cluster_id>/updates/rolling/plan', methods=['GET'])
+@require_auth(perms=['node.update'])
+def get_rolling_update_plan(cluster_id):
+    """MK Oct 2026 (#763, #954) - what moving the templates and letting negative affinity
+    rules give way would change, for the dialog before a rolling update starts. Reads only.
+    The whole cluster's templates and HA rules: confined callers get nothing, as for the
+    run itself."""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    mgr = cluster_managers[cluster_id]
+    if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
+        return jsonify({'supported': False})
+    try:
+        return jsonify(mgr.rolling_update_plan())
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Failed to read the rolling update plan')}), 500
 
 
 

@@ -23,6 +23,10 @@ class MaintenanceTask:
         self.acknowledged = False
         self.native_ha = False  # NS feb 2026 - tracks if Proxmox native HA maintenance was used
         self.note = None  # NS jul 2026 - informational note (e.g. single-node: no evacuation target)
+        # MK Oct 2026 (#763) - templates move only when asked; the ones that stay say why
+        self.migrate_templates = False
+        self.templates_moved = []
+        self.templates_left = []
 
     def to_dict(self):
         return {
@@ -38,7 +42,9 @@ class MaintenanceTask:
             'error': self.error,
             'acknowledged': self.acknowledged,
             'native_ha': self.native_ha,
-            'note': self.note
+            'note': self.note,
+            'templates_moved': self.templates_moved,
+            'templates_left': self.templates_left,
         }
 
 

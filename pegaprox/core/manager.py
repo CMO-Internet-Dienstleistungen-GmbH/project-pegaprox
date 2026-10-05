@@ -252,6 +252,18 @@ def _normalise_private_key(key):
     return data + '\n'
 
 
+def _pve_message(text, max_chars=200):
+    """The message of a PVE error body ('{"data":null,"message":"..."}'), else the text."""
+    msg = str(text or '')
+    try:
+        body = json.loads(msg)
+        if isinstance(body, dict) and body.get('message'):
+            msg = str(body['message'])
+    except ValueError:
+        pass
+    return ' '.join(msg.split())[:max_chars] or 'no reason given'
+
+
 def _ssh_stderr_excerpt(stderr, max_chars=240):
     """Last meaningful line of SSH stderr, capped.
 
@@ -3081,7 +3093,16 @@ class PegaProxManager:
         except Exception as e:
             self.logger.debug(f"[MAINT] config of {vmid} unreadable for placement: {e}")
             config = {}
-        for key, value in config.items():
+        for _key, storage, _value in self._guest_volumes(config):
+            limit = storage_nodes.get(storage)
+            if limit is not None:
+                allowed = set(limit) if allowed is None else allowed & limit
+        return allowed
+
+    def _guest_volumes(self, config):
+        """(key, storage, value) of every volume a guest config names by storage: disks,
+        unused disks, mount points, EFI/TPM state and CD/DVD images."""
+        for key, value in (config or {}).items():
             if not isinstance(value, str) or not self._GUEST_VOLUME_KEY.match(key):
                 continue
             volume = value.split(',')[0]
@@ -3089,10 +3110,322 @@ class PegaProxManager:
                 volume = volume[5:]
             if ':' not in volume or volume.startswith('/'):
                 continue   # passthrough device, bind mount, empty drive
-            limit = storage_nodes.get(volume.split(':', 1)[0])
-            if limit is not None:
-                allowed = set(limit) if allowed is None else allowed & limit
-        return allowed
+            yield key, volume.split(':', 1)[0], value
+
+    def _storage_presence(self):
+        """{node: {storage: shared}} of the storages each node has active, from one
+        /cluster/resources read that covers every node. None when it cannot be read."""
+        try:
+            r = self._api_get(f"https://{self.host}:{self.api_port}/api2/json/cluster/resources",
+                              params={'type': 'storage'})
+            if r is None or r.status_code != 200:
+                return None
+            rows = r.json().get('data') or []
+        except Exception as e:
+            self.logger.debug(f"[MAINT] storage list unreadable: {e}")
+            return None
+        out = {}
+        for s in rows:
+            if s.get('status') == 'available' and s.get('node') and s.get('storage'):
+                out.setdefault(s['node'], {})[s['storage']] = bool(s.get('shared'))
+        return out
+
+    def _guest_config(self, node, vmid, kind):
+        try:
+            r = self._api_get(f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/{kind}/{vmid}/config")
+            if r is not None and r.status_code == 200:
+                return r.json().get('data') or {}
+        except Exception as e:
+            self.logger.debug(f"[MAINT] config of {vmid} unreadable: {e}")
+        return None
+
+    def template_placement(self, templates, presence=None):
+        """MK Oct 2026 (#763) - where each template could go. A template cannot live-migrate;
+        the offline move copies a disk on local storage to the same storage on the target, so
+        a node qualifies only when it has every storage the template uses. Proxmox refuses a
+        CD/DVD image on local storage outright.
+
+        [{vmid, name, type, node, storages, targets, reason, code, args}]: reason (and code,
+        for the dialog to say it in its language) empty when it can move."""
+        if presence is None:
+            presence = self._storage_presence()
+
+        def kind_of(t):
+            return 'lxc' if t.get('type') == 'lxc' else 'qemu'
+        reads = {t.get('vmid'): (lambda t=t: self._guest_config(t.get('node'), t.get('vmid'), kind_of(t)))
+                 for t in templates}
+        if presence is None or not reads:
+            configs = {}
+        elif len(reads) == 1:
+            configs = {k: f() for k, f in reads.items()}
+        else:
+            from pegaprox.utils.concurrent import run_concurrent_dict
+            configs = run_concurrent_dict(reads, timeout=20)
+
+        out = []
+        for tpl in templates:
+            vmid, node = tpl.get('vmid'), tpl.get('node')
+            row = {'vmid': vmid, 'name': tpl.get('name') or f"{kind_of(tpl)} {vmid}", 'type': kind_of(tpl),
+                   'node': node, 'storages': [], 'targets': [], 'reason': '', 'code': '', 'args': {}}
+            out.append(row)
+            if presence is None:
+                row.update(reason='the storage list of the cluster could not be read', code='storage_list')
+                continue
+            config = configs.get(vmid)
+            if config is None:
+                row.update(reason='its configuration could not be read', code='config')
+                continue
+            here = presence.get(node, {})
+            storages, local_image = set(), None
+            for key, storage, value in self._guest_volumes(config):
+                storages.add(storage)
+                if ('media=cdrom' in value and 'cloudinit' not in value.split(',')[0]
+                        and not here.get(storage) and local_image is None):
+                    local_image = (key, storage)
+            row['storages'] = sorted(storages)
+            if local_image:
+                row.update(reason=f"{local_image[0]} holds an image on local storage {local_image[1]} - eject it first",
+                           code='local_image', args={'drive': local_image[0], 'storage': local_image[1]})
+                continue
+            others = {n: set(s) for n, s in presence.items() if n != node}
+            row['targets'] = sorted(n for n, s in others.items() if storages <= s)
+            if not row['targets']:
+                missing = sorted(s for s in storages if not any(s in have for have in others.values()))
+                if missing:
+                    row.update(reason=f"no other node has storage {', '.join(missing)}", code='storage_missing',
+                               args={'storages': ', '.join(missing)})
+                else:
+                    row.update(reason=f"no other node has all of {', '.join(sorted(storages))}",
+                               code='storage_split', args={'storages': ', '.join(sorted(storages))})
+        return out
+
+    def _template_target(self, node_name, vmid, targets):
+        """The node a template goes to: preferably one this rolling update is done with or
+        will not touch, so a template on local storage is copied once and not again with
+        every node after it."""
+        later = set()
+        ru = getattr(self, '_rolling_update', None) or {}
+        if ru.get('status') in ('running', 'paused'):
+            try:
+                later = set((ru.get('nodes') or [])[int(ru.get('current_index') or 0) + 1:])
+            except (TypeError, ValueError):
+                later = set()
+        settled = set(targets) - later
+        target = None
+        if settled and settled != set(targets):
+            target = self.get_best_target_node(exclude_nodes=[node_name], vmid=vmid, allowed_nodes=settled)
+        return target or self.get_best_target_node(exclude_nodes=[node_name], vmid=vmid,
+                                                   allowed_nodes=set(targets))
+
+    def _evacuate_templates(self, node_name, task, templates):
+        """MK Oct 2026 (#763) - move the node's templates offline, one at a time. A template
+        that cannot or does not move stays where it is with the reason in
+        task.templates_left; it never fails the evacuation, a template has nothing running
+        that the node's reboot could take down."""
+        if not templates:
+            return
+        for row in self.template_placement(templates):
+            vmid, name = row['vmid'], row['name']
+            task.current_vm = {'vmid': vmid, 'name': name}
+            reason = row['reason']
+            target = None
+            if not reason:
+                target = self._template_target(node_name, vmid, row['targets'])
+                if not target:
+                    reason = f"none of {', '.join(row['targets'])} is a target right now"
+            if target:
+                self.logger.info(f"[MAINT] Moving template {name} ({vmid}) offline from {node_name} to {target}")
+                res = self.migrate_vm_manual(node_name, vmid, row['type'], target, online=False)
+                if not res.get('success'):
+                    reason = f"Proxmox refused the migration: {_pve_message(res.get('error'))}"
+                elif not res.get('task') or not self._wait_for_task(node_name, res['task'], timeout=1800):
+                    reason = 'the migration task did not finish'
+                else:
+                    task.templates_moved.append({'vmid': vmid, 'name': name, 'to': target})
+                    self.logger.info(f"[OK] Template {name} ({vmid}) moved to {target}")
+                    continue
+            task.templates_left.append({'vmid': vmid, 'name': name, 'reason': reason})
+            self.logger.warning(f"[MAINT] Template {name} ({vmid}) stays on {node_name}: {reason}")
+        task.current_vm = None
+
+    # Proxmox rule ids are config ids; anything else never goes into a URL
+    _HA_RULE_ID = re.compile(r'^[A-Za-z][A-Za-z0-9_.-]{0,127}$')
+
+    def negative_ha_rules(self):
+        """MK Oct 2026 (#954) - the enabled negative resource-affinity rules of Proxmox HA:
+        [{'rule', 'resources': [sid, ...]}]. [] on a cluster without HA rules (PVE 8 has
+        groups only), None when /cluster/ha/rules could not be read."""
+        try:
+            r = self._api_get(f"https://{self.host}:{self.api_port}/api2/json/cluster/ha/rules")
+        except Exception as e:
+            self.logger.debug(f"[MAINT] HA rules unreadable: {e}")
+            return None
+        if r is None:
+            return None
+        if r.status_code in (404, 501):
+            return []
+        if r.status_code != 200:
+            return None
+        out = []
+        for rule in r.json().get('data') or []:
+            if (str(rule.get('type') or '').lower() != 'resource-affinity'
+                    or str(rule.get('affinity') or '').lower() != 'negative'
+                    or str(rule.get('disable') or '').strip().lower() in ('1', 'true', 'yes', 'on')):
+                continue
+            rid = str(rule.get('rule') or '')
+            if self._HA_RULE_ID.match(rid):
+                out.append({'rule': rid, 'resources': [s.strip() for s in str(rule.get('resources') or '').split(',')
+                                                       if s.strip()]})
+        return out
+
+    def suspend_negative_ha_rules(self, who='system'):
+        """MK Oct 2026 (#954) - switch the negative resource-affinity rules of Proxmox HA off,
+        so guests that must run apart may share a node while a rolling update has one out
+        (ha-manager refuses the migration otherwise, with as many such guests as nodes).
+        The list is in the database before the first rule is touched; a restart cannot lose
+        it, and restore_suspended_ha_rules() switches them on again.
+
+        Returns (switched off, could not be switched off)."""
+        rules = self.negative_ha_rules()
+        if not rules:
+            return [], []
+        if not ha.confirm_step('switching off the negative affinity rules'):
+            return [], [r['rule'] for r in rules]
+        db = get_db()
+        db.save_suspended_ha_rules(self.id, [r['rule'] for r in rules])
+        off, failed = [], []
+        for r in rules:
+            try:
+                resp = self._api_put(f"https://{self.host}:{self.api_port}/api2/json/cluster/ha/rules/{r['rule']}",
+                                     data={'type': 'resource-affinity', 'disable': 1})
+            except Exception as e:
+                # it may have landed; it stays listed, switching on an enabled rule changes nothing
+                self.logger.warning(f"[MAINT] switching off HA rule {r['rule']}: {e}")
+                failed.append(r['rule'])
+                continue
+            if resp is not None and resp.status_code == 200:
+                off.append(r['rule'])
+            else:
+                self.logger.warning(f"[MAINT] Proxmox kept HA rule {r['rule']} on: "
+                                    f"{_pve_message(getattr(resp, 'text', ''))}")
+                failed.append(r['rule'])
+                db.remove_suspended_ha_rule(self.id, r['rule'])
+        if off:
+            self.logger.warning(f"[MAINT] Negative affinity rules switched off for a rolling update: {', '.join(off)}")
+            from pegaprox.utils.audit import log_audit
+            log_audit(who, 'ha.rules_suspended',
+                      f"Cluster {self.config.name}: negative affinity rules switched off for a rolling update: "
+                      f"{', '.join(off)}", cluster=self.config.name)
+        return off, failed
+
+    def restore_suspended_ha_rules(self, who='system'):
+        """MK Oct 2026 (#954) - switch on what suspend_negative_ha_rules() switched off. Proxmox
+        HA then moves the guests apart again where a node is free. A rule deleted in the
+        meantime leaves the list; one that cannot be switched on stays for the next try.
+
+        Returns (switched on, still off)."""
+        db = get_db()
+        rows = db.get_suspended_ha_rules(self.id)
+        if not rows:
+            return [], []
+        if not ha.confirm_step('switching the negative affinity rules back on'):
+            return [], [rule for rule, _t, _at in rows]
+        on, left = [], []
+        for rule, rule_type, _at in rows:
+            if not self._HA_RULE_ID.match(rule or ''):
+                db.remove_suspended_ha_rule(self.id, rule)
+                continue
+            try:
+                resp = self._api_put(f"https://{self.host}:{self.api_port}/api2/json/cluster/ha/rules/{rule}",
+                                     data={'type': rule_type, 'delete': 'disable'})
+            except Exception as e:
+                self.logger.warning(f"[MAINT] switching HA rule {rule} back on: {e}")
+                left.append(rule)
+                continue
+            text = (getattr(resp, 'text', '') or '').lower()
+            if resp is not None and resp.status_code == 200:
+                db.remove_suspended_ha_rule(self.id, rule)
+                on.append(rule)
+            elif resp is not None and (resp.status_code == 404 or 'no such' in text):
+                db.remove_suspended_ha_rule(self.id, rule)
+                self.logger.info(f"[MAINT] HA rule {rule} was deleted meanwhile, nothing to switch on")
+            else:
+                left.append(rule)
+        if on:
+            self.logger.info(f"[MAINT] Negative affinity rules switched back on: {', '.join(on)}")
+            from pegaprox.utils.audit import log_audit
+            log_audit(who, 'ha.rules_restored',
+                      f"Cluster {self.config.name}: negative affinity rules switched back on: {', '.join(on)}",
+                      cluster=self.config.name)
+        if left:
+            self.logger.error(f"[MAINT] Negative affinity rules still OFF: {', '.join(left)} - "
+                              f"PegaProx retries; or run `ha-manager rules set resource-affinity <rule> --disable 0`")
+        return on, left
+
+    def _restore_suspended_ha_rules_if_due(self):
+        """#954 - rules a rolling update switched off and did not switch on again: the process
+        ended during the run, or Proxmox did not answer at its end. Looked at every cycle of
+        the daemon loop; rules a run still holds are left to it."""
+        if not ha.is_active():
+            return
+        if (getattr(self, '_rolling_update', None) or {}).get('ha_rules_held'):
+            return
+        try:
+            if not get_db().get_suspended_ha_rules(self.id):
+                return
+        except Exception:
+            return
+        on, _left = self.restore_suspended_ha_rules()
+        if on:
+            self.logger.warning(f"[MAINT] Switched on negative affinity rules a rolling update had left off: "
+                                f"{', '.join(on)}")
+
+    def _anti_affinity_held(self):
+        """#954 - a rolling update runs that lets negative affinity rules give way."""
+        ru = getattr(self, '_rolling_update', None) or {}
+        return bool(ru.get('relax_anti_affinity')) and ru.get('status') in ('running', 'paused')
+
+    def rolling_update_plan(self):
+        """MK Oct 2026 (#763, #954) - what the two evacuation options of a rolling update
+        change, read before it starts: the templates and where each could go, the negative
+        affinity rules of Proxmox HA and of PegaProx. Reads only - the guest list, one
+        storage list, the config of each template and the HA rules."""
+        vms = self.get_vm_resources(max_age=15) or []
+        templates = [v for v in vms if v.get('template') and v.get('type') in ('qemu', 'lxc')]
+        try:
+            online = sorted(n for n, d in (self.get_node_status() or {}).items() if d.get('status') == 'online')
+        except Exception:
+            online = []
+        rules = self.negative_ha_rules()
+        own = []
+        try:
+            stored = get_db().get_affinity_rules(self.id).get(self.id, [])
+        except Exception:
+            stored = []
+        try:
+            stored = list(stored) + self._derive_proxlb_tag_rules(vms)['rules']
+        except Exception:
+            pass
+        for rule in stored:
+            if rule.get('enabled', True) and rule.get('enforce', False) and rule.get('type') == 'separate':
+                own.append({'name': rule.get('name') or 'Anti-Affinity Rule',
+                            'guests': len(rule.get('vm_ids') or rule.get('vms') or [])})
+        try:
+            leftover = [rule for rule, _t, _at in get_db().get_suspended_ha_rules(self.id)]
+        except Exception:
+            leftover = []
+        return {
+            'supported': True,
+            'templates': self.template_placement(templates) if templates else [],
+            # with one node out, a rule over as many guests as online nodes has no room left
+            'negative_rules': None if rules is None else [
+                dict(r, blocks=bool(online) and len(r['resources']) >= len(online)) for r in rules],
+            'online_nodes': len(online),
+            'own_rules': own,
+            'balancer_separates': bool(getattr(self.config, 'auto_migrate', False))
+                                  and not bool(getattr(self.config, 'dry_run', False)),
+            'still_off': leftover,
+        }
 
     def maintenance_capacity_preview(self, node_name, threshold=90.0):
         """#611 — read-only pre-flight: would evacuating node_name push any
@@ -3636,7 +3969,8 @@ class PegaProxManager:
         )
         return None
 
-    def enter_maintenance_mode(self, node_name, skip_evacuation=False, allow_local_disks=False):
+    def enter_maintenance_mode(self, node_name, skip_evacuation=False, allow_local_disks=False,
+                               migrate_templates=False):
         # NS: tries native HA first, falls back to our own evacuation logic
         # NS Apr 2026 (#330): allow_local_disks opts the evacuator into
         # --with-local-disks migration for local-storage VMs. Off by default
@@ -3648,6 +3982,7 @@ class PegaProxManager:
 
             task = MaintenanceTask(node_name)
             task.allow_local_disks = bool(allow_local_disks)
+            task.migrate_templates = bool(migrate_templates)   # #763
             self.nodes_in_maintenance[node_name] = task
 
         self.logger.info(f"[MAINT] Entering maintenance mode for node: {node_name}"
@@ -4084,12 +4419,16 @@ class PegaProxManager:
                 vm.get('status') == 'running' and
                 vm.get('type') in ['qemu', 'lxc']
             ]
+            # #763 - a template is never running, so the list above never holds one
+            templates = [vm for vm in vms if vm.get('node') == node_name and vm.get('template')
+                         and vm.get('type') in ('qemu', 'lxc')] if getattr(task, 'migrate_templates', False) else []
 
             task.total_vms = len(node_vms)
             task.pending_vms = node_vms.copy()
 
             if task.total_vms == 0:
                 self.logger.info(f"[OK] No running VMs on {node_name}, maintenance mode ready")
+                self._evacuate_templates(node_name, task, templates)
                 task.status = 'completed'
                 return
 
@@ -4112,6 +4451,7 @@ class PegaProxManager:
                 task.pending_vms = []
                 task.note = (f"Single node: {task.total_vms} guest(s) not evacuated — no other "
                              f"node to migrate to. They stay running (a reboot will take them down).")
+                self._evacuate_templates(node_name, task, templates)
                 task.status = 'completed'
                 return
 
@@ -4226,6 +4566,9 @@ class PegaProxManager:
                         task.migrated_vms += len(moved)
                 except Exception as e:
                     self.logger.debug(f"[MAINT] recheck of failed evacuations skipped: {e}")
+
+            # after the running guests, before the status the rolling update waits for
+            self._evacuate_templates(node_name, task, templates)
 
             if len(task.failed_vms) == 0:
                 task.status = 'completed'
@@ -18587,7 +18930,11 @@ echo "AGENT_INSTALLED_OK"
 
             # NS: Mar 2026 - Proactive anti-affinity enforcement (Issue #148)
             # Even if cluster is balanced, fix any anti-affinity violations
-            if self.config.auto_migrate and not self.config.dry_run:
+            # MK Oct 2026 (#954) - a rolling update that lets them share a node keeps them
+            # together until it has ended; the first cycle after it separates them
+            if self.config.auto_migrate and not self.config.dry_run and self._anti_affinity_held():
+                self.logger.info("[AFFINITY] Enforcement waits until the rolling update has ended")
+            elif self.config.auto_migrate and not self.config.dry_run:
                 try:
                     affinity_migrations = self._enforce_affinity_rules(node_status)
                     migrations_done += affinity_migrations
@@ -18634,7 +18981,14 @@ echo "AGENT_INSTALLED_OK"
                         self.connect_to_proxmox()
                 
                 self.logger.debug("PegaProx is disabled, skipping check")
-            
+
+            # #954 - balancing on or off, rules a rolling update left off go back on
+            if self.is_connected:
+                try:
+                    self._restore_suspended_ha_rules_if_due()
+                except Exception as e:
+                    self.logger.error(f"[MAINT] switching negative affinity rules back on failed: {e}")
+
             # Wait for next interval or stop signal
             self.stop_event.wait(self.config.check_interval)
         
