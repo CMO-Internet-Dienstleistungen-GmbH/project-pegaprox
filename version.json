@@ -74,6 +74,7 @@
     "pegaprox/api/metrics_exporter.py",
     "pegaprox/api/multi_sdn.py",
     "pegaprox/api/nodes.py",
+    "pegaprox/api/oci_catalog.py",
     "pegaprox/api/pbs.py",
     "pegaprox/api/plugins.py",
     "pegaprox/api/power.py",

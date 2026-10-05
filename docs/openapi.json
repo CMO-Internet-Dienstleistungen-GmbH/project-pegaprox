@@ -41182,6 +41182,181 @@
         ]
       }
     },
+    "/api/oci/catalog": {
+      "get": {
+        "operationId": "oci_catalog.catalog_get",
+        "tags": [
+          "oci_catalog"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          }
+        },
+        "summary": "The curated images, and what a node needs to take them.",
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ]
+      }
+    },
+    "/api/clusters/{cluster_id}/oci/nodes": {
+      "get": {
+        "operationId": "oci_catalog.nodes_get",
+        "tags": [
+          "oci_catalog"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Which nodes of the cluster can create containers from OCI images, and why the others cannot (offline, version unknown, older than Proxmox VE 9.1).",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "vm.create"
+        ]
+      }
+    },
+    "/api/clusters/{cluster_id}/oci/deploy": {
+      "post": {
+        "operationId": "oci_catalog.deploy_post",
+        "tags": [
+          "oci_catalog"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Pull an OCI image onto a storage of a node and create a container from it.",
+        "description": "Body: reference, node, storage (takes the image), rootfs_storage, disk_gb, hostname,\nvmid (optional), cores, memory, swap, bridge, vlan, ip ('dhcp' or address/prefix),\ngw, env (KEY=value list), start. Answers with the job; its progress is under\n/api/clusters/<cluster_id>/oci/jobs.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "vm.create"
+        ]
+      }
+    },
+    "/api/clusters/{cluster_id}/oci/jobs": {
+      "get": {
+        "operationId": "oci_catalog.jobs_get",
+        "tags": [
+          "oci_catalog"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "The recent pulls and creates on this cluster, newest first.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "cluster.view"
+        ]
+      }
+    },
     "/api/push/vapid-key": {
       "get": {
         "operationId": "push.vapid_key_get",

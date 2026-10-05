@@ -259,6 +259,7 @@ FORWARDED_READS = LEADER_ONLY_READS | XCPNG_TASK_READS | frozenset((
     '/api/cluster-groups/<group_id>/lb-history',
     '/api/clusters/<cluster_id>/templates/deployments',
     '/api/templates/deployments/<dep_id>',
+    '/api/clusters/<cluster_id>/oci/jobs',
     '/api/dr-drills/<drill_id>',
     '/api/site-recovery/plans/<plan_id>/drills',
     '/api/site-recovery/plans/<plan_id>/events',

@@ -721,6 +721,7 @@ AUTOMATIONS = {
     ('pegaprox/api/storage.py', 'iso_sync_trigger'): (1, 'job'),
     ('pegaprox/api/storage.py', 'iso_sync_all'): (1, 'job'),
     ('pegaprox/api/templates_lib.py', 'deploy'): (1, 'job'),
+    ('pegaprox/api/oci_catalog.py', '_spawn'): (1, 'job'),
     ('pegaprox/api/vms.py', 'download_iso_from_url'): (1, 'read'),
     ('pegaprox/api/vms.py', 'join_node_to_cluster'): (1, 'read'),
     ('pegaprox/api/vms.py', 'remove_node_from_cluster'): (1, 'read'),
