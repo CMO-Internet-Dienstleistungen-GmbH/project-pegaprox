@@ -499,6 +499,17 @@ def drop_own_recovery_locks(instance_id):
     return removed
 
 
+class UnreadList(list):
+    """The [] get_vm_resources() answers when cluster/resources did not answer.
+
+    It is still an empty list to every caller that only wants one. A caller that acts on
+    what is missing asks `unavailable` first: a timeout of that read at 10k guests is not
+    a cluster without guests, and drift reported every guest baseline removed. MK Oct 2026
+    """
+    __slots__ = ()
+    unavailable = True
+
+
 class PegaProxManager:
     """
     main cluster manager - NS
@@ -2094,13 +2105,14 @@ class PegaProxManager:
             cached = getattr(self, '_vm_resources_cache', None)
             if cached and (time.time() - cached[0]) < max_age:
                 return cached[1]
-        if not self.is_connected or not self.session: return []
+        # a failed read answers UnreadList(): [] for anyone, "not read" for drift
+        if not self.is_connected or not self.session: return UnreadList()
 
         try:
             url = f"https://{self.host}:{self.api_port}/api2/json/cluster/resources"
             resp = self._create_session().get(url, params={'type': 'vm'}, timeout=10)
             
-            if resp.status_code != 200: return []
+            if resp.status_code != 200: return UnreadList()
             
             # NS: success - reset failure counter
             self._consecutive_failures = 0
@@ -2143,9 +2155,9 @@ class PegaProxManager:
             return resources
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
             # LW: don't immediately mark disconnected, use failure counter
-            return []
+            return UnreadList()
         except:
-            return []
+            return UnreadList()
     
     # MK May 2026 (#413) — uniform get_vms(node=None) shim so the site-recovery
     # detection code (and any other caller that loops over manager types) can

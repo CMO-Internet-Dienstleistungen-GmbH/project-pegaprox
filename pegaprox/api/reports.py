@@ -47,6 +47,22 @@ def _period_cutoff(period):
     return 1, now - timedelta(days=1)
 
 
+def _with_offset(ts):
+    """A stored timestamp as ISO with the server's UTC offset.
+
+    MK Oct 2026 - snapshots, scans and syslog rows store datetime.now().isoformat():
+    server-local and naive. A browser reads a naive ISO string as ITS local time, so
+    with server and browser in different zones every chart label was off by the
+    difference. The stored format stays, the answer carries the offset.
+    """
+    if not ts or not isinstance(ts, str):
+        return ts
+    try:
+        return datetime.fromisoformat(ts).astimezone().isoformat()
+    except ValueError:
+        return ts
+
+
 def _syslog_search_terms(search_text):
     return [term for term in re.split(r'\s+', search_text.strip()) if term]
 
@@ -215,8 +231,8 @@ def get_reports_summary():
     report = {
         'period': period,
         'data_points': len(filtered),
-        'start_time': filtered[0].get('timestamp'),
-        'end_time': filtered[-1].get('timestamp'),
+        'start_time': _with_offset(filtered[0].get('timestamp')),
+        'end_time': _with_offset(filtered[-1].get('timestamp')),
         'clusters': {}
     }
 
@@ -450,7 +466,7 @@ def get_integrated_syslog_events():
     total_pages = (total + per_page - 1) // per_page if total else 0
 
     return jsonify({
-        'items': [dict(row) for row in rows],
+        'items': [dict(dict(row), timestamp=_with_offset(row['timestamp'])) for row in rows],
         'pagination': {
             'page': page,
             'per_page': per_page,
@@ -506,7 +522,7 @@ def get_reports_timeline():
 
     for snapshot in filtered:
         timestamp = snapshot.get('timestamp', '')
-        timeline['timestamps'].append(timestamp)
+        timeline['timestamps'].append(_with_offset(timestamp))
 
         for cluster_id, cluster_data in snapshot.get('clusters', {}).items():
             if filter_cluster and cluster_id != filter_cluster:
@@ -659,6 +675,8 @@ def scan_all_nodes_cves(cluster_id):
             continue
         try:
             scan = mgr.scan_node_packages(node_name)
+            if isinstance(scan, dict) and scan.get('timestamp'):
+                scan['timestamp'] = _with_offset(scan['timestamp'])
             results.append(scan)
         except Exception as e:
             logging.warning(f"[cve-scan] node {node_name} scan failed: {e}")  # detail to logs, not the response
@@ -672,7 +690,7 @@ def scan_all_nodes_cves(cluster_id):
     return jsonify({
         'cluster_id': cluster_id,
         'cluster_name': getattr(mgr.config, 'name', cluster_id),
-        'scanned_at': datetime.now().isoformat(),
+        'scanned_at': datetime.now().astimezone().isoformat(),
         'nodes': results,
         'summary': {
             'nodes_scanned': len(results),
@@ -710,6 +728,8 @@ def scan_single_node_cves(cluster_id, node):
         return jsonify({'error': 'Cluster not connected'}), 503
 
     result = mgr.scan_node_packages(node)
+    if isinstance(result, dict) and result.get('timestamp'):
+        result['timestamp'] = _with_offset(result['timestamp'])
     return jsonify(result)
 
 
@@ -1109,7 +1129,7 @@ def get_cluster_report_summary(cluster_id):
         if not cluster_data:
             continue
 
-        report['timestamps'].append(snapshot.get('timestamp', ''))
+        report['timestamps'].append(_with_offset(snapshot.get('timestamp', '')))
         report['data_points'] += 1
 
         totals = cluster_data.get('totals', {})

@@ -145,8 +145,9 @@ def test_the_timeline_runs_forward_and_current_is_the_newest_sample(api, seed, h
     week = _summary(api, seed, 'week')
     assert week['timestamps'] == sorted(week['timestamps'])
     assert week['cpu']['current'] == week['cpu']['samples'][-1]
+    # the answer carries the server's UTC offset (test_report_times_carry_their_offset.py)
     newest = datetime.fromisoformat(week['timestamps'][-1])
-    assert (history.now - newest).total_seconds() < CADENCE_MIN * 60 + 60, (
+    assert (history.now.astimezone() - newest).total_seconds() < CADENCE_MIN * 60 + 60, (
         'the last point is an old one - the series is reversed or decimated past the end')
 
 
