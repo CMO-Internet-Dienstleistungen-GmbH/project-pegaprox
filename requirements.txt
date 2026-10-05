@@ -57,7 +57,13 @@ fido2>=2.2.1
 ldap3>=2.9.0
 
 # === OIDC JWT Verification ===
-PyJWT[crypto]==2.14.0
+# MK Oct 2026 - 2.15.1 rather than the 2.14.0 the scanner asked for (#972). 2.14.0 is the
+# one that matters to us (PyJWKClient stops following JWKS redirects past our SSRF guard),
+# but it refuses '='-padded token segments, so an IdP that pads drops into the unverified
+# fallback in utils/oidc.py; 2.15.1 takes them again. A floor, not a pin: update.sh and the
+# in-app updater run `pip install -r`, which takes a newer PyJWT back down to an == and then
+# never moves past it.
+PyJWT[crypto]>=2.15.1
 
 # === ESXi Migration (Optional) ===
 pyvmomi>=8.0.0
