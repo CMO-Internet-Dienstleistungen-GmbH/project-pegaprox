@@ -384,11 +384,14 @@
 
         // ── side nav (collapsible, grouped) ────────────────────────
         function CloudSideNav({ active, onSelect, isAdmin, canAutoInstall, collapsed, onToggle }) {
+            const { t } = useTranslation();
             const groups = [
                 { label: 'DASHBOARD', items: [{ id: 'overview', label: 'Overview', icon: 'Grid' }] },
                 { label: 'COMPUTE', items: [
                     { id: 'vms', label: 'Virtual Machines', icon: 'Server' },
                     { id: 'containers', label: 'Containers', icon: 'Box' },
+                    // LW Oct 2026 - containers from OCI images
+                    { id: 'apps', label: t('ociTabLabel'), icon: 'Container' },
                 ] },
                 { label: 'STORAGE', items: [
                     { id: 'datastores', label: 'Datastores', icon: 'Database' },
@@ -2395,6 +2398,7 @@
                 overview: T('cloud.overview') || 'Overview',
                 vms: T('cloud.vms') || 'Virtual Machines',
                 containers: T('cloud.containers') || 'Containers',
+                apps: T('ociTabLabel') || 'App Containers',
                 datastores: T('cloud.datastores') || 'Datastores',
                 pools: T('cloud.pools') || 'Resource Pools',
                 networks: T('cloud.networks') || 'Networks',
@@ -2458,6 +2462,10 @@
                         break;
                     case 'containers':
                         body = <CloudInstanceList rows={cts} kind="lxc" clusterId={cid} act={act} onOpen={openDetail} onCreate={act.createVm} t={T} />;
+                        break;
+                    case 'apps':
+                        // raw t: every string of the tab is translated, and it fills {placeholders} in
+                        body = <div className="cloud-mounted"><OciCatalogTab clusters={safeClusters} clusterId={cid} authFetch={authFetch} addToast={addToast} t={t} /></div>;
                         break;
                     case 'datastores':
                         body = <CloudDatastores datastores={clusterDatastores} t={T} />;

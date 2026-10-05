@@ -6057,6 +6057,422 @@
             );
         }
 
+        // LW Oct 2026 - app containers from OCI images. Proxmox VE 9.1 pulls an image onto a
+        // storage and creates a container from it (a technology preview there, so here too).
+        // The server checks each node's version, the storages and the caller; this only
+        // offers what it said yes to (api/oci_catalog.py).
+        function OciCatalogTab({ clusters, clusterId, authFetch, addToast, t }) {
+            const { haReadOnly } = useAuth();
+            const pveClusters = (clusters || []).filter(c => c && (c.cluster_type || 'proxmox') === 'proxmox');
+            const [cid, setCid] = React.useState(clusterId || (pveClusters[0] && pveClusters[0].id) || '');
+            const cidRef = React.useRef(cid);
+            cidRef.current = cid;
+            React.useEffect(() => { if (clusterId) setCid(clusterId); }, [clusterId]);
+            const [images, setImages] = React.useState([]);
+            const [minPve, setMinPve] = React.useState('9.1');
+            const [support, setSupport] = React.useState(null);
+            const [jobs, setJobs] = React.useState([]);
+            const [custom, setCustom] = React.useState('');
+            const [dialog, setDialog] = React.useState(null);
+            const [form, setForm] = React.useState({});
+            const [storages, setStorages] = React.useState([]);
+            const [bridges, setBridges] = React.useState([]);
+            const [submitting, setSubmitting] = React.useState(false);
+            const [formError, setFormError] = React.useState('');
+
+            const fill = (key, vars) => Object.entries(vars || {}).reduce((s, [k, v]) => s.split(`{${k}}`).join(String(v)), t(key));
+            const nodesHere = (support && support.nodes) || [];
+            const readyNodes = nodesHere.filter(n => n.supported);
+            const canAct = !haReadOnly && readyNodes.length > 0;
+            const running = (j) => ['queued', 'pulling', 'creating'].includes(j.status);
+
+            React.useEffect(() => {
+                authFetch(`${API_URL}/oci/catalog`).then(r => (r && r.ok ? r.json() : null)).then(d => {
+                    if (d) { setImages(d.images || []); setMinPve(d.min_pve || '9.1'); }
+                }).catch(() => {});
+            }, []); // eslint-disable-line
+
+            const loadJobs = async () => {
+                const asked = cidRef.current;
+                if (!asked) return;
+                const r = await authFetch(`${API_URL}/clusters/${asked}/oci/jobs`);
+                const d = r && r.ok ? await r.json().catch(() => ({})) : null;
+                // another cluster may have been picked while this one answered
+                if (d && cidRef.current === asked) setJobs(d.jobs || []);
+            };
+
+            const loadSupport = async () => {
+                const asked = cidRef.current;
+                if (!asked) return;
+                const r = await authFetch(`${API_URL}/clusters/${asked}/oci/nodes`);
+                const d = r ? await r.json().catch(() => ({})) : {};
+                if (cidRef.current !== asked) return;
+                if (r && r.ok) setSupport(d);
+                else if (r && r.status === 403) setSupport({ denied: true });
+                else setSupport({ error: d.error || t('ociNodesFailed') });
+            };
+
+            React.useEffect(() => {
+                setSupport(null);
+                setJobs([]);
+                loadSupport();
+                loadJobs();
+            }, [cid]); // eslint-disable-line
+
+            // follow a run while it is on its way
+            React.useEffect(() => {
+                if (!jobs.some(running)) return;
+                const id = setInterval(loadJobs, 4000);
+                return () => clearInterval(id);
+            }, [jobs, cid]); // eslint-disable-line
+
+            const openDialog = (img) => {
+                const ref = img.reference;
+                const last = ref.replace(/:[^:/]*$/, '').split('/').pop() || '';
+                setFormError('');
+                setStorages([]);
+                setBridges([]);
+                setForm({
+                    reference: ref, node: readyNodes[0] ? readyNodes[0].node : '',
+                    storage: '', rootfs_storage: '', disk_gb: img.disk_gb || 4,
+                    bridge: '', vlan: '', ipMode: 'dhcp', ip: '', gw: '',
+                    hostname: img.id || last.replace(/[^a-zA-Z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 63),
+                    vmid: '', cores: img.cores || 1, memory: img.memory || 512, swap: 512, env: '', start: true,
+                });
+                setDialog(img);
+            };
+
+            // the storages and bridges of the chosen node
+            React.useEffect(() => {
+                if (!dialog || !form.node) return;
+                let gone = false;
+                (async () => {
+                    const node = encodeURIComponent(form.node);
+                    const [rs, rn] = await Promise.all([
+                        authFetch(`${API_URL}/clusters/${cid}/nodes/${node}/storage`),
+                        authFetch(`${API_URL}/clusters/${cid}/nodes/${node}/networks`),
+                    ]);
+                    const list = rs && rs.ok ? await rs.json().catch(() => []) : [];
+                    const nets = rn && rn.ok ? await rn.json().catch(() => []) : [];
+                    if (gone) return;
+                    const usable = (Array.isArray(list) ? list : []).filter(s => s && s.enabled !== 0 && s.active !== 0);
+                    const takes = (c) => usable.filter(s => String(s.content || '').split(',').includes(c)).map(s => s.storage);
+                    const tpl = takes('vztmpl');
+                    const root = takes('rootdir');
+                    const br = (Array.isArray(nets) ? nets : []).map(n => n && n.iface).filter(Boolean);
+                    setStorages(usable);
+                    setBridges(br);
+                    setForm(f => ({
+                        ...f,
+                        storage: tpl.includes(f.storage) ? f.storage : (tpl.includes('local') ? 'local' : (tpl[0] || '')),
+                        rootfs_storage: root.includes(f.rootfs_storage) ? f.rootfs_storage : (root.includes('local-lvm') ? 'local-lvm' : (root[0] || '')),
+                        bridge: br.includes(f.bridge) ? f.bridge : (br.includes('vmbr0') ? 'vmbr0' : (br[0] || '')),
+                    }));
+                })();
+                return () => { gone = true; };
+            }, [dialog, form.node, cid]); // eslint-disable-line
+
+            const storagesFor = (c) => storages.filter(s => String(s.content || '').split(',').includes(c)).map(s => s.storage);
+
+            // a double click lands before the disabled button renders; one container per click
+            const sending = React.useRef(false);
+            const submit = async () => {
+                if (sending.current) return;
+                sending.current = true;
+                setSubmitting(true);
+                setFormError('');
+                try {
+                    const body = {
+                        reference: form.reference.trim(), node: form.node, storage: form.storage,
+                        rootfs_storage: form.rootfs_storage, disk_gb: form.disk_gb, bridge: form.bridge,
+                        hostname: form.hostname.trim(), cores: form.cores, memory: form.memory, swap: form.swap,
+                        ip: form.ipMode === 'static' ? form.ip.trim() : 'dhcp', start: !!form.start,
+                        env: form.env.split('\n').map(s => s.trim()).filter(Boolean),
+                    };
+                    if (form.ipMode === 'static' && form.gw.trim()) body.gw = form.gw.trim();
+                    if (String(form.vlan).trim()) body.vlan = form.vlan;
+                    if (String(form.vmid).trim()) body.vmid = form.vmid;
+                    const r = await authFetch(`${API_URL}/clusters/${cid}/oci/deploy`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body),
+                    });
+                    const d = r ? await r.json().catch(() => ({})) : {};
+                    if (r && r.ok) {
+                        addToast(fill('ociStarted', { vmid: d.job ? d.job.vmid : '' }), 'success');
+                        setDialog(null);
+                        loadJobs();
+                    } else {
+                        setFormError(d.error || t('ociDeployFailed'));
+                    }
+                } finally {
+                    sending.current = false;
+                    setSubmitting(false);
+                }
+            };
+
+            const statusLabel = (s) => ({
+                queued: t('ociStatusQueued'), pulling: t('ociStatusPulling'), creating: t('ociStatusCreating'),
+                completed: t('ociStatusCompleted'), failed: t('ociStatusFailed'),
+            }[s] || s);
+            const statusColor = (s) => ({
+                queued: 'bg-gray-500/20 text-gray-400', pulling: 'bg-blue-500/20 text-blue-400',
+                creating: 'bg-blue-500/20 text-blue-400', completed: 'bg-green-500/20 text-green-400',
+                failed: 'bg-red-500/20 text-red-400',
+            }[s] || 'bg-gray-500/20 text-gray-400');
+            const nodeNote = (n) => n.reason === 'too_old'
+                ? fill('ociNodeTooOld', { version: n.pve_version || '?', min: minPve })
+                : (n.reason === 'offline' ? t('ociNodeOffline') : t('ociNodeUnknown'));
+            const field = 'w-full px-3 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm';
+            const label = 'text-xs text-gray-400 block mb-1';
+            const standbyTitle = haReadOnly ? t('pgHaStandbyRefused') : undefined;
+            // the server checks the reference as PVE would; this only waits for a tag
+            const customOk = /^\S+:\w[\w.-]*$/.test(custom.trim());
+            const tplStorages = storagesFor('vztmpl');
+            const rootStorages = storagesFor('rootdir');
+
+            return (
+                <div className="space-y-4" data-oci-catalog>
+                    <div className="flex items-start justify-between flex-wrap gap-2">
+                        <div>
+                            <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+                                <Icons.Container className="w-5 h-5 text-proxmox-orange" />
+                                {t('ociTitle')}
+                                <span data-oci-preview className="text-[10px] px-1.5 py-0.5 bg-yellow-500/20 text-yellow-400 rounded uppercase">
+                                    {t('ociTechPreview')}
+                                </span>
+                            </h2>
+                            <p className="text-xs text-gray-500 mt-0.5">{fill('ociDesc', { min: minPve })}</p>
+                        </div>
+                        <div className="flex gap-2 items-center">
+                            {pveClusters.length > 1 && (
+                                <select data-oci-cluster value={cid} onChange={e => setCid(e.target.value)}
+                                    className="px-3 py-1.5 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm">
+                                    {pveClusters.map(c => <option key={c.id} value={c.id}>{c.display_name || c.name || c.id}</option>)}
+                                </select>
+                            )}
+                            <button onClick={() => { loadSupport(); loadJobs(); }}
+                                className="px-3 py-1.5 bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white rounded-lg text-sm flex items-center gap-1.5">
+                                <Icons.RefreshCw className="w-3.5 h-3.5" />
+                                {t('refresh')}
+                            </button>
+                        </div>
+                    </div>
+
+                    <div className="bg-yellow-500/5 border border-yellow-500/20 rounded-lg p-3 text-xs text-yellow-300 flex items-start gap-2">
+                        <Icons.AlertTriangle className="w-4 h-4 flex-shrink-0" />
+                        <span>{t('ociPreviewNote')}</span>
+                    </div>
+
+                    {support && support.denied && (
+                        <div data-oci-denied className="bg-proxmox-card border border-proxmox-border rounded-lg p-3 text-xs text-gray-400 flex items-start gap-2">
+                            <Icons.Lock className="w-4 h-4 flex-shrink-0" />
+                            <span>{t('ociDenied')}</span>
+                        </div>
+                    )}
+                    {support && support.error && (
+                        <div className="bg-red-500/5 border border-red-500/20 rounded-lg p-3 text-xs text-red-300">{support.error}</div>
+                    )}
+                    {support && support.nodes && readyNodes.length === 0 && (
+                        <div data-oci-no-node className="bg-red-500/5 border border-red-500/20 rounded-lg p-3 text-xs text-red-300">
+                            <div>{fill('ociNoNode', { min: minPve })}</div>
+                            <div className="mt-1 text-gray-400">{nodesHere.map(n => `${n.node}: ${nodeNote(n)}`).join(' · ')}</div>
+                        </div>
+                    )}
+                    {readyNodes.length > 0 && readyNodes.length < nodesHere.length && (
+                        <div data-oci-some-nodes className="text-xs text-gray-400" title={nodesHere.filter(n => !n.supported).map(n => `${n.node}: ${nodeNote(n)}`).join('\n')}>
+                            {fill('ociSomeNodes', { ready: readyNodes.length, total: nodesHere.length, min: minPve })}
+                        </div>
+                    )}
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                        {images.map(img => (
+                            <div key={img.id} data-oci-image={img.id} className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 flex flex-col">
+                                <div className="text-sm font-semibold text-white">{img.name}</div>
+                                <div className="text-xs text-gray-500 mt-0.5">{img.description}</div>
+                                <code className="text-[11px] text-gray-400 mt-2 break-all">{img.reference}</code>
+                                <div className="text-xs text-gray-500 mt-2 mb-3">
+                                    {fill('ociResources', { cores: img.cores, memory: img.memory, disk: img.disk_gb })}
+                                    {(img.ports || []).length > 0 && ` · ${fill('ociListens', { ports: img.ports.join(', ') })}`}
+                                </div>
+                                <div className="flex-1" />
+                                <button data-oci-deploy={img.id} onClick={() => openDialog(img)} disabled={!canAct} title={standbyTitle}
+                                    className="px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm rounded flex items-center justify-center gap-1.5">
+                                    <Icons.Download className="w-3.5 h-3.5" /> {t('ociCreate')}
+                                </button>
+                            </div>
+                        ))}
+                        <div data-oci-image="custom" className="bg-proxmox-card border border-dashed border-proxmox-border rounded-xl p-4 flex flex-col">
+                            <div className="text-sm font-semibold text-white">{t('ociAnyImage')}</div>
+                            <div className="text-xs text-gray-500 mt-0.5">{t('ociAnyImageDesc')}</div>
+                            <input data-oci-custom-ref type="text" value={custom} onChange={e => setCustom(e.target.value)}
+                                placeholder="ghcr.io/owner/app:1.0" className={`${field} mt-2 mb-3`} />
+                            <div className="flex-1" />
+                            <button data-oci-deploy="custom" onClick={() => openDialog({ id: '', name: custom.trim(), reference: custom.trim() })}
+                                disabled={!canAct || !customOk} title={standbyTitle}
+                                className="px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm rounded flex items-center justify-center gap-1.5">
+                                <Icons.Download className="w-3.5 h-3.5" /> {t('ociCreate')}
+                            </button>
+                        </div>
+                    </div>
+
+                    {jobs.length > 0 && (
+                        <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4">
+                            <h3 className="text-sm font-semibold text-white mb-2">{t('ociJobs')}</h3>
+                            <div className="space-y-1.5">
+                                {jobs.slice(0, 10).map(j => (
+                                    <div key={j.id} data-oci-job={j.id} data-oci-job-status={j.status}
+                                        className="flex items-center justify-between text-xs gap-2 bg-proxmox-dark border border-proxmox-border rounded px-3 py-2">
+                                        <div className="flex items-center gap-2 min-w-0 flex-1">
+                                            <span className={`px-1.5 py-0.5 rounded flex-shrink-0 ${statusColor(j.status)}`}>
+                                                {running(j) && <Icons.RotateCw className="w-3 h-3 inline mr-1 animate-spin" />}
+                                                {statusLabel(j.status)}
+                                            </span>
+                                            <span className="text-gray-300 truncate">{j.reference}</span>
+                                            <span className="text-gray-500 flex-shrink-0">CT {j.vmid} · {j.node}</span>
+                                            {j.reused && <span className="text-gray-500 flex-shrink-0">({t('ociReused')})</span>}
+                                            {j.started_by && (
+                                                <span className="text-gray-500 flex-shrink-0 flex items-center gap-1">
+                                                    <Icons.User className="w-3 h-3" />{j.started_by}
+                                                </span>
+                                            )}
+                                        </div>
+                                        {j.status === 'failed' && j.error && (
+                                            <span data-oci-job-error className="text-red-400 truncate max-w-xs" title={j.error}>{j.error}</span>
+                                        )}
+                                        <span className="text-gray-600 flex-shrink-0">{(j.started_at || '').replace('T', ' ').slice(0, 16)}</span>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+
+                    {dialog && (
+                        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" onClick={() => !submitting && setDialog(null)}>
+                            <div data-oci-dialog className="bg-proxmox-card border border-proxmox-border rounded-xl p-5 w-full max-w-xl max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+                                <h3 className="text-base font-semibold text-white mb-1 flex items-center gap-2">
+                                    <Icons.Container className="w-4 h-4 text-proxmox-orange" />
+                                    {fill('ociDialogTitle', { image: dialog.name || dialog.reference })}
+                                </h3>
+                                <code className="text-[11px] text-gray-400 break-all">{form.reference}</code>
+                                <div className="space-y-3 mt-4">
+                                    <div className="grid grid-cols-2 gap-2">
+                                        <div>
+                                            <label className={label}>{t('node')}</label>
+                                            <select data-oci-field="node" value={form.node} onChange={e => setForm({ ...form, node: e.target.value })} className={field}>
+                                                {nodesHere.map(n => (
+                                                    <option key={n.node} value={n.node} disabled={!n.supported}>
+                                                        {n.supported ? `${n.node} (PVE ${n.pve_version})` : `${n.node} - ${nodeNote(n)}`}
+                                                    </option>
+                                                ))}
+                                            </select>
+                                        </div>
+                                        <div>
+                                            <label className={label}>{t('hostname')}</label>
+                                            <input data-oci-field="hostname" type="text" value={form.hostname} onChange={e => setForm({ ...form, hostname: e.target.value })} className={field} />
+                                        </div>
+                                    </div>
+                                    <div>
+                                        <label className={label}>{t('ociImageStorage')}</label>
+                                        <select data-oci-field="storage" value={form.storage} onChange={e => setForm({ ...form, storage: e.target.value })} className={field}>
+                                            {tplStorages.length === 0 && <option value="">{t('ociNoStorage')}</option>}
+                                            {tplStorages.map(s => <option key={s} value={s}>{s}</option>)}
+                                        </select>
+                                        <div className="text-[10px] text-gray-600 mt-1">{t('ociImageStorageHint')}</div>
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-2">
+                                        <div>
+                                            <label className={label}>{t('ociRootStorage')}</label>
+                                            <select data-oci-field="rootfs_storage" value={form.rootfs_storage} onChange={e => setForm({ ...form, rootfs_storage: e.target.value })} className={field}>
+                                                {rootStorages.length === 0 && <option value="">{t('ociNoStorage')}</option>}
+                                                {rootStorages.map(s => <option key={s} value={s}>{s}</option>)}
+                                            </select>
+                                        </div>
+                                        <div>
+                                            <label className={label}>{t('ociDiskGb')}</label>
+                                            <input data-oci-field="disk_gb" type="number" min="1" value={form.disk_gb} onChange={e => setForm({ ...form, disk_gb: e.target.value })} className={field} />
+                                        </div>
+                                    </div>
+                                    <div className="grid grid-cols-3 gap-2">
+                                        <div>
+                                            <label className={label}>{t('cores')}</label>
+                                            <input data-oci-field="cores" type="number" min="1" value={form.cores} onChange={e => setForm({ ...form, cores: e.target.value })} className={field} />
+                                        </div>
+                                        <div>
+                                            <label className={label}>{t('ociMemoryMb')}</label>
+                                            <input data-oci-field="memory" type="number" min="16" step="64" value={form.memory} onChange={e => setForm({ ...form, memory: e.target.value })} className={field} />
+                                        </div>
+                                        <div>
+                                            <label className={label}>{t('ociSwapMb')}</label>
+                                            <input data-oci-field="swap" type="number" min="0" step="64" value={form.swap} onChange={e => setForm({ ...form, swap: e.target.value })} className={field} />
+                                        </div>
+                                    </div>
+                                    <div className="grid grid-cols-3 gap-2">
+                                        <div className="col-span-2">
+                                            <label className={label}>{t('ociBridge')}</label>
+                                            <select data-oci-field="bridge" value={form.bridge} onChange={e => setForm({ ...form, bridge: e.target.value })} className={field}>
+                                                {bridges.map(b => <option key={b} value={b}>{b}</option>)}
+                                            </select>
+                                        </div>
+                                        <div>
+                                            <label className={label}>{t('ociVlan')} <span className="text-gray-600">({t('optional')})</span></label>
+                                            <input data-oci-field="vlan" type="number" min="1" max="4094" value={form.vlan} onChange={e => setForm({ ...form, vlan: e.target.value })} className={field} />
+                                        </div>
+                                    </div>
+                                    <div>
+                                        <label className={label}>{t('ociIpv4')}</label>
+                                        <div className="flex items-center gap-4 text-sm text-gray-300">
+                                            <label className="flex items-center gap-1.5">
+                                                <input type="radio" name="oci-ip" checked={form.ipMode === 'dhcp'} onChange={() => setForm({ ...form, ipMode: 'dhcp' })} /> {t('ociDhcp')}
+                                            </label>
+                                            <label className="flex items-center gap-1.5">
+                                                <input data-oci-field="static" type="radio" name="oci-ip" checked={form.ipMode === 'static'} onChange={() => setForm({ ...form, ipMode: 'static' })} /> {t('ociStatic')}
+                                            </label>
+                                        </div>
+                                        {form.ipMode === 'static' && (
+                                            <div className="grid grid-cols-2 gap-2 mt-2">
+                                                <input data-oci-field="ip" type="text" value={form.ip} placeholder={`${t('ociAddress')} 10.0.0.5/24`} onChange={e => setForm({ ...form, ip: e.target.value })} className={field} />
+                                                <input data-oci-field="gw" type="text" value={form.gw} placeholder={t('ociGateway')} onChange={e => setForm({ ...form, gw: e.target.value })} className={field} />
+                                            </div>
+                                        )}
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-2">
+                                        <div>
+                                            <label className={label}>{t('ociCtId')} <span className="text-gray-600">({t('optional')})</span></label>
+                                            <input data-oci-field="vmid" type="number" min="100" value={form.vmid} placeholder={t('ociCtIdAuto')} onChange={e => setForm({ ...form, vmid: e.target.value })} className={field} />
+                                        </div>
+                                        <label className="flex items-center gap-2 text-sm text-gray-300 mt-6">
+                                            <input data-oci-field="start" type="checkbox" checked={!!form.start} onChange={e => setForm({ ...form, start: e.target.checked })} />
+                                            {t('ociStartAfter')}
+                                        </label>
+                                    </div>
+                                    <div>
+                                        <label className={label}>{t('ociEnv')} <span className="text-gray-600">({t('optional')})</span></label>
+                                        <textarea data-oci-field="env" rows="3" value={form.env} onChange={e => setForm({ ...form, env: e.target.value })}
+                                            placeholder="TZ=Europe/Vienna" className={`${field} font-mono`} />
+                                        <div className="text-[10px] text-gray-600 mt-1">{t('ociEnvHint')}</div>
+                                    </div>
+                                </div>
+                                {formError && <div data-oci-error className="mt-3 text-xs text-red-400">{formError}</div>}
+                                <div className="flex justify-end gap-2 mt-4">
+                                    <button onClick={() => setDialog(null)} disabled={submitting} className="px-3 py-1.5 text-sm text-gray-400 hover:text-white">
+                                        {t('cancel')}
+                                    </button>
+                                    <button data-oci-submit onClick={submit}
+                                        disabled={submitting || !canAct || !form.node || !form.storage || !form.rootfs_storage || !form.bridge
+                                            || (form.ipMode === 'static' && !form.ip.trim())}
+                                        className="px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 disabled:opacity-50 text-white text-sm rounded flex items-center gap-1.5">
+                                        {submitting ? <Icons.RotateCw className="w-3.5 h-3.5 animate-spin" /> : <Icons.Download className="w-3.5 h-3.5" />}
+                                        {t('ociSubmit')}
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
         // NS Apr 2026 — Compliance Dashboard (top-level read-only audit view).
         // Aggregates per-cluster hardening scores, BSI/ISO/NIS2 mapping, audit activity.
         // Available to ops/Compliance Officers without admin rights (admin.audit or
@@ -18405,6 +18821,7 @@
                                                         { id: 'snapshots', label: t('snapPoliciesTitle') || 'Snapshots', icon: Icons.Camera },
                                                         { id: 'replication', label: t('replicationOverview') || 'Replication', icon: Icons.RefreshCw },
                                                         { id: 'templates', label: t('templateLibrary') || 'Templates', icon: Icons.Package },
+                                                        { id: 'apps', label: t('ociTabLabel'), icon: Icons.Container },
                                                         { id: 'hardening', label: t('hardenNode') || 'Harden PVE Node', icon: Icons.Shield }
                                                     ].map(sub => (
                                                         <button
@@ -18949,6 +19366,16 @@
                                                         t={t}
                                                         isAdmin={isAdmin}
                                                         isCorporate={isCorporate}
+                                                    />
+                                                )}
+
+                                                {automationSubTab === 'apps' && (
+                                                    <OciCatalogTab
+                                                        clusters={clusters}
+                                                        clusterId={selectedCluster?.id}
+                                                        authFetch={authFetch}
+                                                        addToast={addToast}
+                                                        t={t}
                                                     />
                                                 )}
 
