@@ -3612,7 +3612,7 @@ def get_update_status(cluster_id, node_name):
 
 # MK Oct 2026 (#625) - what a confined caller does not get of a maintenance, as from
 # updates/status: the guests in it
-_GUEST_FIELDS = ('failed_vms', 'pending_vms', 'current_vm')
+_GUEST_FIELDS = ('failed_vms', 'pending_vms', 'current_vm', 'off_pin_vms')
 
 
 @bp.route('/api/clusters/<cluster_id>/node-progress', methods=['GET'])

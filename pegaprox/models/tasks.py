@@ -120,7 +120,7 @@ class PegaProxConfig:
         # Pin reconciliation migrates a guest back onto its plb_pin_ node only
         # when this is on; otherwise off-pin guests are only reported.
         self.proxlb_pins_auto_migrate = cluster_data.get('proxlb_pins_auto_migrate', False)
-        # A plb_pin_ tag ranks evacuation targets but does not veto a drain — a
+        # A plb_pin_ tag ranks evacuation targets but does not veto a drain - a
         # guest stranded on a node about to reboot is worse than a guest in the
         # wrong place. Turn this on where a pin is a hard constraint (licensing,
         # PCI passthrough, local disks) and the drain should fail instead.

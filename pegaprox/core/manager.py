@@ -2250,7 +2250,8 @@ class PegaProxManager:
           plb_pin_<node>             -> restrict this guest to the named node(s)
 
         Returns {'rules': [<affinity-rule dicts, same shape as get_affinity_rules()>],
-                 'ignored': set(int vmid), 'pins': {int vmid: set(node names)}}.
+                 'ignored': set(int vmid), 'pins': {int vmid: set(node names)},
+                 'unresolved': [{'vmid', 'node'} of pins naming no node here]}.
         Short-TTL cached because _check_affinity_violation calls us per candidate.
         """
         if not getattr(self.config, 'proxlb_tags_enabled', False):
@@ -2319,10 +2320,10 @@ class PegaProxManager:
                 rules.append({'name': f'ProxLB anti-affinity: {g}', 'type': 'separate',
                               'vms': members, 'enabled': True, 'enforce': True, '_source': 'proxlb'})
 
-        # Sep 2026 — a pin naming a node this cluster does not have is silently
+        # Sep 2026 - a pin naming a node this cluster does not have is silently
         # inert, which is indistinguishable from "the pin feature does nothing".
         # It is the single most likely reason a pin looks broken (a typo, or the
-        # node living in a different cluster — a pin cannot cross clusters), so
+        # node living in a different cluster - a pin cannot cross clusters), so
         # say it at WARNING, once per guest/node pair rather than every cycle.
         if unresolved:
             seen = getattr(self, '_proxlb_unresolved_pins', None)
@@ -2334,7 +2335,7 @@ class PegaProxManager:
                     seen.add(key)
                     self.logger.warning(
                         f"[PROXLB] VM {u['vmid']} is tagged plb_pin_{u['node']} but this cluster "
-                        f"has no node of that name — the pin is ignored. Check the spelling, or "
+                        f"has no node of that name - the pin is ignored. Check the spelling, or "
                         f"whether that node belongs to a different cluster.")
 
         result = {'rules': rules, 'ignored': ignored, 'pins': pins, 'unresolved': unresolved}
@@ -2347,25 +2348,28 @@ class PegaProxManager:
         The pin has only ever been a veto on moves the balancer itself proposed
         (the candidate filter and get_best_target_node), and nothing in the
         cycle ever proposes a move *towards* a pin. A guest that was already off
-        its pinned node therefore stayed there forever — whatever put it there:
+        its pinned node therefore stayed there forever - whatever put it there:
         a hand migration in the PVE UI, an HA failover, an evacuation while the
         pinned node was down, or simply the tag being added after the fact.
 
         Read-only. The plb_pin counterpart to the affinity-violation scan.
         """
-        derived = self._derive_proxlb_tag_rules(vms=vms)
-        pins = derived['pins']
-        if not pins:
-            return []  # feature off, or no guest carries a resolvable pin
-            # (an unresolvable pin is reported by get_unresolved_pins(), not here:
-            #  the guest is not in the wrong place, the tag names nowhere)
-
+        if not getattr(self.config, 'proxlb_tags_enabled', False):
+            return []
+        # one guest list for the tags and the placement (a cold tag cache read its own)
         if vms is None:
             try:
                 vms = self.get_vm_resources()
             except Exception as e:
                 self.logger.error(f"[PROXLB] pin scan could not list guests: {e}")
                 return []
+
+        derived = self._derive_proxlb_tag_rules(vms=vms)
+        pins = derived['pins']
+        if not pins:
+            return []  # no guest carries a resolvable pin
+            # (an unresolvable pin is reported by get_unresolved_pins(), not here:
+            #  the guest is not in the wrong place, the tag names nowhere)
 
         cfg_excl = getattr(self.config, 'excluded_nodes', []) or []
         available = {n for n, d in (self.get_node_status() or {}).items()
@@ -2405,7 +2409,7 @@ class PegaProxManager:
     def get_unresolved_pins(self, vms=None):
         """plb_pin_ tags naming a node this cluster does not have.
 
-        Not a violation — the guest is not in the wrong place, the tag points at
+        Not a violation - the guest is not in the wrong place, the tag points at
         nowhere. Reported separately so "my pin does nothing" has an answer that
         is not "read the log at debug level".
         """
@@ -2419,6 +2423,11 @@ class PegaProxManager:
         a statement about placement rules, not consent to move running
         workloads, and a guest may be off its pin deliberately.
         """
+        # MK Oct 2026 - called by every balance cycle of every cluster, so no
+        # /cluster/resources walk while the tags are off
+        if not getattr(self.config, 'proxlb_tags_enabled', False):
+            return {'violations': [], 'migrated': [], 'failed': [], 'deferred': [],
+                    'auto_migrate': False}
         if vms is None:
             try:
                 vms = self.get_vm_resources()
@@ -2437,14 +2446,20 @@ class PegaProxManager:
             auto = False
         result = {'violations': violations, 'migrated': [], 'failed': [], 'deferred': [],
                   'auto_migrate': auto}
+        # each guest once while it stays where it is, the count below every cycle:
+        # report-only is the default and this runs every few minutes per cluster
+        said = getattr(self, '_proxlb_violations_said', None) or set()
+        self._proxlb_violations_said = {(v['vmid'], v['node'], v['reason']) for v in violations}
         if not violations:
             return result
 
         for v in violations:
+            if (v['vmid'], v['node'], v['reason']) in said:
+                continue
             if v['reason'] == 'unavailable':
                 self.logger.info(
                     f"[PROXLB] {v['name']} ({v['vmid']}) is on {v['node']}, off its pin "
-                    f"({', '.join(v['pinned_nodes'])}) — no pinned node is available, so this "
+                    f"({', '.join(v['pinned_nodes'])}) - no pinned node is available, so this "
                     "is expected; it returns when one comes back")
             else:
                 self.logger.warning(
@@ -2454,19 +2469,19 @@ class PegaProxManager:
         if held_back:
             self.logger.warning(
                 "[PROXLB] pin reconciliation is enabled but this cluster's auto_migrate is "
-                "off — reporting only")
+                "off - reporting only")
 
         if not auto:
             self.logger.info(
-                f"[PROXLB] {len(violations)} guest(s) off their pinned node — reporting only "
+                f"[PROXLB] {len(violations)} guest(s) off their pinned node - reporting only "
                 "(enable proxlb_pins_auto_migrate to have these migrated back)")
             return result
 
         if getattr(self.config, 'dry_run', False):
-            self.logger.info("[PROXLB] dry_run is on — not migrating off-pin guests")
+            self.logger.info("[PROXLB] dry_run is on - not migrating off-pin guests")
             return result
 
-        # Sep 2026 — the balancer moves at most 1-3 guests per cycle depending on
+        # Sep 2026 - the balancer moves at most 1-3 guests per cycle depending on
         # cluster size; reconciliation had no cap at all. Switching it on for a
         # cluster where a lot of guests had drifted would therefore start every
         # migration at once, and on a stretched cluster several of those are
@@ -2495,12 +2510,12 @@ class PegaProxManager:
                 # operator's; "never migrate this" beats "belongs over there".
                 self.logger.info(
                     f"[PROXLB] {v['name']} ({v['vmid']}) is off its pin but also tagged "
-                    "plb_ignore — leaving it alone")
+                    "plb_ignore - leaving it alone")
                 continue
             if v['vmid'] in excluded:
                 self.logger.info(
                     f"[PROXLB] {v['name']} ({v['vmid']}) is off its pin but excluded from "
-                    "balancing — leaving it alone")
+                    "balancing - leaving it alone")
                 continue
             # find_migration_candidate skips guests migrated in the last 900s to
             # stop ping-pong. The reconcile records that cooldown after a move but
@@ -2510,13 +2525,13 @@ class PegaProxManager:
             if last_move and (time.time() - last_move) < 900:
                 self.logger.info(
                     f"[PROXLB] {v['name']} ({v['vmid']}) is off its pin but was migrated "
-                    "recently — waiting out the cooldown")
+                    "recently - waiting out the cooldown")
                 result['deferred'].append(v)
                 continue
-            # Sep 2026 — a pin does not make a local disk shared. The balancer
+            # Sep 2026 - a pin does not make a local disk shared. The balancer
             # skips local-storage guests unless balance_local_disks is on
             # (find_migration_candidate), and a reconcile that ignores that just
-            # asks PVE for a migration it refuses — every single cycle, forever.
+            # asks PVE for a migration it refuses - every single cycle, forever.
             vm = next((x for x in vms if x.get('vmid') == v['vmid']), None)
             if not vm:
                 result['failed'].append({**v, 'error': 'guest disappeared'})
@@ -2529,13 +2544,13 @@ class PegaProxManager:
             if stor == 'unknown':
                 self.logger.warning(
                     f"[PROXLB] {v['name']} ({v['vmid']}) is off its pin but its storage type "
-                    "could not be determined — skipping to be safe")
+                    "could not be determined - skipping to be safe")
                 continue
             if stor == 'local':
                 if not getattr(self.config, 'balance_local_disks', False):
                     self.logger.info(
                         f"[PROXLB] {v['name']} ({v['vmid']}) is off its pin but uses local "
-                        "storage — skipping (enable 'Balance Local Disks' to include it)")
+                        "storage - skipping (enable 'Balance Local Disks' to include it)")
                     continue
                 vm['_has_local_disks'] = True
 
@@ -2562,6 +2577,9 @@ class PegaProxManager:
             # blocks for up to wait_timeout, so a cluster where every pinned
             # target refuses would otherwise hold the balance cycle for hours
             # instead of stopping at max_moves.
+            # an automatic leader that lost its lease starts no migration (#625)
+            if not ha.confirm_step(f"returning {v['vmid']} to its pinned node"):
+                break
             migrated_now += 1
             if self.migrate_vm(vm, target, dry_run=False, wait_timeout=1800):
                 result['migrated'].append({**v, 'target': target})
@@ -2571,7 +2589,7 @@ class PegaProxManager:
 
         if result['deferred']:
             self.logger.info(
-                f"[PROXLB] {len(result['deferred'])} more guest(s) off their pin — capped at "
+                f"[PROXLB] {len(result['deferred'])} more guest(s) off their pin - capped at "
                 f"{max_moves} return migration(s) this cycle, the rest follow on the next one")
         return result
 
@@ -3234,7 +3252,7 @@ class PegaProxManager:
         picking an evacuation/migration target for that specific guest.
         allowed_nodes (#647): the only nodes this guest may land on, None = any.
 
-        Sep 2026 — pin_mode decides what a pin means once none of the pinned
+        Sep 2026 - pin_mode decides what a pin means once none of the pinned
         nodes can take the guest:
           'strict' (default)  no target at all. What the pin has always meant,
               and what the balancer wants: it would rather leave a guest where
@@ -3280,6 +3298,16 @@ class PegaProxManager:
             self.logger.debug(f"Insufficent target nodes for migration (all excluded or in maintenace)")
             return None
 
+        # MK Oct 2026 - the HA rule and the storages are hard limits and go first; a pin
+        # only ranks what they leave, else a 'prefer' pin onto a node HA forbids empties
+        # the set and the drain stops although another node could take the guest
+        if allowed_nodes is not None:
+            available_nodes = [(n, d) for (n, d) in available_nodes if n in allowed_nodes]
+            if not available_nodes:
+                self.logger.warning(f"[MAINT] VM {vmid} may only run on {sorted(allowed_nodes)} "
+                                    f"(HA rule / storage) and none of them is an available target")
+                return None
+
         # MK Jul 2026 (#426) — if this guest carries a ProxLB plb_pin_<node> tag,
         # restrict the target set to the pinned node(s). A guest pinned to two
         # nodes keeps the score sort below *within* that pair, so it lands on its
@@ -3296,17 +3324,10 @@ class PegaProxManager:
                 elif pin_mode == 'prefer':
                     self.logger.warning(
                         f"[PROXLB] VM {vmid} is pinned to {sorted(_pin)} and none of those can "
-                        f"take it right now — placing it off-pin so the node can be drained")
+                        f"take it right now - placing it off-pin so the node can be drained")
                 else:
                     self.logger.warning(f"[PROXLB] VM {vmid} pinned to {sorted(_pin)} but none are available targets")
                     return None
-
-        if allowed_nodes is not None:
-            available_nodes = [(n, d) for (n, d) in available_nodes if n in allowed_nodes]
-            if not available_nodes:
-                self.logger.warning(f"[MAINT] VM {vmid} may only run on {sorted(allowed_nodes)} "
-                                    f"(HA rule / storage) and none of them is an available target")
-                return None
 
         # Sort by score (lowest first)
         available_nodes.sort(key=lambda x: x[1]['score'])
@@ -3876,7 +3897,7 @@ class PegaProxManager:
         # lowest projected mem% (mem-dominant proxy for the evacuator's score).
         sim = {n: {'used': float(d['mem_used']), 'total': float(d['mem_total'])}
                for n, d in targets.items()}
-        # Sep 2026 — pins steer the real evacuator, so they have to steer this
+        # Sep 2026 - pins steer the real evacuator, so they have to steer this
         # too, or the preview projects a pinned guest's memory onto a node it can
         # never land on and calls a safe drain unsafe (or the other way round).
         try:
@@ -4889,7 +4910,7 @@ class PegaProxManager:
 
                 # Find best target node (#426: honour a plb_pin tag for this guest,
                 # #647: and only nodes its HA rule and its storages allow)
-                # Sep 2026 — here the pin *ranks* the targets, it does not veto the
+                # Sep 2026 - here the pin *ranks* the targets, it does not veto the
                 # drain. A guest pinned to two nodes goes to its other pinned node;
                 # only when no pinned node can take it does it go elsewhere, because
                 # the alternative is leaving it on a node that is about to reboot.
@@ -4910,7 +4931,7 @@ class PegaProxManager:
                         except Exception:
                             _sp = None
                         if _sp:
-                            err = (f"No target node available — pinned to {', '.join(sorted(_sp))} "
+                            err = (f"No target node available - pinned to {', '.join(sorted(_sp))} "
                                    f"and proxlb_pins_strict is on")
                     task.failed_vms.append({'vmid': vmid, 'name': vm_name, 'error': err})
                     task.pending_vms = [v for v in task.pending_vms if v.get('vmid') != vmid]
@@ -4929,7 +4950,7 @@ class PegaProxManager:
                                'pinned_nodes': sorted(_pin)}
                     self.logger.warning(
                         f"[PROXLB] {vm_name} ({vmid}) is pinned to {', '.join(sorted(_pin))}, none "
-                        f"of which can take it — evacuating to {target_node} instead")
+                        f"of which can take it - evacuating to {target_node} instead")
 
                 # NS Apr 2026 (#330): when the user opted into local-disk evacuation,
                 # probe storage type here and tag the dict so migrate_vm emits
@@ -5011,10 +5032,17 @@ class PegaProxManager:
 
             if task.off_pin_vms:
                 _names = ', '.join(f"{o['name']} ({o['vmid']})" for o in task.off_pin_vms)
+                # MK Oct 2026 - the names stay in off_pin_vms, which a confined caller does not
+                # get (api/vms.py _GUEST_FIELDS); and only promise the way back where it runs
+                _back = (getattr(self.config, 'proxlb_pins_auto_migrate', False)
+                         and getattr(self.config, 'auto_migrate', False)
+                         and not getattr(self.config, 'dry_run', False))
                 task.note = (
                     f"{len(task.off_pin_vms)} pinned guest(s) had to be evacuated off their "
-                    f"plb_pin_ node: {_names}. Pin reconciliation returns them once a pinned "
-                    f"node is available again.")
+                    f"plb_pin_ node. "
+                    + ("Pin reconciliation returns them once a pinned node is available again."
+                       if _back else
+                       "Pin reconciliation is off, so they stay there until they are moved back."))
                 self.logger.warning(f"[PROXLB] evacuated off-pin from {node_name}: {_names}")
 
             if len(task.failed_vms) == 0:
@@ -19417,7 +19445,7 @@ echo "AGENT_INSTALLED_OK"
                 except Exception as e:
                     self.logger.error(f"Error in affinity enforcement: {e}")
 
-            # Sep 2026 — a plb_pin_ tag only ever vetoed moves this cycle
+            # Sep 2026 - a plb_pin_ tag only ever vetoed moves this cycle
             # proposed; nothing here ever proposes a move towards a pin, so a
             # guest already sitting off its pinned node was never brought back.
             # Audit that. Report-only unless proxlb_pins_auto_migrate is set.

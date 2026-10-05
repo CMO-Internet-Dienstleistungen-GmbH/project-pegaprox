@@ -1286,7 +1286,7 @@ class PegaProxDB:
                 except Exception as e:
                     logging.error(f"Failed to add proxlb_tags_enabled column: {e}")
 
-            # A plb_pin_ tag is only a veto on proposed moves — it never pulls a
+            # A plb_pin_ tag is only a veto on proposed moves - it never pulls a
             # guest back to its pinned node. Reconciliation does, and like every
             # other autonomous move it stays off until the operator asks for it.
             if 'proxlb_pins_auto_migrate' not in cluster_columns:

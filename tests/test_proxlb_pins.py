@@ -2,9 +2,9 @@
 #
 # plb_pin_<node> was only ever a veto: it filtered guests out of migrations the
 # balancer had already proposed, and nothing in a cycle proposes a move *towards*
-# a pin. A guest that was on the wrong node — moved by hand in the PVE UI, failed
+# a pin. A guest that was on the wrong node - moved by hand in the PVE UI, failed
 # over by HA, evacuated while the pinned node was down, or simply tagged after
-# the fact — therefore stayed there forever, and the tag looked like it did
+# the fact - therefore stayed there forever, and the tag looked like it did
 # nothing. These tests pin the reconciliation that closes that, and the guards
 # around it: the operator opts in, dry_run and auto_migrate still win, and a
 # guest that is also tagged plb_ignore is left alone.
@@ -134,7 +134,7 @@ def test_untagged_guests_are_ignored(db):
 
 
 def test_pinned_node_down_is_reported_but_not_as_drift(db):
-    # Nothing to migrate back to — the guest is off its pin because that is the
+    # Nothing to migrate back to - the guest is off its pin because that is the
     # only place it can run, which is not the same as someone ignoring the pin.
     v = _manager([_guest()], down=[A1]).get_pin_violations()
     assert len(v) == 1 and v[0]['reason'] == 'unavailable'
@@ -159,7 +159,7 @@ def test_reconcile_returns_the_guest_when_opted_in(db):
 
 
 def test_reconcile_only_ever_targets_a_pinned_node(db):
-    # A2 is by far the cheapest node, and it is in the same site — the pin still
+    # A2 is by far the cheapest node, and it is in the same site - the pin still
     # has to win, or "pinned" means nothing.
     mgr = _manager([_guest()], pins_auto=True, scores={A1: 90.0, A2: 1.0})
     mgr.reconcile_proxlb_pins()
@@ -283,7 +283,7 @@ def test_a_move_onto_the_pin_is_still_offered(db):
 
 def test_reconcile_does_not_start_every_migration_at_once(db):
     # Switching the feature on for a cluster where a lot of guests had drifted
-    # must not kick off one migration per guest in a single cycle — the balancer
+    # must not kick off one migration per guest in a single cycle - the balancer
     # caps itself the same way, and on a stretched cluster these cross sites.
     guests = [_guest(vmid=30000 + i) for i in range(6)]
     mgr = _manager(guests, pins_auto=True)
@@ -328,7 +328,7 @@ def test_the_deferred_guests_come_back_next_cycle(db):
 
 
 # --------------------------------------------------------------------------
-# draining a node — a pin ranks the targets, it does not veto the drain
+# draining a node - a pin ranks the targets, it does not veto the drain
 # --------------------------------------------------------------------------
 
 def _drain(mgr, node):
@@ -402,7 +402,7 @@ def test_an_untagged_guest_drains_exactly_as_before(db):
 
 def test_the_balancer_target_pick_is_still_strict_by_default(db):
     # get_best_target_node has to keep vetoing for every caller that did not ask
-    # for the drain behaviour — the balancer would otherwise quietly break pins.
+    # for the drain behaviour - the balancer would otherwise quietly break pins.
     mgr = _manager([_guest(node=A1)], maintenance=[A1])
     assert mgr.get_best_target_node(exclude_nodes=[A1], vmid=30021) is None
 
@@ -414,7 +414,7 @@ def test_a_drained_guest_goes_home_when_the_node_comes_back(db):
     mgr = _manager(guests, maintenance=[A1], pins_auto=True, scores={I1: 1.0})
     _drain(mgr, A1)
     assert guests[0]['node'] == I1
-    # still off-pin, but not drift — there is nowhere to return it to yet
+    # still off-pin, but not drift - there is nowhere to return it to yet
     assert mgr.get_pin_violations()[0]['reason'] == 'unavailable'
     assert mgr.reconcile_proxlb_pins()['migrated'] == []
 
@@ -445,7 +445,7 @@ def test_the_capacity_preview_skips_a_guest_a_strict_pin_will_strand(db):
 
 
 # --------------------------------------------------------------------------
-# the routes — reconciling migrates running guests, so it is not a read
+# the routes - reconciling migrates running guests, so it is not a read
 # --------------------------------------------------------------------------
 
 VIOLATIONS_ROUTE = '/api/clusters/cluster_1/proxlb-pins/violations'
@@ -589,3 +589,172 @@ def test_reconcile_is_allowed_for_a_tenant_owned_cluster(api, seed):
     _api_manager(api, reconcile_proxlb_pins=outcome)
     r = api.as_user(bob).post(RECONCILE_ROUTE, json={})
     assert r.status_code == 200, r.get_data(as_text=True)
+
+
+# --------------------------------------------------------------------------
+# follow-up on #811: the pins next to #647, #625 and the rolling update
+# --------------------------------------------------------------------------
+
+def test_a_pin_on_a_node_the_ha_rule_forbids_does_not_block_the_drain(db):
+    # #647: the HA rule (or the storage) lets this guest go to I1 only. Its other
+    # pinned node A2 is up but forbidden, so the drain places it off-pin on I1
+    # instead of narrowing to A2 first and then finding nothing at all.
+    guests = [_guest(node=A1, tags=f'{PIN_A1};plb_pin_pve-node-a02')]
+    mgr = _manager(guests, maintenance=[A1])
+    mgr._evacuation_placement = lambda: ({30021: {I1}}, {})
+    task = _drain(mgr, A1)
+    assert mgr.migrated == [(30021, I1)]
+    assert task.failed_vms == []
+    assert [o['target'] for o in task.off_pin_vms] == [I1]
+
+
+def test_a_strict_pin_on_a_node_the_ha_rule_forbids_still_stops(db):
+    # the counterpart: strict never goes off-pin, and the failure names the pin
+    guests = [_guest(node=A1, tags=f'{PIN_A1};plb_pin_pve-node-a02')]
+    mgr = _manager(guests, maintenance=[A1], pins_strict=True)
+    mgr._evacuation_placement = lambda: ({30021: {I1}}, {})
+    task = _drain(mgr, A1)
+    assert mgr.migrated == []
+    assert 'pinned to' in task.failed_vms[0]['error']
+
+
+def test_the_allowed_nodes_still_bound_a_pinned_guest(db):
+    # allowed_nodes goes first now; the pin still ranks inside what it leaves
+    mgr = _manager([_guest(node=A1, tags=f'{PIN_A1};plb_pin_pve-node-a02')],
+                   maintenance=[A1], scores={I1: 1.0})
+    assert mgr.get_best_target_node(exclude_nodes=[A1], vmid=30021,
+                                    allowed_nodes={A2, I1}, pin_mode='prefer') == A2
+    assert mgr.get_best_target_node(exclude_nodes=[A1], vmid=30021,
+                                    allowed_nodes={A1}, pin_mode='prefer') is None
+
+
+def test_a_reconcile_without_a_confirmed_lease_moves_nothing(db, monkeypatch):
+    # #625: every other automatic migration of the balance cycle asks for the
+    # lease first; a leader that lost it must not send the pin moves either
+    import pegaprox.core.manager as mgrmod
+    monkeypatch.setattr(mgrmod.ha, 'confirm_step', lambda what, *a, **k: False)
+    mgr = _manager([_guest()], pins_auto=True)
+    r = mgr.reconcile_proxlb_pins()
+    assert mgr.migrated == [] and r['migrated'] == []
+
+
+def test_the_reconcile_reads_no_guest_list_while_the_tags_are_off(db):
+    # it runs in every balance cycle of every cluster; with the feature off the
+    # /cluster/resources walk it used to start is pure cost
+    mgr = _manager([_guest()], tags_enabled=False, pins_auto=True)
+    calls = []
+    mgr.get_vm_resources = lambda *a, **k: calls.append(1) or [_guest()]
+    r = mgr.reconcile_proxlb_pins()
+    assert calls == [] and r['violations'] == [] and mgr.migrated == []
+
+
+def test_the_violation_scan_reads_the_guest_list_once(db):
+    mgr = _manager([_guest()])
+    calls = []
+    mgr.get_vm_resources = lambda *a, **k: calls.append(1) or [_guest()]
+    assert len(mgr.get_pin_violations()) == 1
+    assert len(calls) == 1
+
+
+def test_the_rolling_update_log_names_a_guest_placed_off_its_pin(db):
+    # the drain did not stop, so the rolling update log is the place that says it
+    from pegaprox.api.helpers import rolling_moved_templates
+    task = MaintenanceTask(A1)
+    task.off_pin_vms = [{'vmid': 30021, 'name': 'guest30021', 'target': I1, 'pinned_nodes': [A1]}]
+    mgr = types.SimpleNamespace(_rolling_update={'logs': []})
+    rolling_moved_templates(mgr, task)
+    line = ' '.join(mgr._rolling_update['logs'])
+    assert 'guest30021 (30021)' in line and I1 in line and A1 in line
+
+
+def test_the_pin_switches_survive_a_save_and_a_restore_that_omits_them(db):
+    from pegaprox.core.db import get_db
+    base = {'name': 'c', 'host': 'h', 'user': 'u', 'pass': 'p', 'proxlb_tags_enabled': True,
+            'proxlb_pins_auto_migrate': True, 'proxlb_pins_strict': True}
+    get_db().save_cluster('cluster_1', base)
+    cfg = PegaProxConfig(get_db().get_cluster('cluster_1'))
+    assert (cfg.proxlb_pins_auto_migrate, cfg.proxlb_pins_strict) == (True, True)
+    # an older backup without the keys keeps what is stored, an explicit False wins
+    get_db().save_cluster('cluster_1', {k: v for k, v in base.items() if not k.startswith('proxlb_')})
+    row = get_db().get_cluster('cluster_1')
+    assert (row['proxlb_tags_enabled'], row['proxlb_pins_auto_migrate'], row['proxlb_pins_strict']) == \
+        (True, True, True)
+    get_db().save_cluster('cluster_1', dict(base, proxlb_pins_strict=False))
+    assert get_db().get_cluster('cluster_1')['proxlb_pins_strict'] is False
+
+
+def test_a_synced_pin_switch_reaches_the_running_manager(db, monkeypatch):
+    # #625: a standby hands the synced row to its managers field by field; a field
+    # missing from that list keeps the old value until the process restarts
+    from pegaprox.core import ha
+    import pegaprox.globals as g
+    from pegaprox.core.db import get_db
+    get_db().save_cluster('cluster_1', {'name': 'c', 'host': 'h', 'user': 'u', 'pass': 'p',
+                                        'proxlb_pins_auto_migrate': True,
+                                        'proxlb_pins_strict': True})
+    cfg = PegaProxConfig({'name': 'c', 'host': 'h', 'user': 'u'})
+    monkeypatch.setitem(g.cluster_managers, 'cluster_1', types.SimpleNamespace(config=cfg))
+    ha._refresh_managers()
+    assert (cfg.proxlb_pins_auto_migrate, cfg.proxlb_pins_strict) == (True, True)
+
+
+def test_an_off_pin_guest_is_named_once_not_every_cycle(db, caplog):
+    # report-only is the default, and the cycle runs every few minutes on every
+    # cluster: the per-guest line comes once, and again after the guest moved
+    guests = [_guest()]
+    mgr = _manager(guests)
+
+    def said():
+        return [r for r in caplog.records if 'but pinned to' in r.getMessage()]
+    with caplog.at_level(logging.WARNING, logger='test.proxlb_pins'):
+        mgr.reconcile_proxlb_pins()
+        mgr.reconcile_proxlb_pins()
+        assert len(said()) == 1
+        guests[0]['node'] = A2
+        mgr.reconcile_proxlb_pins()
+        assert len(said()) == 2
+
+
+def test_the_drain_note_only_promises_the_way_back_where_it_runs(db):
+    # report-only is the default: nothing moves the guest back then, and the note
+    # must not say otherwise. The names are in off_pin_vms, not in the note.
+    task = _drain(_manager([_guest(node=A1)], maintenance=[A1], scores={I1: 1.0}), A1)
+    assert 'stay there' in task.note and 'guest30021' not in task.note
+    task = _drain(_manager([_guest(node=A1)], maintenance=[A1], scores={I1: 1.0},
+                           pins_auto=True), A1)
+    assert 'returns them' in task.note
+
+
+def test_a_confined_caller_does_not_get_the_off_pin_guests(api, seed):
+    # the node progress of a maintenance hands a confined caller the progress,
+    # not which guests are in it (#625); the off-pin list is such a guest list
+    mgr = _manager([_guest(node=A1)], maintenance=[A1], scores={I1: 1.0})
+    task = _drain(mgr, A1)
+    api.set_manager('cluster_1', types.SimpleNamespace(cluster_type='proxmox',
+                                                       nodes_in_maintenance={A1: task},
+                                                       nodes_updating={}))
+    seed.tenant('acme', clusters=['cluster_1'])
+    seed.tenant('globex', clusters=['other'])
+    operator = api.as_user(seed.user('operator', role='user', tenant_id='acme',
+                                     permissions=['cluster.view']))
+    portal = api.as_user(seed.user('portal', role='user', tenant_id='globex',
+                                   permissions=['cluster.view', 'vm.view']))
+    seed.vm_acl('cluster_1', 100, users=['portal'])
+    route = '/api/clusters/cluster_1/node-progress'
+    full = operator.get(route).get_json()['nodes'][A1]['maintenance_task']
+    assert full['off_pin_vms'][0]['vmid'] == 30021
+    confined = portal.get(route).get_json()['nodes'][A1]['maintenance_task']
+    assert 'off_pin_vms' not in confined
+    assert 'guest30021' not in (confined.get('note') or '')
+
+
+def test_the_pin_routes_answer_for_an_xcpng_pool(api, seed):
+    # an XCP-ng manager has no plb_ tags and no get_pin_violations: an answer, no 500
+    admin = api.as_user(seed.user('root', role='admin', tenant_id='default'))
+    api.set_manager('cluster_1', types.SimpleNamespace(cluster_type='xcpng',
+                                                       config=types.SimpleNamespace(name='pool')))
+    r = admin.get(VIOLATIONS_ROUTE)
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert r.get_json()['violations'] == [] and r.get_json()['enabled'] is False
+    r = admin.post(RECONCILE_ROUTE, json={'force': True})
+    assert r.status_code == 400 and r.get_json()['code'] == 'PVE_ONLY'

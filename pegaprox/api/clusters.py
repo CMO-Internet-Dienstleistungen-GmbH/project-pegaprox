@@ -3695,13 +3695,16 @@ def get_proxlb_pin_violations(cluster_id):
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     mgr = cluster_managers[cluster_id]
+    # MK Oct 2026 - plb_ tags are PVE tags; an XCP-ng pool or ESXi host has none to report
+    if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
+        return jsonify({'enabled': False, 'auto_migrate': False, 'violations': [], 'unresolved': []})
     try:
         return jsonify({
             'enabled': bool(getattr(mgr.config, 'proxlb_tags_enabled', False)),
             'auto_migrate': bool(getattr(mgr.config, 'proxlb_pins_auto_migrate', False)),
             # Both lists are per-VM rows (vmid / name / node / pinned nodes) for
             # every guest on the cluster, and check_cluster_access only gates
-            # cluster REACHABILITY — its pool/ACL fallbacks admit a caller who may
+            # cluster REACHABILITY - its pool/ACL fallbacks admit a caller who may
             # see one VM. Same #773 class of leak as the other per-VM reads, so
             # the same filter: admins and cluster-wide operators keep every row.
             'violations': scope_vm_rows(cluster_id, mgr.get_pin_violations()),
@@ -3720,7 +3723,7 @@ def reconcile_proxlb_pins_api(cluster_id):
     """Migrate guests that drifted off their pinned node back onto it.
 
     Honours config.proxlb_pins_auto_migrate unless the body sets force=true,
-    which is the manual "do it now" button — it still refuses under dry_run.
+    which is the manual "do it now" button - it still refuses under dry_run.
     """
     ok, err = check_cluster_access(cluster_id)
     if not ok:
@@ -3729,7 +3732,7 @@ def reconcile_proxlb_pins_api(cluster_id):
     # Same gate as /balance-now (Aikido 469089250): this migrates guests across the
     # whole cluster, so a caller who reached it through a single VM-ACL / pool grant
     # (the #248/#555 fallbacks in check_cluster_access) must not be able to move
-    # other guests. require_unconfined is the predicate that asks that correctly —
+    # other guests. require_unconfined is the predicate that asks that correctly -
     # the open-coded get_user_clusters form does NOT, because it defaults to
     # include_pools=True and a pool-scoped caller's cluster is in the result.
     _sess = getattr(request, 'session', {})
@@ -3743,6 +3746,9 @@ def reconcile_proxlb_pins_api(cluster_id):
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     mgr = cluster_managers[cluster_id]
+    if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
+        return jsonify({'error': 'plb_pin_ tags are read on Proxmox VE clusters only',
+                        'code': 'PVE_ONLY'}), 400
     body = request.get_json(silent=True)
     if body is None:
         body = {}

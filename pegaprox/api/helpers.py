@@ -737,6 +737,10 @@ def rolling_moved_templates(mgr, task):
         rolling_log(mgr, f"  ✓ Template {t.get('name')} ({t.get('vmid')}) moved to {t.get('to')}")
     for t in getattr(task, 'templates_left', None) or []:
         rolling_log(mgr, f"  ⚠ Template {t.get('name')} ({t.get('vmid')}) stays on the node: {t.get('reason')}")
+    # MK Oct 2026 (#811) - and the pinned guests none of their plb_pin_ nodes could take
+    for o in getattr(task, 'off_pin_vms', None) or []:
+        rolling_log(mgr, f"  ⚠ {o.get('name')} ({o.get('vmid')}) went to {o.get('target')}, off its pin "
+                         f"({', '.join(o.get('pinned_nodes') or [])})")
 
 
 def rolling_rules_give_way(mgr, who):

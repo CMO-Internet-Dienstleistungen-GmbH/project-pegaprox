@@ -948,6 +948,8 @@ CONFIRM_SITES = [
     ('pegaprox/core/manager.py', 'PegaProxManager.ha_start_moved_vms', ['post']),
     ('pegaprox/core/manager.py', 'PegaProxManager.run_balance_check', ['migrate_vm']),
     ('pegaprox/core/manager.py', 'PegaProxManager._enforce_affinity_rules', ['migrate_vm']),
+    # the moves back onto a plb_pin_ node, from the balance cycle and the API (#811)
+    ('pegaprox/core/manager.py', 'PegaProxManager.reconcile_proxlb_pins', ['migrate_vm']),
     # the Proxmox HA rules a rolling update switches off, and on again from the daemon loop (#954)
     ('pegaprox/core/manager.py', 'PegaProxManager.suspend_negative_ha_rules', ['_api_put']),
     ('pegaprox/core/manager.py', 'PegaProxManager.restore_suspended_ha_rules', ['_api_put']),

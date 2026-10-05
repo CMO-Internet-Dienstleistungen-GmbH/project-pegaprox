@@ -1437,7 +1437,8 @@ _REFRESH_CLUSTER_FIELDS = (
     'auto_migrate', 'balance_containers', 'balance_local_disks', 'dry_run', 'ha_enabled',
     'ha_settings', 'excluded_nodes', 'predictive_balancing', 'predictive_threshold',
     'balance_cpu_weight', 'balance_mem_weight', 'balance_io_weight', 'cpu_baseline',
-    'vnc_tunnel', 'proxlb_tags_enabled', 'node_ui_suffix', 'backup_sla_max_age_hours',
+    'vnc_tunnel', 'proxlb_tags_enabled', 'proxlb_pins_auto_migrate', 'proxlb_pins_strict',
+    'node_ui_suffix', 'backup_sla_max_age_hours',
     'latitude', 'longitude', 'location_label', 'fallback_hosts', 'smbios_autoconfig',
 )
 _REFRESH_SERVER_FIELDS = ('name', 'notes', 'linked_clusters')

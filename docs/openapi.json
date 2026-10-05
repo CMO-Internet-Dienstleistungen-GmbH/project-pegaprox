@@ -5978,6 +5978,108 @@
         ]
       }
     },
+    "/api/clusters/{cluster_id}/proxlb-pins/violations": {
+      "get": {
+        "operationId": "clusters.get_proxlb_pin_violations_get",
+        "tags": [
+          "clusters"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Guests running somewhere their plb_pin_<node> tag does not allow.",
+        "description": "Read-only. A pin only vetoes moves the balancer proposes, so this is the\nonly way to see a guest that ended up off its pinned node and stayed there.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "cluster.view"
+        ]
+      }
+    },
+    "/api/clusters/{cluster_id}/proxlb-pins/reconcile": {
+      "post": {
+        "operationId": "clusters.reconcile_proxlb_pins_api_post",
+        "tags": [
+          "clusters"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Migrate guests that drifted off their pinned node back onto it.",
+        "description": "Honours config.proxlb_pins_auto_migrate unless the body sets force=true,\nwhich is the manual \"do it now\" button - it still refuses under dry_run.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "vm.migrate"
+        ]
+      }
+    },
     "/api/clusters/{cluster_id}/datacenter/status": {
       "get": {
         "operationId": "vms.get_datacenter_status_get",
