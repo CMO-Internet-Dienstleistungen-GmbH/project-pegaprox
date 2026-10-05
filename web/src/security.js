@@ -2127,6 +2127,9 @@
             const [rebootTimeout, setRebootTimeout] = useState(600);  // NS Apr 2026 (#328): 10 min default, extend for Ceph/slow-boot nodes
             const [allowLocalDisks, setAllowLocalDisks] = useState(false);  // #330
             const [cephHealthGate, setCephHealthGate] = useState('off');  // NS #403 part 2 — 'off' | 'degraded' | 'strict'
+            const [migrateTemplates, setMigrateTemplates] = useState(false);  // #763
+            const [relaxAntiAffinity, setRelaxAntiAffinity] = useState(false);  // #954
+            const [rollingPlan, setRollingPlan] = useState(null);
             const [waitForReboot, setWaitForReboot] = useState(true);  // NS: GitHub #40 - wait for node online before next
             const [pauseOnEvacError, setPauseOnEvacError] = useState(true);  // NS: GitHub #40 - pause if VMs fail to migrate
             const [showAdvancedOptions, setShowAdvancedOptions] = useState(false);  // NS: Toggle for timeouts
@@ -2436,6 +2439,8 @@
                             allow_local_disks: allowLocalDisks,  // #330
                             ceph_health_gate: cephHealthGate,  // NS #403 part 2 — hold on unsafe Ceph
                             notify_channels: notifyChannels,  // MK #716 - mute/un-mute the monitoring
+                            migrate_templates: migrateTemplates && !skipEvacuation,  // #763
+                            relax_anti_affinity: relaxAntiAffinity && !skipEvacuation,  // #954
                         })
                     });
                     const data = await response.json();
@@ -2451,6 +2456,93 @@
                 } catch (error) {
                     addToast(t('connectionError'), 'error');
                 }
+            };
+
+            // LW Oct 2026 (#763, #954) - what moving the templates and letting negative affinity
+            // rules give way would change, read once each time the dialog opens
+            useEffect(() => {
+                if (!showConfirm) return undefined;
+                let gone = false;
+                setRollingPlan(null);
+                (async () => {
+                    try {
+                        const r = await fetch(`${API_URL}/clusters/${clusterId}/updates/rolling/plan`, {
+                            credentials: 'include', headers: getAuthHeaders() });
+                        const d = r.ok ? await r.json() : null;
+                        if (!gone) setRollingPlan(d || { error: true });
+                    } catch (_) {
+                        if (!gone) setRollingPlan({ error: true });
+                    }
+                })();
+                return () => { gone = true; };
+            }, [showConfirm, clusterId]);
+
+            const templateWhy = (tp) => {
+                const text = {
+                    storage_list: t('rollEvacWhyStorageList'), config: t('rollEvacWhyConfig'),
+                    local_image: t('rollEvacWhyLocalImage'), storage_missing: t('rollEvacWhyStorageMissing'),
+                    storage_split: t('rollEvacWhyStorageSplit'),
+                }[tp.code];
+                if (!text) return tp.reason;
+                const args = tp.args || {};
+                return text.replace('{drive}', () => args.drive || '').replace('{storage}', () => args.storage || '')
+                    .replace('{storages}', () => args.storages || '');
+            };
+
+            const rollingPlanTemplates = () => {
+                if (!rollingPlan) return <span className="text-gray-500">{t('rollEvacPlanLoading')}</span>;
+                if (rollingPlan.error) return <span className="text-gray-500">{t('rollEvacPlanError')}</span>;
+                const all = rollingPlan.templates || [];
+                if (!all.length) return <span className="text-gray-500">{t('rollEvacNoTemplates')}</span>;
+                if (!migrateTemplates) {
+                    return <span className="text-yellow-400">{t('rollEvacTemplatesStay').replace('{n}', () => all.length)}</span>;
+                }
+                return (
+                    <>
+                        {all.slice(0, 8).map(tp => (
+                            <div key={tp.vmid} data-template={tp.vmid} data-moves={tp.reason ? 'no' : 'yes'}
+                                className={tp.reason ? 'text-yellow-400' : 'text-gray-400'}>
+                                {tp.name} ({tp.vmid}, {tp.node}): {tp.reason ? templateWhy(tp)
+                                    : t('rollEvacTemplateMoves').replace('{nodes}', () => (tp.targets || []).join(', '))}
+                            </div>
+                        ))}
+                        {all.length > 8 && <div className="text-gray-500">{t('rollEvacMore').replace('{n}', () => all.length - 8)}</div>}
+                    </>
+                );
+            };
+
+            const rollingPlanRules = () => {
+                if (!rollingPlan) return <span className="text-gray-500">{t('rollEvacPlanLoading')}</span>;
+                if (rollingPlan.error) return <span className="text-gray-500">{t('rollEvacPlanError')}</span>;
+                const rules = rollingPlan.negative_rules;
+                const own = rollingPlan.own_rules || [];
+                const stillOff = rollingPlan.still_off || [];
+                return (
+                    <>
+                        {rules == null ? <div className="text-yellow-400">{t('rollEvacRulesUnreadable')}</div>
+                            : !rules.length ? <div className="text-gray-500">{t('rollEvacNoRules')}</div>
+                            : <>
+                                <div className="text-gray-400">{relaxAntiAffinity ? t('rollEvacRulesOff') : t('rollEvacRulesOn')}</div>
+                                {rules.slice(0, 8).map(r => (
+                                    <div key={r.rule} data-rule={r.rule} className="text-gray-400">
+                                        <span className="font-mono">{r.rule}</span>: {(r.resources || []).join(', ')}
+                                        {r.blocks && <span className={relaxAntiAffinity ? 'text-gray-500' : 'text-yellow-400'}> - {t('rollEvacRuleBlocks')}</span>}
+                                    </div>
+                                ))}
+                                {rules.length > 8 && <div className="text-gray-500">{t('rollEvacMore').replace('{n}', () => rules.length - 8)}</div>}
+                            </>}
+                        {own.length > 0 && (
+                            <div className="text-gray-400" data-own-rules={own.length}>
+                                {(!relaxAntiAffinity ? t('rollEvacOwnEnforced')
+                                    : rollingPlan.balancer_separates ? t('rollEvacOwnHeld') : t('rollEvacOwnHeldNoBalancer'))
+                                    .replace('{n}', () => own.length)}
+                            </div>
+                        )}
+                        {stillOff.length > 0 && (
+                            <div className="text-yellow-400">{t('rollEvacStillOff').replace('{rules}', () => stillOff.join(', '))}</div>
+                        )}
+                    </>
+                );
             };
 
             // Cancel rolling update
@@ -3321,7 +3413,7 @@
                     {/* Confirm Modal */}
                     {showConfirm && (
                         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 modal-backdrop" onClick={() => setShowConfirm(false)}>
-                            <div className="bg-proxmox-card border border-proxmox-border rounded-2xl p-6 max-w-md w-full animate-scale-in" onClick={e => e.stopPropagation()}>
+                            <div className="bg-proxmox-card border border-proxmox-border rounded-2xl p-6 max-w-md w-full max-h-[90vh] overflow-y-auto animate-scale-in" data-testid="rolling-confirm" onClick={e => e.stopPropagation()}>
                                 <h3 className="text-lg font-semibold text-white mb-2">{t('confirmRollingUpdate')}</h3>
                                 <p className="text-gray-400 text-sm mb-4">{t('rollingUpdateWarning')}</p>
                                 
@@ -3390,7 +3482,52 @@
                                             {t('skipEvacuationWarning') || '⚠️ Warning: VMs may crash if something goes wrong during the update!'}
                                         </div>
                                     )}
-                                    
+
+                                    {/* LW Oct 2026 (#763, #954) - two evacuation options, off as before; the plan
+                                        under each says what ticking it changes. Proxmox clusters only */}
+                                    {rollingPlan?.supported !== false && (
+                                        <div className="space-y-2" data-testid="rolling-evac-options">
+                                            <label className="flex items-start gap-2 cursor-pointer">
+                                                <input
+                                                    type="checkbox"
+                                                    data-testid="rolling-move-templates"
+                                                    checked={migrateTemplates && !skipEvacuation}
+                                                    disabled={skipEvacuation}
+                                                    onChange={(e) => setMigrateTemplates(e.target.checked)}
+                                                    className="mt-0.5 w-4 h-4 flex-shrink-0 rounded border-proxmox-border bg-proxmox-dark text-proxmox-orange focus:ring-proxmox-orange"
+                                                />
+                                                <div>
+                                                    <span className="text-white text-sm">{t('rollEvacTemplates')}</span>
+                                                    <p className="text-xs text-gray-500">{t('rollEvacTemplatesHint')}</p>
+                                                </div>
+                                            </label>
+                                            {!skipEvacuation && (
+                                                <div className="ml-6 text-xs space-y-0.5" data-testid="rolling-plan-templates">
+                                                    {rollingPlanTemplates()}
+                                                </div>
+                                            )}
+                                            <label className="flex items-start gap-2 cursor-pointer">
+                                                <input
+                                                    type="checkbox"
+                                                    data-testid="rolling-relax-affinity"
+                                                    checked={relaxAntiAffinity && !skipEvacuation}
+                                                    disabled={skipEvacuation}
+                                                    onChange={(e) => setRelaxAntiAffinity(e.target.checked)}
+                                                    className="mt-0.5 w-4 h-4 flex-shrink-0 rounded border-proxmox-border bg-proxmox-dark text-proxmox-orange focus:ring-proxmox-orange"
+                                                />
+                                                <div>
+                                                    <span className="text-white text-sm">{t('rollEvacRelax')}</span>
+                                                    <p className="text-xs text-gray-500">{t('rollEvacRelaxHint')}</p>
+                                                </div>
+                                            </label>
+                                            {!skipEvacuation && (
+                                                <div className="ml-6 text-xs space-y-0.5" data-testid="rolling-plan-rules">
+                                                    {rollingPlanRules()}
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
+
                                     {/* NS: Advanced options toggle */}
                                     <button
                                         onClick={() => setShowAdvancedOptions(!showAdvancedOptions)}
