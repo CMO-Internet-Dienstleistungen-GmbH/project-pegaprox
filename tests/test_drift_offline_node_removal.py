@@ -3,21 +3,21 @@
 A PVE node that is powered off / rebooting does not answer its per-node reads
 (`nodes/<n>/network`, `nodes/<n>/<t>/<vmid>/config`), so those scopes never
 make it into the fetched state and the deletion-detection loop in
-_scan_cluster reads their absence as "object removed" — one critical-adjacent
-wave per scan for objects that still exist. 2026-09-29: pve-cl-01 went down
-and the very next sweep emitted 10 false removals (6 network + 4 vm_config).
+_scan_cluster reads their absence as "object removed" - one wave per scan
+for objects that still exist (#968).
 
 Fix (drift.py): when a missing scope's owning node is not online right now,
-emit it as kind `unknown` / severity info with a `node-offline` diff
-annotation instead of a removal. The baseline keeps the object, so if it is
-really gone the first scan after the node returns raises the normal removal
-event — the guard only delays a true-removal finding, it never erases one.
+record it with severity info and a diff of op `unknown` carrying a
+`node-offline` annotation instead of a removal. The row keeps its real kind.
+A guest's owning node comes from the live guest list, which still lists an
+offline node's guests. The baseline keeps the object, so if it is really
+gone the first scan after the node returns raises the normal removal event -
+the guard only delays a true-removal finding, it never erases one.
 
-Ack-promote of an `unknown` event must never touch its baseline (promote
-rebaselines from LIVE state, and live cannot prove anything about a scope on
-a node that is not answering).
+These tests stub the persistence helpers; the runs against a fake PVE and a
+real database, including ack-promote through the route, are in
+test_drift_offline_node_runtime.py.
 """
-import ast
 import json
 
 import pytest
@@ -33,7 +33,7 @@ def _nodes_status(**kwargs):
     return kwargs
 
 
-def _mk_mgr(monkeypatch, node_status):
+def _mk_mgr(monkeypatch, node_status, guests=()):
     mgr = type('Mgr', (), {})()
     mgr.is_connected = True
     if node_status is None:
@@ -42,14 +42,22 @@ def _mk_mgr(monkeypatch, node_status):
         mgr.get_node_status = _boom
     else:
         mgr.get_node_status = lambda: node_status
+    # cluster/resources: where each guest lives (a guest config has no node key)
+    mgr.get_vm_resources = lambda max_age=0.0: [dict(g) for g in guests]
     ppglobals.cluster_managers[CL] = mgr
     monkeypatch.setattr(drift_mod, '_record_event', lambda *a, **k: f'evt-{id(a)}')
     monkeypatch.setattr(drift_mod, '_set_baseline', lambda *a, **k: None)
+    monkeypatch.setattr(drift_mod, '_open_unknown_events', lambda cid: {})
+    monkeypatch.setattr(drift_mod, '_supersede_events', lambda ids: None)
     # keep the alert fan-out offline: several tests record events, which fires
-    # the notification loop — it must not touch the real webhook/DB layer
+    # the notification loop - it must not touch the real webhook/DB layer
     monkeypatch.setattr('pegaprox.utils.webhooks.send_to_channels',
                         lambda payload, **kw: None)
     return mgr
+
+
+def _guest(t, vmid, node):
+    return {'type': t, 'vmid': vmid, 'node': node}
 
 
 def _teardown():
@@ -62,7 +70,13 @@ def _cleanup():
     _teardown()
 
 
+# A scope with no baseline: proves the API answered (an empty read is skipped as
+# a whole) and raises no event of its own.
+_ALIVE = ('network', 'pve-cl-09/vmbr0', {'iface': 'vmbr0'})
+
+
 def _scan(monkeypatch, mgr, baselines, state):
+    state = list(state) + [_ALIVE]
     monkeypatch.setattr(drift_mod, '_fetch_state', lambda m, cid: state)
     monkeypatch.setattr(drift_mod, '_load_baselines', lambda cid: baselines)
     return drift_mod._scan_cluster(CL)
@@ -76,14 +90,14 @@ def _baseline(snapshot):
 # ── repro: offline node's scopes must not fire as removed ──
 
 def test_offline_node_removals_become_unknown_with_annotation(monkeypatch):
-    """The 2026-09-29 phantom exactly: pve-cl-01 down, its NICs + LXCs missing
-    from live. Expect kind-unknown/info events carrying the node-offline
-    annotation — and NO 'removed' op on any event."""
+    """pve-cl-01 down, its NICs + LXCs missing from live. Expect info events
+    carrying the node-offline annotation - and NO 'removed' op on any of them."""
     mgr = _mk_mgr(monkeypatch, _nodes_status(
-        **{'pve-cl-01': {'status': 'offline'}, 'pve-cl-03': {'status': 'online'}}))
+        **{'pve-cl-01': {'status': 'offline'}, 'pve-cl-03': {'status': 'online'}}),
+        guests=[_guest('lxc', 150, 'pve-cl-01')])
     baselines = {
         ('network', 'pve-cl-01/vmbr0'): _baseline({'iface': 'vmbr0'}),
-        ('vm_config', 'lxc/150'): _baseline({'node': 'pve-cl-01', 'hostname': 'a'}),
+        ('vm_config', 'lxc/150'): _baseline({'hostname': 'a'}),
         # a cluster-wide kind on the same cluster: NOT node-owned, must stay
         # removal-detected (storage.cfg lives on pmxcfs, not on pve-cl-01)
         ('storage', 'local'): _baseline({'storage': 'local'}),
@@ -97,17 +111,19 @@ def test_offline_node_removals_become_unknown_with_annotation(monkeypatch):
     events = res['events']
     assert res['events_count'] >= 3, f"unexpected scan result: {res}"
 
-    unknowns = [e for e in events if e['kind'] == 'unknown']
-    assert {e['scope'] for e in unknowns} == {'pve-cl-01/vmbr0', 'lxc/150'}, \
+    unknowns = [e for e in events if e.get('node_offline')]
+    assert {(e['kind'], e['scope']) for e in unknowns} == {
+        ('network', 'pve-cl-01/vmbr0'), ('vm_config', 'lxc/150')}, \
         f"offline-node scopes not all emitted as unknown: {events}"
 
     for e in unknowns:
         assert e['severity'] == 'info'
+        assert e['node_offline'] == 'pve-cl-01'
         assert 'pve-cl-01' in e['summary'] and 'offline' in e['summary']
 
     # everything else is either the real storage removal or the accounted
-    # pve-cl-03 scope (silent) — no network/vm_config 'removed' event exists
-    removals = [e for e in events if e['kind'] in ('network', 'vm_config', 'storage')]
+    # pve-cl-03 scope (silent) - no network/vm_config 'removed' event exists
+    removals = [e for e in events if not e.get('node_offline')]
     assert [e['kind'] for e in removals] == ['storage']
     removed_storage = removals[0]
     assert removed_storage['severity'] == 'warning'
@@ -118,14 +134,14 @@ def test_offline_node_removals_become_unknown_with_annotation(monkeypatch):
 
 
 def test_offline_node_removal_diff_annotation_roundtrips(monkeypatch):
-    """The node-offline annotation must survive json.dumps — _record_event
+    """The node-offline annotation must survive json.dumps - _record_event
     stores the diff as JSON, the UI reads it back later."""
     mgr = _mk_mgr(monkeypatch, _nodes_status(**{'pve-cl-01': {'status': 'offline'}}))
     sent = []
     monkeypatch.setattr(drift_mod, '_record_event',   # after _mk_mgr: last patch wins
                         lambda cluster_id, kind, scope, diffs, severity, summary:
                         sent.append({'diffs': diffs, 'sev': severity}) or 'e1')
-    monkeypatch.setattr(drift_mod, '_fetch_state', lambda m, cid: [])
+    monkeypatch.setattr(drift_mod, '_fetch_state', lambda m, cid: [_ALIVE])
     monkeypatch.setattr(drift_mod, '_load_baselines',
                         lambda cid: {('network', 'pve-cl-01/eno1'): _baseline({'iface': 'eno1'})})
 
@@ -133,7 +149,7 @@ def test_offline_node_removal_diff_annotation_roundtrips(monkeypatch):
 
     assert res['events_count'] == 1
     e = res['events'][0]
-    assert e['kind'] == 'unknown'
+    assert e['kind'] == 'network' and e['node_offline'] == 'pve-cl-01'
     assert e['severity'] == 'info'
     d = json.loads(json.dumps(sent[0]['diffs']))
     assert d[0]['op'] == 'unknown'
@@ -171,9 +187,10 @@ def test_node_online_real_deletion_still_fires_removed(monkeypatch):
 
 
 def test_vm_config_removal_on_online_node_still_fires(monkeypatch):
-    """The LXC-side phantom: vm_config scope gone while its node is online."""
-    mgr = _mk_mgr(monkeypatch, _nodes_status(**{'pve-cl-01': {'status': 'online'}}))
-    baselines = {('vm_config', 'lxc/402'): _baseline({'node': 'pve-cl-01'})}
+    """The LXC side: vm_config scope unread while its node is online."""
+    mgr = _mk_mgr(monkeypatch, _nodes_status(**{'pve-cl-01': {'status': 'online'}}),
+                  guests=[_guest('lxc', 402, 'pve-cl-01')])
+    baselines = {('vm_config', 'lxc/402'): _baseline({'hostname': 'ct402'})}
     res = _scan(monkeypatch, mgr, baselines, state=[])
     assert res['events_count'] == 1
     assert res['events'][0]['kind'] == 'vm_config'
@@ -182,7 +199,7 @@ def test_vm_config_removal_on_online_node_still_fires(monkeypatch):
 
 def test_cluster_wide_kinds_not_masked_even_when_some_node_is_offline(monkeypatch):
     """storage.cfg / datacenter.cfg live in pmxcfs on every node. An offline
-    node must not suppress removal detection for cluster-wide kinds — the
+    node must not suppress removal detection for cluster-wide kinds - the
     cluster-wide reads go through the online API host, so an absence is real."""
     mgr = _mk_mgr(monkeypatch, _nodes_status(**{'pve-cl-01': {'status': 'offline'}}))
     baselines = {
@@ -197,10 +214,11 @@ def test_cluster_wide_kinds_not_masked_even_when_some_node_is_offline(monkeypatc
 
 
 def test_no_node_owner_means_no_masking(monkeypatch):
-    """A vm_config baseline whose snapshot pre-dates the node key (or a scope
-    shape we don't recognise) must fall through to normal removal detection."""
-    mgr = _mk_mgr(monkeypatch, _nodes_status(**{'pve-cl-01': {'status': 'offline'}}))
-    baselines = {('vm_config', 'lxc/943'): _baseline({'hostname': 'legacy-no-node-key'})}
+    """A guest the guest list no longer has (deleted, so no node owns it) must
+    fall through to normal removal detection, even with a node offline."""
+    mgr = _mk_mgr(monkeypatch, _nodes_status(**{'pve-cl-01': {'status': 'offline'}}),
+                  guests=[_guest('lxc', 150, 'pve-cl-01')])
+    baselines = {('vm_config', 'lxc/943'): _baseline({'hostname': 'deleted-guest'})}
     res = _scan(monkeypatch, mgr, baselines, state=[])
     assert res['events_count'] == 1
     assert res['events'][0]['kind'] == 'vm_config'
@@ -211,7 +229,7 @@ def test_no_node_owner_means_no_masking(monkeypatch):
 
 def test_recovery_node_returns_next_scan_emits_normal_removal(monkeypatch):
     """The safety argument end-to-end: an object genuinely destroyed while its
-    node was down. Scan 1 (node offline) must show kind unknown and NOT
+    node was down. Scan 1 (node offline) must show presence unknown and NOT
     delete/rebaseline anything; scan 2 (node back) must emit the normal
     removal event."""
     offline_nodes = _nodes_status(**{'pve-cl-01': {'status': 'offline'}})
@@ -220,11 +238,11 @@ def test_recovery_node_returns_next_scan_emits_normal_removal(monkeypatch):
 
     mgr = _mk_mgr(monkeypatch, offline_nodes)
     res1 = _scan(monkeypatch, mgr, baselines, state=[])
-    assert res1['events'][0]['kind'] == 'unknown'
+    assert res1['events'][0]['node_offline'] == 'pve-cl-01'
     assert res1['removed'] == []
 
-    # node is back — but the NIC was really removed while it was down.
-    # Liveness is cheap; assert it does not grow the scan cost when unused:
+    # node is back - but the NIC was really removed while it was down,
+    # so the liveness read is needed on this scan
     called = []
     def _counting():
         called.append(1)
@@ -258,15 +276,20 @@ def test_liveness_read_failure_fails_open(monkeypatch):
 
 def test_liveness_not_consulted_when_nothing_is_missing(monkeypatch):
     """The ordinary case (all scopes present) must not touch get_node_status
-    at all — zero new cost on the happy path."""
+    or the guest list at all - zero new cost on the happy path. Counted, not
+    raised: _offline_nodes swallows exceptions, so a raising stub would pass
+    whether it was called or not."""
     mgr = _mk_mgr(monkeypatch, None)
-    def _no():
-        raise AssertionError('get_node_status called although nothing was missing')
-    mgr.get_node_status = _no
+    called = []
+    mgr.get_node_status = lambda: called.append('status') or {}
+    mgr.get_vm_resources = lambda max_age=0.0: called.append('guests') or []
     res = _scan(monkeypatch, mgr,
-                {('network', 'pve-cl-01/vmbr0'): _baseline({'iface': 'vmbr0'})},
-                state=[('network', 'pve-cl-01/vmbr0', {'iface': 'vmbr0'})])
+                {('network', 'pve-cl-01/vmbr0'): _baseline({'iface': 'vmbr0'}),
+                 ('vm_config', 'qemu/101'): _baseline({'cores': 2})},
+                state=[('network', 'pve-cl-01/vmbr0', {'iface': 'vmbr0'}),
+                       ('vm_config', 'qemu/101', {'cores': 2})])
     assert res['events_count'] == 0
+    assert called == []
 
 
 # ── the diff loop itself only sees op 'unknown' for masked scopes ──
@@ -280,7 +303,7 @@ def test_masked_diff_is_recorded_not_removed(monkeypatch):
                         lambda cluster_id, kind, scope, diffs, severity, summary:
                         sent.append(diffs) or 'e1')
     snap = {'iface': 'vmbr0', 'address': '10.0.0.1'}
-    monkeypatch.setattr(drift_mod, '_fetch_state', lambda m, cid: [])
+    monkeypatch.setattr(drift_mod, '_fetch_state', lambda m, cid: [_ALIVE])
     monkeypatch.setattr(drift_mod, '_load_baselines',
                         lambda cid: {('network', 'pve-cl-01/vmbr0'): _baseline(snap)})
 
@@ -292,52 +315,10 @@ def test_masked_diff_is_recorded_not_removed(monkeypatch):
     assert d['before'] == snap and d['after'] is None
 
 
-# ── ack-promote safety: unknown events must never rebaseline ──
-
-def test_ack_promote_never_rebaselines_unknown_events():
-    """Promote rebaselines from LIVE. For an 'unknown' event live cannot prove
-    anything (the node is not answering) — rebaselining it would wipe the
-    baseline entry and fire mirror-image 'added' drift on node return
-    (2026-09-29, 10 phantom removals on pve-cl-01). Pin the guard in
-    acknowledge_event with the same ask-the-tree approach as the #815 suite."""
-    with open('pegaprox/api/drift.py', encoding='utf-8') as fh:
-        src = fh.read()
-    tree = ast.parse(src)
-
-    def _is_unknown_guard(test):
-        if not isinstance(test, ast.BoolOp) or not isinstance(test.op, ast.And):
-            return False
-        if len(test.values) != 2:
-            return False
-        a, b = test.values
-        mgr_name = isinstance(a, ast.Name) and a.id == 'mgr'
-        node = b
-        # ev['kind'] (sqlite Row subscript) or ev.kind — accept either shape
-        left_ok = ((isinstance(node.left, ast.Subscript)
-                    and isinstance(node.left.value, ast.Name)
-                    and node.left.value.id == 'ev'
-                    and getattr(node.left.slice, 'value', None) == 'kind')
-                   or (isinstance(node.left, ast.Attribute)
-                       and node.left.attr == 'kind'
-                       and isinstance(node.left.value, ast.Name)
-                       and node.left.value.id == 'ev'))
-        is_cmp = (isinstance(node, ast.Compare) and len(node.ops) == 1
-                  and isinstance(node.ops[0], ast.NotEq) and left_ok)
-        rhs = node.comparators[0] if is_cmp else None
-        return mgr_name and is_cmp and isinstance(rhs, ast.Constant) and rhs.value == 'unknown'
-
-    fn = next(n for n in ast.walk(tree)
-              if isinstance(n, ast.FunctionDef) and n.name == 'acknowledge_event')
-    promote_branch = next(n for n in ast.walk(fn) if isinstance(n, ast.If)
-                          and isinstance(n.test, ast.Name) and n.test.id == 'promote')
-    guards = [n for n in ast.walk(promote_branch) if isinstance(n, ast.If)
-              and _is_unknown_guard(n.test)]
-    assert guards, "the promote path lost its unknown-kind guard — phantom promotes are live again"
-    # the _fetch_state rebaseline call must sit INSIDE that guard
-    has_fetch = any(isinstance(x, ast.Call)
-                    and getattr(x.func, 'id', '') == '_fetch_state'
-                    for g in guards for x in ast.walk(g))
-    assert has_fetch, "unknown-guard found but the rebaseline call escaped it"
+# Ack-promote of a presence-unknown row is driven through the route in
+# test_drift_offline_node_runtime.py: the row keeps its real kind, so a
+# guard on kind == 'unknown' never fired, and a test of the source shape
+# could not see that.
 
 
 # ── the ordinary no-drift path still looks the same ──
@@ -348,9 +329,9 @@ def test_all_online_scan_with_no_drift_still_emits_nothing(monkeypatch):
     mgr = _mk_mgr(monkeypatch, _nodes_status(**{'pve-cl-01': {'status': 'online'}}))
     res = _scan(monkeypatch, mgr,
                 {('network', 'pve-cl-01/vmbr0'): _baseline({'iface': 'vmbr0'}),
-                 ('vm_config', 'qemu/101'): _baseline({'node': 'pve-cl-01'})},
+                 ('vm_config', 'qemu/101'): _baseline({'cores': 2})},
                 state=[('network', 'pve-cl-01/vmbr0', {'iface': 'vmbr0'}),
-                       ('vm_config', 'qemu/101', {'node': 'pve-cl-01'})])
+                       ('vm_config', 'qemu/101', {'cores': 2})])
     assert res['events_count'] == 0
     assert res['removed'] == []
     assert res['suppressed_offline'] == 0
@@ -362,8 +343,24 @@ def test_owning_node_helper():
     assert drift_mod._owning_node('network', 'pve-cl-01/vmbr0') == 'pve-cl-01'
     assert drift_mod._owning_node('network', 'pve-cl-01/enx0c3796c1d74a') == 'pve-cl-01'
     assert drift_mod._owning_node('network', '/') is None
-    assert drift_mod._owning_node('vm_config', 'lxc/150', {'node': 'pve-cl-01'}) == 'pve-cl-01'
+    on_01 = {'lxc/150': 'pve-cl-01', 'qemu/101': 'pve-cl-02'}
+    assert drift_mod._owning_node('vm_config', 'lxc/150', on_01) == 'pve-cl-01'
+    assert drift_mod._owning_node('vm_config', 'qemu/101', on_01) == 'pve-cl-02'
     assert drift_mod._owning_node('vm_config', 'lxc/150', None) is None
-    assert drift_mod._owning_node('vm_config', 'lxc/150', {'hostname': 'x'}) is None
-    assert drift_mod._owning_node('storage', 'local', {'node': 'pve-cl-01'}) is None
+    assert drift_mod._owning_node('vm_config', 'lxc/943', on_01) is None
+    assert drift_mod._owning_node('storage', 'local', on_01) is None
     assert drift_mod._owning_node('cluster_options', 'global', None) is None
+
+
+def test_guest_nodes_come_from_the_guest_list_only():
+    mgr = type('Mgr', (), {})()
+    mgr.get_vm_resources = lambda max_age=0.0: [
+        _guest('qemu', 101, 'pve-cl-01'), _guest('lxc', 150, 'pve-cl-02'),
+        {'type': 'storage', 'storage': 'local', 'node': 'pve-cl-01'},
+        {'type': 'qemu', 'vmid': 102}]
+    assert drift_mod._guest_nodes(mgr) == {'qemu/101': 'pve-cl-01', 'lxc/150': 'pve-cl-02'}
+
+    def _boom(max_age=0.0):
+        raise RuntimeError('cluster/resources timed out')
+    mgr.get_vm_resources = _boom
+    assert drift_mod._guest_nodes(mgr) == {}

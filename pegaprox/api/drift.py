@@ -297,19 +297,36 @@ def _current_user():
         return ''
 
 
-def _owning_node(kind, scope, baseline_snapshot=None):
+def _owning_node(kind, scope, guest_nodes=None):
     """Node a drift scope belongs to, when a single one owns it. network scopes
-    are '<node>/<iface>'; vm_config scopes are 'qemu/<vmid>' / 'lxc/<vmid>' and
-    the owning node lives in the baseline snapshot ('node' key). Cluster-wide
-    kinds (storage, cluster_options) have no single owning node -> None -> the
-    removal guard never masks them."""
+    are '<node>/<iface>'. A guest config carries no node of its own, so a
+    vm_config scope ('qemu/<vmid>', 'lxc/<vmid>') is looked up in guest_nodes,
+    the live guest list. Cluster-wide kinds (storage, cluster_options) have no
+    single owning node -> None -> the removal guard never masks them."""
     if kind == 'network':
         node = scope.split('/', 1)[0]
         return node or None
-    if kind == 'vm_config' and isinstance(baseline_snapshot, dict):
-        node = baseline_snapshot.get('node')
-        return node or None
+    if kind == 'vm_config' and guest_nodes:
+        return guest_nodes.get(scope) or None
     return None
+
+
+# the guest list _fetch_state read moments ago is still in the manager's cache
+_GUEST_LIST_MAX_AGE = 600
+
+
+def _guest_nodes(mgr):
+    """'qemu/101' -> node. PVE keeps listing an offline node's guests in
+    cluster/resources (status unknown), only their config read fails."""
+    out = {}
+    try:
+        for r in (mgr.get_vm_resources(max_age=_GUEST_LIST_MAX_AGE) or []):
+            t, vmid, node = r.get('type'), r.get('vmid'), r.get('node')
+            if t in ('qemu', 'lxc') and vmid and node:
+                out[f"{t}/{vmid}"] = node
+    except Exception as e:
+        logging.debug(f"[drift] guest list for node ownership failed: {e}")
+    return out
 
 
 def _offline_nodes(mgr):
@@ -317,7 +334,7 @@ def _offline_nodes(mgr):
     node status PegaProx already tracks (get_node_status), so a node reboot or
     power outage is visible to the drift scanner without any new collector.
     Best effort: any error means NO node is considered offline, i.e. removal
-    detection behaves exactly as before — never mask a removal because the
+    detection behaves exactly as before - never mask a removal because the
     liveness read hiccupped."""
     try:
         st = mgr.get_node_status() or {}
@@ -326,6 +343,42 @@ def _offline_nodes(mgr):
     except Exception as e:
         logging.debug(f"[drift] node liveness read failed (removals unmasked): {e}")
         return set()
+
+
+def _is_presence_unknown(diffs):
+    return (isinstance(diffs, list) and len(diffs) == 1 and isinstance(diffs[0], dict)
+            and diffs[0].get('op') == 'unknown')
+
+
+def _open_unknown_events(cluster_id):
+    """(kind, scope) -> ids of the open 'presence unknown' rows of a cluster."""
+    out = {}
+    try:
+        c = get_db().conn.cursor()
+        c.execute("SELECT id, kind, scope, diff FROM drift_events "
+                  "WHERE cluster_id=? AND status='open' AND diff LIKE ?",
+                  (cluster_id, '%"op": "unknown"%'))
+        for r in c.fetchall():
+            try:
+                if _is_presence_unknown(json.loads(r['diff'])):
+                    out.setdefault((r['kind'], r['scope']), []).append(r['id'])
+            except Exception:
+                continue
+    except Exception as e:
+        logging.debug(f"[drift] open unknown events read failed: {e}")
+    return out
+
+
+def _supersede_events(ids):
+    if not ids:
+        return
+    try:
+        c = get_db().conn.cursor()
+        c.executemany("UPDATE drift_events SET status='superseded' WHERE id=? AND status='open'",
+                      [(i,) for i in ids])
+        get_db().conn.commit()
+    except Exception as e:
+        logging.warning(f"[drift] superseding events failed: {e}")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -365,35 +418,38 @@ def _scan_cluster(cluster_id, autobaseline=False):
                            'severity': sev, 'summary': summary})
 
     # detect deletions: baseline keys that are no longer in current state
-    offline_nodes = _offline_nodes(mgr)
+    missing = [(key, bk) for key, bk in baselines.items() if key not in seen_keys]
+    if missing and not state:
+        # MK Oct 2026 - nothing answered at all (API down while the manager still
+        # counts as connected). An empty read says nothing about what exists.
+        return {'error': 'cluster did not answer', 'status': 'skipped'}
+
+    # An offline node does not answer its per-node reads, so its NICs and guest
+    # configs never reach `state` and their absence would read as a removal on
+    # every node reboot (#968). Such a scope is recorded once per outage as
+    # 'presence unknown' (info, no alert) and keeps its baseline: if it is really
+    # gone, the first scan after the node is back reports the removal. Liveness
+    # and the guest list are only read when something is missing.
     removed = []
-    suppressed_offline = 0
-    for (kind, scope), bk in baselines.items():
-        if (kind, scope) in seen_keys:
-            continue
-        # Sep 2026 — an offline node does not answer its config/API reads, so
-        # its guests and NICs simply never make it into `state` above: the
-        # scanner reads their ABSENCE as "object removed" and pages a critical
-        # wave on every node reboot/power event (2026-09-29: pve-cl-01 down ->
-        # 10 false removals on one sweep). Those objects still exist; nothing
-        # was destroyed. When the owning node IS offline, emit the missing
-        # scope as a kind of "unknown" with a node-offline annotation instead
-        # of a removal, so the feed stays self-explanatory without the false
-        # alarm. Liveness comes from the node status the manager already
-        # tracks — no new collectors. This only DELAYS a true-removal finding:
-        # the baseline still holds the object, so if it is genuinely gone the
-        # first scan after the node returns raises the normal removal event.
-        # Unknown scopes are intentionally NOT promoted by acknowledge
-        # (drift.py acknowledge endpoint: promote skips unknown kinds).
-        owning_node = _owning_node(kind, scope, bk.get('snapshot'))
+    masked = set()
+    open_unknown = _open_unknown_events(cluster_id)
+    guest_nodes = offline_nodes = None
+    for (kind, scope), bk in missing:
+        if kind == 'vm_config' and guest_nodes is None:
+            guest_nodes = _guest_nodes(mgr)
+        owning_node = _owning_node(kind, scope, guest_nodes)
+        if owning_node and offline_nodes is None:
+            offline_nodes = _offline_nodes(mgr)
         if owning_node and owning_node in offline_nodes:
-            summary = f"{kind} {scope}: object on offline node {owning_node} — presence unknown"
+            masked.add((kind, scope))
+            if (kind, scope) in open_unknown:
+                continue
+            summary = f"{kind} {scope}: on offline node {owning_node}, presence unknown"
             diffs = [{'path': '*', 'op': 'unknown', 'before': bk['snapshot'], 'after': None,
                       'node-offline': owning_node}]
             eid = _record_event(cluster_id, kind, scope, diffs, 'info', summary)
-            new_events.append({'id': eid, 'kind': 'unknown', 'scope': scope,
-                               'severity': 'info', 'summary': summary})
-            suppressed_offline += 1
+            new_events.append({'id': eid, 'kind': kind, 'scope': scope, 'severity': 'info',
+                               'summary': summary, 'node_offline': owning_node})
             continue
         diffs = [{'path': '*', 'op': 'removed', 'before': bk['snapshot'], 'after': None}]
         summary = f"{kind} {scope}: object removed"
@@ -403,13 +459,18 @@ def _scan_cluster(cluster_id, autobaseline=False):
                            'severity': sev, 'summary': summary})
         removed.append(scope)
 
-    # fire alert handler so configured Slack/Discord/etc. + push pick it up
-    if new_events:
+    # rows of an earlier outage are done with once the node answers again
+    _supersede_events([i for key, ids in open_unknown.items() if key not in masked for i in ids])
+
+    # fire alert handler so configured Slack/Discord/etc. + push pick it up. A
+    # presence-unknown row is no drift; the node being down has its own alert.
+    if any(not e.get('node_offline') for e in new_events):
         try:
             from pegaprox.background import alerts as alerts_mod
-            count = len(new_events)
-            top_sev = 'critical' if any(e['severity'] == 'critical' for e in new_events) \
-                else 'warning' if any(e['severity'] == 'warning' for e in new_events) \
+            alertable = [e for e in new_events if not e.get('node_offline')]
+            count = len(alertable)
+            top_sev = 'critical' if any(e['severity'] == 'critical' for e in alertable) \
+                else 'warning' if any(e['severity'] == 'warning' for e in alertable) \
                 else 'info'
             payload = {
                 'alert_name': 'Config Drift',
@@ -445,7 +506,7 @@ def _scan_cluster(cluster_id, autobaseline=False):
         'events_count': len(new_events),
         'seeded_baselines': seeded,
         'removed': removed,
-        'suppressed_offline': suppressed_offline,
+        'suppressed_offline': len(masked),
         'events': new_events,
     }
 
@@ -620,22 +681,17 @@ def acknowledge_event(eid):
                   (datetime.now().isoformat(), user, eid))
 
         if promote:
-            # re-fetch the live state for that scope and store as new baseline
-            # MK Sep 2026 — a promote rebaselines from LIVE state. An 'unknown'
-            # event means the scope was unreadable at detection time (owning
-            # node offline): there is no truthful live snapshot to baseline, so
-            # promoting one must never rewrite its baseline (today the loop
-            # below would find nothing to set and leave the old one by luck;
-            # make that a guarantee so a future change to _fetch_state — e.g.
-            # last-known caching — cannot silently promote stale node state).
-            # The baseline still holds the object, so the first scan after the
-            # node returns raises a normal removal event if it is really gone.
-            # Promoting a phantom while the node is down would instead wipe the
-            # baseline entry and fire mirror-image 'added' drift on node return
-            # (2026-09-29 pve-cl-01 outage, 10 false events).
+            # re-fetch the live state for that scope and store as new baseline.
+            # A presence-unknown row (#968) has no change to accept: rebaselining
+            # it once the node is back would swallow whatever changed meanwhile.
+            # The row keeps its real kind, the diff says what it is.
+            try:
+                unknown = _is_presence_unknown(json.loads(ev['diff'] or '[]'))
+            except Exception:
+                unknown = False
             cid = ev['cluster_id']
             mgr = cluster_managers.get(cid)
-            if mgr and ev['kind'] != 'unknown':
+            if mgr and not unknown:
                 state = _fetch_state(mgr, cid)
                 for kind, scope, snap in state:
                     if kind == ev['kind'] and scope == ev['scope']:
