@@ -388,6 +388,170 @@
             return null;
         }
 
+        // LW Oct 2026 - the VirtIO RNG of a VM. PVE keeps it as rng0 =
+        // "[source=]<file>[,max_bytes=N][,period=N]" and fills in 1024 bytes per 1000 ms when
+        // the numbers are left out. The server checks the same rules before PVE sees the value.
+        const RNG_SOURCES = ['/dev/urandom', '/dev/random', '/dev/hwrng'];
+        const RNG_MAX_BYTES_TOP = '9223372036854775807';
+
+        function parseRng(value) {
+            const out = { source: '', max_bytes: '', period: '' };
+            String(value || '').split(',').forEach(part => {
+                if (!part.trim()) return;
+                const eq = part.indexOf('=');
+                if (eq < 0) out.source = part;
+                else if (Object.prototype.hasOwnProperty.call(out, part.slice(0, eq))) out[part.slice(0, eq)] = part.slice(eq + 1);
+            });
+            return out;
+        }
+
+        const rngDigits = (v) => String(v ?? '').replace(/^0+(?=[0-9])/, '');
+
+        // '' when the form is fine, else the key of what is wrong with it
+        function rngProblem(form) {
+            if (!RNG_SOURCES.includes(form.source)) return 'rngBadSource';
+            const bytes = rngDigits(form.max_bytes);
+            if (!/^[0-9]{1,19}$/.test(bytes) || (bytes.length === 19 && bytes > RNG_MAX_BYTES_TOP)) return 'rngBadMaxBytes';
+            if (bytes === '0') return '';
+            const period = rngDigits(form.period);
+            if (!/^[0-9]{1,10}$/.test(period) || Number(period) < 1 || Number(period) > 4294967295) return 'rngBadPeriod';
+            return '';
+        }
+
+        // without a limit QEMU never gets the period, so it is left out
+        function rngValue(form) {
+            const bytes = rngDigits(form.max_bytes);
+            const parts = [`source=${form.source}`, `max_bytes=${bytes}`];
+            if (bytes !== '0') parts.push(`period=${rngDigits(form.period)}`);
+            return parts.join(',');
+        }
+
+        function VirtioRngCard({ value, running, onAdd, onEdit, onRemove, t }) {
+            const cur = value ? parseRng(value) : null;
+            const limit = cur && (rngDigits(cur.max_bytes) === '0'
+                ? t('rngNoLimit')
+                : t('rngLimitText').replace('{bytes}', () => rngDigits(cur.max_bytes) || '1024').replace('{ms}', () => rngDigits(cur.period) || '1000'));
+            return (
+                <div className="mt-6 pt-6 border-t border-proxmox-border" data-rng-card>
+                    <h3 className="text-white font-medium mb-4 flex items-center gap-2">
+                        <span className="text-purple-400"><Icons.Dice /></span>
+                        {t('rngTitle')}
+                        {running && (
+                            <span className="text-xs text-yellow-400 bg-yellow-500/10 px-2 py-0.5 rounded">{t('changesAfterRestart')}</span>
+                        )}
+                    </h3>
+                    {cur ? (
+                        <div className="p-3 bg-proxmox-dark rounded-lg" data-rng-device>
+                            <div className="flex items-center justify-between gap-4">
+                                <div className="flex items-center gap-2 min-w-0">
+                                    <span className="text-xs text-gray-500 font-mono">rng0</span>
+                                    <span className="text-sm font-mono text-gray-300 truncate" data-rng-shown-source>{cur.source || value}</span>
+                                    <span className="text-xs text-gray-500 truncate" data-rng-shown-limit>{limit}</span>
+                                </div>
+                                <div className="flex items-center gap-1 shrink-0">
+                                    <button onClick={onEdit} data-rng-edit title={t('edit')}
+                                        className="text-xs px-2 py-1 text-gray-400 hover:text-white hover:bg-proxmox-hover rounded">
+                                        <Icons.Edit />
+                                    </button>
+                                    <button onClick={onRemove} data-rng-remove title={t('remove')}
+                                        className="text-xs px-2 py-1 text-red-400 hover:bg-red-500/20 rounded">
+                                        <Icons.Trash className="w-3.5 h-3.5" />
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    ) : (
+                        <div className="p-3 bg-proxmox-dark rounded-lg border border-dashed border-proxmox-border">
+                            <div className="flex items-center justify-between gap-4">
+                                <span className="text-sm text-gray-500">{t('rngNone')}</span>
+                                <button onClick={onAdd} data-rng-add
+                                    className="shrink-0 text-xs px-3 py-1.5 bg-purple-500/20 text-purple-400 rounded hover:bg-purple-500/30 flex items-center gap-1">
+                                    <Icons.Plus className="w-3 h-3" />
+                                    {t('rngAdd')}
+                                </button>
+                            </div>
+                            <p className="text-xs text-gray-600 mt-2">{t('rngHint')}</p>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        function VirtioRngDialog({ value, onSave, onClose, t }) {
+            const [form, setForm] = useState(() => {
+                const cur = parseRng(value);
+                return {
+                    source: value ? cur.source : '/dev/urandom',
+                    max_bytes: cur.max_bytes !== '' ? cur.max_bytes : '1024',
+                    period: cur.period !== '' ? cur.period : '1000',
+                };
+            });
+            const [busy, setBusy] = useState(false);
+            const problem = rngProblem(form);
+            const unlimited = rngDigits(form.max_bytes) === '0';
+            const set = (key) => (e) => setForm(prev => ({ ...prev, [key]: e.target.value }));
+            const save = async () => {
+                if (problem || busy) return;
+                setBusy(true);
+                if (!(await onSave(rngValue(form)))) setBusy(false);
+            };
+            const warning = form.source === '/dev/random' ? 'rngWarnRandom' : form.source === '/dev/hwrng' ? 'rngWarnHwrng' : '';
+            return (
+                <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60" data-rng-dialog={value ? 'edit' : 'add'}>
+                    <div className="w-full max-w-md bg-proxmox-card border border-proxmox-border rounded-xl p-6">
+                        <h3 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+                            <span className="text-purple-400"><Icons.Dice /></span>
+                            {value ? t('rngEdit') : t('rngAdd')}
+                        </h3>
+                        <div className="space-y-4">
+                            <div>
+                                <label className="block text-xs text-gray-400 mb-1">{t('rngSource')}</label>
+                                <select value={form.source} onChange={set('source')} data-rng-source
+                                    className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white">
+                                    {!RNG_SOURCES.includes(form.source) && <option value={form.source}>{form.source || '-'}</option>}
+                                    {RNG_SOURCES.map(s => <option key={s} value={s}>{s}</option>)}
+                                </select>
+                                {warning && (
+                                    <p className="text-xs text-yellow-400 mt-2 flex items-start gap-1" data-rng-warning={form.source.slice(5)}>
+                                        <span className="shrink-0 mt-0.5"><Icons.AlertTriangle /></span>
+                                        <span>{t(warning)}</span>
+                                    </p>
+                                )}
+                            </div>
+                            <div className="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label className="block text-xs text-gray-400 mb-1">{t('rngMaxBytes')}</label>
+                                    <input type="number" min="0" step="1" value={form.max_bytes} onChange={set('max_bytes')} data-rng-max-bytes
+                                        className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white" />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-gray-400 mb-1">{t('rngPeriod')}</label>
+                                    <input type="number" min="1" step="1" value={unlimited ? '' : form.period} onChange={set('period')} data-rng-period
+                                        disabled={unlimited} placeholder={unlimited ? t('rngNoLimit') : ''}
+                                        className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white disabled:opacity-50" />
+                                </div>
+                            </div>
+                            <p className="text-xs text-gray-500">{t('rngLimitHint')}</p>
+                            {unlimited && (
+                                <p className="text-xs text-yellow-400 flex items-start gap-1" data-rng-warning="unlimited">
+                                    <span className="shrink-0 mt-0.5"><Icons.AlertTriangle /></span>
+                                    <span>{t('rngWarnUnlimited')}</span>
+                                </p>
+                            )}
+                            {problem && <p className="text-xs text-red-400" data-rng-problem={problem}>{t(problem)}</p>}
+                            <div className="flex gap-2 justify-end pt-4">
+                                <button onClick={onClose} className="px-4 py-2 bg-proxmox-dark hover:bg-proxmox-hover rounded">{t('cancel')}</button>
+                                <button onClick={save} disabled={!!problem || busy} data-rng-save
+                                    className="px-4 py-2 bg-purple-600 hover:bg-purple-700 rounded disabled:opacity-50">
+                                    {busy ? t('saving') : (value ? t('save') : t('add'))}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
         function ConfigModal({ vm, clusterId, allClusters = [], dashboardAuthFetch, onClose, addToast, isCorporate = false }) {
             const { t } = useTranslation();
             const { getAuthHeaders, haReadOnly, haStandby } = useAuth();
@@ -502,6 +666,7 @@
             const [cloudInitFormat, setCloudInitFormat] = useState('raw');
             const [cloudInitBus, setCloudInitBus] = useState('ide');
             const [cloudInitDevice, setCloudInitDevice] = useState('2');
+            const [showRngDialog, setShowRngDialog] = useState(false);
             const [selectedPciDevice, setSelectedPciDevice] = useState(null);
             const [selectedUsbDevice, setSelectedUsbDevice] = useState(null);
             const [pciOptions, setPciOptions] = useState({ pcie: true, rombar: true });
@@ -663,6 +828,38 @@
                 } catch (error) {
                     console.error('to load passthrough:', error);
                 }
+            };
+
+            // rng0 set ({rng0: value}) or removed ({delete: 'rng0'}); true when it went through
+            const putRng = async (body, okKey, failKey) => {
+                try {
+                    const res = await authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/qemu/${vm.vmid}/config`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body)
+                    });
+                    if (res?.ok) {
+                        addToast(t(okKey), 'success');
+                        fetchConfig();
+                        return true;
+                    }
+                    const err = res ? await res.json().catch(() => ({})) : {};
+                    addToast(err.error || t(failKey), 'error');
+                } catch (e) {
+                    addToast(t('connectionError'), 'error');
+                }
+                return false;
+            };
+
+            const saveRng = async (value) => {
+                const ok = await putRng({ rng0: value }, 'rngSaved', 'rngSaveFailed');
+                if (ok) setShowRngDialog(false);
+                return ok;
+            };
+
+            const removeRng = () => {
+                if (!confirm(t('rngRemoveConfirm'))) return;
+                putRng({ delete: 'rng0' }, 'rngRemoved', 'rngRemoveFailed');
             };
 
             const loadPtMappings = async (kind) => {
@@ -2778,6 +2975,17 @@
                                                         })()}
                                                     </div>
                                                     
+                                                    {allClusters.find(c => c.id === clusterId)?.cluster_type !== 'xcpng' && (
+                                                        <VirtioRngCard
+                                                            value={config?.raw?.rng0}
+                                                            running={vm.status === 'running'}
+                                                            onAdd={() => setShowRngDialog(true)}
+                                                            onEdit={() => setShowRngDialog(true)}
+                                                            onRemove={removeRng}
+                                                            t={t}
+                                                        />
+                                                    )}
+
                                                     {/* PCI/USB/Serial Passthrough Section */}
                                                     <div className="mt-6 pt-6 border-t border-proxmox-border">
                                                         <h3 className="text-white font-medium mb-4 flex items-center gap-2">
@@ -6418,6 +6626,10 @@
                         </div>
                     )}
                     
+                    {showRngDialog && !haReadOnly && (
+                        <VirtioRngDialog value={config?.raw?.rng0} onSave={saveRng} onClose={() => setShowRngDialog(false)} t={t} />
+                    )}
+
                     {/* MK: Add TPM Modal */}
                     {showAddTpm && (
                         <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60">
