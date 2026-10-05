@@ -1944,6 +1944,7 @@
             ssl_verification: false, migration_threshold: 20, migration_tolerance: 10, check_interval: 300,
             auto_migrate: false, balance_containers: false, balance_local_disks: false,
             dry_run: false, ssh_key: '', ssh_disabled: false, ha_enabled: false, proxlb_tags_enabled: false,
+            proxlb_pins_auto_migrate: false, proxlb_pins_strict: false,
             predictive_balancing: false, predictive_threshold: 75,
             balance_cpu_weight: 1.0, balance_mem_weight: 1.0, balance_io_weight: 0.0,
             cpu_baseline: null,
@@ -1983,7 +1984,7 @@
                         // just this subset. The omitted toggles (HA, ProxLB tags, predictive balancing +
                         // its weights/baseline) started at their defaults, so hitting Re-configure quietly
                         // switched them back off. The list GET already returns all of these.
-                        setConfig(prev => ({ ...prev, name: rc.name || '', host: rc.host || '', api_port: rc.api_port || 8006, node_ui_suffix: rc.node_ui_suffix || '', user: rc.user || '', pass: '', ssl_verification: rc.ssl_verification || false, migration_threshold: rc.migration_threshold || 20, migration_tolerance: rc.migration_tolerance || 10, check_interval: rc.check_interval || 300, auto_migrate: rc.auto_migrate || false, balance_containers: rc.balance_containers || false, balance_local_disks: rc.balance_local_disks || false, dry_run: rc.dry_run || false, ssh_key: '', ssh_disabled: rc.ssh_disabled || false, ha_enabled: rc.ha_enabled || false, proxlb_tags_enabled: rc.proxlb_tags_enabled || false, predictive_balancing: rc.predictive_balancing || false, predictive_threshold: rc.predictive_threshold || 75, balance_cpu_weight: rc.balance_cpu_weight || 1.0, balance_mem_weight: rc.balance_mem_weight || 1.0, balance_io_weight: rc.balance_io_weight || 0.0, cpu_baseline: rc.cpu_baseline || null }));
+                        setConfig(prev => ({ ...prev, name: rc.name || '', host: rc.host || '', api_port: rc.api_port || 8006, node_ui_suffix: rc.node_ui_suffix || '', user: rc.user || '', pass: '', ssl_verification: rc.ssl_verification || false, migration_threshold: rc.migration_threshold || 20, migration_tolerance: rc.migration_tolerance || 10, check_interval: rc.check_interval || 300, auto_migrate: rc.auto_migrate || false, balance_containers: rc.balance_containers || false, balance_local_disks: rc.balance_local_disks || false, dry_run: rc.dry_run || false, ssh_key: '', ssh_disabled: rc.ssh_disabled || false, ha_enabled: rc.ha_enabled || false, proxlb_tags_enabled: rc.proxlb_tags_enabled || false, proxlb_pins_auto_migrate: rc.proxlb_pins_auto_migrate === true, proxlb_pins_strict: rc.proxlb_pins_strict === true, predictive_balancing: rc.predictive_balancing || false, predictive_threshold: rc.predictive_threshold || 75, balance_cpu_weight: rc.balance_cpu_weight || 1.0, balance_mem_weight: rc.balance_mem_weight || 1.0, balance_io_weight: rc.balance_io_weight || 0.0, cpu_baseline: rc.cpu_baseline || null }));
                     }
                 }
             }, [isOpen, initialType, reconfigureConfig]);

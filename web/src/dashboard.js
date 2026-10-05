@@ -5291,6 +5291,154 @@
             );
         }
 
+        // LW Oct 2026 (#811) - the guests that sit off their plb_pin_ node, and the tags that name
+        // no node at all. Read when the cluster settings open, not polled: the scan walks every
+        // guest of the cluster. "Move back now" is the reconcile route with force; the server
+        // says whether this caller may (can_reconcile), the browser cannot tell a scoped one
+        const PIN_ROWS_SHOWN = 50;
+        function ProxlbPinGuests({ clusterId, authFetch, addToast, t, canMigrate, dryRun, resources }) {
+            const [data, setData] = React.useState(null);
+            const [failed, setFailed] = React.useState(false);
+            const [loading, setLoading] = React.useState(false);
+            const [moving, setMoving] = React.useState(false);
+            const [lastRun, setLastRun] = React.useState(null);
+            const [showAll, setShowAll] = React.useState(false);
+            const gen = React.useRef(0);
+
+            const load = React.useCallback(async (retry) => {
+                const mine = ++gen.current;
+                setLoading(true);
+                try {
+                    const r = await authFetch(`${API_URL}/clusters/${clusterId}/proxlb-pins/violations`);
+                    const d = r && r.ok ? await r.json().catch(() => null) : null;
+                    if (mine !== gen.current) return;
+                    setFailed(!d);
+                    if (!d) return;
+                    setData(d);
+                    // the tags were just switched on and their save is still on its way
+                    if (retry && d.enabled === false) setTimeout(() => { if (mine === gen.current) load(false); }, 1500);
+                } finally {
+                    if (mine === gen.current) setLoading(false);
+                }
+            }, [clusterId, authFetch]);
+
+            React.useEffect(() => {
+                setData(null); setLastRun(null); setShowAll(false);
+                load(true);
+                return () => { gen.current += 1; };
+            }, [load]);
+
+            const rows = (data && data.violations) || [];
+            const unresolved = (data && data.unresolved) || [];
+            // what the reconcile itself leaves alone: no pinned node up, plb_ignore, not running
+            const movable = rows.filter(v => v.reason === 'drift' && !v.ignored && v.status === 'running').length;
+            const canMove = canMigrate && !!data && data.can_reconcile === true && movable > 0;
+
+            const nameOf = React.useMemo(() => {
+                const want = new Set(unresolved.map(u => u.vmid));
+                const out = {};
+                if (want.size) (resources || []).forEach(r => { if (want.has(r.vmid)) out[r.vmid] = r.name; });
+                return out;
+            }, [data, resources]);
+
+            const moveBack = async () => {
+                if (moving) return;
+                setMoving(true);
+                try {
+                    const r = await authFetch(`${API_URL}/clusters/${clusterId}/proxlb-pins/reconcile`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ force: true }),
+                    });
+                    const d = r ? await r.json().catch(() => null) : null;
+                    if (!r || !r.ok || !d) {
+                        addToast((d && d.error) || t('proxlbPinMoveFailed'), 'error');
+                        return;
+                    }
+                    const n = { moved: (d.migrated || []).length, failed: (d.failed || []).length, deferred: (d.deferred || []).length };
+                    setLastRun({ ...n, rows: d.failed || [] });
+                    addToast(t('proxlbPinMoveDone').replace('{moved}', () => n.moved).replace('{failed}', () => n.failed)
+                        .replace('{deferred}', () => n.deferred), n.failed ? 'error' : 'success');
+                } finally {
+                    setMoving(false);
+                    load(false);
+                }
+            };
+
+            const why = (v) => v.reason === 'unavailable' ? ['proxlbPinWhyUnavailable', 'text-gray-400']
+                : v.ignored ? ['proxlbPinWhyIgnored', 'text-gray-400']
+                : v.status !== 'running' ? ['proxlbPinWhyStopped', 'text-gray-400']
+                : ['proxlbPinWhyDrift', 'text-yellow-400'];
+            const cut = (list) => showAll ? list : list.slice(0, PIN_ROWS_SHOWN);
+            const longest = Math.max(rows.length, unresolved.length);
+
+            return (
+                <div className="mt-3 ml-12 space-y-2 min-w-0" data-proxlb-pin-guests>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                        <h5 className="text-sm font-medium text-gray-300 flex items-center gap-2">
+                            <span className="text-blue-400 flex-shrink-0"><Icons.Tag /></span>
+                            {t('proxlbPinOffTitle')}
+                            {rows.length > 0 && (
+                                <span className="text-xs px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-400" data-pin-count>{rows.length}</span>
+                            )}
+                        </h5>
+                        <div className="flex items-center gap-2">
+                            {canMove && (
+                                <button type="button" onClick={moveBack} disabled={moving || dryRun} data-pin-move-back
+                                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-proxmox-orange/20 text-proxmox-orange hover:bg-proxmox-orange/30 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
+                                    {moving ? <Icons.RotateCw /> : <Icons.ArrowLeft />}
+                                    {moving ? t('proxlbPinMoving') : t('proxlbPinMoveBack')}
+                                </button>
+                            )}
+                            <button type="button" onClick={() => load(false)} disabled={loading} title={t('refresh')}
+                                className="p-1 text-gray-400 hover:text-white disabled:opacity-40" data-pin-refresh>
+                                {loading ? <Icons.RotateCw /> : <Icons.RefreshCw />}
+                            </button>
+                        </div>
+                    </div>
+                    {canMove && dryRun && <div className="text-xs text-yellow-400">{t('proxlbPinDryRun')}</div>}
+                    {failed && <div className="text-xs text-red-400">{t('proxlbPinLoadError')}</div>}
+                    {!data && !failed && <div className="text-xs text-gray-500">{t('loading')}...</div>}
+                    {data && rows.length === 0 && unresolved.length === 0 && (
+                        <div className="text-xs text-gray-500 p-2 bg-proxmox-dark rounded-lg">{t('proxlbPinOffNone')}</div>
+                    )}
+                    {cut(rows).map(v => {
+                        const [key, tone] = why(v);
+                        return (
+                            <div key={`v${v.vmid}`} data-pin-row={v.vmid}
+                                className="flex flex-wrap items-center gap-x-4 gap-y-1 bg-proxmox-dark rounded-lg px-2 py-1.5 text-xs min-w-0">
+                                <span className="text-sm text-gray-200 truncate">{v.name || `VM ${v.vmid}`} <span className="text-gray-500">({v.vmid})</span></span>
+                                <span className="text-gray-400">
+                                    {t('proxlbPinOffWhere').replace('{node}', () => v.node || '?').replace('{nodes}', () => (v.pinned_nodes || []).join(', '))}
+                                </span>
+                                <span className={tone} data-pin-why={v.reason}>{t(key)}</span>
+                            </div>
+                        );
+                    })}
+                    {cut(unresolved).map(u => (
+                        <div key={`u${u.vmid}-${u.node}`} data-pin-unresolved={u.vmid}
+                            className="flex flex-wrap items-center gap-x-4 gap-y-1 bg-proxmox-dark rounded-lg px-2 py-1.5 text-xs min-w-0">
+                            <span className="text-sm text-gray-200 truncate">{nameOf[u.vmid] || `VM ${u.vmid}`} <span className="text-gray-500">({u.vmid})</span></span>
+                            <code className="font-mono text-gray-400">plb_pin_{u.node}</code>
+                            <span className="text-orange-400">{t('proxlbPinUnresolved')}</span>
+                        </div>
+                    ))}
+                    {longest > PIN_ROWS_SHOWN && (
+                        <button type="button" onClick={() => setShowAll(s => !s)} className="text-xs text-blue-400 hover:text-blue-300">
+                            {showAll ? t('showLess') : t('proxlbPinShowAll').replace('{n}', () => longest)}
+                        </button>
+                    )}
+                    {lastRun && lastRun.rows.length > 0 && (
+                        <div className="space-y-0.5" data-pin-last-failed>
+                            {lastRun.rows.map(f => (
+                                <div key={`f${f.vmid}`} className="text-xs text-red-400">{f.name || `VM ${f.vmid}`} ({f.vmid}): {f.error}</div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
         // NS May 2026 — Config Drift Detection.
         // Tracks open events grouped by kind (vm_config, storage, network, cluster_options).
         // Admin can rescan, set baseline, acknowledge/promote events.
@@ -21545,6 +21693,33 @@
                                                                     <div><code className="font-mono">plb_pin_&lt;node&gt;</code> — {t('proxlbTagPin') || 'restrict this guest to the named node'}</div>
                                                                 </div>
                                                             )}
+                                                            {/* LW Oct 2026 (#811) - what a pin does in a node drain, whether a guest goes
+                                                                back on its own, and who is off their pin now. PVE tags, so not on XCP-ng */}
+                                                            {selectedCluster.proxlb_tags_enabled && (selectedCluster.cluster_type || 'proxmox') === 'proxmox' && (<>
+                                                                <fieldset disabled={haReadOnly} className="mt-3 ml-12 space-y-3 min-w-0" data-ha-locked={haReadOnly ? '' : undefined} data-proxlb-pin-switches>
+                                                                    {[
+                                                                        ['proxlb_pins_strict', 'proxlbPinsStrict', 'proxlbPinsStrictDesc'],
+                                                                        ['proxlb_pins_auto_migrate', 'proxlbPinsAutoMigrate', 'proxlbPinsAutoMigrateDesc'],
+                                                                    ].map(([field, label, hint]) => (
+                                                                        <div key={field}>
+                                                                            <div className="flex items-center gap-3">
+                                                                                <button id={`pin-switch-${field}`} type="button" role="switch" aria-checked={!!selectedCluster[field]}
+                                                                                    data-pin-switch={field} disabled={!can('cluster.config')}
+                                                                                    onClick={() => updateConfig(field, !selectedCluster[field])}
+                                                                                    className={`toggle-switch flex-shrink-0 disabled:opacity-50 disabled:cursor-not-allowed ${selectedCluster[field] ? 'active' : ''}`} />
+                                                                                <label htmlFor={`pin-switch-${field}`} className="text-sm text-gray-300 cursor-pointer">{t(label)}</label>
+                                                                            </div>
+                                                                            <div className="text-xs text-gray-500 pl-12 mt-1">{t(hint)}</div>
+                                                                        </div>
+                                                                    ))}
+                                                                    {selectedCluster.proxlb_pins_auto_migrate && (!selectedCluster.auto_migrate || selectedCluster.dry_run) && (
+                                                                        <div className="text-xs text-yellow-400 pl-12" data-pin-held-back>{t('proxlbPinsHeldBack')}</div>
+                                                                    )}
+                                                                </fieldset>
+                                                                <ProxlbPinGuests key={selectedCluster.id} clusterId={selectedCluster.id} authFetch={authFetch}
+                                                                    addToast={addToast} t={t} canMigrate={can('vm.migrate')} dryRun={!!selectedCluster.dry_run}
+                                                                    resources={clusterResources} />
+                                                            </>)}
                                                         </div>
 
                                                         {/* LW: collapsible advanced LB settings */}
