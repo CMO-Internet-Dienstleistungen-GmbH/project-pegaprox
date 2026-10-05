@@ -20640,7 +20640,8 @@
                                                                         </h3>
                                                                         {/* Name column is one grid track, so the longest node name sets its
                                                                             width for every row instead of a fixed w-28 clipping them all. */}
-                                                                        <div className="grid items-center gap-x-4 gap-y-2 text-sm" style={{gridTemplateColumns: 'minmax(0, max-content) minmax(6rem, 1fr) max-content'}}>
+                                                                        {/* LW Oct 2026 - gap-2 then gap-x-4: gap-y-2 is not in the static Tailwind build */}
+                                                                        <div className="grid items-center gap-2 gap-x-4 text-sm" style={{gridTemplateColumns: 'minmax(0, max-content) minmax(6rem, 1fr) max-content'}}>
                                                                             {Object.entries(clusterMetrics).filter(([, m]) => m && m.disk_percent != null && m.disk_total > 0).map(([name, m]) => (
                                                                                 <React.Fragment key={name}>
                                                                                     <span className="truncate text-gray-400" title={name}>{name}</span>
