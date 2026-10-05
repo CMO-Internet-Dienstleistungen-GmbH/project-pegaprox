@@ -17611,12 +17611,38 @@ echo "AGENT_INSTALLED_OK"
         except Exception as e:
             return {'success': False, 'error': str(e)}
     
+    # MK Oct 2026 (#601) - stock Proxmox has no lm-sensors, so homelab nodes showed no
+    # temperatures at all. The kernel has them anyway: /sys/class/hwmon is what lm-sensors
+    # reads itself. One call does both - `sensors -j` when it answers with readings, else
+    # the hwmon files (plus each chip's device path, which gives it its usual lm-sensors
+    # name). Always exits 0: _ssh_run_command_output takes any other code for a failed call.
+    _SENSORS_PROBE = (
+        "o=$(sensors -j 2>/dev/null); printf '%s\\n' \"$o\"; "
+        "case \"$o\" in *_input*) exit 0;; esac; "
+        "echo __PP_HWMON__; "
+        "command -v sensors >/dev/null 2>&1 || echo __PP_NO_LMSENSORS__; "
+        "for h in /sys/class/hwmon/hwmon*; do "
+        "[ -e \"$h\" ] && echo \"$h/device:$(readlink -f \"$h/device\" 2>/dev/null)\"; done; "
+        "grep -sH . /sys/class/hwmon/hwmon*/name /sys/class/hwmon/hwmon*/temp*_input "
+        "/sys/class/hwmon/hwmon*/temp*_label /sys/class/hwmon/hwmon*/temp*_max "
+        "/sys/class/hwmon/hwmon*/temp*_crit /sys/class/hwmon/hwmon*/temp*_alarm; exit 0"
+    )
+
     def get_node_sensors(self, node: str) -> Dict[str, Any]:
         # MK May 2026 — bare-metal sensors via `sensors -j` (lm-sensors JSON).
         # Returns a flattened list of measurements:
         #   [{chip, label, kind: 'temp'|'fan'|'volt', value, max, crit, alarm}]
-        # On VMs / hosts without lm-sensors installed the command fails or
-        # returns empty — surfaces as graceful empty list.
+        # Order: `sensors -j`, then plain `sensors` (#601), then the kernel's hwmon
+        # temperatures ('source': 'hwmon'). A VM has none of them - that is the error case.
+        #
+        # MK Oct 2026 - with SSH off for the cluster, answer before _get_node_ip: that
+        # lookup TCP-probes every address the node reports, and a live cluster with SSH
+        # switched off still got those connects every collector cycle.
+        _blocked = self.ssh_blocked_reason()
+        if _blocked:
+            why = ('SSH is switched off for this cluster' if _blocked == 'SSH_DISABLED'
+                   else 'this cluster has no SSH credentials (an API token is not one)')
+            return {'error': f'{why}, and sensors are read over SSH', 'code': _blocked}
         if not self.is_connected:
             if not self.connect_to_proxmox():
                 return {'error': 'cluster not connected'}
@@ -17626,9 +17652,12 @@ echo "AGENT_INSTALLED_OK"
         user = getattr(self.config, 'ssh_user', None) or 'root'
 
         with ha.reading():
-            raw = self._ssh_run_command_output(ip, user, 'sensors -j 2>/dev/null', timeout=8)
+            raw = self._ssh_run_command_output(ip, user, self._SENSORS_PROBE, timeout=8)
+        if raw is None:
+            return {'error': f'no answer from node {node} over SSH'}
+        raw, _, hw_dump = raw.partition('__PP_HWMON__')
         data = None
-        if raw and raw.strip():
+        if raw.strip():
             import json as _json
             try:
                 data = _json.loads(raw)
@@ -17638,19 +17667,8 @@ echo "AGENT_INSTALLED_OK"
                 # through to the plain-text parser below.
                 data = None
 
-        if data is None:
-            # `sensors -j` (JSON) needs lm-sensors >= 3.5.0; older builds don't know -j at
-            # all (empty output) or emit broken JSON, even when the plain `sensors` command
-            # is perfectly fine. Parse the human-readable output instead — it works wherever
-            # `sensors` itself does.
-            with ha.reading():
-                text = self._ssh_run_command_output(ip, user, 'sensors 2>/dev/null', timeout=8)
-            if not text or not text.strip():
-                return {'error': 'sensors command unavailable or empty (lm-sensors not installed?)'}
-            out = self._parse_sensors_text(text)
-            if not out:
-                return {'error': 'sensors ran but no readings could be parsed'}
-            return {'sensors': out, 'count': len(out), 'source': 'text'}
+        if not isinstance(data, dict):
+            data = None
 
         # Flatten the {chip: {sensor: {temp1_input: X, ...}}} structure.
         # lm-sensors keys follow `tempN_input`, `tempN_max`, `tempN_crit`, `tempN_alarm`
@@ -17685,7 +17703,31 @@ echo "AGENT_INSTALLED_OK"
                     'alarm': bool(sub.get(f'{prefix}_alarm') or 0),
                 }
                 out.append(row)
-        return {'sensors': out, 'count': len(out)}
+        if data is not None and (out or not hw_dump):
+            return {'sensors': out, 'count': len(out)}
+
+        hw_rows = self._parse_hwmon_dump(hw_dump)
+        text = None
+        if data is None and '__PP_NO_LMSENSORS__' not in hw_dump:
+            # `sensors -j` (JSON) needs lm-sensors >= 3.5.0; older builds don't know -j at
+            # all (empty output) or emit broken JSON, even when the plain `sensors` command
+            # is perfectly fine. Parse the human-readable output instead - it works wherever
+            # `sensors` itself does. Not tried when the probe found no lm-sensors at all.
+            with ha.reading():
+                text = self._ssh_run_command_output(ip, user, 'sensors 2>/dev/null', timeout=8)
+            out = self._parse_sensors_text(text) if text and text.strip() else []
+            if out:
+                return {'sensors': out, 'count': len(out), 'source': 'text'}
+        if hw_rows:
+            return {'sensors': hw_rows, 'count': len(hw_rows), 'source': 'hwmon'}
+        if data is not None:
+            return {'sensors': [], 'count': 0}  # lm-sensors ran and found no chips, as before
+        if text and text.strip():
+            return {'error': 'sensors ran but no readings could be parsed'}
+        if '__PP_NO_LMSENSORS__' in hw_dump:
+            return {'error': 'no temperature sensors: lm-sensors is not installed and the kernel '
+                             'reports none under /sys/class/hwmon (normal inside a VM)'}
+        return {'error': 'sensors command unavailable or empty, and no hwmon temperatures'}
 
     def _parse_sensors_text(self, text: str) -> list:
         """Fallback parser for the human-readable `sensors` output — used when
@@ -17728,6 +17770,75 @@ echo "AGENT_INSTALLED_OK"
                 'alarm': 'ALARM' in rest,
             })
         return rows
+
+    @staticmethod
+    def _parse_hwmon_dump(text: str) -> list:
+        """Temperature rows from the hwmon half of _SENSORS_PROBE, in the row shape of the
+        lm-sensors paths. Lines are `<hwmon dir>/<file>:<content>` from grep -H, plus one
+        `<hwmon dir>/device:<resolved path>` per chip. sysfs gives millidegrees; a sensor
+        without a label file is `tempN`, as lm-sensors calls it too."""
+        chips = {}
+        for line in (text or '').splitlines():
+            path, sep, content = line.partition(':')
+            parts = path.rsplit('/', 2)
+            if not sep or len(parts) < 3 or not re.fullmatch(r'hwmon\d+', parts[1]):
+                continue
+            chips.setdefault(parts[1], {})[parts[2]] = content.strip()
+
+        def _deg(v):
+            # unconnected inputs and unset limits read as -273150 or 65261850 and the like
+            try:
+                c = int(v) / 1000.0
+            except (TypeError, ValueError):
+                return None
+            return c if -60 <= c <= 200 else None
+
+        rows = []
+        for hw in sorted(chips, key=lambda h: int(h[5:])):
+            files = chips[hw]
+            chip = PegaProxManager._hwmon_chip(files.get('name') or hw, files.get('device', ''), hw)
+            inputs = (re.fullmatch(r'temp(\d+)_input', f) for f in files)
+            for n in sorted(int(m.group(1)) for m in inputs if m):
+                value = _deg(files.get(f'temp{n}_input'))
+                if value is None:
+                    continue
+                rows.append({
+                    'chip': chip,
+                    'label': files.get(f'temp{n}_label') or f'temp{n}',
+                    'kind': 'temp',
+                    'value': value,
+                    'max': _deg(files.get(f'temp{n}_max')),
+                    'crit': _deg(files.get(f'temp{n}_crit')),
+                    # temp1_alarm, temp1_crit_alarm, temp1_max_alarm ...
+                    'alarm': any(v == '1' for f, v in files.items()
+                                 if f.startswith(f'temp{n}_') and f.endswith('alarm')),
+                })
+        return rows
+
+    @staticmethod
+    def _hwmon_chip(name: str, dev: str, hw: str) -> str:
+        """lm-sensors' name for a chip (k10temp-pci-00c3, coretemp-isa-0000, nvme-pci-0100)
+        from its resolved device path, so two NVMe drives stay apart and the rows read the
+        same before and after someone installs lm-sensors."""
+        last = dev.rstrip('/').rsplit('/', 1)[-1]
+        m = re.fullmatch(r'(\d+):\d+:\d+:([0-9a-f]+)', last)           # drivetemp
+        if m:
+            return f'{name}-scsi-{int(m.group(1))}-{int(m.group(2), 16):x}'
+        m = re.fullmatch(r'(\d+)-([0-9a-f]{4})', last)                  # i2c client
+        if m:
+            return f'{name}-i2c-{int(m.group(1))}-{int(m.group(2), 16):02x}'
+        pci = re.findall(r'([0-9a-f]{4}):([0-9a-f]{2}):([0-9a-f]{2})\.([0-7])', dev)
+        if pci:
+            dom, bus, slot, fn = (int(x, 16) for x in pci[-1])
+            return f'{name}-pci-{(dom << 16) | (bus << 8) | (slot << 3) | fn:04x}'
+        m = re.search(r'/platform/[^/]+\.(\d+)$', dev)
+        if m:
+            return f'{name}-isa-{int(m.group(1)):04x}'
+        if 'thermal_zone' in dev or 'LNXTHERM' in dev:
+            return f'{name}-acpi-0' if name == 'acpitz' else f'{name}-virtual-0'
+        if not dev or '/virtual/' in dev:
+            return f'{name}-virtual-0'
+        return f'{name}-{hw}'
 
     def get_cached_node_temp(self, node: str, max_age: float = 900):
         """#601 — last cached hottest-sensor temperature (°C) for a node, or None if

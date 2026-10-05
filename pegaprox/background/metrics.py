@@ -21,7 +21,7 @@ from pegaprox.utils.concurrent import run_per_node  # #601: SSH-aware bounded fa
 
 
 def _node_hottest_temp(mgr, node):
-    """#601 — SSH lm-sensors → hottest temperature reading (°C) for one node, or None.
+    """#601 - SSH lm-sensors (or the kernel's hwmon) → hottest temperature (°C) for one node, or None.
 
     Honours a per-node backoff so installs WITHOUT lm-sensors/SSH (or non-PVE hosts)
     aren't re-probed every 5-min cycle — an error parks the node for ~1h. Nodes that
@@ -29,6 +29,12 @@ def _node_hottest_temp(mgr, node):
     up on the next successful probe.
     """
     import time as _t
+    # MK Oct 2026 - SSH off for this cluster (switched off, or only an API token): nothing
+    # to read, so no address lookup for it either. No backoff, so switching SSH back on
+    # shows temperatures from the next cycle.
+    _blocked = getattr(mgr, 'ssh_blocked_reason', None)
+    if callable(_blocked) and isinstance(_blocked(), str):
+        return None
     backoff = getattr(mgr, '_node_temp_probe_backoff', None)
     if backoff is None:
         backoff = mgr._node_temp_probe_backoff = {}
