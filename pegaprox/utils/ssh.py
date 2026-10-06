@@ -147,6 +147,17 @@ def read_capped(fh, limit=None):
     return out
 
 
+def ssh_login_args(user, host):
+    """The end of an OpenSSH argv: ['-l', user, '--', host]. The login name is checked
+    and travels as the value of -l, and '--' ends option parsing before the host, so
+    neither can be read as an option (the command after it neither). Raises ValueError
+    for a user that is not a login name."""
+    from pegaprox.utils.sanitization import validate_ssh_user
+    if not validate_ssh_user(user):
+        raise ValueError(f'refusing SSH login name {str(user)[:40]!r}: not a valid user name')
+    return ['-l', user, '--', str(host)]
+
+
 def _ssh_exec(host, user, password, cmd, timeout=30, use_controlmaster=False,
               connect_timeout=8):
     """Execute command on remote host via SSH.
@@ -177,6 +188,10 @@ def _ssh_exec(host, user, password, cmd, timeout=30, use_controlmaster=False,
     import socket as _socket
     last_err = ''
     errors = []
+    try:
+        login_args = ssh_login_args(user, host)
+    except ValueError as e:
+        return 1, '', str(e)
     # one exit, both ways out below (#625): asked before anything connects, and again
     # right before the command goes out either way
     from pegaprox.core import ha_transport
@@ -383,7 +398,7 @@ def _ssh_exec(host, user, password, cmd, timeout=30, use_controlmaster=False,
             except Exception as _cm_err:
                 # any import / setup error → fall through, ssh just runs without sharing
                 pass
-        ssh_args.extend([f'{user}@{host}', cmd])
+        ssh_args.extend(login_args + [cmd])
         # long after the guard was asked at the top: checked again, bounded and in a
         # process group of its own in an automatic group (#625)
         result = ha_transport.node_cmd(

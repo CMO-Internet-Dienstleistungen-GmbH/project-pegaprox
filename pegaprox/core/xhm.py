@@ -17,6 +17,7 @@ from datetime import datetime
 from pegaprox.globals import cluster_managers, _xhm_migrations
 from pegaprox.core import ha_transport
 from pegaprox.utils.ssh import _ssh_exec, _pve_node_exec, ssh_password_for
+from pegaprox.utils.sanitization import validate_ssh_user
 from pegaprox.utils.realtime import broadcast_sse
 from pegaprox.utils.audit import log_audit
 
@@ -1857,6 +1858,10 @@ def _run_esxi_to_pve(task):
         esxi_host = src_mgr.host
         esxi_user = getattr(src_mgr.config, 'ssh_user', 'root')
         esxi_pass = getattr(src_mgr.config, 'pass_', '')
+        # goes into the sshfs and scp command lines on the PVE node
+        if not validate_ssh_user(esxi_user):
+            task.set_phase('failed', 'The SSH user of the ESXi source is not a valid user name')
+            return
         pve_user = getattr(tgt_mgr.config, 'ssh_user', '') or 'root'
         pve_pass = ssh_password_for(tgt_mgr.config)
         pve_key = getattr(tgt_mgr.config, 'ssh_key', '')
@@ -2248,6 +2253,9 @@ def _run_esxi_to_xcpng(task):
         esxi_host = src_mgr.host
         esxi_user = getattr(src_mgr.config, 'ssh_user', 'root')
         esxi_pass = getattr(src_mgr.config, 'pass_', '')
+        if not validate_ssh_user(esxi_user):
+            task.set_phase('failed', 'The SSH user of the ESXi source is not a valid user name')
+            return
         created_vdis = []
 
         for idx, disk in enumerate(disks):
@@ -2317,7 +2325,7 @@ def _run_esxi_to_xcpng(task):
                 scp_cmd = [
                     'sshpass', '-e',
                     'scp', '-o', f'StrictHostKeyChecking={_hkc}', '-o', f'UserKnownHostsFile={_kh}', '-o', 'HashKnownHosts=no',
-                    f'{esxi_user}@{esxi_host}:{_q_remote_path}',
+                    '--', f'{esxi_user}@{esxi_host}:{_q_remote_path}',
                     tmp_vmdk
                 ]
                 proc = subprocess.run(scp_cmd, capture_output=True, timeout=7200,

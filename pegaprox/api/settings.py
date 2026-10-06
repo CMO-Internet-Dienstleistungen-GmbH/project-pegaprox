@@ -2796,6 +2796,14 @@ def restore_config():
                             cluster['ssh_key_encrypted'] = existing['ssh_key_encrypted']
                         _keep_guarded_ha_settings(cluster, existing)
 
+                    # NS Oct 2026 - it goes onto the ssh command line; a bad one is not restored
+                    from pegaprox.utils.sanitization import validate_ssh_user
+                    _su = cluster.get('ssh_user')
+                    if _su not in (None, '') and not validate_ssh_user(_su):
+                        cluster['ssh_user'] = ''
+                        results['errors'].append(f"Cluster {cluster_id}: ssh_user is not a valid "
+                                                 f"user name, the default user is used")
+
                     if not dry_run:
                         database.save_cluster(cluster_id, cluster)
                     cluster_count += 1

@@ -115,10 +115,12 @@ def test_a_huge_fallback_host_list_is_refused(api, estate):
 
 
 def test_a_reasonable_fallback_host_list_still_works(api, estate):
-    """The counterweight - two or three fallback hosts is the whole point of the field."""
+    """The counterweight - two or three fallback hosts is the whole point of the field.
+    Adding a new address re-points where the stored credential is offered, so the request
+    carries it (Aikido 700487424)."""
     import pegaprox.api.clusters as cl
 
-    with _ctx(api, ADMIN, {'fallback_hosts': ['10.0.0.2', '10.0.0.3']}):
+    with _ctx(api, ADMIN, {'fallback_hosts': ['10.0.0.2', '10.0.0.3'], 'pass': 'fresh-pw'}):
         resp = _handler(cl, 'set_fallback_hosts')('cluster_1')
 
     assert not isinstance(resp, tuple) or resp[1] == 200, resp

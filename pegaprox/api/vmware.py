@@ -1236,6 +1236,16 @@ def start_vmware_migration(vmware_id, vm_id):
     # the task reads data['esxi_host'] as is, so hand it the registered value, not the
     # spelling that passed the compare
     data['esxi_host'] = _reg_host
+    # NS Oct 2026 - user and host go onto the local sshpass/ssh argv and into the ssh, scp,
+    # sshfs and ssh_config text the node runs as root. A user starting with '-' is an
+    # OpenSSH option there, a newline in the host a new ssh_config line.
+    from pegaprox.utils.sanitization import validate_ssh_user, validate_host_address
+    _esxi_user = data.get('esxi_user')
+    if _esxi_user not in (None, '') and not validate_ssh_user(_esxi_user):
+        return jsonify({'error': 'Invalid esxi_user: letters, digits and ._- only, '
+                                 'not starting with - or .'}), 400
+    if not validate_host_address(data['esxi_host']):
+        return jsonify({'error': 'Invalid esxi_host: a host name or an IP address'}), 400
 
     if not data.get('esxi_password'):
         return jsonify({'error': 'esxi_password is required for SSHFS-based migration'}), 400

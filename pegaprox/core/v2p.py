@@ -2682,6 +2682,11 @@ def _ssh_esxi_exec(esxi_host, esxi_user, esxi_pass, cmd, timeout=30):
     """
     import os, subprocess, shlex as _sh
     from pegaprox.utils.ssh_security import cli_hostkey_opts
+    from pegaprox.utils.ssh import ssh_login_args
+    try:
+        login = ssh_login_args(esxi_user, esxi_host)
+    except ValueError as e:
+        return 1, '', str(e)
     _hkc, _kh = cli_hostkey_opts()
     # MK Jul 2026 — feed the ESXi password via SSHPASS env (`sshpass -e`), never
     # `-p <pw>` on argv: the argv of a running process is world-readable in
@@ -2695,7 +2700,7 @@ def _ssh_esxi_exec(esxi_host, esxi_user, esxi_pass, cmd, timeout=30):
         full.extend(controlmaster_args(esxi_host, esxi_user))
     except Exception:
         pass  # graceful fallback
-    full.extend([f'{esxi_user}@{esxi_host}', cmd])
+    full.extend(login + [cmd])
     try:
         # the transport guard of an automatic group, and the bound of a node command (#625)
         from pegaprox.core.ha_transport import node_cmd

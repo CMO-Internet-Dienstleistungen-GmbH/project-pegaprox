@@ -28,7 +28,7 @@ from pegaprox.utils.realtime import broadcast_sse, broadcast_update, push_immedi
 from pegaprox.core.config import load_config, save_config
 from pegaprox.core.manager import PegaProxManager
 from pegaprox.core.xcpng import XcpngManager, XENAPI_AVAILABLE
-from pegaprox.utils.sanitization import bounded_list
+from pegaprox.utils.sanitization import bounded_list, validate_ssh_user, validate_host_address
 from pegaprox.api.helpers import (load_server_settings, get_connected_manager, check_cluster_access,
                                   safe_error, scope_vm_rows, require_unconfined, parse_pve_error,
                                   bounded_limit, node_maintenance_for_caller)
@@ -189,6 +189,9 @@ def add_cluster():
         return jsonify({'error': 'Password or SSH key is required'}), 400
     if 'pass' not in data:
         data['pass'] = ''
+    _uerr = _ssh_user_error(data)
+    if _uerr:
+        return _uerr
 
     # Generate unique ID
     cluster_id = str(uuid.uuid4())[:8]
@@ -395,6 +398,9 @@ def reconfigure_cluster(cluster_id):
         return jsonify({'error': 'Password or SSH key is required'}), 400
     if 'pass' not in data:
         data['pass'] = ''
+    _uerr = _ssh_user_error(data)
+    if _uerr:
+        return _uerr
 
     cluster_type = data.get('cluster_type', getattr(cluster_managers[cluster_id], 'cluster_type', 'proxmox'))
 
@@ -1460,6 +1466,117 @@ ALLOWED_CONFIG_FIELDS = {
 # opt-in on. Only a real bool is accepted for them, no bool() coercion.
 BOOLEAN_CONFIG_FIELDS = {'proxlb_pins_auto_migrate', 'proxlb_pins_strict'}
 
+
+def _ssh_user_error(data):
+    """A 400 when the body names an ssh_user that is no login name. Normalises it in
+    place; empty means the default user."""
+    if 'ssh_user' not in data:
+        return None
+    user = data.get('ssh_user')
+    user = user.strip() if isinstance(user, str) else user
+    if user not in (None, '') and not validate_ssh_user(user):
+        return jsonify({'error': 'ssh_user must be a user name: letters, digits and ._- only, '
+                                 'not starting with - or .'}), 400
+    data['ssh_user'] = user or ''
+    return None
+
+
+def _host_key(h):
+    return str(h or '').strip().strip('[]').lower()
+
+
+# NS Oct 2026 - the stored password or token secret goes to the cluster's host and fallback
+# hosts on every reconnect and console ticket mint, over TLS verified or not as the cluster
+# says. An edit that adds an address, changes the SSH port or turns verification off moves
+# that credential, so like PBS and the ESXi servers it needs the credential typed again,
+# and a stored secret nobody re-entered is dropped instead of carried along.
+def _config_edit_checks(mgr, data):
+    """Check a cluster config edit. Returns (error, rebind): error is a response to hand
+    back as it is; rebind is None when the credential stays where it was, else
+    {'creds': what this request typed, 'moved': which fields moved it}.
+    ssh_user, ssh_port, host and fallback_hosts are normalised in place."""
+    cfg = mgr.config
+    err = _ssh_user_error(data)
+    if err:
+        return err, None
+
+    def bad(msg):
+        return (jsonify({'error': msg}), 400), None
+
+    known = set()
+    if 'host' in data or 'fallback_hosts' in data:
+        known = {_host_key(cfg.host)} | {_host_key(h) for h in (getattr(cfg, 'fallback_hosts', None) or [])}
+    moved = []
+    if 'host' in data:
+        host = data.get('host')
+        if not isinstance(host, str) or not host.strip():
+            return bad('host must be a host name or an IP address')
+        data['host'] = host = host.strip()
+        if _host_key(host) != _host_key(cfg.host):
+            if not validate_host_address(host):
+                return bad('host must be a host name or an IP address')
+            if _host_key(host) not in known:
+                moved.append('host')
+    if 'fallback_hosts' in data:
+        hosts, lerr = bounded_list(data.get('fallback_hosts'), max_items=32, max_length=253,
+                                   name='fallback_hosts')
+        if lerr:
+            return bad(lerr)
+        data['fallback_hosts'] = hosts
+        new = [h for h in hosts if _host_key(h) not in known]
+        if any(not validate_host_address(h) for h in new):
+            return bad('fallback_hosts entries must be host names or IP addresses')
+        if new:
+            moved.append('fallback_hosts')
+    if data.get('ssh_port') in (None, ''):
+        data.pop('ssh_port', None)
+    if 'ssh_port' in data:
+        port = data.get('ssh_port')
+        if isinstance(port, bool) or not str(port).strip().isdigit() or not 1 <= int(port) <= 65535:
+            return bad('ssh_port must be a port number')
+        data['ssh_port'] = int(port)
+        try:
+            old_port = int(getattr(cfg, 'ssh_port', 22) or 22)
+        except (TypeError, ValueError):
+            old_port = 22
+        if data['ssh_port'] != old_port:
+            moved.append('ssh_port')
+    if 'ssl_verification' in data and getattr(cfg, 'ssl_verification', False) \
+            and not data.get('ssl_verification'):
+        moved.append('ssl_verification')
+    if not moved:
+        return None, None
+
+    def typed(key):
+        return isinstance(data.get(key), str) and data[key] not in ('', '********')
+
+    token_user = getattr(cfg, 'api_token_user', '') or ''
+    creds = {'pass_': data['pass'] if typed('pass') else '',
+             'api_token_user': '', 'api_token_secret': ''}
+    if token_user and typed('api_token_secret'):
+        creds.update(api_token_user=token_user, api_token_secret=data['api_token_secret'])
+    if not creds['pass_'] and not creds['api_token_secret']:
+        return (jsonify({'error': 'Re-enter the cluster password (pass) or the API token secret '
+                                  '(api_token_secret) to change ' + ', '.join(moved) + '.',
+                         'code': 'CREDENTIAL_REQUIRED'}), 400), None
+    return None, {'creds': creds, 'moved': moved}
+
+
+def _rebind(mgr, rebind):
+    """Swap in the credential the request typed and forget the login of the old
+    destination, so the next call logs in afresh where the admin pointed it."""
+    for key, value in rebind['creds'].items():
+        setattr(mgr.config, key, value)
+    for attr in ('_ticket', '_csrf_token', '_api_token', '_original_host'):
+        if hasattr(mgr, attr):
+            setattr(mgr, attr, None)
+    mgr.current_host = None
+    mgr.is_connected = False
+    reset = getattr(mgr, '_reset_auth_failures', None)
+    if callable(reset):
+        reset()
+
+
 @bp.route('/api/clusters/<cluster_id>', methods=['PUT'])
 @require_auth(perms=['cluster.config'])
 def update_cluster_config(cluster_id):
@@ -1475,6 +1592,8 @@ def update_cluster_config(cluster_id):
         return jsonify({'error': 'Cluster not found'}), 404
 
     data = request.json
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Expected a JSON object'}), 400
     mgr = cluster_managers[cluster_id]
 
     # Reject non-boolean pin flags before any assignment, so a partial apply
@@ -1482,6 +1601,11 @@ def update_cluster_config(cluster_id):
     for _bk in BOOLEAN_CONFIG_FIELDS:
         if _bk in data and type(data[_bk]) is not bool:
             return jsonify({'error': f"'{_bk}' must be a boolean"}), 400
+    _err, rebind = _config_edit_checks(mgr, data)
+    if _err:
+        return _err
+    if rebind:
+        _rebind(mgr, rebind)
 
     # update config - only allowed fields
     updated = []
@@ -1494,6 +1618,9 @@ def update_cluster_config(cluster_id):
     save_config()
 
     usr = getattr(request, 'session', {}).get('user', 'system')
+    if rebind:
+        log_audit(usr, 'cluster.endpoint_changed', f"Cluster {mgr.config.name}: "
+                  f"{', '.join(rebind['moved'])} changed with the credential re-entered")
     log_audit(usr, 'cluster.config_changed', f"Cluster {mgr.config.name} config updated: {', '.join(updated)}")
 
     return jsonify({'message': 'Configuration updated successfully', 'updated_fields': updated})
@@ -1513,6 +1640,8 @@ def update_cluster_config_live(cluster_id):
         return jsonify({'error': 'Cluster not found'}), 404
 
     data = request.json
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Expected a JSON object'}), 400
     mgr = cluster_managers[cluster_id]
 
     # Reject non-boolean pin flags before any assignment, so a partial apply
@@ -1520,6 +1649,11 @@ def update_cluster_config_live(cluster_id):
     for _bk in BOOLEAN_CONFIG_FIELDS:
         if _bk in data and type(data[_bk]) is not bool:
             return jsonify({'error': f"'{_bk}' must be a boolean"}), 400
+    _err, rebind = _config_edit_checks(mgr, data)
+    if _err:
+        return _err
+    if rebind:
+        _rebind(mgr, rebind)
 
     updated = []
     for key, value in data.items():
@@ -1528,6 +1662,10 @@ def update_cluster_config_live(cluster_id):
             updated.append(key)
 
     save_config()
+    if rebind:
+        log_audit(getattr(request, 'session', {}).get('user', 'system'), 'cluster.endpoint_changed',
+                  f"Cluster {mgr.config.name}: {', '.join(rebind['moved'])} changed with the "
+                  f"credential re-entered")
 
     return jsonify({'message': 'Configuration updated successfully', 'updated_fields': updated})
 
@@ -1968,10 +2106,22 @@ def set_fallback_hosts(cluster_id):
         return jsonify({'error': _lerr}), 400
     
     mgr = cluster_managers[cluster_id]
+    # a new fallback host gets the stored credential on the next reconnect
+    edit = {'fallback_hosts': fallback_hosts,
+            **{k: data[k] for k in ('pass', 'api_token_secret') if k in data}}
+    _err, rebind = _config_edit_checks(mgr, edit)
+    if _err:
+        return _err
+    fallback_hosts = edit['fallback_hosts']
+    if rebind:
+        _rebind(mgr, rebind)
     mgr.config.fallback_hosts = fallback_hosts
     
     # Save to database
     try:
+        if rebind:
+            # the credential changed with it, so the whole row
+            save_config()
         db = get_db()
         cursor = db.conn.cursor()
         cursor.execute(

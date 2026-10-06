@@ -99,6 +99,41 @@ def validate_hostname(hostname: str) -> bool:
     return bool(re.match(ip_pattern, hostname) or re.match(hostname_pattern, hostname))
 
 
+# NS Oct 2026 - an SSH login name goes onto the ssh/sshpass/scp command line and into
+# shell strings run on the nodes. Starting with '-' it is an OpenSSH option there
+# (-oProxyCommand=... runs a command on this host), so only what a POSIX login name
+# can be: letters, digits, '_', '.', '-', not starting with '-' or '.'.
+_SSH_USER_RE = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,63}\Z')
+
+
+def validate_ssh_user(value) -> bool:
+    """True if `value` can be used as the remote login name of an SSH connection.
+    Empty is rejected; callers that mean "the default user" decide that first."""
+    if not value or not isinstance(value, str):
+        return False
+    return bool(_SSH_USER_RE.match(value))
+
+
+# a little wider than validate_hostname: '_' turns up in internal names
+_HOST_NAME_RE = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,252}\Z')
+
+
+def validate_host_address(value) -> bool:
+    """True for a host name, an IPv4 or an IPv6 address (bracketed or not) and nothing
+    else: no scheme, user, port, path, whitespace or leading '-'."""
+    import ipaddress
+    if not value or not isinstance(value, str):
+        return False
+    if _HOST_NAME_RE.match(value):
+        return True
+    bare = value[1:-1] if value.startswith('[') and value.endswith(']') else value
+    try:
+        ipaddress.ip_address(bare)
+        return True
+    except ValueError:
+        return False
+
+
 def validate_storage_name(storage) -> bool:
     """Validate Proxmox / XCP-ng storage identifier.
 

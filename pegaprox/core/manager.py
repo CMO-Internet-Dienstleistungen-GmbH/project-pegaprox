@@ -17,7 +17,7 @@ import subprocess
 import re
 import shlex
 from pegaprox.utils.ssh_security import cli_hostkey_opts  # secure host-key opts for subprocess ssh/scp
-from pegaprox.utils.sanitization import validate_snapshot_name, validate_hostname
+from pegaprox.utils.sanitization import validate_snapshot_name, validate_hostname, validate_ssh_user
 import requests
 import urllib3
 from datetime import datetime, timedelta
@@ -52,6 +52,7 @@ from pegaprox.models.tasks import MaintenanceTask, PegaProxConfig
 from pegaprox.core.config import save_config
 from pegaprox.utils.realtime import broadcast_sse, is_cluster_watched
 from pegaprox.utils.ssh import get_ssh_connection_stats, _ssh_track_connection, ssh_password_for
+from pegaprox.utils.ssh import ssh_login_args
 from pegaprox.utils.concurrent import GEVENT_PATCHED
 from pegaprox.core.db import get_db
 from pegaprox.core import ha  # PegaProx's own warm standby (#625), not PVE HA
@@ -8002,7 +8003,7 @@ if ours; then rm -f "$F" && { rmdir "$D" 2>/dev/null; echo "CLAIM_REMOVED"; } ||
                 result = node_cmd(
                     ['ssh', '-o', 'ConnectTimeout=5', '-o', f'StrictHostKeyChecking={_hkc}',
                      '-o', f'UserKnownHostsFile={_kh}',
-                     f'{ssh_user}@{ssh_host}', 'poweroff'],
+                     '--', f'{ssh_user}@{ssh_host}', 'poweroff'],
                     capture_output=True, timeout=15, host=str(ssh_host)
                 )
                 
@@ -10247,6 +10248,18 @@ echo "AGENT_INSTALLED_OK"
         seen.add((host, hint))
         self.logger.info(f"[SSH] {host}: {hint}")
 
+    def _ssh_login(self, user, host):
+        """ssh_login_args() for the command-line SSH family below, or None when `user`
+        is no login name. Said once per name, the HA loop asks every few seconds."""
+        try:
+            return ssh_login_args(user, host)
+        except ValueError as e:
+            seen = self.__dict__.setdefault('_ssh_bad_user_logged', set())
+            if str(user) not in seen:
+                seen.add(str(user))
+                self.logger.warning(f"[SSH] {e} - set a valid SSH user for this cluster")
+            return None
+
     def _ssh_run_command_output(self, host: str, user: str, command: str, timeout: int = 30) -> str:
         """Run SSH command and return output - HA PRIORITY (no rate limiting)
 
@@ -10267,6 +10280,9 @@ echo "AGENT_INSTALLED_OK"
             command = _wrap_with_sudo(command)
         if host and host.startswith('[') and host.endswith(']'):
             host = host[1:-1]
+        login = self._ssh_login(user, host)
+        if login is None:
+            return None
         _ssh_track_connection('ha', +1)
 
         try:
@@ -10275,7 +10291,7 @@ echo "AGENT_INSTALLED_OK"
             result = node_cmd(
                 ['ssh', '-o', f'ConnectTimeout={ct}', '-o', f'StrictHostKeyChecking={_hkc}',
                  '-o', f'UserKnownHostsFile={_kh}',
-                 '-o', 'BatchMode=yes', f'{user}@{host}', command],
+                 '-o', 'BatchMode=yes', *login, command],
                 capture_output=True, text=True, timeout=timeout, host=host
             )
             if result.returncode == 0:
@@ -10312,6 +10328,9 @@ echo "AGENT_INSTALLED_OK"
             command = _wrap_with_sudo(command)
         if host and host.startswith('[') and host.endswith(']'):
             host = host[1:-1]
+        login = self._ssh_login(user, host)
+        if login is None:
+            return None
         _ssh_track_connection('ha', +1)
 
         try:
@@ -10336,7 +10355,7 @@ echo "AGENT_INSTALLED_OK"
                 result = node_cmd(
                     ['ssh', '-o', f'ConnectTimeout={ct}', '-o', f'StrictHostKeyChecking={_hkc}',
                      '-o', f'UserKnownHostsFile={_kh}',
-                     '-i', key_file, f'{user}@{host}', command],
+                     '-i', key_file, *login, command],
                     capture_output=True, text=True, timeout=timeout, host=host
                 )
                 if result.returncode == 0:
@@ -10379,18 +10398,21 @@ echo "AGENT_INSTALLED_OK"
             command = _wrap_with_sudo(command)
         if host and host.startswith('[') and host.endswith(']'):
             host = host[1:-1]
+        login = self._ssh_login(user, host)
+        if login is None:
+            return None
         _ssh_track_connection('ha', +1)
 
         try:
             env = os.environ.copy()
             env['SSHPASS'] = password
-            
+
             ct = self.ha_config.get('ssh_connect_timeout', 10)
             _hkc, _kh = cli_hostkey_opts()
             result = node_cmd(
                 ['sshpass', '-e', 'ssh', '-o', f'ConnectTimeout={ct}', '-o', f'StrictHostKeyChecking={_hkc}',
                  '-o', f'UserKnownHostsFile={_kh}',
-                 f'{user}@{host}', command],
+                 *login, command],
                 capture_output=True, text=True, timeout=timeout, env=env, host=host
             )
             if result.returncode == 0:
@@ -11376,15 +11398,18 @@ echo "AGENT_INSTALLED_OK"
             command = _wrap_with_sudo(command)
         if host and host.startswith('[') and host.endswith(']'):
             host = host[1:-1]
+        login = self._ssh_login(user, host)
+        if login is None:
+            return False
         _ssh_track_connection('ha', +1)
-        
+
         try:
             ct = self.ha_config.get('ssh_connect_timeout', 10)
             _hkc, _kh = cli_hostkey_opts()
             ssh_cmd = ['ssh', '-o', f'StrictHostKeyChecking={_hkc}', '-o', f'UserKnownHostsFile={_kh}', '-o', f'ConnectTimeout={ct}', '-o', 'BatchMode=yes']
             if key_file:
                 ssh_cmd.extend(['-i', key_file])
-            ssh_cmd.append(f'{user}@{host}')
+            ssh_cmd.extend(login)
             ssh_cmd.append(command)
             
             self.logger.info(f"[HA] Running: ssh {user}@{host} '{command}'")
@@ -11498,6 +11523,9 @@ echo "AGENT_INSTALLED_OK"
             command = _wrap_with_sudo(command)
         if host and host.startswith('[') and host.endswith(']'):
             host = host[1:-1]
+        login = self._ssh_login(user, host)
+        if login is None:
+            return False
         _ssh_track_connection('ha', +1)
 
         try:
@@ -11513,7 +11541,7 @@ echo "AGENT_INSTALLED_OK"
             ssh_cmd = [
                 'sshpass', '-e',
                 'ssh', '-o', f'StrictHostKeyChecking={_hkc}', '-o', f'UserKnownHostsFile={_kh}', '-o', f'ConnectTimeout={ct}',
-                f'{user}@{host}',
+                *login,
                 command
             ]
             
@@ -16893,6 +16921,9 @@ echo "AGENT_INSTALLED_OK"
 
             # method 1: node-to-node scp with sshpass (most PVE nodes don't have keys to each other)
             try:
+                # the login name lands in a root shell on the source node
+                if not validate_ssh_user(ssh_user):
+                    raise ValueError(f'SSH user {ssh_user!r} is not a valid user name')
                 ssh_src = self._ssh_connect(src_ip)
                 # try with sshpass if password available
                 # NOTE: this scp runs node->node (executed ON the source PVE node), so
@@ -16905,8 +16936,9 @@ echo "AGENT_INSTALLED_OK"
                 # node to any local user for the duration of the sync — same leak class as the
                 # fencing fix (4c2487e). Feed the password over stdin into an SSHPASS env var and
                 # use `sshpass -e`, so neither the shell's nor sshpass's argv carries the secret.
-                scp_tail = (f"scp -o StrictHostKeyChecking={_hkc} -o ConnectTimeout=10 "
-                            f"{shlex.quote(src_file)} {ssh_user}@{tgt_ip}:{shlex.quote(tgt_path + '/')}")
+                scp_tail = (f"scp -o StrictHostKeyChecking={_hkc} -o ConnectTimeout=10 -- "
+                            f"{shlex.quote(src_file)} {shlex.quote(f'{ssh_user}@{tgt_ip}')}:"
+                            f"{shlex.quote(tgt_path + '/')}")
                 if ssh_pass:
                     scp_cmd = f"IFS= read -r SSHPASS; export SSHPASS; sshpass -e {scp_tail}"
                 else:

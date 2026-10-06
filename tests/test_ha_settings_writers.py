@@ -324,7 +324,8 @@ WRITERS = {
 }
 # file -> the functions that copy fields named in a list onto a cluster config
 COPIERS = {
-    'api/clusters.py': {'update_cluster_config', 'update_cluster_config_live'},   # ALLOWED_CONFIG_FIELDS
+    'api/clusters.py': {'update_cluster_config', 'update_cluster_config_live',
+                        '_rebind'},   # ALLOWED_CONFIG_FIELDS; _rebind writes only the re-entered credential
     'core/ha.py': {'_refresh_managers'},                    # a standby takes the leader's row
 }
 # file -> the functions that write a whole cluster row
