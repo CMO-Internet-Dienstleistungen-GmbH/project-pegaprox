@@ -9,10 +9,13 @@ import json
 import logging
 import threading
 import base64
+import itertools
 import os
+import socket
 from datetime import datetime
 
 from pegaprox.constants import SSE_TOKEN_TTL
+from pegaprox.utils.sanitization import sanitize_log_message as _sl
 from pegaprox.globals import (
     cluster_managers, ws_clients, ws_clients_lock,
     sse_tokens, sse_tokens_lock,
@@ -291,6 +294,94 @@ def invalidate_user_sse_tokens(username: str) -> int:
         for t in gone:
             del sse_tokens[t]
     return len(gone)
+
+
+# NS Oct 2026 (#988) - a WebSocket on the main port holds a request-pool slot for as long
+# as it is open, like an SSE stream, and nothing bounded how many one account kept open:
+# any signed-in viewer could fill the pool with them. Counted per account across the
+# live-update socket and the consoles. Over the cap the oldest is hung up rather than the
+# new one refused, so a console that reconnects never locks its owner out. Next to the
+# SSE cap (20) one account holds at most 31 slots (slow bodies below), and the smallest
+# pool is 32.
+MAX_WS_PER_USER = 10
+_held_ws = {}
+_held_ws_lock = threading.Lock()
+_held_ws_seq = itertools.count()
+# NS Oct 2026 (#1052) - request bodies taken off their clock, key -> account. A body that
+# never arrives holds its slot like a socket does, so these share the cap: one more
+# WebSocket hangs up the oldest socket, one more body keeps its clock. Bodies are never
+# hung up, so an account holds at most MAX_WS_PER_USER + 1 of the two.
+_held_bodies = {}
+
+
+def _bodies_of(username):
+    return sum(1 for user in _held_bodies.values() if user == username)
+
+
+def hold_websocket(username, ws):
+    """Count this request's open WebSocket against its account until the route returns.
+    Past MAX_WS_PER_USER the account's oldest socket is hung up."""
+    from flask import after_this_request
+    key = next(_held_ws_seq)
+    with _held_ws_lock:
+        mine = sorted(k for k, (user, _) in _held_ws.items() if user == username)
+        over = len(mine) + _bodies_of(username) - MAX_WS_PER_USER + 1
+        gone = [_held_ws.pop(k)[1] for k in mine[:max(0, over)]]
+        _held_ws[key] = (username, ws)
+
+    # per request, not an app-wide hook: the lease fast path in app.py stands in for the
+    # app-wide ones and turns itself off for any it does not know
+    @after_this_request
+    def _let_go(response):
+        release_websocket(key)
+        return response
+
+    for old in gone:
+        logging.info(f"[WS] hung up the oldest WebSocket of '{_sl(username)}' - over the per-user cap")
+        _hang_up(old)
+
+
+def release_websocket(key):
+    with _held_ws_lock:
+        _held_ws.pop(key, None)
+
+
+def hold_body(username):
+    """Count a request body that may take as long as the link needs against its account.
+    The key to release it with, or None when the account's WebSockets and slow bodies
+    already fill MAX_WS_PER_USER: that body keeps its clock."""
+    with _held_ws_lock:
+        mine = sum(1 for user, _ in _held_ws.values() if user == username) + _bodies_of(username)
+        if mine >= MAX_WS_PER_USER:
+            return None
+        key = next(_held_ws_seq)
+        _held_bodies[key] = username
+    return key
+
+
+def release_body(key):
+    with _held_ws_lock:
+        _held_bodies.pop(key, None)
+
+
+def _hang_up(ws):
+    """End a WebSocket's connection from outside the greenlet that serves it. A close frame
+    waits on a client that may never answer; a shutdown wakes every read on the connection
+    with EOF, TLS or not, and the handler unwinds as it does when a browser goes away."""
+    sock = getattr(ws, 'sock', None)                                    # simple-websocket
+    if sock is None:
+        sock = getattr(getattr(ws, 'handler', None), 'socket', None)    # geventwebsocket
+    try:
+        # on a dup of the descriptor, so a TLS socket object is left in one piece
+        raw = socket.fromfd(sock.fileno(), sock.family, sock.type)
+    except (AttributeError, OSError, ValueError):
+        return
+    try:
+        raw.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    finally:
+        raw.close()
 
 
 _SSE_FILTER_MISSING = object()

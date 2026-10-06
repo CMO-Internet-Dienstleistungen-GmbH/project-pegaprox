@@ -37,6 +37,8 @@ def test_the_three_phases_all_have_a_bound():
 @pytest.mark.parametrize('var,attr', [
     ('PEGAPROX_HANDSHAKE_TIMEOUT', '_HANDSHAKE_TIMEOUT'),
     ('PEGAPROX_HEADER_TIMEOUT', '_HEADER_TIMEOUT'),
+    ('PEGAPROX_BODY_TIMEOUT', '_BODY_TIMEOUT'),     # #1052, tests/test_request_body_deadline.py
+    ('PEGAPROX_SEND_TIMEOUT', '_SEND_TIMEOUT'),     # #1052, tests/test_response_send_deadline.py
 ])
 def test_each_bound_is_operator_overridable(var, attr):
     """An operator on a genuinely awful link has to be able to raise these."""

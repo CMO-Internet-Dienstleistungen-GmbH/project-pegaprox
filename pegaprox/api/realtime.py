@@ -32,6 +32,7 @@ from pegaprox.utils.realtime import (
     create_sse_token, validate_sse_token,
     create_ws_token, validate_ws_token,
     push_immediate_update,
+    hold_websocket,
 )
 from pegaprox.utils.email import send_email
 from pegaprox.api.helpers import load_server_settings, get_connected_manager
@@ -73,6 +74,8 @@ def ws_live_updates(ws):
             return
 
         username = session['user']
+        # #988 - a request slot for as long as it is open, counted against the account
+        hold_websocket(username, ws)
         # NS Aug 2026 (audit) — scope the WS cluster subscription to what RBAC allows, mirroring the
         # SSE path (/api/sse/updates). Without this a client could omit "clusters" (→ None = all) or
         # name a foreign cluster and receive another tenant's live action events.

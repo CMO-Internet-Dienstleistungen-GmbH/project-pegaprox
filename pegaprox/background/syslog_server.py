@@ -6,6 +6,7 @@ NS: Apr 2026 — rewritten for gevent compatibility (no asyncio, no multiprocess
 Original PR by gyptazy, adapted to fit PegaProx architecture.
 """
 import os
+import sys
 import time
 import logging
 import threading
@@ -46,11 +47,18 @@ _QUEUE_BYTES_LOCK = threading.Lock()
 
 
 def _entry_bytes(entry):
-    """Rough resident size of one queued entry. The message dominates; the rest is
-    small fixed fields, so a flat allowance beats summing every one of them."""
+    """Rough resident size of one queued entry, the row tuple the listeners build for
+    _flush_batch. Its text dominates; the rest is small fixed fields, so a flat allowance
+    beats sizing every one of them.
+
+    NS Oct 2026 (#1015) - this asked the tuple for entry.get('message'), which raised, so
+    every entry was charged the flat 200 bytes and the byte ceiling never came close. And
+    len() counts characters: text outside ASCII is two or four bytes each in memory, so
+    that is charged by its real size (sys.getsizeof, constant time like len)."""
     try:
-        return len(entry.get('message') or '') + 200
-    except Exception:
+        return sum(len(f) if f.isascii() else sys.getsizeof(f)
+                   for f in entry if isinstance(f, str)) + 200
+    except TypeError:
         return 200
 
 # Runtime start/stop so the Settings → Syslog toggle can open/close the port live

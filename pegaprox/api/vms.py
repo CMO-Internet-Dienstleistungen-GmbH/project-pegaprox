@@ -40,7 +40,7 @@ def _require_vm_access(cluster_id, vmid, perm, vm_type=None):
     if not user_can_access_vm(user, cluster_id, vmid, perm, vm_type):
         return jsonify({'error': f'Access denied to this VM ({perm})'}), 403
     return None
-from pegaprox.utils.realtime import broadcast_sse, broadcast_action, push_immediate_update
+from pegaprox.utils.realtime import broadcast_sse, broadcast_action, push_immediate_update, hold_websocket
 from pegaprox.core.config import save_config
 from pegaprox.api.helpers import get_connected_manager, check_cluster_access, register_task_user, safe_error, parse_pve_error, scope_vm_rows, require_unconfined, caller_is_scoped
 from pegaprox.api.helpers import evacuation_options, evacuation_options_said
@@ -9906,6 +9906,8 @@ def vnc_websocket_route(cluster_id, node, vm_type, vmid):
     ws = request.environ.get('wsgi.websocket')
     if ws is not None:
         print("Using geventwebsocket handler...")
+        # #988 - counted against the account until the request ends
+        hold_websocket(user['username'], ws)
         handle_vnc_websocket(ws, cluster_id, node, vm_type, vmid)
         return ''
     
@@ -10695,6 +10697,10 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
         try: ws.send('Invalid node or vm_type')
         except: pass
         return
+
+    # NS Oct 2026 (#988) - this socket holds a request slot for as long as the console is
+    # open: counted against the account until the request ends
+    hold_websocket(user['username'], ws)
 
     if cluster_id not in cluster_managers:
         print(f"ERROR: Cluster {cluster_id} not found")
@@ -11960,6 +11966,8 @@ def node_shell_websocket_proxy(ws, cluster_id, node):
         return
 
     logging.info(f"SHELL WS: User {session['user']} authenticated for shell on {cluster_id}/{node}")
+    # #988 - counted against the account until the request ends, the credential wait included
+    hold_websocket(session['user'], ws)
 
     logging.info(f"")
     logging.info(f"========================================")

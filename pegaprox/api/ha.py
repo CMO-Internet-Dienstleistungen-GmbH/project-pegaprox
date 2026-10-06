@@ -58,7 +58,7 @@ from pegaprox import witness_boot
 from pegaprox.constants import GITHUB_RAW_URL, MIRROR_RAW_URL
 from pegaprox.core import ha, ha_vote
 from pegaprox.models.permissions import ROLE_ADMIN
-from pegaprox.utils.auth import require_auth, build_authz_user
+from pegaprox.utils.auth import require_auth, build_authz_user, lift_body_deadline
 from pegaprox.utils.audit import log_audit, get_client_ip
 from pegaprox.utils.ratelimit import SlidingWindow
 from pegaprox.utils.sanitization import sanitize_log_message
@@ -399,6 +399,8 @@ def forward_to_active(read=False):
                                  'instance - try again in a moment'})
         resp.headers['Retry-After'] = '10'
         return resp, 503
+    # a signed-in user's write: its upload may take as long as the link needs (#1052)
+    lift_body_deadline(session['user'])
     try:
         return _forward(session)
     finally:
@@ -2080,6 +2082,9 @@ def signed_member_call():
     key = 'pegaprox.ha_signed_headers'
     if key not in request.environ:
         request.environ[key] = ha.signed_before_body(request.headers, request.method, request.path)
+        if request.environ[key]:
+            # a member signed for the body to come: not an anonymous one (#1052)
+            lift_body_deadline()
     return request.environ[key]
 
 

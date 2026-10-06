@@ -108,6 +108,15 @@ def test_time_based_retention_still_works(syslog_db, monkeypatch):
 
 # --- memory: the count cap was a cap on the wrong thing ----------------------
 
+def _row(message):
+    """An entry as the UDP and TCP listeners queue it: the row _flush_batch inserts.
+    (#1015) These tests fed dicts, which nothing in the receiver ever queues - the byte
+    count worked on those and on nothing real, so they passed while the ceiling never
+    fired."""
+    return (datetime.datetime.now().isoformat(), '192.0.2.10', 'pve1', 1, 6, 'info',
+            message, 'TCP')
+
+
 class _QueueHarness:
     """Reload the module with a small byte ceiling, and put it back afterwards."""
 
@@ -140,29 +149,29 @@ def small_queue(monkeypatch):
 
 def test_large_messages_hit_the_byte_ceiling_long_before_the_count(small_queue):
     """20000 entries x 64 KB is 1.2 GB. The count cap never came near it."""
-    big = {'message': 'x' * 60000}
+    big = _row('x' * 60000)
 
     for _ in range(40):
-        small_queue.sl._enqueue_log(dict(big))
+        small_queue.sl._enqueue_log(big)
 
     assert small_queue.sl._LOG_QUEUE.qsize() < 40
     assert small_queue.sl._DROPPED > 0
 
 
 def test_the_bytes_counted_stay_under_the_ceiling(small_queue):
-    big = {'message': 'x' * 60000}
+    big = _row('x' * 60000)
 
     for _ in range(40):
-        small_queue.sl._enqueue_log(dict(big))
+        small_queue.sl._enqueue_log(big)
 
     assert small_queue.sl._QUEUE_BYTES <= small_queue.sl._QUEUE_MAX_BYTES
 
 
 def test_draining_gives_the_budget_back(small_queue):
     """Without this the counter only ever rises and ingestion dies permanently."""
-    big = {'message': 'x' * 60000}
+    big = _row('x' * 60000)
     for _ in range(40):
-        small_queue.sl._enqueue_log(dict(big))
+        small_queue.sl._enqueue_log(big)
 
     small_queue.drain()
 
@@ -170,21 +179,81 @@ def test_draining_gives_the_budget_back(small_queue):
 
 
 def test_ingestion_recovers_after_a_flood(small_queue):
-    big = {'message': 'x' * 60000}
+    big = _row('x' * 60000)
     for _ in range(40):
-        small_queue.sl._enqueue_log(dict(big))
+        small_queue.sl._enqueue_log(big)
     small_queue.drain()
 
-    small_queue.sl._enqueue_log(dict(big))
+    small_queue.sl._enqueue_log(big)
 
     assert small_queue.sl._LOG_QUEUE.qsize() == 1
 
 
-def test_ordinary_traffic_is_unaffected(small_queue):
-    """A real syslog line is a couple of hundred bytes; 1 MB holds thousands."""
-    line = {'message': 'kernel: something happened on eth0'}
+def test_text_outside_ascii_is_charged_what_it_holds(small_queue):
+    """len() counts characters. An emoji is one of them and four bytes in memory, so a
+    flood of them filled four times the ceiling (#1015)."""
+    import sys
+    big = _row('\U0001F600' * 15000)            # 60 KB on the wire and in memory
+
+    for _ in range(40):
+        small_queue.sl._enqueue_log(big)
+
+    held = sum(sys.getsizeof(e[6]) for e in small_queue.drain())
+    assert held <= small_queue.sl._QUEUE_MAX_BYTES, \
+        f'{held // 1024} KB of messages queued under a {small_queue.sl._QUEUE_MAX_BYTES // 1024} KB ceiling'
+
+
+def test_ordinary_text_outside_ascii_is_unaffected(small_queue):
+    line = _row('Gerät eth0 läuft wieder')
 
     for _ in range(2000):
-        small_queue.sl._enqueue_log(dict(line))
+        small_queue.sl._enqueue_log(line)
 
     assert small_queue.sl._LOG_QUEUE.qsize() == 2000
+
+
+def test_ordinary_traffic_is_unaffected(small_queue):
+    """A real syslog line is a couple of hundred bytes; 1 MB holds thousands."""
+    line = _row('kernel: something happened on eth0')
+
+    for _ in range(2000):
+        small_queue.sl._enqueue_log(line)
+
+    assert small_queue.sl._LOG_QUEUE.qsize() == 2000
+
+
+def test_the_listener_entries_are_charged_what_they_hold(small_queue):
+    """The real thing: lines through the TCP listener on loopback. 100 lines of 30 KB are
+    3 MB, three times the 1 MB ceiling; charged a flat 200 bytes each they were 20 KB and
+    every one of them was queued (#1015)."""
+    import socket
+    import time
+    import gevent
+    sl_ = small_queue.sl
+    listener = gevent.spawn(sl_._tcp_listener, '127.0.0.1', 0)
+    try:
+        end = time.monotonic() + 5
+        while sl_._tcp_sock is None and time.monotonic() < end:
+            gevent.sleep(0.01)
+        port = sl_._tcp_sock.getsockname()[1]
+        line = b'<14>Oct  6 10:00:00 pve1 app: ' + b'x' * 30000 + b'\n'
+        c = socket.create_connection(('127.0.0.1', port), timeout=5)
+        for _ in range(100):
+            c.sendall(line)
+        c.close()
+        while sl_._LOG_QUEUE.qsize() + sl_._DROPPED < 100 and time.monotonic() < end + 5:
+            gevent.sleep(0.01)
+
+        queued = sl_._LOG_QUEUE.qsize()
+        assert sl_._LOG_QUEUE.qsize() + sl_._DROPPED == 100
+        assert queued < 40, f'{queued} lines of 30 KB queued under a 1 MB ceiling'
+        assert sl_._QUEUE_BYTES <= sl_._QUEUE_MAX_BYTES
+        assert sl_._QUEUE_BYTES >= queued * 30000
+    finally:
+        sl_._stop_event.set()
+        try:
+            sl_._tcp_sock.close()
+        except Exception:
+            pass
+        listener.kill()
+        small_queue.drain()

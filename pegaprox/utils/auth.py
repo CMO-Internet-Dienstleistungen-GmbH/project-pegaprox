@@ -1159,6 +1159,46 @@ def revoke_api_token(token_id: int, username: str) -> bool:
         return False
 
 
+# where app.py's request handler hangs the clock on a request body (_BodyDeadline, #1052)
+BODY_DEADLINE_ENVIRON = 'pegaprox.body_deadline'
+# a body this small comes with its headers and keeps its clock: only an upload needs more
+_SMALL_BODY = 64 * 1024
+
+
+def lift_body_deadline(owner=None):
+    """This request is somebody's: its body may take as long as the link needs.
+
+    Until then a body has PEGAPROX_BODY_TIMEOUT seconds to arrive, which is what bounds how
+    long an anonymous client holds a request slot. Called where a request is known to be
+    signed in or signed: require_auth, a standby's forwarded write, a group member's call.
+    Outside a request, or without the gevent server's clock, it does nothing.
+
+    owner: the account behind it. A signed-in account could otherwise hold every slot with
+    bodies it never sends, so a large one counts against the account like a WebSocket
+    (realtime.hold_body) and a small one keeps its clock.
+    """
+    try:
+        clock = request.environ.get(BODY_DEADLINE_ENVIRON)
+    except RuntimeError:
+        return
+    if clock is None or clock.lifted:
+        return
+    if owner is None:
+        clock.lift()
+        return
+    chunked = 'chunked' in (request.headers.get('Transfer-Encoding') or '').lower()
+    if not chunked and (request.content_length or 0) <= _SMALL_BODY:
+        return
+    from pegaprox.utils.realtime import hold_body, release_body
+    key = hold_body(owner)
+    if key is None:
+        from pegaprox.utils.sanitization import sanitize_log_message
+        logging.info(f"[auth] a large request body of '{sanitize_log_message(str(owner))}' keeps "
+                     f"its clock - the account holds its share of long requests")
+        return
+    clock.lift(release=lambda: release_body(key))
+
+
 def require_auth(roles: list = None, perms: list = None):
     """auth decorator for protected routes
 
@@ -1309,7 +1349,9 @@ def require_auth(roles: list = None, perms: list = None):
                     _eff_pub = _tr
             session = {**session, 'effective_role': _eff_pub}
             request.session = session
-            
+            # signed in and allowed: the body is no longer an anonymous one (#1052)
+            lift_body_deadline(session['user'])
+
             return f(*args, **kwargs)
         # MK Sep 2026 - publish what this route demands so the OpenAPI generator can
         # read it instead of re-deriving it from the decorator source. functools.wraps

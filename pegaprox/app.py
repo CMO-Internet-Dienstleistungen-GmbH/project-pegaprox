@@ -35,6 +35,7 @@ from pegaprox.constants import (
 )
 from pegaprox import globals as g
 from pegaprox.api import register_blueprints
+from pegaprox.utils.auth import BODY_DEADLINE_ENVIRON
 
 
 def get_allowed_origins():
@@ -2016,22 +2017,184 @@ _KEEPALIVE_IDLE_TIMEOUT = float(os.environ.get('PEGAPROX_KEEPALIVE_TIMEOUT', '75
 # because `workers` slots held open is the whole server.
 _HANDSHAKE_TIMEOUT = float(os.environ.get('PEGAPROX_HANDSHAKE_TIMEOUT', '30'))
 _HEADER_TIMEOUT = float(os.environ.get('PEGAPROX_HEADER_TIMEOUT', '30'))
+# NS Oct 2026 (#1052) - and the body after the headers. handle() clears the socket timeout
+# and the bounds above end with the headers, so a POST that announces a Content-Length and
+# never sends it parked in get_json() - or, on a route that answers without reading it, in
+# pywsgi's discard of the rest - for as long as the client liked. Until the request is
+# signed in (lift_body_deadline) its body has this long to arrive; after that an ISO
+# upload takes as long as the link needs.
+_BODY_TIMEOUT = float(os.environ.get('PEGAPROX_BODY_TIMEOUT', '30'))
+# and the answer: how long a client may take none of it (_IdleTimeoutMixin._sendall)
+_SEND_TIMEOUT = float(os.environ.get('PEGAPROX_SEND_TIMEOUT', '60'))
+_SEND_SLICE = 64 * 1024
+
+
+class _BodyTimedOut(TimeoutError):
+    """The request body did not arrive in time. An OSError on purpose: werkzeug answers it
+    like a client that went away (400), and the HA fast path reads it as a short body."""
+
+
+class _BodyDeadline:
+    """pywsgi's request body with a clock on it.
+
+    Every read has to be done by the deadline, the discard after the response included.
+    lift() takes the clock off for the rest of the request. A read that runs out raises
+    _BodyTimedOut and marks the connection for closing: the rest of the body is still on
+    the wire, so nothing after it can be read as the next request.
+    """
+
+    def __init__(self, body, seconds):
+        self._body = body
+        self._until = time.monotonic() + seconds
+        self.expired = False
+        self._release = None
+
+    @property
+    def lifted(self):
+        return self._until is None
+
+    def lift(self, release=None):
+        """release: called once the request is done, to give back the account's share
+        (utils/auth.py lift_body_deadline)"""
+        self._until = None
+        self._release = release
+
+    def done(self):
+        release, self._release = self._release, None
+        if release is not None:
+            release()
+
+    @property
+    def rfile(self):
+        # simple-websocket finds the socket through here, as on pywsgi's own Input
+        return self._body.rfile
+
+    def _timed(self, read, *args):
+        if self._until is None:
+            return read(*args)
+        if self.expired:
+            raise _BodyTimedOut('request body not received in time')
+        import gevent
+        # what is already buffered is read without waiting, so it still comes through
+        # after the deadline; only the wait for more is cut off
+        t = gevent.Timeout(max(self._until - time.monotonic(), 0.01))
+        t.start()
+        try:
+            return read(*args)
+        except gevent.Timeout as ex:
+            if ex is not t:
+                raise
+            self.expired = True
+            raise _BodyTimedOut('request body not received in time')
+        finally:
+            t.close()
+
+    def read(self, length=None):
+        return self._timed(self._body.read, length)
+
+    def readline(self, size=None):
+        return self._timed(self._body.readline, size)
+
+    def readlines(self, hint=None):
+        return list(self)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        line = self.readline()
+        if not line:
+            raise StopIteration
+        return line
+
+    def _discard(self):
+        try:
+            self._timed(self._body._discard)
+        except _BodyTimedOut:
+            pass
 
 
 class _IdleTimeoutMixin:
-    """Bound the idle wait for the next request line, and the header read after it.
+    """Bound the idle wait for the next request line, the header read after it, the
+    body of a request nobody has signed in for yet, and each write of the answer.
 
     Compose ahead of a gevent pywsgi handler class in the MRO so `super().read_requestline()`
     reaches the real handler.
 
     MK Sep 2026 - read_requestline was the only bounded phase, so `GET / HTTP/1.1` followed by
     headers dribbled one byte at a time held a slot indefinitely: the request line arrived
-    promptly, and everything after it was unbounded. Note this bounds the HEADERS only - the
-    body is read later, by the application, and a WebSocket upgrade completes its headers in
-    one packet like any other request, so a live console is unaffected.
+    promptly, and everything after it was unbounded. A WebSocket upgrade completes its
+    headers in one packet like any other request, so a live console is unaffected.
     """
     _idle_timeout = _KEEPALIVE_IDLE_TIMEOUT
     _header_timeout = _HEADER_TIMEOUT
+    _body_timeout = _BODY_TIMEOUT
+    _send_timeout = _SEND_TIMEOUT
+
+    def get_environ(self):
+        env = super().get_environ()
+        to = self._body_timeout
+        if to and to > 0 and self.wsgi_input is not None:
+            # pywsgi hands a request that only asks for an upgrade its raw rfile, and a POST
+            # with `Connection: Upgrade` is never upgraded: the route read the body from
+            # there, off the clock. Neither WebSocket library reads frames from wsgi.input
+            # (geventwebsocket uses the handler's rfile, simple-websocket the socket behind
+            # clock.rfile), so every request gets the clock.
+            clock = _BodyDeadline(self.wsgi_input, to)
+            env['wsgi.input'] = clock
+            self.wsgi_input = clock
+            env[BODY_DEADLINE_ENVIRON] = clock
+        return env
+
+    def handle_one_response(self):
+        try:
+            return super().handle_one_response()
+        finally:
+            if getattr(self.wsgi_input, 'expired', False):
+                self.close_connection = True
+            done = getattr(self.wsgi_input, 'done', None)
+            if done is not None:
+                done()
+
+    def _sendall(self, data):
+        # NS Oct 2026 (#1052) - the mirror image of a body that never arrives: a client that
+        # asks for index.html (7 MB) and reads none of it parks this write, and the slot,
+        # once the socket buffers are full. Like nginx's send_timeout, the clock is on
+        # progress, not on the whole answer: a slow link keeps going.
+        to = self._send_timeout
+        if not to or to <= 0 or not data:
+            return super()._sendall(data)
+        import gevent
+        view = memoryview(data)
+        for at in range(0, len(view), _SEND_SLICE):
+            t = gevent.Timeout(to)
+            t.start()
+            try:
+                super()._sendall(view[at:at + _SEND_SLICE])
+            except gevent.Timeout as ex:
+                if ex is not t:
+                    raise
+                self.close_connection = True
+                # pywsgi lets a client that went away go quietly
+                raise OSError(errno.EPIPE, f'the client took nothing for {to:g}s')
+            finally:
+                t.close()
+
+    def handle_one_request(self):
+        result = super().handle_one_request()
+        if not isinstance(result, tuple):
+            return result
+        # pywsgi writes its own 400 and 414 straight to the socket, past _sendall, and a
+        # client can have filled the buffers with the answers before it: same clock
+        import gevent
+        self.status = result[0]
+        to = self._send_timeout if self._send_timeout and self._send_timeout > 0 else None
+        try:
+            with gevent.Timeout(to, False):
+                self.socket.sendall(result[1])
+        except OSError:
+            pass
+        return None
 
     def read_request(self, raw_requestline):
         to = self._header_timeout
@@ -2311,7 +2474,7 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
             """The handshake is done by the time we get here, so lift its deadline.
 
             Everything after this point has its own bounds: _IdleTimeoutMixin for the
-            request line and the headers, and the application for the body. A console
+            request line, the headers and an anonymous body. A console
             WebSocket lives here for hours and must not inherit a 30s socket timeout.
             """
             try:
@@ -2395,9 +2558,16 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
         def _handle_http_redirect(self, client_socket, address):
             """Send HTTP 301 redirect to HTTPS version"""
             try:
-                client_socket.settimeout(5.0)
+                # NS Oct 2026 (#997) - the 5s was per recv, so a byte every 4s held this
+                # pool slot for hours. One deadline for the whole request head, the same
+                # PEGAPROX_HEADER_TIMEOUT the TLS side gets in _IdleTimeoutMixin.
+                until = time.monotonic() + _HEADER_TIMEOUT if _HEADER_TIMEOUT > 0 else None
                 request_data = b''
                 while b'\r\n\r\n' not in request_data and len(request_data) < 8192:
+                    left = 5.0 if until is None else min(5.0, until - time.monotonic())
+                    if left <= 0:
+                        return
+                    client_socket.settimeout(left)
                     chunk = client_socket.recv(1024)
                     if not chunk:
                         break
@@ -2468,6 +2638,7 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
                     f"Connection: close\r\n"
                     f"\r\n"
                 )
+                client_socket.settimeout(5.0)
                 client_socket.sendall(response.encode())
             except Exception:
                 pass
