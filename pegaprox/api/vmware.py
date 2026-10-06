@@ -98,7 +98,29 @@ def update_vmware_server(vmware_id):
     if not ok:
         return err
     data = request.json or {}
-    
+
+    # NS Oct 2026 (#981) - linked_clusters is the list check_vmware_access reads, and an
+    # empty one opens the server to everybody. Same rule as the PBS twin: a non-admin may
+    # only narrow it, to clusters they reach themselves.
+    if 'linked_clusters' in data:
+        _lc = data.get('linked_clusters')
+        # a string was stored as its characters and kept raw on the live manager
+        if _lc is not None and not (isinstance(_lc, list) and all(isinstance(c, str) for c in _lc)):
+            return jsonify({'error': 'linked_clusters must be a list of cluster ids'}), 400
+        from pegaprox.utils.rbac import get_user_clusters
+        _caller = build_authz_user(request.session.get('user', ''), request.session)
+        if _caller.get('effective_role', _caller.get('role')) != ROLE_ADMIN:
+            _new_links = list(data.get('linked_clusters') or [])
+            if not _new_links:
+                return jsonify({'error': 'Access denied: only a global admin may unlink an ESXi '
+                                         'server from every cluster'}), 403
+            _reachable = get_user_clusters(_caller, include_pools=False)
+            if _reachable is not None:
+                _beyond = [c for c in _new_links if c not in set(_reachable)]
+                if _beyond:
+                    return jsonify({'error': 'Access denied: cannot link this ESXi server to '
+                                             + ', '.join(_beyond)}), 403
+
     if vmware_id not in vmware_managers:
         db = get_db()
         row = db.conn.cursor().execute("SELECT * FROM vmware_servers WHERE id = ?", (vmware_id,)).fetchone()
@@ -160,6 +182,17 @@ def update_vmware_server(vmware_id):
             data['password'] = vmware_managers[vmware_id].password
 
     save_vmware_server(vmware_id, data)
+
+    # an update that leaves linked_clusters out keeps them (the row already does); the
+    # live manager below is built from `data` and came up unlinked, open to everybody (#981)
+    if 'linked_clusters' not in data:
+        if vmware_id in vmware_managers:
+            data['linked_clusters'] = list(getattr(vmware_managers[vmware_id], 'linked_clusters', None) or [])
+        else:
+            import json as _json
+            _lr = get_db().conn.cursor().execute(
+                "SELECT linked_clusters FROM vmware_servers WHERE id = ?", (vmware_id,)).fetchone()
+            data['linked_clusters'] = _json.loads(_lr['linked_clusters'] or '[]') if _lr else []
 
     mgr = VMwareManager(vmware_id, data)
     if data.get('enabled', True):
@@ -1191,6 +1224,18 @@ def start_vmware_migration(vmware_id, vm_id):
     _aio = (data.get('aio_mode') or '').strip().lower()
     if _aio and _aio not in ('threads', 'native', 'io_uring'):
         return jsonify({'error': 'Invalid aio_mode: must be threads, native or io_uring.'}), 400
+
+    # NS Oct 2026 (#1106) - esxi_host decides which host the PVE node SSHes/sshfs-mounts and
+    # reads disks from as root. Left to the caller it could aim the node at an attacker's SSH
+    # server serving a crafted descriptor. It is the configured server's host; pin it there.
+    # The wizard never sends it (it defaults to the server host); an explicit mismatch is refused.
+    _reg_host = vmware_managers[vmware_id].host
+    _req_host = data.get('esxi_host')
+    if _req_host not in (None, '') and str(_req_host).strip().lower() != str(_reg_host or '').lower():
+        return jsonify({'error': 'esxi_host must match the registered ESXi server'}), 400
+    # the task reads data['esxi_host'] as is, so hand it the registered value, not the
+    # spelling that passed the compare
+    data['esxi_host'] = _reg_host
 
     if not data.get('esxi_password'):
         return jsonify({'error': 'esxi_password is required for SSHFS-based migration'}), 400

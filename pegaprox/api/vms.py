@@ -12877,14 +12877,41 @@ def remote_migrate_vm_api(cluster_id, node, vm_type, vmid):
     delete_source = data.get('delete_source', True)
     bwlimit = data.get('bwlimit')
     
-    if not all([target_endpoint, target_storage, target_bridge]):
-        return jsonify({'error': 'target_endpoint, target_storage, and target_bridge are required'}), 400
-    
-    result = manager.remote_migrate_vm(
-        node, vmid, vm_type, 
-        target_endpoint, target_storage, target_bridge,
-        target_vmid, online, delete_source, bwlimit
-    )
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    if getattr(manager, 'cluster_type', 'proxmox') == 'xcpng':
+        # NS Oct 2026 (#1088, #1048) - an XCP-ng pool logs into the target with stored
+        # credentials, so the target is a registered pool, never a URL from the request
+        from pegaprox.utils.rbac import has_permission
+        if not has_permission(user, 'xapi.vm.migrate'):
+            return jsonify({'error': 'Permission denied: xapi.vm.migrate'}), 403
+        target_cluster = data.get('target_cluster')
+        if not isinstance(target_cluster, str) or not all([target_cluster, target_storage, target_bridge]):
+            return jsonify({'error': 'target_cluster (a registered XCP-ng pool), target_storage '
+                                     'and target_bridge are required'}), 400
+        target_mgr = cluster_managers.get(target_cluster)
+        if (target_cluster == cluster_id or target_mgr is None
+                or getattr(target_mgr, 'cluster_type', 'proxmox') != 'xcpng'):
+            return jsonify({'error': 'Target must be another XCP-ng pool registered in PegaProx'}), 400
+        ok, err = check_cluster_access(target_cluster)
+        if not ok:
+            return err
+        if caller_is_scoped(user, target_cluster):
+            return jsonify({'error': 'Access denied to target cluster'}), 403
+        result = manager.remote_migrate_vm(
+            node, vmid, vm_type, None, target_storage, target_bridge,
+            target_vmid, online, delete_source, bwlimit, target_pool=target_mgr)
+    else:
+        if not all([target_endpoint, target_storage, target_bridge]):
+            return jsonify({'error': 'target_endpoint, target_storage, and target_bridge are required'}), 400
+        # same rule as XHM: removing the source guest is vm.delete, not vm.migrate
+        if delete_source and not user_can_access_vm(user, cluster_id, vmid, 'vm.delete', vm_type):
+            return jsonify({'error': 'Access denied: removing the source guest needs '
+                                     'vm.delete on it'}), 403
+        result = manager.remote_migrate_vm(
+            node, vmid, vm_type,
+            target_endpoint, target_storage, target_bridge,
+            target_vmid, online, delete_source, bwlimit
+        )
     
     if result.get('success'):
         # NS: Register PegaProx user for this task
@@ -12945,7 +12972,13 @@ def cross_cluster_migrate_api():
     
     if not target_node:
         return jsonify({'error': 'Target node is required for cross-cluster migration'}), 400
-    
+    # NS Oct 2026 (#1048) - the gates and the migration have to mean the same guest. '0100'
+    # or ' 100' missed the ACL row of VM 100 and got decided by the role instead.
+    try:
+        vmid = int(vmid)
+    except (TypeError, ValueError):
+        return jsonify({'error': 'vmid must be a number'}), 400
+
     if source_cluster_id not in cluster_managers:
         return jsonify({'error': 'Source cluster not found'}), 404
     if target_cluster_id not in cluster_managers:
@@ -12972,11 +13005,18 @@ def cross_cluster_migrate_api():
     _xu = build_authz_user(request.session.get('user', ''), request.session)
     if caller_is_scoped(_xu, target_cluster_id):
         return jsonify({'error': 'Access denied to the target cluster'}), 403
-    if _xu.get('effective_role', _xu.get('role')) != ROLE_ADMIN:
+    from pegaprox.utils.rbac import acts_as_admin
+    if not acts_as_admin(_xu):
         from pegaprox.utils.rbac import check_tenant_vmid, DEFAULT_TENANT_ID
         _rok, _rmsg = check_tenant_vmid(_xu.get('tenant_id') or DEFAULT_TENANT_ID, target_vmid or vmid)
         if not _rok:
             return jsonify({'error': _rmsg}), 403
+    # NS Oct 2026 (#1048) - delete_source destroys the source guest: vm.delete, like XHM
+    if delete_source:
+        err = _require_vm_access(source_cluster_id, vmid, 'vm.delete', vm_type)
+        if err:
+            return jsonify({'error': 'Access denied: removing the source guest needs '
+                                     'vm.delete on it'}), 403
 
     source_manager = cluster_managers[source_cluster_id]
     target_manager = cluster_managers[target_cluster_id]

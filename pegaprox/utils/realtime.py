@@ -524,12 +524,13 @@ def _sse_may_see_object_frame(username, update_type, data, effective_role=None):
     try:
         if update_type.startswith('xhm_'):
             from pegaprox.globals import _xhm_migrations
-            from pegaprox.utils.rbac import user_can_access_vm
+            from pegaprox.api.xhm import _may_migrate_source
             t = _xhm_migrations.get(data.get('id'))
             vmid, cid = getattr(t, 'source_vmid', None), getattr(t, 'source_cluster', None)
             if t is None or not vmid or not cid:
                 return False
-            return user_can_access_vm(user, cid, int(vmid), 'vm.migrate')
+            # the same gate as the list route, ESXi sources included (#1039)
+            return _may_migrate_source(user, cid, vmid)
 
         if update_type.startswith('vmware_migration'):
             # the live V2P registry is vmware.py's module-level dict; globals._v2p_migrations

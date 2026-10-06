@@ -4421,13 +4421,17 @@ echo DONE""",
 
     def remote_migrate_vm(self, node, vmid, vm_type='qemu', target_endpoint=None,
                           target_storage=None, target_bridge=None, target_vmid=None,
-                          online=True, delete_source=True, bwlimit=None):
+                          online=True, delete_source=True, bwlimit=None, target_pool=None):
         """Migrate VM to another XCP-ng pool via XAPI migrate_send.
 
-        target_endpoint: https://<remote_host> of the target pool master
+        target_pool: the XcpngManager of a pool registered in PegaProx. Its own stored
+        URL, credentials and TLS setting open the session there. target_endpoint is
+        not used: a URL from the caller never gets a stored credential.
         """
-        if not target_endpoint:
-            return {'success': False, 'error': 'Target endpoint required'}
+        # NS Oct 2026 (#1088, #1048) - this logged into the caller's target_endpoint
+        # with THIS pool's user and password
+        if not isinstance(target_pool, XcpngManager) or target_pool is self:
+            return {'success': False, 'error': 'Target must be another XCP-ng pool registered in PegaProx'}
 
         api = self._api()
         if not api:
@@ -4437,16 +4441,11 @@ echo DONE""",
             vm_ref = self._resolve_vm(vmid)
             power = api.VM.get_power_state(vm_ref)
 
-            # connect to remote pool to get session. The TLS setting is the source
-            # cluster's - we have no config object for the target here, only its URL,
-            # and this call already logs into the target with the SOURCE credentials
-            # below, so the source's setting is the one that is actually meaningful.
-            # MK Sep 2026 - was pinned to ignore_ssl=True, which quietly ignored an
-            # operator who had turned verification ON for this cluster.
+            tcfg = target_pool.config
             remote_session = ha_transport.guard_xapi(XenAPI.Session(
-                target_endpoint, ignore_ssl=not self.config.ssl_verification))
+                target_pool._get_xapi_url(), ignore_ssl=not tcfg.ssl_verification))
             remote_session.xenapi.login_with_password(
-                self.config.user, self.config.pass_, '1.0', 'PegaProx')
+                tcfg.user, tcfg.pass_, '1.0', 'PegaProx')
 
             # build migrate_send params
             dest = {
@@ -4482,7 +4481,7 @@ echo DONE""",
             except Exception:
                 pass
 
-            self.logger.info(f"Remote migration started: VM {vmid} -> {target_endpoint}")
+            self.logger.info(f"Remote migration started: VM {vmid} -> pool {tcfg.name}")
             return {'success': True, 'task': task_id}
         except Exception as e:
             self.logger.error(f"remote_migrate_vm {vmid}: {e}")

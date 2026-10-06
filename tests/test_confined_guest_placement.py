@@ -164,7 +164,9 @@ def test_a_new_guest_from_a_restore_keeps_to_the_tenant_range(api, seed):
 
 def _xc(client, **extra):
     body = {'source_cluster': CID, 'target_cluster': 'cluster_2', 'vmid': 100, 'vm_type': 'qemu',
-            'source_node': 'pve1', 'target_node': 'far1', 'target_storage': 'local-lvm'}
+            'source_node': 'pve1', 'target_node': 'far1', 'target_storage': 'local-lvm',
+            # placement only: removing the source needs vm.delete as well (#1048)
+            'delete_source': False}
     body.update(extra)
     return client.post('/api/cross-cluster-migrate', json=body)
 

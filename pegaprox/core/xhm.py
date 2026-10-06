@@ -2030,8 +2030,11 @@ def _run_esxi_to_pve(task):
                     p_out.channel.recv_exit_status()
                     dev_path = p_out.read().decode().strip()
 
-                    # qemu-img convert vmdk -> raw directly to storage
-                    conv_cmd = f"qemu-img convert -f vmdk -O raw '{tmp_path}' '{dev_path}'"
+                    # qemu-img convert -> raw directly to storage. The file is the -flat
+                    # extent, raw data: read as raw. NS Oct 2026 (#1106) - with -f vmdk a
+                    # descriptor dropped on the datastore under that name was parsed as
+                    # root here and its extent paths followed
+                    conv_cmd = f"qemu-img convert -f raw -O raw '{tmp_path}' '{dev_path}'"
                     task.log(f"  Converting VMDK to raw...")
                     _, conv_out, conv_err = ssh_pve.exec_command(conv_cmd, timeout=7200)
                     conv_exit = conv_out.channel.recv_exit_status()
@@ -2077,7 +2080,7 @@ def _run_esxi_to_pve(task):
                 # convert from SSHFS mount directly to storage volume
                 # NS Jul 2026 (CodeAnt RCE) — shlex.quote both paths (defense-in-depth on top of
                 # the component validation above) instead of the naive single-quoting.
-                conv_cmd = f"qemu-img convert -p -f vmdk -O raw {_q_local(sshfs_vmdk)} {_q_local(dev_path)}"
+                conv_cmd = f"qemu-img convert -p -f raw -O raw {_q_local(sshfs_vmdk)} {_q_local(dev_path)}"  # #1106
                 task.log(f"  Converting via SSHFS → {vol_id}")
                 _, conv_out, conv_err = ssh_pve.exec_command(conv_cmd, timeout=7200)
                 conv_exit = conv_out.channel.recv_exit_status()
@@ -2323,10 +2326,11 @@ def _run_esxi_to_xcpng(task):
                     task.set_phase('failed', f'SCP failed: {proc.stderr.decode()[:200]}')
                     return
 
-                # convert VMDK -> raw
+                # the -flat extent is raw already; read it as raw so qemu-img on this
+                # host never treats a datastore file as a descriptor (#1106)
                 task.log(f"  Converting VMDK to raw...")
                 conv = subprocess.run(
-                    ['qemu-img', 'convert', '-f', 'vmdk', '-O', 'raw', tmp_vmdk, tmp_raw],
+                    ['qemu-img', 'convert', '-f', 'raw', '-O', 'raw', tmp_vmdk, tmp_raw],
                     capture_output=True, timeout=7200
                 )
                 os.remove(tmp_vmdk)  # free space
