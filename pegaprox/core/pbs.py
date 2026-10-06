@@ -1104,6 +1104,38 @@ class PBSManager:
         }
 
 
+def pbs_config_from_row(db, row_dict):
+    """A pbs_servers row as the config dict PBSManager takes, secrets decrypted.
+
+    NS Oct 2026 (#999, #1033) - shared with the update route, which used to rebuild the live
+    manager from the request body alone. A secret that does not decrypt comes back empty."""
+    def _secret(col):
+        if not row_dict.get(col):
+            return ''
+        try:
+            return db._decrypt(row_dict[col])
+        except Exception:
+            return ''
+
+    return {
+        'name': row_dict.get('name', 'PBS'),
+        'host': row_dict.get('host', ''),
+        'port': row_dict.get('port', 8007),
+        'user': row_dict.get('user', 'root@pam'),
+        'password': _secret('pass_encrypted'),
+        'api_token_id': row_dict.get('api_token_id', ''),
+        'api_token_secret': _secret('api_token_secret_encrypted'),
+        'fingerprint': row_dict.get('fingerprint', ''),
+        'ssl_verify': bool(row_dict.get('ssl_verify', 0)),
+        'enabled': bool(row_dict.get('enabled', 1)),
+        'linked_clusters': json.loads(row_dict.get('linked_clusters', '[]') or '[]'),
+        'notes': row_dict.get('notes', ''),
+        'ssh_user': row_dict.get('ssh_user', '') or '',
+        'ssh_port': row_dict.get('ssh_port', 22) or 22,
+        'ssh_key': _secret('ssh_key_encrypted'),
+    }
+
+
 def load_pbs_servers(only=None):
     """Load all PBS server configs from DB and create managers. `only` limits it to
     those ids (a warm standby rebuilding a few, core/ha.py reload_managers)."""
@@ -1119,47 +1151,8 @@ def load_pbs_servers(only=None):
         for row in rows:
             row_dict = dict(row)
             pbs_id = row_dict['id']
-            
-            # Decrypt credentials
-            password = ''
-            if row_dict.get('pass_encrypted'):
-                try:
-                    password = db._decrypt(row_dict['pass_encrypted'])
-                except Exception:
-                    password = ''
-            
-            api_token_secret = ''
-            if row_dict.get('api_token_secret_encrypted'):
-                try:
-                    api_token_secret = db._decrypt(row_dict['api_token_secret_encrypted'])
-                except Exception:
-                    api_token_secret = ''
-            
-            ssh_key = ''
-            if row_dict.get('ssh_key_encrypted'):
-                try:
-                    ssh_key = db._decrypt(row_dict['ssh_key_encrypted'])
-                except Exception:
-                    ssh_key = ''
+            config = pbs_config_from_row(db, row_dict)
 
-            config = {
-                'name': row_dict.get('name', 'PBS'),
-                'host': row_dict.get('host', ''),
-                'port': row_dict.get('port', 8007),
-                'user': row_dict.get('user', 'root@pam'),
-                'password': password,
-                'api_token_id': row_dict.get('api_token_id', ''),
-                'api_token_secret': api_token_secret,
-                'fingerprint': row_dict.get('fingerprint', ''),
-                'ssl_verify': bool(row_dict.get('ssl_verify', 0)),
-                'enabled': bool(row_dict.get('enabled', 1)),
-                'linked_clusters': json.loads(row_dict.get('linked_clusters', '[]')),
-                'notes': row_dict.get('notes', ''),
-                'ssh_user': row_dict.get('ssh_user', '') or '',
-                'ssh_port': row_dict.get('ssh_port', 22) or 22,
-                'ssh_key': ssh_key,
-            }
-            
             try:
                 mgr = PBSManager(pbs_id, config)
                 if config['enabled']:
