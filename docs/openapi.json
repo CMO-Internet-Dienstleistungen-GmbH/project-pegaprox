@@ -11331,7 +11331,7 @@
           }
         ],
         "x-pegaprox-permissions": [
-          "vm.view"
+          "vm.config"
         ]
       }
     },

@@ -669,7 +669,6 @@ def check_vmware_access(vmware_id):
     all-cluster (get_user_clusters None), or the caller reaches one of the server's linked clusters.
     Returns (True, None) or (False, error_response)."""
     from flask import request, jsonify
-    from pegaprox.utils.auth import build_authz_user
     from pegaprox.utils.rbac import get_user_clusters
     from pegaprox.globals import vmware_managers
     from pegaprox.models.permissions import ROLE_ADMIN
@@ -677,7 +676,15 @@ def check_vmware_access(vmware_id):
     if vmware_id not in vmware_managers:
         return False, (jsonify({'error': 'VMware server not found'}), 404)
     # #491 — floor an admin-owned scoped API token to its effective_role (mirrors check_cluster_access).
-    user = build_authz_user(request.session.get('user', ''), request.session)
+    # NS Oct 2026 (#1101) - resolve by the account's own row through acting_user (g.current_user,
+    # the record require_auth already fetched and refused when it was gone), not build_authz_user:
+    # that re-read the whole users table, and the {} a failed read answers is a role-less
+    # default-tenant identity get_user_clusters hands every cluster. A transient read therefore let
+    # any vmware-view holder past this server gate onto another tenant's ESXi (detail, performance,
+    # watch, the VM list) - the same empty-read hole closed for the console. No account, no reach.
+    user = acting_user()
+    if not user:
+        return False, (jsonify({'error': 'Unauthorized', 'code': 'AUTH_REQUIRED'}), 401)
     if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
         return True, None
     linked = getattr(vmware_managers[vmware_id], 'linked_clusters', None) or []

@@ -231,8 +231,9 @@ def validate_sse_token(token: str) -> dict:
 # These are single-use and expire after 60s
 WS_TOKEN_TTL = 60
 
-def create_ws_token(username: str, role: str) -> str:
-    """Create a short-lived single-use WebSocket auth token"""
+def create_ws_token(username: str, role: str, api_token: bool = False) -> str:
+    """Create a short-lived single-use WebSocket auth token. api_token: minted by an API
+    token, whose role then bounds every console the ws token opens (#1116)."""
     token = base64.urlsafe_b64encode(os.urandom(24)).decode('utf-8')
     expires = time.time() + WS_TOKEN_TTL
 
@@ -246,6 +247,7 @@ def create_ws_token(username: str, role: str) -> str:
         ws_tokens[token] = {
             'user': username,
             'role': role,
+            'api_token': bool(api_token),
             'expires': expires,
         }
 

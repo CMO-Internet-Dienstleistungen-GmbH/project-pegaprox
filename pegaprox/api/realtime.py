@@ -309,7 +309,7 @@ def get_ws_token():
     """Get a single-use WebSocket auth token - avoids session_id in URLs"""
     user = request.session.get('user', 'unknown')
     role = request.session.get('role', 'viewer')
-    token = create_ws_token(user, role)
+    token = create_ws_token(user, role, api_token=bool(request.session.get('api_token')))
     return jsonify({'token': token, 'expires_in': 60})
 
 
@@ -355,7 +355,7 @@ def validate_ws_token_api():
     cluster_context = None
     if requested_cluster:
         try:
-            from pegaprox.utils.auth import load_users
+            from pegaprox.utils.auth import resolve_authz_user
             from pegaprox.utils.rbac import get_user_clusters, load_vm_acls, acl_grants_user
             from pegaprox.core.db import get_db
             # MK Aug 2026 — resolve the token's user by its indexed row, not a whole-table
@@ -365,10 +365,11 @@ def validate_ws_token_api():
             # dropping admin/all-access and 403-ing a valid node console ("No access to
             # cluster", intermittent). An unresolvable identity is a retryable auth failure
             # (401), not a cluster denial; a genuinely unauthorized user still resolves + 403s.
-            try:
-                user = get_db().get_user(data['user'])
-            except Exception:
-                user = load_users().get(data['user'])
+            #
+            # NS Oct 2026 (#1116) - and floored by the role of the API token behind the ws
+            # token, through the same helper the VNC handlers use, so the two cannot drift.
+            # The old local floor also missed the owner ceiling for a custom-role token.
+            user = resolve_authz_user(data)
             if not user:
                 return jsonify({'error': 'Invalid or expired token'}), 401
             # NS Aug 2026 (audit re-verify) — a ws_token minted while enabled must not keep opening a
@@ -377,14 +378,6 @@ def validate_ws_token_api():
             if not user.get('enabled', True):
                 logging.warning(f"[WS-TOKEN] user '{_sl(data['user'])}' is disabled")
                 return jsonify({'error': 'Account disabled'}), 401
-            # sec (audit): `user` is the OWNER's stored record, so every gate below read the
-            # owner's role. For an admin-owned but viewer-scoped API token that meant
-            # get_user_clusters returned None (= all clusters) and the node.shell check
-            # short-circuited on the admin bypass — a read-only CI token could open a root
-            # shell on any node. The token's own role is right here in `data`; floor by it.
-            # (check_cluster_access does the same inline from request.session; there is no
-            # session on this route, so the token role is the source.)
-            user = _floor_by_token_role(user, data.get('role'))
             allowed = get_user_clusters(user)
             access_ok = allowed is None or requested_cluster in allowed
             if not access_ok:

@@ -12,7 +12,7 @@ from pegaprox.globals import *
 from pegaprox.models.permissions import *
 from pegaprox.core.db import get_db
 
-from pegaprox.utils.auth import require_auth, load_users, build_authz_user
+from pegaprox.utils.auth import require_auth, load_users, build_authz_user, resolve_authz_user
 from pegaprox.utils.audit import log_audit
 # MK 2026-06-04 (CWE-117): mgr.name is from cluster-config (admin-controlled),
 # vmware_id from URL. Sanitise both before logging for consistency.
@@ -855,10 +855,14 @@ def get_vmware_console(vmware_id, vm_id):
         return jsonify({'error': 'VMware server not found'}), 404
 
     # Security fix: Check VM-level authorization
-    from pegaprox.utils.auth import load_users
     # #491 — token-scoped identity so an admin-owned viewer/user API token can't reach a VM
     # outside its token scope (user_can_access_vmware_vm honors effective_role).
-    user = build_authz_user(request.session.get('user', ''), request.session)
+    # NS Oct 2026 (#1101) - read by the account's own row. This route has no cluster gate of
+    # its own, so the {} a failed whole-table read answers (default tenant, every cluster)
+    # passed the tenant check in user_can_access_vmware_vm for any ESXi server.
+    user = resolve_authz_user(request.session)
+    if not user:
+        return jsonify({'error': 'Unauthorized', 'code': 'AUTH_REQUIRED'}), 401
 
     if not user_can_access_vmware_vm(user, vmware_id, vm_id, 'vmware.vm.view'):
         return jsonify({'error': 'Permission denied: You do not have access to this VM'}), 403

@@ -23,7 +23,8 @@ from pegaprox.globals import *
 from pegaprox.models.permissions import *
 from pegaprox.core.db import get_db
 
-from pegaprox.utils.auth import require_auth, load_users, validate_session, build_authz_user
+from pegaprox.utils.auth import (require_auth, load_users, validate_session, build_authz_user,
+                                 resolve_authz_user)
 from pegaprox.utils.audit import log_audit
 from pegaprox.utils.rbac import user_can_access_vm, get_user_permissions, get_user_clusters
 
@@ -4397,7 +4398,11 @@ def get_console_ticket(cluster_id, node, vm_type, vmid):
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
 
-    user = build_authz_user(request.session.get('user', ''), request.session)
+    # NS Oct 2026 (#1101) - every console reads its caller by the account's own row:
+    # the whole-table read behind build_authz_user answers {} when it fails
+    user = resolve_authz_user(request.session)
+    if not user:
+        return jsonify({'error': 'Unauthorized', 'code': 'AUTH_REQUIRED'}), 401
 
     mgr = cluster_managers[cluster_id]
     console_perm = 'xapi.vm.view' if getattr(mgr, 'cluster_type', 'proxmox') == 'xcpng' else 'vm.console'
@@ -4466,7 +4471,9 @@ def get_spice_console(cluster_id, node, vm_type, vmid):
     if vm_type != 'qemu':
         return jsonify({'error': 'SPICE is only available for QEMU VMs'}), 400
 
-    user = build_authz_user(request.session.get('user', ''), request.session)
+    user = resolve_authz_user(request.session)
+    if not user:
+        return jsonify({'error': 'Unauthorized', 'code': 'AUTH_REQUIRED'}), 401
     mgr = cluster_managers[cluster_id]
     if not user_can_access_vm(user, cluster_id, vmid, 'vm.console', vm_type):
         return jsonify({'error': 'Permission denied: vm.console'}), 403
@@ -4671,7 +4678,9 @@ def get_vm_screenshot(cluster_id, node, vm_type, vmid):
         # LXC consoles are a terminal, not a framebuffer — nothing to screenshot
         return jsonify({'error': 'screenshot only available for qemu'}), 400
 
-    user = build_authz_user(request.session.get('user', ''), request.session)
+    user = resolve_authz_user(request.session)
+    if not user:
+        return jsonify({'error': 'Unauthorized', 'code': 'AUTH_REQUIRED'}), 401
     mgr = cluster_managers[cluster_id]
     if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
         return jsonify({'error': 'screenshot only available on proxmox'}), 400
@@ -4741,7 +4750,9 @@ def vnc_poll(cluster_id, node, vm_type, vmid):
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
 
-    user = build_authz_user(request.session.get('user', ''), request.session)
+    user = resolve_authz_user(request.session)
+    if not user:
+        return jsonify({'error': 'Unauthorized', 'code': 'AUTH_REQUIRED'}), 401
     mgr = cluster_managers[cluster_id]
     console_perm = 'xapi.vm.view' if getattr(mgr, 'cluster_type', 'proxmox') == 'xcpng' else 'vm.console'
     if not user_can_access_vm(user, cluster_id, vmid, console_perm, vm_type):
@@ -5368,14 +5379,18 @@ def get_vm_guest_fsinfo_api(cluster_id, node, vm_type, vmid):
 # PVE 9.2 added optional `count`, `offset`, `decode` (base64) params so you
 # can stream large files in chunks without dragging the whole thing through
 # memory. We pass them through; older PVE silently ignores extras.
+# NS Oct 2026 (#1059) - the agent reads ANY file in the guest as root (/etc/shadow, keys),
+# so this is not a viewer's right. PVE 8 asks VM.Monitor (PVEVMAdmin), PVE 9
+# VM.GuestAgent.FileRead (PVEVMUser and up), no auditor role has either. vm.config is
+# the match here: user, tenant_admin and tenant_operator hold it, the viewer roles do not.
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/guest-file-read', methods=['POST'])
-@require_auth(perms=['vm.view'])
+@require_auth(perms=['vm.config'])
 def get_vm_guest_file_read_api(cluster_id, node, vm_type, vmid):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
-    denied = _require_vm_access(cluster_id, vmid, 'vm.view', vm_type)
+    denied = _require_vm_access(cluster_id, vmid, 'vm.config', vm_type)
     if denied: return denied
     if vm_type != 'qemu':
         return jsonify({'error': 'Guest-agent file-read is QEMU-only'}), 400
@@ -9599,7 +9614,8 @@ def _console_authz(user, cluster_id, vmid, vm_type=None):
     # pre-minted ws_token (this path is reached without require_auth's account-state gate).
     if not user.get('enabled', True):
         return False, 'account disabled'
-    if user.get('role') == ROLE_ADMIN:
+    # NS Oct 2026 (#1116) - the role an API token acts under, not its owner's
+    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
         return True, None
     username = user.get('username', '') or ''
     # cluster gate (mirrors helpers.check_cluster_access, but no request.session)
@@ -9848,31 +9864,25 @@ def vnc_websocket_route(cluster_id, node, vm_type, vmid):
     ws_token = request.args.get('token')
     session_id = request.args.get('session')
 
-    auth_user = None
-    auth_role = None
     if ws_token:
-        token_data = validate_ws_token(ws_token)
-        if not token_data:
+        auth = validate_ws_token(ws_token)
+        if not auth:
             return jsonify({'error': 'Invalid token', 'code': 'INVALID_TOKEN'}), 401
-        auth_user = token_data['user']
-        auth_role = token_data['role']
     elif session_id:
-        session = validate_session(session_id)
-        if not session:
+        auth = validate_session(session_id)
+        if not auth:
             return jsonify({'error': 'Invalid session', 'code': 'INVALID_SESSION'}), 401
-        auth_user = session['user']
-        auth_role = session['role']
     else:
         return jsonify({'error': 'Auth required', 'code': 'AUTH_REQUIRED'}), 401
 
-    # Check permissions
-    users = load_users()
-    user = users.get(auth_user, {})
-    user_perms = get_user_permissions(user)
     # MK 2026-06-10 (#537/RBAC): coarse "global vm.console perm OR admin" pre-check dropped —
     # the per-VM _console_authz gate below is authoritative and portal/custom-role aware.
+    # NS Oct 2026 (#1101, #1116) - the account by its own row, refused when unreadable,
+    # and held to the role of the API token that minted the ws token
+    user = resolve_authz_user(auth)
+    if not user:
+        return jsonify({'error': 'Auth required', 'code': 'AUTH_REQUIRED'}), 401
     # H-1/H-2: cluster + per-VM gate (vm.console alone isn't enough)
-    user['username'] = auth_user
     _ok, _why = _console_authz(user, cluster_id, vmid, vm_type)
     if not _ok:
         return jsonify({'error': 'Permission denied', 'code': 'INSUFFICIENT_PERMISSIONS'}), 403
@@ -9988,10 +9998,8 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                 print("ERROR: Invalid or expired WS token")
                 await websocket.close(1002, "Invalid token")
                 return
-            # check perms from token
-            users = load_users()
-            user = users.get(token_data['user'], {})
-            user['username'] = token_data['user']
+            # check perms from token - as the token's role, from the account's own row (#1116, #1101)
+            user = resolve_authz_user(token_data)
             # MK 2026-06-10 (#537 abyss1): the per-VM _console_authz gate below (H-1/H-2) is the
             # authoritative check (cluster + per-VM vm.console via user_can_access_vm). The old
             # coarse "global vm.console perm OR admin" pre-check here rejected Client-Portal users
@@ -10004,16 +10012,18 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                 print("ERROR: Invalid session")
                 await websocket.close(1002, "Invalid session")
                 return
-            users = load_users()
-            user = users.get(session['user'], {})
-            user['username'] = session['user']
+            user = resolve_authz_user(session)
             # #537: per-VM _console_authz below is the authoritative gate (see ws_token note).
             print(f"User {session['user']} authenticated for VNC (session)")
         else:
             print("ERROR: No token or session provided")
             await websocket.close(1002, "Authentication required")
             return
-        
+        if not user:
+            print("ERROR: account could not be read, no console")
+            await websocket.close(1002, "Authentication required")
+            return
+
         # Parse path: /api/clusters/{cluster_id}/vms/{node}/{vm_type}/{vmid}/vncwebsocket
         import re
         match = re.match(r'/api/clusters/([^/]+)/vms/([^/]+)/(qemu|lxc)/(\d+)/vncwebsocket', parsed.path)
@@ -10635,38 +10645,33 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
     ws_token = request.args.get('token')
     session_id = request.args.get('session')
 
-    auth_user = None
     if ws_token:
-        token_data = validate_ws_token(ws_token)
-        if not token_data:
+        auth = validate_ws_token(ws_token)
+        if not auth:
             try: ws.send('Invalid or expired token')
             except: pass
             return
-        users = load_users()
-        user = users.get(token_data['user'], {})
-        user_perms = get_user_permissions(user)
         # #537/RBAC: coarse "global vm.console OR admin" pre-check dropped — _console_authz below is authoritative.
-        auth_user = token_data['user']
     elif session_id:
-        session = validate_session(session_id)
-        if not session:
+        auth = validate_session(session_id)
+        if not auth:
             try: ws.send('Invalid session')
             except: pass
             return
-        users = load_users()
-        user = users.get(session['user'], {})
-        user_perms = get_user_permissions(user)
-        # #537/RBAC: coarse pre-check dropped — _console_authz below is authoritative.
-        auth_user = session['user']
     else:
         try: ws.send('Authentication required')
         except: pass
         return
 
-    print(f"User {auth_user} authenticated for VNC")
+    # #1101, #1116 - see vnc_websocket_route
+    user = resolve_authz_user(auth)
+    if not user:
+        try: ws.send('Authentication required')
+        except: pass
+        return
+    print(f"User {user['username']} authenticated for VNC")
 
     # H-1/H-2: cluster + per-VM gate before this proxy self-mints a PVE ticket
-    user['username'] = auth_user
     _ok, _why = _console_authz(user, cluster_id, vmid, vm_type)
     if not _ok:
         try: ws.send('Permission denied')
@@ -10927,12 +10932,12 @@ def get_termproxy_ticket_api(cluster_id, node, vm_type, vmid):
     if vm_type not in ('qemu', 'lxc'):
         return jsonify({'error': 'Unsupported vm_type'}), 400
 
-    # H-1/H-2: per-VM gate (cluster access alone isn't enough for a console)
-    from flask import g as _g
-    _u = getattr(_g, 'current_user', None)
-    if _u is None:
-        _u = get_db().get_user(request.session.get('user', '')) or {}
-    _u = dict(_u); _u['username'] = request.session.get('user', '')
+    # H-1/H-2: per-VM gate (cluster access alone isn't enough for a console). Not on
+    # g.current_user: that is the token OWNER's record, an admin's for an admin-owned
+    # viewer token (#1116)
+    _u = resolve_authz_user(request.session)
+    if not _u:
+        return jsonify({'error': 'Unauthorized', 'code': 'AUTH_REQUIRED'}), 401
     _ok2, _why2 = _console_authz(_u, cluster_id, vmid, vm_type)
     if not _ok2:
         return jsonify({'error': 'Permission denied: no access to this VM'}), 403
@@ -11908,8 +11913,15 @@ def node_shell_websocket_proxy(ws, cluster_id, node):
         return
 
     # Check permissions - require node.shell or admin role
-    users = load_users()
-    user = users.get(session['user'], {})
+    # NS Oct 2026 (#1101) - by the account's own row; one we cannot read opens nothing
+    user = resolve_authz_user(session)
+    if not user or not user.get('enabled', True):
+        logging.error(f"SHELL WS: account {session['user']} could not be read or is disabled")
+        try:
+            ws.send('{"status":"error","message":"Invalid session"}')
+        except:
+            pass
+        return
     user_perms = get_user_permissions(user)
     # MK 2026-06-10 (RBAC): gate on the node.shell perm only — admin holds it via
     # all-perms so the explicit admin bypass was redundant; a custom role with node.shell now works.
@@ -11934,8 +11946,7 @@ def node_shell_websocket_proxy(ws, cluster_id, node):
     # confined to single VMs or a pool here (a portal user, say): no node shell, the same
     # rule as /api/internal/cluster-creds
     from pegaprox.api.helpers import caller_is_scoped
-    from pegaprox.utils.auth import build_authz_user
-    if caller_is_scoped(build_authz_user(session['user'], session), cluster_id):
+    if caller_is_scoped(user, cluster_id):
         logging.error(f"SHELL WS: User {session['user']} is confined on cluster {cluster_id}")
         try:
             ws.send('{"status":"error","message":"Access denied: this action affects the whole cluster"}')

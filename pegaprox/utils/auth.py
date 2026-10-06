@@ -406,6 +406,38 @@ def build_authz_user(username: str, session: dict) -> dict:
     return user
 
 
+def resolve_authz_user(auth: dict):
+    """The identity a console, shell or terminal is opened for, or None.
+
+    `auth` is a session or the ws token minted from one: the user, the role it was
+    issued with and whether an API token stood behind it.
+
+    NS Oct 2026 (#1101) - read by the account's own row. The console handlers used
+    load_users().get(name, {}), and that whole-table read comes back as {} when it
+    fails; {} is a role-less viewer in the default tenant, whose empty cluster list
+    means every cluster. An account we cannot read is a refusal, never a default.
+
+    (#1116) - an API token acts under its own role, floored to the owner's, exactly as
+    build_authz_user does for the REST routes. A ws token whose role is not the one
+    stored on the account is floored the same way, so a role change inside its 60 s
+    life cannot widen it either."""
+    username = (auth or {}).get('user') or ''
+    if not username:
+        return None
+    try:
+        stored = get_db().get_user(username)
+    except Exception as e:
+        logging.warning(f"[AUTHZ] could not read account {username!r}: {type(e).__name__}")
+        return None
+    if not stored:
+        return None
+    user = dict(stored, username=username)
+    role = auth.get('role')
+    if auth.get('api_token') or (role and role != stored.get('role')):
+        user = apply_token_role(user, role)
+    return user
+
+
 # Answers of initialization_state(). "unknown" is the one that matters: it is
 # what every caller used to see as "uninitialised" and act on.
 INIT_INITIALIZED = 'initialized'
