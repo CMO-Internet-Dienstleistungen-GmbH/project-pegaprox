@@ -24,7 +24,7 @@ from flask import request, jsonify
 from typing import List, Optional
 
 from pegaprox.constants import (
-    SESSION_TIMEOUT, CONFIG_DIR, USERS_FILE_ENCRYPTED,
+    SESSION_TIMEOUT, CONFIG_DIR,
     SESSIONS_FILE, SESSIONS_FILE_ENCRYPTED, ADMIN_INITIALIZED_FILE, SETUP_REOPEN_FILE,
     LOGIN_MAX_ATTEMPTS, LOGIN_LOCKOUT_TIME, LOGIN_ATTEMPT_WINDOW,
 )
@@ -336,8 +336,11 @@ def load_users(readonly: bool = False) -> dict:
                     logging.error(f"User {username} has invalid data type: {type(userdata)}")
             return users
     except Exception as e:
+        # NS Oct 2026 (#1053) - this fell back to users.enc, a copy frozen at the SQLite
+        # import: a DB that stopped answering signed people in with the old passwords and
+        # roles, and accounts deleted since. An unreadable store has nobody to sign in.
         logging.error(f"db load failed: {e}")
-        return _load_users_legacy()  # fallback to old format
+        return {}
 
     # no users in db — uninitialised install, or admin deleted on purpose.
     # the previous code auto-bootstrapped pegaprox/admin here; that path is
@@ -523,24 +526,6 @@ def backfill_initialized_marker():
             logging.info("backfilled ADMIN_INITIALIZED_FILE for pre-setup-wizard install")
     except Exception as e:
         logging.debug(f"backfill check skipped: {e}")
-
-
-def _load_users_legacy() -> dict:
-    """old json loader, just for migration"""
-    fernet = get_fernet()
-    
-    if fernet and os.path.exists(USERS_FILE_ENCRYPTED):
-        try:
-            with open(USERS_FILE_ENCRYPTED, 'rb') as f:
-                encrypted_data = f.read()
-            decrypted_data = fernet.decrypt(encrypted_data)
-            users = json.loads(decrypted_data.decode('utf-8'))
-            logging.info(f"loaded {len(users)} users from legacy file")
-            return users
-        except Exception as e:
-            logging.error(f"legacy load failed: {e}")
-    
-    return {}
 
 
 def save_single_user(username: str, data: dict):

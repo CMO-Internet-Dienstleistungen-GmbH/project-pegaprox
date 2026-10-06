@@ -11571,11 +11571,15 @@ async def ssh_handler(websocket):
         _ssh_kh = os.path.abspath(os.path.join('config', '.ssh_known_hosts'))
         print("[SSH-WS] WARNING: PEGAPROX_SSH_KNOWN_HOSTS not set; falling back to "
               + _ssh_kh + " — host-key pinning may not match the main app")
+    kh_unreadable = False
     try:
         if os.path.exists(_ssh_kh):
             ssh.load_host_keys(_ssh_kh)
-    except Exception:
-        pass
+    except Exception as _kh_err:
+        # NS Oct 2026 - as in utils/ssh_security.py: the pins behind a damaged line read as
+        # unknown hosts, so no first use while the file cannot be read, and no save over it
+        print("[SSH-WS] known_hosts unreadable (" + str(_kh_err) + ") - refusing new host keys")
+        kh_unreadable = True
     class _TofuPolicy(paramiko.MissingHostKeyPolicy):
         def missing_host_key(self, _c, _h, _k):
             if known_only:
@@ -11586,6 +11590,11 @@ async def ssh_handler(websocket):
                     "leader once. This standby only has the keys the leader pinned; if the "
                     f"leader reaches this node at another address than {_h}, its key is "
                     "pinned under that one")
+            if kh_unreadable:
+                raise paramiko.SSHException(
+                    f"config/.ssh_known_hosts could not be read, so the host key of {_h} "
+                    "cannot be checked against its pin - refusing to trust it on first use. "
+                    "Repair or remove the damaged line (see the log) and connect again")
             if os.environ.get('PEGAPROX_SSH_STRICT_HOST_KEYS', '').strip().lower() in ('1', 'true', 'yes', 'on'):
                 raise paramiko.SSHException("strict host-key checking: unknown SSH host key for " + str(_h))
             try:
@@ -11594,11 +11603,25 @@ async def ssh_handler(websocket):
                 pass
     ssh.set_missing_host_key_policy(_TofuPolicy())
     def _persist_ssh_hostkeys():
-        if known_only:
+        if known_only or kh_unreadable:
             return
+        # NS Oct 2026 - save_host_keys() wrote the set loaded before connect over the file,
+        # erasing any pin the main app or another shell recorded meanwhile (#1025). Merge
+        # into what is on disk now and let the disk win, as persist_host_keys() does.
         try:
             with _KH_WRITE_LOCK:
-                ssh.save_host_keys(_ssh_kh)
+                merged = paramiko.hostkeys.HostKeys()
+                if os.path.exists(_ssh_kh):
+                    merged.load(_ssh_kh)
+                added = 0
+                for _hn, _keys in ssh.get_host_keys().items():
+                    _on_disk = merged.lookup(_hn)
+                    for _kt, _key in _keys.items():
+                        if _on_disk is None or _kt not in _on_disk:
+                            merged.add(_hn, _kt, _key)
+                            added += 1
+                if added:
+                    merged.save(_ssh_kh)
         except Exception:
             pass
 
@@ -12537,6 +12560,12 @@ def delete_vm_api(cluster_id, node, vm_type, vmid):
             logging.error(f"{vm_type.upper()} {vmid} deleted but its VM ACL was NOT removed: {e} "
                           f"- remove the stale vm_acls row by hand, a recycled VMID would "
                           f"inherit the grant")
+            # NS Oct 2026 - and in the audit trail, where an admin looks, as the portal's
+            # teardown does: delete_vm_acl raises now instead of answering "no grant"
+            log_audit(usr, 'vm.acl_cleanup_failed',
+                      f"{vm_type.upper()} {vmid} deleted but its VM ACL is still there - remove it "
+                      f"by hand, the next guest on this VMID would inherit it",
+                      cluster=manager.config.name)
         log_audit(usr, 'vm.deleted', f"{vm_type.upper()} {vmid} deleted from {node}" + (" (purged)" if purge else ""), cluster=manager.config.name)
         broadcast_action('delete', vm_type, str(vmid), {'node': node, 'purge': purge}, cluster_id, usr)
         

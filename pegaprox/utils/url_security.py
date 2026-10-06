@@ -72,7 +72,9 @@ def _embedded_ipv4(ip: ipaddress._BaseAddress):
     # NAT64 well-known prefix 64:ff9b::/96 (RFC 6052) — embedded IPv4 in the last 4 bytes.
     if packed[0:12] == b'\x00\x64\xff\x9b' + b'\x00' * 8:
         return ipaddress.IPv4Address(packed[12:16])
-    # NAT64 local-use prefix 64:ff9b:1::/48 (RFC 8215) — embedded IPv4 in the last 4 bytes.
+    # NAT64 local-use prefix 64:ff9b:1::/48 (RFC 8215) - this is the /96 reading only. The
+    # operator may use another prefix length in that block, so _is_private_or_special and
+    # _is_loopback judge it before they get here (see _nat64_local_use_readings).
     if packed[0:6] == b'\x00\x64\xff\x9b\x00\x01':
         return ipaddress.IPv4Address(packed[12:16])
     # Teredo 2001:0000::/32 (RFC 4380) — client IPv4 is the last 4 bytes, bitwise-inverted.
@@ -88,8 +90,30 @@ def _embedded_ipv4(ip: ipaddress._BaseAddress):
     return None
 
 
+_NAT64_LOCAL_USE = ipaddress.IPv6Network('64:ff9b:1::/48')
+
+
+def _in_nat64_local_use(ip) -> bool:
+    return isinstance(ip, ipaddress.IPv6Address) and ip in _NAT64_LOCAL_USE
+
+
+def _nat64_local_use_readings(ip: ipaddress.IPv6Address):
+    """The IPv4 address an address in 64:ff9b:1::/48 carries under each prefix length
+    RFC 6052 allows there: /48, /56 and /64 (byte 8, the u octet, sits in the way) and /96.
+    Which one a translator uses is the operator's choice, the address does not say."""
+    p = ip.packed
+    return [ipaddress.IPv4Address(b) for b in (
+        p[6:8] + p[9:11], p[7:8] + p[9:12], p[9:13], p[12:16])]
+
+
 def _is_private_or_special(ip: ipaddress._BaseAddress) -> bool:
     """True if the IP falls in a range we should never reach over the public path."""
+    # NS Oct 2026 - the local-use NAT64 block is site-internal by definition (RFC 8215,
+    # the stdlib calls it private too). Reading its last four bytes assumed the /96
+    # layout: 64:ff9b:1:a9fe:a9:fe00:808:808 carries 169.254.169.254 under /48 and
+    # passed as 8.8.8.8. Whatever the layout, it is no public destination.
+    if _in_nat64_local_use(ip):
+        return True
     # GHSA-ffhp-cpm8-4mpv — if this is an IPv6 transition address wrapping an IPv4
     # address, the real destination is that inner v4; classify it instead of trusting
     # the outer v6's stdlib flags (which miss embedded private/metadata targets on
@@ -114,6 +138,11 @@ def _is_loopback(ip: ipaddress._BaseAddress) -> bool:
     it first would hand back 0.0.0.1 and lose the loopback that was staring at us."""
     if ip.is_loopback or ip.is_unspecified:
         return True
+    if _in_nat64_local_use(ip):
+        # NS Oct 2026 - every layout, not only the /96 one (see _is_private_or_special). A
+        # zero run reads as 0.0.0.0 under the other layouts, so those count 127/8 only.
+        readings = _nat64_local_use_readings(ip)
+        return _is_loopback(readings[-1]) or any(r.is_loopback for r in readings[:-1])
     embedded = _embedded_ipv4(ip)
     if embedded is not None:
         return _is_loopback(embedded)

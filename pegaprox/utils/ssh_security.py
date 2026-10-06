@@ -83,6 +83,22 @@ def _not_known_here(address):
             "that one")
 
 
+def _unreadable_refusal(address):
+    # NS Oct 2026 - paramiko's load() raises on a truncated entry and drops every line after
+    # it, so the pins behind it read as unknown hosts. Trusting those on first use is the
+    # MitM window the pins close. The reason is logged; the message stays generic.
+    return (f"config/.ssh_known_hosts could not be read, so the host key of {address} cannot "
+            "be checked against its pin - refusing to trust it on first use. Repair or remove "
+            "the damaged line (see the log) and connect again")
+
+
+def _unpinned_type_refusal(paramiko, hostname, keytype):
+    return paramiko.SSHException(
+        f"host {hostname} is known but presented an unpinned key type "
+        f"({keytype}) - refusing (possible downgrade/MitM). Remove its "
+        "config/.ssh_known_hosts entry to re-pin.")
+
+
 def cli_hostkey_opts():
     """Host-key options for subprocess ``ssh``/``scp``/``sshfs`` commands.
 
@@ -98,7 +114,7 @@ def cli_hostkey_opts():
     return hkc, _KNOWN_HOSTS
 
 
-def _make_policy(paramiko):
+def _make_policy(paramiko, unreadable=False):
     strict = strict_host_keys_enabled()
 
     class _TofuHostKeyPolicy(paramiko.MissingHostKeyPolicy):
@@ -113,6 +129,8 @@ def _make_policy(paramiko):
                 pass
             if not pins_host_keys_here():
                 raise paramiko.SSHException(_not_known_here(hostname))
+            if unreadable:
+                raise paramiko.SSHException(_unreadable_refusal(hostname))
             if strict:
                 raise paramiko.SSHException(
                     "strict host-key checking: unknown SSH host key for "
@@ -138,12 +156,16 @@ def apply_host_key_policy(client, paramiko):
 
     Use in place of ``client.set_missing_host_key_policy(paramiko.AutoAddPolicy())``.
     """
+    unreadable = False
     try:
         if os.path.exists(_KNOWN_HOSTS):
             client.load_host_keys(_KNOWN_HOSTS)
-    except Exception:
-        pass
-    client.set_missing_host_key_policy(_make_policy(paramiko))
+    except Exception as e:
+        # NS Oct 2026 - the keys loaded before the error still verify; a host that is
+        # missing now may be one whose pin sat behind it, so no first use this round
+        _log.warning("known_hosts unreadable (%s) - refusing new host keys until it is repaired", e)
+        unreadable = True
+    client.set_missing_host_key_policy(_make_policy(paramiko, unreadable))
     return client
 
 
@@ -278,6 +300,7 @@ def verify_transport_host_key(transport, hostname, paramiko, port=22):
     * known host, key changed  -> raise BadHostKeyException (MitM protection)
     * unknown host, strict off -> record (TOFU) + persist
     * unknown host, strict on or on a standby -> raise SSHException
+    * unknown host, known_hosts unreadable    -> raise SSHException
     """
     try:
         key = transport.get_remote_server_key()
@@ -299,11 +322,12 @@ def verify_transport_host_key(transport, hostname, paramiko, port=22):
         _port = 22
     lookup_name = hostname if _port == 22 else '[%s]:%d' % (hostname, _port)
     hostkeys = paramiko.hostkeys.HostKeys()
+    unreadable = None
     try:
         if os.path.exists(_KNOWN_HOSTS):
             hostkeys.load(_KNOWN_HOSTS)
-    except Exception:
-        pass
+    except Exception as e:
+        unreadable = e
     entry = hostkeys.lookup(lookup_name)
     if entry is not None:
         # host is already known — the offered key MUST match one of its pinned keys.
@@ -315,13 +339,13 @@ def verify_transport_host_key(transport, hostname, paramiko, port=22):
         # trust-on-first-use a new key type for an already-known host — an on-path
         # attacker who holds a key of a different type could otherwise downgrade
         # around the pinned key. Reject; an admin can drop the stale entry to re-pin.
-        raise paramiko.SSHException(
-            f"host {hostname} is known but presented an unpinned key type "
-            f"({keytype}) — refusing (possible downgrade/MitM). Remove its "
-            "config/.ssh_known_hosts entry to re-pin.")
+        raise _unpinned_type_refusal(paramiko, hostname, keytype)
     # genuinely unknown host — first time we see it at all
     if not pins_host_keys_here():
         raise paramiko.SSHException(_not_known_here(lookup_name))
+    if unreadable is not None:
+        _log.warning("known_hosts unreadable (%s) - not trusting %s on first use", unreadable, lookup_name)
+        raise paramiko.SSHException(_unreadable_refusal(lookup_name))
     if strict_host_keys_enabled():
         raise paramiko.SSHException(
             "strict host-key checking: unknown SSH host key for "
@@ -332,6 +356,7 @@ def verify_transport_host_key(transport, hostname, paramiko, port=22):
     # back on the TOFU path, which is the MitM window this function exists to close.
     # persist_host_keys() already does it the right way; do the same here: re-read inside
     # the lock, add only the key we just verified, save that.
+    refusal, recorded = None, False
     try:
         with _persist_lock:
             fresh = paramiko.hostkeys.HostKeys()
@@ -341,16 +366,32 @@ def verify_transport_host_key(transport, hostname, paramiko, port=22):
             except Exception as _le:
                 # Same call persist_host_keys makes, and for the same reason: if the file
                 # cannot be read we cannot merge into it, and writing anyway would replace
-                # pins we never saw. Skip the write; the host stays unpinned and the next
-                # connect tries again.
+                # pins we never saw. Skip the write, and (NS Oct 2026) refuse: we cannot
+                # see whether somebody pinned this host since the lookup above.
                 _log.warning("known_hosts unreadable (%s) - not pinning %s this round",
                              _le, hostname)
+                refusal = paramiko.SSHException(_unreadable_refusal(lookup_name))
                 raise
-            fresh.add(lookup_name, keytype, key)
-            fresh.save(_KNOWN_HOSTS)
+            # NS Oct 2026 (#1025) - another first-use connection may have pinned this host
+            # since the lookup above, and add() used to replace that pin with our key, so a
+            # racing on-path key could swap itself in. The pin on disk wins: the same key needs no
+            # write, another key or key type is refused like any pinned host. Decided in
+            # here, raised below, outside the best-effort except.
+            pinned = fresh.lookup(lookup_name)
+            if pinned is None:
+                fresh.add(lookup_name, keytype, key)
+                fresh.save(_KNOWN_HOSTS)
+                recorded = True
+            elif keytype not in pinned:
+                refusal = _unpinned_type_refusal(paramiko, hostname, keytype)
+            elif pinned[keytype] != key:
+                refusal = paramiko.BadHostKeyException(hostname, key, pinned[keytype])
     except Exception:
         pass
-    try:
-        _log.info("TOFU: recorded new SSH host key for %s (%s) via transport", hostname, keytype)
-    except Exception:
-        pass
+    if refusal is not None:
+        raise refusal
+    if recorded:
+        try:
+            _log.info("TOFU: recorded new SSH host key for %s (%s) via transport", hostname, keytype)
+        except Exception:
+            pass

@@ -962,8 +962,8 @@ def _fake_paramiko(known):
             if not known:
                 self._policy.missing_host_key(self, host, types.SimpleNamespace(get_name=lambda: 'ssh-ed25519'))
 
-        def save_host_keys(self, path):
-            fake.saved.append(path)
+        def get_host_keys(self):
+            return self._host_keys
 
         def invoke_shell(self, **kw):
             raise SSHException('no shell in this test')
@@ -971,6 +971,18 @@ def _fake_paramiko(known):
         def close(self):
             pass
 
+    class _OnDisk(_HostKeys):
+        # the script merges into the file instead of saving the client's set (NS Oct 2026)
+        def load(self, path):
+            pass
+
+        def lookup(self, host):
+            return self.get(host)
+
+        def save(self, path):
+            fake.saved.append(path)
+
+    fake.hostkeys = types.SimpleNamespace(HostKeys=_OnDisk)
     fake.SSHException = SSHException
     fake.AuthenticationException = type('AuthenticationException', (SSHException,), {})
     fake.MissingHostKeyPolicy = object

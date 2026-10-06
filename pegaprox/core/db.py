@@ -2429,6 +2429,9 @@ class PegaProxDB:
         
         if cluster_count > 0 and not needs_user_remigration:
             logging.info("Database already has data, skipping legacy migration")
+            cursor.execute("SELECT COUNT(*) FROM users")
+            if cursor.fetchone()[0]:
+                self._retire_legacy_users_file()
             return
         
         # Migrate clusters (only if no clusters exist)
@@ -2468,6 +2471,7 @@ class PegaProxDB:
                     self.conn.commit()
                     migrated_any = True
                     logging.info("Re-migrated users from the legacy store")
+                    self._retire_legacy_users_file()
                 else:
                     self.conn.rollback()
                     logging.error("Re-migration wrote no users - kept the existing accounts")
@@ -2478,7 +2482,11 @@ class PegaProxDB:
             if self._migrate_users():
                 self.conn.commit()
                 migrated_any = True
-        
+                self._retire_legacy_users_file()
+        else:
+            # the table already holds the accounts: the file is a stale copy
+            self._retire_legacy_users_file()
+
         # Migrate sessions
         if self._migrate_sessions():
             migrated_any = True
@@ -2626,6 +2634,21 @@ class PegaProxDB:
         except Exception as e:
             logging.error(f"Failed to load users: {e}")
             return None
+
+    def _retire_legacy_users_file(self):
+        """NS Oct 2026 (#1053) - users.enc was never retired after the import. Once the users
+        table holds the accounts it is a stale copy, and the salt-repair re-migration above
+        would bring its old passwords, roles and deleted accounts back over the live ones.
+        Moved aside, so it stays as a backup that nothing reads."""
+        if not os.path.exists(USERS_FILE_ENCRYPTED):
+            return
+        retired = USERS_FILE_ENCRYPTED + '.migrated'
+        try:
+            os.replace(USERS_FILE_ENCRYPTED, retired)
+            logging.info(f"Legacy user file moved to {retired}, the database holds the accounts")
+        except OSError as e:
+            logging.warning(f"Could not move the legacy user file aside ({e}) - "
+                            f"remove {USERS_FILE_ENCRYPTED} by hand")
 
     def _migrate_users(self) -> bool:
         """Migrate users from encrypted file"""
@@ -4459,16 +4482,23 @@ class PegaProxDB:
         """Delete a VM ACL entry from the database
         
         NS: This was missing! save_all_vm_acls only adds/updates, never deletes.
+
+        NS Oct 2026 - a failed DELETE raises. It used to log and answer False, which reads
+        as "there was no grant": the VM delete route took that as done and the grant stayed
+        for the next guest on that VMID, and the ACL route answered success.
         """
+        cursor = self.conn.cursor()
         try:
-            cursor = self.conn.cursor()
             cursor.execute('DELETE FROM vm_acls WHERE cluster_id = ? AND vmid = ?',
                           (cluster_id, str(vmid)))
             self.conn.commit()
-            return cursor.rowcount > 0
-        except Exception as e:
-            logging.error(f"Failed to delete VM ACL: {e}")
-            return False
+        except Exception:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            raise
+        return cursor.rowcount > 0
     
     # ========================================
     # POOL PERMISSIONS - MK Jan 2026

@@ -82,6 +82,7 @@ def start_verification(pve_mgr, params):
     def run():
         start_time = time.time()
         test_vmid = None
+        restore_accepted = False
         host, port = pve_mgr.host, pve_mgr.api_port
         node = params.get('node', '')
         vm_type = params.get('vm_type', 'qemu')
@@ -129,6 +130,9 @@ def start_verification(pve_mgr, params):
 
             if restore_resp.status_code != 200:
                 raise Exception(f"Restore failed: {restore_resp.text[:200]}")
+            # PVE creates and locks the guest config before it answers, so from here on
+            # the VMID is ours to clean up
+            restore_accepted = True
 
             restore_upid = restore_resp.json().get('data')
             _log(f"Restore task started: {restore_upid}")
@@ -276,7 +280,12 @@ def start_verification(pve_mgr, params):
             _log(f"ERROR: {e}")
 
             # cleanup on error
-            if test_vmid:
+            # NS Oct 2026 (#1018) - nextid only names a free VMID, it does not reserve it.
+            # When another create took it first our restore was refused, and this purged
+            # that other guest. Only what our accepted restore created goes.
+            if test_vmid and not restore_accepted:
+                _log(f"Restore to VMID {test_vmid} was not accepted - a guest there is not ours, left alone")
+            elif test_vmid:
                 try:
                     pve_mgr._api_post(
                         f"https://{host}:{port}/api2/json/nodes/{node}/{vm_type}/{test_vmid}/status/stop"
