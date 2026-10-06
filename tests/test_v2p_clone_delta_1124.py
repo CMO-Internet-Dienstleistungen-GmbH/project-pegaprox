@@ -50,11 +50,14 @@ class FakeEsxi:
 
     `consolidation` is what removing a snapshot does: 'now', 'later' (the remove call times
     out and ESXi finishes a few polls afterwards), 'never' (times out and stays), or
-    'snapshot_only' (the snapshot goes, the disks stay on their delta)."""
+    'snapshot_only' (the snapshot goes, the disks stay on their delta). 'slow' and 'stuck'
+    keep a merge task running on the VM for `merge_secs` of clock time, or forever; like
+    ESXi, the VM then takes no other task, PowerOn included."""
 
-    def __init__(self, events, disks, power='POWERED_ON', consolidation='now', polls=3,
-                 clone_snap_fails=False, ignores_stop=False):
+    def __init__(self, events, disks, clock=None, power='POWERED_ON', consolidation='now', polls=3,
+                 merge_secs=0, clone_snap_fails=False, ignores_stop=False):
         self.events = events
+        self.clock = clock
         self.host = 'esx1.lab'
         self.power = power
         self.disks = disks
@@ -62,10 +65,17 @@ class FakeEsxi:
         self.snaps = []
         self.consolidation = consolidation
         self.polls = polls
+        self.merge_secs = merge_secs
         self.clone_snap_fails = clone_snap_fails
         self.ignores_stop = ignores_stop
         self._pending = None
+        self._merging = None  # (snapshot id, clock time the merge ends)
         self._n = 0
+
+    def _tick(self):
+        if self._merging and self.clock.now >= self._merging[1]:
+            self._fold(self._merging[0])
+            self._merging = None
 
     def consolidated(self):
         return not self.snaps and self.files == {d['key']: d['file'] for d in self.disks}
@@ -75,6 +85,7 @@ class FakeEsxi:
         self.files = {d['key']: d['file'] for d in self.disks}
 
     def get_vm_disks_for_export(self, vm_id):
+        self._tick()
         return {'data': {
             'vm_id': vm_id, 'name': 'app01', 'power_state': self.power,
             'cpu_count': 2, 'memory_mb': 2048, 'guest_os': 'Linux',
@@ -84,12 +95,14 @@ class FakeEsxi:
             'total_disk_gb': sum(d['capacity'] for d in self.disks) / GiB}}
 
     def get_vm(self, vm_id):
+        self._tick()
         return {'data': {'name': 'app01', 'power_state': self.power, 'guest_OS': 'Linux',
                          'hardware': {'firmware': 'bios', 'scsi_controller_pve': 'pvscsi',
                                       'disk_bus': 'scsi', 'nic_type_pve': 'vmxnet3'},
                          'controllers': {}, 'nics': []}}
 
     def get_snapshots(self, vm_id):
+        self._tick()
         if self._pending:
             sid, left = self._pending
             if left <= 0:
@@ -120,9 +133,16 @@ class FakeEsxi:
         return {'data': 'no migration snapshot found'}
 
     def delete_snapshot(self, vm_id, snapshot_id):
+        self._tick()
         self.events.append(('remove_snapshot', snapshot_id, self.power))
+        if self._merging:
+            return {'error': 'Another task is already in progress.'}
         if not any(s['snapshot'] == snapshot_id for s in self.snaps):
             return {'error': f'snapshot {snapshot_id} not found'}
+        if self.consolidation in ('slow', 'stuck'):
+            ends = self.clock.now + self.merge_secs if self.consolidation == 'slow' else float('inf')
+            self._merging = (snapshot_id, ends)
+            return {'error': 'remove timed out'}
         if self.consolidation == 'now':
             self._fold(snapshot_id)
             return {'data': 'deleted'}
@@ -135,7 +155,10 @@ class FakeEsxi:
         return {'error': 'remove timed out'}
 
     def vm_power_action(self, vm_id, action):
+        self._tick()
         self.events.append(('power', action))
+        if self._merging:
+            return {'error': 'Another task is already in progress.'}
         if action == 'stop' and self.power != 'POWERED_OFF':
             if not self.ignores_stop:
                 self.power = 'POWERED_OFF'
@@ -153,32 +176,48 @@ class FakeEsxi:
 
 
 class _Resp:
-    def __init__(self, data, status=200):
+    def __init__(self, data, status=200, text=''):
         self.status_code = status
         self._data = data
-        self.text = ''
+        self.text = text
 
     def json(self):
         return {'data': self._data}
 
 
 class FakePve:
+    """`start` is how Proxmox takes the target start: 'ok', 'http500' (refused, no task),
+    'task_error' (the start task fails), 'no_answer' (the request times out, nothing runs)
+    or 'dies' (the task ends OK, the VM is gone right after)."""
     host = 'pve1.lab'
     api_port = 8006
 
-    def __init__(self, events):
+    def __init__(self, events, start='ok'):
         self.events = events
+        self.start = start
+        self.running = False
 
     def _api_get(self, url, **kw):
         if url.endswith('/cluster/nextid'):
             return _Resp(VMID)
         if '/tasks/' in url:
+            if 'qmstart' in url and self.start == 'task_error':
+                return _Resp({'status': 'stopped', 'exitstatus': 'start failed: QEMU exited with code 1'})
             return _Resp({'status': 'stopped', 'exitstatus': 'OK'})
+        if url.endswith('/status/current'):
+            return _Resp({'status': 'running' if self.running else 'stopped'})
         return _Resp({})
 
     def _api_post(self, url, data=None, **kw):
         if url.endswith('/status/start'):
             self.events.append(('start_target',))
+            if self.start == 'http500':
+                return _Resp(None, 500, "can't lock file '/var/lock/qemu-server/lock-120.conf'")
+            if self.start == 'no_answer':
+                import requests
+                raise requests.exceptions.ReadTimeout('read timed out')
+            self.running = self.start == 'ok'
+            return _Resp(f'UPID:pve1:00005678:0000ABCD:qmstart:{VMID}:root@pam:')
         return _Resp('UPID:pve1:00001234:create')
 
 
@@ -220,10 +259,12 @@ def _esxi_shell(host, user, pw, cmd, timeout=30):
 
 
 class EsxiSsh:
-    """_ssh_esxi_exec: datastore space, descriptor contents and file sizes."""
+    """_ssh_esxi_exec: datastore space, descriptor contents and file sizes. `delta` is the
+    size of each disk's clone snapshot delta file, None when it cannot be found."""
 
-    def __init__(self, descriptors):
+    def __init__(self, descriptors, delta=256 * 1024 ** 2):
         self.descriptors = descriptors
+        self.delta = delta
         self.cmds = []
 
     def __call__(self, host, user, pw, cmd, timeout=30):
@@ -233,6 +274,8 @@ class EsxiSsh:
         if cmd.startswith('cat '):
             text = self.descriptors.get(shlex.split(cmd)[1])
             return (0, text, '') if text else (1, '', 'No such file or directory')
+        if cmd.startswith('stat ') and '-*.vmdk' in cmd:
+            return (0, f'{self.delta}\n4096\n', '') if self.delta is not None else (1, '', '')
         if cmd.startswith('stat '):
             return 0, f'{64 * GiB}\n', ''
         return 0, '', ''
@@ -267,17 +310,19 @@ def _descriptors(disks):
 
 class Run:
     def __init__(self, monkeypatch, disks=TWO_DISKS, descriptors=None, replay_ok=None,
-                 confirm=True, cancel=False, mode='vmkfstools_clone', **esxi_kw):
+                 confirm=True, cancel=False, mode='vmkfstools_clone', start='ok', start_after=True,
+                 remove_source=False, delta=256 * 1024 ** 2, **esxi_kw):
         self.events = []
-        self.esxi = FakeEsxi(self.events, disks, **esxi_kw)
-        self.pve = FakePve(self.events)
-        self.node = FakeNode(self.events)
-        self.ssh = EsxiSsh(descriptors if descriptors is not None else _descriptors(disks))
         self.clock = Clock()
+        self.esxi = FakeEsxi(self.events, disks, clock=self.clock, **esxi_kw)
+        self.pve = FakePve(self.events, start=start)
+        self.node = FakeNode(self.events)
+        self.ssh = EsxiSsh(descriptors if descriptors is not None else _descriptors(disks), delta=delta)
         self.replay_ok = replay_ok or {}
         self.copied = set()
         config = {'esxi_password': 'pw', 'esxi_host': 'esx1.lab', 'transfer_mode': mode,
-                  'wait_for_confirmation': confirm or cancel, 'start_after': True}
+                  'wait_for_confirmation': confirm or cancel, 'start_after': start_after,
+                  'remove_source': remove_source}
         self.task = v2p.V2PMigrationTask('m1124', 'vw1', 'vm-42', 'pve-cl', 'pve1', 'local-lvm',
                                          vm_name='app01', config=config)
 
@@ -394,17 +439,42 @@ def test_a_remove_that_times_out_is_waited_for_until_esxi_is_done(monkeypatch):
     assert r.idx(lambda e: e[0] == 'remove_snapshot')[0] < r.idx(lambda e: e[0] == 'replay')[0]
 
 
-def test_a_source_that_was_off_throughout_has_nothing_to_carry_over(monkeypatch):
-    r = Run(monkeypatch, power='POWERED_OFF', confirm=False).go()
+def test_a_source_that_was_off_throughout_is_still_folded_back_and_compared(monkeypatch):
+    """Off at the snapshot and off at the switchover does not mean nothing was written in
+    between. The compare costs the ESXi read only, the source serves nothing anyway."""
+    r = Run(monkeypatch, power='POWERED_OFF', confirm=True).go()
     assert r.task.status == 'completed', r.task.error
-    assert r.kinds('replay') == []
-    assert r.kinds('checksums') == []
     assert r.kinds('power') == [], 'a source that was off is never powered on or off'
-    # the snapshot of an idle VM still goes, after the start like before
-    start = r.idx(lambda e: e == ('start_target',))[0]
-    assert r.idx(lambda e: e[0] == 'remove_snapshot')[0] > start
+    # an off source serves nothing, so the confirmation hold does not open
+    assert r.kinds('hold') == []
+    assert any('already stopped' in line for line in r.task.log_lines)
+    remove = r.idx(lambda e: e[0] == 'remove_snapshot')[0]
+    rep = r.kinds('replay')
+    assert [e[1] for e in rep] == [0, 1]
+    assert remove < r.idx(lambda e: e[0] == 'replay')[0] < r.idx(lambda e: e == ('start_target',))[0]
+    assert all(e[6] == 'POWERED_OFF' and e[7] for e in rep), rep
+    # the target checksums were taken ahead, the replay only reads ESXi
+    assert all(e[5] == [f'{e[3]}#{b}' for b in range(e[4] // (256 * 1024 ** 2))] for e in rep)
     assert r.esxi.consolidated()
-    assert any('nothing changed since' in line for line in r.task.log_lines)
+
+
+def test_an_off_source_powered_on_and_off_during_the_copy_is_replayed(monkeypatch):
+    """What it wrote while it ran sits in the clone snapshot's delta. Deciding from two power
+    readings dropped it."""
+    r = Run(monkeypatch, power='POWERED_OFF', confirm=False)
+    real_clone = r._clone
+
+    def clone_with_a_power_cycle(*a, **k):
+        out = real_clone(*a, **k)
+        r.esxi.power = 'POWERED_ON'     # someone booted it mid-copy ...
+        r.esxi.power = 'POWERED_OFF'    # ... and shut it down again
+        return out
+    monkeypatch.setattr(v2p, '_esxi_vmkfstools_clone', clone_with_a_power_cycle)
+    r.go()
+    assert r.task.status == 'completed', r.task.error
+    rep = r.kinds('replay')
+    assert [e[1] for e in rep] == [0, 1]
+    assert all(e[7] for e in rep), 'read before the snapshot was folded back'
 
 
 def test_a_source_started_during_the_copy_is_replayed_anyway(monkeypatch):
@@ -419,8 +489,24 @@ def test_a_source_started_during_the_copy_is_replayed_anyway(monkeypatch):
     r.go()
     assert r.task.status == 'completed', r.task.error
     rep = r.kinds('replay')
-    assert len(rep) == 2 and all(e[5] is None for e in rep), 'no checksums were taken ahead'
+    assert len(rep) == 2 and all(e[5] for e in rep), 'the checksums taken ahead reach the replay'
     assert r.idx(lambda e: e == ('power', 'stop'))[0] < r.idx(lambda e: e[0] == 'replay')[0]
+
+
+def test_a_source_booted_during_the_copy_gets_the_hold(monkeypatch):
+    """The hold follows what the source does at the gate, not what it did at the snapshot."""
+    r = Run(monkeypatch, power='POWERED_OFF', confirm=True)
+    real_clone = r._clone
+
+    def clone_then_boot(*a, **k):
+        out = real_clone(*a, **k)
+        r.esxi.power = 'POWERED_ON'
+        return out
+    monkeypatch.setattr(v2p, '_esxi_vmkfstools_clone', clone_then_boot)
+    r.go()
+    assert r.task.status == 'completed', r.task.error
+    assert r.kinds('hold') == [('hold', 'POWERED_ON')]
+    assert r.idx(lambda e: e[0] == 'hold')[0] < r.idx(lambda e: e == ('power', 'stop'))[0]
 
 
 # --------------------------------------------------------------------------- rollback
@@ -465,6 +551,127 @@ def test_a_cancel_at_the_hold_leaves_the_source_untouched(monkeypatch):
     # the clones and the clone snapshot go, the running source is left as it was
     assert {e[1] for e in r.kinds('rm_clone')} == {f'_pegaprox_clone_{VMID}_0', f'_pegaprox_clone_{VMID}_1'}
     assert r.esxi.consolidated() and r.esxi.power == 'POWERED_ON'
+
+
+# --------------------------------------------------------------------------- a merge that takes long
+
+def test_a_merge_that_outlasts_its_deadline_still_gets_the_source_back(monkeypatch):
+    """The merge ran out of time but ESXi is still at it and takes no PowerOn until it is
+    done. One start right after gave up and left the source off for good."""
+    r = Run(monkeypatch, consolidation='slow', merge_secs=2400).go()
+    assert r.task.status == 'failed'
+    assert 'not consolidated within 600s' in r.task.error, r.task.error
+    assert 'powered back on' in r.task.error
+    assert r.esxi.power == 'POWERED_ON'
+    assert ('start_target',) not in r.events and r.kinds('replay') == []
+    assert len([e for e in r.kinds('power') if e[1] == 'start']) > 1, 'asked ESXi only once'
+    # it got the source back once the merge was over, not before
+    assert r.clock.now - 1000.0 >= 2400
+
+
+def test_the_merge_deadline_follows_the_measured_delta(monkeypatch):
+    """40 GiB of changes on slow storage take longer than the 10 minutes the old formula
+    gave a 3 GiB VM from its capacity."""
+    r = Run(monkeypatch, consolidation='slow', merge_secs=3000, delta=20 * GiB).go()
+    assert r.task.status == 'completed', r.task.error
+    assert len(r.kinds('replay')) == 2
+    assert any('40.0 GiB of changes' in line for line in r.task.log_lines), r.task.log_lines
+    # measured on the files the disks ran on, the clone snapshot's deltas
+    assert [c for c in r.ssh.cmds if '-*.vmdk' in c] == [
+        "stat -c '%s' /vmfs/volumes/ds1/app01/app01-000001-*.vmdk 2>/dev/null",
+        "stat -c '%s' /vmfs/volumes/ds2/app01-data/app01_1-000001-*.vmdk 2>/dev/null"]
+
+
+def test_an_unmeasured_delta_falls_back_to_the_disk_size(monkeypatch):
+    r = Run(monkeypatch, delta=None).go()
+    assert r.task.status == 'completed', r.task.error
+    assert any('could not be measured' in line for line in r.task.log_lines)
+
+
+def test_a_merge_that_never_ends_gives_up_in_bounded_time(monkeypatch):
+    r = Run(monkeypatch, consolidation='stuck').go()
+    assert r.task.status == 'failed'
+    assert 'did not come back up' in r.task.error, r.task.error
+    assert r.esxi.power == 'POWERED_OFF' and ('start_target',) not in r.events
+    # the 600s merge deadline, then up to an hour of asking ESXi, not forever
+    assert 3600 < r.clock.now - 1000.0 < 600 + 3600 + 300
+
+
+def test_an_idle_esxi_that_keeps_refusing_is_given_up_on_soon(monkeypatch):
+    """No merge running and the snapshot is gone: three refusals are an answer."""
+    r = Run(monkeypatch, replay_ok={0: False})
+    real_transfer, real_power = r._transfer, r.esxi.vm_power_action
+
+    def no_second_copy(pve_mgr, task, host, user, pw, ds, vm_dir, desc, i):
+        if r.esxi.power == 'POWERED_OFF':
+            return None, None
+        return real_transfer(pve_mgr, task, host, user, pw, ds, vm_dir, desc, i)
+
+    def no_memory(vm_id, action):
+        if action == 'start':
+            r.events.append(('power', action))
+            return {'error': 'Insufficient memory resources on the host'}
+        return real_power(vm_id, action)
+    monkeypatch.setattr(v2p, '_ssh_pipe_transfer', no_second_copy)
+    r.esxi.vm_power_action = no_memory
+    t0 = r.clock.now
+    r.go()
+    assert r.task.status == 'failed' and 'did not come back up' in r.task.error
+    assert len([e for e in r.kinds('power') if e[1] == 'start']) == 3
+    assert r.clock.now - t0 < 600
+
+
+# --------------------------------------------------------------------------- starting the target
+
+def test_a_target_proxmox_refuses_to_start_brings_the_source_back(monkeypatch):
+    """_api_post hands back the 500 instead of raising. It used to count as started: the run
+    said completed with both VMs off, and remove_source deleted the source."""
+    r = Run(monkeypatch, start='http500', remove_source=True).go()
+    assert r.task.status == 'failed'
+    assert 'did not start' in r.task.error and 'HTTP 500' in r.task.error, r.task.error
+    assert 'powered back on' in r.task.error
+    assert r.esxi.power == 'POWERED_ON'
+    assert ('delete_vm',) not in r.events
+    assert r.idx(lambda e: e == ('start_target',))[0] < r.idx(lambda e: e == ('power', 'start'))[0]
+
+
+def test_a_start_task_that_fails_brings_the_source_back(monkeypatch):
+    r = Run(monkeypatch, start='task_error', remove_source=True).go()
+    assert r.task.status == 'failed'
+    assert 'QEMU exited with code 1' in r.task.error and 'powered back on' in r.task.error
+    assert r.esxi.power == 'POWERED_ON' and ('delete_vm',) not in r.events
+
+
+def test_a_target_that_stops_right_after_its_start_brings_the_source_back(monkeypatch):
+    r = Run(monkeypatch, start='dies', remove_source=True).go()
+    assert r.task.status == 'failed'
+    assert 'not running' in r.task.error and 'powered back on' in r.task.error
+    assert r.esxi.power == 'POWERED_ON' and ('delete_vm',) not in r.events
+
+
+def test_a_start_without_an_answer_leaves_both_alone(monkeypatch):
+    """The start may still go through. Powering the source on could leave the VM running
+    twice, once on each side, so both stay as they are and the run says so."""
+    r = Run(monkeypatch, start='no_answer', remove_source=True).go()
+    assert r.task.status == 'failed'
+    assert 'may be running' in r.task.error, r.task.error
+    assert r.esxi.power == 'POWERED_OFF'
+    assert ('power', 'start') not in r.events and ('delete_vm',) not in r.events
+
+
+def test_the_source_is_deleted_only_once_the_target_runs(monkeypatch):
+    r = Run(monkeypatch, remove_source=True).go()
+    assert r.task.status == 'completed', r.task.error
+    assert r.pve.running
+    assert r.idx(lambda e: e == ('start_target',))[0] < r.idx(lambda e: e == ('delete_vm',))[0]
+    assert any('Target VM is running' in line for line in r.task.log_lines)
+
+
+def test_remove_source_keeps_the_source_when_the_target_is_not_started(monkeypatch):
+    r = Run(monkeypatch, start_after=False, remove_source=True).go()
+    assert r.task.status == 'completed', r.task.error
+    assert ('start_target',) not in r.events and ('delete_vm',) not in r.events
+    assert any('stays on ESXi' in line for line in r.task.log_lines)
 
 
 # --------------------------------------------------------------------------- replay sources
