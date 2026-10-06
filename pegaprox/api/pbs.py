@@ -955,15 +955,14 @@ def _authz_restore_node(cluster_id, node, user):
     from pegaprox.api.helpers import caller_is_scoped
     if not caller_is_scoped(user, cluster_id):
         return None
-    from pegaprox.utils.rbac import get_user_vms
-    _mine = get_user_vms(user, cluster_id)
-    if _mine is None:
-        return None                      # no restrictions expressed for them here
+    from pegaprox.utils.rbac import user_can_access_vm
     mgr = cluster_managers.get(cluster_id)
     try:
+        # NS Oct 2026 - asked guest by guest. get_user_vms knows the VM-ACLs only, so a caller
+        # confined by a pool came back as unrestricted and restored onto any node (#1081)
         _nodes = {r.get('node') for r in (mgr.get_vm_resources() or [])
                   if r.get('node') and str(r.get('vmid', '')).isdigit()
-                  and int(r['vmid']) in set(_mine)}
+                  and user_can_access_vm(user, cluster_id, int(r['vmid']), 'vm.view', r.get('type'))}
     except Exception as e:
         logging.error(f"[PBS] cannot resolve the caller's nodes on {cluster_id}: {e}")
         return jsonify({'error': 'Cannot verify the restore destination - check the server logs'}), 503

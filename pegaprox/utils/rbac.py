@@ -697,6 +697,11 @@ def check_tenant_vmid(tenant_id, vmid):
     start, end = tenant_vmid_range(tenant_id)
     if not start:
         return True, ''
+    # NS Oct 2026 - a list or an object passed for "nothing to judge" below, and a list still
+    # reaches PVE as a VMID once it is form-encoded (#1081, #1056). A string PVE cannot read
+    # as a number it refuses itself.
+    if vmid is not None and not isinstance(vmid, (int, str)):
+        return False, f'A VMID here is one whole number inside this tenant\'s range ({start}-{end})'
     try:
         v = int(vmid)
     except (TypeError, ValueError):

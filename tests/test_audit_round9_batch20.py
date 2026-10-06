@@ -8,6 +8,11 @@
 # narrows a shipped role. vm.create is template-only but is the tenant_admin's core job, and its
 # QEMU/LXC twins are consistent today, so that stays open too and goes to Nico as a pool-semantics
 # question rather than a unilateral fix.
+#
+# Oct 2026: both questions are decided the other way. Shared storage content (an upload overwrites
+# an ISO of the same name) and a new guest's placement are calls for the whole cluster, so the
+# writes and both create routes now refuse a confined caller (#1109, #1081). The two tests below
+# that held them open now hold that, with the owning-tenant operator still let through.
 import time
 
 import pegaprox.utils.rbac as rbac
@@ -169,31 +174,45 @@ def test_unconfined_storage_admin_keeps_deleting_any_volume(api, seed):
 
 
 # ── routes deliberately left OPEN — these assert the absence of a regression ──
-def test_pool_user_can_still_download_an_iso(api, seed):
-    # storage.upload/storage.download are BUILTIN ROLE_USER perms. Confining these would 403 the
-    # pool-scoped Client Portal user this whole audit exists to protect, for a self-service
-    # workflow the UI already offers them.
+def test_pool_user_downloads_no_iso_but_the_owning_tenant_does(api, seed, monkeypatch):
+    # (#1109) an ISO is content of the whole cluster, not of the pool user's guests
+    monkeypatch.setattr('pegaprox.utils.url_security.resolve_and_pin_url', lambda url, **kw: url)
     seed.tenant('tenant_x', clusters=['cluster_1'])
+    seed.tenant('tenant_y', clusters=['cluster_1'])
     u = seed.user('pooluser', role='user', tenant_id='tenant_x',
                   permissions=['storage.upload', 'storage.download', 'cluster.view'])
     seed.pool('cluster_1', 'pool_1', 'pooluser', ['pool.view', 'vm.view'])
     _seed_pool_membership('cluster_1', {100: ('qemu', 'pool_1')})
+    # the same role in a tenant that owns the cluster, with no pool grant of its own
+    owner = seed.user('poolowner', role='user', tenant_id='tenant_y',
+                      permissions=['storage.upload', 'storage.download', 'cluster.view'])
     m = _content_mgr(api)
-    m.download_url_to_storage.return_value = {'success': True}
-    r = api.as_user(u).post('/api/clusters/cluster_1/datastores/local/download-url',
-                            json={'url': 'https://example.com/x.iso', 'filename': 'x.iso'})
-    assert r.status_code != 403, r.get_data(as_text=True)
+    refused = m._create_session.return_value.post.return_value
+    refused.status_code, refused.text = 500, 'stopped here'
+    refused.json.return_value = {}
+    body = {'url': 'https://example.com/x.iso', 'filename': 'x.iso', 'node': 'n1'}
+    r = api.as_user(u).post('/api/clusters/cluster_1/datastores/local/download-url', json=body)
+    assert r.status_code == 403, r.get_data(as_text=True)
+    assert not m._create_session.return_value.post.called
+    r = api.as_user(owner).post('/api/clusters/cluster_1/datastores/local/download-url', json=body)
+    assert r.status_code == 500, r.get_data(as_text=True)
+    assert m._create_session.return_value.post.called
 
 
-def test_pool_scoped_tenant_admin_can_still_create_a_container(api, seed):
-    # vm.create is the tenant_admin's core job, and the QEMU twin create_vm_api is equally
-    # ungated — confining only the LXC path would be the asymmetry, not the fix.
+def test_pool_scoped_tenant_admin_creates_no_container_but_the_owner_does(api, seed):
+    # (#1081) the QEMU and LXC create routes stay twins: both refuse a confined caller
     u = _scoped(seed, 'ctcreator', ['vm.create', 'cluster.view'])
+    owner = _owner(seed, 'ctowner', ['vm.create', 'cluster.view'])
     m = _cluster(api)
     m.create_container.return_value = {'success': True, 'vmid': 999}
     r = api.as_user(u).post('/api/clusters/cluster_1/nodes/n1/lxc',
                             json={'vmid': 999, 'ostemplate': 'local:vztmpl/deb.tar.zst'})
-    assert r.status_code != 403, r.get_data(as_text=True)
+    assert r.status_code == 403, r.get_data(as_text=True)
+    assert not m.create_container.called
+    r = api.as_user(owner).post('/api/clusters/cluster_1/nodes/n1/lxc',
+                                json={'vmid': 999, 'ostemplate': 'local:vztmpl/deb.tar.zst'})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert m.create_container.called
 
 
 # ── storage-cluster delete mirrors its siblings, not require_unconfined ──────

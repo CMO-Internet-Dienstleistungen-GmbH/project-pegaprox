@@ -2315,6 +2315,11 @@ def download_template(cluster_id):
     """
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    # NS Oct 2026 - a template lands on a storage of the whole cluster, like an ISO upload
+    # (vms.py upload_to_datastore): not for a caller confined to some guests here (#1109)
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -2474,6 +2479,9 @@ def download_from_url(cluster_id, node, storage):
     """
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)   # same as the template download above (#1109)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:

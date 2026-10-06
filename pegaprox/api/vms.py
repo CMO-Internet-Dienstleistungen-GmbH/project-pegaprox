@@ -1152,6 +1152,12 @@ def upload_to_datastore(cluster_id, storage_name):
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
+    # NS Oct 2026 - an ISO, template or import image lands on a storage every guest of the
+    # cluster draws from, none of it belongs to one guest. A caller confined to some guests
+    # here does not write it (#1109), as with the ISO sync.
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
@@ -1323,6 +1329,9 @@ def download_iso_from_url(cluster_id, storage_name):
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
+    _cerr = require_unconfined(cluster_id)   # same as the upload above (#1109)
+    if _cerr:
+        return _cerr
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
@@ -1700,6 +1709,18 @@ def restore_vm_backup(cluster_id, node, vm_type, vmid):
         if _src_vmid is None or not user_can_access_vm(_authz_user, cluster_id, _src_vmid,
                                                        'vm.backup', 'lxc' if _src_is_lxc else 'qemu'):
             return jsonify({'error': 'Permission denied for source backup'}), 403
+        # another VMID makes this a new guest, which keeps to what the PBS twin asks of one
+        # (restore_backup, mode 'new'): the tenant's VMID range, and for a confined caller a
+        # node one of their guests lives on (#1081)
+        if str(target_vmid) != str(vmid):
+            from pegaprox.utils.rbac import check_tenant_vmid, DEFAULT_TENANT_ID
+            from pegaprox.api.pbs import _authz_restore_node
+            _rok, _rmsg = check_tenant_vmid(_authz_user.get('tenant_id') or DEFAULT_TENANT_ID, target_vmid)
+            if not _rok:
+                return jsonify({'error': _rmsg}), 403
+            _nerr = _authz_restore_node(cluster_id, node, _authz_user)
+            if _nerr:
+                return _nerr
 
     try:
         host, port = manager.host, manager.api_port
@@ -4289,8 +4310,22 @@ def clone_vm_api(cluster_id, node, vm_type, vmid):
     
     manager = cluster_managers[cluster_id]
     data = request.json or {}
-    
+
+    # NS Oct 2026 - a clone is a new guest, so it keeps to what a restore into a new VMID
+    # asks: the tenant's VMID range for a VMID the caller names, and for a caller confined
+    # here a node one of their own guests lives on (#1081)
     newid = data.get('newid')
+    if user.get('effective_role', user.get('role')) != ROLE_ADMIN:
+        from pegaprox.utils.rbac import check_tenant_vmid, DEFAULT_TENANT_ID
+        from pegaprox.api.pbs import _authz_restore_node
+        if newid:
+            _rok, _rmsg = check_tenant_vmid(user.get('tenant_id') or DEFAULT_TENANT_ID, newid)
+            if not _rok:
+                return jsonify({'error': _rmsg}), 403
+        _nerr = _authz_restore_node(cluster_id, data.get('target_node') or node, user)
+        if _nerr:
+            return _nerr
+
     if not newid:
         # Get next available VMID
         next_result = manager.get_next_vmid()
@@ -5538,6 +5573,18 @@ def update_vm_config_api(cluster_id, node, vm_type, vmid):
     if refused:
         return refused
 
+    if getattr(manager, 'cluster_type', 'proxmox') != 'xcpng':
+        # NS Oct 2026 - a list goes out as the same key twice, and which one PVE keeps is not
+        # the one checked below. Every PVE config value is a string or a number (#1102)
+        if any(isinstance(v, (list, dict)) for v in config_updates.values()):
+            return jsonify({'error': 'Config values are strings or numbers'}), 400
+        # a cluster connected with root@pam's own password takes QEMU args, a hookscript or
+        # a host device from us where PVE refuses every token (#1102)
+        if caller_is_scoped(user, cluster_id):
+            root_key = _root_only_config_key(manager, node, vmid, vm_type, config_updates)
+            if root_key:
+                return _confined_root_refusal(f'setting {root_key}')
+
     result = manager.update_vm_config(node, vmid, vm_type, config_updates)
 
     if result['success']:
@@ -5801,9 +5848,9 @@ def add_pci_passthrough(cluster_id, node, vmid):
             access = manager.pve_root_access()
             if not access['root']:
                 return _root_refusal(access, 'attach a raw PCI device - use a resource mapping instead')
-            session, priv, priv_err = _session_as_root(manager, access, 'raw PCI passthrough')
-            if priv_err:
-                return jsonify({'error': priv_err, 'code': 'PVE_ROOT_LOGIN_FAILED'}), 502
+            session, priv, refused = _session_as_root(manager, cluster_id, access, 'raw PCI passthrough')
+            if refused:
+                return refused
 
         # Find next available hostpci slot
         config_url = f"https://{host}:{port}/api2/json/nodes/{node}/qemu/{vmid}/config"
@@ -5907,9 +5954,9 @@ def add_usb_passthrough(cluster_id, node, vmid):
             access = manager.pve_root_access()
             if not access['root']:
                 return _root_refusal(access, 'attach a raw USB device - use a resource mapping instead')
-            session, priv, priv_err = _session_as_root(manager, access, 'raw USB passthrough')
-            if priv_err:
-                return jsonify({'error': priv_err, 'code': 'PVE_ROOT_LOGIN_FAILED'}), 502
+            session, priv, refused = _session_as_root(manager, cluster_id, access, 'raw USB passthrough')
+            if refused:
+                return refused
 
         # Find next available usb slot
         config_url = f"https://{host}:{port}/api2/json/nodes/{node}/qemu/{vmid}/config"
@@ -5976,6 +6023,9 @@ def add_serial_port(cluster_id, node, vmid):
 
     data = request.json or {}
     serial_type = data.get('type', 'socket')  # socket, pty, or /dev/xxx
+    if serial_type != 'socket' and caller_is_scoped(
+            build_authz_user(request.session.get('user', ''), request.session), cluster_id):
+        return _confined_root_refusal('passing a serial device of the host')
     
     try:
         host, port = manager.host, manager.api_port
@@ -6050,9 +6100,10 @@ def remove_passthrough_device(cluster_id, node, vmid, device_type, key):
                 access = manager.pve_root_access()
                 if not access['root']:
                     return _root_refusal(access, f'remove a raw {device_type.upper()} device')
-                session, priv, priv_err = _session_as_root(manager, access, f'raw {device_type.upper()} passthrough')
-                if priv_err:
-                    return jsonify({'error': priv_err, 'code': 'PVE_ROOT_LOGIN_FAILED'}), 502
+                session, priv, refused = _session_as_root(manager, cluster_id, access,
+                                                          f'raw {device_type.upper()} passthrough')
+                if refused:
+                    return refused
 
         # Delete by setting to empty/delete
         update_data = {'delete': key}
@@ -6108,7 +6159,7 @@ def _parse_usb_config(config_str):
         return result
 
     parts = config_str.split(',')
-    for part in parts:
+    for i, part in enumerate(parts):
         if '=' in part:
             key, value = part.split('=', 1)
             if key == 'host':
@@ -6117,6 +6168,9 @@ def _parse_usb_config(config_str):
                 result['mapping'] = value
             else:
                 result['options'][key] = value
+        elif i == 0 and part:
+            # host is the default key, as the device is for PCI
+            result['host'] = part
 
     return result
 
@@ -6137,10 +6191,15 @@ _PCI_ID_RE = re.compile(r'^(?:[0-9a-fA-F]{4,}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}(?:
 def _passthrough_is_raw(device_type, value):
     """Whether a hostpci/usb value names a host device rather than a mapping. USB's
     host=spice is no device of the host and open to everyone."""
+    # a host address next to a mapping is still a host address
     if device_type == 'pci':
-        return not _parse_pci_config(value)['mapping']
+        parsed = _parse_pci_config(value)
+        return bool(parsed['device']) or not parsed['mapping']
     parsed = _parse_usb_config(value)
-    return not parsed['mapping'] and (parsed['host'] or '').lower() != 'spice'
+    host = (parsed['host'] or '').lower()
+    if host:
+        return host != 'spice'
+    return not parsed['mapping']
 
 
 def _root_refusal(access, what):
@@ -6155,14 +6214,93 @@ def _root_refusal(access, what):
                     'code': 'PVE_ROOT_REQUIRED', 'reason': access.get('reason')}), 403
 
 
-def _session_as_root(manager, access, what):
-    """(session, owned, error) for a root@pam change: the cluster session when it is
+def _confined_root_refusal(what):
+    return jsonify({'error': f'{what[:1].upper()}{what[1:]} is a change Proxmox keeps for root@pam. '
+                             'It reaches the host, so it needs access to the whole cluster.',
+                    'code': 'PVE_ROOT_CLUSTER_WIDE'}), 403
+
+
+def _session_as_root(manager, cluster_id, access, what):
+    """(session, owned, refusal) for a root@pam change: the cluster session when it is
     root@pam's own password login, else a session on a fresh root@pam ticket, which the
-    caller closes (owned)."""
+    caller closes (owned). refusal is the response to return instead.
+
+    NS Oct 2026 - on either session PVE checks nothing more about the change, so the
+    answer for a caller confined to some guests of the cluster comes from here (#1102)."""
+    if caller_is_scoped(build_authz_user(request.session.get('user', ''), request.session), cluster_id):
+        return None, None, _confined_root_refusal(what)
     if not access.get('fresh_ticket'):
         return manager._create_session(), None, None
     priv, err = manager.create_privileged_session(what)
-    return priv, priv, err
+    if err:
+        return None, None, (jsonify({'error': err, 'code': 'PVE_ROOT_LOGIN_FAILED'}), 502)
+    return priv, priv, None
+
+
+# What else of a guest config Proxmox keeps for root@pam: every QEMU key without a privilege
+# of its own (check_vm_modify_config_perm), a raw device or a romfile, a serial port that is
+# no socket, a drive on a path of the host; for a container device passthrough, the
+# hookscript, bind and device mount points and the feature flags (check_ct_modify_config_perm).
+# A token is refused all of it, a cluster connected with root@pam's own password is not.
+_QEMU_ROOT_KEYS = ('args', 'hookscript', 'lock', 'affinity', 'hugepages', 'keephugepages',
+                   'ivshmem', 'arch', 'amd-sev', 'intel-tdx', 'vmgenid', 'spice_enhancements',
+                   'skiplock')
+_QEMU_DRIVE_KEY_RE = re.compile(r'(?:ide|sata|scsi|virtio|unused)[0-9]+|efidisk0|tpmstate0|cdrom')
+_LXC_VOLUME_KEY_RE = re.compile(r'rootfs|mp[0-9]+|unused[0-9]+')
+
+
+def _on_host_path(value, volume_key):
+    """Whether a drive or mount point names a path of the host rather than a volume"""
+    for i, part in enumerate(str(value or '').split(',')):
+        key, sep, val = part.partition('=')
+        if not sep:
+            key, val = (volume_key if i == 0 else ''), part
+        if key in (volume_key, 'import-from') and val.strip().startswith('/'):
+            return True
+    return False
+
+
+def _root_only_config_key(manager, node, vmid, vm_type, updates):
+    """The first key of a config change only root@pam may make on Proxmox, else None"""
+    # PVE splits these lists on commas, semicolons and spaces alike; revert drops a pending
+    # change the way delete drops a set one
+    deleted = [k for name in ('delete', 'revert')
+               for k in re.split(r'[,;\s]+', str(updates.get(name) or '')) if k]
+    if vm_type == 'qemu':
+        for key in list(updates) + deleted:
+            if key in _QEMU_ROOT_KEYS or re.fullmatch(r'parallel[0-9]+', str(key)):
+                return key
+        for key, value in updates.items():
+            key, value = str(key), str(value)
+            if re.fullmatch(r'hostpci[0-9]+', key):
+                if _passthrough_is_raw('pci', value) or 'romfile' in _parse_pci_config(value)['options']:
+                    return key
+            elif re.fullmatch(r'usb[0-9]+', key):
+                if _passthrough_is_raw('usb', value):
+                    return key
+            elif re.fullmatch(r'serial[0-9]+', key):
+                if value != 'socket':
+                    return key
+            elif _QEMU_DRIVE_KEY_RE.fullmatch(key) and _on_host_path(value, 'file'):
+                return key
+        return None
+    for key in list(updates) + deleted:
+        if key == 'hookscript' or re.fullmatch(r'dev[0-9]+', str(key)):
+            return key
+    for key, value in updates.items():
+        if _LXC_VOLUME_KEY_RE.fullmatch(str(key)) and _on_host_path(value, 'volume'):
+            return key
+    if 'features' in updates or 'features' in deleted:
+        rows, _resp = _lxc_pending(manager, node, vmid)
+        if rows is None:
+            return 'features'
+        current, _effective, unprivileged, _digest = _lxc_feature_state(rows)
+        old = _parse_lxc_features(current)
+        new = {} if 'features' in deleted else _parse_lxc_features(updates.get('features'))
+        if not unprivileged or any(k != 'nesting' for k in set(old) | set(new)
+                                   if old.get(k, '') != new.get(k, '')):
+            return 'features'
+    return None
 
 
 def _property_fields(text):
@@ -6634,9 +6772,9 @@ def set_lxc_features(cluster_id, node, vmid):
                 what = ('change the feature flags of a privileged container' if not unprivileged
                         else 'change feature flags other than nesting')
                 return _root_refusal(access, what)
-            session, priv, priv_err = _session_as_root(manager, access, 'LXC feature flags')
-            if priv_err:
-                return jsonify({'error': priv_err, 'code': 'PVE_ROOT_LOGIN_FAILED'}), 502
+            session, priv, refused = _session_as_root(manager, cluster_id, access, 'LXC feature flags')
+            if refused:
+                return refused
         body = {'features': new_text} if new_text else {'delete': 'features'}
         if digest:
             body['digest'] = digest
@@ -6747,6 +6885,35 @@ def get_iso_list_api(cluster_id, node):
     return jsonify(isos)
 
 
+# NS Oct 2026 - manager.add_disk and set_cdrom write these fields into the drive string and
+# its key as they come. A comma adds options, another key name changes another setting: both
+# are config changes the config route answers for (#1102), so here each field is one value.
+_STORAGE_ID_RE = re.compile(r'[A-Za-z][A-Za-z0-9._-]*')
+_DISK_SIZE_RE = re.compile(r'[0-9]+(?:\.[0-9]+)?[Gg]?')
+_DISK_WORD_RE = re.compile(r'[a-z0-9_]*')
+_QEMU_DISK_KEY_RE = re.compile(r'(?:ide|sata|scsi|virtio)[0-9]{1,2}')
+_CDROM_KEY_RE = re.compile(r'(?:ide|sata|scsi)[0-9]{1,2}')
+
+
+def _add_disk_problem(vm_type, cfg):
+    """Why an add-disk body cannot go into a drive string as it is, else None"""
+    if 'storage' in cfg and not (isinstance(cfg['storage'], str)
+                                 and _STORAGE_ID_RE.fullmatch(cfg['storage'])):
+        return 'Invalid storage id'
+    if 'size' in cfg and (isinstance(cfg['size'], bool)
+                          or not _DISK_SIZE_RE.fullmatch(str(cfg['size']))):
+        return 'Disk size is a number of GB'
+    if vm_type != 'qemu':
+        return None
+    if 'disk_id' in cfg and not (isinstance(cfg['disk_id'], str)
+                                 and _QEMU_DISK_KEY_RE.fullmatch(cfg['disk_id'])):
+        return 'disk_id names a drive: ide, sata, scsi or virtio and its number'
+    for key in ('cache', 'format'):
+        if cfg.get(key) and not (isinstance(cfg[key], str) and _DISK_WORD_RE.fullmatch(cfg[key])):
+            return f'Invalid {key}'
+    return None
+
+
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/disks', methods=['POST'])
 @require_auth(perms=['vm.config'])
 def add_disk_api(cluster_id, node, vm_type, vmid):
@@ -6761,7 +6928,13 @@ def add_disk_api(cluster_id, node, vm_type, vmid):
 
     manager = cluster_managers[cluster_id]
     disk_config = request.json or {}
-    
+    if not isinstance(disk_config, dict):
+        return jsonify({'error': 'Expected an object'}), 400
+    if getattr(manager, 'cluster_type', 'proxmox') != 'xcpng':
+        why = _add_disk_problem(vm_type, disk_config)
+        if why:
+            return jsonify({'error': why}), 400
+
     result = manager.add_disk(node, vmid, vm_type, disk_config)
     
     if result['success']:
@@ -6878,9 +7051,22 @@ def set_cdrom_api(cluster_id, node, vmid):
 
     manager = cluster_managers[cluster_id]
     data = request.json or {}
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Expected an object'}), 400
     iso_path = data.get('iso')  # None to eject
     drive = data.get('drive', 'ide2')
-    
+    if getattr(manager, 'cluster_type', 'proxmox') != 'xcpng':
+        if not (isinstance(drive, str) and _CDROM_KEY_RE.fullmatch(drive)):
+            return jsonify({'error': 'drive names a CD-ROM drive: ide, sata or scsi and its number'}), 400
+        if iso_path and not (isinstance(iso_path, str) and ',' not in iso_path):
+            return jsonify({'error': 'iso is one volume id'}), 400
+        if iso_path and caller_is_scoped(build_authz_user(request.session.get('user', ''),
+                                                          request.session), cluster_id):
+            root_key = _root_only_config_key(manager, node, vmid, 'qemu',
+                                             {drive: f'{iso_path},media=cdrom'})
+            if root_key:
+                return _confined_root_refusal('mounting a file of the host')
+
     result = manager.set_cdrom(node, vmid, iso_path, drive)
     
     if result['success']:
@@ -8338,14 +8524,42 @@ def _xcincr_zfs_pool(ssh, storage):
     return p or storage
 
 
-def _xcincr_vm_exists(mgr, vmid):
+def _xcincr_vm_node(mgr, vmid):
+    """(node or None, readable): where the guest with this VMID lives. NS Oct 2026 - a list
+    that could not be read is not an empty one (#1051): read as "nobody there" it sent a
+    seed onto the VMID, and a seed replaces whatever disk carries that name."""
     try:
         r = mgr._api_get(f"https://{mgr.host}:{mgr.api_port}/api2/json/cluster/resources", params={'type': 'vm'})
-        if r.status_code == 200:
-            return any(int(x.get('vmid', 0)) == int(vmid) for x in r.json().get('data', []))
+        if r.status_code != 200:
+            return None, False
+        for x in r.json().get('data', []):
+            if int(x.get('vmid', 0)) == int(vmid):
+                return x.get('node') or None, True
+        return None, True
     except Exception:
-        pass
-    return False
+        return None, False
+
+
+def _xcincr_vm_exists(mgr, vmid):
+    """True / False, or None when the guest list cannot be read"""
+    node, readable = _xcincr_vm_node(mgr, vmid)
+    return bool(node) if readable else None
+
+
+def _xcincr_replica_node(target_mgr, tgt_vmid, vm_type, job_id):
+    """(node, None) of the guest at the target VMID when it is THIS job's replica, (None,
+    None) when there is none, (None, error) when it is somebody else's or cannot be told."""
+    node, readable = _xcincr_vm_node(target_mgr, tgt_vmid)
+    if not readable:
+        return None, (f"Cannot read the guests of the target cluster to check VMID {tgt_vmid} - "
+                      f"refusing to write to it this run")
+    if not node:
+        return None, None
+    if not _is_replica_of_job(target_mgr, node, tgt_vmid, vm_type, job_id):
+        return None, (f"Target VM {tgt_vmid} on {node} is not tagged as this job's replica "
+                      f"({_job_tag(job_id)} missing) - refusing to overwrite. Pick a free target VMID "
+                      f"or tag it if it really is a stranded replica.")
+    return node, None
 
 
 def _xcincr_remove_existing_replica(target_mgr, tgt_vmid, vm_type, job_id):
@@ -8353,21 +8567,11 @@ def _xcincr_remove_existing_replica(target_mgr, tgt_vmid, vm_type, job_id):
     freed and can be re-created. Same safety gate as the full path (#413): only
     remove a VM we can prove is THIS job's replica; refuse otherwise so a mis-set
     target VMID never nukes a bystander. Returns (ok, error)."""
-    node = None
-    try:
-        r = target_mgr._api_get(f"https://{target_mgr.host}:{target_mgr.api_port}/api2/json/cluster/resources", params={'type': 'vm'})
-        if r.status_code == 200:
-            for x in r.json().get('data', []):
-                if int(x.get('vmid', 0)) == int(tgt_vmid):
-                    node = x.get('node'); break
-    except Exception:
-        pass
+    node, foreign = _xcincr_replica_node(target_mgr, tgt_vmid, vm_type, job_id)
+    if foreign:
+        return False, foreign
     if not node:
         return True, None   # nothing there
-    if not _is_replica_of_job(target_mgr, node, tgt_vmid, vm_type, job_id):
-        return False, (f"Target VM {tgt_vmid} on {node} is not tagged as this job's replica "
-                       f"({_job_tag(job_id)} missing) — refusing to overwrite. Pick a free target VMID "
-                       f"or tag it if it really is a stranded replica.")
     try:
         base = f"https://{target_mgr.host}:{target_mgr.api_port}/api2/json/nodes/{node}/{vm_type}/{tgt_vmid}"
         sr = target_mgr._api_post(f"{base}/status/stop", data={})
@@ -8556,12 +8760,29 @@ def _execute_replication_incremental(job):
         # 2. decide (re)build + remove a stale replica FIRST so its RBD images
         #    are freed and a seed can recreate them (a seed can't `rbd rm` an
         #    image that an existing replica VM still has open).
-        rebuild = (not last_snap) or (not _xcincr_vm_exists(target_mgr, tgt_vmid))
-        if rebuild and _xcincr_vm_exists(target_mgr, tgt_vmid):
+        exists = _xcincr_vm_exists(target_mgr, tgt_vmid)
+        if exists is None:
+            _cleanup_snapshot(source_mgr, source_node, vmid, vm_type, new_snap)
+            _update_repl_status(db, job_id, 'error', f'Cannot read the guests of the target '
+                                f'cluster to check VMID {tgt_vmid} - nothing was written')
+            return True
+        rebuild = (not last_snap) or (not exists)
+        if rebuild and exists:
             ok_rm, rm_err = _xcincr_remove_existing_replica(target_mgr, tgt_vmid, vm_type, job_id)
             if not ok_rm:
                 _cleanup_snapshot(source_mgr, source_node, vmid, vm_type, new_snap)
                 _update_repl_status(db, job_id, 'error', rm_err); return True
+        elif not rebuild:
+            # NS Oct 2026 - a delta goes onto the disks of whatever guest holds the VMID now,
+            # and a target image without the base falls back to a seed, which removes it
+            # first. Once the replica is gone and the id taken again that is somebody
+            # else's guest, so it needs the same proof as the reseed above (#1051)
+            tgt_node, foreign = _xcincr_replica_node(target_mgr, tgt_vmid, vm_type, job_id)
+            if foreign or not tgt_node:
+                _cleanup_snapshot(source_mgr, source_node, vmid, vm_type, new_snap)
+                _update_repl_status(db, job_id, 'error',
+                                    foreign or f'Target VM {tgt_vmid} is gone - the next run seeds it again')
+                return True
 
         # 3. replicate each disk (seed when rebuilding, else the base..new delta)
         base_for_disk = None if rebuild else (last_snap or None)
@@ -9296,6 +9517,15 @@ def create_cross_cluster_replication():
             return jsonify({'error': 'target_vmid must be an integer'}), 400
         if not (100 <= target_vmid <= 999999999):
             return jsonify({'error': 'target_vmid out of range (100–999999999)'}), 400
+    # NS Oct 2026 - the replica takes a VMID on the target as the migration twin does: the one
+    # set here, else the source's (a local job takes the next free one), and for a non-admin
+    # inside the tenant's range (#1056)
+    if _xu.get('effective_role', _xu.get('role')) != ROLE_ADMIN:
+        from pegaprox.utils.rbac import check_tenant_vmid, DEFAULT_TENANT_ID
+        _land = target_vmid or (None if source_cluster == target_cluster else vmid)
+        _rok, _rmsg = check_tenant_vmid(_xu.get('tenant_id') or DEFAULT_TENANT_ID, _land)
+        if not _rok:
+            return jsonify({'error': _rmsg}), 403
     delete_target = 1 if data.get('delete_target') else 0
     # #174 aderumier — opt-in incremental mode. Validated here; the engine still
     # falls back to 'full' at run time if the VM's disks aren't rbd/zfspool on
@@ -12735,6 +12965,18 @@ def cross_cluster_migrate_api():
     err = _require_vm_access(source_cluster_id, vmid, 'vm.migrate', vm_type)
     if err:
         return err
+    # NS Oct 2026 - the target side runs on a token we mint for the target cluster's own
+    # account, on any node, storage and bridge the body names. Reaching that cluster through
+    # one guest or pool is no standing to place one there, the replication twin refuses it
+    # too; and the guest takes a VMID there as a create would, inside the tenant's range (#1056)
+    _xu = build_authz_user(request.session.get('user', ''), request.session)
+    if caller_is_scoped(_xu, target_cluster_id):
+        return jsonify({'error': 'Access denied to the target cluster'}), 403
+    if _xu.get('effective_role', _xu.get('role')) != ROLE_ADMIN:
+        from pegaprox.utils.rbac import check_tenant_vmid, DEFAULT_TENANT_ID
+        _rok, _rmsg = check_tenant_vmid(_xu.get('tenant_id') or DEFAULT_TENANT_ID, target_vmid or vmid)
+        if not _rok:
+            return jsonify({'error': _rmsg}), 403
 
     source_manager = cluster_managers[source_cluster_id]
     target_manager = cluster_managers[target_cluster_id]
@@ -13055,6 +13297,11 @@ def create_vm_api(cluster_id, node):
     """Create a new VM on a node"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    # NS Oct 2026 - a new guest has no grant to ask about yet: which node, storage and bridge
+    # it takes is a call for the whole cluster, as on template and OCI deploy (#1081, #1086)
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -13126,6 +13373,9 @@ def create_container_api(cluster_id, node):
     """Create a new container on a node"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)   # same as the VM twin above (#1081)
+    if _cerr:
+        return _cerr
     
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
