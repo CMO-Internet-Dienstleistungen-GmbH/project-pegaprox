@@ -107,9 +107,9 @@ def update_vmware_server(vmware_id):
         # a string was stored as its characters and kept raw on the live manager
         if _lc is not None and not (isinstance(_lc, list) and all(isinstance(c, str) for c in _lc)):
             return jsonify({'error': 'linked_clusters must be a list of cluster ids'}), 400
-        from pegaprox.utils.rbac import get_user_clusters
+        from pegaprox.utils.rbac import get_user_clusters, acts_as_admin
         _caller = build_authz_user(request.session.get('user', ''), request.session)
-        if _caller.get('effective_role', _caller.get('role')) != ROLE_ADMIN:
+        if not acts_as_admin(_caller):
             _new_links = list(data.get('linked_clusters') or [])
             if not _new_links:
                 return jsonify({'error': 'Access denied: only a global admin may unlink an ESXi '

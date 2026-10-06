@@ -373,7 +373,7 @@ def _esxi_readable(linked):
     return m
 
 
-# The console is not the only vmware route that answers for a VM. detail, performance
+# The console is not the only ESXi route that answers for a VM. detail, performance
 # and watch gate the tenant through check_vmware_access, which read the whole users
 # table: the same empty read #1101 fixed for the console reached a foreign tenant's
 # ESXi inventory through every one of them.

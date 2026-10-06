@@ -4315,7 +4315,8 @@ def clone_vm_api(cluster_id, node, vm_type, vmid):
     # asks: the tenant's VMID range for a VMID the caller names, and for a caller confined
     # here a node one of their own guests lives on (#1081)
     newid = data.get('newid')
-    if user.get('effective_role', user.get('role')) != ROLE_ADMIN:
+    from pegaprox.utils.rbac import acts_as_admin
+    if not acts_as_admin(user):
         from pegaprox.utils.rbac import check_tenant_vmid, DEFAULT_TENANT_ID
         from pegaprox.api.pbs import _authz_restore_node
         if newid:
@@ -9520,7 +9521,8 @@ def create_cross_cluster_replication():
     # NS Oct 2026 - the replica takes a VMID on the target as the migration twin does: the one
     # set here, else the source's (a local job takes the next free one), and for a non-admin
     # inside the tenant's range (#1056)
-    if _xu.get('effective_role', _xu.get('role')) != ROLE_ADMIN:
+    from pegaprox.utils.rbac import acts_as_admin
+    if not acts_as_admin(_xu):
         from pegaprox.utils.rbac import check_tenant_vmid, DEFAULT_TENANT_ID
         _land = target_vmid or (None if source_cluster == target_cluster else vmid)
         _rok, _rmsg = check_tenant_vmid(_xu.get('tenant_id') or DEFAULT_TENANT_ID, _land)

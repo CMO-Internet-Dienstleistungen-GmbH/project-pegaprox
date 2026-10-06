@@ -565,7 +565,7 @@ def sse_updates():
         logging.error(f"[SSE] cannot resolve the cluster scope of '{_sl(user)}': {_ce}")
         _fresh = []
     subscribed_clusters = narrow_stream_scope(subscribed_clusters, _fresh)
-    if (_ident or {}).get('role') != ROLE_ADMIN:
+    if not acts_as_admin(_ident or {}):
         _is_admin = False
 
     with sse_clients_lock:

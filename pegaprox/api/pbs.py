@@ -2596,7 +2596,7 @@ def get_pbs_reports_protected_vms(pbs_id):
     # this cluster's and that they may read; everyone else keeps the report as it was.
     from pegaprox.utils.auth import build_authz_user
     _caller = build_authz_user(request.session.get('user', ''), request.session)
-    if (_caller.get('effective_role', _caller.get('role')) != ROLE_ADMIN
+    if (not acts_as_admin(_caller)
             and _caller_is_scoped_here(mgr, _caller)):
         owners = _BackupOwners(mgr)
         snaps = [s for s in _scope_pbs_rows(mgr, snaps, owners=owners)

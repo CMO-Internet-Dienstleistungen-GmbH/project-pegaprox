@@ -245,6 +245,25 @@ def test_a_replica_takes_a_vmid_of_the_tenant_too(api, seed):
     assert admin.post('/api/cross-cluster-replications', json=body).status_code == 200
 
 
+
+def test_an_admin_a_tenant_lowers_keeps_to_the_range_as_well(api, seed):
+    """Admin globally, user inside the ranged tenant (what the directory mapping writes):
+    the admin shortcut of the range check must not let them past it (#1028)."""
+    seed.db.save_tenant('ranged', {'name': 'ranged', 'clusters': [CID, 'cluster_2'],
+                                   'vmid_range_start': 1000, 'vmid_range_end': 1999})
+    c = api.as_user(seed.user('lowered', role='admin', tenant_id='ranged',
+                              tenant_permissions={'ranged': {'role': 'user',
+                                                             'extra': ['cluster.config'],
+                                                             'denied': []}}))
+    _manager(api, CID)
+    _manager(api, 'cluster_2')
+    body = {'source_cluster': CID, 'target_cluster': 'cluster_2', 'vmid': 100}
+    r = c.post('/api/cross-cluster-replications', json=dict(body, target_vmid=555))
+    assert r.status_code == 403 and '1000-1999' in r.get_json()['error'], r.data
+    r = c.post('/api/cross-cluster-replications', json=dict(body, target_vmid=1500))
+    assert r.status_code == 200, r.data
+
+
 # --- clone: the other way to put a new guest on a node ------------------------------------------
 
 def _token(owner, role):
