@@ -399,6 +399,9 @@ def test_v2p_refuses_an_option_shaped_esxi_user(v2p):
 
 @pytest.mark.parametrize('host', ['esxi01.lab\nUser x', '-oPegaProxMarker=yes', 'esxi01.lab x', 'a/b'])
 def test_v2p_refuses_an_esxi_host_that_is_no_host(v2p, host):
+    # the host is pinned to the registered server (#1106): register the bad one, so it is
+    # the shape check that refuses it and not the pin
+    vmwareapi.vmware_managers['v1'].host = host
     status, started = v2p({'esxi_host': host})
     assert status == 400
     assert not started
@@ -407,6 +410,9 @@ def test_v2p_refuses_an_esxi_host_that_is_no_host(v2p, host):
 @pytest.mark.parametrize('body', [{}, {'esxi_user': 'root', 'esxi_host': '10.30.0.9'},
                                   {'esxi_host': 'esx_01.lab'}, {'esxi_host': 'fd00::9'}])
 def test_v2p_still_starts_with_a_real_user_and_host(v2p, body):
+    # the host is pinned to the registered server (#1106): register the one the body names
+    if body.get('esxi_host'):
+        vmwareapi.vmware_managers['v1'].host = body['esxi_host']
     status, started = v2p(body)
     assert status == 202
     assert started
