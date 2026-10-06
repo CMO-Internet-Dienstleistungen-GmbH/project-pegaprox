@@ -10141,8 +10141,9 @@ def vnc_websocket_route(cluster_id, node, vm_type, vmid):
     ws = request.environ.get('wsgi.websocket')
     if ws is not None:
         print("Using geventwebsocket handler...")
-        # #988 - counted against the account until the request ends
-        hold_websocket(user['username'], ws)
+        # #988 - counted against the account until the request ends, and hung up with
+        # the session it was opened under (#1038)
+        hold_websocket(user['username'], ws, sid=auth.get('sid') if ws_token else session_id)
         handle_vnc_websocket(ws, cluster_id, node, vm_type, vmid)
         return ''
     
@@ -10934,8 +10935,9 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
         return
 
     # NS Oct 2026 (#988) - this socket holds a request slot for as long as the console is
-    # open: counted against the account until the request ends
-    hold_websocket(user['username'], ws)
+    # open: counted against the account until the request ends, and hung up with the
+    # session it was opened under (#1038)
+    hold_websocket(user['username'], ws, sid=auth.get('sid') if ws_token else session_id)
 
     if cluster_id not in cluster_managers:
         print(f"ERROR: Cluster {cluster_id} not found")
@@ -12201,8 +12203,9 @@ def node_shell_websocket_proxy(ws, cluster_id, node):
         return
 
     logging.info(f"SHELL WS: User {session['user']} authenticated for shell on {cluster_id}/{node}")
-    # #988 - counted against the account until the request ends, the credential wait included
-    hold_websocket(session['user'], ws)
+    # #988 - counted against the account until the request ends, the credential wait included,
+    # and hung up with its session (#1038)
+    hold_websocket(session['user'], ws, sid=session_id)
 
     logging.info(f"")
     logging.info(f"========================================")

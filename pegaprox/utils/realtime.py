@@ -173,13 +173,16 @@ def broadcast_action(action: str, resource_type: str, resource_id: str, details:
     }, cluster_id)
 
 
-def create_sse_token(username: str, allowed_clusters: list, effective_role: str = None) -> str:
+def create_sse_token(username: str, allowed_clusters: list, effective_role: str = None,
+                     sid: str = None, token_id=None) -> str:
     """Create SSE token - avoids session ID in URL
 
     sec (audit): effective_role is captured at mint time because /api/sse/updates authenticates
     on the token alone — it has no session to floor an API token's role from, and reading the
     stored role there flagged an admin-owned viewer-scoped token as admin, which switched off
-    every per-VM filter in the broadcast loop."""
+    every per-VM filter in the broadcast loop.
+
+    sid / token_id: the session or API token it was minted under, see end_session_channels."""
     token = base64.urlsafe_b64encode(os.urandom(24)).decode('utf-8')
     expires = time.time() + SSE_TOKEN_TTL
 
@@ -195,6 +198,8 @@ def create_sse_token(username: str, allowed_clusters: list, effective_role: str 
             'expires': expires,
             'allowed_clusters': allowed_clusters,
             'effective_role': effective_role,
+            'sid': sid,
+            'token_id': token_id,
         }
 
     return token
@@ -234,9 +239,10 @@ def validate_sse_token(token: str) -> dict:
 # These are single-use and expire after 60s
 WS_TOKEN_TTL = 60
 
-def create_ws_token(username: str, role: str, api_token: bool = False) -> str:
+def create_ws_token(username: str, role: str, api_token: bool = False, sid: str = None) -> str:
     """Create a short-lived single-use WebSocket auth token. api_token: minted by an API
-    token, whose role then bounds every console the ws token opens (#1116)."""
+    token, whose role then bounds every console the ws token opens (#1116). sid: the
+    session it was minted under, see end_session_channels."""
     token = base64.urlsafe_b64encode(os.urandom(24)).decode('utf-8')
     expires = time.time() + WS_TOKEN_TTL
 
@@ -252,6 +258,7 @@ def create_ws_token(username: str, role: str, api_token: bool = False) -> str:
             'role': role,
             'api_token': bool(api_token),
             'expires': expires,
+            'sid': sid,
         }
 
     return token
@@ -296,6 +303,45 @@ def invalidate_user_sse_tokens(username: str) -> int:
     return len(gone)
 
 
+def end_session_channels(username: str, sids=None, keep: str = None) -> int:
+    """End what a session opened next to itself: its pending ws and SSE tokens, its open
+    SSE streams and its WebSockets on this port.
+
+    NS Oct 2026 (#1038) - signing out, a revoked session or a password change dropped the
+    session and its SSE token, and left a console token minted under it working for its
+    60 s and every stream and socket it had open running. sids: those sessions only.
+    Without: every one of the user's but `keep`'s, the API token ones among them.
+    Consoles on the VNC and SSH ports of their own are not reached from here.
+    """
+    sids = set(sids) if sids is not None else None
+
+    def _ends(d):
+        if d.get('user') != username:
+            return False
+        if sids is not None:
+            return d.get('sid') in sids
+        return keep is None or d.get('sid') != keep
+
+    n = 0
+    for store, lock in ((ws_tokens, ws_tokens_lock), (sse_tokens, sse_tokens_lock),
+                        (sse_clients, sse_clients_lock)):
+        with lock:
+            gone = [k for k, d in store.items() if isinstance(d, dict) and _ends(d)]
+            for k in gone:
+                store.pop(k, None)
+        n += len(gone)
+    with _held_ws_lock:
+        gone = [k for k, (user, _ws) in _held_ws.items()
+                if _ends({'user': user, 'sid': _held_ws_sid.get(k)})]
+        socks = [_held_ws.pop(k)[1] for k in gone]
+        for k in gone:
+            _held_ws_sid.pop(k, None)
+    for ws in socks:
+        logging.info(f"[WS] hung up a WebSocket of '{_sl(username)}' - its session ended")
+        _hang_up(ws)
+    return n + len(socks)
+
+
 # NS Oct 2026 (#988) - a WebSocket on the main port holds a request-pool slot for as long
 # as it is open, like an SSE stream, and nothing bounded how many one account kept open:
 # any signed-in viewer could fill the pool with them. Counted per account across the
@@ -305,6 +351,7 @@ def invalidate_user_sse_tokens(username: str) -> int:
 # pool is 32.
 MAX_WS_PER_USER = 10
 _held_ws = {}
+_held_ws_sid = {}      # key -> the session a socket was opened under, when one was
 _held_ws_lock = threading.Lock()
 _held_ws_seq = itertools.count()
 # NS Oct 2026 (#1052) - request bodies taken off their clock, key -> account. A body that
@@ -318,9 +365,10 @@ def _bodies_of(username):
     return sum(1 for user in _held_bodies.values() if user == username)
 
 
-def hold_websocket(username, ws):
+def hold_websocket(username, ws, sid=None):
     """Count this request's open WebSocket against its account until the route returns.
-    Past MAX_WS_PER_USER the account's oldest socket is hung up."""
+    Past MAX_WS_PER_USER the account's oldest socket is hung up. sid: the session it was
+    opened under, hung up with it (end_session_channels)."""
     from flask import after_this_request
     key = next(_held_ws_seq)
     with _held_ws_lock:
@@ -328,6 +376,8 @@ def hold_websocket(username, ws):
         over = len(mine) + _bodies_of(username) - MAX_WS_PER_USER + 1
         gone = [_held_ws.pop(k)[1] for k in mine[:max(0, over)]]
         _held_ws[key] = (username, ws)
+        if sid:
+            _held_ws_sid[key] = sid
 
     # per request, not an app-wide hook: the lease fast path in app.py stands in for the
     # app-wide ones and turns itself off for any it does not know
@@ -344,6 +394,7 @@ def hold_websocket(username, ws):
 def release_websocket(key):
     with _held_ws_lock:
         _held_ws.pop(key, None)
+        _held_ws_sid.pop(key, None)
 
 
 def hold_body(username):

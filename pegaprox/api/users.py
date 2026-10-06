@@ -174,8 +174,12 @@ def _caller_can_manage_user(target_user):
     if caller_acts_as_admin():
         return True
     from pegaprox.utils.auth import build_authz_user
-    from pegaprox.utils.rbac import get_user_permissions
     caller = build_authz_user(request.session.get('user', ''), request.session)
+    return all(has_permission(caller, p) for p in _account_reach(target_user))
+
+
+def _account_reach(target_user):
+    """Every permission an account holds or is one override removal away from holding."""
     target = target_user or {}
     theirs = set(get_user_permissions(target))
     # NS Oct 2026 (#998) - and as the account stands without the override of its own tenant.
@@ -186,7 +190,7 @@ def _caller_can_manage_user(target_user):
     if _home in _tp:
         theirs.update(get_user_permissions(
             dict(target, tenant_permissions={t: o for t, o in _tp.items() if t != _home})))
-    return all(has_permission(caller, p) for p in theirs)
+    return theirs
 
 
 def _parse_avatar_data_url(value: str):
@@ -642,9 +646,20 @@ def unlock_all_users():
     
     MK: New endpoint for clearing all username lockouts
     """
-    count = len(login_attempts_by_user)
-    login_attempts_by_user.clear()
-    
+    _ct = _caller_tenant_or_none()
+    if _ct is None:
+        count = len(login_attempts_by_user)
+        login_attempts_by_user.clear()
+    else:
+        # NS Oct 2026 - a tenant delegate clears what the lockout list shows them (their own
+        # tenant's accounts), not every tenant's lockouts
+        _users_db = load_users()
+        mine = [u for u in list(login_attempts_by_user)
+                if _users_db.get(u, {}).get('tenant_id', DEFAULT_TENANT_ID) == _ct]
+        for u in mine:
+            login_attempts_by_user.pop(u, None)
+        count = len(mine)
+
     logging.info(f"Admin manually unlocked all users ({count} entries cleared)")
     log_audit(request.session.get('user', 'admin'), 'security.unlock_all_users', f"Cleared all {count} locked users")
     
@@ -667,12 +682,25 @@ def reset_all_password_expiry():
     users_db = load_users()
     reset_count = 0
     skipped_admins = 0
-    
+
+    # NS Oct 2026 - a tenant delegate holding security.lockout.manage expired every tenant's
+    # passwords, global admins' with include_admins. Their own tenant's accounts now, and of
+    # those only the ones they could reset a password for (_caller_can_manage_user).
+    _ct = _caller_tenant_or_none()
+    _held = None
+    if _ct is not None:
+        from pegaprox.utils.auth import build_authz_user
+        _held = set(get_user_permissions(build_authz_user(request.session.get('user', ''),
+                                                          request.session)))
+
     # Set password_changed_at to a date far in the past
     # this makes all passwords appear expired
     old_date = (datetime.now() - timedelta(days=9999)).isoformat()
-    
+
     for username, user in users_db.items():
+        if _ct is not None and (user.get('tenant_id', DEFAULT_TENANT_ID) != _ct
+                                or not _account_reach(user) <= _held):
+            continue
         if user.get('role') == ROLE_ADMIN and not include_admins:
             skipped_admins += 1
             continue
@@ -2095,7 +2123,16 @@ def set_vm_acl(cluster_id, vmid):
     users = data.get('users', [])
     permissions = data.get('permissions', [])
     inherit_role = data.get('inherit_role', True)
-    
+
+    # NS Oct 2026 (#1085) - one reading of each field for the ceiling below and the row the
+    # DB stores. inherit_role=[] was weighed as false here and stored as true, a string of
+    # users matched any name inside it (acl_grants_user asks `in`).
+    if not isinstance(inherit_role, bool):
+        return jsonify({'error': 'inherit_role must be true or false'}), 400
+    for _name, _val in (('users', users), ('permissions', permissions)):
+        if not isinstance(_val, list) or not all(isinstance(x, str) for x in _val):
+            return jsonify({'error': f'{_name} must be a list of names'}), 400
+
     # validate permissions
     for p in permissions:
         if p not in PERMISSIONS:

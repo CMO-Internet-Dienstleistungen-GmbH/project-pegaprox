@@ -407,7 +407,8 @@ def tenant_chargeback(tenant_id):
         # scope to the caller's own tenant unless a real admin, else one tenant could
         # read another tenant's full VM inventory + per-VM cost breakdown (BOLA).
         from pegaprox.api.helpers import caller_acts_as_admin
-        if not caller_acts_as_admin():
+        _global = caller_acts_as_admin()
+        if not _global:
             _caller = get_db().get_user(request.session.get('user', '')) or {}
             if tenant_id != _caller.get('tenant_id', _rbac.DEFAULT_TENANT_ID):
                 return jsonify({'error': 'Access denied to this tenant'}), 403
@@ -431,6 +432,11 @@ def tenant_chargeback(tenant_id):
                                        'monthly_subtotal': 0.0, 'vm_count': 0, 'enough_data': False})
                     continue
                 rows = _compute_per_vm(snaps, mgr, rates, days * 24)
+                if not _global:
+                    # NS Oct 2026 - the statement is the tenant's clusters, its rows only the
+                    # guests this caller may see, as on the per-cluster cost routes. A pool- or
+                    # ACL-confined delegate read every guest's name, size and cost here.
+                    rows = scope_vm_rows(cid, rows)
                 for r in rows:
                     r['cluster_id'] = cid
                     r['cluster_name'] = cname

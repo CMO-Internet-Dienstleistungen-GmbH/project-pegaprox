@@ -25,7 +25,8 @@ from pegaprox.globals import (
     ws_clients, ws_clients_lock,
     sse_clients, sse_clients_lock,
 )
-from pegaprox.utils.auth import require_auth, validate_session, load_users
+from pegaprox.utils.auth import (require_auth, validate_session, session_alive,
+                                 api_token_alive, request_credential)
 from pegaprox.utils.rbac import get_user_clusters, acts_as_admin
 from pegaprox.utils.realtime import (
     broadcast_update, broadcast_sse, broadcast_action,
@@ -74,20 +75,22 @@ def ws_live_updates(ws):
             return
 
         username = session['user']
-        # #988 - a request slot for as long as it is open, counted against the account
-        hold_websocket(username, ws)
+        # #988 - a request slot for as long as it is open, counted against the account, and
+        # hung up with the session it was opened under (#1038)
+        hold_websocket(username, ws, sid=session_id)
         # NS Aug 2026 (audit) — scope the WS cluster subscription to what RBAC allows, mirroring the
         # SSE path (/api/sse/updates). Without this a client could omit "clusters" (→ None = all) or
         # name a foreign cluster and receive another tenant's live action events.
         # use the indexed get_user() (not whole-table load_users(), which can transiently degrade to
         # {} under gevent/WAL contention — that would silently drop an admin to a scoped view, or a
         # scoped user onto the default tenant's clusters).
-        try:
-            from pegaprox.core.db import get_db as _gdb
-            _user_data = _gdb().get_user(username)
-        except Exception:
-            _user_data = load_users().get(username, {})
-        _allowed = get_user_clusters(_user_data or {})  # None = admin (all clusters)
+        # NS Oct 2026 - and no whole-table fallback either: when the row read failed it fell back
+        # to load_users().get(name, {}), the {} the comment above warns about (#1037)
+        _user_data = _stream_identity(username)
+        if _user_data is None:
+            ws.send(json.dumps({'type': 'error', 'message': 'Authentication required'}))
+            return
+        _allowed = get_user_clusters(_user_data)  # None = admin (all clusters)
         subscribed_clusters = _scope_ws_clusters(_allowed, auth_data.get('clusters', None))
 
         # sec (audit): the delivery loop now filters per-VM 'action' frames for non-admins, and
@@ -130,6 +133,10 @@ def ws_live_updates(ws):
                 _acct = _stream_identity(username)
                 if _acct is None or not _acct.get('enabled', True):
                     logging.info(f"[WS] closing stream for '{_sl(username)}' — account gone or disabled")
+                    break
+                # the session it was opened under, signed out or revoked since (#1038)
+                if not session_alive(session_id):
+                    logging.info(f"[WS] closing stream for '{_sl(username)}' - its session ended")
                     break
                 _allowed = get_user_clusters(_acct)
                 with ws_clients_lock:
@@ -180,6 +187,17 @@ def ws_live_updates(ws):
             if client_id in ws_clients:
                 del ws_clients[client_id]
         logging.info(f"WebSocket client disconnected: {client_id}")
+
+
+def _credential_alive(bound):
+    """Whether the session or API token a stream was opened under still stands: True,
+    False, or None when it cannot be told right now. A stream bound to neither (minted
+    before tokens carried it) answers True."""
+    if bound.get('sid'):
+        return session_alive(bound['sid'])
+    if bound.get('token_id') is not None:
+        return api_token_alive(bound['token_id'])
+    return True
 
 
 def narrow_stream_scope(previous, fresh_allowed):
@@ -295,8 +313,11 @@ def get_sse_token():
         return jsonify({'error': 'Unauthorized'}), 401
     allowed_clusters = get_user_clusters(user_data)
 
+    # bound to the session or API token it is minted under, so it ends with it (#1038)
+    _sid, _tok = request_credential()
     token = create_sse_token(user, allowed_clusters,
-                             user_data.get('effective_role', user_data.get('role')))
+                             user_data.get('effective_role', user_data.get('role')),
+                             sid=_sid, token_id=_tok)
 
     return jsonify({
         'token': token,
@@ -313,7 +334,8 @@ def get_ws_token():
     """Get a single-use WebSocket auth token - avoids session_id in URLs"""
     user = request.session.get('user', 'unknown')
     role = request.session.get('role', 'viewer')
-    token = create_ws_token(user, role, api_token=bool(request.session.get('api_token')))
+    token = create_ws_token(user, role, api_token=bool(request.session.get('api_token')),
+                            sid=request_credential()[0])
     return jsonify({'token': token, 'expires_in': 60})
 
 
@@ -500,6 +522,7 @@ def sse_updates():
     allowed_clusters = None
     auth_method = None
     _token_role = None
+    _bound = {}
 
     if sse_token:
         # Validate SSE token
@@ -508,6 +531,7 @@ def sse_updates():
             user = token_data['user']
             allowed_clusters = token_data['allowed_clusters']
             _token_role = token_data.get('effective_role')
+            _bound = {'sid': token_data.get('sid'), 'token_id': token_data.get('token_id')}
             auth_method = 'token'
 
     # NS Mar 2026 - removed session_id fallback, token-only auth for SSE
@@ -581,7 +605,9 @@ def sse_updates():
             # role itself so every filter decides as this stream, not as its owner.
             'effective_role': _eff,
             'connected_at': datetime.now().isoformat(),
-            'auth_method': auth_method
+            'auth_method': auth_method,
+            # what it was opened under: ending that ends this stream (end_session_channels)
+            'sid': _bound.get('sid'),
         }
 
     logging.info(f"[SSE] Client connected: {client_id} (user: {user}, auth: {auth_method}) - Total: {len(sse_clients)}")
@@ -621,6 +647,14 @@ def sse_updates():
                 if time.monotonic() >= _next_authz:
                     _next_authz = time.monotonic() + SSE_REAUTHZ_INTERVAL
                     _acct = _stream_identity(user)
+                    # NS Oct 2026 (#1038) - and the session or API token the stream was
+                    # opened under: signed out, revoked or expired since ends it
+                    _alive = _credential_alive(_bound)
+                    if _alive is False:
+                        logging.info(f"[SSE] closing stream for '{_sl(user)}' - signed out")
+                        return
+                    if _alive is None:
+                        _acct = None
                     if _acct is None:
                         # _stream_identity folds "row missing" and "the read failed" into the
                         # same None, and this now runs for every client every 30s — so one

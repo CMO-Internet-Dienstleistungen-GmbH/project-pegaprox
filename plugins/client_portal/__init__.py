@@ -296,8 +296,11 @@ def _vm_console():
             # sec (audit): mint at the caller's EFFECTIVE role. Using the stored role handed an
             # admin-owned viewer token a ws_token stamped 'admin', and the ws-token validate path
             # floors its gates by exactly that stamp — so the ceiling was defeated at the source.
+            from pegaprox.utils.auth import request_credential
+            # NS Oct 2026 - and it ends with the portal session it is minted under
             ws_token = create_ws_token(username,
-                                       user.get('effective_role', user.get('role', 'viewer')))
+                                       user.get('effective_role', user.get('role', 'viewer')),
+                                       sid=request_credential()[0])
             result['ws_token'] = ws_token
             from pegaprox.utils.audit import log_audit
             log_audit(username, 'vm.console', f'Portal: VNC console opened for VM {vmid}', cluster=mgr.config.name, cluster_id=cluster_id)

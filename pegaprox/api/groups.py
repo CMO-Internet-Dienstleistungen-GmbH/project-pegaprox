@@ -15,7 +15,7 @@ from pegaprox.utils.auth import require_auth, load_users, build_authz_user
 from pegaprox.utils.audit import log_audit
 # MK 2026-06-04 (CWE-117): group_id from URL path goes into the logger below.
 from pegaprox.utils.sanitization import sanitize_log_message as _sl
-from pegaprox.utils.rbac import DEFAULT_TENANT_ID, get_user_clusters
+from pegaprox.utils.rbac import DEFAULT_TENANT_ID, UNRESOLVED_TENANT, acting_tenant, get_user_clusters
 from pegaprox.api.helpers import load_server_settings, save_server_settings, check_cluster_access, require_unconfined
 
 bp = Blueprint('groups', __name__)
@@ -76,12 +76,15 @@ def _user_tenant(user: dict):
     Admin + the implicit 'default' tenant stay unscoped (None = see all) so
     single-tenant installs are unaffected; a real tenant gets scoped.
     """
-    tid = (user or {}).get('tenant_id') or DEFAULT_TENANT_ID
     # MK Sep 2026 - effective_role, not role. An API token restricted to viewer/user but
     # owned by an administrator carries role='admin' in the stored record, so reading the
     # raw field here returned None ("unscoped") and every tenant check in this file was
     # skipped for exactly the identity that is supposed to be the most confined one.
-    if _is_admin(user) or tid == DEFAULT_TENANT_ID:
+    # NS Oct 2026 (#1008) - and the tenant its role puts it in, not the stored one: a
+    # default-tenant account on another tenant's role acts in that tenant's clusters
+    # (get_user_clusters) and read here as unscoped, so it edited every tenant's groups.
+    tid = acting_tenant(user)
+    if tid is None or tid == DEFAULT_TENANT_ID:
         return None
     return tid
 
@@ -132,7 +135,9 @@ def create_cluster_group():
     tenant_id = data.get('tenant_id')
     if not _is_admin(user):
         tenant_id = _user_tenant(user)  # Force to user's tenant
-    
+        if tenant_id == UNRESOLVED_TENANT:
+            return jsonify({'error': 'Your role does not resolve to one tenant'}), 403
+
     db = get_db()
     group_id = str(uuid.uuid4())[:8]
     now = datetime.now().isoformat()

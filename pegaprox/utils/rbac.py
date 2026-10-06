@@ -303,6 +303,8 @@ tenants_db = {}
 # No tenant id can contain a NUL, so this never collides with a real one. It is a
 # tenant that does not exist on purpose — see the ambiguity branch below.
 _AMBIGUOUS_ROLE_TENANT = '\x00ambiguous'
+# what a role resolving to no single tenant acts in, for callers outside this module
+UNRESOLVED_TENANT = _AMBIGUOUS_ROLE_TENANT
 
 
 def _tenant_defining_role(role: str, tenant_id: str) -> str:
@@ -353,7 +355,10 @@ def _tenant_defining_role(role: str, tenant_id: str) -> str:
             f"the intended tenant to resolve it."
         )
         return _AMBIGUOUS_ROLE_TENANT
-    return tenant_id
+    # NS Oct 2026 - and a name nobody defines (a role deleted while held, or a role store
+    # that did not load) has no tenant either. It grants nothing, and the default tenant
+    # it fell back to answered every cluster when that tenant has no list (#1061).
+    return _AMBIGUOUS_ROLE_TENANT
 
 
 def get_user_permissions(user: dict, tenant_id: str = None) -> list:
@@ -528,6 +533,50 @@ def get_user_clusters(user: dict, include_pools: bool = True) -> list:
     return _role_clusters(user, include_pools)
 
 
+def _cluster_role(user: dict) -> str:
+    """The role whose tenant an account's clusters come from.
+
+    NS Oct 2026 (#992) - the override of the tenant an account lives in is the role it acts
+    under there: get_user_permissions takes its permissions from it, so a custom role named
+    there has to pick the clusters too. Only a lowered admin read it here, anyone else in the
+    default tenant got another tenant's permissions on the default tenant's scope, all
+    clusters when it has no list. An override naming a builtin remaps nothing and leaves the
+    account's own role to decide. A token acting under a role of its own keeps that one;
+    get_user_clusters holds it inside its owner's clusters.
+    """
+    own = user.get('role', ROLE_VIEWER)
+    role = user.get('effective_role') or own
+    if role not in (ROLE_ADMIN, own):
+        return role
+    tp = (user.get('tenant_permissions') or {}).get(user.get('tenant_id', DEFAULT_TENANT_ID))
+    home = tp.get('role', own) if isinstance(tp, dict) else own
+    if role == ROLE_ADMIN or home not in BUILTIN_ROLES:
+        return home
+    return role
+
+
+def acting_tenant(user: dict):
+    """The tenant whose clusters `user` acts on, or None for an administrator.
+
+    Its own tenant, or for a default-tenant account the one its role is defined by, as
+    get_user_clusters resolves it. A token acting under a role of its own answers for its
+    owner as well: the narrower of the two, and where they name two different tenants
+    UNRESOLVED_TENANT, which owns nothing. NS Oct 2026 (#1008)
+    """
+    if acts_as_admin(user or {}):
+        return None
+    user = user or {}
+    tid = _tenant_defining_role(_cluster_role(user), user.get('tenant_id') or DEFAULT_TENANT_ID)
+    eff = user.get('effective_role')
+    if not eff or eff == user.get('role'):
+        return tid
+    owner = acting_tenant({k: v for k, v in user.items()
+                           if k not in ('effective_role', '_token_owner_capped')})
+    if owner is None or owner == tid or owner == DEFAULT_TENANT_ID:
+        return tid
+    return owner if tid == DEFAULT_TENANT_ID else _AMBIGUOUS_ROLE_TENANT
+
+
 def _role_clusters(user: dict, include_pools: bool = True) -> list:
     global tenants_db
     if not tenants_db:
@@ -552,13 +601,8 @@ def _role_clusters(user: dict, include_pools: bool = True) -> list:
     # MK: If user has default tenant but a tenant-specific role, use the role's tenant.
     # Shared with get_user_permissions — the two answered this differently for years, and the
     # permission side silently fell back to the viewer defaults because of it.
-    role = user.get('effective_role', user.get('role', ROLE_VIEWER))
-    if role == ROLE_ADMIN:
-        # a lowered admin (the only admin left here) holds the override's role where they
-        # live, and a tenant custom role there has to remap like anyone else's
-        role = get_user_effective_role(user)
-    tenant_id = _tenant_defining_role(role, tenant_id)
-    
+    tenant_id = _tenant_defining_role(_cluster_role(user), tenant_id)
+
     tenant = tenants_db.get(tenant_id, {})
     clusters = tenant.get('clusters', [])
     
@@ -684,6 +728,10 @@ def check_tenant_quota(tenant_id, add_cores=0, add_mem_gb=0, add_vms=1, add_disk
         return {'ok': True, 'enforce': 'warn', 'violations': [], 'usage': {}, 'quota': {}}
 
 
+class TenantRangeUnknown(Exception):
+    """The tenant table did not load, so whether a tenant has a VMID range is unknown."""
+
+
 def tenant_vmid_range(tenant_id):
     """(start, end) of the VMID slice a tenant may create in, or (0, 0) for no restriction.
 
@@ -691,9 +739,14 @@ def tenant_vmid_range(tenant_id):
     ids: PVE hands out the next free VMID globally, so whoever creates first takes it and the
     other's numbering drifts into their neighbour's block. Giving each tenant its own slice keeps
     a customer's guests recognisable by id alone, which is what makes per-tenant backup selectors
-    and log greps usable at all."""
+    and log greps usable at all.
+
+    Raises TenantRangeUnknown when the tenant table could not be read: that is not "no range"."""
+    tenants = load_tenants()
+    if store_unavailable(tenants):
+        raise TenantRangeUnknown(tenant_id)
     try:
-        t = (load_tenants() or {}).get(tenant_id) or {}
+        t = (tenants or {}).get(tenant_id) or {}
         start = int(t.get('vmid_range_start', 0) or 0)
         end = int(t.get('vmid_range_end', 0) or 0)
         if start <= 0 or end <= 0 or end < start:
@@ -711,18 +764,29 @@ def check_tenant_vmid(tenant_id, vmid):
     can be over by one, it is the boundary that stops two tenants colliding on the same id. A
     'warn' here would just let the collision happen quietly. No range configured → always ok,
     which is every install that has not set one."""
-    start, end = tenant_vmid_range(tenant_id)
-    if not start:
+    try:
+        start, end = tenant_vmid_range(tenant_id)
+    except TenantRangeUnknown:
+        # NS Oct 2026 - an unreadable tenant table read as "no range" and let every VMID
+        # through. Judged below as if a range were set, and a VMID to judge is refused.
+        start = end = None
+    if start == 0:
         return True, ''
+    _unknown = 'Cannot verify the tenant VMID range right now - check the server logs'
     # NS Oct 2026 - a list or an object passed for "nothing to judge" below, and a list still
     # reaches PVE as a VMID once it is form-encoded (#1081, #1056). A string PVE cannot read
     # as a number it refuses itself.
     if vmid is not None and not isinstance(vmid, (int, str)):
+        if start is None:
+            return False, _unknown
         return False, f'A VMID here is one whole number inside this tenant\'s range ({start}-{end})'
     try:
         v = int(vmid)
     except (TypeError, ValueError):
         return True, ''      # nothing to judge; PVE allocates and the id lands wherever it lands
+    if start is None:
+        logging.error(f"[vmid-range] tenant table unreadable, refusing VMID {v} for {tenant_id!r}")
+        return False, _unknown
     if start <= v <= end:
         return True, ''
     return False, f'VMID {v} is outside this tenant\'s range ({start}-{end})'

@@ -111,7 +111,7 @@ def create_pool(cluster_id):
 # verbs. The members routes below stay here, they have no twin.
 
 
-def _authorize_pool_assignment(cluster_id, pool_id, vmid, vm_type=None):
+def _authorize_pool_assignment(cluster_id, pool_id, vmid, vm_type=None, removing=False):
     """sec (private disclosure Sep 2026 — regression of #766): the pool-member add/remove gate was
     lowered from admin.users to pool.assign (a DEFAULT ROLE_USER perm). Without a per-object check a
     pool.assign holder could re-pool a FOREIGN VM into a pool they control and self-grant access to it
@@ -164,9 +164,13 @@ def _authorize_pool_assignment(cluster_id, pool_id, vmid, vm_type=None):
         # type is not needed to identify the guest.
         _current = next((_p for _k, _p in _members.items()
                          if _k.split(':', 1)[0] == str(_vid)), None)
-    if _current != pool_id and not user_can_access_vm(user, cluster_id, _vid, 'vm.config', vm_type):
+    # NS Oct 2026 - taking a guest out of the pool it is in is no no-op either: whoever reached
+    # it through that pool loses it. A read-only grant on the pool removed it all the same.
+    if (removing or _current != pool_id) and not user_can_access_vm(
+            user, cluster_id, _vid, 'vm.config', vm_type):
+        what = 'removed from its pool' if removing else 'moved between pools'
         return False, (jsonify({
-            'error': 'You can see this VM but not manage it, so it cannot be moved between pools'
+            'error': f'You can see this VM but not manage it, so it cannot be {what}'
         }), 403)
     return True, None
 
@@ -262,7 +266,7 @@ def remove_pool_member(cluster_id, pool_id, vmid):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
 
-    ok, err = _authorize_pool_assignment(cluster_id, pool_id, vmid)
+    ok, err = _authorize_pool_assignment(cluster_id, pool_id, vmid, removing=True)
     if not ok: return err
 
     manager = cluster_managers.get(cluster_id)

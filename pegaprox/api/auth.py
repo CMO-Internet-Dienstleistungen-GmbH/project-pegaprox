@@ -447,10 +447,15 @@ def oidc_test_connection():
             results.append({'step': 'JWKS Endpoint', 'status': 'error',
                             'detail': f"URL rejected by SSRF guard: {guard_err}{hint}"})
             return jsonify({'success': False, 'results': results})
-        resp = requests.get(validated_jwks_url, timeout=10)
+        # NS Oct 2026 - not followed: a redirect target is a URL the guard above never saw
+        resp = requests.get(validated_jwks_url, allow_redirects=False, timeout=10)
         if resp.status_code == 200:
             keys = resp.json().get('keys', [])
             results.append({'step': 'JWKS Endpoint', 'status': 'ok', 'detail': f"Found {len(keys)} signing keys"})
+        elif 300 <= resp.status_code < 400:
+            results.append({'step': 'JWKS Endpoint', 'status': 'warning',
+                            'detail': f"HTTP {resp.status_code}: the JWKS URL redirects, "
+                                      f"which this test does not follow"})
         else:
             results.append({'step': 'JWKS Endpoint', 'status': 'error', 'detail': f"HTTP {resp.status_code}"})
     except Exception as e:

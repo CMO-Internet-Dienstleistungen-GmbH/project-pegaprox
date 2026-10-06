@@ -764,11 +764,13 @@ def create_session(username: str, role: str, remember: bool = False) -> str:
                          if sess.get('user') == username and not sess.get('ha_forward')]
 
         # Sort by last_activity, remove oldest if more than 2 (new one will be 3rd)
+        rotated = []
         if len(user_sessions) >= 3:
             user_sessions.sort(key=lambda x: x[1].get('last_activity', 0))
             # Remove oldest sessions, keep 2
             for sid, _ in user_sessions[:-2]:
                 del active_sessions[sid]
+                rotated.append(sid)
                 logging.debug(f"Session rotation: removed old session for {username}")
 
         active_sessions[session_id] = {
@@ -783,6 +785,8 @@ def create_session(username: str, role: str, remember: bool = False) -> str:
 
     # Save sessions to disk (outside lock - I/O operation)
     save_sessions()
+    if rotated:
+        _end_channels(username, sids=rotated)
 
     return session_id
 
@@ -989,13 +993,56 @@ def _serves_forwarded_write(session_id: str) -> bool:
 
 def invalidate_session(session_id: str):
     """Invalidate a session (logout)"""
-    removed = False
+    removed = None
     with sessions_lock:
         if session_id in active_sessions:
-            del active_sessions[session_id]
-            removed = True
-    if removed:
+            removed = active_sessions.pop(session_id)
+    if removed is not None:
         save_sessions()
+        _end_channels(removed.get('user'), sids={session_id})
+
+
+def _end_channels(username, **kw):
+    """NS Oct 2026 (#1038) - what the ended sessions opened goes with them."""
+    if not username:
+        return
+    try:
+        from pegaprox.utils.realtime import end_session_channels
+        end_session_channels(username, **kw)
+    except Exception as e:
+        logging.warning(f"could not end the live channels of {username!r}: {e}")
+
+
+def session_alive(session_id: str) -> bool:
+    """Whether a session still stands. Touches nothing, so an open stream asking this does
+    not keep its session from idling out."""
+    with sessions_lock:
+        return bool(session_id) and session_id in active_sessions
+
+
+def api_token_alive(token_id):
+    """True while an API token stands, False once it is revoked, deleted or expired, None
+    when the token table cannot be read."""
+    try:
+        cur = get_db().conn.cursor()
+        cur.execute('SELECT revoked, expires_at FROM api_tokens WHERE id = ?', (token_id,))
+        row = cur.fetchone()
+        if not row or row['revoked']:
+            return False
+        return not (row['expires_at'] and datetime.now() > datetime.fromisoformat(row['expires_at']))
+    except Exception as e:
+        logging.warning(f"[APIToken] cannot tell whether token id={token_id} stands: {e}")
+        return None
+
+
+def request_credential():
+    """(session id, API token id) this request is signed in with, one of them None. For a
+    token or stream minted here, so it ends with what it was minted under."""
+    sess = getattr(request, 'session', None) or {}
+    if sess.get('api_token'):
+        return None, sess.get('token_id')
+    return request.headers.get('X-Session-ID') or request.cookies.get('session_id'), None
+
 
 def invalidate_all_user_sessions(username: str, except_session: str = None):
     """Invalidate all sessions for a user (used when password changes)
@@ -1013,6 +1060,9 @@ def invalidate_all_user_sessions(username: str, except_session: str = None):
     if sessions_removed > 0:
         save_sessions()
         logging.info(f"Invalidated {sessions_removed} sessions for user '{username}'")
+    # every caller is a credential change, a disable or a delete: whatever the user has open
+    # elsewhere goes too, API token streams included
+    _end_channels(username, keep=except_session)
 
     return sessions_removed
 
