@@ -13,7 +13,7 @@ from pegaprox.core.db import get_db
 from pegaprox.utils.auth import require_auth
 from pegaprox.utils.audit import log_audit
 from pegaprox.utils.sanitization import bounded_list
-from pegaprox.api.helpers import safe_error, check_pbs_access, check_cluster_access, scope_vm_rows, require_unconfined, bounded_limit
+from pegaprox.api.helpers import safe_error, check_pbs_access, check_cluster_access, scope_vm_rows, require_unconfined, bounded_limit, acts_as_admin
 from pegaprox.core.pbs import PBSManager, load_pbs_servers, save_pbs_server
 
 bp = Blueprint('pbs', __name__)
@@ -58,11 +58,11 @@ def list_pbs_servers():
     # PBS server (role==ADMIN short-circuit + _guc None) despite the token's reduced scope.
     from pegaprox.utils.auth import build_authz_user as _bau
     from pegaprox.utils.rbac import get_user_clusters as _guc
-    from pegaprox.models.permissions import ROLE_ADMIN as _RA
     _lu = _bau(request.session.get('user', ''), request.session)
     _uc = _guc(_lu)  # None => all clusters (admin / default tenant)
+    _all = acts_as_admin(_lu)
     def _pbs_visible(linked):
-        if _lu.get('effective_role', _lu.get('role')) == _RA or _uc is None:
+        if _all or _uc is None:
             return True
         linked = linked or []
         return (not linked) or any(c in _uc for c in linked)
@@ -165,7 +165,7 @@ def update_pbs_server(pbs_id):
         from pegaprox.utils.auth import build_authz_user as _bau
         from pegaprox.utils.rbac import get_user_clusters as _guc
         _caller = _bau(request.session.get('user', ''), request.session)
-        if _caller.get('effective_role', _caller.get('role')) != ROLE_ADMIN:
+        if not acts_as_admin(_caller):
             _new_links = list(data.get('linked_clusters') or [])
             if not _new_links:
                 return jsonify({'error': 'Access denied: only a global admin may unlink a PBS '
@@ -775,7 +775,7 @@ def _scope_pbs_rows(mgr, rows, type_key='backup-type', id_key='backup-id',
     rows name it in worker_id, not in backup-type/backup-id."""
     from pegaprox.utils.auth import build_authz_user
     user = build_authz_user(request.session.get('user', ''), request.session)
-    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+    if acts_as_admin(user):
         return rows
     scoped = _caller_is_scoped_here(mgr, user)
     if not scoped:
@@ -882,7 +882,7 @@ def require_pbs_wide(pbs_id, action='this action'):
         return jsonify({'error': 'PBS server not found'}), 404
 
     user = build_authz_user(request.session.get('user', ''), request.session)
-    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+    if acts_as_admin(user):
         return None
 
     linked = list(mgr.linked_clusters or [])
@@ -940,7 +940,7 @@ def _authz_pbs_backup(mgr, backup_type, backup_id, permission='vm.backup', user=
     if user is None:
         from pegaprox.utils.auth import build_authz_user
         user = build_authz_user(request.session.get('user', ''), request.session)
-    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+    if acts_as_admin(user):
         return True, None
 
     if scoped is None:
@@ -3458,7 +3458,7 @@ def restore_backup(cluster_id):
     from pegaprox.utils.auth import build_authz_user
     from pegaprox.utils.rbac import user_can_access_vm
     _src_authz_user = build_authz_user(request.session.get('user', ''), request.session)
-    if _src_authz_user.get('effective_role', _src_authz_user.get('role')) != ROLE_ADMIN:
+    if not acts_as_admin(_src_authz_user):
         _sm = _re.search(r'/(?:vm|ct)/(\d+)/', volid) or _re.search(r'vzdump-(?:qemu|lxc|openvz)-(\d+)-', volid)
         _src_vmid = int(_sm.group(1)) if _sm else None
         _src_is_lxc = '/ct/' in volid or 'vzdump-lxc' in volid or 'vzdump-openvz' in volid or volid.endswith('.lxc.tar')
@@ -3472,8 +3472,7 @@ def restore_backup(cluster_id):
     # including one inside another tenant's configured VMID range, and onto storage they have
     # no claim to. vms.py has enforced the range on create since the tenant-limits work; the
     # restore path never learned about it.
-    if mode == 'new' and _src_authz_user.get('effective_role',
-                                             _src_authz_user.get('role')) != ROLE_ADMIN:
+    if mode == 'new' and not acts_as_admin(_src_authz_user):
         from pegaprox.utils.rbac import check_tenant_vmid, DEFAULT_TENANT_ID as _DT
         _rok, _rmsg = check_tenant_vmid(_src_authz_user.get('tenant_id') or _DT, target_vmid)
         if not _rok:

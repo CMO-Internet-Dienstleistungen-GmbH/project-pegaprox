@@ -20,13 +20,17 @@ def test_admin_is_never_confined(api, seed):
 
 
 def test_admin_owned_scoped_token_is_confined(api, seed):
-    # the point of the token-flooring work: effective_role beats the stored role
+    # the point of the token-flooring work: effective_role beats the stored role, so the token
+    # takes no admin shortcut and is confined outside its owner's tenant. Inside it, it is the
+    # plain viewer it was scoped to - user_has_any_pool_access used to read the owner's stored
+    # role and called it confined there as well (#1028).
     seed.tenant('acme', clusters=['cluster_1'])
     with api.app.test_request_context('/'):
         from flask import request
         request.session = {'user': 'root', 'role': 'viewer', 'api_token': True}
         u = {'username': 'root', 'role': 'admin', 'effective_role': 'viewer', 'tenant_id': 'acme'}
-        assert caller_is_scoped(u, 'cluster_1') is True
+        assert caller_is_scoped(u, 'cluster_2') is True
+        assert caller_is_scoped(u, 'cluster_1') is False
 
 
 def test_unknown_identity_fails_closed(api, seed):

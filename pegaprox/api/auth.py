@@ -2053,8 +2053,9 @@ def _api_token_admin_scope():
     used IP) and revoke any of it. Same rule the user-management routes use.
     """
     from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import acts_as_admin
     u = build_authz_user(request.session.get('user', ''), request.session)
-    if u.get('effective_role', u.get('role')) == ROLE_ADMIN:
+    if acts_as_admin(u):
         return None
     return u.get('tenant_id', DEFAULT_TENANT_ID)
 

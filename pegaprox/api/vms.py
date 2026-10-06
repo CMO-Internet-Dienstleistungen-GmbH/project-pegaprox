@@ -1691,7 +1691,8 @@ def restore_vm_backup(cluster_id, node, vm_type, vmid):
     # scoped to their own VM could restore ANOTHER VM's backup image into it (force=1 when
     # target==vmid) and read the contents. Mirrors pbs.py restore_backup's source check.
     _authz_user = build_authz_user(request.session.get('user', ''), request.session)
-    if _authz_user.get('effective_role', _authz_user.get('role')) != ROLE_ADMIN:
+    from pegaprox.utils.rbac import acts_as_admin
+    if not acts_as_admin(_authz_user):
         import re as _re
         _sm = _re.search(r'/(?:vm|ct)/(\d+)/', volid) or _re.search(r'vzdump-(?:qemu|lxc|openvz)-(\d+)-', volid)
         _src_vmid = int(_sm.group(1)) if _sm else None
@@ -1760,7 +1761,8 @@ def delete_vm_backup(cluster_id, node, vm_type, vmid, volid):
     # else a scoped backup.delete holder could delete ANOTHER VM's backup by naming its volid (the
     # source vmid is embedded in vzdump-<type>-<vmid>-...). Mirrors restore_vm_backup's source check.
     _authz_user = build_authz_user(request.session.get('user', ''), request.session)
-    if _authz_user.get('effective_role', _authz_user.get('role')) != ROLE_ADMIN:
+    from pegaprox.utils.rbac import acts_as_admin
+    if not acts_as_admin(_authz_user):
         import re as _re
         _sm = _re.search(r'/(?:vm|ct)/(\d+)/', volid) or _re.search(r'vzdump-(?:qemu|lxc|openvz)-(\d+)-', volid)
         _src_vmid = int(_sm.group(1)) if _sm else None
@@ -7468,7 +7470,8 @@ def snapshots_overview_delete():
     user_data = build_authz_user(user, request.session)
     data = request.get_json(silent=True) or {}
     snapshots = data.get('snapshots', [])
-    is_admin = user_data.get('effective_role', user_data.get('role')) == ROLE_ADMIN
+    from pegaprox.utils.rbac import acts_as_admin
+    is_admin = acts_as_admin(user_data)
     user_clusters = get_user_clusters(user_data)   # None => all clusters
     
     deleted_count = 0
@@ -9614,8 +9617,10 @@ def _console_authz(user, cluster_id, vmid, vm_type=None):
     # pre-minted ws_token (this path is reached without require_auth's account-state gate).
     if not user.get('enabled', True):
         return False, 'account disabled'
-    # NS Oct 2026 (#1116) - the role an API token acts under, not its owner's
-    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+    # NS Oct 2026 (#1116, #1028) - the role an API token acts under, and no tenant override
+    # lowering the account where it lives
+    from pegaprox.utils.rbac import acts_as_admin
+    if acts_as_admin(user):
         return True, None
     username = user.get('username', '') or ''
     # cluster gate (mirrors helpers.check_cluster_access, but no request.session)

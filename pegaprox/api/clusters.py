@@ -1360,7 +1360,8 @@ def get_cluster_resources(cluster_id):
     from pegaprox.utils.auth import build_authz_user
     user = build_authz_user(request.session['user'], request.session)
     user['username'] = request.session['user']
-    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+    from pegaprox.utils.rbac import acts_as_admin
+    if acts_as_admin(user):
         return jsonify(all_resources)
 
     # Aikido 469089182 re-verify — the RESTRICTIVE ACL listing below (an ACL'd VM is hidden from

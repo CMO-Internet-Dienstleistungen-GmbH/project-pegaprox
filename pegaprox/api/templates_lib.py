@@ -559,13 +559,13 @@ def delete_custom_template(tpl_id):
         if _row is None:
             return jsonify({'error': 'not found'}), 404
         _owner = (_row['created_by'] if hasattr(_row, 'keys') else _row[0]) or ''
-        from pegaprox.models.permissions import ROLE_ADMIN
+        from pegaprox.utils.rbac import acts_as_admin
         # sec (audit): resolve the role live rather than reading the value cached when the session
         # was minted — same drift the role-template path in users.py had, and build_authz_user also
         # applies an API token's floor here.
         from pegaprox.utils.auth import build_authz_user
         _caller = build_authz_user(_current_user(), request.session)
-        if _owner != _current_user() and _caller.get('effective_role', _caller.get('role')) != ROLE_ADMIN:
+        if _owner != _current_user() and not acts_as_admin(_caller):
             return jsonify({'error': 'Access denied'}), 403
         c.execute('DELETE FROM custom_cloud_templates WHERE id = ?', (tpl_id,))
         get_db().conn.commit()
@@ -631,9 +631,9 @@ def deploy(cluster_id):
     # path was closed the same way earlier this month.
     from pegaprox.utils.auth import build_authz_user as _bau
     from pegaprox.api.helpers import require_unconfined as _runc
-    from pegaprox.models.permissions import ROLE_ADMIN as _RA
+    from pegaprox.utils.rbac import acts_as_admin
     _caller = _bau(request.session.get('user', ''), request.session)
-    if _caller.get('effective_role', _caller.get('role')) != _RA:
+    if not acts_as_admin(_caller):
         _cerr = _runc(cluster_id)
         if _cerr:
             return _cerr

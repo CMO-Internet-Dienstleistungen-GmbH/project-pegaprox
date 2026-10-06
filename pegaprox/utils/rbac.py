@@ -320,7 +320,13 @@ def _tenant_defining_role(role: str, tenant_id: str) -> str:
     more tenants has no single answer and is refused outright rather than guessed at."""
     if not role or role in BUILTIN_ROLES or tenant_id != DEFAULT_TENANT_ID:
         return tenant_id
-    owners = [tid for tid, roles in get_custom_roles().get('tenants', {}).items()
+    custom = get_custom_roles()
+    # NS Oct 2026 (#1013) - a GLOBAL role of this name is the one a default-tenant caller
+    # holds. Remapping past it let any tenant that defined the same name take over every
+    # default-tenant holder: their permissions and their clusters became that tenant's.
+    if role in (custom.get('global') or {}):
+        return tenant_id
+    owners = [tid for tid, roles in custom.get('tenants', {}).items()
               if role in roles]
     if len(owners) == 1:
         return owners[0]
@@ -442,6 +448,20 @@ def _admin_is_capped_in_own_tenant(user: dict) -> bool:
     return tp.get('role', user.get('role')) != ROLE_ADMIN
 
 
+def acts_as_admin(user: dict) -> bool:
+    """The admin fast path of a gate: the role (an API token's effective one) is admin and
+    no tenant override lowers the account inside its own tenant.
+
+    NS Oct 2026 (#1028, #1031) - has_permission and get_user_clusters have asked both since
+    Aikido 700487698, the other shortcuts compared the role alone. An admin mapped down to
+    viewer where they live then still passed caller_is_scoped, the per-VM gates and the PBS
+    checks, and so reached every tenant's guests and backups. Every admin shortcut asks this.
+    """
+    if not user or user.get('effective_role', user.get('role')) != ROLE_ADMIN:
+        return False
+    return not _admin_is_capped_in_own_tenant(user)
+
+
 def has_permission(user: dict, permission: str, tenant_id: str = None) -> bool:
     """check if user has a specific permission
     
@@ -489,8 +509,7 @@ def get_user_clusters(user: dict, include_pools: bool = True) -> list:
     # admin sees all — honor the token-scoped effective_role (#491) so an admin-owned API token
     # restricted to viewer/user doesn't inherit the owner's all-cluster access, and the LDAP
     # tenant override for the same reason (see _admin_is_capped_in_own_tenant).
-    if (user.get('effective_role', user.get('role')) == ROLE_ADMIN
-            and not _admin_is_capped_in_own_tenant(user)):
+    if acts_as_admin(user):
         return None  # None means all clusters
 
     # MK Sep 2026 - we could not read the tenant table, so we do not know what this caller
@@ -507,6 +526,10 @@ def get_user_clusters(user: dict, include_pools: bool = True) -> list:
     # Shared with get_user_permissions — the two answered this differently for years, and the
     # permission side silently fell back to the viewer defaults because of it.
     role = user.get('effective_role', user.get('role', ROLE_VIEWER))
+    if role == ROLE_ADMIN:
+        # a lowered admin (the only admin left here) holds the override's role where they
+        # live, and a tenant custom role there has to remap like anyone else's
+        role = get_user_effective_role(user)
     tenant_id = _tenant_defining_role(role, tenant_id)
     
     tenant = tenants_db.get(tenant_id, {})
@@ -1000,7 +1023,7 @@ def _pool_perms_for(cluster_id: str, username: str, groups=None) -> dict:
 def user_has_any_pool_access(user: dict, cluster_id: str) -> bool:
     """#555 — does this user hold ANY pool permission in this cluster?
     One cheap DB read, no membership scan. For the cluster gates."""
-    if user.get('role') == ROLE_ADMIN:
+    if acts_as_admin(user):
         return True
     username = user.get('username', '')
     if not username:
@@ -1121,7 +1144,7 @@ def _user_can_access_vm_uncapped(user: dict, cluster_id: str, vmid: int, permiss
     """
     # MK: effective_role (token-scoped) wins over the stored role so an admin-owned
     # restricted token doesn't get the admin VM bypass below
-    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+    if acts_as_admin(user):
         return True
 
     username = user.get('username', '')
@@ -1320,7 +1343,7 @@ def get_user_vms(user: dict, cluster_id: str) -> list:
     
     Returns None if user can access all VMs (admin or no restrictions)
     """
-    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+    if acts_as_admin(user):
         return None
 
     username = user.get('username', '')
@@ -1377,7 +1400,7 @@ def user_can_access_vmware_vm(user: dict, vmware_id: str, vm_id: str, permission
     # NS Aug 2026 (Aikido pentest) — effective_role (token-scoped) wins over the stored role,
     # exactly like the Proxmox twin user_can_access_vm above; otherwise an admin-owned but
     # viewer-scoped API token gets the full-admin VMware VM bypass here.
-    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+    if acts_as_admin(user):
         return True
 
     username = user.get('username', '')

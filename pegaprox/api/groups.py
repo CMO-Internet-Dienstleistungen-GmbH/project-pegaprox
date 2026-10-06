@@ -62,7 +62,8 @@ def _group_denied_as_missing(group, user):
 _GROUP_MISSING = ({'error': 'Group not found'}, 404)
 
 def _is_admin(user) -> bool:
-    return (user or {}).get('effective_role', (user or {}).get('role')) == ROLE_ADMIN
+    from pegaprox.utils.rbac import acts_as_admin
+    return acts_as_admin(user)
 
 
 def _user_tenant(user: dict):
@@ -80,8 +81,7 @@ def _user_tenant(user: dict):
     # owned by an administrator carries role='admin' in the stored record, so reading the
     # raw field here returned None ("unscoped") and every tenant check in this file was
     # skipped for exactly the identity that is supposed to be the most confined one.
-    if (user or {}).get('effective_role', (user or {}).get('role')) == ROLE_ADMIN \
-            or tid == DEFAULT_TENANT_ID:
+    if _is_admin(user) or tid == DEFAULT_TENANT_ID:
         return None
     return tid
 

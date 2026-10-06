@@ -423,11 +423,11 @@ _SSE_OBJECT_FRAMES = ('xhm_migration', 'xhm_migration_log',
 def _sse_may_see_object_frame(username, update_type, data, effective_role=None):
     """True if this client may see one of the _SSE_OBJECT_FRAMES. Fails closed: an unknown user, or
     a frame naming an object we can no longer resolve, gets nothing (an admin short-circuits)."""
-    from pegaprox.models.permissions import ROLE_ADMIN
+    from pegaprox.utils.rbac import acts_as_admin
     user = _sse_stored_user(username, effective_role)
     if not user:
         return False
-    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+    if acts_as_admin(user):
         return True
     data = data or {}
     try:

@@ -327,7 +327,9 @@ def _auth_ok():
                                     "account is gone or disabled")
                     return False
                 if info.get('role') == ROLE_ADMIN:
-                    if owner.get('role') == ROLE_ADMIN:
+                    # an owner a tenant override lowers is not an admin here either (#1028)
+                    from pegaprox.utils.rbac import acts_as_admin
+                    if acts_as_admin(owner):
                         return True
                     logging.warning(f"[metrics] rejected admin token for '{info.get('user')}' - "
                                     "owner is no longer admin")

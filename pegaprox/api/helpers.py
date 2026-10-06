@@ -17,6 +17,7 @@ from pegaprox.globals import (
     task_pegaprox_users_cache, task_pegaprox_users_lock,
 )
 from pegaprox.core.db import get_db
+from pegaprox.utils.rbac import acts_as_admin
 
 def effective_reverse_proxy(settings=None):
     """#614 — the frontend builds console (VNC/SSH) WebSocket URLs from
@@ -404,6 +405,13 @@ def acting_user():
     return user
 
 
+def caller_acts_as_admin():
+    """rbac.acts_as_admin for the caller of this request. request.session['role'] is the
+    account's role as stored: neither a token's floor nor a tenant override lowers it, so it
+    is no answer to "may this caller skip the tenant checks". NS Oct 2026 (#1060)"""
+    return acts_as_admin(acting_user())
+
+
 def check_cluster_access(cluster_id):
     """Check if current user can access a cluster based on tenant or VM ACLs.
     Returns (True, None) if allowed, (False, error_response) if not.
@@ -448,12 +456,11 @@ def caller_is_scoped(user, cluster_id):
     caller whose tenant DOES own the cluster — the Client Portal case. Those endpoints therefore
     treated a portal user as a cluster-wide operator and handed back the whole cluster. Centralised
     here so the rule can't drift between call sites again."""
-    from pegaprox.models.permissions import ROLE_ADMIN
     from pegaprox.utils.rbac import (get_user_clusters, user_has_any_pool_access, get_vm_acls,
                                      acls_unavailable, acl_grants_user)
     if not user:
         return True   # unknown identity → treat as confined (fail closed)
-    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+    if acts_as_admin(user):
         return False
     tenant_clusters = get_user_clusters(user, include_pools=False)
     if tenant_clusters is not None and cluster_id not in tenant_clusters:
@@ -491,16 +498,9 @@ MAINTENANCE_GUEST_FIELDS = ('failed_vms', 'pending_vms', 'current_vm', 'off_pin_
 
 def sees_whole_maintenance(user, cluster_id):
     """Whether `user` gets the guests of a maintenance in `cluster_id`: when caller_is_scoped
-    says no. An admin a tenant override lowers where they live is asked as that role - the
-    admin shortcut in caller_is_scoped does not look at the override, and such an admin
-    reaches a foreign cluster through the ACL and pool fallbacks like anybody. Fails closed."""
-    from pegaprox.models.permissions import ROLE_ADMIN
-    from pegaprox.utils.rbac import _admin_is_capped_in_own_tenant, get_user_effective_role
+    says no. An admin a tenant override lowers where they live is asked as that role (see
+    rbac.acts_as_admin). Fails closed."""
     try:
-        if (user and user.get('effective_role', user.get('role')) == ROLE_ADMIN
-                and _admin_is_capped_in_own_tenant(user)):
-            lowered = get_user_effective_role(user)
-            user = dict(user, role=lowered, effective_role=lowered)
         return not caller_is_scoped(user, cluster_id)
     except Exception as e:
         logging.warning(f"[MAINT] scope on {cluster_id} unknown, maintenance guests left out: {e}")
@@ -584,7 +584,6 @@ def check_pbs_access(pbs_id):
     from pegaprox.utils.auth import build_authz_user
     from pegaprox.utils.rbac import get_user_clusters
     from pegaprox.globals import pbs_managers
-    from pegaprox.models.permissions import ROLE_ADMIN
 
     # Check if PBS exists
     if pbs_id not in pbs_managers:
@@ -596,8 +595,8 @@ def check_pbs_access(pbs_id):
     # check_cluster_access). get_user_clusters() already honors effective_role.
     user = build_authz_user(request.session.get('user', ''), request.session)
 
-    # Admins have full access
-    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+    # Admins have full access - not one a tenant override lowered where they live
+    if acts_as_admin(user):
         return True, None
     
     # Get PBS linked clusters
@@ -671,7 +670,6 @@ def check_vmware_access(vmware_id):
     from flask import request, jsonify
     from pegaprox.utils.rbac import get_user_clusters
     from pegaprox.globals import vmware_managers
-    from pegaprox.models.permissions import ROLE_ADMIN
 
     if vmware_id not in vmware_managers:
         return False, (jsonify({'error': 'VMware server not found'}), 404)
@@ -685,7 +683,7 @@ def check_vmware_access(vmware_id):
     user = acting_user()
     if not user:
         return False, (jsonify({'error': 'Unauthorized', 'code': 'AUTH_REQUIRED'}), 401)
-    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+    if acts_as_admin(user):
         return True, None
     linked = getattr(vmware_managers[vmware_id], 'linked_clusters', None) or []
     if not linked:

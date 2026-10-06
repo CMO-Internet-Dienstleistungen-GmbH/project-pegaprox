@@ -158,7 +158,8 @@ def unconfined_admin(username, session):
     banner names instances only to them. Fails closed."""
     try:
         user = build_authz_user(username or '', session or {})
-        return user.get('role') == ROLE_ADMIN and _unconfined(user)
+        from pegaprox.utils.rbac import acts_as_admin
+        return acts_as_admin(user) and _unconfined(user)
     except Exception as e:
         logging.warning(f"[HA] could not resolve a cluster scope for the banner: {e}")
         return False

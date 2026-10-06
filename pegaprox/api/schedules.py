@@ -671,7 +671,8 @@ def get_schedules():
     # admin-owned viewer token hit the all-clusters early return below and read every
     # scheduled action in the install.
     user_data = build_authz_user(user, request.session)
-    is_admin = user_data.get('effective_role', user_data.get('role')) == ROLE_ADMIN
+    from pegaprox.utils.rbac import acts_as_admin
+    is_admin = acts_as_admin(user_data)
 
     # NS Jul 2026 (CodeAnt IDOR) — use the real access model. The old filter read the raw
     # user_data['clusters'] field and FELL OPEN (`if not user_clusters` -> returned every tenant's

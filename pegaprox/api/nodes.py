@@ -2261,8 +2261,8 @@ def install_starlvm_plugin(cluster_id):
     # to that delegate; pointing it somewhere else is the global admin's call.
     from pegaprox.utils.auth import build_authz_user as _bau
     _caller = _bau(request.session.get('user', ''), request.session)
-    if (_caller.get('effective_role', _caller.get('role')) != ROLE_ADMIN
-            and (body.get('repo_url') or body.get('key_url'))):
+    from pegaprox.utils.rbac import acts_as_admin
+    if not acts_as_admin(_caller) and (body.get('repo_url') or body.get('key_url')):
         return jsonify({'error': 'Only a global admin can install from a repository or '
                                  'signing key other than the default'}), 403
     try:

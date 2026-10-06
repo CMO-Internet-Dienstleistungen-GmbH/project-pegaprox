@@ -1121,8 +1121,8 @@ def alerts_force_check():
     # cooldown that stops repeat sends. Both side effects are global; only a global admin gets
     # them. Everyone else still gets the diagnostic read below, scoped to their own clusters.
     from pegaprox.utils.auth import build_authz_user as _bau
-    _fc_admin = (_bau(request.session.get('user', ''), request.session)
-                 .get('effective_role', request.session.get('role')) == ROLE_ADMIN)
+    from pegaprox.utils.rbac import acts_as_admin
+    _fc_admin = acts_as_admin(_bau(request.session.get('user', ''), request.session))
     if not _fc_admin:
         _ev_only = A._last_eval
         from pegaprox.utils.rbac import get_user_clusters as _guc

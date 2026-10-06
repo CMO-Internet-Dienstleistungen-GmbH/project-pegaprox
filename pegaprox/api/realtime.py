@@ -26,7 +26,7 @@ from pegaprox.globals import (
     sse_clients, sse_clients_lock,
 )
 from pegaprox.utils.auth import require_auth, validate_session, load_users
-from pegaprox.utils.rbac import get_user_clusters
+from pegaprox.utils.rbac import get_user_clusters, acts_as_admin
 from pegaprox.utils.realtime import (
     broadcast_update, broadcast_sse, broadcast_action,
     create_sse_token, validate_sse_token,
@@ -91,7 +91,8 @@ def ws_live_updates(ws):
         # `subscribed is None` does NOT mean admin (get_user_clusters returns None for a
         # default-tenant scoped user too) — capture the real role once, like the SSE path does.
         # Fail closed: an unresolvable identity is treated as non-admin and gets filtered.
-        _is_admin = (_user_data or {}).get('role') == ROLE_ADMIN
+        # NS Oct 2026 (#1028) - and an admin a tenant override lowers is no admin here either
+        _is_admin = acts_as_admin(_user_data or {})
 
         with ws_clients_lock:
             ws_clients[client_id] = {
@@ -132,7 +133,7 @@ def ws_live_updates(ws):
                     _ci = ws_clients.get(client_id)
                     if _ci is not None:
                         _acct_role = _acct.get('effective_role') or _acct.get('role')
-                        _ci['is_admin'] = _acct_role == ROLE_ADMIN
+                        _ci['is_admin'] = acts_as_admin(_acct)
                         _ci['effective_role'] = _acct_role
                         # a demotion has to narrow the LIVE subscription too, not just future ones
                         _ci['clusters'] = _scope_ws_clusters(_allowed, _ci.get('clusters'))
@@ -544,7 +545,7 @@ def sse_updates():
         # the token's minted role wins — this route has no session, so the stored role would
         # hand an admin-owned scoped token the admin flag again
         _eff = _token_role or (_ident or {}).get('effective_role') or (_ident or {}).get('role')
-        _is_admin = bool(_ident) and _eff == ROLE_ADMIN
+        _is_admin = bool(_ident) and _eff == ROLE_ADMIN and acts_as_admin(_ident)
     except Exception:
         _eff = _token_role
         _is_admin = False
@@ -646,7 +647,7 @@ def sse_updates():
                         _ci = sse_clients.get(client_id)
                         if _ci is not None:
                             _ci['effective_role'] = _token_role if _token_restricts else _acct_role
-                            _ci['is_admin'] = (_acct_role == ROLE_ADMIN) and not _token_restricts
+                            _ci['is_admin'] = acts_as_admin(_acct) and not _token_restricts
                             _prev = _ci.get('clusters')
                             _now_allowed = narrow_stream_scope(_prev, _fresh_allowed)
                             if _now_allowed != _prev:

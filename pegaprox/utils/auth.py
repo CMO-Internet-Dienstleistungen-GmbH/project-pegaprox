@@ -1235,8 +1235,22 @@ def require_auth(roles: list = None, perms: list = None):
                 if fresh_role != session['role']:
                     session['role'] = fresh_role
 
+            # NS Oct 2026 (#1000, #1028) - an admin a tenant override lowers where they live is
+            # that role here as well. has_permission already answered so, but roles=[ROLE_ADMIN]
+            # compared the stored role and let them run every admin-only route, the scheduled
+            # tasks against any cluster's guests among them. Published below as effective_role.
+            _lowered = False
+            if fresh_role == ROLE_ADMIN:
+                from pegaprox.utils.rbac import _admin_is_capped_in_own_tenant, get_user_effective_role
+                if _admin_is_capped_in_own_tenant(user):
+                    fresh_role, _lowered = get_user_effective_role(user), True
+
             # Check role if specified
             if roles and fresh_role not in roles:
+                if _lowered:
+                    return jsonify({'error': 'Forbidden: a tenant mapping lowers this account '
+                                             'below administrator',
+                                    'code': 'INSUFFICIENT_PERMISSIONS'}), 403
                 return jsonify({'error': 'Forbidden', 'code': 'INSUFFICIENT_PERMISSIONS'}), 403
             
             # check permissions if specified
