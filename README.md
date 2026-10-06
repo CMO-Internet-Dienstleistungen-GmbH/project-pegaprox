@@ -44,7 +44,7 @@ PegaProx is a powerful web-based management interface for Proxmox VE and XCP-ng 
 
 ### 🪽 What's in the name?
 
-The name **PegaProx** is inspired by *Pegasus*, the winged horse of Greek mythology, combined with *Prox* as a reference to Proxmox VE. Pegasus symbolises speed, freedom and elegant flight — qualities we aspire to bring to multi-cluster hypervisor management.
+The name **PegaProx** is inspired by *Pegasus*, the winged horse of Greek mythology, combined with *Prox* as a reference to Proxmox VE. Pegasus symbolises speed, freedom and elegant flight - qualities we aspire to bring to multi-cluster hypervisor management.
 
 ## ❤️ Sponsors
 
@@ -133,7 +133,7 @@ The name **PegaProx** is inspired by *Pegasus*, the winged horse of Greek mythol
 - ✅ **Backup Verification** *(Experimental)* - Automated restore → boot → health check → cleanup (ISO 27001, SOC 2, HIPAA compliance)
 - 🖱️ **noVNC / xterm.js Console** - Browser-based console for QEMU and LXC
 - ⚖️ **Load Balancing** - Automatic VM distribution across nodes
-- 🔁 **High Availability** - Auto-restart VMs on node failure with configurable timing
+- 🔁 **High Availability** - Restart the guests of a failed node elsewhere, with fencing, a self-fence agent and only guests whose volumes are on shared storage
 - 📍 **Affinity Rules** - Keep VMs together or apart on hosts (QEMU + LXC)
 
 ### XCP-ng Integration (Tech Preview)
@@ -153,7 +153,7 @@ The name **PegaProx** is inspired by *Pegasus*, the winged horse of Greek mythol
 - 👥 **Multi-User Support** - Role-based access control (Admin, Operator, Viewer) + custom roles
 - 🛠️ **API Token Management** - Create, list, and revoke Bearer tokens (scoped per role)
 - 🔐 **2FA Authentication** - TOTP-based two-factor authentication (with force option)
-- 🔑 **WebAuthn / FIDO2** - Hardware-key login (YubiKey, Nitrokey, Touch ID, Windows Hello) — passwordless or as 2FA factor
+- 🔑 **WebAuthn / FIDO2** - Hardware-key login (YubiKey, Nitrokey, Touch ID, Windows Hello) - passwordless or as 2FA factor
 - 🏛️ **LDAP / OIDC** - Active Directory, OpenLDAP, Entra ID, Keycloak, Google Workspace, Authentik (with PKCE)
 - 🛡️ **VM-Level ACLs** - Fine-grained permissions per VM
 - 🏢 **Multi-Tenancy** - Isolate clusters for different customers
@@ -175,7 +175,7 @@ The name **PegaProx** is inspired by *Pegasus*, the winged horse of Greek mythol
 - 💿 **Ceph Management** - Monitor and manage Ceph storage pools, RBD mirroring
 - 🔐 **ACME / Let's Encrypt** - Automatic SSL certificate renewal with HTTP-01 challenge (+ custom ACME CAs)
 - 📋 **Integrated Syslog Server** - Receive and view syslog messages (UDP/TCP) with filtering, search, and severity-based coloring
-- 🧬 **Config Drift Detection** - Nightly snapshot of cluster config (VM configs, storage.cfg, network, datacenter options) — alerts on any unauthorized change vs the admin-set baseline. Pairs with the Compliance Dashboard.
+- 🧬 **Config Drift Detection** - Nightly snapshot of cluster config (VM configs, storage.cfg, network, datacenter options) - alerts on any unauthorized change vs the admin-set baseline. Pairs with the Compliance Dashboard.
 
 ### Reports & Analytics
 - 💰 **Cost Dashboard / Chargeback** - €/VM/Month from real metrics (CPU-h × node tariff + RAM-GB-h + Storage-GB-month). Currency-configurable, per-cluster rates, top-spender table, by-node breakdown. CSV + PDF export.
@@ -190,6 +190,8 @@ The name **PegaProx** is inspired by *Pegasus*, the winged horse of Greek mythol
 - 🚑 **Site Recovery** - Configure DR plans (boot order, dependencies, replication mappings) and execute controlled failover with audit trail.
 - 📦 **Backup SLA Tracking** - SLA dashboard per cluster + datastore: last-backup age vs configured RPO, integrated with the Alert pipeline.
 - 🔁 **ZFS / Cross-Cluster Replication** - Native PVE replication monitor + cross-cluster replication for clusters without shared storage.
+- 🪽 **PegaProx High Availability** - Pair up to 4 PegaProx instances: standbys keep a copy of the configuration, show a live view and pass changes on to the leader; failover is a confirmed, manual promote
+- 🧩 **Automated PVE Installations** - Serve answer files for the Proxmox VE auto-installer from profiles (guided setup or editor) and follow every installation run
 - 🛠️ **V2P / ESXi Migration** - Pyvmomi + SSHFS-based, with VirtIO driver pre-staging via MSI bulk-install (Windows guests).
 
 ### Notifications
@@ -209,14 +211,14 @@ The name **PegaProx** is inspired by *Pegasus*, the winged horse of Greek mythol
 - 🌐 **Offline Mode** - Works without internet (local assets, air-gap mode disables external CVE/sponsor lookups for VS-NfD / classified networks)
 - 🎨 **Themes** - 17 themes including Dark/Light, Proxmox, Corporate (light/dark), Dracula, Nord, Monokai, Solarized, Cyberpunk, etc.
 - 🏢 **Corporate Layout** - Tree-based sidebar with dense tables
-- 🌍 **Multi-Language** - English, German, French, Spanish, Portuguese, Korean, Italian, Simplified Chinese
+- 🌍 **Multi-Language** - English, German, French, Spanish, Portuguese, Polish, Korean, Italian, Simplified Chinese
 - 📱 **Responsive + PWA** - Works on desktop and mobile, installable as native-feeling app
 - 📦 **PBS Integration** - Proxmox Backup Server management with backup verification
-- 🔭 **Prometheus Exporter** - Scrape `/api/metrics` with bearer auth for cluster + VM metrics
+- 🔭 **Prometheus Exporter** - Scrape `/api/metrics` with a bearer token (an admin's or one with `metrics.view`) for cluster, node, guest, storage, replication and backup-age metrics
 
 ## 📋 Requirements
 
-- Python 3.8+
+- Python 3.10 to 3.13 (3.12 recommended)
 - Proxmox VE 8.0+ or 9.0+ and/or XCP-ng 8.2+
 - Modern web browser (Chrome, Firefox, Edge, Safari)
 
@@ -316,14 +318,9 @@ After starting PegaProx, open your browser and navigate to:
 https://your-server-ip:5000
 ```
 
-Default credentials:
+A fresh install has no default credentials:
 
-```
-Username: pegaprox
-Password: admin
-```
-
-1. **First Login**: Create your admin account on the setup page
+1. **Setup wizard**: The first visit opens the setup wizard, where you create the first admin account
 2. **Add Cluster**: Go to Settings → Clusters → Add your Proxmox credentials
 3. **Done!** Start managing your VMs
 
@@ -345,7 +342,7 @@ Password: admin
 │   ├── index.html              # Compiled frontend
 │   └── src/                    # Frontend source (JSX)
 ├── config/
-│   └── pegaprox.db             # SQLite database — fully encrypted at rest via SQLCipher (Linux x86_64); plain SQLite + Fernet-encrypted fields elsewhere
+│   └── pegaprox.db             # SQLite database - fully encrypted at rest via SQLCipher (Linux x86_64); plain SQLite + Fernet-encrypted fields elsewhere
 ├── static/                     # JS/CSS libraries (offline mode)
 ├── logs/                       # Application logs
 └── update.sh                   # Update script
@@ -362,7 +359,7 @@ Password: admin
 - Session tokens expire after inactivity; optional strict-IP binding.
 - Per-IP rate limiting on login + every authenticated endpoint.
 - Input sanitization, CSRF Origin matching, RBAC enforced server-side on every route.
-- Auto-encryption on first boot — operators can opt out with `PEGAPROX_DISABLE_AUTO_ENCRYPT=1` if they want to take their own pre-encryption backup first.
+- Auto-encryption on first boot - operators can opt out with `PEGAPROX_DISABLE_AUTO_ENCRYPT=1` if they want to take their own pre-encryption backup first.
 
 ## 📖 Documentation
 
@@ -382,9 +379,9 @@ This project is licensed under the AGPL-3.0 License - see the [LICENSE](LICENSE)
 
 ## 🤖 Development Tools
 
-Like most modern dev teams, we use AI-assisted tooling (code completion, docs generation, review automation, security audits). All architecture decisions, implementation, and testing are handled by our three-person team. — see [IBM](https://www.ibm.com/solutions/ai-coding) , [IBM Case Studies](https://www.ibm.com/case-studies/ibm-software-team) , [MIT Tech Review](https://www.technologyreview.com/2025/12/15/1128352/rise-of-ai-coding-developers-2026/)
+Like most modern dev teams, we use AI-assisted tooling (code completion, docs generation, review automation, security audits). All architecture decisions, implementation, and testing are handled by our three-person team. - see [IBM](https://www.ibm.com/solutions/ai-coding) , [IBM Case Studies](https://www.ibm.com/case-studies/ibm-software-team) , [MIT Tech Review](https://www.technologyreview.com/2025/12/15/1128352/rise-of-ai-coding-developers-2026/)
 
-AI-driven security auditing is an industry-standard practice — see [Hacker News](https://thehackernews.com/2026/02/claude-opus-46-finds-500-high-severity.html), [IBM Research](https://www.ibm.com/think/insights/chatgpt-4-exploits-87-percent-one-day-vulnerabilities).
+AI-driven security auditing is an industry-standard practice - see [Hacker News](https://thehackernews.com/2026/02/claude-opus-46-finds-500-high-severity.html), [IBM Research](https://www.ibm.com/think/insights/chatgpt-4-exploits-87-percent-one-day-vulnerabilities).
 
 ## ⭐ Star History
 
