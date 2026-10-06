@@ -2477,7 +2477,10 @@ def _inject_virtio_drivers(pve_mgr, task):
         "done\n"
         "[ \"$COPIED\" -gt 0 ] || { echo 'NO_DRIVERS_COPIED'; exit 8; }\n"
         # Inject SYSTEM-hive registry: CriticalDeviceDatabase + Services for storage drivers.
-        # We always target ControlSet001 (the most common; Windows fixes Select on next boot).
+        # MK Oct 2026 (#823) - into the control set(s) Select names, not a fixed
+        # ControlSet001. Default is what the next boot loads, Current what the last boot
+        # used (and what virt-v2v writes to); normally the same set. A set that is not
+        # there is never created - Windows would not boot from it anyway.
         # NS Apr 2026 — using python3-hivex (well-supported on Debian/Proxmox) instead of
         # hivexregedit which Debian's libhivex-bin doesn't ship.
         "SYSTEM_HIVE=\"$WIN_MNT/$WDIR/System32/config/SYSTEM\"\n"
@@ -2512,31 +2515,37 @@ def _inject_virtio_drivers(pve_mgr, task):
         "have_vioscsi = os.path.exists(drv_root + '/vioscsi.sys')\n"
         "print(f'HIVEX have_viostor={have_viostor} have_vioscsi={have_vioscsi}')\n"
         "root = h.root()\n"
-        "cs = navigate(root, ['ControlSet001'])\n"
-        "services = navigate(cs, ['Services'])\n"
-        "control = navigate(cs, ['Control'])\n"
-        "cdb = navigate(control, ['CriticalDeviceDatabase'])\n"
-        # MK Oct 2026 (#823) - BusType is what each driver's own INF writes: viostor 1,
-        # vioscsi 0x0A. vioscsi with 1 stops a guest whose boot disk sits on virtio-scsi
-        # with INACCESSIBLE_BOOT_DEVICE - the same stop that got the scsihw auto-switch
-        # further down turned off, so that is worth a retest. Both INFs also set
-        # DmaRemappingCompatible = 0.
+        "def control_sets():\n"
+        "    sel = h.node_get_child(root, 'Select')\n"
+        "    picks = {}\n"
+        "    if sel is not None:\n"
+        "        for v in h.node_values(sel):\n"
+        "            k = h.value_key(v).lower()\n"
+        "            if k in ('default', 'current'):\n"
+        "                try: picks[k] = h.value_dword(v)\n"
+        "                except Exception: pass\n"
+        "    names = []\n"
+        "    for n in (picks.get('default'), picks.get('current')):\n"
+        "        if not n or not 0 < n < 1000: continue\n"
+        "        name = f'ControlSet{n:03d}'\n"
+        "        if name not in names and h.node_get_child(root, name) is not None:\n"
+        "            names.append(name)\n"
+        "    if not names and h.node_get_child(root, 'ControlSet001') is not None:\n"
+        "        names = ['ControlSet001']\n"
+        "    return names\n"
+        "cs_names = control_sets()\n"
+        "print(f'HIVEX control sets: {cs_names}')\n"
+        "if not cs_names:\n"
+        "    print('HIVEX no ControlSet in this SYSTEM hive - nothing written')\n"
+        "    sys.exit(3)\n"
+        # MK Oct 2026 (#823) - BusType and DmaRemappingCompatible as each driver's own INF
+        # writes them (viostor 1, vioscsi 0x0A); vioscsi with 1 stops at
+        # INACCESSIBLE_BOOT_DEVICE. This alone does not make Win8+ bind vioscsi at early
+        # boot (it ignores the CriticalDeviceDatabase, and no DriverDatabase entries are
+        # written), so the scsihw auto-switch further down stays off.
         "_svcs = []\n"
         "if have_viostor: _svcs.append(('viostor', 0x58, 'system32\\\\drivers\\\\viostor.sys', 0x01))\n"
         "if have_vioscsi: _svcs.append(('vioscsi', 0x59, 'system32\\\\drivers\\\\vioscsi.sys', 0x0A))\n"
-        "for svc, tag, img, bus_type in _svcs:\n"
-        "    svc_node = navigate(services, [svc])\n"
-        "    set_expand_sz(svc_node, 'ImagePath', img)\n"
-        "    set_dword(svc_node, 'Type', 1)\n"
-        "    set_dword(svc_node, 'Start', 0)\n"
-        "    set_sz(svc_node, 'Group', 'SCSI miniport')\n"
-        "    set_dword(svc_node, 'ErrorControl', 1)\n"
-        "    set_dword(svc_node, 'Tag', tag)\n"
-        "    params = navigate(svc_node, ['Parameters'])\n"
-        "    set_dword(params, 'BusType', bus_type)\n"
-        "    set_dword(params, 'DmaRemappingCompatible', 0)\n"
-        "    pnp = navigate(params, ['PnpInterface'])\n"
-        "    set_dword(pnp, '5', 1)\n"
         "GUID = '{4D36E97B-E325-11CE-BFC1-08002BE10318}'\n"
         # The ids the INFs name, transitional (1001/1004) and modern (1042/1048), since
         # the machine type decides which one the guest sees. 1041 is virtio-net (netkvm)
@@ -2556,10 +2565,27 @@ def _inject_virtio_drivers(pve_mgr, task):
         "             ('pci#ven_1af4&dev_1048', 'vioscsi'),\n"
         "             ('pci#ven_1af4&dev_1048&subsys_11001af4', 'vioscsi'),\n"
         "             ('pci#ven_1af4&dev_1048&subsys_11001af4&rev_01', 'vioscsi')]\n"
-        "for pci_id, svc in _pci:\n"
-        "    cd = navigate(cdb, [pci_id])\n"
-        "    set_sz(cd, 'ClassGUID', GUID)\n"
-        "    set_sz(cd, 'Service', svc)\n"
+        "for cs_name in cs_names:\n"
+        "    cs = h.node_get_child(root, cs_name)\n"
+        "    services = navigate(cs, ['Services'])\n"
+        "    cdb = navigate(cs, ['Control', 'CriticalDeviceDatabase'])\n"
+        "    for svc, tag, img, bus_type in _svcs:\n"
+        "        svc_node = navigate(services, [svc])\n"
+        "        set_expand_sz(svc_node, 'ImagePath', img)\n"
+        "        set_dword(svc_node, 'Type', 1)\n"
+        "        set_dword(svc_node, 'Start', 0)\n"
+        "        set_sz(svc_node, 'Group', 'SCSI miniport')\n"
+        "        set_dword(svc_node, 'ErrorControl', 1)\n"
+        "        set_dword(svc_node, 'Tag', tag)\n"
+        "        params = navigate(svc_node, ['Parameters'])\n"
+        "        set_dword(params, 'BusType', bus_type)\n"
+        "        set_dword(params, 'DmaRemappingCompatible', 0)\n"
+        "        pnp = navigate(params, ['PnpInterface'])\n"
+        "        set_dword(pnp, '5', 1)\n"
+        "    for pci_id, svc in _pci:\n"
+        "        cd = navigate(cdb, [pci_id])\n"
+        "        set_sz(cd, 'ClassGUID', GUID)\n"
+        "        set_sz(cd, 'Service', svc)\n"
         "h.commit(None)\n"
         "print('hivex commit OK')\n"
         "PYEOF\n"
