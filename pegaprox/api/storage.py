@@ -826,6 +826,15 @@ def get_storage_cluster_status(cluster_id, sc_id):
                 else:
                     all_vms = []
             
+            # NS Oct 2026 - the inventory is the whole cluster's; a caller confined to some of
+            # its guests gets recommendations, names and disks for those only, as on the
+            # other per-VM lists
+            from pegaprox.api.helpers import caller_is_scoped
+            from pegaprox.utils.auth import build_authz_user
+            if caller_is_scoped(build_authz_user(request.session.get('user', ''), request.session),
+                                cluster_id):
+                all_vms = scope_vm_rows(cluster_id, all_vms)
+
             # NS: Process VMs in batches to avoid blocking too long
             # and to spread out API calls over time
             vms_checked = 0

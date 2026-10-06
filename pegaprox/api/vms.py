@@ -39,10 +39,19 @@ def _require_vm_access(cluster_id, vmid, perm, vm_type=None):
     user = build_authz_user(request.session.get('user', ''), request.session)
     if not user_can_access_vm(user, cluster_id, vmid, perm, vm_type):
         return jsonify({'error': f'Access denied to this VM ({perm})'}), 403
+    return _xapi_refusal(cluster_id, user, perm)
+
+
+def _xapi_refusal(cluster_id, user, perm):
+    """403 when an XCP-ng pool also wants an xapi.vm.* permission the caller lacks (#1110)"""
+    missing = xapi_permission_missing(cluster_id, user, perm)
+    if missing:
+        return jsonify({'error': f'Permission denied: {missing}'}), 403
     return None
 from pegaprox.utils.realtime import broadcast_sse, broadcast_action, push_immediate_update, hold_websocket
 from pegaprox.core.config import save_config
 from pegaprox.api.helpers import get_connected_manager, check_cluster_access, register_task_user, safe_error, parse_pve_error, scope_vm_rows, require_unconfined, caller_is_scoped
+from pegaprox.api.helpers import xapi_permission_missing
 from pegaprox.api.helpers import evacuation_options, evacuation_options_said
 from pegaprox.api.helpers import (sees_whole_maintenance, maintenance_without_guests,
                                   node_maintenance_for_caller)
@@ -393,6 +402,43 @@ def get_cluster_info(cluster_id):
         return jsonify([])
 
 
+def _confirmed_api_fingerprint(manager, host, port, node_names):
+    """The fingerprint of the certificate host:port presents, but only when the cluster's
+    own API reports that certificate for one of `node_names`, else None.
+
+    NS Oct 2026 - join-info without a pve_fp fell back to reading the certificate off an
+    unverified handshake, and pvecm add then pinned whatever answered it. The API we are
+    signed in to vouches for the result now, as it does for pve_fp itself (#1087)."""
+    from pegaprox.core.manager import PegaProxManager
+    try:
+        wire = PegaProxManager.tls_fingerprint(host, port, timeout=5)
+    except Exception as e:
+        logging.debug(f"[Join] could not read the certificate of {host}: {e}")
+        return None
+    names = [n for n in node_names if n]
+    session = manager._create_session()
+    if not names:
+        try:
+            r = session.get(f"https://{host}:{port}/api2/json/nodes", timeout=5)
+            names = [n.get('node') for n in r.json().get('data', [])] if r.status_code == 200 else []
+        except Exception:
+            names = []
+    for name in names:
+        try:
+            r = session.get(f"https://{host}:{port}/api2/json/nodes/{url_quote(str(name), safe='')}"
+                            f"/certificates/info", timeout=5)
+            if r.status_code != 200:
+                continue
+            if any(str(c.get('fingerprint') or '').upper() == wire for c in r.json().get('data') or []
+                   if c.get('filename') in ('pve-ssl.pem', 'pveproxy-ssl.pem')):
+                return wire
+        except Exception:
+            continue
+    logging.warning(f"[Join] the certificate {host} presents is not one the cluster reports, "
+                    f"not using it as the join fingerprint")
+    return None
+
+
 @bp.route('/api/clusters/<cluster_id>/datacenter/join-info', methods=['GET'])
 @require_auth(perms=['cluster.view'])
 def get_join_info(cluster_id):
@@ -427,17 +473,11 @@ def get_join_info(cluster_id):
             # so a cluster reached on any other port silently produced no fingerprint and the
             # join command could not be built.
             if not data.get('fingerprint'):
-                try:
-                    context = ssl.create_default_context()
-                    context.check_hostname = False
-                    context.verify_mode = ssl.CERT_NONE
-                    with socket.create_connection((host, port), timeout=5) as sock:
-                        with context.wrap_socket(sock, server_hostname=host) as ssock:
-                            cert_der = ssock.getpeercert(binary_form=True)
-                            fp_hex = hashlib.sha256(cert_der).hexdigest()
-                            data['fingerprint'] = ':'.join(fp_hex[i:i+2].upper() for i in range(0, len(fp_hex), 2))
-                except:
-                    pass
+                _fp = _confirmed_api_fingerprint(
+                    manager, host, port,
+                    [n.get('name') for n in data.get('nodelist', []) if isinstance(n, dict)])
+                if _fp:
+                    data['fingerprint'] = _fp
             return jsonify(data)
         
         # fallback
@@ -472,23 +512,11 @@ def get_join_info(cluster_id):
                         n['ring0_addr'] = node.get('ring0_addr')
                         n['pve_addr'] = node.get('pve_addr')
         
-        # Try to get fingerprint via SSL certificate
-        try:
-            import socket
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-            
-            with socket.create_connection((host, port), timeout=5) as sock:
-                with context.wrap_socket(sock, server_hostname=host) as ssock:
-                    cert_der = ssock.getpeercert(binary_form=True)
-                    fingerprint = hashlib.sha256(cert_der).hexdigest()
-                    # Format as colon-separated uppercase
-                    result['fingerprint'] = ':'.join(fingerprint[i:i+2].upper() for i in range(0, len(fingerprint), 2))
-        except Exception as e:
-            logging.debug(f"Could not get SSL fingerprint: {e}")
-            result['fingerprint'] = f'Run "pvecm status" on {host} to get fingerprint'
-        
+        # Try to get fingerprint via SSL certificate, one the cluster itself reports
+        result['fingerprint'] = (_confirmed_api_fingerprint(manager, host, port,
+                                                            [n.get('name') for n in result['nodelist']])
+                                 or f'Run "pvecm status" on {host} to get fingerprint')
+
         return jsonify(result)
 
     except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
@@ -1056,11 +1084,18 @@ def delete_datastore_content(cluster_id, storage_name, volid):
         # (local:100/vm-100-disk-0.qcow2). Under any other directory it is just a filename that
         # happens to look like one — local:snippets/vm-100-cloudinit.yml is a user snippet, not
         # guest 100's disk, and attributing it would deny a scoped caller their own file.
-        _disk_ok = len(_parts) == 1 or (len(_parts) == 2 and _parts[0].isdigit())
+        # NS Oct 2026 - PVE takes the owner from the number alone: vm-100-anything at the root,
+        # anything under 100/, and a linked clone 99/base-99-disk-0.qcow2/100/<name> belong to
+        # guest 100, whatever the rest of the name says (#1066). On ZFS, LVM-thin and RBD a
+        # linked clone is base-99-disk-0/vm-100-disk-1, the guest named last
         _m = (_re.search(r'/(?:vm|ct)/(\d+)/', volid)
               or _re.search(r'(?:^|/)vzdump-(?:qemu|lxc|openvz)-(\d+)-', _seg)
-              or (_re.match(r'(?:vm|base|subvol)-(\d+)-(?:disk|state|cloudinit)', _parts[-1])
-                  if _disk_ok else None))
+              or (_re.match(r'(?:vm|base|basevol|subvol)-(\d+)-', _parts[-1])
+                  if len(_parts) == 1 or (len(_parts) == 2 and _re.match(r'(?:base|basevol)-\d+-', _parts[0]))
+                  else None)
+              or (_re.fullmatch(r'(\d+)', _parts[0]) if len(_parts) == 2 else None)
+              or (_re.fullmatch(r'(\d+)', _parts[2])
+                  if len(_parts) == 4 and _parts[0].isdigit() else None))
         _src = int(_m.group(1)) if _m else None
         if _src is not None and not user_can_access_vm(_dc_user, cluster_id, _src, 'vm.view'):
             return jsonify({'error': 'Access denied to this volume'}), 403
@@ -3173,24 +3208,11 @@ def join_node_to_cluster(cluster_id):
             # Same method as get_join_info uses - this is the cert fingerprint
             # that pvecm add --fingerprint expects
             logging.warning(f"[Join] No pve_fp in API response, extracting from SSL certificate of {host}")
-            try:
-                import ssl
-                import socket
-                import hashlib
-                
-                context = ssl.create_default_context()
-                context.check_hostname = False
-                context.verify_mode = ssl.CERT_NONE
-                
-                with socket.create_connection((host, port), timeout=5) as sock:
-                    with context.wrap_socket(sock, server_hostname=host) as ssock:
-                        cert_der = ssock.getpeercert(binary_form=True)
-                        fp_hex = hashlib.sha256(cert_der).hexdigest()
-                        fingerprint = ':'.join(fp_hex[i:i+2].upper() for i in range(0, len(fp_hex), 2))
-                        logging.info(f"[Join] Got SSL fingerprint: {fingerprint[:20]}...")
-            except Exception as ssl_err:
-                logging.error(f"[Join] SSL fingerprint extraction failed: {ssl_err}")
-        
+            fingerprint = _confirmed_api_fingerprint(
+                mgr, host, port, [n.get('name') for n in nodelist if isinstance(n, dict)]) or ''
+            if fingerprint:
+                logging.info(f"[Join] Got SSL fingerprint: {fingerprint[:20]}...")
+
         if not fingerprint:
             logging.error(f"[Join] No fingerprint found! join_info type={type(join_info).__name__}, "
                          f"nodelist={len(nodelist)} entries, "
@@ -3880,7 +3902,14 @@ def start_node_update(cluster_id, node_name):
     data = request.json or {}
     reboot = data.get('reboot', True)
     force = data.get('force', False)
-    
+    # NS Oct 2026 - rebooting after the update is node.reboot, as on the rolling-update and
+    # schedule routes; an update without one stays on node.update (#1072)
+    if reboot:
+        from pegaprox.utils.rbac import has_permission
+        if not has_permission(build_authz_user(request.session.get('user', ''), request.session),
+                              'node.reboot'):
+            return jsonify({'error': 'Rebooting the node needs the node.reboot permission'}), 403
+
     # check maintenance mode (unless force)
     if not force:
         if node_name not in mgr.nodes_in_maintenance:
@@ -4307,7 +4336,9 @@ def clone_vm_api(cluster_id, node, vm_type, vmid):
     user = build_authz_user(request.session.get('user', ''), request.session)
     if not user_can_access_vm(user, cluster_id, vmid, 'vm.clone', vm_type):
         return jsonify({'error': 'Permission denied: vm.clone'}), 403
-    
+    denied = _xapi_refusal(cluster_id, user, 'vm.clone')
+    if denied: return denied
+
     manager = cluster_managers[cluster_id]
     data = request.json or {}
 
@@ -5547,13 +5578,12 @@ def update_vm_config_api(cluster_id, node, vm_type, vmid):
     # MK: Check pool permission for vm.config (+ xapi.vm.config for XCP-ng)
     user = build_authz_user(request.session.get('user', ''), request.session)
 
-    if getattr(manager, 'cluster_type', 'proxmox') == 'xcpng':
-        from pegaprox.utils.rbac import has_permission
-        if not has_permission(user, 'xapi.vm.config'):
-            return jsonify({'error': 'Permission denied: xapi.vm.config'}), 403
-    else:
-        if not user_can_access_vm(user, cluster_id, vmid, 'vm.config', vm_type):
-            return jsonify({'error': 'Permission denied: vm.config'}), 403
+    # NS Oct 2026 - an XCP-ng guest is checked per VM as well, not only by the pool-wide
+    # xapi.vm.config, or a caller confined to some guests edited every one (#1110)
+    if not user_can_access_vm(user, cluster_id, vmid, 'vm.config', vm_type):
+        return jsonify({'error': 'Permission denied: vm.config'}), 403
+    denied = _xapi_refusal(cluster_id, user, 'vm.config')
+    if denied: return denied
 
     config_updates = request.json or {}
     if not isinstance(config_updates, dict):
@@ -5627,7 +5657,9 @@ def sanitize_boot_order_api(cluster_id, node, vm_type, vmid):
     user = build_authz_user(request.session.get('user', ''), request.session)
     if not user_can_access_vm(user, cluster_id, vmid, 'vm.config', vm_type):
         return jsonify({'error': 'Permission denied: vm.config'}), 403
-    
+    denied = _xapi_refusal(cluster_id, user, 'vm.config')
+    if denied: return denied
+
     manager = cluster_managers[cluster_id]
     result = manager.sanitize_boot_order(node, vmid, vm_type)
     
@@ -7251,10 +7283,12 @@ def create_snapshot_api(cluster_id, node, vm_type, vmid):
     user = build_authz_user(request.session.get('user', ''), request.session)
     if not user_can_access_vm(user, cluster_id, vmid, 'vm.snapshot', vm_type):
         return jsonify({'error': 'Permission denied: vm.snapshot'}), 403
-    
+    denied = _xapi_refusal(cluster_id, user, 'vm.snapshot')
+    if denied: return denied
+
     mgr = cluster_managers[cluster_id]
     data = request.json or {}
-    
+
     snapname = data.get('snapname', f'snap_{int(time.time())}')
     description = data.get('description', '')
     vmstate = data.get('vmstate', False)
@@ -7282,7 +7316,9 @@ def delete_snapshot_api(cluster_id, node, vm_type, vmid, snapname):
     user = build_authz_user(request.session.get('user', ''), request.session)
     if not user_can_access_vm(user, cluster_id, vmid, 'vm.snapshot', vm_type):
         return jsonify({'error': 'Permission denied: vm.snapshot'}), 403
-    
+    denied = _xapi_refusal(cluster_id, user, 'vm.snapshot')
+    if denied: return denied
+
     mgr = cluster_managers[cluster_id]
     result = mgr.delete_snapshot(node, vmid, vm_type, snapname)
     
@@ -7307,7 +7343,9 @@ def rollback_snapshot_api(cluster_id, node, vm_type, vmid, snapname):
     user = build_authz_user(request.session.get('user', ''), request.session)
     if not user_can_access_vm(user, cluster_id, vmid, 'vm.snapshot', vm_type):
         return jsonify({'error': 'Permission denied: vm.snapshot'}), 403
-    
+    denied = _xapi_refusal(cluster_id, user, 'vm.snapshot')
+    if denied: return denied
+
     mgr = cluster_managers[cluster_id]
     result = mgr.rollback_snapshot(node, vmid, vm_type, snapname)
     
@@ -7462,6 +7500,8 @@ def create_efficient_snapshot_api(cluster_id, node, vm_type, vmid):
     user = build_authz_user(request.session.get('user', ''), request.session)
     if not user_can_access_vm(user, cluster_id, vmid, 'vm.snapshot', vm_type):
         return jsonify({'error': 'Permission denied: vm.snapshot'}), 403
+    denied = _xapi_refusal(cluster_id, user, 'vm.snapshot')
+    if denied: return denied
 
     mgr = cluster_managers[cluster_id]
     data = request.json or {}
@@ -7501,6 +7541,8 @@ def delete_efficient_snapshot_api(cluster_id, node, vm_type, vmid, snap_id):
     user = build_authz_user(request.session.get('user', ''), request.session)
     if not user_can_access_vm(user, cluster_id, vmid, 'vm.snapshot', vm_type):
         return jsonify({'error': 'Permission denied: vm.snapshot'}), 403
+    denied = _xapi_refusal(cluster_id, user, 'vm.snapshot')
+    if denied: return denied
 
     mgr = cluster_managers[cluster_id]
     result = mgr.delete_efficient_snapshot(node, vmid, snap_id)
@@ -7527,6 +7569,8 @@ def rollback_efficient_snapshot_api(cluster_id, node, vm_type, vmid, snap_id):
     user = build_authz_user(request.session.get('user', ''), request.session)
     if not user_can_access_vm(user, cluster_id, vmid, 'vm.snapshot', vm_type):
         return jsonify({'error': 'Permission denied: vm.snapshot'}), 403
+    denied = _xapi_refusal(cluster_id, user, 'vm.snapshot')
+    if denied: return denied
 
     mgr = cluster_managers[cluster_id]
     result = mgr.rollback_efficient_snapshot(node, vmid, vm_type, snap_id)
@@ -7690,6 +7734,10 @@ def snapshots_overview_delete():
             # MK Feb 2026 - VM-level ACL check for snapshot delete
             if not user_can_access_vm(user_data, cluster_id, vmid, 'vm.snapshot', vm_type):
                 errors.append(f"Permission denied: vm.snapshot for VM {vmid}")
+                continue
+            _missing = xapi_permission_missing(cluster_id, user_data, 'vm.snapshot')
+            if _missing:
+                errors.append(f"Permission denied: {_missing} for VM {vmid}")
                 continue
 
             result = mgr.delete_snapshot(node, vmid, vm_type, snapname)
@@ -8599,6 +8647,11 @@ _XCINCR_COPY_KEYS = (
     'rng0', 'tpmstate0', 'args', 'description',
 )
 
+# NS Oct 2026 - args is a QEMU command line the target node runs as root. The only args we
+# write ourselves are the V2P sector-size ones, so a replica carries those and no other (#1058)
+_SECTOR_ARG = r'-set device\.(?:scsi|sata|virtio|ide)[0-9]+\.(?:logical|physical)_block_size=512'
+_SECTOR_ARGS_RE = re.compile(f'{_SECTOR_ARG}(?: {_SECTOR_ARG})*')
+
 
 def _build_incremental_replica_vm(target_mgr, target_node, tgt_vmid, src_cfg, replicated,
                                   target_storage, job):
@@ -8608,6 +8661,16 @@ def _build_incremental_replica_vm(target_mgr, target_node, tgt_vmid, src_cfg, re
     payload = {'vmid': int(tgt_vmid)}
     for k in _XCINCR_COPY_KEYS:
         if k in src_cfg and src_cfg[k] not in (None, ''):
+            if k == 'args' and not (isinstance(src_cfg[k], str)
+                                    and _SECTOR_ARGS_RE.fullmatch(src_cfg[k].strip())):
+                logging.warning(f"[XCINCR] job {job.get('id')}: the source's QEMU args are not "
+                                f"carried to replica {tgt_vmid}")
+                continue
+            # NS Oct 2026 - root-only as well: TPM state on a device of the target host
+            if k == 'tpmstate0' and _on_host_path(src_cfg[k], 'file'):
+                logging.warning(f"[XCINCR] job {job.get('id')}: the source's TPM state is on a host "
+                                f"path, not carried to replica {tgt_vmid}")
+                continue
             payload[k] = src_cfg[k]
     # net: keep the source model + MAC, remap the bridge to the job's target bridge
     tgt_bridge = (job.get('target_bridge') or 'vmbr0').split(',')[0].split(':')[-1] or 'vmbr0'
@@ -9670,8 +9733,8 @@ def delete_cross_cluster_replication(job_id):
     # cluster is gone there are no ACLs or pool grants left to answer the question with, and the
     # guest went with it — gating there would only make the orphaned job undeletable again.
     _src = job.get('source_cluster') or ''
+    _xu = build_authz_user(request.session.get('user', ''), request.session)
     if _src in cluster_managers:
-        _xu = build_authz_user(request.session.get('user', ''), request.session)
         try:
             if not user_can_access_vm(_xu, _src, int(job.get('vmid')), 'vm.migrate'):
                 return jsonify({'error': 'Access denied to this replication job'}), 403
@@ -9679,6 +9742,12 @@ def delete_cross_cluster_replication(job_id):
             return jsonify({'error': 'Replication job has no valid guest'}), 403
 
     want_teardown = _wants_delete_target(job)
+    # NS Oct 2026 - removing the replica is a delete on the target cluster, which a caller
+    # confined there could not have created the job on either (#1068)
+    _tgt_cid = job.get('target_cluster') or ''
+    if want_teardown and _tgt_cid in cluster_managers and caller_is_scoped(_xu, _tgt_cid):
+        return jsonify({'error': 'Access denied to the target cluster: delete the job with '
+                                 'delete_target=0 to keep the replica'}), 403
 
     # Don't race an in-flight run: tearing the replica down mid-run just lets the run
     # re-create it (we hit exactly this during testing). Same _claim_job set the run
@@ -9745,6 +9814,9 @@ def run_cross_cluster_replication(job_id):
             return jsonify({'error': 'Access denied to this replication job'}), 403
     except (TypeError, ValueError):
         return jsonify({'error': 'Replication job has no valid guest'}), 403
+    # NS Oct 2026 - a run writes the replica on the target, as create would have (#1068)
+    if caller_is_scoped(_xu, _job.get('target_cluster') or ''):
+        return jsonify({'error': 'Access denied to the target cluster'}), 403
 
     # MK May 2026 (#455) — block duplicate triggers while a previous run is still
     # in-flight. The scheduler uses the same _claim_job() guard.
@@ -12533,7 +12605,9 @@ def delete_vm_api(cluster_id, node, vm_type, vmid):
     user = build_authz_user(request.session.get('user', ''), request.session)
     if not user_can_access_vm(user, cluster_id, vmid, 'vm.delete', vm_type):
         return jsonify({'error': 'Permission denied: vm.delete'}), 403
-    
+    denied = _xapi_refusal(cluster_id, user, 'vm.delete')
+    if denied: return denied
+
     manager = cluster_managers[cluster_id]
     data = request.json or {}
     purge = data.get('purge', False)
@@ -12645,9 +12719,9 @@ def bulk_migrate_api(cluster_id):
     # bulk twin only had the cluster gate, so a VM-ACL/pool-scoped user could relocate foreign VMs
     # by listing their vmids. Build the authz user once and skip (don't abort on) each VM the caller
     # isn't scoped to.
-    _authz_user = load_users().get(request.session['user'], {})
-    _authz_user['username'] = request.session['user']
-    
+    # NS Oct 2026 - as the API token acts, not as its owner's stored record (#1047)
+    _authz_user = build_authz_user(request.session['user'], request.session)
+
     # LW: Feb 2026 - enforced violations skip that VM but don't abort the whole batch
     from pegaprox.api.history import check_affinity_violation
 

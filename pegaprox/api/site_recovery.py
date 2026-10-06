@@ -92,7 +92,15 @@ def _approved_vmids(plan):
     The route authorizes a list and then spawns a greenlet that reads the list again.
     Anything added in between was acted on unauthorized, so the worker gets told what
     was approved rather than looking it up a second time. MK Sep 2026
+
+    NS Oct 2026 - looking it up here was that second time: the checks can wait on the
+    cluster, and a guest added meanwhile came back from this read unchecked. The list
+    _authz_plan_vms checked is kept for the request.
     """
+    from flask import g
+    checked = (getattr(g, '_sr_checked_vmids', None) or {}).get(plan['id'])
+    if checked is not None:
+        return list(checked)
     return [v.get('vmid') for v in _get_plan_vms(plan['id'])]
 
 
@@ -117,6 +125,11 @@ def _authz_plan_vms(plan, starts_vms=False):
         perm = 'vm.start'
 
     _vms = _get_plan_vms(plan['id'])
+    # one read, checked below and handed to the worker by _approved_vmids
+    from flask import g
+    if not hasattr(g, '_sr_checked_vmids'):
+        g._sr_checked_vmids = {}
+    g._sr_checked_vmids[plan['id']] = [v.get('vmid') for v in _vms]
 
     # MK Sep 2026 - an EMPTY plan walked straight out of the loop below and answered
     # "authorized". That is the wrong default for a plan a confined caller does not own:
@@ -129,7 +142,7 @@ def _authz_plan_vms(plan, starts_vms=False):
                                              'authorize you against'}), 403)
         return True, None
 
-    for vm in _get_plan_vms(plan['id']):
+    for vm in _vms:
         try:
             vmid = int(vm['vmid'])
         except (ValueError, TypeError, KeyError):
@@ -797,7 +810,7 @@ def execute_test_failover(plan_id):
     db.execute("UPDATE site_recovery_plans SET status = 'testing', updated_at = ? WHERE id = ?", (now, plan_id))
 
     from pegaprox.background.site_recovery import execute_test_failover
-    _safe_spawn_failover(execute_test_failover, plan_id, _console_vmids(plan))
+    _safe_spawn_failover(execute_test_failover, plan_id, _console_vmids(plan), _approved_vmids(plan))
 
     usr = getattr(request, 'session', {}).get('user', 'system')
     log_audit(usr, 'site_recovery.test', f"Test failover started: {plan['name']}")

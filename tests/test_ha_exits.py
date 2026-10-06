@@ -393,12 +393,11 @@ EXITS = {
     ('pegaprox/api/vms.py', 'test_node_connection', 'ssh-paramiko'): (1, 'read'),
     ('pegaprox/api/vms.py', 'test_node_connection', 'ssh-exec'): (4, 'read'),
     ('pegaprox/api/vms.py', 'join_node_to_cluster', 'ssh-exec'): (2, 'client'),
-    ('pegaprox/api/vms.py', 'join_node_to_cluster', 'socket'): (1, 'read'),
     ('pegaprox/api/vms.py', 'remove_node_from_cluster', 'ssh-exec'): (3, 'client'),
     # `id -u` on the guarded client, the shutdown on a channel of its transport after
     # guard_ssh (see test_a_channel_of_a_transport_asks_guard_ssh_first)
     ('pegaprox/api/vms.py', 'node_action_api', 'ssh-exec'): (5, 'guard'),
-    ('pegaprox/api/vms.py', 'get_join_info', 'socket'): (2, 'read'),
+    # the join fingerprint is read through PegaProxManager.tls_fingerprint above (#1087)
     # consoles
     ('pegaprox/api/vms.py', 'node_shell_websocket_proxy', 'ssh-paramiko'): (1, 'console'),
     ('pegaprox/api/vms.py', 'node_shell_websocket_proxy', 'ssh-exec'): (1, 'console'),
@@ -503,11 +502,12 @@ def test_the_inventory_counts_what_the_report_says():
     for (_f, _q, kind), (n, verdict) in EXITS.items():
         by[verdict] += n
     # S4 with the witness and the lease link, and the connection check, the three restarts
-    # asking systemctl in one helper: 260 calls out of this process, 154 (function, kind)
-    # pairs in 139 functions; 46 of them guarded at the exit and 84 execs on a client from
-    # a guarded factory. No route relies on the write gate alone any more
-    assert sum(n for n, _v in EXITS.values()) == 260 and len(EXITS) == 154
-    assert len({(f, q) for f, q, _k in EXITS}) == 139
+    # asking systemctl in one helper, the join fingerprint read through tls_fingerprint:
+    # 257 calls out of this process, 152 (function, kind) pairs in 138 functions; 46 of
+    # them guarded at the exit and 84 execs on a client from a guarded factory. No route
+    # relies on the write gate alone any more
+    assert sum(n for n, _v in EXITS.values()) == 257 and len(EXITS) == 152
+    assert len({(f, q) for f, q, _k in EXITS}) == 138
     assert by['guard'] == 46 and by['client'] == 84
 
 

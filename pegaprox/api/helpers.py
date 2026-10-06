@@ -660,6 +660,23 @@ def require_unconfined(cluster_id):
     return None
 
 
+# NS Oct 2026 - an XCP-ng pool asks for its own xapi.vm.* permission next to the vm.* one,
+# as its power, config and migrate routes already did (#1110)
+XAPI_TWINS = {'vm.config': 'xapi.vm.config', 'vm.snapshot': 'xapi.vm.snapshot',
+              'vm.clone': 'xapi.vm.clone', 'vm.delete': 'xapi.vm.delete',
+              'vm.migrate': 'xapi.vm.migrate'}
+
+
+def xapi_permission_missing(cluster_id, user, perm):
+    """The xapi.vm.* permission `user` lacks for `perm` when `cluster_id` is an XCP-ng
+    pool, else None."""
+    twin = XAPI_TWINS.get(perm)
+    if not twin or getattr(cluster_managers.get(cluster_id), 'cluster_type', 'proxmox') != 'xcpng':
+        return None
+    from pegaprox.utils.rbac import has_permission
+    return None if has_permission(user, twin) else twin
+
+
 def check_vmware_access(vmware_id):
     """NS Jul 2026 (CodeAnt re-scan IDOR) — tenant gate for a VMware/ESXi server, mirroring
     check_pbs_access. Most vmware.py routes only had a role perm and never scoped to tenant, so

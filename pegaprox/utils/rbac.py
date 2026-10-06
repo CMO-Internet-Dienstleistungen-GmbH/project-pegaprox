@@ -881,6 +881,10 @@ def save_vm_acls(acls: dict):
     except Exception as e:
         logging.error(f"Failed to save VM ACLs: {e}")
         return False
+    finally:
+        # NS Oct 2026 - the writer drops the cached copy itself, so a caller that forgets
+        # to cannot leave a revoked or a new grant unseen for the TTL (#1007)
+        invalidate_vm_acls_cache()
 
 _vm_acls_cache = None
 

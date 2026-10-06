@@ -2051,6 +2051,8 @@ class PegaProxDB:
                 ('schedule_day', "INTEGER DEFAULT 1"),
                 ('run_once_at', "TEXT DEFAULT ''"),
                 ('prune_only', "INTEGER DEFAULT 0"),
+                # the role of the API token that wrote the policy, '' for a session (#1073)
+                ('created_role', "TEXT DEFAULT ''"),
             ):
                 if _cn not in _spcols:
                     cursor.execute(f"ALTER TABLE snapshot_policies ADD COLUMN {_cn} {_cd}")
