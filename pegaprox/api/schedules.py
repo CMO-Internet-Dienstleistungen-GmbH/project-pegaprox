@@ -72,6 +72,30 @@ def _schedule_target_error(action):
     return ''
 
 
+def _creator(row):
+    """The account a stored schedule acts for, as it stands now, or None.
+
+    NS Oct 2026 - a schedule acts with the cluster's own credentials long after the request
+    that made it. Its creator may since have been demoted, moved to another tenant, lost the
+    VM grant or been removed (#1093), so every run asks again. Read by the account's own row:
+    one that is gone, unreadable or switched off acts for nobody."""
+    from pegaprox.utils.auth import resolve_authz_user
+    user = resolve_authz_user({'user': row.get('created_by') or ''})
+    if not user or not user.get('enabled', True):
+        return None
+    return user
+
+
+def _creator_may_update(cluster_id, schedule):
+    """Whether the creator of a rolling-update schedule may still arm it: the gates of
+    set_update_schedule, asked again at run time."""
+    from pegaprox.api.helpers import caller_is_scoped
+    creator = _creator(schedule)
+    if not creator or not has_permission(creator, 'node.update') or caller_is_scoped(creator, cluster_id):
+        return False
+    return not schedule.get('include_reboot', True) or has_permission(creator, 'node.reboot')
+
+
 _bad_targets_said = set()
 
 
@@ -426,7 +450,17 @@ def execute_scheduled_action(action):
             logging.error(f"[SCHEDULER] Refusing scheduled action {action.get('id')}: {why}")
             return
         vmid = _schedule_vmid(vmid)
-        
+        from pegaprox.utils.rbac import user_can_access_vm
+        creator = _creator(action)
+        if not creator or not user_can_access_vm(creator, cluster_id, vmid,
+                                                 _perm_for_action(action_type), vm_type):
+            logging.warning(f"[SCHEDULER] Not running scheduled action {action.get('id')}: "
+                            f"{action.get('created_by')!r} may no longer {action_type} {vm_type}/{vmid}")
+            log_audit('scheduler', 'scheduled.refused',
+                      f"Scheduled {action_type} of VM {vmid} in {cluster_id} not run: its creator "
+                      f"{action.get('created_by')!r} may no longer do it")
+            return
+
         # Find the node where the VM is running
         resources = mgr.get_vm_resources()
         vm = next((r for r in resources if r.get('vmid') == vmid), None)
@@ -964,11 +998,16 @@ def update_schedule(schedule_id):
         return jsonify({'error': 'Days are required for weekly schedules'}), 400
 
     # Update fields (vmid/vm_type added Mar 2026 - #133)
+    _before = (schedule.get('vmid'), schedule.get('vm_type', 'qemu'), schedule.get('action'))
     updatable = ['name', 'vmid', 'vm_type', 'action', 'schedule_type', 'time', 'date', 'days', 'enabled']
     for field in updatable:
         if field in data:
             schedule[field] = data[field]
     schedule['vmid'] = _uv
+    # NS Oct 2026 - a run asks its creator again (#1093); who picked the guest and the action
+    # is the one to ask, so a retarget makes the editor the creator
+    if (schedule.get('vmid'), schedule.get('vm_type', 'qemu'), schedule.get('action')) != _before:
+        schedule['created_by'] = request.session.get('user', 'unknown')
 
     if not save_schedules(schedules):
         return jsonify({'error': 'Could not save the schedule - check the server logs',
@@ -1181,7 +1220,9 @@ def load_all_update_schedules() -> dict:
         cursor = db.conn.cursor()
         cursor.execute('SELECT * FROM update_schedules WHERE enabled = 1')
         for row in cursor.fetchall():
-            schedules[row['cluster_id']] = _update_schedule_row(row)
+            # the scheduler asks the creator again before a run (#1093); the GET route
+            # reads load_update_schedule and keeps not naming them
+            schedules[row['cluster_id']] = dict(_update_schedule_row(row), created_by=row['created_by'])
     except Exception as e:
         logging.error(f"Error loading all update schedules: {e}")
     return schedules
@@ -1380,7 +1421,16 @@ def check_scheduled_updates():
                 if hasattr(mgr, '_rolling_update') and mgr._rolling_update:
                     if mgr._rolling_update.get('status') == 'running':
                         continue
-                
+
+                if not _creator_may_update(cluster_id, schedule):
+                    logging.warning(f"[SCHEDULER] Not starting the scheduled update of {cluster_id}: "
+                                    f"{schedule.get('created_by')!r} may no longer schedule it")
+                    log_audit('scheduler', 'update.schedule_refused',
+                              f"Scheduled rolling update not started: its creator "
+                              f"{schedule.get('created_by')!r} may no longer schedule it",
+                              cluster=getattr(mgr.config, 'name', cluster_id))
+                    continue
+
                 logging.info(f"[SCHEDULER] Starting scheduled update for cluster {cluster_id} (type: {schedule_type})")
                 
                 if ha.schedule_fire_first():

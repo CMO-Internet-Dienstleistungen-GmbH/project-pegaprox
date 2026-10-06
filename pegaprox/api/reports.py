@@ -425,7 +425,10 @@ def get_integrated_syslog_events():
     # cluster's syslog to a tenant-scoped admin.audit holder.
     from pegaprox.utils.auth import build_authz_user
     from pegaprox.utils.rbac import get_user_clusters
-    _acc = get_user_clusters(build_authz_user(request.session.get('user', ''), request.session))
+    # NS Oct 2026 - a node's syslog is the whole node's, so only clusters the caller's tenant
+    # owns count. A pool grant on a foreign cluster reaches that pool's guests, not its hosts (#1010).
+    _acc = get_user_clusters(build_authz_user(request.session.get('user', ''), request.session),
+                             include_pools=False)
     if _acc is not None:  # None = global-admin / all-cluster; a list = confine to it
         _allowed_hosts = set()
         for _cid in _acc:
@@ -839,6 +842,11 @@ def check_hardening(cluster_id, node):
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
+    # NS Oct 2026 - runs root checks over SSH and reads back the node's own security
+    # evidence, nothing a pool or VM grant reaches; same gate as the apply route below
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     mgr = cluster_managers[cluster_id]

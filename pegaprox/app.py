@@ -373,6 +373,11 @@ def create_app():
             "base-uri 'self'; "
             "form-action 'self'"
         )
+        # NS Oct 2026 - an SVG opened as a page runs its scripts under this origin, and an
+        # admin can upload one as the login background (#1065). As an <img> or a CSS
+        # background the sandbox changes nothing.
+        if response.mimetype == 'image/svg+xml':
+            csp += "; sandbox"
         response.headers['Content-Security-Policy'] = csp
 
         # LW: Mar 2026 - only trust X-Forwarded-Proto from trusted proxies

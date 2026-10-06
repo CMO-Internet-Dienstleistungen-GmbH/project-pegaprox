@@ -20,6 +20,8 @@ from test_ha_api import ha_env, _standby_of_active, _active_with_standby, _audit
 BASE = 'https://10.0.0.1:8006/api2/json'
 _REAL_SPAWN = oci._spawn
 REF = 'docker.io/library/nginx:stable-alpine'
+# the readable part and a digest of the exact reference (#1063)
+NGINX_ARCHIVE = 'docker.io_library_nginx_stable-alpine_e28e1e3689705bcf'
 DEPLOY = '/api/clusters/cluster_1/oci/deploy'
 
 # --- what the API viewer says ----------------------------------------------------------------
@@ -282,11 +284,11 @@ def test_a_deploy_pulls_the_image_then_creates_the_container_from_it(api, admin)
 
     (pull_path, pull), (create_path, create) = pve.posts
     assert pull_path == '/nodes/pve1/storage/local/oci-registry-pull'
-    assert pull == {'reference': REF, 'filename': 'docker.io_library_nginx_stable-alpine'}
+    assert pull == {'reference': REF, 'filename': NGINX_ARCHIVE}
     assert create_path == '/nodes/pve1/lxc'
     # the template is the file PVE made of the pull, by its own naming rule
     assert create['ostemplate'] == _pve_archive('local', pull['filename']) \
-        == 'local:vztmpl/docker.io_library_nginx_stable-alpine.tar'
+        == f'local:vztmpl/{NGINX_ARCHIVE}.tar'
     assert create['vmid'] == 105 and create['hostname'] == 'nginx'
     assert create['rootfs'] == 'local-lvm:2'
     assert create['net0'] == 'name=eth0,bridge=vmbr0,ip=dhcp,tag=20'
@@ -312,7 +314,7 @@ def test_a_deploy_pulls_the_image_then_creates_the_container_from_it(api, admin)
 
 
 def test_an_image_already_on_the_storage_is_not_pulled_again(api, admin):
-    pve = FakePve(on_storage=['local:vztmpl/docker.io_library_nginx_stable-alpine.tar'])
+    pve = FakePve(on_storage=[f'local:vztmpl/{NGINX_ARCHIVE}.tar'])
     pve.manager(api)
     job = _job(_deploy(admin))
     assert job['status'] == 'completed', job['error']
@@ -372,7 +374,7 @@ def test_two_jobs_at_once_do_not_get_the_same_free_id(api, admin, monkeypatch):
     the create ran. Two jobs that ask in between would both get it; the second create
     would then fail on an id the first one took."""
     monkeypatch.setattr(oci, '_spawn', _REAL_SPAWN)
-    pve = FakePve(on_storage=['local:vztmpl/docker.io_library_nginx_stable-alpine.tar'])
+    pve = FakePve(on_storage=[f'local:vztmpl/{NGINX_ARCHIVE}.tar'])
     m = pve.manager(api)
     taken = set()
 
@@ -532,7 +534,9 @@ def test_a_registry_on_the_lan_is_fine_and_docker_hub_needs_no_lookup(api, admin
     pve.manager(api)
     job = _job(_deploy(admin, reference='10.0.0.50:5000/team/app:1.2'))
     assert job['status'] == 'completed', job['error']
-    assert pve.posts[0][1] == {'reference': '10.0.0.50:5000/team/app:1.2', 'filename': '10.0.0.50_5000_team_app_1.2'}
+    assert pve.posts[0][1] == {'reference': '10.0.0.50:5000/team/app:1.2',
+                               'filename': oci.archive_name('10.0.0.50:5000/team/app:1.2')}
+    assert pve.posts[0][1]['filename'].startswith('10.0.0.50_5000_team_app_1.2_')
     assert oci.registry_of('library/nginx:1') == oci.registry_of('nginx:1') == 'docker.io'
     assert oci.registry_of('ghcr.io/owner/app:1') == 'ghcr.io'
 
@@ -602,6 +606,33 @@ def test_the_archive_name_keeps_the_registry():
     for ref in ('docker.io/library/nginx:1', 'localhost:5000/a/b:t'):
         name = oci.archive_name(ref)
         assert _pve_archive('s', name) == f's:vztmpl/{name}.tar'
+
+
+@pytest.mark.parametrize('a,b', [
+    ('example.com:5000/team:tag', 'example.com/5000/team:tag'),
+    ('registry.example/a_b/c:t', 'registry.example/a/b_c:t'),
+    ('ghcr.io/team/app_x:y', 'ghcr.io/team/app:x_y'),
+])
+def test_two_references_never_share_an_archive(a, b):
+    """'/', ':' and '_' all became _, so a reference anyone may type could name the file
+    another one pulled, and a deploy reused it (#1063)."""
+    assert oci.reference_problem(a) is None and oci.reference_problem(b) is None
+    assert oci.archive_name(a) != oci.archive_name(b)
+    # and the same reference keeps its one file, which is what reuse rests on
+    assert oci.archive_name(a) == oci.archive_name(a)
+    assert _pve_archive('s', oci.archive_name(b)) == f's:vztmpl/{oci.archive_name(b)}.tar'
+
+
+def test_a_colliding_reference_pulls_its_own_archive(api, admin):
+    """The storage holds what the pull of the first reference left; the second pulls."""
+    first, second = '10.0.0.50:5000/team:tag', '10.0.0.50/5000/team:tag'
+    pve = FakePve(on_storage=[f'local:vztmpl/{oci.archive_name(first)}.tar'])
+    pve.manager(api)
+    job = _job(_deploy(admin, reference=second))
+    assert job['status'] == 'completed', job['error']
+    assert job['reused'] is False, 'the deploy took the archive another reference pulled'
+    pull = dict(pve.posts)['/nodes/pve1/storage/local/oci-registry-pull']
+    assert pull == {'reference': second, 'filename': oci.archive_name(second)}
 
 
 # --- who may -------------------------------------------------------------------------------------

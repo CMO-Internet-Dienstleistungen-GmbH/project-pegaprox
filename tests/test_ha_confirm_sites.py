@@ -519,6 +519,7 @@ def _run_updates(monkeypatch, order, kind='recurring'):
     mgr = MagicMock()
     mgr.is_connected, mgr._rolling_update = True, None
     monkeypatch.setattr(sch, 'load_all_update_schedules', lambda: {'c1': schedule})
+    monkeypatch.setattr(sch, '_creator_may_update', lambda cid, s: True)   # its own file (#1093)
     monkeypatch.setitem(sch.cluster_managers, 'c1', mgr)
     monkeypatch.setattr(sch, 'execute_scheduled_rolling_update', lambda m, cid, a: order.append('acts'))
     monkeypatch.setattr(sch, 'update_schedule_last_run', lambda cid, last, nxt: order.append('last_run'))

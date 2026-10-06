@@ -208,6 +208,11 @@ PERMISSION_WARNINGS = {
         'host boots into - treat it like physical access to the rack. Only takes '
         'effect for accounts that see every cluster.'
     ),
+    'update.manage': (
+        'Not tenant-scoped. Updating or rolling back replaces and restarts this whole '
+        'installation, for every tenant on it. Only takes effect for accounts that see '
+        'every cluster.'
+    ),
 }
 
 # Default permissions per role

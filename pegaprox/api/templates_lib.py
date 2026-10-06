@@ -220,6 +220,26 @@ def _row_to_template(r):
     }
 
 
+def _shown_url(url):
+    """`url` with any user:password@ replaced, for every place it is shown.
+
+    NS Oct 2026 - a mirror that wants a login gets it in the URL, which the node needs
+    as typed. The catalog is one list for every account though, and the deploy log is
+    read by the cluster's viewers, so neither gets the login."""
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+        p = urlsplit(url or '')
+        if '@' not in p.netloc:
+            return url
+        return urlunsplit(p._replace(netloc='****@' + p.netloc.rpartition('@')[2]))
+    except Exception:
+        return ''
+
+
+def _public_template(tpl):
+    return dict(tpl, image_url=_shown_url(tpl.get('image_url')))
+
+
 def _load_custom_templates():
     try:
         c = get_db().conn.cursor()
@@ -341,6 +361,12 @@ def _run_deploy(dep_id, cluster_id, node, template_id, storage, vmid, vm_name):
     _update_dep(dep_id, status='running', progress=5,
                 log_append=f"deploying {tpl['name']} to {node} ({target_host}) as VMID {vmid}")
 
+    # the log keeps the command lines, which carry the URL; not its login (see _shown_url)
+    _url, _url_shown = tpl['image_url'], _shown_url(tpl['image_url'])
+
+    def _scrub(text):
+        return text.replace(_url, _url_shown) if _url and _url != _url_shown else text
+
     ssh = None
     try:
         ssh = mgr._ssh_connect(target_host)
@@ -350,11 +376,11 @@ def _run_deploy(dep_id, cluster_id, node, template_id, storage, vmid, vm_name):
             return
 
         def run(cmd, label, weight=10):
-            _update_dep(dep_id, log_append=f"$ {cmd}")
+            _update_dep(dep_id, log_append=f"$ {_scrub(cmd)}")
             stdin, stdout, stderr = ssh.exec_command(cmd, get_pty=False, timeout=900)
             rc = stdout.channel.recv_exit_status()
-            out = _read_capped(stdout).strip()
-            err = _read_capped(stderr).strip()
+            out = _scrub(_read_capped(stdout).strip())
+            err = _scrub(_read_capped(stderr).strip())
             if out:
                 _update_dep(dep_id, log_append=out[:1000])
             if err and rc != 0:
@@ -439,8 +465,8 @@ def _run_deploy(dep_id, cluster_id, node, template_id, storage, vmid, vm_name):
     except Exception as e:
         logging.exception(f"[templates_lib] deploy {dep_id} failed")
         _update_dep(dep_id, status='failed',
-                    error=str(e)[:500],
-                    log_append=f"FAILED: {e}",
+                    error=_scrub(str(e))[:500],
+                    log_append=f"FAILED: {_scrub(str(e))}",
                     finished_at=_now_iso())
     finally:
         try:
@@ -456,7 +482,7 @@ def _run_deploy(dep_id, cluster_id, node, template_id, storage, vmid, vm_name):
 @require_auth()
 def catalog():
     """Curated catalog + user-defined custom templates."""
-    return jsonify({'templates': list(CATALOG) + _load_custom_templates()})
+    return jsonify({'templates': list(CATALOG) + [_public_template(t) for t in _load_custom_templates()]})
 
 
 @bp.route('/api/templates/custom', methods=['POST'])
@@ -540,7 +566,7 @@ def add_custom_template():
     c = get_db().conn.cursor()
     c.execute('SELECT * FROM custom_cloud_templates WHERE id = ?', (tpl_id,))
     row = c.fetchone()
-    return jsonify({'template': _row_to_template(row) if row else {'id': tpl_id}})
+    return jsonify({'template': _public_template(_row_to_template(row)) if row else {'id': tpl_id}})
 
 
 @bp.route('/api/templates/custom/<tpl_id>', methods=['DELETE'])

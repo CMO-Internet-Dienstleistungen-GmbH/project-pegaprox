@@ -22,7 +22,9 @@ INJECTED = 'qemu/200/status/stop#'
 
 
 @pytest.fixture
-def cluster(api):
+def cluster(api, seed):
+    # the scheduler asks the creator of a row again before it sends (#1093)
+    seed.user('sched_owner', role='admin')
     m = api.make_fake_manager(cluster_id='cluster_1')
     m.is_connected = True
     m.host, m.api_port = 'pve.example', 8006
@@ -137,7 +139,8 @@ def test_a_switched_off_row_is_still_listed_and_deletable(api, seed, db, cluster
 
 def _run(action, **kw):
     sched.execute_scheduled_action(dict({'id': 9, 'cluster_id': 'cluster_1', 'vmid': 100,
-                                         'vm_type': 'qemu', 'action': action}, **kw))
+                                         'vm_type': 'qemu', 'action': action,
+                                         'created_by': 'sched_owner'}, **kw))
 
 
 def test_the_scheduler_does_not_send_a_path_from_the_row(api, cluster):

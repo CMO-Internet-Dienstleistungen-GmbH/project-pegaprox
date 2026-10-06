@@ -392,6 +392,27 @@ def _restart_through_systemd():
     return False
 
 
+def _refuse_confined_updater():
+    """403 unless the caller sees every cluster, else None.
+
+    NS Oct 2026 - the updater replaces and restarts the whole installation, every tenant's
+    included. update.manage is grantable like any other permission, so a role confined to a
+    tenant could hold it; the rule is the automated-installations one, reused so the two
+    cannot drift apart."""
+    from pegaprox.api.auto_install import _sees_every_cluster
+    from pegaprox.utils.auth import build_authz_user
+    try:
+        session = getattr(request, 'session', None) or {}
+        unconfined = _sees_every_cluster(build_authz_user(session.get('user', ''), session))
+    except Exception as e:
+        logging.warning(f"[update] could not resolve the caller's cluster scope: {e}")
+        unconfined = False
+    if not unconfined:
+        return jsonify({'error': 'The updater is only available to accounts that are not '
+                                 'limited to a tenant or to specific clusters'}), 403
+    return None
+
+
 @bp.route('/api/pegaprox/check-update', methods=['GET'])
 @require_auth(perms=['update.manage'])
 def check_pegaprox_update():
@@ -401,6 +422,9 @@ def check_pegaprox_update():
     current version with a hint flag so the UI can render "Air-gap mode active —
     update checks disabled" instead of a misleading "no updates available".
     """
+    _uerr = _refuse_confined_updater()
+    if _uerr:
+        return _uerr
     if load_server_settings().get('air_gap_mode', False):
         return jsonify({
             'current_version': PEGAPROX_VERSION,
@@ -528,6 +552,9 @@ def perform_pegaprox_update():
     - *.db, *.enc             (databases, encrypted files)
     - *.pem, *.key, *.crt    (certificates, private keys)
     """
+    _uerr = _refuse_confined_updater()
+    if _uerr:
+        return _uerr
     try:
         data = request.json or {}
         force = data.get('force', False)
@@ -1053,6 +1080,9 @@ def rollback_pegaprox_update():
     
     NS: Rollback functionality - Jan 2026
     """
+    _uerr = _refuse_confined_updater()
+    if _uerr:
+        return _uerr
     try:
         data = request.json or {}
         backup_name = data.get('backup')

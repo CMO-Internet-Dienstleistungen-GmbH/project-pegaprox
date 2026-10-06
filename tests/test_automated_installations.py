@@ -554,6 +554,36 @@ def test_a_file_that_cannot_be_blanked_is_not_shown_at_all(api, seed, form):
     assert SECRET not in body['answer']
 
 
+# (#1026) the value check searched the decoded secret in the text, and an escaped or
+# line-continued spelling does not contain it: the reader got the secret in that spelling
+ESCAPED_SECRET = SECRET[:-1] + '\\u0063'
+CONTINUED_SECRET = SECRET[:8] + '\\\n    ' + SECRET[8:]
+DOTTED = ('global.keyboard = "de"\nglobal.country = "de"\nglobal.fqdn = "pve01.lab.example.com"\n'
+          'global.mailto = "root@example.com"\nglobal.timezone = "Europe/Berlin"\n'
+          'global.root-password = "%s"\n\n[network]' + ANSWER.split('[network]', 1)[1])
+ESCAPED = [
+    ('quoted key, unicode escape', ESCAPED_SECRET,
+     ANSWER.replace('root-password = "hunter2-in-the-rack"', '"root-password" = "%s"' % ESCAPED_SECRET)),
+    ('dotted key, unicode escape', ESCAPED_SECRET, DOTTED % ESCAPED_SECRET),
+    ('line-continued string', CONTINUED_SECRET,
+     ANSWER.replace('root-password = "hunter2-in-the-rack"', 'root-password = """%s"""' % CONTINUED_SECRET)),
+]
+
+
+@pytest.mark.parametrize('label,spelled,answer', ESCAPED, ids=[s[0] for s in ESCAPED])
+def test_an_escaped_spelling_of_the_password_reaches_no_view_only_reader(api, seed, label, spelled, answer):
+    assert tomllib.loads(answer)['global']['root-password'] == SECRET
+    created = _create(_admin(api, seed), answer=answer)
+    body = _viewer(api, seed).get(f"/api/auto-install/profiles/{created['id']}").get_json()
+    shown = body['answer']
+    assert SECRET not in shown and SECRET[8:] not in shown and spelled.split('\n')[0] not in shown, (label, shown)
+    try:
+        decoded = tomllib.loads(shown)
+    except tomllib.TOMLDecodeError:
+        decoded = {}
+    assert SECRET not in json.dumps(decoded), (label, shown)
+
+
 def test_view_only_cannot_create_or_rotate(api, seed):
     created = _create(_admin(api, seed))
     w = _viewer(api, seed)

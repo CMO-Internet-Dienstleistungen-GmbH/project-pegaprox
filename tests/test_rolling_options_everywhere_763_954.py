@@ -518,6 +518,7 @@ def test_the_scheduler_hands_the_stored_options_to_the_run(monkeypatch):
     runs = []
     monkeypatch.setattr(sch, 'execute_scheduled_rolling_update', lambda m, cid, a: runs.append((cid, a['config'])))
     monkeypatch.setattr(sch, 'update_schedule_last_run', lambda *a: None)
+    monkeypatch.setattr(sch, '_creator_may_update', lambda cid, s: True)   # its own file (#1093)
     base = {'enabled': True, 'schedule_type': 'recurring', 'day': 'daily', 'time': '03:00'}
     monkeypatch.setattr(sch, 'load_all_update_schedules', lambda: {
         'c1': dict(base, migrate_templates=True, relax_anti_affinity=True),

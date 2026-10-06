@@ -331,6 +331,20 @@ def _record_event(cluster_id, kind, scope, diffs, severity, summary):
         return None
 
 
+def _refuse_baseline_write():
+    """403 unless the caller may also change the cluster's configuration, else None.
+
+    NS Oct 2026 - admin.audit reads drift. Rewriting a baseline accepts whatever changed
+    as the new normal, so a read-only auditor could make drift disappear. Plain
+    acknowledging stays with the reader: it keeps the row and who acknowledged it."""
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import has_permission
+    if not has_permission(build_authz_user(_current_user(), request.session), 'cluster.config'):
+        return jsonify({'error': 'Permission denied: changing a drift baseline needs cluster.config',
+                        'code': 'MISSING_PERMISSION', 'required': 'cluster.config'}), 403
+    return None
+
+
 def _current_user():
     try:
         u = request.session.get('user') if hasattr(request, 'session') else ''
@@ -742,6 +756,10 @@ def acknowledge_event(eid):
         _cerr = require_unconfined(ev['cluster_id'])
         if _cerr:
             return _cerr
+        if promote:
+            _werr = _refuse_baseline_write()
+            if _werr:
+                return _werr
         c.execute('''UPDATE drift_events SET status='acknowledged',
                      acknowledged_at=?, acknowledged_by=? WHERE id=?''',
                   (datetime.now().isoformat(), user, eid))
@@ -781,6 +799,10 @@ def manual_scan(cluster_id):
         return _cerr
     body = request.get_json(silent=True) or {}
     seed = bool(body.get('seed', False))
+    if seed:
+        _werr = _refuse_baseline_write()
+        if _werr:
+            return _werr
     return jsonify(_scan_cluster(cluster_id, autobaseline=seed))
 
 
@@ -794,6 +816,9 @@ def reset_baseline(cluster_id):
     _cerr = require_unconfined(cluster_id)
     if _cerr:
         return _cerr
+    _werr = _refuse_baseline_write()
+    if _werr:
+        return _werr
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'cluster not found'}), 404
     mgr = cluster_managers[cluster_id]

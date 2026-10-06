@@ -33,6 +33,15 @@ def _mask_channel(ch):
         c['url'] = '********'
     if c.get('token'):
         c['token'] = '********'
+    # NS Oct 2026 - an ntfy topic is the channel: without a token, whoever knows it reads
+    # and posts the feed (#993). Same when it was typed into the url instead.
+    if c.get('topic'):
+        c['topic'] = '********'
+    if c.get('type') == 'ntfy' and u:
+        from urllib.parse import urlsplit
+        p = urlsplit(u)
+        if p.path.strip('/'):
+            c['url'] = f"{p.scheme}://{p.netloc.rpartition('@')[2]}/…"
     return c
 
 
@@ -996,7 +1005,7 @@ def update_alert_channel(cid):
         for k in ('name', 'type', 'enabled', 'topic', 'url', 'token'):
             if k in data:
                 v = data[k]
-                if k in ('url', 'token') and isinstance(v, str) and ('…' in v or v == '********'):
+                if k in ('url', 'token', 'topic') and isinstance(v, str) and ('…' in v or v == '********'):
                     continue  # untouched
                 updated[k] = v
         channels[i] = updated
@@ -1028,6 +1037,10 @@ def delete_alert_channel(cid):
 @bp.route('/api/alert-channels/<cid>/test', methods=['POST'])
 @require_auth(perms=['alert.manage'])
 def test_alert_channel(cid):
+    # NS Oct 2026 - the channel list is installation-wide, so is firing at it (#989)
+    _serr = _require_settings_admin()
+    if _serr:
+        return _serr
     from pegaprox.api.helpers import load_server_settings
     from pegaprox.utils.webhooks import send_to_channel
     channels = (load_server_settings() or {}).get('alert_webhooks') or []
@@ -1074,18 +1087,21 @@ def alerts_diagnostics():
     _allowed = get_user_clusters(build_authz_user(request.session.get('user', ''), request.session))
     _reach = (lambda cid: True) if _allowed is None else (lambda cid: cid in _allowed)
     _rules = [a for a in cfg.get('alerts', []) if _reach(a.get('cluster_id'))]
+    # NS Oct 2026 - the count, the recipients and the channels were the whole installation's
+    # for a caller confined to some clusters; they get their own rules and nothing global
+    _whole = _allowed is None
     return jsonify({
         'last_tick_at': A._last_tick_at,
         'tick_interval_seconds': 60,
-        'alerts_in_config': len(cfg.get('alerts', [])),
+        'alerts_in_config': len(_rules),
         'enabled': cfg.get('enabled', True),
         'cooldown_seconds': settings.get('alert_cooldown', 300),
-        'email_recipients': len(settings.get('alert_email_recipients') or []),
+        'email_recipients': len(settings.get('alert_email_recipients') or []) if _whole else None,
         'webhook_channels': [
             {'id': c.get('id'), 'name': c.get('name'), 'type': c.get('type'),
              'enabled': c.get('enabled', True)}
             for c in (settings.get('alert_webhooks') or [])
-        ],
+        ] if _whole else None,
         'clusters_loaded': sorted([
             {'id': cid, 'connected': bool(getattr(m, 'is_connected', False))}
             for cid, m in cluster_managers.items() if _reach(cid)

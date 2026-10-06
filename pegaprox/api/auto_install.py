@@ -837,6 +837,16 @@ def _secret_values(node):
     return found
 
 
+def _strings(node):
+    if isinstance(node, str):
+        return [node]
+    if isinstance(node, dict):
+        return [s for v in node.values() for s in _strings(v)]
+    if isinstance(node, list):
+        return [s for v in node for s in _strings(v)]
+    return []
+
+
 def redact_answer(text):
     """Blank secret values for a view-only reader, and fail closed.
 
@@ -857,7 +867,15 @@ def redact_answer(text):
     data, err = _parse_toml(text or '')
     if err:
         return _UNREDACTABLE
-    if any(value in redacted for value in _secret_values(data)):
+    found = _secret_values(data)
+    # as written: a secret copied into a comment is in no parsed value
+    if any(value in redacted for value in found):
+        return _UNREDACTABLE
+    # NS Oct 2026 - and as decoded: a \u escape or a line-continued string reads back as the
+    # secret without spelling it out, and half a rewritten multi-line string does not
+    # parse at all (#1026)
+    shown, err = _parse_toml(redacted)
+    if err or any(value in s for s in _strings(shown) for value in found):
         return _UNREDACTABLE
     return redacted
 
