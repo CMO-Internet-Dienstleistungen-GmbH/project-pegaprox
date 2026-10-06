@@ -2104,7 +2104,8 @@
                                                                     )}
                                                                     <div className="flex items-center gap-2 mt-1 text-xs text-gray-500">
                                                                         {tmpl.os && <span>OS: {tmpl.os}</span>}
-                                                                        {tmpl.infopage && (
+                                                                        {/* NS Oct 2026 - the link comes from the PVE answer, React renders a javascript: href as is */}
+                                                                        {typeof tmpl.infopage === 'string' && /^https?:\/\//i.test(tmpl.infopage) && (
                                                                             <a 
                                                                                 href={tmpl.infopage} 
                                                                                 target="_blank" 

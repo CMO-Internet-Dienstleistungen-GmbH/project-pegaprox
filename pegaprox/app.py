@@ -887,6 +887,21 @@ def _check_api_rate_limit(client_ip: str) -> bool:
     return g.api_rate_window.allow(client_ip)
 
 
+def _sri(data):
+    """The sha384 integrity string of some bytes, as web/index.html writes them."""
+    import base64
+    import hashlib
+    return 'sha384-' + base64.b64encode(hashlib.sha384(data).digest()).decode('ascii')
+
+
+# NS Oct 2026 - --download-static wrote whatever the CDN served for react@18, chart.js@4 and
+# friends into static/ unchecked, and the app then ran it as its own code. Every file is now
+# fetched at an exact version and kept only when it hashes to the copy this repository ships
+# (for react, react-dom, chart.js and xterm that is also the SRI hash web/index.html carries).
+# noVNC is 45 module files: one digest over all of them as downloaded, before the import rewrite.
+_NOVNC_SHA384 = 'sha384-1MofzirpfH0EVfkfVyRyOwvUg2NQKMuDXnCeYaFnB5Mm/m+6yRVLY8tIk5Yw04fS'
+
+
 def download_static_files():
     """Download all required static files for offline operation."""
     import urllib.request
@@ -899,15 +914,22 @@ def download_static_files():
 
     static_files = {
         'js': [
-            ('react.production.min.js', 'https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js'),
-            ('react-dom.production.min.js', 'https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js'),
-            ('babel.min.js', 'https://cdn.jsdelivr.net/npm/@babel/standalone@7/babel.min.js'),
-            ('chart.umd.min.js', 'https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js'),
-            ('xterm.min.js', 'https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js'),
-            ('xterm-addon-fit.min.js', 'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js'),
+            ('react.production.min.js', 'https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js',
+             'sha384-DGyLxAyjq0f9SPpVevD6IgztCFlnMF6oW/XQGmfe+IsZ8TqEiDrcHkMLKI6fiB/Z'),
+            ('react-dom.production.min.js', 'https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js',
+             'sha384-gTGxhz21lVGYNMcdJOyq01Edg0jhn/c22nsx0kyqP0TxaV5WVdsSH1fSDUf5YJj1'),
+            ('babel.min.js', 'https://cdn.jsdelivr.net/npm/@babel/standalone@7.28.6/babel.min.js',
+             'sha384-JPppEYE7ZC9vFS/7cNjjowtWnUZ23GWT7OnRptB9bRQlXx1ufYwKfNbS2DrBYZ4a'),
+            ('chart.umd.min.js', 'https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js',
+             'sha384-jb8JQMbMoBUzgWatfe6COACi2ljcDdZQ2OxczGA3bGNeWe+6DChMTBJemed7ZnvJ'),
+            ('xterm.min.js', 'https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js',
+             'sha384-xjfWUeCWdMtvpAb/SmM6lMzS6pQGcQa0loOl1d97j6Odw0vjK9nW3+dTb/bn/mwH'),
+            ('xterm-addon-fit.min.js', 'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js',
+             'sha384-dpjGwSSISUTz2taP54Bor7qkyMR20sSO9oe11UVYnGs2/YdUBf7HW30XKQx9PCzn'),
         ],
         'css': [
-            ('xterm.min.css', 'https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css'),
+            ('xterm.min.css', 'https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css',
+             'sha384-9ftsg11+LSxVUaknegCfeKvlkO9EdIPI2op725RqY87IvhyGjElmpjZlP3LhTQjn'),
         ]
     }
 
@@ -921,7 +943,7 @@ def download_static_files():
 
     for subdir, files in static_files.items():
         print(f"Downloading {subdir} files...")
-        for filename, url in files:
+        for filename, url, integrity in files:
             dest = f'static/{subdir}/{filename}'
             print(f"  {filename}...", end=' ')
             try:
@@ -930,6 +952,9 @@ def download_static_files():
                 })
                 with urllib.request.urlopen(req, timeout=30, context=ctx) as response:
                     data = response.read()
+                if _sri(data) != integrity:
+                    # the file already in static/ stays as it is
+                    raise ValueError('hash does not match the pinned release, not written')
                 with open(dest, 'wb') as f:
                     f.write(data)
                 print(f"OK ({len(data):,} bytes)")
@@ -1040,10 +1065,10 @@ def download_static_files():
 
     novnc_success = 0
     novnc_failed = 0
+    fetched = {}
 
     for filepath in novnc_files:
         url = f"{novnc_base}/{filepath}"
-        dest = f"static/js/novnc/{filepath}"
         filename = filepath.split('/')[-1]
         print(f"  {filename}...", end=' ')
         try:
@@ -1051,7 +1076,26 @@ def download_static_files():
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             })
             with urllib.request.urlopen(req, timeout=30, context=ctx) as response:
-                content = response.read().decode('utf-8')
+                fetched[filepath] = response.read()
+            print("OK")
+        except Exception as e:
+            print(f"FAILED: {e}")
+            novnc_failed += 1
+            failed += 1
+
+    # written whole and as pinned, or not at all: every module imports the others
+    bundle = b''.join(fp.encode() + b'\0' + fetched.get(fp, b'') + b'\0' for fp in novnc_files)
+    if not novnc_failed and _sri(bundle) != _NOVNC_SHA384:
+        print("  noVNC: the files do not match the pinned 1.4.0 release, nothing written")
+        novnc_failed = len(novnc_files)
+        failed += novnc_failed
+    if novnc_failed:
+        fetched = {}
+
+    for filepath, raw in fetched.items():
+        dest = f"static/js/novnc/{filepath}"
+        try:
+            content = raw.decode('utf-8')
 
             file_dir = '/'.join(filepath.split('/')[:-1])
             pattern = r'''from\s+(['"])(\.{1,2}/[^'"]+)\1'''
@@ -1080,11 +1124,10 @@ def download_static_files():
 
             with open(dest, 'w') as f:
                 f.write(content)
-            print("OK")
             novnc_success += 1
             success += 1
         except Exception as e:
-            print(f"FAILED: {e}")
+            print(f"  {filepath}... FAILED: {e}")
             novnc_failed += 1
             failed += 1
 

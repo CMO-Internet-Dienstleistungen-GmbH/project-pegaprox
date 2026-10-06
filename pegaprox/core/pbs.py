@@ -38,6 +38,42 @@ def _validate_pbs_host(host: str) -> bool:
     # hostname, FQDN, IPv4, or IPv6 — no scheme, no path, no whitespace
     return bool(re.match(r'^[a-zA-Z0-9\.\-\:]+$', host))
 
+
+def pbs_target_refusal(host: str, allow_loopback: bool = True) -> str:
+    """Why PegaProx will not dial a PBS host somebody typed in, or '' when it may.
+
+    NS Oct 2026 - the format check above let every address through. A PBS sits on the LAN,
+    so private ranges stay open, but link-local (where the cloud metadata services answer)
+    has no PBS on it, and the errors of a connection attempt tell whether anything listens
+    there. Loopback only for a global admin, who may run PegaProx on the PBS host itself.
+    A name that does not resolve is left to the connection, which reports it anyway.
+    """
+    import ipaddress
+    import socket
+    from pegaprox.utils.url_security import _embedded_ipv4
+
+    host = (host or '').strip()
+    if not _validate_pbs_host(host):
+        return 'Invalid PBS host'
+    try:
+        found = socket.getaddrinfo(host, None)
+    except (OSError, UnicodeError):
+        return ''
+    for info in found:
+        try:
+            ip = ipaddress.ip_address(str(info[4][0]).split('%', 1)[0])
+        except ValueError:
+            continue
+        # the address itself and an IPv4 one carried inside it (mapped, 6to4, NAT64)
+        for addr in (ip, _embedded_ipv4(ip)):
+            if addr is None:
+                continue
+            if addr.is_link_local or str(addr) == 'fd00:ec2::254':
+                return 'The PBS host is a link-local or cloud metadata address'
+            if not allow_loopback and (addr.is_loopback or addr.is_unspecified):
+                return 'The PBS host is a loopback address of this server'
+    return ''
+
 class _PinnedFingerprintAdapter(requests.adapters.HTTPAdapter):
     """Verify the peer certificate against a configured SHA-256 fingerprint.
 

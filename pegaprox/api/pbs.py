@@ -13,8 +13,8 @@ from pegaprox.core.db import get_db
 from pegaprox.utils.auth import require_auth
 from pegaprox.utils.audit import log_audit
 from pegaprox.utils.sanitization import bounded_list
-from pegaprox.api.helpers import safe_error, check_pbs_access, check_cluster_access, scope_vm_rows, require_unconfined, bounded_limit, acts_as_admin
-from pegaprox.core.pbs import PBSManager, load_pbs_servers, save_pbs_server, pbs_config_from_row
+from pegaprox.api.helpers import safe_error, check_pbs_access, check_cluster_access, scope_vm_rows, require_unconfined, bounded_limit, acts_as_admin, caller_acts_as_admin
+from pegaprox.core.pbs import PBSManager, load_pbs_servers, save_pbs_server, pbs_config_from_row, pbs_target_refusal
 
 bp = Blueprint('pbs', __name__)
 
@@ -48,6 +48,36 @@ def pbs_upstream_error(result):
         return 502, {'error': 'PBS is unreachable', 'code': 'PBS_UNREACHABLE', 'upstream_status': None}
     return 502, {'error': f'PBS returned HTTP {upstream}', 'code': 'PBS_UPSTREAM',
                  'upstream_status': upstream}
+
+
+def _link_refusal(links, empty_error):
+    """The 403 for a non-admin caller who links a PBS server to `links`, or None.
+
+    linked_clusters is the list check_pbs_access reads, and an empty one opens the server to
+    every tenant. So only a global admin leaves it empty, and anybody else links it only to
+    clusters they reach themselves. NS Oct 2026 (#995) - shared by the add and the update.
+    """
+    from pegaprox.utils.auth import build_authz_user as _bau
+    from pegaprox.utils.rbac import get_user_clusters as _guc
+    _caller = _bau(request.session.get('user', ''), request.session)
+    if acts_as_admin(_caller):
+        return None
+    _new_links = list(links or [])
+    if not _new_links:
+        return jsonify({'error': empty_error}), 403
+    _reachable = _guc(_caller)
+    if _reachable is not None:
+        _beyond = [c for c in _new_links if c not in set(_reachable)]
+        if _beyond:
+            return jsonify({'error': 'Access denied: cannot link this PBS server to '
+                                     + ', '.join(_beyond)}), 403
+    return None
+
+
+def _target_refusal(host):
+    """pbs_target_refusal for the caller of this request: loopback for a global admin only."""
+    return pbs_target_refusal(host, allow_loopback=caller_acts_as_admin())
+
 
 @bp.route('/api/pbs', methods=['GET'])
 @require_auth(perms=['pbs.view'])
@@ -127,7 +157,17 @@ def add_pbs_server():
     
     if not data.get('user') and not data.get('api_token_id'):
         return jsonify({'error': 'Username or API token is required'}), 400
-    
+
+    # NS Oct 2026 (#995) - the update has refused an empty or foreign link list since September,
+    # the add never did: a new server without links was open to every tenant from the start
+    _lerr = _link_refusal(data.get('linked_clusters'),
+                          'Access denied: only a global admin may add a PBS server linked to no cluster')
+    if _lerr:
+        return _lerr
+    _why = _target_refusal(data.get('host'))
+    if _why:
+        return jsonify({'error': _why}), 400
+
     pbs_id = str(uuid.uuid4())[:8]
     
     # Test connection first
@@ -166,20 +206,10 @@ def update_pbs_server(pbs_id):
     # the same move at half speed, so a non-admin may only ever narrow it, and only to clusters
     # they can reach themselves.
     if 'linked_clusters' in data:
-        from pegaprox.utils.auth import build_authz_user as _bau
-        from pegaprox.utils.rbac import get_user_clusters as _guc
-        _caller = _bau(request.session.get('user', ''), request.session)
-        if not acts_as_admin(_caller):
-            _new_links = list(data.get('linked_clusters') or [])
-            if not _new_links:
-                return jsonify({'error': 'Access denied: only a global admin may unlink a PBS '
-                                         'server from every cluster'}), 403
-            _reachable = _guc(_caller)
-            if _reachable is not None:
-                _beyond = [c for c in _new_links if c not in set(_reachable)]
-                if _beyond:
-                    return jsonify({'error': 'Access denied: cannot link this PBS server to '
-                                             + ', '.join(_beyond)}), 403
+        _lerr = _link_refusal(data.get('linked_clusters'),
+                              'Access denied: only a global admin may unlink a PBS server from every cluster')
+        if _lerr:
+            return _lerr
 
     # NS Oct 2026 (#999, #1033) - the stored row is what this update starts from, for the guards
     # below and for the manager it rebuilds. The manager used to be rebuilt from the body alone:
@@ -218,6 +248,10 @@ def update_pbs_server(pbs_id):
         _old_port_i = 8007
     host_changed = (data.get('host') and data.get('host') != old_host) or \
                    (_new_port is not None and _new_port != _old_port_i)
+    if host_changed:
+        _why = _target_refusal(data.get('host') or old_host)
+        if _why:
+            return jsonify({'error': _why}), 400
 
     # NS Aug 2026 (Aikido 469089267 + AI-pentest re-check) — FAIL CLOSED on a host/port change: every
     # credential the STORED config holds must be freshly re-entered, otherwise it would be shipped to
@@ -297,7 +331,10 @@ def test_pbs_new_connection():
     data = request.json or {}
     if not data.get('host'):
         return jsonify({'error': 'Host is required'}), 400
-    
+    _why = _target_refusal(data.get('host'))
+    if _why:
+        return jsonify({'success': False, 'error': _why}), 400
+
     try:
         test_mgr = PBSManager('test', data)
     except ValueError as e:
@@ -322,6 +359,9 @@ def test_pbs_connection(pbs_id):
     data = request.json or {}
     
     if data.get('host'):
+        _why = _target_refusal(data.get('host'))
+        if _why:
+            return jsonify({'success': False, 'error': _why}), 400
         # MK Oct 2026 (#805) - the edit dialog shows stored secrets as '********', and its Test
         # button sent that mask to PBS as the password or token secret, so testing a saved
         # server always failed with HTTP 401. Fill the mask from the stored server like the PUT
@@ -2863,6 +2903,9 @@ def probe_pbs_fingerprint():
             return jsonify({'error': f'unsafe target: {reason}'}), 400
     except Exception:
         pass
+    _why = _target_refusal(host)
+    if _why:
+        return jsonify({'error': _why}), 400
 
     ctx = _ssl._create_unverified_context()
     try:
@@ -3109,6 +3152,16 @@ def auto_attach_pbs_to_clusters(pbs_id):
     cluster_ids = cluster_ids or list(pbs_mgr.linked_clusters or [])
     if not cluster_ids:
         return jsonify({'error': 'no clusters specified or linked'}), 400
+    # NS Oct 2026 (#980) - the credentials go only where the server is linked. The tenant check
+    # below takes any cluster the caller's tenant owns, so reaching the server through one
+    # linked cluster was enough to plant its credentials on another. A global admin may still
+    # attach it anywhere, and a server linked to nothing is open to everybody anyway.
+    _linked = list(pbs_mgr.linked_clusters or [])
+    if _linked and not caller_acts_as_admin():
+        _off = [c for c in cluster_ids if c not in _linked]
+        if _off:
+            return jsonify({'error': 'Access denied: this PBS server is not linked to '
+                                     + ', '.join(_off)}), 403
     # NS Aug 2026 (Aikido 469089213) — this injects the PBS's stored (often root@pam) credentials
     # into a PVE storage config, so check_cluster_access (which passes on the #555 pool / #248 ACL
     # fallback) is not enough: confine to clusters the caller's TENANT owns, like the storage
@@ -3131,15 +3184,29 @@ def auto_attach_pbs_to_clusters(pbs_id):
 
     # Probe live fingerprint so we always inject a current one
     import socket as _sock, ssl as _ssl, hashlib
+    from urllib3.util.ssl_ import assert_fingerprint as _assert_fp
+    from urllib3.exceptions import SSLError as _FpMismatch
     try:
         ctx = _ssl._create_unverified_context()
         with _sock.create_connection((pbs_mgr.host, pbs_mgr.port or 8007), timeout=10) as s:
             with ctx.wrap_socket(s, server_hostname=pbs_mgr.host) as ssock:
                 der = ssock.getpeercert(binary_form=True)
-        fp_hex = hashlib.sha256(der).hexdigest().upper()
-        fingerprint = ':'.join(fp_hex[i:i+2] for i in range(0, len(fp_hex), 2))
     except Exception as e:
         return jsonify({'error': f'fingerprint probe failed: {e}'}), 502
+    # NS Oct 2026 (#1074) - PVE is told to trust this certificate, next to the stored credentials,
+    # and it was read unverified past the fingerprint the server is pinned to. A pinned server has
+    # to present its pinned certificate now; one without a pin takes what the probe sees, as before.
+    _pin = getattr(pbs_mgr, 'fingerprint', '')
+    _pin = _pin.strip() if isinstance(_pin, str) else ''
+    if _pin:
+        try:
+            _assert_fp(der, _pin)
+        except _FpMismatch:
+            logging.warning(f"[PBS:{pbs_id}] auto-storage refused: the certificate does not match the stored fingerprint")
+            return jsonify({'error': 'The PBS server presents a certificate that does not match its '
+                                     'stored fingerprint'}), 502
+    fp_hex = hashlib.sha256(der).hexdigest().upper()
+    fingerprint = ':'.join(fp_hex[i:i+2] for i in range(0, len(fp_hex), 2))
 
     pbs_user = getattr(pbs_mgr, 'user', None) or getattr(pbs_mgr, 'username', None)
     pbs_pass = getattr(pbs_mgr, 'password', None)
@@ -3237,12 +3304,17 @@ def storage_preflight(cluster_id):
             return jsonify({'ok': False, 'issues': [f'unsafe target: {_reason}'], 'info': {}}), 200
     except Exception:
         pass
+    _why = _target_refusal(server)
+    if _why:
+        return jsonify({'ok': False, 'issues': [_why], 'info': {}}), 200
 
     issues = []
     info = {}
 
     # 1) TCP reachability
     import socket as _sock, ssl as _ssl, hashlib
+    from urllib3.util.ssl_ import assert_fingerprint as _assert_fp
+    from urllib3.exceptions import SSLError as _FpMismatch
     try:
         with _sock.create_connection((server, port), timeout=6):
             info['tcp'] = 'ok'
@@ -3258,15 +3330,25 @@ def storage_preflight(cluster_id):
         fp_hex = hashlib.sha256(der).hexdigest().upper()
         live_fp = ':'.join(fp_hex[i:i+2] for i in range(0, len(fp_hex), 2))
         info['live_fingerprint'] = live_fp
-        if given_fp and given_fp != live_fp:
-            issues.append(f'Fingerprint mismatch — server presents {live_fp[:16]}…, you supplied {given_fp[:16]}…')
     except Exception as e:
         return jsonify({'ok': False, 'issues': [f'TLS handshake failed: {e}'], 'info': info}), 200
+    # NS Oct 2026 (#1074) - a mismatch was only a line in the list, and the typed password went to
+    # that server right after. It stays here now, and with a fingerprint given the login below
+    # only talks to the certificate it names (colons and case no longer count as a mismatch).
+    if given_fp:
+        try:
+            _assert_fp(der, given_fp)
+        except _FpMismatch:
+            issues.append(f'Fingerprint mismatch - server presents {live_fp[:16]}…, you supplied {given_fp[:16]}…')
+            return jsonify({'ok': False, 'issues': issues, 'info': info}), 200
 
     # 3) Auth probe
     try:
         import requests as _r
         s = _r.Session(); s.verify = False
+        if given_fp:
+            from pegaprox.core.pbs import _PinnedFingerprintAdapter
+            s.mount('https://', _PinnedFingerprintAdapter(given_fp))
         ar = s.post(f'https://{server}:{port}/api2/json/access/ticket',
                     data={'username': username, 'password': password}, timeout=8)
         if ar.status_code != 200:
