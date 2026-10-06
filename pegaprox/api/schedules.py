@@ -2,11 +2,13 @@
 """scheduler + update schedule routes - split from monolith dec 2025, MK/NS"""
 
 import os
+import re
 import json
 import time
 import logging
 import threading
 from datetime import datetime, timedelta
+from urllib.parse import quote
 from flask import Blueprint, jsonify, request
 
 from pegaprox.constants import *
@@ -40,6 +42,49 @@ def _require_action_perm(action):
     if not has_permission(user, perm):
         return jsonify({'error': f'Permission denied: {perm} required to schedule a {action} action'}), 403
     return None
+
+
+# NS Oct 2026 - vm_type went from the request into the row and from the row into the PVE path
+# (nodes/<node>/<vm_type>/<vmid>/...), unchecked. The per-VM check does not look at it on the
+# ACL path, so one VM's start/stop grant scheduled 'qemu/<other>/status/stop#' and the scheduler
+# sent it with the cluster's own credentials (#1023). A row names a guest by type and number.
+VM_ACTIONS = ('start', 'stop', 'shutdown', 'reboot', 'snapshot')
+VM_TYPES = ('qemu', 'lxc')
+
+
+def _schedule_vmid(value):
+    """`value` as a VMID, None when it is not one. int() alone takes True, 100.9, ' 100' and '1_00'."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str) and re.fullmatch(r'[0-9]{1,9}', value):
+        value = int(value)
+    return value if isinstance(value, int) and 100 <= value <= 999999999 else None
+
+
+def _schedule_target_error(action):
+    """Why `action` cannot run as a scheduled VM action, '' when it can."""
+    if action.get('action') not in VM_ACTIONS:
+        return f"action must be one of {list(VM_ACTIONS)}"
+    if action.get('vm_type') not in VM_TYPES:
+        return "vm_type must be 'qemu' or 'lxc'"
+    if _schedule_vmid(action.get('vmid')) is None:
+        return 'vmid must be a VM ID (100 - 999999999)'
+    return ''
+
+
+_bad_targets_said = set()
+
+
+def _disable_bad_target(action):
+    """A stored row that names no guest (written before the checks above) stays, so it can be
+    seen, fixed or deleted, but it is switched off and never fires. Logged once per row."""
+    why = _schedule_target_error(action)
+    if not why:
+        return
+    action['enabled'] = False
+    if action.get('id') not in _bad_targets_said:
+        _bad_targets_said.add(action.get('id'))
+        logging.warning(f"[SCHEDULER] scheduled action {action.get('id')} switched off: {why}")
 
 # ============================================
 
@@ -102,6 +147,7 @@ def load_schedules():
                 'name': (row['name'] if has_name and row['name'] else ''),
                 'created_by': row['created_by'],
             })
+            _disable_bad_target(actions[-1])
         
         return _ScheduleSnapshot(actions=actions, last_id=last_id)
     except Exception as e:
@@ -110,7 +156,11 @@ def load_schedules():
         try:
             if os.path.exists(SCHEDULES_FILE):
                 with open(SCHEDULES_FILE, 'r') as f:
-                    return _ScheduleSnapshot(json.load(f))
+                    legacy = _ScheduleSnapshot(json.load(f))
+                for a in legacy.get('actions', []):
+                    a['vm_type'] = a.get('vm_type') or 'qemu'   # same default as a table row
+                    _disable_bad_target(a)
+                return legacy
         except Exception:
             pass
     # NOT an empty schedule table - we do not know what is in it.
@@ -369,6 +419,14 @@ def execute_scheduled_action(action):
             execute_scheduled_rolling_update(mgr, cluster_id, action)
             return
         
+        # the row is checked again here, whatever wrote it, and the path is built from the
+        # guest PVE lists under that number: its type must be the row's (#1023)
+        why = _schedule_target_error(dict(action, vm_type=vm_type))
+        if why:
+            logging.error(f"[SCHEDULER] Refusing scheduled action {action.get('id')}: {why}")
+            return
+        vmid = _schedule_vmid(vmid)
+        
         # Find the node where the VM is running
         resources = mgr.get_vm_resources()
         vm = next((r for r in resources if r.get('vmid') == vmid), None)
@@ -376,8 +434,12 @@ def execute_scheduled_action(action):
         if not vm:
             logging.error(f"[SCHEDULER] VM {vmid} not found")
             return
+        if vm.get('type') != vm_type:
+            logging.error(f"[SCHEDULER] Refusing scheduled {action_type} of {vmid}: "
+                          f"the schedule says {vm_type}, the guest is {vm.get('type')}")
+            return
         
-        node = vm.get('node')
+        node = quote(str(vm.get('node') or ''), safe='')
         host, port = mgr.host, mgr.api_port
         
         # Build the API URL based on action
@@ -747,15 +809,16 @@ def create_schedule():
 
     # NS Aug 2026 (Aikido pentest) — clear the SAME per-VM ACL the live action enforces (vms.py),
     # not just cluster reachability, else a pool-restricted user could schedule actions on any VMID.
-    try:
-        _sv = int(data['vmid'])
-    except (TypeError, ValueError):
-        return jsonify({'error': 'vmid must be a number'}), 400
+    _sv = _schedule_vmid(data['vmid'])
+    _vm_type = data.get('vm_type', 'qemu')
+    _bad = _schedule_target_error({'action': data['action'], 'vm_type': _vm_type, 'vmid': _sv})
+    if _bad:
+        return jsonify({'error': _bad}), 400
     from pegaprox.utils.auth import build_authz_user
     from pegaprox.utils.rbac import user_can_access_vm
     if not user_can_access_vm(build_authz_user(request.session.get('user', ''), request.session),
                               data['cluster_id'], _sv, _perm_for_action(data['action']),
-                              data.get('vm_type', 'qemu')):
+                              _vm_type):
         return jsonify({'error': 'Permission denied for this VM'}), 403
 
     # Validate schedule type
@@ -787,8 +850,8 @@ def create_schedule():
     new_schedule = {
         'id': new_id,
         'cluster_id': data['cluster_id'],
-        'vmid': int(data['vmid']),
-        'vm_type': data.get('vm_type', 'qemu'),
+        'vmid': _sv,
+        'vm_type': _vm_type,
         'action': data['action'],
         'schedule_type': data['schedule_type'],
         'time': time_str,
@@ -851,10 +914,13 @@ def update_schedule(schedule_id):
 
     # NS Aug 2026 (Aikido pentest) — re-check the per-VM ACL for the effective target/action (same
     # as create) so an edit cannot retarget a schedule onto an unauthorized VMID.
-    try:
-        _uv = int(data.get('vmid', schedule.get('vmid')))
-    except (TypeError, ValueError):
-        return jsonify({'error': 'vmid must be a number'}), 400
+    # The target as it will be stored, the request's fields over the row's (#1023).
+    _uv = _schedule_vmid(data.get('vmid', schedule.get('vmid')))
+    _ut = data.get('vm_type', schedule.get('vm_type', 'qemu'))
+    _bad = _schedule_target_error({'action': data.get('action', schedule.get('action')),
+                                   'vm_type': _ut, 'vmid': _uv})
+    if _bad:
+        return jsonify({'error': _bad}), 400
     from pegaprox.utils.auth import build_authz_user
     from pegaprox.utils.rbac import user_can_access_vm
     _authz = build_authz_user(request.session.get('user', ''), request.session)
@@ -872,7 +938,7 @@ def update_schedule(schedule_id):
         return jsonify({'error': 'Permission denied for this VM'}), 403
     if not user_can_access_vm(_authz, _cid, _uv,
                               _perm_for_action(data.get('action', schedule.get('action', 'start'))),
-                              data.get('vm_type', schedule.get('vm_type', 'qemu'))):
+                              _ut):
         return jsonify({'error': 'Permission denied for this VM'}), 403
 
     # Validate time format if being updated
@@ -902,6 +968,7 @@ def update_schedule(schedule_id):
     for field in updatable:
         if field in data:
             schedule[field] = data[field]
+    schedule['vmid'] = _uv
 
     if not save_schedules(schedules):
         return jsonify({'error': 'Could not save the schedule - check the server logs',

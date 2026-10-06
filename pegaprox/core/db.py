@@ -1944,8 +1944,14 @@ class PegaProxDB:
             if 'severity' not in cols:
                 cursor.execute("ALTER TABLE audit_log ADD COLUMN severity TEXT DEFAULT 'info'")
                 logging.info("Added severity column to audit_log")
+            # NS Oct 2026 - `cluster` holds the display name, which a cluster.config holder can
+            # set to anyone else's. Who may read a row is decided on the id (#1121).
+            if 'cluster_id' not in cols:
+                cursor.execute("ALTER TABLE audit_log ADD COLUMN cluster_id TEXT DEFAULT ''")
+                logging.info("Added cluster_id column to audit_log")
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_audit_cluster ON audit_log(cluster)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_audit_cluster_id ON audit_log(cluster_id)')
         except Exception as e:
             logging.error(f"Error extending audit_log schema: {e}")
 
@@ -4049,18 +4055,24 @@ class PegaProxDB:
     # ========================================
     
     def _generate_audit_hmac(self, timestamp: str, user: str, action: str, details: str,
-                             ip: str, cluster: str = '', severity: str = '') -> str:
+                             ip: str, cluster: str = '', severity: str = '',
+                             cluster_id: str = '') -> str:
         """Generate HMAC signature for audit entry (tamper detection).
 
         MK May 2026 (audit fix M-2) — added cluster + severity to the canonical
         string. Old entries (signed before May 2026) won't have those fields
         in their HMAC; the verify path tries the new format first, then
         falls back to the legacy format for backward compat.
+
+        The cluster id joins the string only when the row has one, so every row
+        written before it existed keeps the signature it had.
         """
         if not self.aes_key:
             return ''
-        # Canonical: timestamp|user|action|details|ip|cluster|severity
+        # Canonical: timestamp|user|action|details|ip|cluster|severity[|cluster_id]
         data = f"{timestamp}|{user or ''}|{action}|{details or ''}|{ip or ''}|{cluster or ''}|{severity or ''}"
+        if cluster_id:
+            data += f"|{cluster_id}"
         signature = hmac.new(self.aes_key, data.encode('utf-8'), hashlib.sha256).hexdigest()
         return signature
 
@@ -4084,6 +4096,7 @@ class PegaProxDB:
             entry.get('ip_address', ''),
             entry.get('cluster', ''),
             entry.get('severity', ''),
+            entry.get('cluster_id', ''),
         )
         if hmac.compare_digest(stored_sig, expected_new):
             return True
@@ -4099,11 +4112,12 @@ class PegaProxDB:
         return hmac.compare_digest(stored_sig, legacy_sig)
     
     def add_audit_entry(self, user: str, action: str, details: str = '', ip: str = '',
-                        cluster: str = '', severity: str = None):
+                        cluster: str = '', severity: str = None, cluster_id: str = ''):
         """Add audit log entry with HMAC signature for integrity verification.
 
         cluster/severity added MK May 2026 — keep optional so existing callers
-        keep working unchanged.
+        keep working unchanged. cluster is the name shown, cluster_id the cluster
+        the row belongs to (#1121).
         """
         cursor = self.conn.cursor()
         timestamp = datetime.now().isoformat()
@@ -4121,13 +4135,14 @@ class PegaProxDB:
                 severity = 'info'
 
         signature = self._generate_audit_hmac(timestamp, user, action, details, ip,
-                                               cluster or '', severity)
+                                               cluster or '', severity, cluster_id or '')
 
         cursor.execute('''
             INSERT INTO audit_log (timestamp, user, action, details, ip_address,
-                                   hmac_signature, cluster, severity)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (timestamp, user, action, details, ip, signature, cluster or '', severity))
+                                   hmac_signature, cluster, severity, cluster_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (timestamp, user, action, details, ip, signature, cluster or '', severity,
+              cluster_id or ''))
         last_id = cursor.lastrowid
         self.conn.commit()
 
@@ -4207,21 +4222,35 @@ class PegaProxDB:
             logging.warning(f"audit_facets failed: {e}")
         return out
     
-    def get_audit_log(self, limit: int = 1000, user: str = None, action: str = None, verify_integrity: bool = False) -> list:
-        """Get audit log entries, optionally verifying HMAC integrity"""
+    def get_audit_log(self, limit: int = 1000, user: str = None, action: str = None, verify_integrity: bool = False,
+                      scope: tuple = None) -> list:
+        """Get audit log entries, optionally verifying HMAC integrity.
+
+        scope=(cluster_ids, username) keeps the rows of those clusters plus the user's own,
+        in the query so the limit still counts what the caller gets (#1044)."""
         cursor = self.conn.cursor()
-        
+
         query = 'SELECT * FROM audit_log'
         params = []
         conditions = []
-        
+
         if user:
             conditions.append('user = ?')
             params.append(user)
         if action:
             conditions.append('action LIKE ?')
             params.append(f'%{action}%')
-        
+        if scope is not None:
+            cids, own = list(scope[0] or []), scope[1] or ''
+            parts = []
+            if cids:
+                parts.append(f"cluster_id IN ({','.join('?' * len(cids))})")
+                params.extend(cids)
+            if own:
+                parts.append('user = ?')
+                params.append(own)
+            conditions.append(f"({' OR '.join(parts)})" if parts else '1 = 0')
+
         if conditions:
             query += ' WHERE ' + ' AND '.join(conditions)
         
@@ -4850,7 +4879,7 @@ class PegaProxDB:
             try:
                 _saved_key = self.aes_key
                 cursor.execute('SELECT id, timestamp, user, action, details, ip_address, '
-                               'cluster, severity, hmac_signature FROM audit_log '
+                               'cluster, severity, cluster_id, hmac_signature FROM audit_log '
                                'WHERE hmac_signature IS NOT NULL AND hmac_signature != ""')
                 _rows = cursor.fetchall()
                 for _r in _rows:
@@ -4858,7 +4887,7 @@ class PegaProxDB:
                         'timestamp': _r['timestamp'], 'user': _r['user'], 'action': _r['action'],
                         'details': _r['details'], 'ip_address': _r['ip_address'],
                         'cluster': _r['cluster'], 'severity': _r['severity'],
-                        'hmac_signature': _r['hmac_signature'],
+                        'cluster_id': _r['cluster_id'], 'hmac_signature': _r['hmac_signature'],
                     }
                     self.aes_key = old_key
                     _ok = self._verify_audit_hmac(_entry)
@@ -4868,7 +4897,7 @@ class PegaProxDB:
                     self.aes_key = new_key
                     _new_sig = self._generate_audit_hmac(
                         _r['timestamp'], _r['user'], _r['action'], _r['details'],
-                        _r['ip_address'], _r['cluster'], _r['severity'])
+                        _r['ip_address'], _r['cluster'], _r['severity'], _r['cluster_id'])
                     cursor.execute('UPDATE audit_log SET hmac_signature = ? WHERE id = ?',
                                    (_new_sig, _r['id']))
                     stats['audit_resigned'] += 1

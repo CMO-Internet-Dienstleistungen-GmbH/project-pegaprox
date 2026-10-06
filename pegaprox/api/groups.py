@@ -357,6 +357,13 @@ def assign_cluster_to_group(cluster_id):
         
         # Check tenant access to target group
         if not _is_admin(user):
+            # NS Oct 2026 - the check below lets a NULL (global) group through, and a global
+            # group is admin-only for a tenant-scoped caller, as in update/delete: a tenant
+            # could put its own cluster into one, where a live cross-cluster balance of that
+            # group moves other tenants' guests onto it (#986)
+            if _group_denied_as_missing(group, user):
+                log_audit(usr, 'cluster.group_assign_denied', f"Access denied to assign cluster {cluster_id} to group '{group['name']}' - tenant mismatch", ip_address=ip)
+                return jsonify(_GROUP_MISSING[0]), _GROUP_MISSING[1]
             user_tenant = _user_tenant(user)
             if group['tenant_id'] and group['tenant_id'] != user_tenant:
                 log_audit(usr, 'cluster.group_assign_denied', f"Access denied to assign cluster {cluster_id} to group '{group['name']}' - tenant mismatch", ip_address=ip)

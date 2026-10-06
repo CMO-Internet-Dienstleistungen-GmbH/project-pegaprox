@@ -59,21 +59,17 @@ def _get_recent_audit_tasks(cluster_id, cluster_name):
         # `cluster` (= cluster name) so this filter attributes each event correctly; non-cluster
         # portal actions (e.g. password change) carry no cluster and simply don't surface here.
         #
-        # sec (audit) — but the name is all the row stores and nothing makes it unique: two
+        # sec (audit) - but the name is all the row stored and nothing makes it unique: two
         # clusters both called "Production" would each publish the other tenant's portal
         # activity (username + VMID) into their live task feed, which is the same leak again
-        # one level down. Until the rows carry the cluster id, an ambiguous name shows nothing.
-        from pegaprox.globals import cluster_managers
-        if sum(1 for m in list(cluster_managers.values())
-               if getattr(getattr(m, 'config', None), 'name', None) == cluster_name) > 1:
-            return []
+        # one level down. NS Oct 2026 - the rows carry the cluster id now (#1121).
         cursor.execute('''
             SELECT id, timestamp, user, action, details FROM audit_log
             WHERE action LIKE 'portal.%'
-            AND cluster = ?
+            AND cluster_id = ?
             AND timestamp > ?
             ORDER BY timestamp DESC LIMIT 10
-        ''', (cluster_name, cutoff,))
+        ''', (cluster_id, cutoff,))
         rows = cursor.fetchall()
         if not rows:
             return []

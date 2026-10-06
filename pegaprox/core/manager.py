@@ -7139,7 +7139,8 @@ class PegaProxManager:
         self.logger.critical(f"[HA] {details}")
         try:
             from pegaprox.utils.audit import log_audit
-            log_audit('system', action, f"Cluster {self.config.name}: {details}", cluster=self.config.name)
+            log_audit('system', action, f"Cluster {self.config.name}: {details}", cluster=self.config.name,
+                      cluster_id=self.id)
         except Exception:
             pass
         try:

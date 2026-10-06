@@ -113,7 +113,8 @@ def _syslog_hostname_tokens(value):
     if not value:
         return set()
     tokens = {value}
-    if '.' in value:
+    # the short form of an address is its first octet, and LIKE '10.%' is every sender in 10/8 (#1119)
+    if '.' in value and not re.fullmatch(r'[0-9.]+', value):
         tokens.add(value.split('.', 1)[0])
     return tokens
 
@@ -183,15 +184,25 @@ def _syslog_ambiguous_hostnames():
         return tokens
 
 
+def _syslog_like_literal(value):
+    """`value` with LIKE's wildcards escaped, for `LIKE ? ESCAPE '\\'`."""
+    return value.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+
+
 def _syslog_host_clause(values, params):
-    """`(host = x OR host LIKE 'x.%' OR ...)` over the tokens that identify one cluster."""
+    """`(host = x OR host LIKE 'x.%' OR ...)` over the tokens that identify one cluster.
+
+    NS Oct 2026 - the tokens come from the cluster name and host, which a cluster.config
+    holder sets on their own cluster. A name of '%' made the LIKE half match every host
+    with a dot in it, so the caller read every tenant's syslog (#1119). Only the '.%' we
+    add is a wildcard now."""
     _ambiguous = _syslog_ambiguous_hostnames()
     parts = []
     for value in sorted(set(values) - _ambiguous):
         parts.append("LOWER(logs.hostname) = ?")
         params.append(value)
-        parts.append("LOWER(logs.hostname) LIKE ?")
-        params.append(f"{value}.%")
+        parts.append("LOWER(logs.hostname) LIKE ? ESCAPE '\\'")
+        params.append(f"{_syslog_like_literal(value)}.%")
     return f"({' OR '.join(parts)})" if parts else "1 = 0"
 
 

@@ -118,13 +118,46 @@ def _via_standby():
     return str(mark.get('via') or '') if isinstance(mark, dict) else ''
 
 
-def log_audit(user: str, action: str, details: str = None, ip_address: str = None, cluster: str = None):
+def _audit_cluster_id(cluster):
+    """The id of the cluster an entry names, '' when it cannot be told.
+
+    NS Oct 2026 (#1121) - callers pass the display name (a few the id), and any cluster.config
+    holder can rename their cluster to another tenant's. The route's own cluster wins when
+    the entry names it, else the one cluster that answers to the name or id, else none.
+    With no name at all, a cluster route's own cluster is the one the entry is about."""
+    from pegaprox.globals import cluster_managers
+    route_cid = ''
+    if has_request_context():
+        route_cid = (request.view_args or {}).get('cluster_id') or ''
+    if not cluster:
+        return route_cid if route_cid in cluster_managers else ''
+    if not isinstance(cluster, str):
+        return ''
+
+    def _answers(cid):
+        return cluster in (cid, getattr(getattr(cluster_managers.get(cid), 'config', None), 'name', None))
+
+    if route_cid in cluster_managers and _answers(route_cid):
+        return route_cid
+    hits = [cid for cid in list(cluster_managers) if _answers(cid)]
+    return hits[0] if len(hits) == 1 else ''
+
+
+def log_audit(user: str, action: str, details: str = None, ip_address: str = None, cluster: str = None,
+              cluster_id: str = None):
     """Add an entry to the audit log
-    
-    writes to db now
+
+    writes to db now. cluster is the name shown with the entry, cluster_id the cluster it
+    belongs to; left out, it is worked out from the name (_audit_cluster_id).
     """
     global audit_log
-    
+
+    if cluster_id is None:
+        try:
+            cluster_id = _audit_cluster_id(cluster)
+        except Exception:
+            cluster_id = ''
+
     via = _via_standby()
     if via:
         details = f'{details} (via standby {via})' if details else f'via standby {via}'
@@ -135,7 +168,8 @@ def log_audit(user: str, action: str, details: str = None, ip_address: str = Non
         'action': action,
         'details': details,
         'ip_address': ip_address or get_client_ip(),
-        'cluster': cluster  # Which cluster this action was performed on
+        'cluster': cluster,  # Which cluster this action was performed on
+        'cluster_id': cluster_id,
     }
     
     # Add to in-memory list (for backwards compatibility)
@@ -152,6 +186,7 @@ def log_audit(user: str, action: str, details: str = None, ip_address: str = Non
             details=f"{details}" + (f" [{cluster}]" if cluster else ""),
             ip=ip_address or get_client_ip(),
             cluster=cluster or '',
+            cluster_id=cluster_id or '',
         )
     except Exception as e:
         logging.error(f"Failed to save audit entry to database: {e}")

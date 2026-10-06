@@ -1257,14 +1257,21 @@ _SPONSOR_HEAL_SOURCES = (
 )
 _sponsor_heal_misses = {}  # name -> monotonic ts of last failed remote fetch
 _sponsor_mem_cache = {}    # name -> (bytes, content_type) — fallback when images/ isn't writable
+# NS Oct 2026 - the route needs no login, and every new name used to cost two outbound
+# fetches of up to 8 s each plus a miss entry kept forever (#1045). Only the names the
+# footer asks for (SponsorSlot in web/src/ui.js, slots 1-8) are healed, one fetch at a time;
+# a request that finds one running gets the usual 404 instead of waiting for it.
+_SPONSOR_HEAL_NAMES = frozenset(f'sponsor{n}.png' for n in range(1, 9))
+_sponsor_heal_lock = threading.Lock()
 
 def _get_healed_sponsor(filename):
     """Return (content, content_type) for a missing sponsors/* asset pulled from
     the mirror then GitHub. Caches to images/sponsors/ when writable, otherwise
     keeps it in memory so the logo still shows on read-only installs. Returns
-    (None, None) in air-gap mode, on a recent miss, or if it can't be fetched."""
+    (None, None) in air-gap mode, on a recent miss, while another fetch runs,
+    or if it can't be fetched."""
     name = os.path.basename(filename)
-    if not re.match(r'^sponsor[\w-]+\.(png|svg|jpg|jpeg|webp|gif)$', name, re.I):
+    if name not in _SPONSOR_HEAL_NAMES or filename != f'sponsors/{name}':
         return None, None
     if name in _sponsor_mem_cache:          # fetched before but couldn't write to disk
         return _sponsor_mem_cache[name]
@@ -1276,29 +1283,34 @@ def _get_healed_sponsor(filename):
     now = time.monotonic()
     if now - _sponsor_heal_misses.get(name, 0) < 600:
         return None, None
-    for tmpl in _SPONSOR_HEAL_SOURCES:
-        url = tmpl.format(name=name)
-        try:
-            r = requests.get(url, timeout=8)
-            if r.status_code == 200 and 0 < len(r.content) <= 5 * 1024 * 1024:
-                ctype = r.headers.get('Content-Type') or ('image/svg+xml' if name.lower().endswith('.svg') else 'image/png')
-                try:
-                    dst_dir = os.path.join(IMAGES_DIR, 'sponsors')
-                    os.makedirs(dst_dir, exist_ok=True)
-                    with open(os.path.join(dst_dir, name), 'wb') as fh:
-                        fh.write(r.content)
-                    logging.info(f"[sponsors] self-healed {name} via {url.split('/')[2]} (cached to disk)")
-                except Exception as werr:
-                    # images/ not writable — keep it in memory so the logo still
-                    # renders; perms must not be able to break a sponsor logo.
-                    _sponsor_mem_cache[name] = (r.content, ctype)
-                    logging.warning(f"[sponsors] fetched {name} via {url.split('/')[2]} but images/ not writable ({werr}); serving from memory")
-                _sponsor_heal_misses.pop(name, None)
-                return r.content, ctype
-        except Exception as e:
-            logging.debug(f"[sponsors] heal fetch failed ({url}): {e}")
-    _sponsor_heal_misses[name] = now
-    return None, None
+    if not _sponsor_heal_lock.acquire(blocking=False):
+        return None, None
+    try:
+        for tmpl in _SPONSOR_HEAL_SOURCES:
+            url = tmpl.format(name=name)
+            try:
+                r = requests.get(url, timeout=8)
+                if r.status_code == 200 and 0 < len(r.content) <= 5 * 1024 * 1024:
+                    ctype = r.headers.get('Content-Type') or ('image/svg+xml' if name.lower().endswith('.svg') else 'image/png')
+                    try:
+                        dst_dir = os.path.join(IMAGES_DIR, 'sponsors')
+                        os.makedirs(dst_dir, exist_ok=True)
+                        with open(os.path.join(dst_dir, name), 'wb') as fh:
+                            fh.write(r.content)
+                        logging.info(f"[sponsors] self-healed {name} via {url.split('/')[2]} (cached to disk)")
+                    except Exception as werr:
+                        # images/ not writable - keep it in memory so the logo still
+                        # renders; perms must not be able to break a sponsor logo.
+                        _sponsor_mem_cache[name] = (r.content, ctype)
+                        logging.warning(f"[sponsors] fetched {name} via {url.split('/')[2]} but images/ not writable ({werr}); serving from memory")
+                    _sponsor_heal_misses.pop(name, None)
+                    return r.content, ctype
+            except Exception as e:
+                logging.debug(f"[sponsors] heal fetch failed ({url}): {e}")
+        _sponsor_heal_misses[name] = now
+        return None, None
+    finally:
+        _sponsor_heal_lock.release()
 
 @bp.route('/images/<path:filename>')
 def serve_images(filename):
@@ -3231,13 +3243,26 @@ def get_audit_log_api():
     verify = request.args.get('verify', '').lower() == 'true'
     fmt = (request.args.get('format') or 'json').lower()
 
+    # NS Oct 2026 - admin.audit is in the auditor and monitoring templates, so a tenant's
+    # auditor read every tenant's trail here. A caller confined to some clusters gets the
+    # rows of the clusters they see whole, and their own (#1044).
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import get_user_clusters
+    from pegaprox.api.helpers import caller_is_scoped
+    _au = build_authz_user(request.session.get('user', ''), request.session)
+    _theirs = get_user_clusters(_au, include_pools=False)
+    scope = None
+    if _theirs is not None:
+        scope = ([c for c in _theirs if not caller_is_scoped(_au, c)], _au.get('username', ''))
+
     # Get from database with optional integrity verification
     database = get_db()
     entries = database.get_audit_log(
         limit=limit,
         user=user_filter,
         action=action_filter,
-        verify_integrity=verify
+        verify_integrity=verify,
+        scope=scope,
     )
 
     if fmt == 'csv':
@@ -3289,6 +3314,14 @@ def get_cluster_audit_log_api(cluster_id):
     database = get_db()
     entries = database.get_audit_log(limit=limit * 10)  # Get more to filter
     
+    # NS Oct 2026 - the name below is one a tenant admin can give their own cluster, and then
+    # this read another tenant's trail (#1121). A row that carries a cluster id belongs to that
+    # cluster only. Rows without one (older ones, ones that name no cluster) are matched by
+    # name as before for a caller who sees every cluster, and left out for anyone else.
+    from pegaprox.utils.rbac import get_user_clusters
+    from pegaprox.api.helpers import acting_user
+    sees_every_cluster = get_user_clusters(acting_user()) is None
+
     # Filter by cluster and vmid
     filtered = []
     for entry in entries:
@@ -3296,7 +3329,12 @@ def get_cluster_audit_log_api(cluster_id):
         details = entry.get('details', '')
         
         # Cluster filter
-        if cluster_name:
+        if entry.get('cluster_id'):
+            if entry['cluster_id'] != cluster_id:
+                continue
+        elif not sees_every_cluster:
+            continue
+        elif cluster_name:
             detected_cluster = None
             
             # First check the cluster field
