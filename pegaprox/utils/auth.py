@@ -25,7 +25,7 @@ from typing import List, Optional
 
 from pegaprox.constants import (
     SESSION_TIMEOUT, CONFIG_DIR, USERS_FILE_ENCRYPTED,
-    SESSIONS_FILE, SESSIONS_FILE_ENCRYPTED, ADMIN_INITIALIZED_FILE,
+    SESSIONS_FILE, SESSIONS_FILE_ENCRYPTED, ADMIN_INITIALIZED_FILE, SETUP_REOPEN_FILE,
     LOGIN_MAX_ATTEMPTS, LOGIN_LOCKOUT_TIME, LOGIN_ATTEMPT_WINDOW,
 )
 from pegaprox.globals import (
@@ -366,10 +366,12 @@ def apply_token_role(user: dict, token_role: str) -> dict:
         # a custom role keeps its NAME — see build_authz_user for why, and for what
         # _token_owner_capped then has to do about the missing numeric floor
         out['effective_role'] = token_role
-        out['_token_owner_capped'] = True
     else:
         eff = min(_h.get(token_role, 1), _h.get(user.get('role'), 1))
         out['effective_role'] = next((r for r, lvl in _h.items() if lvl == eff), ROLE_VIEWER)
+    # NS Oct 2026 (#1014) - a builtin token role too: the floor caps the role, not the
+    # owner's extra grants, and only rbac._token_permissions leaves those out
+    out['_token_owner_capped'] = True
     return out
 
 
@@ -443,6 +445,8 @@ def resolve_authz_user(auth: dict):
 INIT_INITIALIZED = 'initialized'
 INIT_UNINITIALIZED = 'uninitialized'
 INIT_UNKNOWN = 'unknown'
+# configuration but no account: lost its users, never was a fresh install (#991)
+INIT_NO_ACCOUNTS = 'no_accounts'
 
 
 def initialization_state() -> str:
@@ -477,7 +481,15 @@ def initialization_state() -> str:
     # the user table survived (volume mount oddities, manual restore, etc.)
     try:
         db = get_db()
-        return INIT_INITIALIZED if db.get_all_users() else INIT_UNINITIALIZED
+        if db.get_all_users():
+            return INIT_INITIALIZED
+        # NS Oct 2026 (#991) - and when both are gone, an empty users table alone does not
+        # make a fresh install. With the clusters, their credentials and the issued tokens
+        # still there, setup handed the first caller to reach the port an administrator
+        # over all of it. Reopened only by the operator on the server (SETUP_REOPEN_FILE).
+        if db.holds_configuration() and not os.path.exists(SETUP_REOPEN_FILE):
+            return INIT_NO_ACCOUNTS
+        return INIT_UNINITIALIZED
     except Exception as e:
         logging.error(f"cannot read the user store to decide first-run state: {e}")
         return INIT_UNKNOWN
@@ -599,6 +611,17 @@ def release_admin_initialization():
         pass
     except Exception as e:
         logging.error(f"couldnt release admin init: {e}")
+
+
+def consume_setup_reopen():
+    """Drop SETUP_REOPEN_FILE once a setup created the administrator: it opens the
+    wizard for one setup, not for whenever the accounts are gone again (#991)."""
+    try:
+        os.unlink(SETUP_REOPEN_FILE)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logging.error(f"[SETUP] could not remove {SETUP_REOPEN_FILE}, remove it by hand: {e}")
 
 
 def mark_admin_initialized():
@@ -763,6 +786,90 @@ def create_session(username: str, role: str, remember: bool = False) -> str:
 
     return session_id
 
+
+# NS Oct 2026 (#1076) - force_2fa held on the server, not only by the setup screen.
+MFA_NOT_DUE = 'not_due'
+MFA_DUE = 'due'
+MFA_SKIPPED_ON_STANDBY = 'skipped_on_standby'
+
+# What a session that still has to enrol may reach: the enrolment, the session check the
+# setup screen reads, and signing out. Matched on the endpoint that serves the request.
+MFA_ENROLMENT_ENDPOINTS = frozenset({
+    'auth.setup_2fa', 'auth.verify_2fa_setup', 'auth.get_2fa_status',
+    'auth.auth_check', 'auth.auth_logout',
+})
+# marks the request validate_session held back, so require_auth can say why
+MFA_HELD_ENVIRON = 'pegaprox.mfa_enrolment_due'
+_MFA_RECHECK_S = 30
+
+
+def mfa_enrolment_state(user: dict, settings: dict) -> str:
+    """Whether force_2fa still holds `user` back. MFA_SKIPPED_ON_STANDBY is an admin let
+    past it on a standby that cannot hand the enrolment to the active (#625); the
+    sign-in puts that on the record."""
+    if not settings.get('force_2fa') or not TOTP_AVAILABLE:
+        return MFA_NOT_DUE
+    # enrolled = a code can be asked for, which is what auth_login asks
+    if user.get('totp_enabled') and user.get('totp_secret'):
+        return MFA_NOT_DUE
+    # OIDC/Entra accounts use their IdP's MFA
+    if user.get('auth_source', 'local') in ('oidc', 'entra'):
+        return MFA_NOT_DUE
+    # NS Oct 2026 (#1028) - an admin a tenant override lowers where they live is not
+    # excused as an admin either
+    from pegaprox.utils.rbac import acts_as_admin
+    is_admin = acts_as_admin(user)
+    if is_admin and settings.get('force_2fa_exclude_admins', False):
+        return MFA_NOT_DUE
+    if is_admin:
+        from pegaprox.core import ha
+        if ha.is_standby() and not ha.forwarding():
+            return MFA_SKIPPED_ON_STANDBY
+    return MFA_DUE
+
+
+def _mfa_enrolment_lets_through(session: dict) -> bool:
+    """May this session serve this request, as far as force_2fa goes?
+
+    auth_login minted a full session and only returned requires_2fa_setup, so the setup
+    screen was the whole enforcement: a client that ignored the flag, or anyone holding
+    the password, used the API without ever enrolling. Asked from validate_session
+    because every way in passes it - require_auth, the consoles, the live WebSocket,
+    WebAuthn and the writes a standby hands on.
+
+    The answer stays on the session. Re-read on every request while it holds, so the
+    enrolment frees it at once, and every _MFA_RECHECK_S otherwise, so force_2fa
+    switched on or a factor an admin cleared reaches sessions already open.
+    """
+    now = time.time()
+    due = session.get('mfa_due')
+    if due is None or due or now - session.get('mfa_checked_at', 0) >= _MFA_RECHECK_S:
+        try:
+            user = get_db().get_user(session.get('user', ''))
+            from pegaprox.api.helpers import load_server_settings
+            fresh = bool(user) and mfa_enrolment_state(user, load_server_settings()) == MFA_DUE
+        except Exception as e:
+            # keep the last answer; a session never judged stays held until it can be
+            logging.warning(f"[2FA] cannot tell whether force_2fa holds "
+                            f"{session.get('user')!r}: {e}")
+            fresh = True if due is None else due
+        due = fresh
+        with sessions_lock:
+            session['mfa_due'] = due
+            session['mfa_checked_at'] = now
+    if not due:
+        return True
+    try:
+        from flask import has_request_context
+        if has_request_context():
+            if request.endpoint in MFA_ENROLMENT_ENDPOINTS:
+                return True
+            request.environ[MFA_HELD_ENVIRON] = True
+    except Exception:
+        pass
+    return False
+
+
 def validate_session(session_id: str) -> dict:
     """Validate a session and return user info if valid"""
     if not session_id:
@@ -832,6 +939,9 @@ def validate_session(session_id: str) -> dict:
                     logging.warning(f"[SECURITY] Session IP changed: {session_ip} → {current_ip} (user={session.get('user')})")
     except Exception:
         pass
+
+    if not _mfa_enrolment_lets_through(session):
+        return None
 
     return session
 
@@ -1223,6 +1333,9 @@ def require_auth(roles: list = None, perms: list = None):
                 session = validate_session(session_id)
             
             if not session:
+                if request.environ.get(MFA_HELD_ENVIRON):
+                    return jsonify({'error': 'Set up two-factor authentication first',
+                                    'code': 'MFA_ENROLMENT_REQUIRED'}), 403
                 return jsonify({'error': 'Unauthorized', 'code': 'AUTH_REQUIRED'}), 401
             
             # NS: Feb 2026 - Check if user was disabled while session/token is still active
@@ -1305,27 +1418,13 @@ def require_auth(roles: list = None, perms: list = None):
                 # own permissions only — the owner's interactive extra perms / group grants
                 # do NOT extend to a token — while still honouring the owner's denials.
                 if session.get('api_token'):
-                    # NS Aug 2026 (AI-pentest) — carry the owner's tenant overrides so a tenant-scoped
-                    # DOWNGRADE / denial isn't silently dropped for token auth (the interactive path
-                    # keeps them), but cap any tenant ROLE at fresh_role so a tenant grant can only
-                    # downgrade a token, never re-escalate it above its declared/floored role.
-                    from pegaprox.models.permissions import ROLE_ADMIN as _RA, ROLE_USER as _RU, ROLE_VIEWER as _RV
-                    _h = {_RA: 3, _RU: 2, _RV: 1}
-                    _fl = _h.get(fresh_role, 1)
-                    _tp = {}
-                    for _tid, _ov in (user.get('tenant_permissions', {}) or {}).items():
-                        if isinstance(_ov, dict):
-                            _ov = dict(_ov)
-                            if _ov.get('role') and _h.get(_ov['role'], 1) > _fl:
-                                _ov['role'] = next((k for k, v in _h.items() if v == _fl), fresh_role)
-                        _tp[_tid] = _ov
-                    perm_user = {
-                        'role': fresh_role,
-                        'permissions': [],
-                        'denied_permissions': user.get('denied_permissions', []),
-                        'tenant_id': user.get('tenant_id'),
-                        'tenant_permissions': _tp,
-                    }
+                    # NS Oct 2026 (#1014) - the identity build_authz_user hands the route, so
+                    # gate and route agree. The inline copy capped a tenant override's role by
+                    # its builtin level only: a custom tenant role (level 1) went through whole,
+                    # so a viewer token carried node.shell or admin.users wherever its owner's
+                    # override granted them, and a custom-role token was judged as a viewer.
+                    perm_user = apply_token_role(dict(user, username=session['user']),
+                                                 session.get('role'))
                 else:
                     perm_user = user
                 for p in perms:

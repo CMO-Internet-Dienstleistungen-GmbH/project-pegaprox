@@ -9611,7 +9611,10 @@ def get_hardware_options():
 def _console_authz(user, cluster_id, vmid, vm_type=None):
     """Return (ok, reason) — user must have cluster access AND per-VM console access."""
     from pegaprox.utils.rbac import get_user_clusters, load_vm_acls, user_can_access_vm
-    if not user:
+    # NS Oct 2026 - load_users() answers {} when it cannot read the store, and the callers
+    # add the username: that bare dict read as a default-tenant viewer, every cluster and
+    # vm.console. A record without a role is no account.
+    if not user or not user.get('role'):
         return False, 'no user'
     # NS Aug 2026 (audit re-verify) — a disabled account keeps no console access, even via a
     # pre-minted ws_token (this path is reached without require_auth's account-state gate).

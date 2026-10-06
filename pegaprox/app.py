@@ -1341,7 +1341,8 @@ def _start_managers(config, only=None):
 def main(debug_mode=False):
     """Main entry point - starts PegaProx server."""
     from pegaprox.utils.auth import (load_users, load_sessions, backfill_initialized_marker,
-                                     initialization_state, INIT_UNINITIALIZED, INIT_UNKNOWN)
+                                     initialization_state, INIT_UNINITIALIZED, INIT_UNKNOWN,
+                                     INIT_NO_ACCOUNTS, SETUP_REOPEN_FILE)
     from pegaprox.utils.audit import load_audit_log
     from pegaprox.core.config import load_config
     from pegaprox.background.broadcast import start_broadcast_thread
@@ -1551,6 +1552,15 @@ def main(debug_mode=False):
         print("  Could not read the user table. Login and the setup wizard")
         print("  are BOTH refused until this is resolved - check the")
         print("  encryption key and the permissions on config/.")
+        print("=" * 50 + "\n")
+    elif _init_state == INIT_NO_ACCOUNTS:
+        # NS Oct 2026 (#991) - not a fresh install either: the setup wizard stays shut
+        print("\n" + "=" * 50)
+        print("NO ACCOUNTS")
+        print("  This install holds configuration but no user account.")
+        print("  Login and the setup wizard are refused. To create a new")
+        print("  administrator, create this file on the server, then open")
+        print(f"  the PegaProx URL: {SETUP_REOPEN_FILE}")
         print("=" * 50 + "\n")
 
     # MK Sep 2026 (#625) - a standby holds the configuration and acts on none of it.

@@ -47,6 +47,9 @@ SESSIONS_FILE = os.path.join(CONFIG_DIR, 'sessions.json')
 SESSIONS_FILE_ENCRYPTED = os.path.join(CONFIG_DIR, 'sessions.enc')
 SERVER_SETTINGS_FILE = os.path.join(CONFIG_DIR, 'server_settings.json')
 ADMIN_INITIALIZED_FILE = os.path.join(CONFIG_DIR, '.admin_initialized')
+# created by hand on the server to run the setup wizard on an install that holds
+# configuration but no account any more (#991); the setup removes it
+SETUP_REOPEN_FILE = os.path.join(CONFIG_DIR, 'reopen_setup')
 ALERTS_CONFIG_FILE = os.path.join(CONFIG_DIR, 'alerts.json')
 SCHEDULED_TASKS_FILE = os.path.join(CONFIG_DIR, 'scheduled_tasks.json')
 VM_TAGS_FILE = os.path.join(CONFIG_DIR, 'vm_tags.json')

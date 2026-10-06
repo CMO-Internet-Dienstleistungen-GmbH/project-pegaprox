@@ -373,6 +373,9 @@ def get_user_permissions(user: dict, tenant_id: str = None) -> list:
     if not tenant_id:
         tenant_id = user.get('tenant_id', DEFAULT_TENANT_ID)
     
+    if user.get('_token_owner_capped'):
+        return _token_permissions(user, tenant_id)
+
     # check if user has tenant-specific settings
     tenant_perms = user.get('tenant_permissions', {})
     
@@ -412,21 +415,28 @@ def get_user_permissions(user: dict, tenant_id: str = None) -> list:
         _cap = set(get_role_permissions_for_user({'role': _eff}, _tenant_defining_role(_eff, tenant_id)))
         base_perms = [p for p in base_perms if p in _cap]
 
-    # MK Sep 2026 - and cap by what the OWNER holds right now. The block above caps by the
-    # token's own role, which is the right ceiling only while the owner still outranks it.
-    # A token bound to a custom role never went through the numeric floor in
-    # build_authz_user, so demoting its owner, stripping one of their permissions, or
-    # editing the custom role itself left the token resolving through the old, larger set.
-    # require_auth re-floors BUILTIN token roles on every request; this is the same
-    # promise for custom ones, and it is evaluated per-tenant because that is the only
-    # place the answer is actually decidable.
-    if user.get('_token_owner_capped'):
-        _owner = {k: v for k, v in user.items()
-                  if k not in ('effective_role', '_token_owner_capped')}
-        _owner_perms = set(get_user_permissions(_owner, tenant_id))
-        base_perms = [p for p in base_perms if p in _owner_perms]
-
     return base_perms
+
+
+def _token_permissions(user: dict, tenant_id: str) -> list:
+    """What an API token may do in `tenant_id`: its own role, of what its owner holds today.
+
+    MK Sep 2026 - the owner half: a token bound to a custom role never went through the
+    numeric floor, so demoting its owner, stripping one of their permissions, or editing
+    the custom role itself left the token resolving through the old, larger set.
+
+    NS Oct 2026 (#1014) - and the token half has to be the role alone. The cap above only
+    ran when the tenant override named another role than the token's, so the owner's
+    extra grants - global or in a tenant override naming that same role - came along
+    unasked. Every identity apply_token_role builds lands here, the route gate in
+    require_auth included, so both answer alike. Per tenant, because that is where the
+    owner's side is decidable.
+    """
+    eff = user.get('effective_role') or ROLE_VIEWER
+    own = get_role_permissions_for_user({'role': eff}, _tenant_defining_role(eff, tenant_id))
+    owner = {k: v for k, v in user.items() if k not in ('effective_role', '_token_owner_capped')}
+    held = set(get_user_permissions(owner, tenant_id))
+    return [p for p in own if p in held]
 
 def _admin_is_capped_in_own_tenant(user: dict) -> bool:
     """True when a tenant override governs this caller's own tenant and downgrades them.

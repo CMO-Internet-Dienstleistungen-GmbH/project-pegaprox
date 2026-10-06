@@ -276,7 +276,11 @@ async function login(u,p,totpCode){
                 S.loading=false;render();return;
             }
             S.sid=d.session_id;S.user=d.user;sessionStorage.setItem('portal-sid',d.session_id);
-            S.screen='dashboard';S.pending2fa=null;await loadCfg();await loadVMs();
+            S.screen='dashboard';S.pending2fa=null;
+            // NS Oct 2026 (#1076) - with forced 2FA the server answers nothing else until the
+            // code is verified, so enrol first; verify2FA loads the guests afterwards
+            if(d.requires_2fa_setup){S.loading=false;render();await setup2FA();return;}
+            await loadCfg();await loadVMs();
         }else{S.err=d.error||'Login failed';S.pending2fa=null;}
     }catch(e){S.err='Connection error';}
     S.loading=false;render();
@@ -328,7 +332,9 @@ async function checkSess(){
             if(d.authenticated){
                 // NS: also check portal_only on session restore
                 if(d.user?.role==='admin'||!d.user?.portal_only){logout();return;}
-                S.user=d.user;S.screen='dashboard';await loadCfg();await loadVMs();
+                S.user=d.user;S.screen='dashboard';
+                if(d.requires_2fa_setup){render();await setup2FA();return;}
+                await loadCfg();await loadVMs();
             }else logout();
         }else logout();
     }catch(e){logout();}
@@ -418,7 +424,7 @@ async function setup2FA(){
 async function verify2FA(code){
     try{
         const r=await api(`${API}/api/auth/2fa/verify`,{method:'POST',body:{code}});
-        if(r&&r.ok){const d=await r.json();if(d.success){toast('2FA enabled successfully!','success');S.user.totp_enabled=true;S.modal=null;render();}else toast(d.error||'Invalid code','error');}
+        if(r&&r.ok){const d=await r.json();if(d.success){toast('2FA enabled successfully!','success');S.user.totp_enabled=true;S.modal=null;render();await loadCfg();await loadVMs();}else toast(d.error||'Invalid code','error');}
         else{const d=await r?.json().catch(()=>({}));toast(d?.error||'Verification failed','error');}
     }catch(e){toast('Error','error');}
 }

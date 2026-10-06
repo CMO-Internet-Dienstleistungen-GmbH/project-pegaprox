@@ -3626,6 +3626,25 @@ class PegaProxDB:
     # USER OPERATIONS
     # ========================================
     
+    # NS Oct 2026 (#991) - rows only somebody signed in can have written: the systems this
+    # install connects to and the credentials it issued. Settings, tenants and the rate
+    # tables are left out on purpose, a fresh install fills those before its setup runs.
+    CONFIGURATION_TABLES = ('clusters', 'pbs_servers', 'vmware_servers', 'xcpng_pools',
+                            'storage_clusters', 'api_tokens', 'webauthn_credentials')
+
+    def holds_configuration(self) -> bool:
+        """True once this database holds anything from CONFIGURATION_TABLES. Raises
+        when it cannot tell."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        present = {row[0] for row in cursor.fetchall()}
+        for table in self.CONFIGURATION_TABLES:
+            if table in present:
+                cursor.execute(f'SELECT 1 FROM "{table}" LIMIT 1')
+                if cursor.fetchone():
+                    return True
+        return False
+
     def get_all_users(self) -> dict:
         """Get all users"""
         cursor = self.conn.cursor()

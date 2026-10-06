@@ -19,7 +19,7 @@ from pegaprox.utils.auth import (
     hash_password, verify_password, needs_password_rehash,
     validate_password_policy, load_users, save_users, save_single_user,
     create_initial_admin, is_initialized, initialization_state,
-    INIT_UNINITIALIZED, INIT_UNKNOWN,
+    INIT_UNINITIALIZED, INIT_UNKNOWN, INIT_NO_ACCOUNTS, consume_setup_reopen,
     claim_admin_initialization, release_admin_initialization,
     create_session, validate_session, invalidate_session,
     invalidate_all_user_sessions, cleanup_expired_sessions,
@@ -28,6 +28,7 @@ from pegaprox.utils.auth import (
     generate_session_id, mark_admin_initialized, ensure_api_tokens_table,
     dummy_verify_password,
     ARGON2_AVAILABLE, TOTP_AVAILABLE,
+    mfa_enrolment_state, MFA_DUE, MFA_SKIPPED_ON_STANDBY,
 )
 from pegaprox.utils.audit import log_audit, get_client_ip
 from pegaprox.utils.ldap import (get_ldap_settings, ldap_authenticate, ldap_provision_user,
@@ -496,6 +497,15 @@ def auth_setup():
             'error': 'Cannot read the user store - refusing setup. Check the server logs.',
             'code': 'USER_STORE_UNAVAILABLE',
         }), 503
+    if state == INIT_NO_ACCOUNTS:
+        logging.error(f"[SETUP] refused from {get_client_ip()}: this install holds configuration "
+                      f"but no accounts. To create a new administrator on it, create the file "
+                      f"{SETUP_REOPEN_FILE} on the server and open the setup page again")
+        return jsonify({
+            'error': 'This install holds configuration but no accounts - setup stays closed. '
+                     'See the server log.',
+            'code': 'NO_ACCOUNTS',
+        }), 409
     if state != INIT_UNINITIALIZED:
         # already done, no replay
         return jsonify({
@@ -565,6 +575,7 @@ def auth_setup():
                       "restrict access to this port until it completes")
         return jsonify({'error': 'Setup failed, check server logs'}), 500
 
+    consume_setup_reopen()
     log_audit(username, 'admin.initial_setup',
               f"First admin '{username}' created via setup wizard from {client_ip}")
     logging.info(f"[SETUP] initial admin '{username}' created from {client_ip}")
@@ -696,6 +707,12 @@ def auth_login():
         return jsonify({
             'error': 'PegaProx is not initialised — run the setup wizard first',
             'code': 'NOT_INITIALIZED',
+        }), 503
+    if _init_state == INIT_NO_ACCOUNTS:
+        # NS Oct 2026 (#991) - refused here as before, when this state still read as fresh
+        return jsonify({
+            'error': 'This install has no accounts - see the server log',
+            'code': 'NO_ACCOUNTS',
         }), 503
 
     # get settings
@@ -1065,24 +1082,18 @@ def auth_login():
     default_theme = settings.get('default_theme', 'proxmoxDark')
     
     # NS: Feb 2026 - Check if user needs to set up 2FA (force_2fa setting)
-    requires_2fa_setup = False
-    if settings.get('force_2fa') and TOTP_AVAILABLE:
-        has_2fa = user.get('totp_enabled', False)
-        is_external = user.get('auth_source', 'local') in ('oidc', 'entra')
-        is_admin = user.get('role') == ROLE_ADMIN
-        exclude_admins = settings.get('force_2fa_exclude_admins', False)
-        if not has_2fa and not is_external and not (is_admin and exclude_admins):
-            if is_admin and ha.is_standby() and not ha.forwarding():
-                # MK Sep 2026 (#625) - enrolment is a write, and a standby that cannot hand
-                # it to the active (the active is gone, or forwarding is off) refuses it;
-                # the setup screen has no way past it. For an admin that is the way to
-                # the promote button during a failover, so let them in and say so in the
-                # audit trail. While the standby forwards, enrolment goes to the active
-                # like any other change, and nobody skips it.
-                log_audit(username, 'ha.standby_2fa_skipped',
-                          'Forced 2FA enrolment skipped on a standby for an admin without TOTP')
-            else:
-                requires_2fa_setup = True
+    # NS Oct 2026 (#1076) - the same decision validate_session holds the session to
+    _mfa = mfa_enrolment_state(user, settings)
+    requires_2fa_setup = _mfa == MFA_DUE
+    if _mfa == MFA_SKIPPED_ON_STANDBY:
+        # MK Sep 2026 (#625) - enrolment is a write, and a standby that cannot hand
+        # it to the active (the active is gone, or forwarding is off) refuses it;
+        # the setup screen has no way past it. For an admin that is the way to
+        # the promote button during a failover, so let them in and say so in the
+        # audit trail. While the standby forwards, enrolment goes to the active
+        # like any other change, and nobody skips it.
+        log_audit(username, 'ha.standby_2fa_skipped',
+                  'Forced 2FA enrolment skipped on a standby for an admin without TOTP')
     
     # NS: Debug log for theme sync issues
     user_theme = user.get('theme', '') or default_theme
@@ -1355,17 +1366,9 @@ def auth_check():
     user_permissions = get_user_permissions(user)
     
     # NS: Feb 2026 - Check if user needs to set up 2FA (force_2fa setting)
-    requires_2fa_setup = False
-    if settings.get('force_2fa') and TOTP_AVAILABLE:
-        has_2fa = user.get('totp_enabled', False)
-        is_external = user.get('auth_source', 'local') in ('oidc', 'entra')
-        is_admin = fresh_role == ROLE_ADMIN
-        exclude_admins = settings.get('force_2fa_exclude_admins', False)
-        # skip OIDC/Entra users (they use their IdP's MFA) and optionally admins
-        # #625: and admins on a standby that cannot enrol them (see auth_login)
-        if not has_2fa and not is_external and not (is_admin and exclude_admins) \
-                and not (is_admin and ha.is_standby() and not ha.forwarding()):
-            requires_2fa_setup = True
+    # skip OIDC/Entra users (they use their IdP's MFA), optionally admins, and #625 admins
+    # on a standby that cannot enrol them (see auth_login)
+    requires_2fa_setup = mfa_enrolment_state(user, settings) == MFA_DUE
     
     from pegaprox.api.auto_install import autoinstall_access
     return jsonify({
@@ -1841,6 +1844,9 @@ def setup_2fa():
     """Generate TOTP secret and QR code for 2FA setup"""
     global users_db
     
+    refused = _refuse_api_token('Setting up 2FA')
+    if refused:
+        return refused
     if not TOTP_AVAILABLE:
         return jsonify({'error': '2FA not available. Please install pyotp and qrcode: pip install pyotp qrcode[pil]'}), 500
     
@@ -1915,6 +1921,9 @@ def verify_2fa_setup():
     """Verify TOTP code and activate 2FA"""
     global users_db
     
+    refused = _refuse_api_token('Setting up 2FA')
+    if refused:
+        return refused
     if not TOTP_AVAILABLE:
         return jsonify({'error': '2FA not available'}), 500
     
@@ -1969,6 +1978,9 @@ def disable_2fa():
     """Disable 2FA for current user"""
     global users_db
     
+    refused = _refuse_api_token('Disabling 2FA')
+    if refused:
+        return refused
     data = request.get_json()
     password = data.get('password', '')
     
@@ -2065,6 +2077,25 @@ def _token_owner_tenant(owner, users=None):
     return (users.get(owner) or {}).get('tenant_id', DEFAULT_TENANT_ID)
 
 
+def _refuse_api_token(what):
+    """403 when an API token asks for `what`, None for a signed-in session.
+
+    NS Oct 2026 (#1001) - minting a token and enrolling a second factor act on the
+    owner's credentials, and both were judged by the owner's account. A token scoped
+    to viewer minted an admin token: the one-active-token rule only held it back until
+    a DELETE of the calling token landed while the POST body was still arriving, and
+    the new token then outlived the revocation. Enrolment let the same token put its
+    own authenticator on an owner who had none, which locks the owner out of the
+    login. Neither has a use without a browser: the one-token rule already refused
+    every token-made token that did not win that race.
+    """
+    if not (getattr(request, 'session', None) or {}).get('api_token'):
+        return None
+    return jsonify({'error': f'{what} needs an interactive sign-in - an API token '
+                             'cannot do it',
+                    'code': 'INTERACTIVE_SESSION_REQUIRED'}), 403
+
+
 @bp.route('/api/auth/tokens', methods=['GET'])
 @require_auth()
 def list_api_tokens():
@@ -2105,6 +2136,10 @@ def list_api_tokens():
 @require_auth()
 def create_api_token_endpoint():
     """Create a new API token for the current user"""
+    # before the body is read: the race in _refuse_api_token was won while it arrived
+    refused = _refuse_api_token('Creating an API token')
+    if refused:
+        return refused
     username = request.session['user']
     data = request.get_json() or {}
     
