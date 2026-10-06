@@ -691,8 +691,14 @@ def oidc_map_groups_to_role(config: dict, groups: list, id_token_claims: dict = 
     group_names = set()
     for g in groups:
         if isinstance(g, dict):
-            group_ids.add(g.get('id', '').lower())
-            group_names.add(g.get('name', '').lower())
+            # MK Oct 2026 (#962) - Graph sends "displayName": null for some groups, and
+            # .get(k, '') only covers a missing key; the .lower() on None was a 500 at login
+            gid = str(g.get('id') or '').strip().lower()
+            gname = str(g.get('name') or '').strip().lower()
+            if gid:
+                group_ids.add(gid)
+            if gname:
+                group_names.add(gname)
         elif isinstance(g, str):
             group_ids.add(g.lower())
             group_names.add(g.lower())
