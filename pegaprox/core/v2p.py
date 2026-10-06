@@ -6988,6 +6988,34 @@ def _pve_block_checksums(pve_mgr, node, vol_path, size_bytes):
     return [s.strip() for s in str(out).strip().split('\n') if s.strip()]
 
 
+def _pve_block_checksums_at(pve_mgr, node, vol_path, blocks, size_bytes):
+    """md5 of the listed blocks of a target volume, in the order given, or None.
+
+    A partial last block is hashed over the bytes ESXi hashed and no further: the volume
+    can be larger than the disk (LVM rounds up to its extent size)."""
+    bs = DELTA_BLOCK_SIZE
+    q = shlex.quote(vol_path)
+    full = [i for i in blocks if (i + 1) * bs <= size_bytes]
+    tail = [i for i in blocks if (i + 1) * bs > size_bytes]
+    parts = []
+    if full:
+        parts.append(f"for i in {' '.join(str(i) for i in full)}; do "
+                     f"dd if={q} bs={bs} skip=$i count=1 iflag=fullblock 2>/dev/null "
+                     f"| md5sum | cut -d' ' -f1; done")
+    for i in tail:
+        parts.append(f"dd if={q} bs={bs} skip={i} count=1 iflag=fullblock 2>/dev/null "
+                     f"| head -c {max(0, size_bytes - i * bs)} | md5sum | cut -d' ' -f1")
+    if not parts:
+        return []
+    rc, out, _ = _pve_node_exec(pve_mgr, node, '; '.join(parts),
+                                timeout=_checksum_timeout(len(blocks) * bs))
+    sums = [s.strip() for s in str(out or '').strip().split('\n') if s.strip()]
+    if rc != 0 or len(sums) != len(full) + len(tail):
+        return None
+    by_block = dict(zip(full + tail, sums))
+    return [by_block[i] for i in blocks]
+
+
 def _delta_sync_blocks(pve_mgr, task, esxi_host, esxi_user, esxi_pass,
                         esxi_flat_path, vol_path, flat_size, disk_index,
                         pve_checksums=None):
@@ -7068,7 +7096,10 @@ def _delta_sync_blocks(pve_mgr, task, esxi_host, esxi_user, esxi_pass,
         timeout=10)
     
     # Build a script that transfers all differing blocks
-    xfer_lines = ['#!/bin/bash', 'ERRORS=0']
+    # MK Oct 2026 (#1124) - a pipe read returns at most 64 KiB and count=1 took that as the
+    # whole block, so only the head of each block landed. fullblock reads until the block is
+    # complete, pipefail makes a failed ssh count instead of an empty write that exits 0.
+    xfer_lines = ['#!/bin/bash', 'set -o pipefail', 'ERRORS=0']
     _hk = _node_hkc()
     for i in diff_blocks:
         xfer_lines.append(
@@ -7077,7 +7108,7 @@ def _delta_sync_blocks(pve_mgr, task, esxi_host, esxi_user, esxi_pass,
             f"-o KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group14-sha256 "
             f"{esxi_user}@{esxi_host} "
             f"\"dd if={shlex.quote(esxi_flat_path)} bs={BLOCK_SIZE} skip={i} count=1 2>/dev/null\" "
-            f"| dd of={shlex.quote(vol_path)} bs={BLOCK_SIZE} seek={i} count=1 conv=notrunc 2>/dev/null "
+            f"| dd of={shlex.quote(vol_path)} bs={BLOCK_SIZE} seek={i} count=1 conv=notrunc iflag=fullblock 2>/dev/null "
             f"|| ERRORS=$((ERRORS+1))"
         )
     xfer_lines.append(f'rm -f {pass_file}')
@@ -7100,8 +7131,22 @@ def _delta_sync_blocks(pve_mgr, task, esxi_host, esxi_user, esxi_pass,
     # Cleanup
     _pve_node_exec(pve_mgr, task.target_node,
         f"rm -f {script_file or ''} {pass_file}", timeout=5)
-    
-    return rc_x == 0 or 'DELTA_DONE errors=0' in result
+
+    if not (rc_x == 0 or 'DELTA_DONE errors=0' in result):
+        return False
+    # every command in the pipe can exit 0 and a block still arrive short. Read the changed
+    # blocks back and hold them against ESXi; a mismatch sends the caller to the full copy.
+    got = _pve_block_checksums_at(pve_mgr, task.target_node, vol_path, diff_blocks, flat_size)
+    if got is None:
+        task.log("  Read-back check failed: the copied blocks could not be checksummed on the node")
+        return False
+    bad = [i for i, s in zip(diff_blocks, got) if s != esxi_sums[i]]
+    if bad:
+        task.log(f"  Read-back check: {len(bad)} of {len(diff_blocks)} copied blocks do not match ESXi "
+                 f"(first: block {bad[0]})")
+        return False
+    task.log(f"  Read-back check: all {len(diff_blocks)} copied blocks match ESXi")
+    return True
 
 
 def _cleanup_sshfs(pve_mgr, node, mnt_path):

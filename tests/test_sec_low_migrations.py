@@ -455,7 +455,8 @@ def test_the_efi_fallback_never_runs_a_planted_script(monkeypatch, tmp_path):
 def test_the_delta_sync_runs_its_own_script_and_keeps_the_password_out_of_tmp(monkeypatch, tmp_path):
     """(#1123, #1029) the transfer script and the password file were named after the task
     id, which the /tmp/v2p-<id> mount next to them gives away."""
-    box = _Sandbox(tmp_path)
+    # MK Oct 2026 (#1124) - the read-back after the transfer finds block 1 as ESXi has it
+    box = _Sandbox(tmp_path, answers={'for i in 1; do dd if=': (0, 'bbb\n', '')})
     monkeypatch.setattr(v2p, '_pve_node_exec', box)
     monkeypatch.setattr(v2p, '_ssh_exec', lambda *a, **k: (0, 'aaa\nbbb\n', ''))
     t = _v2p_task()

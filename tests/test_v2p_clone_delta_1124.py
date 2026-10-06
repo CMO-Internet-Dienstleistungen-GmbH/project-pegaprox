@@ -584,3 +584,111 @@ def test_the_pre_sync_flow_checksums_scale_with_the_disk(monkeypatch):
     # and the pre-computed list still reaches the replay
     (rep,) = r.kinds('replay')
     assert rep[5] == [f'{path}#{b}' for b in range(800)]
+
+
+# --------------------------------------------------------------------------- the block copy itself
+#
+# The tests above stub _delta_sync_blocks. These run the real one: the checksum loops and the
+# transfer script go through bash on this machine, ssh and sshpass are stand-ins that run the
+# "remote" dd here, so the bytes travel through a real pipe like they do on the node.
+
+MiB = 1024 ** 2
+
+SSHPASS_STANDIN = '#!/bin/sh\n[ "$1" = "-f" ] && shift 2\nexec "$@"\n'
+# drop the -o options and the login, run the remote command here
+SSH_STANDIN = '#!/bin/sh\nwhile [ "$1" = "-o" ]; do shift 2; done\nshift\nexec sh -c "$*"\n'
+
+
+class BlockCopy:
+    def __init__(self, monkeypatch, tmp_path, ssh=SSH_STANDIN, flat_size=4 * MiB + 512 * 1024,
+                 vol_size=5 * MiB):
+        import random
+        self.tmp = tmp_path
+        rnd = random.Random(1124)
+        self.flat = tmp_path / 'app01-flat.vmdk'
+        self.vol = tmp_path / 'vm-120-disk-0'
+        self.flat_size = flat_size
+        old = rnd.randbytes(flat_size)
+        # the copy made from the snapshot; the volume is a little larger than the disk, like
+        # an LVM volume rounded up to its extent size
+        self.vol.write_bytes(old + b'\0' * (vol_size - flat_size))
+        new = bytearray(old)
+        # written after the snapshot: well past the first 64 KiB of block 2, and the tail of
+        # the last, partial block
+        new[2 * MiB + 300 * 1024: 2 * MiB + 400 * 1024] = rnd.randbytes(100 * 1024)
+        new[flat_size - 1000:] = rnd.randbytes(1000)
+        self.new = bytes(new)
+        self.flat.write_bytes(self.new)
+
+        bin_dir = tmp_path / 'bin'
+        bin_dir.mkdir()
+        for name, body in (('sshpass', SSHPASS_STANDIN), ('ssh', ssh)):
+            (bin_dir / name).write_text(body)
+            (bin_dir / name).chmod(0o755)
+        import os
+        self.env = dict(os.environ, PATH=f"{bin_dir}:{os.environ.get('PATH', '')}")
+        self.node_cmds = []
+
+        monkeypatch.setattr(v2p, 'DELTA_BLOCK_SIZE', MiB)
+        monkeypatch.setattr(v2p, '_ssh_exec', self._esxi)
+        monkeypatch.setattr(v2p, '_pve_node_exec', self._node)
+        monkeypatch.setattr(v2p, '_node_hkc', lambda: 'accept-new')
+        monkeypatch.setattr(v2p, 'broadcast_sse', lambda *a, **k: None)
+        t = object.__new__(v2p.V2PMigrationTask)
+        t.id, t.log_lines, t.esxi_password, t.phase, t.progress = 'm1124', [], 'pw', 'delta_sync', 0
+        t.target_node, t.target_storage, t.proxmox_vmid, t.config = 'pve1', 'local-lvm', VMID, {}
+        self.task = t
+
+    def _sh(self, shell, cmd):
+        import subprocess
+        p = subprocess.run([shell, '-c', cmd], capture_output=True, text=True, env=self.env, timeout=60)
+        return p.returncode, p.stdout, p.stderr
+
+    def _esxi(self, host, user, pw, cmd, timeout=30):
+        return self._sh('sh', cmd)
+
+    def _node(self, mgr, node, cmd, timeout=600, **kw):
+        # the password file goes to /run on the node, here it stays in the test folder
+        cmd = cmd.replace('/run/pegaprox-', f'{self.tmp}/run-pegaprox-')
+        self.node_cmds.append(cmd)
+        return self._sh('bash', cmd)
+
+    def go(self):
+        return v2p._delta_sync_blocks(None, self.task, 'esx1.lab', 'root', 'pw', str(self.flat),
+                                      str(self.vol), self.flat_size, 0)
+
+
+def test_the_changed_blocks_really_arrive(monkeypatch, tmp_path):
+    """A pipe hands dd at most 64 KiB per read. Without iflag=fullblock, count=1 took that
+    first read as the whole block, wrote it and exited 0: the rest of every changed block
+    never arrived and the run said it did."""
+    bc = BlockCopy(monkeypatch, tmp_path)
+    assert bc.go(), bc.task.log_lines
+    got = bc.vol.read_bytes()
+    assert got[:bc.flat_size] == bc.new, 'the target does not hold what the source holds'
+    # nothing past the end of the disk was touched
+    assert got[bc.flat_size:] == b'\0' * (len(got) - bc.flat_size)
+    assert not list(tmp_path.glob('run-pegaprox-*')), 'the password file was left behind'
+
+
+def test_a_transfer_whose_ssh_fails_is_not_reported_as_done(monkeypatch, tmp_path):
+    """The receiving dd gets an empty pipe, writes nothing and exits 0. Without pipefail
+    that read as 'DELTA_DONE errors=0'."""
+    bc = BlockCopy(monkeypatch, tmp_path, ssh='#!/bin/sh\necho "Permission denied" >&2\nexit 255\n')
+    before = bc.vol.read_bytes()
+    assert not bc.go()
+    assert bc.vol.read_bytes() == before
+    # the transfer itself counts every failed block, the read-back is not what caught it
+    result = [line for line in bc.task.log_lines if 'Delta result' in line]
+    assert result and 'DELTA_DONE errors=2' in result[0], bc.task.log_lines
+    assert not any('Read-back' in line for line in bc.task.log_lines)
+
+
+def test_a_short_block_that_exits_0_fails_the_read_back(monkeypatch, tmp_path):
+    """Every command in the pipe exits 0, but a block arrives short. Only reading the target
+    back and comparing it with the ESXi checksums notices, and the caller then copies the
+    whole disk again."""
+    short = '#!/bin/sh\nwhile [ "$1" = "-o" ]; do shift 2; done\nshift\nsh -c "$*" | head -c 1000\n'
+    bc = BlockCopy(monkeypatch, tmp_path, ssh=short)
+    assert not bc.go()
+    assert any('do not match' in line for line in bc.task.log_lines), bc.task.log_lines
