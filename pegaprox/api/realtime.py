@@ -543,6 +543,7 @@ def sse_updates():
     # flagged is_admin and every per-VM filter in the broadcast loop was skipped for it —
     # unfiltered 'resources', 'vm_config' (full guest configs incl. cloud-init) and 'tasks'.
     # _stream_identity carries the floored role require_auth published.
+    _ident = None
     try:
         _ident = _stream_identity(user)
         # the token's minted role wins — this route has no session, so the stored role would
@@ -551,6 +552,20 @@ def sse_updates():
         _is_admin = bool(_ident) and _eff == ROLE_ADMIN and acts_as_admin(_ident)
     except Exception:
         _eff = _token_role
+        _is_admin = False
+
+    # NS Oct 2026 - an SSE token can be reused for its whole TTL and carries what its holder
+    # was when it was minted, so every stream it opened started on that until the re-check
+    # in generate() 30s later: an owner moved off the role of their API token (#1049), or an
+    # admin demoted since, kept reopening streams onto the old scope. Same rule as that check.
+    try:
+        _fresh = (get_user_clusters(_floor_by_token_role(dict(_ident), _token_role))
+                  if _ident else [])
+    except Exception as _ce:
+        logging.error(f"[SSE] cannot resolve the cluster scope of '{_sl(user)}': {_ce}")
+        _fresh = []
+    subscribed_clusters = narrow_stream_scope(subscribed_clusters, _fresh)
+    if (_ident or {}).get('role') != ROLE_ADMIN:
         _is_admin = False
 
     with sse_clients_lock:

@@ -1050,7 +1050,11 @@ def create_api_token(username: str, token_name: str, role: str = None,
     # Default to user's own role if not specified
     if not role:
         role = user.get('role', ROLE_VIEWER)
-    
+    # NS Oct 2026 - straight from the JSON body: a list or an object is no role name,
+    # and the hierarchy lookup below died on it with a TypeError (500)
+    if not isinstance(role, str):
+        return {'error': 'Invalid role'}
+
     # NS: Don't allow creating tokens with higher privileges than the user
     # MK: custom roles default to level 2 (user) not 1 (viewer) — prevents escalation
     role_hierarchy = {ROLE_ADMIN: 3, ROLE_USER: 2, ROLE_VIEWER: 1}
@@ -1069,7 +1073,7 @@ def create_api_token(username: str, token_name: str, role: str = None,
     # lacks. Admins hold everything, so their custom-role tokens are unaffected.
     if role not in role_hierarchy:
         try:
-            from pegaprox.utils.rbac import (get_user_permissions,
+            from pegaprox.utils.rbac import (get_user_permissions, token_role_tenant,
                                               get_role_permissions_for_user, DEFAULT_TENANT_ID)
             _owner = dict(user, username=username)
             # Resolve BOTH sides in the owner's tenant. get_role_permissions_for_user only
@@ -1079,8 +1083,14 @@ def create_api_token(username: str, token_name: str, role: str = None,
             # catch. Request time resolves the same role WITH the tenant, so the token then
             # carried the elevated set.
             _tid = _owner.get('tenant_id') or DEFAULT_TENANT_ID
+            # NS Oct 2026 - and the token's side where request time resolves it. Another
+            # tenant's role resolved to nothing here, so it passed, and the token then
+            # acted in that tenant's clusters.
+            _role_tid = token_role_tenant(_owner, role)
+            if _role_tid is None:
+                return {'error': 'This role is not defined in your tenant'}
             _owner_perms = set(get_user_permissions(_owner, _tid))
-            _token_perms = set(get_role_permissions_for_user(dict(_owner, role=role), _tid))
+            _token_perms = set(get_role_permissions_for_user(dict(_owner, role=role), _role_tid))
             _extra = _token_perms - _owner_perms
             if _extra:
                 return {'error': 'Cannot create token with permissions beyond your own role: '
@@ -1180,6 +1190,18 @@ def validate_api_token(token: str) -> dict:
             if datetime.now() > expires:
                 return None
         
+        # NS Oct 2026 - and on every use, not only at mint: tokens minted before that
+        # check, an owner moved off the role or a role deleted or redefined since.
+        _role = row_dict.get('role')
+        if _role and _role not in (ROLE_ADMIN, ROLE_USER, ROLE_VIEWER):
+            from pegaprox.utils.rbac import token_role_tenant
+            _owner = db.get_user(row_dict['username'])
+            if _owner and token_role_tenant(_owner, _role) is None:
+                logging.warning(f"[APIToken] refused token id={row_dict['id']} of "
+                                f"{row_dict['username']!r}: its role does not resolve in "
+                                f"the owner's tenant")
+                return None
+
         # Update last used timestamp
         cursor.execute('''
             UPDATE api_tokens SET last_used_at = ?, last_used_ip = ? WHERE id = ?

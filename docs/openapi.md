@@ -69,7 +69,10 @@ Two schemes, both described in the spec:
 
 - `Authorization: Bearer pgx_...` - an API token from Settings > API Tokens.
   This is what automation should use. A token is capped by its own role and by
-  what its owner holds at the time of the call.
+  what its owner holds at the time of the call, and it reaches no cluster its
+  owner cannot. A custom role on a token has to be global or belong to the
+  tenant its owner works in; a token whose role no longer resolves there is
+  refused.
 - `X-Session-ID` - an interactive session from `POST /api/auth/login`. State
   changing calls also need an `Origin` header or `X-Requested-With:
   XMLHttpRequest`, otherwise the CSRF gate rejects them.

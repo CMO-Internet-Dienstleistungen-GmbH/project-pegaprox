@@ -512,6 +512,23 @@ def get_user_clusters(user: dict, include_pools: bool = True) -> list:
     NS: Dec 2025 - Also checks role's tenant for tenant-specific roles
     NS: Jan 2026 - Added group-based access (tenant can be assigned to groups)
     """
+    # NS Oct 2026 - an API token resolves its own role, which a builtin never remaps and a
+    # custom one may remap elsewhere than its owner's. Its permissions were capped to the
+    # owner's already, its clusters were not: a token reaches none its owner cannot (#1049).
+    eff = user.get('effective_role')
+    if eff and eff != user.get('role'):
+        owner = {k: v for k, v in user.items() if k not in ('effective_role', '_token_owner_capped')}
+        own = get_user_clusters(owner, include_pools)
+        mine = _role_clusters(user, include_pools)
+        if own is None:
+            return mine
+        if mine is None:
+            return list(own)
+        return [c for c in mine if c in own]
+    return _role_clusters(user, include_pools)
+
+
+def _role_clusters(user: dict, include_pools: bool = True) -> list:
     global tenants_db
     if not tenants_db:
         tenants_db = load_tenants()
@@ -1333,6 +1350,35 @@ def _within_token_role(user: dict, permission: str) -> bool:
     allowed = get_role_permissions_for_user({'role': eff, 'tenant_id': _tid},
                                             _tenant_defining_role(eff, _tid))
     return permission in (allowed or [])
+
+
+def token_role_tenant(owner: dict, role: str):
+    """The tenant an API token of `owner` resolves `role` in, or None when the token may
+    not carry that role.
+
+    NS Oct 2026 - a custom role is found by name, and _tenant_defining_role moves a
+    default-tenant caller into whichever tenant defines it. For an account an admin put
+    on a tenant role that is the point. A token's role is picked by its owner, so a
+    default-tenant user minted one with another tenant's role and acted in that tenant's
+    clusters. The role has to resolve where the owner does: in their own tenant, or in
+    the one their own role already places them in. A global admin is not confined to a
+    tenant and may name any role that resolves.
+    """
+    tid = owner.get('tenant_id') or DEFAULT_TENANT_ID
+    if not role or role in BUILTIN_ROLES:
+        return tid
+    custom = get_custom_roles()
+    if store_unavailable(custom):
+        return None
+    used = _tenant_defining_role(role, tid)
+    # deleted, misspelt, or defined by more than one tenant
+    if (role not in ((custom.get('tenants') or {}).get(used) or {})
+            and role not in (custom.get('global') or {})):
+        return None
+    if owner.get('role') == ROLE_ADMIN and not _admin_is_capped_in_own_tenant(owner):
+        return used
+    home = _tenant_defining_role(owner.get('role') or ROLE_VIEWER, tid)
+    return used if used in (tid, home) else None
 
 
 def user_can_access_vm(user: dict, cluster_id: str, vmid: int, permission: str = 'vm.view', vm_type: str = None) -> bool:
