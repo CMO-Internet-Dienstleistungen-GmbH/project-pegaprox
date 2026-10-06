@@ -447,11 +447,47 @@ def _filtered_vmware_vms_frame(data, username, timestamp, effective_role=None):
     if not user:
         return None
     from pegaprox.utils.rbac import user_can_access_vmware_vm
+    from pegaprox.api.helpers import vmware_server_reach
+    from pegaprox.globals import vmware_managers
     data = data or {}
     vmware_id = data.get('vmware_id')
+    # NS Oct 2026 - a client subscribed to a linked cluster it does not own (a pool grant there)
+    # still got this frame for a server it cannot reach: its id, an empty list, and every ten
+    # seconds the news that the server is up. check_vmware_access answers no, so send nothing.
+    mgr = vmware_managers.get(vmware_id)
+    if mgr is not None and not vmware_server_reach(user)(getattr(mgr, 'linked_clusters', None)):
+        return None
     allowed = [v for v in (data.get('vms') or [])
                if user_can_access_vmware_vm(user, vmware_id, str(v.get('vm', '')), 'vmware.vm.view')]
     return _serialize_sse_message('vmware_vms', {**data, 'vms': allowed}, None, timestamp)
+
+
+def _filtered_vmware_servers_frame(servers, username, timestamp, effective_role=None):
+    """The 'vmware_servers' list cut to the servers a NON-admin client may reach. Returns the
+    serialized JSON, or None to send nothing (unknown user -> fail closed).
+
+    NS Oct 2026 - the frame went to every vmware.view holder, so each tenant saw the name and
+    host of every other tenant's ESXi server, pool-confined users included. Same question as
+    GET /api/vmware now asks per row. The linkage comes from the live manager, where
+    check_vmware_access reads it; a server removed since the frame was built is dropped."""
+    if not isinstance(servers, list):
+        return None
+    user = _sse_stored_user(username, effective_role)
+    if not user:
+        return None
+    from pegaprox.api.helpers import vmware_server_reach
+    from pegaprox.globals import vmware_managers
+    try:
+        reaches = vmware_server_reach(user)
+        allowed = []
+        for s in servers:
+            mgr = vmware_managers.get(s.get('id')) if isinstance(s, dict) else None
+            if mgr is not None and reaches(getattr(mgr, 'linked_clusters', None)):
+                allowed.append(s)
+    except Exception as e:
+        logging.debug(f"[SSE] vmware_servers filter failed for '{_sl(username)}': {e}")
+        return None
+    return _serialize_sse_message('vmware_servers', allowed, None, timestamp)
 
 
 def _sse_user_can_view_vmware_vm(username, vmware_id, vm_id, effective_role=None):
@@ -664,6 +700,7 @@ def broadcast_sse(update_type: str, data: dict, cluster_id: str = None, target_c
         _tasks_frame_cache = {}   # uname -> per-VM-filtered 'tasks' frame (audit M1)
         _vmw_perm_cache = {}      # uname -> bool: holds the vmware.* perm the REST twin requires
         _vmw_vms_frame_cache = {} # uname -> per-VM-filtered ESXi inventory frame (audit)
+        _vmw_servers_frame_cache = {}  # uname -> the ESXi server list cut to what they reach
         _vmw_detail_cache = {}    # uname -> bool: may see THIS watched ESXi guest's detail (audit)
         _obj_frame_cache = {}     # uname -> bool: may see THIS migration/DR-plan frame (audit)
         _maint_seen_cache = {}    # uname -> bool: gets the guests of a maintenance in this cluster
@@ -772,6 +809,20 @@ def broadcast_sse(update_type: str, data: dict, cluster_id: str = None, target_c
                         if client_message is _SSE_FILTER_MISSING:
                             client_message = _filtered_vmware_vms_frame(data, uname, timestamp, _eff)
                             _vmw_vms_frame_cache[uname, _eff] = client_message
+                    elif update_type == 'vmware_servers' and not client_info.get('is_admin', False):
+                        # NS Oct 2026 - the perm gate decided who hears about ESXi, never which
+                        # servers; the list carried every tenant's to each vmware.view holder
+                        uname, _eff = client_info.get('user'), client_info.get('effective_role')
+                        _ok_vmw = _vmw_perm_cache.get((uname, _eff, 'vmware.view'), _SSE_FILTER_MISSING)
+                        if _ok_vmw is _SSE_FILTER_MISSING:
+                            _ok_vmw = _sse_user_has_perm(uname, 'vmware.view', _eff)
+                            _vmw_perm_cache[uname, _eff, 'vmware.view'] = _ok_vmw
+                        if not _ok_vmw:
+                            continue
+                        client_message = _vmw_servers_frame_cache.get((uname, _eff), _SSE_FILTER_MISSING)
+                        if client_message is _SSE_FILTER_MISSING:
+                            client_message = _filtered_vmware_servers_frame(data, uname, timestamp, _eff)
+                            _vmw_servers_frame_cache[uname, _eff] = client_message
                     elif update_type == 'vmware_vm_detail' and not client_info.get('is_admin', False):
                         uname, _eff = client_info.get('user'), client_info.get('effective_role')
                         _ok_det = _vmw_detail_cache.get((uname, _eff), _SSE_FILTER_MISSING)
@@ -788,7 +839,7 @@ def broadcast_sse(update_type: str, data: dict, cluster_id: str = None, target_c
                         # the stream skipped entirely. Both are default viewer perms, so this
                         # only bites a custom role that deliberately withholds them.
                         uname, _eff = client_info.get('user'), client_info.get('effective_role')
-                        _need = 'vmware.view' if update_type == 'vmware_servers' else 'vmware.vm.view'
+                        _need = 'vmware.vm.view'   # vmware_servers has its own branch above
                         _ok_vmw = _vmw_perm_cache.get((uname, _eff, _need), _SSE_FILTER_MISSING)
                         if _ok_vmw is _SSE_FILTER_MISSING:
                             _ok_vmw = _sse_user_has_perm(uname, _need, _eff)

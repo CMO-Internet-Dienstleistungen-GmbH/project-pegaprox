@@ -28148,7 +28148,7 @@
             "description": "Insufficient permissions"
           }
         },
-        "summary": "List all configured VMware/vCenter servers",
+        "summary": "List the ESXi servers the caller may reach",
         "x-pegaprox-auth": "decorator",
         "security": [
           {

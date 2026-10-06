@@ -701,6 +701,30 @@ def check_vmware_access(vmware_id):
     return False, (jsonify({'error': 'Access denied to this VMware server'}), 403)
 
 
+def vmware_server_reach(user):
+    """check_vmware_access's answer for every ESXi server at once, for a caller that lists
+    servers instead of naming one. Returns reaches(linked_clusters) -> bool.
+
+    NS Oct 2026 - GET /api/vmware and the 'vmware_servers' stream frame asked for vmware.view
+    and nothing else, so every holder read every tenant's servers (host, account, notes, last
+    error). Same rule as the gate: a global admin, an unlinked server, an unconfined caller, or
+    a linked cluster the caller owns - pool grants do not count. The caller's reach is resolved
+    once, not once per server."""
+    from pegaprox.utils.rbac import get_user_clusters
+
+    if not user:
+        return lambda linked: False
+    if acts_as_admin(user):
+        return lambda linked: True
+    uc = get_user_clusters(user, include_pools=False)
+
+    def reaches(linked):
+        if not linked or uc is None:
+            return True
+        return any(c in uc for c in linked)
+    return reaches
+
+
 def safe_error(e, default_msg='An internal error occurred'):
     """Return a safe error message for API responses.
     MK Feb 2026 - logs full exception but returns generic message to client.

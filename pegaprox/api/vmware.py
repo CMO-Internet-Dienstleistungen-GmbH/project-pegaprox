@@ -17,8 +17,9 @@ from pegaprox.utils.audit import log_audit
 # MK 2026-06-04 (CWE-117): mgr.name is from cluster-config (admin-controlled),
 # vmware_id from URL. Sanitise both before logging for consistency.
 from pegaprox.utils.sanitization import sanitize_log_message as _sl
-from pegaprox.utils.rbac import user_can_access_vmware_vm
-from pegaprox.api.helpers import check_cluster_access, check_vmware_access, caller_is_scoped
+from pegaprox.utils.rbac import user_can_access_vmware_vm, acts_as_admin
+from pegaprox.api.helpers import (check_cluster_access, check_vmware_access, caller_is_scoped,
+                                  acting_user, vmware_server_reach)
 from pegaprox.core.vmware import VMwareManager, load_vmware_servers, save_vmware_server
 from pegaprox.core.v2p import V2PMigrationTask, _run_v2p_migration
 from pegaprox.background.broadcast import broadcast_resources_loop
@@ -34,19 +35,39 @@ _migration_lock_v2p = threading.Lock()
 @bp.route('/api/vmware', methods=['GET'])
 @require_auth(perms=['vmware.view'])
 def list_vmware_servers():
-    """List all configured VMware/vCenter servers"""
+    """List the ESXi servers the caller may reach"""
+    # NS Oct 2026 - this handed every tenant's servers to any vmware.view holder; each row
+    # now has to pass the rule check_vmware_access applies to the server it names
+    user = acting_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized', 'code': 'AUTH_REQUIRED'}), 401
+    reaches = vmware_server_reach(user)
     result = []
-    for vmware_id, mgr in vmware_managers.items():
-        result.append(mgr.to_dict())
+    for vmware_id, mgr in list(vmware_managers.items()):
+        if reaches(getattr(mgr, 'linked_clusters', None)):
+            result.append(mgr.to_dict())
     
     # Also include disabled servers from DB
     try:
+        import json as _json
         db = get_db()
         cursor = db.conn.cursor()
-        cursor.execute("SELECT id, name, host, port, enabled, server_type FROM vmware_servers")
+        cursor.execute("SELECT id, name, host, port, enabled, server_type, linked_clusters "
+                       "FROM vmware_servers")
         for row in cursor.fetchall():
             row_dict = dict(row)
             if row_dict['id'] not in vmware_managers:
+                try:
+                    _linked = _json.loads(row_dict.get('linked_clusters') or '[]')
+                except (TypeError, ValueError):
+                    _linked = False
+                # a linkage we cannot read shows the row to an admin and nobody else
+                if not isinstance(_linked, (list, type(None))):
+                    if not acts_as_admin(user):
+                        continue
+                    _linked = []
+                if not reaches(_linked):
+                    continue
                 result.append({
                     'id': row_dict['id'],
                     'name': row_dict['name'],
