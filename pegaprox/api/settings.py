@@ -2867,6 +2867,11 @@ def restore_config():
                     tenant_count += 1
                 except Exception as e:
                     results['errors'].append(f"Tenant: {str(e)}")
+            # NS Oct 2026 (#1046) - get_user_clusters reads a cached copy of the tenants, so
+            # a cluster the restore took away stayed reachable until the next restart
+            if not dry_run:
+                from pegaprox.utils.rbac import invalidate_tenants_cache
+                invalidate_tenants_cache()
             results['restored']['tenants'] = tenant_count
         
         # VM ACLs

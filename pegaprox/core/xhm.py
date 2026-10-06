@@ -1084,6 +1084,7 @@ def _run_pve_to_xcpng(task):
 
         task.vm_name = task.vm_name or raw.get('name', f'vm-{task.source_vmid}')
         task.log(f"Source VM: {task.vm_name} (VMID {task.source_vmid})")
+        source_identity = _pve_guest_identity(raw)
 
         ostype = raw.get('ostype', 'l26')
         memory_mb = int(raw.get('memory', 1024))
@@ -1497,9 +1498,19 @@ def _run_pve_to_xcpng(task):
         # cleanup source
         if task.remove_source:
             try:
-                _pve_node_exec(src_mgr, task.source_node,
-                               f"qm destroy {task.source_vmid} --purge", timeout=120)
-                task.log("Source VM destroyed on Proxmox")
+                # NS Oct 2026 (#1079) - hours can pass since planning, and a VMID freed in
+                # the meantime may already belong to somebody else's new guest. Destroy only
+                # the guest that was copied.
+                now = src_mgr.get_vm_config(task.source_node, int(task.source_vmid), 'qemu')
+                now_cfg = now.get('config', {}) if now.get('success') else None
+                now_raw = now_cfg.get('raw', now_cfg) if now_cfg is not None else None
+                if now_raw is None or _pve_guest_identity(now_raw) != source_identity:
+                    task.log(f"Source VM {task.source_vmid} is no longer the guest that was "
+                             f"copied - left in place, remove it by hand if needed")
+                else:
+                    _pve_node_exec(src_mgr, task.source_node,
+                                   f"qm destroy {task.source_vmid} --purge", timeout=120)
+                    task.log("Source VM destroyed on Proxmox")
             except Exception as e:
                 task.log(f"Source cleanup failed: {e}")
 
@@ -1523,6 +1534,15 @@ def _run_pve_to_xcpng(task):
 # ============================================================
 # helpers
 # ============================================================
+
+def _pve_guest_identity(raw):
+    """The config keys that tell a guest apart from a later one under the same VMID.
+
+    PVE generates smbios1 (uuid), vmgenid and meta (ctime) for every new guest, so a guest
+    created after the copy started differs in all three; name catches the rest."""
+    raw = raw if isinstance(raw, dict) else {}
+    return {k: raw.get(k) for k in ('smbios1', 'vmgenid', 'meta', 'name') if raw.get(k)}
+
 
 def _next_pve_vmid(pve_mgr):
     """Ask the target cluster for the next free VMID.
@@ -2278,6 +2298,13 @@ def _run_esxi_to_xcpng(task):
                 return
             datastore_name = ds_match.group(1)
             vmdk_rel_path = ds_match.group(2)
+            # NS Oct 2026 - same component check as the ESXi-to-PVE branch, before the VDI
+            # exists: no '..' or other non-name part reaches the scp path
+            from pegaprox.utils.sanitization import validate_esxi_path_component
+            _pcs = [datastore_name] + [c for c in vmdk_rel_path.split('/') if c]
+            if not all(validate_esxi_path_component(c) for c in _pcs):
+                task.set_phase('failed', f'Unsafe ESXi path component in VMDK path: {vmdk!r}')
+                return
             flat_path = vmdk_rel_path
             if flat_path.endswith('.vmdk') and '-flat.vmdk' not in flat_path:
                 flat_path = flat_path.replace('.vmdk', '-flat.vmdk')

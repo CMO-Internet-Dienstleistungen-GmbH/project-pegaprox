@@ -188,6 +188,17 @@ def validate_esxi_path_component(value) -> bool:
     return bool(_ESXI_NAME_RE.match(value))
 
 
+# NS Oct 2026 (#1090) - virtio_iso_path is loop-mounted by root on the PVE node. Any node
+# path was taken, so a disk image or another file could be mounted in the ISO's place.
+_NODE_ISO_PATH_RE = re.compile(r'/[A-Za-z0-9 ._()+\-/]{0,4090}\.iso\Z', re.IGNORECASE)
+
+def validate_node_iso_path(value) -> bool:
+    """True for an absolute path to an .iso file: no '..' part, no control characters."""
+    if not isinstance(value, str) or not _NODE_ISO_PATH_RE.match(value):
+        return False
+    return '..' not in value.split('/')
+
+
 # MK Sep 2026 (audit CRIT) — a snapshot name goes straight into the PVE API path
 # (.../{vmid}/snapshot/{snapname}), and the authz gate in front of those routes only ever
 # validates the vmid. So a name carrying dot-segments walked out of the guest the caller owns

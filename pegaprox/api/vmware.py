@@ -1246,6 +1246,13 @@ def start_vmware_migration(vmware_id, vm_id):
     if _aio and _aio not in ('threads', 'native', 'io_uring'):
         return jsonify({'error': 'Invalid aio_mode: must be threads, native or io_uring.'}), 400
 
+    # NS Oct 2026 (#1090) - root loop-mounts this on the node; empty = the default places
+    from pegaprox.utils.sanitization import validate_node_iso_path
+    _iso = data.get('virtio_iso_path')
+    if data.get('install_virtio_drivers') and _iso not in (None, '') and not validate_node_iso_path(_iso):
+        return jsonify({'error': 'Invalid virtio_iso_path: an absolute path to an .iso file '
+                                 'on the node'}), 400
+
     # NS Oct 2026 (#1106) - esxi_host decides which host the PVE node SSHes/sshfs-mounts and
     # reads disks from as root. Left to the caller it could aim the node at an attacker's SSH
     # server serving a crafted descriptor. It is the configured server's host; pin it there.
@@ -1378,6 +1385,13 @@ def confirm_vmware_cutover(mid):
     if getattr(task, 'phase', None) != 'awaiting_confirmation':
         return jsonify({'error': 'Migration is not waiting for cutover confirmation',
                         'phase': getattr(task, 'phase', None)}), 409
+    # NS Oct 2026 (#984) - on a run started with remove_source this click is what sets the
+    # source deletion off, so it asks the same right the start asked for that
+    if getattr(task, 'remove_source', False):
+        _cu = build_authz_user(request.session.get('user', ''), request.session)
+        if not user_can_access_vmware_vm(_cu, task.vmware_id, str(task.vm_id), 'vmware.vm.manage'):
+            return jsonify({'error': 'Permission denied: this cutover removes the source guest, '
+                                     'which needs vmware.vm.manage on it'}), 403
     task._cutover_confirmed = True
     log_audit(request.session.get('user', 'admin'), 'vmware.migration.cutover_confirmed',
               f"V2P cutover confirmed for {getattr(task, 'vm_name', mid)} (migration {mid})")

@@ -365,6 +365,42 @@ class V2PMigrationTask:
         }
 
 
+def _node_hkc():
+    """StrictHostKeyChecking for the ssh/sshfs the PVE node runs against the ESXi host.
+
+    NS Oct 2026 (#1112) - same rule as the XHM path: strict host keys travel with these
+    commands. They check against the node's own known_hosts, which a strict setup seeds
+    the way it seeds ours."""
+    from pegaprox.utils.ssh_security import strict_host_keys_enabled
+    return 'yes' if strict_host_keys_enabled() else 'accept-new'
+
+
+# what mktemp in _write_node_script prints, and nothing else
+_NODE_SCRIPT_RE = re.compile(r'/tmp/v2p-[a-z0-9-]+-[A-Za-z0-9]{10}')
+
+
+def _write_node_script(pve_mgr, node, body, tag, timeout=15):
+    """Write `body` to a new root-only file on the node and return its path, or None.
+
+    NS Oct 2026 (#1123) - the helper scripts went to fixed names in /tmp (the VMID, or the
+    task id the mount next to them gives away) and ran in a later call. A local account
+    that created the name first got its own file run as root; with protected_regular the
+    root write fails and the run still went ahead. mktemp makes a new 0600 file nobody else
+    can swap in sticky /tmp, and nothing runs when the write did not happen. Writing and
+    running stay two calls: some bodies carry the ESXi password, and a command line is
+    readable by every local account for as long as it runs.
+    """
+    tag = re.sub(r'[^a-z0-9-]', '', str(tag).lower()) or 'script'
+    if not body.endswith('\n'):
+        body += '\n'
+    rc, out, _ = _pve_node_exec(pve_mgr, node,
+        f"umask 077; f=$(mktemp /tmp/v2p-{tag}-XXXXXXXXXX) && "
+        f"cat > \"$f\" << 'V2P_NODE_SCRIPT' && echo \"$f\"\n{body}V2P_NODE_SCRIPT\n",
+        timeout=timeout)
+    path = (str(out or '').strip().splitlines() or [''])[-1].strip()
+    return path if rc == 0 and _NODE_SCRIPT_RE.fullmatch(path) else None
+
+
 def _run_v2p_migration(task):
     """Execute VMware -> Proxmox migration via SSHFS + qm importdisk.
     
@@ -844,11 +880,11 @@ def _run_v2p_migration(task):
         v2p_tmpdir = str(tmpdir_out or '').strip() or '/var/tmp'
         task.log(f"TMPDIR for subprocesses: {v2p_tmpdir}")
 
-        _pve_node_exec(pve_mgr, task.target_node,
-            "grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null || "
-            "sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf 2>/dev/null || "
-            "echo 'user_allow_other' >> /etc/fuse.conf",
-            timeout=10)
+        # NS Oct 2026 (#1117) - the datastore mount below is root's alone now: no allow_other,
+        # and no user_allow_other switched on in /etc/fuse.conf for every account on the
+        # node. allow_other let any local account read the whole datastore with the ESXi
+        # login's rights for the length of the run. Whatever reads the mount is root
+        # (qemu-img, dd, qemu-nbd, kvm), and root owns the mount.
 
         # NS: resolve datastore symlink — /vmfs/volumes/<name> -> /vmfs/volumes/<uuid>
         # SSHFS can't mount symlinks, need the real path
@@ -880,9 +916,10 @@ def _run_v2p_migration(task):
         #     (avoids thousands of stat() calls -- HUGE reduction in FUSE overhead)
         #   negative_timeout=3600: cache "file not found" for 1h
         #   no_check_root: skip root dir check (faster mount)
+        _hk = _node_hkc()
         sshfs_ssh_opts = (
-            "StrictHostKeyChecking=accept-new,"
-            "allow_other,reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,"
+            f"StrictHostKeyChecking={_hk},"
+            "reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,"
             "cache=yes,kernel_cache,"
             "max_read=1048576,max_write=1048576,big_writes,large_read,"
             "entry_timeout=3600,negative_timeout=3600,attr_timeout=3600,"
@@ -910,8 +947,8 @@ def _run_v2p_migration(task):
             mount_cmd2 = (
                 f"mkdir -p {mnt_path} && "
                 f"printf '%s' {safe_pass} | sshfs -o password_stdin,"
-                f"StrictHostKeyChecking=accept-new,"
-                f"allow_other,reconnect,ServerAliveInterval=15,"
+                f"StrictHostKeyChecking={_hk},"
+                f"reconnect,ServerAliveInterval=15,"
                 f"cache=yes,kernel_cache,"
                 f"max_read=1048576,big_writes,large_read,"
                 f"entry_timeout=3600,attr_timeout=3600 "
@@ -922,8 +959,8 @@ def _run_v2p_migration(task):
             mount_cmd3 = (
                 f"mkdir -p {mnt_path} && "
                 f"printf '%s' {safe_pass} | sshfs -o password_stdin,"
-                f"StrictHostKeyChecking=accept-new,"
-                f"allow_other,reconnect,ServerAliveInterval=15,"
+                f"StrictHostKeyChecking={_hk},"
+                f"reconnect,ServerAliveInterval=15,"
                 f"cache=yes "
                 f"{esxi_user}@{esxi_host}:{shlex.quote(ds_mount_path)} {mnt_path}")
             rc, out, err = _pve_node_exec(pve_mgr, task.target_node, mount_cmd3, timeout=30)
@@ -2073,10 +2110,11 @@ def _register_uefi_fallback_loader(pve_mgr, task):
             "mkdir -p \"$MNT/EFI/BOOT\"\n"
             "cp -f \"$MGR\" \"$DST\" && sync && echo 'fallback loader installed'\n"
         )
-        sf = f"/tmp/v2p-efi-fallback-{task.proxmox_vmid}.sh"
-        _pve_node_exec(pve_mgr, task.target_node,
-            f"cat > {sf} << 'EOFSCRIPT'\n{script}EOFSCRIPT\nchmod +x {sf}",
-            timeout=15)
+        sf = _write_node_script(pve_mgr, task.target_node, script,
+                                f"efi-fallback-{task.proxmox_vmid}")
+        if not sf:
+            task.log("EFI fallback loader skipped (non-fatal): the script could not be written")
+            return
         rc, out, err = _pve_node_exec(pve_mgr, task.target_node,
             f"bash {sf} 2>&1; rm -f {sf}", timeout=120)
         out_str = str(out or '').strip()
@@ -2223,6 +2261,10 @@ def _inject_virtio_drivers(pve_mgr, task):
     # 2) Locate ISO. User-set path wins.
     iso_candidates = []
     if getattr(task, 'virtio_iso_path', ''):
+        from pegaprox.utils.sanitization import validate_node_iso_path
+        if not validate_node_iso_path(task.virtio_iso_path):
+            task.log("[VirtIO] ✗ virtio_iso_path must be an absolute path to an .iso file - skipping")
+            return False
         iso_candidates.append(task.virtio_iso_path)
     iso_candidates += [
         "/var/lib/vz/template/iso/virtio-win.iso",
@@ -2283,7 +2325,9 @@ def _inject_virtio_drivers(pve_mgr, task):
         "  rm -rf \"$TMP\"; "
         "}\n"
         "trap cleanup EXIT\n"
-        "mount -o ro,loop \"$ISO\" \"$ISO_MNT\" || { echo 'ISO_MOUNT_FAILED'; exit 3; }\n"
+        # NS Oct 2026 (#1090) - CD filesystems only: a disk image under an .iso name is
+        # refused instead of handed to the kernel's other filesystem parsers as root
+        "mount -t iso9660,udf -o ro,loop \"$ISO\" \"$ISO_MNT\" || { echo 'ISO_MOUNT_FAILED'; exit 3; }\n"
         # ── Expose target disk as a partitioned block device (BLK) ──
         "BLK=\"\"\n"
         "case \"$STYPE\" in\n"
@@ -2585,10 +2629,10 @@ def _inject_virtio_drivers(pve_mgr, task):
         "echo 'INJECTION_OK'\n"
     )
 
-    sf = f"/tmp/v2p-virtio-inject-{task.proxmox_vmid}.sh"
-    _pve_node_exec(pve_mgr, node,
-        f"cat > {sf} << 'EOFSCRIPT'\n{script}EOFSCRIPT\nchmod +x {sf}",
-        timeout=15)
+    sf = _write_node_script(pve_mgr, node, script, f"virtio-inject-{task.proxmox_vmid}")
+    if not sf:
+        task.log("[VirtIO] ✗ the injection script could not be written on the node")
+        return False
 
     # Detect version first via a separate quick run (so we can pass VIRTIO_SUBDIR cleanly)
     # Simpler path: do a probe-only run then a real run. But to keep cost down we just
@@ -3808,7 +3852,7 @@ def _setup_temp_ssh_key(pve_mgr, node, esxi_host, esxi_user, esxi_pass):
     
     # SSH options for key-based verification (after deployment)
     ESXI_SSH_OPTS = (
-        "-o StrictHostKeyChecking=accept-new "
+        f"-o StrictHostKeyChecking={_node_hkc()} "
         "-o LogLevel=ERROR "
         "-o HostKeyAlgorithms=+ssh-rsa,ssh-ed25519,ecdsa-sha2-nistp256 "
         "-o PubkeyAcceptedAlgorithms=+ssh-rsa,ssh-ed25519 "
@@ -3921,7 +3965,7 @@ def _setup_temp_ssh_key(pve_mgr, node, esxi_host, esxi_user, esxi_pass):
         f"  HostName {esxi_host}\n"
         f"  User {esxi_user}\n"
         f"  IdentityFile {key_path}\n"
-        f"  StrictHostKeyChecking accept-new\n"
+        f"  StrictHostKeyChecking {_node_hkc()}\n"
         f"  HostKeyAlgorithms +ssh-rsa,ssh-ed25519,ecdsa-sha2-nistp256\n"
         f"  PubkeyAcceptedAlgorithms +ssh-rsa,ssh-ed25519\n"
         f"  KexAlgorithms +diffie-hellman-group14-sha1,diffie-hellman-group14-sha256\n"
@@ -3945,7 +3989,7 @@ def _cleanup_temp_ssh_key(pve_mgr, node, key_path, esxi_host, esxi_user):
     ssh_config_path = f"/tmp/v2p-sshcfg-{key_id}"
     
     ESXI_SSH_OPTS = (
-        "-o StrictHostKeyChecking=accept-new "
+        f"-o StrictHostKeyChecking={_node_hkc()} "
         "-o LogLevel=ERROR "
         "-o HostKeyAlgorithms=+ssh-rsa,ssh-ed25519 "
         "-o PubkeyAcceptedAlgorithms=+ssh-rsa,ssh-ed25519 "
@@ -4116,14 +4160,14 @@ def _qemu_img_ssh_copy(pve_mgr, task, esxi_host, esxi_user, key_path,
     )
     if key_path:
         ssh_base = (
-            f"-i {key_path} -o StrictHostKeyChecking=accept-new "
+            f"-i {key_path} -o StrictHostKeyChecking={_node_hkc()} "
             f"-o ServerAliveInterval=30 -o ServerAliveCountMax=5 "
             f"{ESXI_ALGO_OPTS}"
         )
         SSH_PREFIX = "ssh"
     else:
         ssh_base = (
-            f"-o StrictHostKeyChecking=accept-new "
+            f"-o StrictHostKeyChecking={_node_hkc()} "
             f"-o ServerAliveInterval=30 -o ServerAliveCountMax=5 "
             f"{ESXI_ALGO_OPTS}"
         )
@@ -4253,7 +4297,6 @@ def _qemu_img_ssh_copy(pve_mgr, task, esxi_host, esxi_user, key_path,
             
             task.log(f"  Method 1: SSH+{compress_name} × {NUM_STREAMS} streams")
             
-            script = f"/tmp/v2p-ssh-{task.id[:8]}-d{di}.sh"
             lines = [
                 "#!/bin/bash",
                 # sec/correctness (audit): each stream below is a PIPELINE (ssh | dd), so
@@ -4290,14 +4333,15 @@ def _qemu_img_ssh_copy(pve_mgr, task, esxi_host, esxi_user, key_path,
             lines.append('for p in $pids; do wait "$p" || rc=1; done')
             lines.append('exit $rc')
             
-            _pve_node_exec(pve_mgr, task.target_node,
-                f"( umask 077; cat > {script} << 'SSHEOF'\n" + "\n".join(lines) + "\nSSHEOF\n"
-                f" ); chmod 700 {script}", timeout=10)
-            
+            script = _write_node_script(pve_mgr, task.target_node, "\n".join(lines),
+                                        f"ssh-{task.id[:8]}-d{di}", timeout=10)
+
             start_time = time.time()
-            rc_ssh, _, _ = _pve_node_exec(pve_mgr, task.target_node,
-                f"bash {script} 2>&1", timeout=86400)
-            _pve_node_exec(pve_mgr, task.target_node, f"rm -f {script}", timeout=5)
+            rc_ssh = 1
+            if script:
+                rc_ssh, _, _ = _pve_node_exec(pve_mgr, task.target_node,
+                    f"bash {script} 2>&1", timeout=86400)
+                _pve_node_exec(pve_mgr, task.target_node, f"rm -f {script}", timeout=5)
             elapsed = time.time() - start_time
             
             if rc_ssh == 0:
@@ -4312,7 +4356,6 @@ def _qemu_img_ssh_copy(pve_mgr, task, esxi_host, esxi_user, key_path,
         # ==============================================================
         if not copied:
             task.log(f"  Method 2: SSH single + {compress_name}")
-            script = f"/tmp/v2p-s-{task.id[:8]}-d{di}.sh"
             if compress_name != 'none':
                 pipe = (
                     f'{NICE} {SSH_PREFIX} {ssh_fast} {esxi_user}@{esxi_host} '
@@ -4325,16 +4368,17 @@ def _qemu_img_ssh_copy(pve_mgr, task, esxi_host, esxi_user, key_path,
                     f'"{NICE} {DD_READ} if={esxi_path} 2>/dev/null" '
                     f'| {NICE} {DD_WRITE_SPARSE} of={dev_path} 2>/dev/null'
                 )
-            _pve_node_exec(pve_mgr, task.target_node,
-                f"( umask 077; cat > {script} << 'SEOF'\n#!/bin/bash\n{CG_EXEC}\n"
+            script = _write_node_script(pve_mgr, task.target_node,
+                f"#!/bin/bash\n{CG_EXEC}\n"
                 f"echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true\n"
-                f"{pipe}\nSEOF\n ); chmod 700 {script}",
-                timeout=10)
-            
+                f"{pipe}\n", f"s-{task.id[:8]}-d{di}", timeout=10)
+
             start_time = time.time()
-            rc_s, _, _ = _pve_node_exec(pve_mgr, task.target_node,
-                f"bash {script} 2>&1", timeout=86400)
-            _pve_node_exec(pve_mgr, task.target_node, f"rm -f {script}", timeout=5)
+            rc_s = 1
+            if script:
+                rc_s, _, _ = _pve_node_exec(pve_mgr, task.target_node,
+                    f"bash {script} 2>&1", timeout=86400)
+                _pve_node_exec(pve_mgr, task.target_node, f"rm -f {script}", timeout=5)
             elapsed = time.time() - start_time
             
             if rc_s == 0:
@@ -4356,7 +4400,6 @@ def _qemu_img_ssh_copy(pve_mgr, task, esxi_host, esxi_user, key_path,
         if rc_xxh == 0 and esxi_xxhash and disk_gb < 100:  # Only for disks < 100GB
             task.log(f"  Verifying integrity (xxhash)...")
             # Hash first 64MB + last 64MB (spot check, not full hash)
-            verify_script = f"/tmp/v2p-verify-{task.id[:8]}-d{di}.sh"
             verify_body = f"""#!/bin/bash
 # Hash first 64MB + last 64MB on both sides
 ESX_HASH=$({SSH_PREFIX} {ssh_base} {esxi_user}@{esxi_host} "{{
@@ -4375,12 +4418,13 @@ else
   echo "MISMATCH:ESX=$ESX_HASH PVE=$PVE_HASH"
 fi
 """
-            _pve_node_exec(pve_mgr, task.target_node,
-                f"cat > {verify_script} << 'VEOF'\n{verify_body}\nVEOF\nchmod +x {verify_script}",
-                timeout=10)
-            rc_v, out_v, _ = _pve_node_exec(pve_mgr, task.target_node,
-                f"bash {verify_script} 2>&1", timeout=120)
-            _pve_node_exec(pve_mgr, task.target_node, f"rm -f {verify_script}", timeout=5)
+            verify_script = _write_node_script(pve_mgr, task.target_node, verify_body,
+                                               f"verify-{task.id[:8]}-d{di}", timeout=10)
+            out_v = ''
+            if verify_script:
+                rc_v, out_v, _ = _pve_node_exec(pve_mgr, task.target_node,
+                    f"bash {verify_script} 2>&1", timeout=120)
+                _pve_node_exec(pve_mgr, task.target_node, f"rm -f {verify_script}", timeout=5)
             v_out = str(out_v or '').strip()
             if 'MATCH:' in v_out:
                 task.log(f"  ✓ Verified: {v_out.split(':',1)[1][:16]}")
@@ -4512,13 +4556,17 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
         drive_id = f"ssh-disk{di}"
         
         # QEMU drive spec with SSH backend + write-back cache
+        # NS Oct 2026 (#1112) - known_hosts, not none: the node's root known_hosts holds
+        # the ESXi key since the key check in _setup_temp_ssh_key, so a changed key is
+        # refused here as everywhere else. The pre-flight below asks the same way, and a
+        # host libssh will not accept falls through to the next boot method.
         drive_spec = (
             f"file.driver=ssh,"
             f"file.host={esxi_host},"
             f"file.port=22,"
             f"file.path={esxi_path},"
             f"file.user={esxi_user},"
-            f"file.host-key-check.mode=none"
+            f"file.host-key-check.mode=known_hosts"
             f"{ssh_key_opt},"
             f"format=raw,"
             f"if=none,"
@@ -4594,7 +4642,7 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
         f"\"file.port\":22,"
         f"\"file.path\":\"{esxi_test_path}\","
         f"\"file.user\":\"{esxi_user}\","
-        f"\"file.host-key-check.mode\":\"none\","
+        f"\"file.host-key-check.mode\":\"known_hosts\","
         f"\"file.identity-file\":\"{key_path}\"}}' 2>&1",
         timeout=20, ignore_node_backoff=True)
     qtest_out = (str(out_qtest or '') + str(err_qtest or '')).strip()
@@ -4901,8 +4949,8 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             f"fusermount -u {mnt_path} 2>/dev/null; "
             f"mkdir -p {mnt_path} && "
             f"printf '%s' {safe_pass_r} | sshfs -o password_stdin,"
-            f"StrictHostKeyChecking=accept-new,"
-            f"allow_other,reconnect,ServerAliveInterval=15,"
+            f"StrictHostKeyChecking={_node_hkc()},"
+            f"reconnect,ServerAliveInterval=15,"
             f"cache=yes,{sshfs_algo} "
             f"{esxi_user}@{esxi_host}:{shlex.quote(ds_remount)} {mnt_path} 2>&1",
             timeout=20)
@@ -4945,14 +4993,11 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             boot_method = "nbd"
             # NBD bridge uses Unix sockets -- no AppArmor issues
         
-        # Ensure key file is readable by QEMU process
-        # NOTE (audit 2026-09): this leaves a passphrase-less private key world-readable on the
-        # Proxmox node for the life of the migration. The right fix is to chown it to the user
-        # QEMU actually runs as and keep 0600, but that is on the VM-start path and cannot be
-        # verified without a real migration, so it is deliberately left alone rather than
-        # changed blind. Raised with the maintainer.
-        _pve_node_exec(pve_mgr, task.target_node, f"chmod 644 {key_path} 2>/dev/null", timeout=5)
-        
+        # NS Oct 2026 (#1029) - the key stays 0600 as ssh-keygen made it. A chmod 644 here
+        # left a passphrase-less ESXi root key readable to every local account on the node
+        # for the whole run. Everything that reads it on a PVE node is root: the node
+        # commands, qemu-img, and kvm, which qemu-server starts as root.
+
         task.log(f"Starting Proxmox VM ({boot_method} backend + cache=writeback)...")
         try:
             pve_mgr._api_post(
@@ -5102,7 +5147,7 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
     BS = BS_MB * 1024 * 1024
     
     bg_ssh_base = (
-        f"-i {key_path} -o StrictHostKeyChecking=accept-new "
+        f"-i {key_path} -o StrictHostKeyChecking={_node_hkc()} "
         f"-o ServerAliveInterval=30 -o ServerAliveCountMax=5 "
         f"-o HostKeyAlgorithms=+ssh-rsa,ssh-ed25519 "
         f"-o PubkeyAcceptedAlgorithms=+ssh-rsa,ssh-ed25519 "
@@ -5327,7 +5372,6 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             if sshfs_src.endswith('.vmdk') and not sshfs_src.endswith('-flat.vmdk'):
                 src_format = "vmdk"
 
-            copy_script = f"/tmp/v2p-copy-{task.proxmox_vmid}-{di}.sh"
             if src_format == "raw":
                 # dd path — preferred for raw flat-vmdk sources, works on any sector size
                 script_body = (
@@ -5349,13 +5393,13 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
                     f"&> '{progress_log}'\n"
                     f"echo \"EXIT_CODE=$?\" >> '{progress_log}'\n"
                 )
-            _pve_node_exec(pve_mgr, task.target_node,
-                f"cat > {copy_script} << 'EOFSCRIPT'\n{script_body}EOFSCRIPT\n"
-                f"chmod +x {copy_script}", timeout=10)
-            
-            _pve_node_exec(pve_mgr, task.target_node,
-                f"nohup {copy_script} > /dev/null 2>&1 &", timeout=10)
-            
+            # the name keeps v2p-copy-<vmid>-<di>, which the pgrep fallbacks below look for
+            copy_script = _write_node_script(pve_mgr, task.target_node, script_body,
+                                             f"copy-{task.proxmox_vmid}-{di}", timeout=10)
+            if copy_script:
+                _pve_node_exec(pve_mgr, task.target_node,
+                    f"nohup bash {copy_script} > /dev/null 2>&1 &", timeout=10)
+
             # Verify process actually started (look for either dd or qemu-img depending on src_format)
             time.sleep(2)
             proc_pattern = "dd if=" if src_format == "raw" else "qemu-img convert"
@@ -5378,10 +5422,13 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
                     f"&> '{progress_log}'\n"
                     f"echo \"EXIT_CODE=$?\" >> '{progress_log}'\n"
                 )
-                _pve_node_exec(pve_mgr, task.target_node,
-                    f"cat > {copy_script} << 'EOFSCRIPT'\n{script_body_min}EOFSCRIPT", timeout=10)
-                _pve_node_exec(pve_mgr, task.target_node,
-                    f"nohup {copy_script} > /dev/null 2>&1 &", timeout=10)
+                if copy_script:
+                    _pve_node_exec(pve_mgr, task.target_node, f"rm -f {copy_script}", timeout=5)
+                copy_script = _write_node_script(pve_mgr, task.target_node, script_body_min,
+                                                 f"copy-{task.proxmox_vmid}-{di}", timeout=10)
+                if copy_script:
+                    _pve_node_exec(pve_mgr, task.target_node,
+                        f"nohup bash {copy_script} > /dev/null 2>&1 &", timeout=10)
                 time.sleep(2)
 
             task.log(f"  Background copy started ({'dd' if src_format == 'raw' else 'qemu-img'}: {src_format} → raw)")
@@ -5496,7 +5543,7 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             
             # Cleanup temp files
             _pve_node_exec(pve_mgr, task.target_node,
-                f"rm -f {progress_log} {copy_script}", timeout=5)
+                f"rm -f {progress_log} {copy_script or ''}", timeout=5)
         
         if import_ok:
             task.log("=== ALL DISKS COPIED - switching to local storage (brief restart) ===")
@@ -5699,7 +5746,6 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             streams = min(8, max(1, total_blocks // 4))
             bps = math.ceil(total_blocks / streams)
             task.log(f"  SSH+compress × {streams}")
-            ss = f"/tmp/v2p-bgssh-{task.id[:8]}-d{di}.sh"
             lines = [
                 "#!/bin/bash",
                 f"{BG_CG_EXEC}",
@@ -5727,12 +5773,14 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             #     with no clue what failed. Capture and surface the tail
             #     of the output on rc!=0 so the next ticket on this has
             #     something actionable.
-            _pve_node_exec(pve_mgr, task.target_node,
-                f"cat > {ss} << 'SEOF'\n" + "\n".join(lines) + f"\nSEOF\nchmod +x {ss}", timeout=10)
+            ss = _write_node_script(pve_mgr, task.target_node, "\n".join(lines),
+                                    f"bgssh-{task.id[:8]}-d{di}", timeout=10)
             start_time = time.time()
-            rc_bg, bg_out, bg_err = _pve_node_exec(pve_mgr, task.target_node,
-                f"bash {ss} 2>&1", timeout=86400)
-            _pve_node_exec(pve_mgr, task.target_node, f"rm -f {ss}", timeout=5)
+            rc_bg, bg_out, bg_err = 1, '', 'the copy script could not be written on the node'
+            if ss:
+                rc_bg, bg_out, bg_err = _pve_node_exec(pve_mgr, task.target_node,
+                    f"bash {ss} 2>&1", timeout=86400)
+                _pve_node_exec(pve_mgr, task.target_node, f"rm -f {ss}", timeout=5)
             elapsed = time.time() - start_time
             if rc_bg == 0:
                 speed = disk_gb * 1024 / max(elapsed, 1)
@@ -6452,12 +6500,14 @@ def _ssh_pipe_transfer(pve_mgr, task, esxi_host, esxi_user, esxi_pass, datastore
     task.log(f"  URL: .../{vm_dir}/{flat_file}?dsName={ds_name}")
     
     # 6. Store credentials on Proxmox node
-    auth_file = f"/tmp/v2p-{task.id}-auth-{disk_index}"
-    cookie_jar = f"/tmp/v2p-{task.id}-cookies-{disk_index}"
+    # NS Oct 2026 (#1029) - both in /run, 0600 from creation: curl writes the jar (an ESXi
+    # session) with the default umask, and a /tmp name could be taken first
+    auth_file = f"/run/pegaprox-v2p-{task.id}-auth-{disk_index}"
+    cookie_jar = f"/run/pegaprox-v2p-{task.id}-cookies-{disk_index}"
     b64auth = base64.b64encode(f"{esxi_user}:{esxi_pass}".encode()).decode()
     _pve_node_exec(pve_mgr, task.target_node,
-        f"echo '{b64auth}' | base64 -d > {auth_file} && chmod 600 {auth_file}", timeout=10)
-    
+        f"umask 077; echo '{b64auth}' | base64 -d > {auth_file} && : > {cookie_jar}", timeout=10)
+
     # 7. Establish cookie session
     task.log(f"  Establishing ESXi session...")
     _pve_node_exec(pve_mgr, task.target_node,
@@ -6595,7 +6645,7 @@ def _ssh_pipe_transfer(pve_mgr, task, esxi_host, esxi_user, esxi_pass, datastore
             dd_log2 = f"/tmp/v2p-{task.id}-sshdd-{disk_index}.log"
 
             ssh_cmd = (
-                f"SSHPASS={safe_p} sshpass -e ssh -o StrictHostKeyChecking=accept-new "  # NS Feb 2026 - env var instead of -p
+                f"SSHPASS={safe_p} sshpass -e ssh -o StrictHostKeyChecking={_node_hkc()} "  # NS Feb 2026 - env var instead of -p
                 f"-o ConnectTimeout=15 "
                 f"-o HostKeyAlgorithms=+ssh-rsa,ssh-ed25519 "
                 f"-o KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group14-sha256 "
@@ -6755,16 +6805,18 @@ def _delta_sync_blocks(pve_mgr, task, esxi_host, esxi_user, esxi_pass,
     # 4. Transfer only changed blocks via SSH dd
     # Write password file on Proxmox node
     b64pass = base64.b64encode(esxi_pass.encode()).decode()
-    pass_file = f"/tmp/v2p-{task.id}-delta-pass"
+    # in /run and 0600 from the first byte, like the auth file of the HTTPS fallback
+    pass_file = f"/run/pegaprox-v2p-{task.id}-delta-pass"
     _pve_node_exec(pve_mgr, task.target_node,
-        f"echo '{b64pass}' | base64 -d > {pass_file} && chmod 600 {pass_file}",
+        f"umask 077; echo '{b64pass}' | base64 -d > {pass_file}",
         timeout=10)
     
     # Build a script that transfers all differing blocks
     xfer_lines = ['#!/bin/bash', 'ERRORS=0']
+    _hk = _node_hkc()
     for i in diff_blocks:
         xfer_lines.append(
-            f"sshpass -f {pass_file} ssh -o StrictHostKeyChecking=accept-new "
+            f"sshpass -f {pass_file} ssh -o StrictHostKeyChecking={_hk} "
             f"-o HostKeyAlgorithms=+ssh-rsa,ssh-ed25519 "
             f"-o KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group14-sha256 "
             f"{esxi_user}@{esxi_host} "
@@ -6777,22 +6829,21 @@ def _delta_sync_blocks(pve_mgr, task, esxi_host, esxi_user, esxi_pass,
     xfer_lines.append('exit $ERRORS')
     
     xfer_script = '\n'.join(xfer_lines) + '\n'
-    script_file = f"/tmp/v2p-{task.id}-delta-{disk_index}.sh"
-    b64script = base64.b64encode(xfer_script.encode()).decode()
-    _pve_node_exec(pve_mgr, task.target_node,
-        f"echo '{b64script}' | base64 -d > {script_file} && chmod +x {script_file}",
-        timeout=10)
-    
+    script_file = _write_node_script(pve_mgr, task.target_node, xfer_script,
+                                     f"delta-{task.id}-{disk_index}", timeout=10)
+
     task.log(f"  Transferring {len(diff_blocks)} changed blocks ({diff_size_mb} MB)...")
-    rc_x, out_x, _ = _pve_node_exec(pve_mgr, task.target_node,
-        f"bash {script_file} 2>&1", timeout=86400)
-    
+    rc_x, out_x = 1, 'the delta script could not be written on the node'
+    if script_file:
+        rc_x, out_x, _ = _pve_node_exec(pve_mgr, task.target_node,
+            f"bash {script_file} 2>&1", timeout=86400)
+
     result = str(out_x or '').strip()
     task.log(f"  Delta result: rc={rc_x}, {result[-200:]}")
-    
+
     # Cleanup
     _pve_node_exec(pve_mgr, task.target_node,
-        f"rm -f {script_file} {pass_file}", timeout=5)
+        f"rm -f {script_file or ''} {pass_file}", timeout=5)
     
     return rc_x == 0 or 'DELTA_DONE errors=0' in result
 
