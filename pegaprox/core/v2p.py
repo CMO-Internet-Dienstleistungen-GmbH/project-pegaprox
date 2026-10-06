@@ -2516,10 +2516,15 @@ def _inject_virtio_drivers(pve_mgr, task):
         "services = navigate(cs, ['Services'])\n"
         "control = navigate(cs, ['Control'])\n"
         "cdb = navigate(control, ['CriticalDeviceDatabase'])\n"
+        # MK Oct 2026 (#823) - BusType is what each driver's own INF writes: viostor 1,
+        # vioscsi 0x0A. vioscsi with 1 stops a guest whose boot disk sits on virtio-scsi
+        # with INACCESSIBLE_BOOT_DEVICE - the same stop that got the scsihw auto-switch
+        # further down turned off, so that is worth a retest. Both INFs also set
+        # DmaRemappingCompatible = 0.
         "_svcs = []\n"
-        "if have_viostor: _svcs.append(('viostor', 0x58, 'system32\\\\drivers\\\\viostor.sys'))\n"
-        "if have_vioscsi: _svcs.append(('vioscsi', 0x59, 'system32\\\\drivers\\\\vioscsi.sys'))\n"
-        "for svc, tag, img in _svcs:\n"
+        "if have_viostor: _svcs.append(('viostor', 0x58, 'system32\\\\drivers\\\\viostor.sys', 0x01))\n"
+        "if have_vioscsi: _svcs.append(('vioscsi', 0x59, 'system32\\\\drivers\\\\vioscsi.sys', 0x0A))\n"
+        "for svc, tag, img, bus_type in _svcs:\n"
         "    svc_node = navigate(services, [svc])\n"
         "    set_expand_sz(svc_node, 'ImagePath', img)\n"
         "    set_dword(svc_node, 'Type', 1)\n"
@@ -2528,18 +2533,29 @@ def _inject_virtio_drivers(pve_mgr, task):
         "    set_dword(svc_node, 'ErrorControl', 1)\n"
         "    set_dword(svc_node, 'Tag', tag)\n"
         "    params = navigate(svc_node, ['Parameters'])\n"
-        "    set_dword(params, 'BusType', 1)\n"
+        "    set_dword(params, 'BusType', bus_type)\n"
+        "    set_dword(params, 'DmaRemappingCompatible', 0)\n"
         "    pnp = navigate(params, ['PnpInterface'])\n"
         "    set_dword(pnp, '5', 1)\n"
         "GUID = '{4D36E97B-E325-11CE-BFC1-08002BE10318}'\n"
+        # The ids the INFs name, transitional (1001/1004) and modern (1042/1048), since
+        # the machine type decides which one the guest sees. 1041 is virtio-net (netkvm)
+        # and was mapped to vioscsi here by mistake.
         "_pci = []\n"
         "if have_viostor:\n"
         "    _pci += [('pci#ven_1af4&dev_1001', 'viostor'),\n"
-        "             ('pci#ven_1af4&dev_1001&subsys_00021af4&rev_00', 'viostor')]\n"
+        "             ('pci#ven_1af4&dev_1001&subsys_00021af4', 'viostor'),\n"
+        "             ('pci#ven_1af4&dev_1001&subsys_00021af4&rev_00', 'viostor'),\n"
+        "             ('pci#ven_1af4&dev_1042', 'viostor'),\n"
+        "             ('pci#ven_1af4&dev_1042&subsys_11001af4', 'viostor'),\n"
+        "             ('pci#ven_1af4&dev_1042&subsys_11001af4&rev_01', 'viostor')]\n"
         "if have_vioscsi:\n"
         "    _pci += [('pci#ven_1af4&dev_1004', 'vioscsi'),\n"
         "             ('pci#ven_1af4&dev_1004&subsys_00081af4', 'vioscsi'),\n"
-        "             ('pci#ven_1af4&dev_1041', 'vioscsi')]\n"
+        "             ('pci#ven_1af4&dev_1004&subsys_00081af4&rev_00', 'vioscsi'),\n"
+        "             ('pci#ven_1af4&dev_1048', 'vioscsi'),\n"
+        "             ('pci#ven_1af4&dev_1048&subsys_11001af4', 'vioscsi'),\n"
+        "             ('pci#ven_1af4&dev_1048&subsys_11001af4&rev_01', 'vioscsi')]\n"
         "for pci_id, svc in _pci:\n"
         "    cd = navigate(cdb, [pci_id])\n"
         "    set_sz(cd, 'ClassGUID', GUID)\n"
