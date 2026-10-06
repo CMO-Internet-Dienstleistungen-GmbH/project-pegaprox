@@ -307,8 +307,9 @@ class V2PMigrationTask:
         self._cutover_cancelled = False
         self.set_phase('awaiting_confirmation')
         self.log("=== HOLD FOR CONFIRMATION: disks are staged and the source VM is STILL "
-                 "RUNNING on VMware. The switchover (suspend source → start target) will "
-                 "happen only when you confirm. Drain traffic / flip DNS now, then commit. ===")
+                 "RUNNING on ESXi. The switchover (stop the source, carry over what changed, "
+                 "start the target) happens only when you confirm. Drain traffic / flip DNS "
+                 "now, then commit. ===")
         try:
             broadcast_sse('vmware_migration', {
                 'id': self.id, 'phase': self.phase, 'status': self.status,
@@ -1199,13 +1200,15 @@ def _run_v2p_migration(task):
             return
         
         if task.transfer_mode in ('vmkfstools_clone', 'auto'):
-            # NS Jun 2026 — VDDK-free near-zero-downtime. We snapshot the running VM (freezes the
+            # NS Jun 2026 - VDDK-free live clone. We snapshot the running VM (freezes the
             # base, writes go to the delta), then vmkfstools-clone the *frozen base* ON the ESXi
             # host. vmkfstools is vmkernel-aware, so it reads the active-chain base extent that a
             # raw dd/HTTP/SSHFS open cannot ("Device or resource busy"). The static clone then
             # rides PegaProx's existing transfer + per-storage import path (CEPH/RBD krbd, LVM,
             # LVM-thin, dir/qcow2) verbatim — so this branch is just the clone front-end + cutover.
-            # v1 = single snapshot + short cutover (no iterative CBT delta yet).
+            # MK Oct 2026 (#1124) - v1 dropped every write made after the snapshot, the hold
+            # included. The switchover now stops the source, folds the snapshot back and copies
+            # the blocks that differ, like the pre-sync flow below. Downtime grows with disk size.
             # NS Jun 2026 — this is now ALSO the implicit path for transfer_mode='auto' (Nico:
             # auto should prefer the clone). For 'auto' we fall back to the legacy pre-sync flow
             # below if the source can't be snapshotted/cloned — raised as _VmkFallback BEFORE any
@@ -1213,15 +1216,65 @@ def _run_v2p_migration(task):
             _vmk_auto = (task.transfer_mode == 'auto')
             class _VmkFallback(Exception):
                 pass
-            task.log(f"=== TRANSFER MODE: {'Auto -> vmkfstools_clone' if _vmk_auto else 'vmkfstools_clone'} (VDDK-free near-zero downtime) ===")
+            class _VmkSwitchoverFailed(Exception):
+                pass
+            task.log(f"=== TRANSFER MODE: {'Auto -> vmkfstools_clone' if _vmk_auto else 'vmkfstools_clone'} (VDDK-free live clone) ===")
             clone_bases = []  # (datastore, vm_dir, basename) to rm on every exit path (#561: per-disk)
+            src_stopped = False        # we powered off a running source at the switchover
+            target_start_sent = False  # from here on a rollback would leave two VMs running
 
             def _vc_cleanup_clones():
                 for _cb_ds, _cb_dir, b in clone_bases:
                     try: _esxi_rm_clone(esxi_host, esxi_user, esxi_pass, _cb_ds, _cb_dir, b)
                     except Exception: pass
 
+            def _vc_drop_clone_snap():
+                try:
+                    snaps = vmware_mgr.get_snapshots(task.vm_id)
+                    if 'error' in snaps:
+                        return {'error': f"snapshot listing failed: {snaps['error']}"}
+                    for s in (snaps.get('data') or []):
+                        if s.get('name') == '_pegaprox_clone_snap':
+                            return vmware_mgr.delete_snapshot(task.vm_id, str(s.get('snapshot') or s.get('id') or ''))
+                except Exception as _de:
+                    return {'error': str(_de)}
+                return None
+
+            def _vc_replay_source(i, ds_i, vmdir_i, desc_file):
+                """(flat on ESXi, descriptor name for a full copy) holding disk i as it is now."""
+                base = f"/vmfs/volumes/{ds_i}/{vmdir_i}"
+                rc_d, out_d, _ = _ssh_esxi_exec(esxi_host, esxi_user, esxi_pass,
+                    f"cat {shlex.quote(base + '/' + desc_file)} 2>/dev/null", timeout=15)
+                text = str(out_d or '') if rc_d == 0 else ''
+                extents = re.findall(r'^\s*(?:RW|RDONLY)\s+\d+\s+\S+\s+"([^"]*)"', text, re.M | re.I)
+                if text.strip() and 'parentFileNameHint' not in text and len(extents) <= 1:
+                    flat = extents[0] if extents and validate_esxi_path_component(extents[0]) \
+                        else desc_file.replace('.vmdk', '-flat.vmdk')
+                    rc_s, out_s, _ = _ssh_esxi_exec(esxi_host, esxi_user, esxi_pass,
+                        f"stat -c '%s' {shlex.quote(base + '/' + flat)} 2>/dev/null", timeout=15)
+                    if rc_s == 0 and str(out_s or '').strip().isdigit():
+                        # the full copy derives "<name>-flat.vmdk" from the name it gets
+                        full = flat[:-len('-flat.vmdk')] + '.vmdk' if flat.endswith('-flat.vmdk') else desc_file
+                        return f"{base}/{flat}", full
+                # a delta of the VM's own snapshots (its flat is not the whole disk), a split disk
+                # or a descriptor we could not read: vmkfstools reads all of them, the source is off
+                cb_r = f"_pegaprox_replay_{task.proxmox_vmid}_{i}"
+                clone_bases.append((ds_i, vmdir_i, cb_r))
+                task.log(f"  Disk {i}: {desc_file} is not a single flat file - cloning it to read the whole disk")
+                cdesc_r, cflat_r = _esxi_vmkfstools_clone(
+                    esxi_host, esxi_user, esxi_pass, ds_i, vmdir_i, desc_file, cb_r, task=task)
+                if not cdesc_r:
+                    raise _VmkSwitchoverFailed(f'Disk {i}: could not clone {desc_file} to read what changed')
+                return cflat_r, f"{cb_r}.vmdk"
+
             try:
+                # a source that is off before the snapshot and still off at the switchover
+                # wrote nothing to carry over. `disks` was read at planning, so it names the
+                # file every disk used before the snapshot; the consolidation check waits for
+                # exactly those again.
+                src_off_at_snap = _vm_power_state(vmware_mgr, task.vm_id) == 'POWERED_OFF'
+                backing_before = _disk_backing_files(disks)
+
                 # --- freeze the base (VM keeps running) ---
                 task.log("Creating clone snapshot (freezes base VMDKs; VM stays up)...")
                 # quiesce=False on purpose — see the snapshot_zero note above (Tools can stall).
@@ -1322,6 +1375,7 @@ def _run_v2p_migration(task):
                 task.disk_progress = {f'disk{_i}': {'copied': 0, 'total': _c or 1, 'pct': 0, 'file': _d}
                                       for _i, (_a, _b, _d, _c) in enumerate(disk_specs)}
 
+                clone_vols = []  # (vol_id, vol_path, size) per disk, what the replay writes to
                 for i, (ds_i, vmdir_i, desc_file, disk_size) in enumerate(disk_specs):
                     dk = f'disk{i}'
                     cb = f"_pegaprox_clone_{task.proxmox_vmid}_{i}"
@@ -1398,8 +1452,95 @@ def _run_v2p_migration(task):
                         return
                     task.log(f"  Disk {i}: cloned → transferred → attached as {disk_bus}{i}")
                     task.update_progress(dk, disk_size, disk_size)
+                    clone_vols.append((vol_id, vol_path, disk_size or csz))
+
+                # checksums of the untouched copies while the source still runs, so the
+                # switchover only has to read the ESXi side. Nothing writes to the target
+                # disks before the replay, the post-copy steps come after it.
+                pristine = {}
+                if src_off_at_snap:
+                    task.log("Source VM was powered off at the snapshot - no checksums ahead of the switchover")
+                else:
+                    task.log("Checksumming the copied disks for the switchover (source VM still running)...")
+                    for i, (_vid, vol_path, size) in enumerate(clone_vols):
+                        sums = _pve_block_checksums(pve_mgr, task.target_node, vol_path, size)
+                        if sums:
+                            pristine[i] = sums
+                            task.log(f"  Disk {i}: {len(sums)} block checksums")
+                        else:
+                            task.log(f"  Disk {i}: checksums failed, the switchover computes them instead")
+
+                # #562 - optional operator-scheduled cutover. The copy finished and the source
+                # VM is still running on ESXi, so this is the clean seam to hold.
+                task.await_cutover_confirmation()
+
+                # --- switchover: stop the source, fold the snapshot back, copy what changed ---
+                task.set_phase('delta_sync')
+                cut_t0 = time.time()
+                src_state = _vm_power_state(vmware_mgr, task.vm_id)
+                if src_state != 'POWERED_OFF':
+                    task.log(f"=== SWITCHOVER: stopping the source VM on ESXi ({src_state or 'state unknown'}), downtime starts ===")
+                    vmware_mgr.vm_power_action(task.vm_id, 'stop')
+                    src_stopped = src_state != 'SUSPENDED'
+                    if not _wait_power_state(vmware_mgr, task.vm_id, 'POWERED_OFF', 120):
+                        raise _VmkSwitchoverFailed('The source VM did not power off within 120s')
+                    task.log("  Source VM is powered off")
+                else:
+                    task.log("=== SWITCHOVER: the source VM is already powered off ===")
+
+                if src_off_at_snap and src_state == 'POWERED_OFF':
+                    task.log("  Source VM was powered off before the snapshot and still is - "
+                             "nothing changed since, no blocks to carry over")
+                else:
+                    task.log("Removing the clone snapshot, ESXi folds what changed since then back into the source disks...")
+                    for _try in range(2):
+                        _res = _vc_drop_clone_snap()
+                        _err = str(_res.get('error') or '') if isinstance(_res, dict) else ''
+                        if _err:
+                            task.log(f"  Snapshot removal reported: {_err}")
+                        if not _err or 'timed out' in _err.lower():
+                            break
+                        if _try == 0:
+                            time.sleep(10)
+                    # a timed-out remove keeps consolidating on ESXi, any other error gets a short look
+                    _limit = 120 if _err and 'timed out' not in _err.lower() else \
+                        _consolidation_timeout(sum(s[3] for s in disk_specs))
+                    if not _wait_clone_snap_consolidated(vmware_mgr, task.vm_id, backing_before, _limit):
+                        raise _VmkSwitchoverFailed(
+                            f'The clone snapshot was not consolidated within {_limit}s (still listed, or a '
+                            f'disk is not back on its own file), nothing was read from the source')
+                    task.log("  Snapshot consolidated, every disk is back on its own file")
+
+                    task.log("=== Carrying over what changed on the source since the snapshot ===")
+                    for i, (ds_i, vmdir_i, desc_file, _cap) in enumerate(disk_specs):
+                        dk = f'disk{i}'
+                        vol_id, vol_path, size = clone_vols[i]
+                        src_flat, full_desc = _vc_replay_source(i, ds_i, vmdir_i, desc_file)
+                        task.log(f"Disk {i}: comparing [{ds_i}] {vmdir_i}/{os.path.basename(src_flat)} with {vol_id}")
+                        if not _delta_sync_blocks(pve_mgr, task, esxi_host, esxi_user, esxi_pass,
+                                                  src_flat, vol_path, size, i, pve_checksums=pristine.get(i)):
+                            task.log(f"  Disk {i}: block replay failed, copying the whole disk again")
+                            _pve_node_exec(pve_mgr, task.target_node,
+                                f"qm set {task.proxmox_vmid} --delete {disk_bus}{i} 2>/dev/null", timeout=15)
+                            _pve_node_exec(pve_mgr, task.target_node,
+                                f"pvesm free {shlex.quote(vol_id)} 2>/dev/null", timeout=30)
+                            vol_id, vol_path = _ssh_pipe_transfer(
+                                pve_mgr, task, esxi_host, esxi_user, esxi_pass,
+                                ds_i, vmdir_i, full_desc, i)
+                            if not vol_id:
+                                raise _VmkSwitchoverFailed(f'Disk {i}: the block replay and the full copy both failed')
+                            rc_a, out_a, _ = _pve_node_exec(pve_mgr, task.target_node,
+                                f"qm set {task.proxmox_vmid} --{disk_bus}{i} {vol_id}{task._disk_attach_opts()} 2>&1", timeout=30)
+                            if rc_a != 0:
+                                raise _VmkSwitchoverFailed(
+                                    f'qm set --{disk_bus}{i} {vol_id} -> {str(out_a or "").strip()[-300:]}')
+                            clone_vols[i] = (vol_id, vol_path, size)
+                            task.log(f"  Disk {i}: copied again as {vol_id}")
+                        task.update_progress(dk, task.disk_progress[dk]['total'], task.disk_progress[dk]['total'])
 
                 # --- post-copy fix chain (mirror offline/snapshot_zero) ---
+                # MK Oct 2026 (#1124) - after the replay: the UEFI loader, the VirtIO drivers and
+                # the qcow2 move write to the target disks, a replay after them would undo that
                 _pve_node_exec(pve_mgr, task.target_node,
                     f"qm set {task.proxmox_vmid} --boot order={disk_bus}0 2>&1", timeout=15)
                 if bios == 'ovmf':
@@ -1417,40 +1558,22 @@ def _run_v2p_migration(task):
                 try: _maybe_convert_disks_to_qcow2(pve_mgr, task)
                 except Exception as _qe: task.log(f"  qcow2 convert skipped: {_qe}")
 
-                # #562 — optional operator-scheduled cutover. The clone finished and the
-                # source VM is still running on ESXi, so this is the clean seam to hold.
-                task.await_cutover_confirmation()
-                # --- cutover (short downtime: stop source, start target) ---
-                # v1 has no delta replay; the delta_sync→cutover transitions just bracket the
-                # cutover so the downtime metric (downtime_start/end) is recorded.
-                task.set_phase('delta_sync')
                 task.set_phase('cutover')
-                cut_t0 = time.time()
-                task.log("=== CUTOVER: suspending source, starting target ===")
-                pwr = vmware_mgr.vm_power_action(task.vm_id, 'suspend')
-                if 'error' in pwr:
-                    task.log(f"  Suspend failed ({pwr.get('error')}), powering off instead")
-                    vmware_mgr.vm_power_action(task.vm_id, 'stop')
-                else:
-                    task._source_suspended = True
-                time.sleep(3)
                 if task.start_after:
+                    target_start_sent = True
+                    task.log("Starting the target VM on Proxmox...")
                     pve_mgr._api_post(
                         f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                         f"/qemu/{task.proxmox_vmid}/status/start")
                 actual_downtime = time.time() - cut_t0
                 task.total_downtime_seconds = actual_downtime
-                task.log(f"=== CUTOVER DONE (downtime ~{actual_downtime:.1f}s) ===")
+                task.log(f"=== SWITCHOVER DONE (downtime {actual_downtime:.1f}s) ===")
 
                 # --- cleanup (clone artifacts + snapshot + source) ---
+                # the source is off by now: stopped above, or it was never running
                 task.set_phase('verify')
                 time.sleep(3)
                 task.set_phase('cleanup')
-                try:
-                    vmware_mgr.vm_power_action(task.vm_id, 'stop')
-                    time.sleep(2)
-                except Exception:
-                    pass
                 _vc_cleanup_clones()
                 try:
                     sl = vmware_mgr.get_snapshots(task.vm_id).get('data', []) or []
@@ -1471,13 +1594,34 @@ def _run_v2p_migration(task):
                 task.log(f"COMPLETED (vmkfstools_clone, downtime ~{actual_downtime:.1f}s): "
                          f"{task.vm_name} -> VMID {task.proxmox_vmid}")
                 return
+            except V2PCutoverCancelled:
+                # the hold comes before the source is touched. The outer handler marks the run
+                # cancelled and drops the clone snapshot, the clones go here
+                _vc_cleanup_clones()
+                raise
             except _VmkFallback:
                 # auto-mode: clone path bailed before any irreversible work — drop through to
                 # the legacy auto pre-sync/live-mirror flow below (do NOT return).
                 pass
             except Exception as _vce:
-                task.set_phase('failed', f'vmkfstools_clone exception: {_vce}')
+                msg = str(_vce) if isinstance(_vce, _VmkSwitchoverFailed) else f'vmkfstools_clone exception: {_vce}'
+                # MK Oct 2026 (#1124) - we stopped the source and the target never got a start:
+                # bring the source back, the target stays off. Once the start went out, two
+                # running copies would be worse than two stopped ones.
+                if src_stopped and not target_start_sent:
+                    try:
+                        vmware_mgr.vm_power_action(task.vm_id, 'start')
+                    except Exception as _pe:
+                        task.log(f"  Powering the source back on failed: {_pe}")
+                    if _wait_power_state(vmware_mgr, task.vm_id, 'POWERED_ON', 120):
+                        msg += ' - the source VM was powered back on, the target VM stays stopped'
+                    else:
+                        msg += ' - the source VM did not come back up, start it on ESXi; the target VM stays stopped'
+                task.set_phase('failed', msg)
                 _vc_cleanup_clones()
+                _res = _vc_drop_clone_snap()
+                if isinstance(_res, dict) and _res.get('error'):
+                    task.log(f"  Clone snapshot not removed ({_res['error']}), check _pegaprox_clone_snap on ESXi")
                 try: vmware_mgr.delete_migration_snapshot(task.vm_id)
                 except: pass
                 _cleanup_sshfs(pve_mgr, task.target_node, mnt_path)
@@ -1811,18 +1955,12 @@ def _run_v2p_migration(task):
             # Normal path: VM still running, do checksums + delta sync
             task.log("Pre-computing Proxmox checksums (VM still running)...")
             presync_checksums = {}
-            DELTA_BS = 256 * 1024 * 1024  # Must match _delta_sync_blocks
             for i, (vol_id, vol_path, esxi_flat, flat_size) in enumerate(presync_volumes):
-                num_blocks = (flat_size + DELTA_BS - 1) // DELTA_BS
+                num_blocks = (flat_size + DELTA_BLOCK_SIZE - 1) // DELTA_BLOCK_SIZE
                 task.log(f"  Checksumming disk {i}: {num_blocks} blocks...")
-                pve_script = (
-                    f"i=0; while [ $i -lt {num_blocks} ]; do "
-                    f"dd if={shlex.quote(vol_path)} bs={DELTA_BS} skip=$i count=1 2>/dev/null | md5sum | cut -d' ' -f1; "
-                    f"i=$((i+1)); done"
-                )
-                rc_p, out_p, _ = _pve_node_exec(pve_mgr, task.target_node, pve_script, timeout=600)
-                if rc_p == 0 and out_p:
-                    presync_checksums[i] = [s.strip() for s in out_p.strip().split('\n') if s.strip()]
+                sums = _pve_block_checksums(pve_mgr, task.target_node, vol_path, flat_size)
+                if sums:
+                    presync_checksums[i] = sums
                     task.log(f"  Disk {i}: {len(presync_checksums[i])} checksums computed")
                 else:
                     task.log(f"  Disk {i}: checksum failed, will do full comparison during downtime")
@@ -2853,6 +2991,61 @@ def _esxi_rm_clone(esxi_host, esxi_user, esxi_pass, datastore, vm_dir, clone_bas
     _ssh_esxi_exec(esxi_host, esxi_user, esxi_pass,
         f"vmkfstools -U {shlex.quote(dst)} 2>/dev/null; rm -f {shlex.quote(dst)} {extras}",
         timeout=30)
+
+
+def _vm_power_state(vmware_mgr, vm_id):
+    """'POWERED_ON', 'POWERED_OFF', 'SUSPENDED', or '' when ESXi did not say."""
+    try:
+        return str((vmware_mgr.get_vm(vm_id).get('data') or {}).get('power_state') or '')
+    except Exception:
+        return ''
+
+
+def _wait_power_state(vmware_mgr, vm_id, want, timeout, poll=2):
+    deadline = time.monotonic() + timeout
+    while _vm_power_state(vmware_mgr, vm_id) != want:
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll)
+    return True
+
+
+def _disk_backing_files(disks):
+    """{disk key: '[ds] dir/file.vmdk'} from get_vm_disks_for_export's disk list."""
+    return {(d.get('key') or f'#{i}'): (d.get('vmdk_file') or '').strip()
+            for i, d in enumerate(disks or [])}
+
+
+def _clone_snap_consolidated(vmware_mgr, vm_id, backing_before):
+    """True once _pegaprox_clone_snap is gone and every disk runs on the file it used before
+    the snapshot again. A listing that fails reads as not yet."""
+    try:
+        snaps = vmware_mgr.get_snapshots(vm_id)
+        if 'error' in snaps or any(s.get('name') == '_pegaprox_clone_snap'
+                                   for s in (snaps.get('data') or [])):
+            return False
+        now = vmware_mgr.get_vm_disks_for_export(vm_id)
+        if 'error' in now:
+            return False
+        files = _disk_backing_files((now.get('data') or {}).get('disks'))
+    except Exception:
+        return False
+    return bool(backing_before) and all(files.get(k) == f for k, f in backing_before.items())
+
+
+def _consolidation_timeout(total_bytes):
+    # the remove call gives up after 120s while ESXi keeps folding the delta back, and a
+    # delta can grow to the size of the disk. 10s per GiB, 10 min to 1 h.
+    return min(3600, max(600, int(total_bytes or 0) // (1024 ** 3) * 10))
+
+
+def _wait_clone_snap_consolidated(vmware_mgr, vm_id, backing_before, timeout, poll=10):
+    deadline = time.monotonic() + timeout
+    while not _clone_snap_consolidated(vmware_mgr, vm_id, backing_before):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll)
+    return True
 
 
 def _list_delta_files_on_esxi(esxi_host, esxi_user, esxi_pass, datastore, vm_dir, descriptor_files):
@@ -6764,6 +6957,36 @@ def _ssh_pipe_transfer(pve_mgr, task, esxi_host, esxi_user, esxi_pass, datastore
     return vol_id, vol_path
 
 
+# the replay compares block by block, so the ESXi side, the node side and checksums taken
+# ahead of the switchover all have to use the same block size and loop
+DELTA_BLOCK_SIZE = 256 * 1024 * 1024
+
+
+def _block_md5_script(path, num_blocks):
+    """Shell loop printing the md5 of every DELTA_BLOCK_SIZE block of `path`, one per line.
+    Plain dd + md5sum, so the same loop runs on the ESXi BusyBox and on the node."""
+    return (
+        f"i=0; while [ $i -lt {num_blocks} ]; do "
+        f"dd if={shlex.quote(path)} bs={DELTA_BLOCK_SIZE} skip=$i count=1 2>/dev/null | md5sum | cut -d' ' -f1; "
+        f"i=$((i+1)); done"
+    )
+
+
+def _checksum_timeout(size_bytes):
+    # a fixed 600s ran out above ~100 GB and every replay fell back to a full copy.
+    # Assume 50 MiB/s, never less than the old 600s
+    return min(86400, max(600, int(size_bytes or 0) // (50 * 1024 * 1024)))
+
+
+def _pve_block_checksums(pve_mgr, node, vol_path, size_bytes):
+    """Block md5s of a target volume in the form _delta_sync_blocks takes, or None."""
+    num_blocks = (size_bytes + DELTA_BLOCK_SIZE - 1) // DELTA_BLOCK_SIZE
+    rc, out, _ = _pve_node_exec(pve_mgr, node, _block_md5_script(vol_path, num_blocks),
+                                timeout=_checksum_timeout(size_bytes))
+    if rc != 0 or not out:
+        return None
+    return [s.strip() for s in str(out).strip().split('\n') if s.strip()]
+
 
 def _delta_sync_blocks(pve_mgr, task, esxi_host, esxi_user, esxi_pass,
                         esxi_flat_path, vol_path, flat_size, disk_index,
@@ -6778,7 +7001,7 @@ def _delta_sync_blocks(pve_mgr, task, esxi_host, esxi_user, esxi_pass,
     """
     import base64
     
-    BLOCK_SIZE = 256 * 1024 * 1024  # 256 MB blocks (fewer checksums = faster downtime)
+    BLOCK_SIZE = DELTA_BLOCK_SIZE  # 256 MB blocks (fewer checksums = faster downtime)
     num_blocks = (flat_size + BLOCK_SIZE - 1) // BLOCK_SIZE
     bs_mb = BLOCK_SIZE // (1024 * 1024)
     
@@ -6786,13 +7009,8 @@ def _delta_sync_blocks(pve_mgr, task, esxi_host, esxi_user, esxi_pass,
     
     # 1. Generate checksums on ESXi (one SSH call, BusyBox-compatible)
     task.log(f"  Computing checksums on ESXi ({num_blocks} blocks)...")
-    checksum_script = (
-        f"i=0; while [ $i -lt {num_blocks} ]; do "
-        f"dd if={shlex.quote(esxi_flat_path)} bs={BLOCK_SIZE} skip=$i count=1 2>/dev/null | md5sum | cut -d' ' -f1; "
-        f"i=$((i+1)); done"
-    )
     rc_e, out_e, _ = _ssh_exec(esxi_host, esxi_user, esxi_pass,
-        checksum_script, timeout=600)
+        _block_md5_script(esxi_flat_path, num_blocks), timeout=_checksum_timeout(flat_size))
     
     if rc_e != 0 or not out_e:
         task.log(f"  ESXi checksum failed: rc={rc_e}")
@@ -6813,12 +7031,8 @@ def _delta_sync_blocks(pve_mgr, task, esxi_host, esxi_user, esxi_pass,
         task.log(f"  Proxmox: using {len(pve_sums)} pre-computed checksums (no downtime cost)")
     else:
         task.log(f"  Computing checksums on Proxmox...")
-        pve_script = (
-            f"i=0; while [ $i -lt {num_blocks} ]; do "
-            f"dd if={shlex.quote(vol_path)} bs={BLOCK_SIZE} skip=$i count=1 2>/dev/null | md5sum | cut -d' ' -f1; "
-            f"i=$((i+1)); done"
-        )
-        rc_p, out_p, _ = _pve_node_exec(pve_mgr, task.target_node, pve_script, timeout=600)
+        rc_p, out_p, _ = _pve_node_exec(pve_mgr, task.target_node,
+            _block_md5_script(vol_path, num_blocks), timeout=_checksum_timeout(flat_size))
         
         if rc_p != 0 or not out_p:
             task.log(f"  Proxmox checksum failed: rc={rc_p}")
