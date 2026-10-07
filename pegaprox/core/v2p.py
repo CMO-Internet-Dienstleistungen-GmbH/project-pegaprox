@@ -382,7 +382,7 @@ def _node_hkc():
 _NODE_SCRIPT_RE = re.compile(r'/tmp/v2p-[a-z0-9-]+-[A-Za-z0-9]{10}')
 
 
-def _write_node_script(pve_mgr, node, body, tag, timeout=15):
+def _write_node_script(pve_mgr, node, body, tag, timeout=15, node_exec=None):
     """Write `body` to a new root-only file on the node and return its path, or None.
 
     NS Oct 2026 (#1123) - the helper scripts went to fixed names in /tmp (the VMID, or the
@@ -396,7 +396,8 @@ def _write_node_script(pve_mgr, node, body, tag, timeout=15):
     tag = re.sub(r'[^a-z0-9-]', '', str(tag).lower()) or 'script'
     if not body.endswith('\n'):
         body += '\n'
-    rc, out, _ = _pve_node_exec(pve_mgr, node,
+    # Fork patch #15 - node_exec: the Hyper-V direction reaches the node with its own login
+    rc, out, _ = (node_exec or _pve_node_exec)(pve_mgr, node,
         f"umask 077; f=$(mktemp /tmp/v2p-{tag}-XXXXXXXXXX) && "
         f"cat > \"$f\" << 'V2P_NODE_SCRIPT' && echo \"$f\"\n{body}V2P_NODE_SCRIPT\n",
         timeout=timeout)
@@ -2740,10 +2741,10 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
         # NS Apr 2026 — using python3-hivex (well-supported on Debian/Proxmox) instead of
         # hivexregedit which Debian's libhivex-bin doesn't ship.
         "SYSTEM_HIVE=\"$WIN_MNT/$WDIR/System32/config/SYSTEM\"\n"
-        "python3 - \"$SYSTEM_HIVE\" \"$SUBDIR\" << 'PYEOF' || { echo 'HIVEX_MERGE_FAILED'; exit 9; }\n"
+        "export SUBDIR\n"
+        "python3 - \"$SYSTEM_HIVE\" << 'PYEOF' || { echo 'HIVEX_MERGE_FAILED'; exit 9; }\n"
         "import sys, hivex\n"
-        "from hivex.hive_types import (REG_BINARY, REG_DWORD, REG_EXPAND_SZ,\n"
-        "                              REG_MULTI_SZ, REG_SZ)\n"
+        "from hivex.hive_types import REG_DWORD, REG_SZ, REG_EXPAND_SZ\n"
         "h = hivex.Hivex(sys.argv[1], write=True)\n"
         "def navigate(parent, parts):\n"
         "    n = parent\n"
@@ -2762,68 +2763,14 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
         "def set_expand_sz(node, key, val):\n"
         "    h.node_set_value(node, {'key': key, 't': REG_EXPAND_SZ,\n"
         "        'value': (val + '\\u0000').encode('utf-16-le')})\n"
-        "def set_binary(node, key, val):\n"
-        "    h.node_set_value(node, {'key': key, 't': REG_BINARY, 'value': val})\n"
-        "def set_multi_sz(node, key, values):\n"
-        "    blob = ''.join(v + '\\u0000' for v in values) + '\\u0000'\n"
-        "    h.node_set_value(node, {'key': key, 't': REG_MULTI_SZ,\n"
-        "        'value': blob.encode('utf-16-le')})\n"
         # NS May 2026 — only register drivers whose .sys actually got copied.
         # Setting Start=0 for a missing miniport bricks Windows boot
         # (BSOD INACCESSIBLE_BOOT_DEVICE before usermode), so we skip any
         # service whose backing file isn't present on the target FS.
-        "import os, struct\n"
+        "import os\n"
         "drv_root = os.path.dirname(sys.argv[1]) + '/../drivers'\n"
-        # A driver the loader will refuse must not be made boot-critical. winload checks a
-        # boot-start driver's signature before the kernel exists, stops with 0xc0000428 and
-        # the guest never starts -- strictly worse than leaving it on the controller it
-        # arrived on, which boots. Measured on Windows Server 2012 R2 against virtio-win
-        # 0.1.271: the boot manager names \Windows\system32\drivers\viostor.sys, and that
-        # file's certificate table holds only 'virtio-win / Red Hat Inc.'. Red Hat stopped
-        # getting the legacy variants signed through Microsoft once those Windows versions
-        # went out of support; 0.1.208 was the last release whose 2k12R2 drivers carried a
-        # cross-certificate at all, and 0.1.189 is the release to use for that version --
-        # its 2k12R2 drivers chain to Microsoft Code Verification Root and a guest built
-        # from them reaches its login screen on virtio-scsi. The 2k16 and newer variants
-        # are unaffected.
-        #
-        # Read from the file rather than guessed from the Windows version: an operator who
-        # supplies an older ISO for an old guest has a driver that does load, and a rule
-        # based on the build number would refuse it.
-        "_ACCEPTED_SIGNERS = (b'Microsoft Code Verification Root',\n"
-        "                     b'Microsoft Windows Third Party Component CA',\n"
-        "                     b'Microsoft Windows Hardware Compatibility Publisher')\n"
-        "def boot_signable(path):\n"
-        "    \"\"\"Whether the PE certificate table names a signer the loader accepts.\"\"\"\n"
-        "    try:\n"
-        "        with open(path, 'rb') as fh:\n"
-        "            data = fh.read()\n"
-        "        if data[:2] != b'MZ':\n"
-        "            return False\n"
-        "        pe = struct.unpack_from('<I', data, 0x3C)[0]\n"
-        "        if data[pe:pe + 2] != b'PE':\n"
-        "            return False\n"
-        "        optional = pe + 24\n"
-        "        magic = struct.unpack_from('<H', data, optional)[0]\n"
-        # The certificate table is data directory 4, and the directories start at a
-        # different offset for PE32+ than for PE32.
-        "        directories = optional + (112 if magic == 0x20B else 96)\n"
-        "        offset, size = struct.unpack_from('<II', data, directories + 32)\n"
-        "        if not offset or not size:\n"
-        "            return False\n"
-        "        blob = data[offset:offset + size]\n"
-        "    except Exception:\n"
-        "        return False\n"
-        "    return any(signer in blob for signer in _ACCEPTED_SIGNERS)\n"
-        "_present = {n: os.path.exists(drv_root + '/' + n + '.sys')\n"
-        "            for n in ('viostor', 'vioscsi')}\n"
-        "_signable = {n: (present and boot_signable(drv_root + '/' + n + '.sys'))\n"
-        "             for n, present in _present.items()}\n"
-        "for _name in ('viostor', 'vioscsi'):\n"
-        "    if _present[_name] and not _signable[_name]:\n"
-        "        print('BOOT_SIGNATURE_MISSING ' + _name)\n"
-        "have_viostor = _signable['viostor']\n"
-        "have_vioscsi = _signable['vioscsi']\n"
+        "have_viostor = os.path.exists(drv_root + '/viostor.sys')\n"
+        "have_vioscsi = os.path.exists(drv_root + '/vioscsi.sys')\n"
         "print(f'HIVEX have_viostor={have_viostor} have_vioscsi={have_vioscsi}')\n"
         "root = h.root()\n"
         "def control_sets():\n"
@@ -2930,7 +2877,16 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
         # virtio catalogue of its own, and an entry under the driver's real INF name would
         # replace whatever that belongs to with something assembled here. libguestfs does
         # the same for the same reason.
-        "    arch = 'x86' if sys.argv[2].lower().endswith('x86') else 'amd64'\n"
+        "    import os as _os\n"
+        # Only a guest that has the database needs these two value types.
+        "    from hivex.hive_types import REG_BINARY, REG_MULTI_SZ\n"
+        "    def set_binary(node, key, val):\n"
+        "        h.node_set_value(node, {'key': key, 't': REG_BINARY, 'value': val})\n"
+        "    def set_multi_sz(node, key, values):\n"
+        "        blob = ''.join(v + '\\u0000' for v in values) + '\\u0000'\n"
+        "        h.node_set_value(node, {'key': key, 't': REG_MULTI_SZ,\n"
+        "            'value': blob.encode('utf-16-le')})\n"
+        "    arch = 'x86' if _os.environ.get('SUBDIR', '').lower().endswith('x86') else 'amd64'\n"
         "    for svc, pci_ids in _devices.items():\n"
         "        inf = 'pegaprox_' + svc + '.inf'\n"
         "        label = inf + '_' + arch + '_0000000000000000'\n"
@@ -3036,7 +2992,8 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
         "echo 'INJECTION_OK'\n"
     )
 
-    sf = _write_node_script(pve_mgr, node, script, f"virtio-inject-{task.proxmox_vmid}")
+    sf = _write_node_script(pve_mgr, node, script, f"virtio-inject-{task.proxmox_vmid}",
+                           node_exec=run_on_node)
     if not sf:
         task.log("[VirtIO] ✗ the injection script could not be written on the node")
         return False
