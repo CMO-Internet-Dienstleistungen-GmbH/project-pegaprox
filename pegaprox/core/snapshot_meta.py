@@ -82,7 +82,7 @@ def _ensure_schema() -> None:
         return
     cursor = _connection().cursor()
     cursor.execute(f'''
-        CREATE TABLE IF NOT EXISTS {_TABLE} (
+        CREATE TABLE IF NOT EXISTS snapshot_authors (
             cluster_id   TEXT    NOT NULL,
             vm_type      TEXT    NOT NULL,
             vmid         INTEGER NOT NULL,

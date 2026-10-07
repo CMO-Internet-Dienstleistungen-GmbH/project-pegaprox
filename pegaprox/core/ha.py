@@ -366,6 +366,8 @@ SYNC_TABLES = (
     # which tenant and role of this instance a federation member's tenants and roles map
     # onto: the group is one member, and a promoted standby keeps the admin's mapping
     'federation_identity_map',
+    # who asked for each snapshot: it is the active instance's record, and a standby that takes over keeps it
+    'snapshot_authors',
 )
 LOCAL_TABLES = (
     'sessions', 'audit_log', 'task_users', 'migration_history', 'metrics_history',
