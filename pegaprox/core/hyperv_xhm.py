@@ -2261,7 +2261,9 @@ def retry_driver_injection(migration_id, by, *, iso=None, background=True):
         _retries_running.add(migration_id)
     work = (prepared['run'], prepared['target'], prepared['vmid'], by)
     if background:
-        threading.Thread(target=_run_injection_retry, args=work, daemon=True).start()
+        from pegaprox.core import ha
+        threading.Thread(target=ha.as_job(_run_injection_retry, 'VirtIO injection retry'),
+                         args=work, daemon=True).start()
     else:
         _run_injection_retry(*work)
     return {'success': True, 'vmid': prepared['vmid'],
