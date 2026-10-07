@@ -33,7 +33,7 @@ from pegaprox.core.hyperv import format_mac
 from pegaprox.core.hyperv_errors import HyperVError
 from pegaprox.core.hyperv_transfer import TransferError
 from pegaprox.globals import cluster_managers
-from pegaprox.utils.ssh import read_capped
+from pegaprox.utils.ssh import read_capped, ssh_password_for
 
 logger = logging.getLogger(__name__)
 
@@ -1034,7 +1034,7 @@ def _free_leftover_volumes(migration, target, volumes):
     try:
         ssh = _connect_ssh(node_ip,
                            getattr(target.config, 'ssh_user', '') or 'root',
-                           getattr(target.config, 'pass_', ''),
+                           ssh_password_for(target.config),
                            key_path=getattr(target.config, 'ssh_key', ''),
                            port=int(getattr(target.config, 'ssh_port', 22) or 22))
         node = _Node(ssh, getattr(target.config, 'ssh_user', '') or 'root')
@@ -1508,7 +1508,7 @@ def open_target_node_session(target, node_name, ssh_user=None):
         raise TransferError(f'Cannot resolve an address for Proxmox node {node_name}.')
     ssh = _connect_ssh(node_ip,
                        ssh_user or getattr(target.config, 'ssh_user', '') or 'root',
-                       getattr(target.config, 'pass_', ''),
+                       ssh_password_for(target.config),
                        key_path=getattr(target.config, 'ssh_key', ''),
                        port=int(getattr(target.config, 'ssh_port', 22) or 22))
     return _Node(ssh, ssh_user or getattr(target.config, 'ssh_user', '') or 'root')
@@ -1618,7 +1618,7 @@ def _open_target_node(task, source, target):
     try:
         ssh = _connect_ssh(node_ip,
                            getattr(target.config, 'ssh_user', '') or 'root',
-                           getattr(target.config, 'pass_', ''),
+                           ssh_password_for(target.config),
                            key_path=getattr(target.config, 'ssh_key', ''),
                            port=int(getattr(target.config, 'ssh_port', 22) or 22))
     except Exception as exc:
@@ -2478,7 +2478,7 @@ def _node_session(task, target, min_timeout=0):
         if node_ip:
             ssh = _connect_ssh(node_ip,
                                getattr(target.config, 'ssh_user', '') or 'root',
-                               getattr(target.config, 'pass_', ''),
+                               ssh_password_for(target.config),
                                key_path=getattr(target.config, 'ssh_key', ''),
                                port=int(getattr(target.config, 'ssh_port', 22) or 22))
     except Exception as exc:                                   # noqa: BLE001

@@ -864,6 +864,8 @@
         }
 
         function ConfigModal({ vm, clusterId, allClusters = [], dashboardAuthFetch, onClose, addToast, isCorporate = false, initialTab = 'general' }) {
+            const { t } = useTranslation();
+            const { getAuthHeaders, haReadOnly, haStandby } = useAuth();
             // Fork patch #15 — a Hyper-V guest is a migration source, not a machine this
             // product manages. Its hardware is shown so the operator can see what a
             // migration has to reproduce; changing it would address a Proxmox API the host
@@ -871,8 +873,6 @@
             // by field, so a field added later cannot quietly become editable here.
             const isReadOnlySource = typeof hvType === 'function'
                 && hvType((allClusters || []).find(c => c.id === clusterId)) === 'hyperv';
-            const { t } = useTranslation();
-            const { getAuthHeaders, haReadOnly, haStandby } = useAuth();
             // LW Nov 2026 - the guest view reads its config again once this dialog is gone
             const closedRef = useRef(null);
             closedRef.current = { cluster_id: clusterId, vmid: vm.vmid, vm_type: vm.type };
@@ -3061,9 +3061,10 @@
                                     {hasChanges && !crVc && (
                                         <span className="corp-unsaved-pill">{t('unsavedChanges') || 'Unsaved Changes'}</span>
                                     )}
-                                    {hasChanges && !haReadOnly && !isReadOnlySource && (crVc ? null :
+                                    {hasChanges && !haReadOnly && (crVc ? null :
                                         <button
                                             onClick={handleSave}
+                                            hidden={isReadOnlySource}
                                             disabled={saving}
                                             className="corp-vm-btn corp-vm-btn-primary"
                                             title={t('save') || 'Apply changes'}
@@ -6561,7 +6562,7 @@
                                 </button>
                                 {!haReadOnly && <button
                                     onClick={handleSave}
-                                    disabled={!hasChanges || saving || isReadOnlySource}
+                                    disabled={!hasChanges || saving}
                                     hidden={isReadOnlySource}
                                     className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange rounded-lg text-white font-medium hover:bg-orange-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                                 >
