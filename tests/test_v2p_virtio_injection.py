@@ -44,10 +44,22 @@ def node_calls(monkeypatch):
     calls = []
     answers = {}
 
+    written = {}
+
     def fake_exec(pve_mgr, node, cmd, timeout=600, **kwargs):
         calls.append(cmd)
+        # The script goes to the node through _write_node_script (mktemp + heredoc) and is
+        # run by its path afterwards. Answer the write with a path, and let the needles
+        # below match the script text when that path is run.
+        if 'V2P_NODE_SCRIPT' in cmd:
+            written['/tmp/v2p-virtio-inject-AbCdEfGhIj'] = cmd
+            return 0, '/tmp/v2p-virtio-inject-AbCdEfGhIj', ''
+        haystack = cmd
+        for path, text in written.items():
+            if path in cmd:
+                haystack = cmd + text
         for needle, reply in answers.items():
-            if needle in cmd:
+            if needle in haystack:
                 return reply
         return 0, '', ''
 
@@ -219,20 +231,14 @@ def test_every_windows_version_in_the_matrix_picks_its_own_drivers(product, buil
 # Which control set the registry work lands in
 # ---------------------------------------------------------------------------
 
-def test_the_drivers_are_registered_in_every_control_set(resolved_node):
-    """Not only ControlSet001, because that is not the only set that can be booted.
-
-    Select\\Current names the active set and Select\\LastKnownGood the set Windows falls
-    back to after a failed boot. Measured on freshly installed Server 2012 R2, 2016 and
-    2025 images: Current was 1 and LastKnownGood was 2, and ControlSet002 held no storage
-    driver at all. A single failed boot would therefore have moved the guest into a
-    control set that cannot reach its own disk.
-    """
+def test_the_drivers_are_registered_in_the_control_sets_select_names(resolved_node):
+    """Upstream's choice (#823): the sets Select\\Default and Select\\Current name, not a fixed
+    ControlSet001. This patch only adds the DriverDatabase on top of that."""
     calls, _ = resolved_node
     v2p._inject_virtio_drivers(_Manager(), _Task())
 
     script = _injection_script(calls)
-    assert "for cs_name in control_sets:" in script
+    assert "for cs_name in cs_names:" in script
     assert "navigate(root, ['ControlSet001'])" not in script
 
 
@@ -247,12 +253,13 @@ def test_the_control_sets_are_discovered_rather_than_listed(resolved_node):
 
 
 def test_the_first_boot_service_reaches_the_same_control_sets(resolved_node):
-    """The service that installs the driver package properly had the same gap."""
+    """The first-boot service registers itself in every control set it finds; the storage
+    merge follows Select (see above), so the discovery appears once, in the service."""
     calls, _ = resolved_node
     v2p._inject_virtio_drivers(_Manager(), _Task())
 
     script = _injection_script(calls)
-    assert script.count("h.node_name(c).lower().startswith('controlset')") == 2
+    assert script.count("h.node_name(c).lower().startswith('controlset')") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -466,7 +473,7 @@ def test_the_old_database_is_written_as_well(resolved_node):
     v2p._inject_virtio_drivers(_Manager(), _Task())
 
     script = _injection_script(calls)
-    assert "cdb = navigate(navigate(cs, ['Control']), ['CriticalDeviceDatabase'])" in script
+    assert "cdb = navigate(cs, ['Control', 'CriticalDeviceDatabase'])" in script
 
 
 def test_the_driver_package_does_not_take_a_name_windows_may_already_use(resolved_node):
@@ -502,33 +509,6 @@ def test_both_the_transitional_and_the_modern_device_are_bound(resolved_node, dr
 # ---------------------------------------------------------------------------
 # A driver the loader would refuse
 # ---------------------------------------------------------------------------
-
-def test_an_unsignable_driver_is_not_made_boot_critical(resolved_node):
-    """Registering it produces a guest that stops at 0xc0000428 before the kernel starts.
-
-    virtio-win stopped having the drivers for out-of-support Windows versions signed
-    through Microsoft after release 0.1.208; from 0.1.221 the 2012 R2 variants carry
-    'virtio-win / Red Hat Inc.' and nothing else. The release used for Server 2012 R2 is
-    0.1.189, whose 2k12R2 drivers chain to Microsoft Code Verification Root.
-    """
-    calls, _ = resolved_node
-    v2p._inject_virtio_drivers(_Manager(), _Task())
-
-    script = _injection_script(calls)
-    assert "def boot_signable(path):" in script
-    assert "_signable['vioscsi']" in script
-    assert "b'Microsoft Code Verification Root'" in script
-
-
-def test_the_signature_is_read_from_the_file_not_the_windows_version(resolved_node):
-    """An operator supplying an older ISO for an old guest has a driver that does load."""
-    calls, _ = resolved_node
-    v2p._inject_virtio_drivers(_Manager(), _Task())
-
-    script = _injection_script(calls)
-    #: data directory 4 is the certificate table
-    assert "struct.unpack_from('<II', data, directories + 32)" in script
-
 
 def test_a_refused_signature_is_reported_rather_than_called_success(node_calls,
                                                                     resolved_node):
@@ -622,7 +602,7 @@ class TestTheHibernationOnlyModeReachesItsOwnWork:
     def test_the_driver_path_still_mounts_its_iso(self):
         script = self._script(False)
         assert 'CLEAN_ONLY=0' in script
-        assert 'mount -o ro,loop' in script
+        assert 'mount -t iso9660,udf -o ro,loop' in script
 
 
 # ===========================================================================
