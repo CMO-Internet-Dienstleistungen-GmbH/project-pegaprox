@@ -24,6 +24,7 @@ import logging
 import threading
 import time
 from datetime import datetime
+from types import MappingProxyType
 
 from pegaprox.core import hyperv_db
 from pegaprox.core.hyperv import HyperVManager
@@ -54,6 +55,10 @@ class HyperVConfig:
     several are read without a guard, so they exist here with honest values rather than
     being absent and raising in a cluster list nobody expected to break.
     """
+
+    # Read by shared code without a getattr guard. Class level and read-only: nothing here
+    # stores HA settings, and an assignment in a function is what the HA inventory looks for.
+    ha_settings = MappingProxyType({})
 
     def __init__(self, data: dict):
         self.name = data.get('name') or data.get('host') or 'Hyper-V host'
@@ -113,7 +118,6 @@ class HyperVConfig:
         self.ha_enabled = False
         self.fallback_hosts = []
         self.excluded_nodes = []
-        self.ha_settings = {}
         self.api_token_user = ''
         self.api_token_secret = ''
         self.vnc_tunnel = False
