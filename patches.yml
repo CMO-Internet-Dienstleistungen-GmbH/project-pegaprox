@@ -113,18 +113,6 @@ patches:
     commit_message: 'feat(health): broadcast one shared cluster health rollup'
     requested_by: 11
 
-  # The Corporate QEMU summary already fetches the VM config for hardware
-  # details. Reuse that response to show a non-empty description as escaped,
-  # multiline text without changing the Config editor or Markdown preview.
-  - name: vm-description-summary
-    branch: feat/vm-description-summary
-    base: main
-    kind: feature
-    upstream_pr:
-    summary: 'Corporate QEMU summaries show the VM description as safe multiline text'
-    commit_message: 'feat(web): show VM descriptions in Corporate summary'
-    requested_by: 14
-
   # Every search request asked each connected cluster for a fresh /cluster/resources walk
   # with max_age=0 — the heaviest query PegaProx makes of a cluster, run once per cluster
   # per keystroke, serially, each able to wait out its own ten-second timeout. The tag
