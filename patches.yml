@@ -54,18 +54,6 @@ fork:
 #                subject is materially wrong, and explain why in the
 #                cmo/automation commit body.
 patches:
-  # Upstream issue #743 is open; PR #745 was closed pending discussion, so there
-  # is no PR to track and the entry has to be retired by hand once upstream
-  # ships its own System theme.
-  - name: system-theme
-    branch: feat/system-theme
-    base: main
-    kind: feature
-    upstream_pr:
-    summary: '"System" theme follows the OS light/dark setting (upstream issue #743)'
-    commit_message: 'feat(theme): follow the OS light/dark setting'
-    requested_by: 6
-
   # The chooser GitHub shows when someone opens an issue here. Upstream's asks
   # for sponsors and stars; ours asks the two questions the triage needs
   # answered. It is `internal` on purpose -- there is no version of this that
