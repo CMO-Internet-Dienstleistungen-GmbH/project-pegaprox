@@ -10364,7 +10364,7 @@
         // second one there. The capture behind this change had 40% of all API calls
         // starting while the same URL was still in flight.
         //
-        // Deliberately narrow — only plain GETs with no timeout, signal or body. A
+        // Deliberately narrow - only plain GETs with no timeout, signal or body. A
         // shared request must not be abortable by one of its callers, and a caller
         // that passed opts.timeout expects its own abort to apply to its own request.
         //
