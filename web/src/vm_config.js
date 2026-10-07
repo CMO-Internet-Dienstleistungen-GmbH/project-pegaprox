@@ -795,6 +795,8 @@
         }
 
         function ConfigModal({ vm, clusterId, allClusters = [], dashboardAuthFetch, onClose, addToast, isCorporate = false }) {
+            const { t } = useTranslation();
+            const { getAuthHeaders, haReadOnly, haStandby } = useAuth();
             // Fork patch #15 — a Hyper-V guest is a migration source, not a machine this
             // product manages. Its hardware is shown so the operator can see what a
             // migration has to reproduce; changing it would address a Proxmox API the host
@@ -802,8 +804,6 @@
             // by field, so a field added later cannot quietly become editable here.
             const isReadOnlySource = typeof hvType === 'function'
                 && hvType((allClusters || []).find(c => c.id === clusterId)) === 'hyperv';
-            const { t } = useTranslation();
-            const { getAuthHeaders, haReadOnly, haStandby } = useAuth();
             const [config, setConfig] = useState(null);
             const [configError, setConfigError] = useState(null);  // MK: Track config load errors
             const [loading, setLoading] = useState(true);
@@ -2423,9 +2423,10 @@
                                     {hasChanges && (
                                         <span className="corp-unsaved-pill">{t('unsavedChanges') || 'Unsaved Changes'}</span>
                                     )}
-                                    {hasChanges && !haReadOnly && !isReadOnlySource && (
+                                    {hasChanges && !haReadOnly && (
                                         <button
                                             onClick={handleSave}
+                                            hidden={isReadOnlySource}
                                             disabled={saving}
                                             className="corp-vm-btn corp-vm-btn-primary"
                                             title={t('save') || 'Apply changes'}
@@ -6179,7 +6180,7 @@
                                 </button>
                                 {!haReadOnly && <button
                                     onClick={handleSave}
-                                    disabled={!hasChanges || saving || isReadOnlySource}
+                                    disabled={!hasChanges || saving}
                                     hidden={isReadOnlySource}
                                     className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange rounded-lg text-white font-medium hover:bg-orange-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                                 >

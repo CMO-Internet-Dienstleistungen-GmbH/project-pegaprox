@@ -10792,7 +10792,9 @@
             };
 
             // NS: auto-clear topology/xhm sidebar when navigating to something else
-            useEffect(() => { if (selectedCluster || selectedPBS || selectedVMware || selectedHyperV || selectedGroup) { setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); setSidebarAutoInstall(false); } }, [selectedCluster, selectedPBS, selectedVMware, selectedGroup, selectedHyperV]);
+            useEffect(() => { if (selectedCluster || selectedPBS || selectedVMware || selectedGroup) { setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); setSidebarAutoInstall(false); } }, [selectedCluster, selectedPBS, selectedVMware, selectedGroup]);
+            // Fork patch #15 - the same for a Hyper-V source, kept out of the line above
+            useEffect(() => { if (selectedHyperV) { setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); setSidebarAutoInstall(false); } }, [selectedHyperV]);
             // Fork issue #15 — the Hyper-V host view ranks above every sidebar view below, and the
             // upstream sidebar buttons do not clear it, so choosing one of them clears it here.
             useEffect(() => { if (sidebarXHM || sidebarTopology || sidebarWorldmap || sidebarMultiSdn || sidebarAutoInstall) setSelectedHyperV(null); }, [sidebarXHM, sidebarTopology, sidebarWorldmap, sidebarMultiSdn, sidebarAutoInstall]);

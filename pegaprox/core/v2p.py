@@ -2542,7 +2542,7 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
         # NS Oct 2026 (#1090) - CD filesystems only: a disk image under an .iso name is
         # refused instead of handed to the kernel's other filesystem parsers as root
         "if [ \"$CLEAN_ONLY\" != 1 ]; then\n"
-        "  mount -t iso9660,udf -o ro,loop \"$ISO\" \"$ISO_MNT\" || { echo 'ISO_MOUNT_FAILED'; exit 3; }\n"
+        "mount -t iso9660,udf -o ro,loop \"$ISO\" \"$ISO_MNT\" || { echo 'ISO_MOUNT_FAILED'; exit 3; }\n"
         "fi\n"
         # ── Expose target disk as a partitioned block device (BLK) ──
         "BLK=\"\"\n"
