@@ -512,6 +512,19 @@ def _override_refused(username, target, tenant_id, override):
     return None
 
 
+def _permission_list(value):
+    """A permission list from a request body: absent is empty, a list of strings is itself,
+    anything else is None.
+
+    MK Oct 2026 - the lists went into `extra + denied` unchecked, so a string or an object
+    answered 500 instead of saying what was wrong, and a string was walked letter by letter."""
+    if value is None:
+        return []
+    if isinstance(value, list) and all(isinstance(p, str) for p in value):
+        return value
+    return None
+
+
 @bp.route('/api/users/<username>/permissions', methods=['PUT'])
 @require_auth(perms=['admin.users'])
 def set_user_perms(username):
@@ -539,8 +552,10 @@ def set_user_perms(username):
 
         # per-tenant permissions
         role = data.get('role')
-        extra = data.get('extra', [])
-        denied = data.get('denied', [])
+        extra = _permission_list(data.get('extra'))
+        denied = _permission_list(data.get('denied'))
+        if extra is None or denied is None:
+            return jsonify({'error': 'extra and denied must be lists of permission names'}), 400
 
         # NS Jul 2026 (CodeAnt re-scan — tenant->global privilege escalation) — a non-global-admin
         # delegating tenant admin must NOT grant the global admin role or any admin.* permission:
@@ -590,9 +605,12 @@ def set_user_perms(username):
             log_audit(request.session.get('user', ''), 'security.global_perms_denied',
                       f"Denied setting GLOBAL permissions for {username} (caller is not a global admin)")
             return jsonify({'error': 'Access denied: only a global admin may set global permissions'}), 403
-        extra = data.get('permissions', [])
-        denied = data.get('denied_permissions', [])
-        
+        extra = _permission_list(data.get('permissions'))
+        denied = _permission_list(data.get('denied_permissions'))
+        if extra is None or denied is None:
+            return jsonify({'error': 'permissions and denied_permissions must be lists of '
+                                     'permission names'}), 400
+
         for p in extra + denied:
             if p not in PERMISSIONS:
                 return jsonify({'error': f'Invalid permission: {p}'}), 400
