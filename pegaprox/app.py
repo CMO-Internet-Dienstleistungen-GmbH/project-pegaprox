@@ -1269,11 +1269,43 @@ def _generate_self_signed(cert_file, key_file, domain, app_name):
     cert.set_issuer(cert.get_subject())
     cert.set_pubkey(key)
     cert.sign(key, 'sha256')
-    with open(cert_file, "wb") as f:
-        f.write(crypto.dump_certificate(crypto.FILETYPE_PEM, cert))
-    with open(key_file, "wb") as f:
-        f.write(crypto.dump_privatekey(crypto.FILETYPE_PEM, key))
-    os.chmod(key_file, 0o600)
+    # #1129: written in place, a power cut or a hard VM kill right after generation left
+    # both files at 0 bytes (data not yet on disk), and every later start refused them.
+    # Write each to a temp file, fsync, then rename over the target.
+    _write_atomic(key_file, crypto.dump_privatekey(crypto.FILETYPE_PEM, key), 0o600)
+    _write_atomic(cert_file, crypto.dump_certificate(crypto.FILETYPE_PEM, cert), 0o644)
+
+
+def _write_atomic(path, data, mode):
+    tmp = path + '.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+    try:
+        dfd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+
+
+def _blank(path, err):
+    """True if path holds no certificate material at all: missing, or present and empty.
+    An empty pair is what an interrupted generation leaves behind (#1129); there is
+    nothing in it to protect, unlike a corrupt or mismatched pair (#633)."""
+    if err is not None:
+        return err.errno == errno.ENOENT
+    try:
+        return os.path.getsize(path) == 0
+    except OSError:
+        return False
 
 
 def _resolve_ssl_context(reverse_proxy, domain='', app_name='PegaProx',
@@ -1287,6 +1319,17 @@ def _resolve_ssl_context(reverse_proxy, domain='', app_name='PegaProx',
         return None      # nginx/haproxy/traefik owns TLS, plain HTTP on the bind
 
     cert_err, key_err = _unreadable(cert_file), _unreadable(key_file)
+    if (cert_err is None or key_err is None) and _blank(cert_file, cert_err) and _blank(key_file, key_err):
+        # #1129: zero-byte leftovers of an interrupted generation - drop them and
+        # generate below, exactly as if the pair had never been written
+        print("SSL certificate files are empty (an interrupted generation) - replacing them")
+        for path, err in ((cert_file, cert_err), (key_file, key_err)):
+            if err is None:
+                try:
+                    os.remove(path)
+                except OSError as e:
+                    return _tls_setup_failed("cannot remove the empty %s: %s" % (path, e.strerror), path)
+        cert_err = key_err = OSError(errno.ENOENT, 'empty file removed')
     if cert_err is None and key_err is None:
         # MK #633 follow-up: readable isn't enough - a corrupt/mismatched pair has
         # to fail here with a clear reason, not crash later at load_cert_chain.
