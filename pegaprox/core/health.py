@@ -222,6 +222,20 @@ def health_etag(payload):
     return 'W/"' + hashlib.sha256(blob).hexdigest()[:32] + '"'
 
 
+def _storage_part_is_live(cluster_id, payload):
+    """The storage figure inside a cached rollup is only as fresh as the shared storage
+    read it came from (#946: a short TTL, and a failed read is not kept). A rollup built
+    on a read that has since expired, or that never succeeded, is not served again; the
+    rollup of a cluster that was never asked for storage (not connected) has no such part."""
+    if not payload.get('computed_at'):
+        return True
+    try:
+        from pegaprox.api import clusters as _clusters
+        return _clusters._health_storage_cache.get(cluster_id, 'storage')[1]
+    except Exception:
+        return True
+
+
 def get_cluster_health(cluster_id, mgr, max_age=None, force=False):
     """Cached rollup. Returns (payload, etag, from_cache).
 
@@ -236,7 +250,7 @@ def get_cluster_health(cluster_id, mgr, max_age=None, force=False):
     if not force and ttl > 0:
         with _cache_lock:
             entry = _cache.get(cluster_id)
-        if entry and (now - entry['at']) <= ttl:
+        if entry and (now - entry['at']) <= ttl and _storage_part_is_live(cluster_id, entry['payload']):
             return entry['payload'], entry['etag'], True
 
     payload = compute_cluster_health(mgr, cluster_id)
