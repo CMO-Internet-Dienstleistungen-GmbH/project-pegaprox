@@ -44,9 +44,9 @@ def test_an_error_is_not_taken_away_before_it_can_be_read():
     dashboard = _read('web', 'src', 'dashboard.js')
     start = dashboard.index('const addToast = ')
     body = dashboard[start:dashboard.index('const removeToast', start)]
-    assert "if (type === 'error') return;" in body, (
-        'an error toast still disappears on a timer; it is the one kind somebody has to '
-        'read and act on')
+    assert "type === 'error' ? 86400000 : 5000" in body, (
+        'an error toast still disappears on the five second timer; it is the one kind '
+        'somebody has to read and act on')
 
     ui = _read('web', 'src', 'ui.js')
     toast = ui[ui.index('function Toast('):]
